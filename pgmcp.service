@@ -1,0 +1,16 @@
+[Unit]
+Description=pgmcp - PostgreSQL MCP File Indexer
+After=postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/pgmcp daemon
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5
+User=%i
+Environment=PGMCP_CONFIG=%h/.config/pgmcp/config.toml
+
+[Install]
+WantedBy=default.target

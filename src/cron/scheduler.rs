@@ -1,0 +1,698 @@
+//! Generic Lock-Free Reactive State Machine Task Scheduler
+//!
+//! Adapted from MeTTaTron's task_scheduler.rs.
+
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
+use tracing::{error, warn};
+
+use crate::config::CronConfig;
+use crate::stats::tracker::StatsTracker;
+
+// ============================================================================
+// Time utilities
+// ============================================================================
+
+pub type UnixTimestampMs = u64;
+
+#[inline]
+pub fn now_ms() -> UnixTimestampMs {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("System time went backwards")
+        .as_millis() as u64
+}
+
+// ============================================================================
+// CronState
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronState {
+    CheckEvents,
+    DrainChannel,
+    ExecutingTask,
+    Sleeping,
+    Terminated,
+}
+
+// ============================================================================
+// CronEvent
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronEvent {
+    TaskReceived,
+    TimerExpired,
+    TaskDue,
+    TaskCompleted {
+        success: bool,
+        should_requeue: bool,
+    },
+    TerminationRequested,
+    ChannelDisconnected,
+    NoEvents,
+}
+
+// ============================================================================
+// TaskMetadata
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub enum TaskMetadata {
+    OneShot,
+    Recurring { interval_ms: u64 },
+    Named {
+        name: String,
+        recurring_interval_ms: Option<u64>,
+    },
+}
+
+impl TaskMetadata {
+    #[inline]
+    pub fn recurrence_interval(&self) -> Option<u64> {
+        match self {
+            TaskMetadata::OneShot => None,
+            TaskMetadata::Recurring { interval_ms } => Some(*interval_ms),
+            TaskMetadata::Named { recurring_interval_ms, .. } => *recurring_interval_ms,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            TaskMetadata::OneShot => "one-shot",
+            TaskMetadata::Recurring { .. } => "recurring",
+            TaskMetadata::Named { name, .. } => name,
+        }
+    }
+}
+
+// ============================================================================
+// ScheduledTask
+// ============================================================================
+
+pub struct ScheduledTask {
+    pub scheduled_time_ms: UnixTimestampMs,
+    pub metadata: TaskMetadata,
+    pub task: Box<dyn FnMut() -> bool + Send>,
+}
+
+impl std::fmt::Debug for ScheduledTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScheduledTask")
+            .field("scheduled_time_ms", &self.scheduled_time_ms)
+            .field("metadata", &self.metadata)
+            .field("task", &"<fn>")
+            .finish()
+    }
+}
+
+impl Ord for ScheduledTask {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other.scheduled_time_ms.cmp(&self.scheduled_time_ms)
+    }
+}
+
+impl PartialOrd for ScheduledTask {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for ScheduledTask {
+    fn eq(&self, other: &Self) -> bool {
+        self.scheduled_time_ms == other.scheduled_time_ms
+    }
+}
+
+impl Eq for ScheduledTask {}
+
+// ============================================================================
+// CronStateMachine
+// ============================================================================
+
+pub struct CronStateMachine {
+    state: CronState,
+    queue: BinaryHeap<ScheduledTask>,
+    task_rx: Receiver<ScheduledTask>,
+    poll_interval_ms: u64,
+    terminating: Arc<AtomicBool>,
+    channel_disconnected: bool,
+    ready_tx: Option<Sender<()>>,
+}
+
+impl CronStateMachine {
+    pub const DEFAULT_POLL_INTERVAL_MS: u64 = 100;
+
+    pub fn new(
+        task_rx: Receiver<ScheduledTask>,
+        terminating: Arc<AtomicBool>,
+        poll_interval_ms: u64,
+        ready_tx: Option<Sender<()>>,
+    ) -> Self {
+        Self {
+            state: CronState::CheckEvents,
+            queue: BinaryHeap::new(),
+            task_rx,
+            poll_interval_ms,
+            terminating,
+            channel_disconnected: false,
+            ready_tx,
+        }
+    }
+
+    pub fn run(&mut self) {
+        if let Some(tx) = self.ready_tx.take() {
+            let _ = tx.send(());
+        }
+
+        while self.state != CronState::Terminated {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let event = self.poll_event();
+                self.transition(event);
+            }));
+
+            if let Err(payload) = result {
+                error!(
+                    panic = ?payload,
+                    "CronStateMachine::run() caught panic -- resetting to CheckEvents"
+                );
+                self.state = CronState::CheckEvents;
+                thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
+
+    fn poll_event(&mut self) -> CronEvent {
+        if let Some(task) = self.queue.peek() {
+            if task.scheduled_time_ms <= now_ms() {
+                return CronEvent::TaskDue;
+            }
+        }
+
+        if self.terminating.load(AtomicOrdering::Acquire) {
+            return CronEvent::TerminationRequested;
+        }
+
+        match self.state {
+            CronState::CheckEvents => self.poll_check_events(),
+            CronState::DrainChannel => self.poll_drain_channel(),
+            CronState::ExecutingTask => unreachable!("ExecutingTask polls internally"),
+            CronState::Sleeping => CronEvent::TimerExpired,
+            CronState::Terminated => unreachable!("Cannot poll from Terminated"),
+        }
+    }
+
+    fn poll_check_events(&mut self) -> CronEvent {
+        if self.terminating.load(AtomicOrdering::Acquire) {
+            return CronEvent::TerminationRequested;
+        }
+
+        match self.task_rx.try_recv() {
+            Ok(task) => {
+                self.queue.push(task);
+                return CronEvent::TaskReceived;
+            }
+            Err(TryRecvError::Disconnected) if !self.channel_disconnected => {
+                self.channel_disconnected = true;
+                return CronEvent::ChannelDisconnected;
+            }
+            _ => {}
+        }
+
+        if let Some(task) = self.queue.peek() {
+            if task.scheduled_time_ms <= now_ms() {
+                return CronEvent::TaskDue;
+            }
+        }
+
+        CronEvent::NoEvents
+    }
+
+    fn poll_drain_channel(&mut self) -> CronEvent {
+        match self.task_rx.try_recv() {
+            Ok(task) => {
+                self.queue.push(task);
+                CronEvent::TaskReceived
+            }
+            Err(TryRecvError::Empty) => {
+                if let Some(task) = self.queue.peek() {
+                    if task.scheduled_time_ms <= now_ms() {
+                        return CronEvent::TaskDue;
+                    }
+                }
+                CronEvent::NoEvents
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.channel_disconnected = true;
+                CronEvent::ChannelDisconnected
+            }
+        }
+    }
+
+    fn transition(&mut self, event: CronEvent) {
+        self.state = match (self.state, event) {
+            (_, CronEvent::TerminationRequested) => CronState::Terminated,
+
+            (CronState::CheckEvents, CronEvent::TaskReceived) => CronState::DrainChannel,
+            (CronState::CheckEvents, CronEvent::TaskDue) => {
+                self.execute_one_task();
+                CronState::CheckEvents
+            }
+            (CronState::CheckEvents, CronEvent::NoEvents) => CronState::Sleeping,
+            (CronState::CheckEvents, CronEvent::ChannelDisconnected) => {
+                if self.queue.is_empty() {
+                    CronState::Terminated
+                } else {
+                    CronState::CheckEvents
+                }
+            }
+
+            (CronState::DrainChannel, CronEvent::TaskReceived) => CronState::DrainChannel,
+            (CronState::DrainChannel, CronEvent::TaskDue) => {
+                self.execute_one_task();
+                CronState::CheckEvents
+            }
+            (CronState::DrainChannel, CronEvent::NoEvents) => CronState::Sleeping,
+            (CronState::DrainChannel, CronEvent::ChannelDisconnected) => CronState::CheckEvents,
+
+            (CronState::Sleeping, CronEvent::TimerExpired) => CronState::CheckEvents,
+            (CronState::Sleeping, CronEvent::TaskDue) => {
+                self.execute_one_task();
+                CronState::CheckEvents
+            }
+
+            (CronState::ExecutingTask, CronEvent::TaskCompleted { .. }) => CronState::CheckEvents,
+
+            (CronState::Terminated, _) => unreachable!("Cannot transition from Terminated"),
+
+            (state, event) => {
+                warn!(?state, ?event, "Unexpected transition");
+                CronState::CheckEvents
+            }
+        };
+
+        if self.state == CronState::Sleeping {
+            self.do_sleep();
+        }
+    }
+
+    fn execute_one_task(&mut self) {
+        let Some(task) = self.queue.pop() else {
+            return;
+        };
+        Self::execute_inline(task, &mut self.queue);
+    }
+
+    fn execute_inline(mut task: ScheduledTask, queue: &mut BinaryHeap<ScheduledTask>) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (task.task)()));
+
+        match result {
+            Ok(true) => {
+                if let Some(interval) = task.metadata.recurrence_interval() {
+                    task.scheduled_time_ms = now_ms() + interval;
+                    queue.push(task);
+                }
+            }
+            Ok(false) => {}
+            Err(e) => {
+                error!(task_name = task.metadata.name(), panic = ?e, "Task panicked");
+            }
+        }
+    }
+
+    fn do_sleep(&self) {
+        let sleep_ms = if let Some(task) = self.queue.peek() {
+            let now = now_ms();
+            if task.scheduled_time_ms <= now {
+                0
+            } else {
+                (task.scheduled_time_ms - now).min(self.poll_interval_ms)
+            }
+        } else {
+            self.poll_interval_ms
+        };
+
+        if sleep_ms > 0 {
+            thread::sleep(Duration::from_millis(sleep_ms));
+        }
+    }
+
+    pub fn pending_count(&self) -> usize {
+        self.queue.len()
+    }
+
+    pub fn current_state(&self) -> CronState {
+        self.state
+    }
+}
+
+// ============================================================================
+// CronHandle
+// ============================================================================
+
+#[derive(Clone)]
+pub struct CronHandle {
+    task_tx: Sender<ScheduledTask>,
+    terminating: Arc<AtomicBool>,
+}
+
+impl CronHandle {
+    pub fn schedule_at<F>(&self, time_ms: UnixTimestampMs, metadata: TaskMetadata, task: F) -> bool
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        let scheduled_task = ScheduledTask {
+            scheduled_time_ms: time_ms,
+            metadata,
+            task: Box::new(task),
+        };
+        self.task_tx.send(scheduled_task).is_ok()
+    }
+
+    pub fn schedule_after<F>(&self, delay_ms: u64, metadata: TaskMetadata, task: F) -> bool
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        self.schedule_at(now_ms() + delay_ms, metadata, task)
+    }
+
+    pub fn schedule_recurring<F>(
+        &self,
+        initial_delay_ms: u64,
+        interval_ms: u64,
+        name: &str,
+        task: F,
+    ) -> bool
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        let metadata = TaskMetadata::Named {
+            name: name.to_string(),
+            recurring_interval_ms: Some(interval_ms),
+        };
+        self.schedule_after(initial_delay_ms, metadata, task)
+    }
+
+    pub fn schedule_once<F>(&self, delay_ms: u64, name: &str, task: F) -> bool
+    where
+        F: FnMut() -> bool + Send + 'static,
+    {
+        let metadata = TaskMetadata::Named {
+            name: name.to_string(),
+            recurring_interval_ms: None,
+        };
+        self.schedule_after(delay_ms, metadata, task)
+    }
+
+    pub fn request_shutdown(&self) {
+        self.terminating.store(true, AtomicOrdering::Release);
+    }
+
+    pub fn is_shutting_down(&self) -> bool {
+        self.terminating.load(AtomicOrdering::Acquire)
+    }
+}
+
+// ============================================================================
+// Spawn functions
+// ============================================================================
+
+pub fn spawn_cron(
+    terminating: Arc<AtomicBool>,
+) -> (CronHandle, JoinHandle<()>, Receiver<()>) {
+    spawn_cron_with_interval(terminating, CronStateMachine::DEFAULT_POLL_INTERVAL_MS)
+}
+
+pub fn spawn_cron_with_interval(
+    terminating: Arc<AtomicBool>,
+    poll_interval_ms: u64,
+) -> (CronHandle, JoinHandle<()>, Receiver<()>) {
+    let (task_tx, task_rx) = unbounded::<ScheduledTask>();
+    let (ready_tx, ready_rx) = unbounded::<()>();
+
+    let terminating_clone = Arc::clone(&terminating);
+
+    let thread_handle = thread::Builder::new()
+        .name("pgmcp-cron".to_string())
+        .spawn(move || {
+            let mut sm = CronStateMachine::new(
+                task_rx,
+                terminating_clone,
+                poll_interval_ms,
+                Some(ready_tx),
+            );
+            sm.run();
+        })
+        .expect("Failed to spawn cron state machine thread");
+
+    let handle = CronHandle {
+        task_tx,
+        terminating,
+    };
+
+    (handle, thread_handle, ready_rx)
+}
+
+// ============================================================================
+// Maintenance job scheduling
+// ============================================================================
+
+/// Schedule all standard maintenance cron jobs.
+pub fn schedule_maintenance_jobs(
+    handle: &CronHandle,
+    db_pool: sqlx::PgPool,
+    stats: Arc<StatsTracker>,
+    config: &CronConfig,
+) {
+    // Stats aggregation
+    let stats_clone = Arc::clone(&stats);
+    let db_clone = db_pool.clone();
+    handle.schedule_recurring(
+        1000, // 1s initial delay
+        config.stats_aggregation_interval_secs * 1000,
+        "stats-aggregation",
+        move || {
+            let rt = tokio::runtime::Handle::try_current();
+            if let Ok(rt) = rt {
+                let db = db_clone.clone();
+                let stats = Arc::clone(&stats_clone);
+                rt.spawn(async move {
+                    if let Ok(count) = crate::db::queries::count_indexed_files(&db).await {
+                        stats.files_indexed.store(count, std::sync::atomic::Ordering::Relaxed);
+                    }
+                });
+            }
+            true
+        },
+    );
+
+    // Stale file cleanup
+    let db_clone = db_pool.clone();
+    handle.schedule_recurring(
+        5000,
+        config.stale_cleanup_interval_secs * 1000,
+        "stale-cleanup",
+        move || {
+            let rt = tokio::runtime::Handle::try_current();
+            if let Ok(rt) = rt {
+                let db = db_clone.clone();
+                rt.spawn(async move {
+                    match crate::db::queries::cleanup_stale_files(&db).await {
+                        Ok(count) => {
+                            if count > 0 {
+                                tracing::info!(count, "Cleaned up stale files");
+                            }
+                        }
+                        Err(e) => tracing::error!("Stale cleanup failed: {}", e),
+                    }
+                });
+            }
+            true
+        },
+    );
+
+    // DB maintenance (VACUUM ANALYZE)
+    let db_clone = db_pool.clone();
+    handle.schedule_recurring(
+        config.db_maintenance_interval_secs * 1000,
+        config.db_maintenance_interval_secs * 1000,
+        "db-maintenance",
+        move || {
+            let rt = tokio::runtime::Handle::try_current();
+            if let Ok(rt) = rt {
+                let db = db_clone.clone();
+                rt.spawn(async move {
+                    if let Err(e) = sqlx::query("VACUUM ANALYZE indexed_files")
+                        .execute(&db)
+                        .await
+                    {
+                        tracing::error!("DB maintenance failed: {}", e);
+                    }
+                    if let Err(e) = sqlx::query("VACUUM ANALYZE file_chunks")
+                        .execute(&db)
+                        .await
+                    {
+                        tracing::error!("DB maintenance (chunks) failed: {}", e);
+                    }
+                });
+            }
+            true
+        },
+    );
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+    use std::time::Instant;
+
+    #[test]
+    fn test_state_transitions() {
+        let (_, rx) = unbounded::<ScheduledTask>();
+        let terminating = Arc::new(AtomicBool::new(false));
+        let sm = CronStateMachine::new(rx, terminating, 100, None);
+        assert_eq!(sm.current_state(), CronState::CheckEvents);
+    }
+
+    #[test]
+    fn test_termination_from_any_state() {
+        let (_, rx) = unbounded::<ScheduledTask>();
+        let terminating = Arc::new(AtomicBool::new(false));
+        let mut sm = CronStateMachine::new(rx, terminating.clone(), 100, None);
+        terminating.store(true, AtomicOrdering::Release);
+        sm.run();
+        assert_eq!(sm.current_state(), CronState::Terminated);
+    }
+
+    #[test]
+    fn test_concurrent_task_submission() {
+        let terminating = Arc::new(AtomicBool::new(false));
+        let (handle, thread, _ready) = spawn_cron(Arc::clone(&terminating));
+        let counter = Arc::new(AtomicU64::new(0));
+
+        let handles: Vec<_> = (0..10)
+            .map(|_| {
+                let h = handle.clone();
+                let c = Arc::clone(&counter);
+                thread::spawn(move || {
+                    for _ in 0..100 {
+                        h.schedule_after(0, TaskMetadata::OneShot, {
+                            let c = Arc::clone(&c);
+                            move || {
+                                c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                true
+                            }
+                        });
+                    }
+                })
+            })
+            .collect();
+
+        for h in handles {
+            h.join().expect("Thread panicked");
+        }
+
+        thread::sleep(Duration::from_millis(500));
+        handle.request_shutdown();
+        thread.join().expect("Cron thread panicked");
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1000);
+    }
+
+    #[test]
+    fn test_recurring_task() {
+        let terminating = Arc::new(AtomicBool::new(false));
+        let (handle, thread, _ready) = spawn_cron_with_interval(Arc::clone(&terminating), 10);
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&counter);
+
+        handle.schedule_recurring(0, 50, "counter", move || {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        });
+
+        thread::sleep(Duration::from_millis(275));
+        handle.request_shutdown();
+        thread.join().expect("Cron thread panicked");
+        let count = counter.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(count >= 4 && count <= 7, "Expected 4-7 executions, got {}", count);
+    }
+
+    #[test]
+    fn test_one_shot_task() {
+        let terminating = Arc::new(AtomicBool::new(false));
+        let (handle, thread, _ready) = spawn_cron_with_interval(Arc::clone(&terminating), 10);
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&counter);
+
+        handle.schedule_once(0, "one-shot", move || {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        });
+
+        thread::sleep(Duration::from_millis(100));
+        handle.request_shutdown();
+        thread.join().expect("Cron thread panicked");
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_panic_safety() {
+        let terminating = Arc::new(AtomicBool::new(false));
+        let (handle, thread, ready_rx) = spawn_cron_with_interval(Arc::clone(&terminating), 10);
+        ready_rx.recv().expect("Cron thread failed to start");
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&counter);
+
+        handle.schedule_once(0, "panicking", || { panic!("intentional panic"); });
+        handle.schedule_once(50, "normal", move || {
+            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while counter.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            if Instant::now() > deadline {
+                panic!("Timeout waiting for normal task");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        handle.request_shutdown();
+        thread.join().expect("Cron thread should not panic from task panic");
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_task_ordering() {
+        let mut heap = BinaryHeap::new();
+        heap.push(ScheduledTask { scheduled_time_ms: 300, metadata: TaskMetadata::OneShot, task: Box::new(|| true) });
+        heap.push(ScheduledTask { scheduled_time_ms: 100, metadata: TaskMetadata::OneShot, task: Box::new(|| true) });
+        heap.push(ScheduledTask { scheduled_time_ms: 200, metadata: TaskMetadata::OneShot, task: Box::new(|| true) });
+        assert_eq!(heap.pop().expect("should have task").scheduled_time_ms, 100);
+        assert_eq!(heap.pop().expect("should have task").scheduled_time_ms, 200);
+        assert_eq!(heap.pop().expect("should have task").scheduled_time_ms, 300);
+    }
+
+    #[test]
+    fn test_shutdown_flag() {
+        let terminating = Arc::new(AtomicBool::new(false));
+        let (handle, thread, _ready) = spawn_cron(Arc::clone(&terminating));
+        assert!(!handle.is_shutting_down());
+        handle.request_shutdown();
+        assert!(handle.is_shutting_down());
+        thread.join().expect("Cron thread panicked");
+    }
+}
