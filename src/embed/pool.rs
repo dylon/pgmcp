@@ -4,6 +4,7 @@
 //! A bounded crossbeam channel provides backpressure.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
 use crossbeam_channel::{bounded, Sender, Receiver};
@@ -40,10 +41,17 @@ pub struct EmbeddingPool {
 
 impl EmbeddingPool {
     /// Create a new embedding pool with the specified number of threads.
-    pub fn new(config: &EmbeddingsConfig, stats: Arc<StatsTracker>) -> Result<Self> {
+    pub fn new(
+        config: &EmbeddingsConfig,
+        stats: Arc<StatsTracker>,
+        shutdown: Arc<AtomicBool>,
+    ) -> Result<Self> {
         let pool_size = config.pool_size;
         let batch_size = config.batch_size;
         let (tx, rx) = bounded::<EmbedRequest>(batch_size * 2);
+
+        // Capture the tokio runtime handle so embedding workers can run async DB queries.
+        let rt_handle = tokio::runtime::Handle::current();
 
         let mut workers = Vec::with_capacity(pool_size);
 
@@ -51,11 +59,13 @@ impl EmbeddingPool {
             let rx = rx.clone();
             let config = config.clone();
             let stats = Arc::clone(&stats);
+            let shutdown = Arc::clone(&shutdown);
+            let rt = rt_handle.clone();
 
             let handle = thread::Builder::new()
                 .name(format!("pgmcp-embed-{}", i))
                 .spawn(move || {
-                    embedding_worker(i, rx, &config, &stats);
+                    embedding_worker(i, rx, &config, &stats, &shutdown, &rt);
                 })
                 .map_err(|e| PgmcpError::Other(format!("Failed to spawn embedding worker: {}", e)))?;
 
@@ -85,6 +95,8 @@ fn embedding_worker(
     rx: Receiver<EmbedRequest>,
     config: &EmbeddingsConfig,
     stats: &StatsTracker,
+    shutdown: &AtomicBool,
+    rt: &tokio::runtime::Handle,
 ) {
     // Each worker owns its own model instance
     let model = match super::model::create_embedding_model(config) {
@@ -97,7 +109,19 @@ fn embedding_worker(
 
     debug!(worker_id = id, "Embedding worker started");
 
-    for request in rx {
+    loop {
+        // Check shutdown before blocking on recv
+        if shutdown.load(Ordering::Acquire) {
+            break;
+        }
+
+        // Use recv_timeout so we can periodically check the shutdown flag
+        let request = match rx.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(req) => req,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        };
+
         let start = std::time::Instant::now();
 
         // Batch embed all chunks
@@ -105,41 +129,37 @@ fn embedding_worker(
 
         match model.embed(texts, None) {
             Ok(embeddings) => {
-                // Store embeddings in DB
-                let rt = tokio::runtime::Handle::try_current();
-                if let Ok(rt) = rt {
-                    let chunks = request.chunks;
-                    let db_pool = request.db_pool;
-                    let file_id = request.file_id;
+                let chunks = request.chunks;
+                let db_pool = request.db_pool;
+                let file_id = request.file_id;
 
-                    rt.block_on(async {
-                        for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
-                            if let Err(e) = crate::db::queries::insert_chunk(
-                                &db_pool,
+                rt.block_on(async {
+                    for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
+                        if let Err(e) = crate::db::queries::insert_chunk(
+                            &db_pool,
+                            file_id,
+                            chunk.chunk_index,
+                            &chunk.content,
+                            chunk.start_line,
+                            chunk.end_line,
+                            embedding,
+                        )
+                        .await
+                        {
+                            error!(
                                 file_id,
-                                chunk.chunk_index,
-                                &chunk.content,
-                                chunk.start_line,
-                                chunk.end_line,
-                                embedding,
-                            )
-                            .await
-                            {
-                                error!(
-                                    file_id,
-                                    chunk_index = chunk.chunk_index,
-                                    error = %e,
-                                    "Failed to insert chunk"
-                                );
-                            }
+                                chunk_index = chunk.chunk_index,
+                                error = %e,
+                                "Failed to insert chunk"
+                            );
                         }
-                    });
+                    }
+                });
 
-                    stats.chunks_embedded.fetch_add(
-                        chunks.len() as u64,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                }
+                stats.chunks_embedded.fetch_add(
+                    chunks.len() as u64,
+                    Ordering::Relaxed,
+                );
             }
             Err(e) => {
                 error!(worker_id = id, error = %e, "Embedding batch failed");
@@ -149,7 +169,7 @@ fn embedding_worker(
         let elapsed = start.elapsed().as_millis() as u64;
         stats
             .embedding_duration_ms
-            .fetch_add(elapsed, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(elapsed, Ordering::Relaxed);
     }
 
     debug!(worker_id = id, "Embedding worker exiting");

@@ -89,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::load(cli.config.as_deref())?;
             println!("Triggering full re-index of all workspaces...");
             let pool = db::pool::create_pool(&config.database).await?;
+            db::migrations::run_migrations(&pool).await?;
             sqlx::query("DELETE FROM file_chunks")
                 .execute(&pool)
                 .await?;
@@ -168,6 +169,7 @@ async fn run_server(config: Config, is_daemon: bool) -> anyhow::Result<()> {
     let embed_pool = embed::pool::EmbeddingPool::new(
         &config_snapshot.embeddings,
         Arc::clone(&stats_tracker),
+        shutdown.terminating_flag(),
     )?;
 
     // 7. Start cron scheduler

@@ -62,6 +62,15 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Migration: drop the old UNIQUE composite index on projects(workspace_path, path)
+    // if it exists. The path column is already UNIQUE on its own, so the composite
+    // index only needs to be a regular (non-unique) index for query performance.
+    // Without this, concurrent upserts hit the composite UNIQUE constraint which
+    // isn't covered by ON CONFLICT (path).
+    let _ = sqlx::query("DROP INDEX IF EXISTS idx_projects_workspace_path")
+        .execute(pool)
+        .await;
+
     // Create indexes (IF NOT EXISTS for idempotency)
     let indexes = [
         "CREATE INDEX IF NOT EXISTS idx_files_fts ON indexed_files USING gin(to_tsvector('english', content))",
@@ -70,7 +79,7 @@ pub async fn run_migrations(pool: &PgPool) -> Result<(), sqlx::Error> {
         "CREATE INDEX IF NOT EXISTS idx_files_project ON indexed_files(project_id)",
         "CREATE INDEX IF NOT EXISTS idx_files_language ON indexed_files(language)",
         "CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON file_chunks(file_id)",
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_workspace_path ON projects(workspace_path, path)",
+        "CREATE INDEX IF NOT EXISTS idx_projects_workspace_path ON projects(workspace_path, path)",
     ];
 
     for idx_sql in &indexes {

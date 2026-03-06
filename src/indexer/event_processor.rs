@@ -38,6 +38,11 @@ pub fn start_indexing(
     let config_snapshot = config.load();
     let project_roots: Arc<DashMap<PathBuf, scanner::ProjectRoot>> = Arc::new(DashMap::new());
 
+    // Capture the tokio runtime handle so WorkPool threads can run async code.
+    // This must be called while we're on a tokio runtime thread (which we are,
+    // since start_indexing is called from run_server inside #[tokio::main]).
+    let rt_handle = tokio::runtime::Handle::current();
+
     // 1. Start file watcher
     let (event_tx, event_rx) = crossbeam_channel::bounded(4096);
     let watcher_handle = watcher::start_watching(
@@ -110,6 +115,7 @@ pub fn start_indexing(
     let stats_for_events = Arc::clone(&stats);
     let project_roots_for_events = Arc::clone(&project_roots);
 
+    let rt_for_events = rt_handle.clone();
     let event_sub = crate::reactive::observable::Observable::from_receiver(debounced_rx)
         .subscribe(move |event: watcher::FileEvent| {
             let path = event.path.clone();
@@ -118,15 +124,13 @@ pub fn start_indexing(
             let embed_tx = embed_tx_for_events.clone();
             let stats = Arc::clone(&stats_for_events);
             let roots = Arc::clone(&project_roots_for_events);
+            let rt = rt_for_events.clone();
 
             work_pool_for_events.submit(
                 move || {
-                    let rt = tokio::runtime::Handle::try_current();
-                    if let Ok(rt) = rt {
-                        rt.block_on(async {
-                            handle_file_event(&path, &event.kind, &config.load(), &db, &embed_tx, &stats, &roots).await;
-                        });
-                    }
+                    rt.block_on(async {
+                        handle_file_event(&path, &event.kind, &config.load(), &db, &embed_tx, &stats, &roots).await;
+                    });
                 },
                 Priority::High,
             );
@@ -139,6 +143,7 @@ pub fn start_indexing(
     let embed_tx_for_scan = embed_tx.clone();
     let stats_for_scan = Arc::clone(&stats);
     let project_roots_for_scan = Arc::clone(&project_roots);
+    let rt_for_scan = rt_handle;
 
     std::thread::Builder::new()
         .name("pgmcp-scanner".into())
@@ -163,24 +168,22 @@ pub fn start_indexing(
                 let embed_tx = embed_tx_for_scan.clone();
                 let stats = Arc::clone(&stats_for_scan);
                 let roots = Arc::clone(&project_roots_for_scan);
+                let rt = rt_for_scan.clone();
 
                 work_pool_for_scan.submit(
                     move || {
-                        let rt = tokio::runtime::Handle::try_current();
-                        if let Ok(rt) = rt {
-                            rt.block_on(async {
-                                handle_file_event(
-                                    &path,
-                                    &watcher::FileEventKind::Create,
-                                    &config.load(),
-                                    &db,
-                                    &embed_tx,
-                                    &stats,
-                                    &roots,
-                                )
-                                .await;
-                            });
-                        }
+                        rt.block_on(async {
+                            handle_file_event(
+                                &path,
+                                &watcher::FileEventKind::Create,
+                                &config.load(),
+                                &db,
+                                &embed_tx,
+                                &stats,
+                                &roots,
+                            )
+                            .await;
+                        });
                     },
                     Priority::Low,
                 );
