@@ -20,6 +20,10 @@ use clap::{Parser, Subcommand};
 use tracing::info;
 
 use rmcp::ServiceExt;
+use rmcp::transport::streamable_http_server::{
+    StreamableHttpServerConfig, StreamableHttpService,
+    session::local::LocalSessionManager,
+};
 
 use crate::config::Config;
 use crate::shutdown::ShutdownCoordinator;
@@ -98,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run_server(config: Config, _is_daemon: bool) -> anyhow::Result<()> {
+async fn run_server(config: Config, is_daemon: bool) -> anyhow::Result<()> {
     let shutdown = ShutdownCoordinator::new();
     let config = Arc::new(ArcSwap::from_pointee(config));
 
@@ -205,8 +209,7 @@ async fn run_server(config: Config, _is_daemon: bool) -> anyhow::Result<()> {
         None
     };
 
-    // 10. Start MCP server (blocks until shutdown)
-    info!("Starting MCP server on stdio");
+    // 10. Start MCP server
     let mcp_server = mcp::server::McpServer::new(
         db_pool.clone(),
         embed_model,
@@ -214,22 +217,60 @@ async fn run_server(config: Config, _is_daemon: bool) -> anyhow::Result<()> {
         Arc::clone(&config),
     );
 
-    let mcp_service = mcp_server
-        .serve(rmcp::transport::stdio())
-        .await
-        .map_err(|e| anyhow::anyhow!("MCP server error: {:?}", e))?;
-
-    // Wait for MCP service to finish (client disconnected) or shutdown signal
     let cancel_token = shutdown.cancellation_token();
-    tokio::select! {
-        result = mcp_service.waiting() => {
-            if let Err(e) = result {
-                tracing::warn!("MCP service ended with error: {:?}", e);
+
+    if is_daemon {
+        // Daemon mode: Streamable HTTP transport — multiple clients can connect
+        let bind_addr = format!(
+            "{}:{}",
+            config_snapshot.mcp.host, config_snapshot.mcp.port
+        );
+        info!("Starting MCP server on http://{}/mcp (Streamable HTTP)", bind_addr);
+
+        let mcp_service = StreamableHttpService::new(
+            move || Ok(mcp_server.clone()),
+            Arc::new(LocalSessionManager::default()),
+            StreamableHttpServerConfig {
+                stateful_mode: true,
+                cancellation_token: cancel_token.clone(),
+                ..Default::default()
+            },
+        );
+
+        let router = axum::Router::new().nest_service("/mcp", mcp_service);
+        let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to bind MCP server to {}: {}", bind_addr, e))?;
+
+        // Serve until shutdown signal
+        axum::serve(tcp_listener, router)
+            .with_graceful_shutdown(async move {
+                cancel_token.cancelled().await;
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("MCP HTTP server error: {}", e))?;
+
+        info!("MCP HTTP server stopped");
+    } else {
+        // Foreground mode: stdio transport — single client (debugging)
+        info!("Starting MCP server on stdio");
+
+        let mcp_service = mcp_server
+            .serve(rmcp::transport::stdio())
+            .await
+            .map_err(|e| anyhow::anyhow!("MCP server error: {:?}", e))?;
+
+        // Wait for MCP service to finish (client disconnected) or shutdown signal
+        tokio::select! {
+            result = mcp_service.waiting() => {
+                if let Err(e) = result {
+                    tracing::warn!("MCP service ended with error: {:?}", e);
+                }
+                info!("MCP client disconnected");
             }
-            info!("MCP client disconnected");
-        }
-        _ = cancel_token.cancelled() => {
-            info!("Shutdown signal received");
+            _ = cancel_token.cancelled() => {
+                info!("Shutdown signal received");
+            }
         }
     }
 

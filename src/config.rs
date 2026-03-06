@@ -241,17 +241,27 @@ fn default_embed_pool_size() -> usize { 2 }
 pub struct McpConfig {
     #[serde(default = "default_transport")]
     pub transport: String,
+    /// Bind address for the Streamable HTTP transport (daemon mode).
+    #[serde(default = "default_mcp_host")]
+    pub host: String,
+    /// Port for the Streamable HTTP transport (daemon mode).
+    #[serde(default = "default_mcp_port")]
+    pub port: u16,
 }
 
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
             transport: default_transport(),
+            host: default_mcp_host(),
+            port: default_mcp_port(),
         }
     }
 }
 
 fn default_transport() -> String { "stdio".into() }
+fn default_mcp_host() -> String { "127.0.0.1".into() }
+fn default_mcp_port() -> u16 { 3100 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricsConfig {
