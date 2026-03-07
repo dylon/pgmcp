@@ -3,7 +3,11 @@ name = "pgmcp"
 version = "0.1.0"
 edition = "2024"
 description = "PostgreSQL + pgvector MCP File Indexer for Claude Code"
-license = "MIT"
+license = "Apache-2.0"
+
+[features]
+default = []
+cuda = ["ort/cuda"]
 
 [dependencies]
 # Async runtime
@@ -20,6 +24,7 @@ pgvector = { version = "0.4", features = ["sqlx"] }
 
 # Embeddings
 fastembed = "4"
+ort = { version = "=2.0.0-rc.9", default-features = false }
 
 # Filesystem
 notify = "7"
@@ -62,6 +67,7 @@ thiserror = "2"
 anyhow = "1"
 regex = "1"
 libc = "0.2"
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 proptest = "1"

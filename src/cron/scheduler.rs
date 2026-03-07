@@ -465,84 +465,113 @@ pub fn spawn_cron_with_interval(
 // ============================================================================
 
 /// Schedule all standard maintenance cron jobs.
+///
+/// `rt` must be a handle to the tokio runtime so cron closures (which run on a
+/// plain `std::thread`) can spawn async database work. Passing it explicitly
+/// avoids the `try_current()` pitfall — `Handle::try_current()` always fails on
+/// non-tokio threads.
 pub fn schedule_maintenance_jobs(
     handle: &CronHandle,
     db_pool: sqlx::PgPool,
     stats: Arc<StatsTracker>,
     config: &CronConfig,
+    rt: tokio::runtime::Handle,
 ) {
     // Stats aggregation
     let stats_clone = Arc::clone(&stats);
     let db_clone = db_pool.clone();
+    let rt_clone = rt.clone();
     handle.schedule_recurring(
         1000, // 1s initial delay
         config.stats_aggregation_interval_secs * 1000,
         "stats-aggregation",
         move || {
-            let rt = tokio::runtime::Handle::try_current();
-            if let Ok(rt) = rt {
-                let db = db_clone.clone();
-                let stats = Arc::clone(&stats_clone);
-                rt.spawn(async move {
-                    if let Ok(count) = crate::db::queries::count_indexed_files(&db).await {
-                        stats.files_indexed.store(count, std::sync::atomic::Ordering::Relaxed);
-                    }
-                });
-            }
+            let db = db_clone.clone();
+            let stats = Arc::clone(&stats_clone);
+            rt_clone.spawn(async move {
+                if let Ok(count) = crate::db::queries::count_indexed_files(&db).await {
+                    stats.files_indexed.store(count, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
             true
         },
     );
 
     // Stale file cleanup
     let db_clone = db_pool.clone();
+    let rt_clone = rt.clone();
     handle.schedule_recurring(
         5000,
         config.stale_cleanup_interval_secs * 1000,
         "stale-cleanup",
         move || {
-            let rt = tokio::runtime::Handle::try_current();
-            if let Ok(rt) = rt {
-                let db = db_clone.clone();
-                rt.spawn(async move {
-                    match crate::db::queries::cleanup_stale_files(&db).await {
-                        Ok(count) => {
-                            if count > 0 {
-                                tracing::info!(count, "Cleaned up stale files");
-                            }
+            let db = db_clone.clone();
+            rt_clone.spawn(async move {
+                match crate::db::queries::cleanup_stale_files(&db).await {
+                    Ok(count) => {
+                        if count > 0 {
+                            tracing::info!(count, "Cleaned up stale files");
                         }
-                        Err(e) => tracing::error!("Stale cleanup failed: {}", e),
                     }
-                });
-            }
+                    Err(e) => tracing::error!("Stale cleanup failed: {}", e),
+                }
+            });
+            true
+        },
+    );
+
+    // Integrity check: clean up files with incomplete indexing (NULL content_hash).
+    // These are files where pgmcp was killed between upsert and embedding completion.
+    // Deleting them causes re-indexing on the next scan; ON DELETE CASCADE cleans partial chunks.
+    let db_clone = db_pool.clone();
+    let rt_clone = rt.clone();
+    handle.schedule_recurring(
+        config.integrity_check_interval_secs * 1000,
+        config.integrity_check_interval_secs * 1000,
+        "integrity-check",
+        move || {
+            let db = db_clone.clone();
+            rt_clone.spawn(async move {
+                match sqlx::query("DELETE FROM indexed_files WHERE content_hash IS NULL")
+                    .execute(&db)
+                    .await
+                {
+                    Ok(result) => {
+                        let count = result.rows_affected();
+                        if count > 0 {
+                            tracing::info!(count, "Cleaned up incompletely indexed files");
+                        }
+                    }
+                    Err(e) => tracing::error!("Integrity check failed: {}", e),
+                }
+            });
             true
         },
     );
 
     // DB maintenance (VACUUM ANALYZE)
     let db_clone = db_pool.clone();
+    let rt_clone = rt;
     handle.schedule_recurring(
         config.db_maintenance_interval_secs * 1000,
         config.db_maintenance_interval_secs * 1000,
         "db-maintenance",
         move || {
-            let rt = tokio::runtime::Handle::try_current();
-            if let Ok(rt) = rt {
-                let db = db_clone.clone();
-                rt.spawn(async move {
-                    if let Err(e) = sqlx::query("VACUUM ANALYZE indexed_files")
-                        .execute(&db)
-                        .await
-                    {
-                        tracing::error!("DB maintenance failed: {}", e);
-                    }
-                    if let Err(e) = sqlx::query("VACUUM ANALYZE file_chunks")
-                        .execute(&db)
-                        .await
-                    {
-                        tracing::error!("DB maintenance (chunks) failed: {}", e);
-                    }
-                });
-            }
+            let db = db_clone.clone();
+            rt_clone.spawn(async move {
+                if let Err(e) = sqlx::query("VACUUM ANALYZE indexed_files")
+                    .execute(&db)
+                    .await
+                {
+                    tracing::error!("DB maintenance failed: {}", e);
+                }
+                if let Err(e) = sqlx::query("VACUUM ANALYZE file_chunks")
+                    .execute(&db)
+                    .await
+                {
+                    tracing::error!("DB maintenance (chunks) failed: {}", e);
+                }
+            });
             true
         },
     );

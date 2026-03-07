@@ -22,6 +22,8 @@ pub struct EmbedRequest {
     pub chunks: Vec<ChunkData>,
     /// Database pool for upserting.
     pub db_pool: sqlx::PgPool,
+    /// Content hash to finalize after all chunks are inserted (two-phase commit).
+    pub content_hash: i64,
 }
 
 /// Data for a single chunk to embed.
@@ -81,10 +83,16 @@ impl EmbeddingPool {
         self.tx.clone()
     }
 
-    /// Shutdown the embedding pool and wait for workers to finish.
-    pub fn shutdown(self) {
+    /// Signal shutdown and return worker handles for joining with custom timeout logic.
+    pub fn shutdown_take_handles(self) -> Vec<JoinHandle<()>> {
         drop(self.tx);
-        for handle in self.workers {
+        self.workers
+    }
+
+    /// Shutdown the embedding pool and wait for workers to finish.
+    #[allow(dead_code)]
+    pub fn shutdown(self) {
+        for handle in self.shutdown_take_handles() {
             let _ = handle.join();
         }
     }
@@ -132,8 +140,10 @@ fn embedding_worker(
                 let chunks = request.chunks;
                 let db_pool = request.db_pool;
                 let file_id = request.file_id;
+                let content_hash = request.content_hash;
 
                 rt.block_on(async {
+                    let mut all_chunks_ok = true;
                     for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
                         if let Err(e) = crate::db::queries::insert_chunk(
                             &db_pool,
@@ -152,6 +162,16 @@ fn embedding_worker(
                                 error = %e,
                                 "Failed to insert chunk"
                             );
+                            all_chunks_ok = false;
+                        }
+                    }
+
+                    // Two-phase commit: finalize hash only if all chunks succeeded
+                    if all_chunks_ok {
+                        if let Err(e) = crate::db::queries::finalize_file_hash(
+                            &db_pool, file_id, content_hash,
+                        ).await {
+                            error!(file_id, error = %e, "Failed to finalize content hash");
                         }
                     }
                 });

@@ -60,6 +60,43 @@ pub struct ProjectInfo {
     pub file_count: Option<i64>,
 }
 
+/// Find the project whose path is the longest prefix of a given directory.
+/// Used by the `context` CLI subcommand to identify which project the user is in.
+pub async fn find_project_by_cwd(pool: &PgPool, cwd: &str) -> Result<Option<ProjectInfo>, sqlx::Error> {
+    sqlx::query_as::<_, ProjectInfo>(
+        "SELECT p.id, p.workspace_path, p.path, p.name, p.discovered_at, p.last_scanned_at,
+                (SELECT COUNT(*) FROM indexed_files f WHERE f.project_id = p.id) AS file_count
+         FROM projects p
+         WHERE $1 LIKE p.path || '%'
+         ORDER BY LENGTH(p.path) DESC
+         LIMIT 1"
+    )
+    .bind(cwd)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Returns language breakdown (language, count) for a project, ordered by count descending.
+pub async fn language_summary(pool: &PgPool, project_name: &str) -> Result<Vec<LanguageCount>, sqlx::Error> {
+    sqlx::query_as::<_, LanguageCount>(
+        "SELECT f.language, COUNT(*) as count
+         FROM indexed_files f
+         JOIN projects p ON f.project_id = p.id
+         WHERE p.name = $1
+         GROUP BY f.language
+         ORDER BY count DESC"
+    )
+    .bind(project_name)
+    .fetch_all(pool)
+    .await
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct LanguageCount {
+    pub language: String,
+    pub count: i64,
+}
+
 /// Update last_scanned_at for a project.
 pub async fn update_project_scanned(pool: &PgPool, project_id: i32) -> Result<(), sqlx::Error> {
     sqlx::query("UPDATE projects SET last_scanned_at = NOW() WHERE id = $1")
@@ -70,10 +107,34 @@ pub async fn update_project_scanned(pool: &PgPool, project_id: i32) -> Result<()
 }
 
 // ============================================================================
+// Scan-time metadata (Level 1 skip check)
+// ============================================================================
+
+/// Metadata for scan-time skip decisions.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct IndexedFileMeta {
+    pub path: String,
+    pub modified_at: DateTime<Utc>,
+    pub size_bytes: i64,
+}
+
+/// Load all indexed file metadata in a single batch query.
+/// Only returns files with non-NULL content_hash (fully indexed).
+pub async fn get_all_file_metadata(pool: &PgPool) -> Result<Vec<IndexedFileMeta>, sqlx::Error> {
+    sqlx::query_as::<_, IndexedFileMeta>(
+        "SELECT path, modified_at, size_bytes FROM indexed_files WHERE content_hash IS NOT NULL"
+    )
+    .fetch_all(pool)
+    .await
+}
+
+// ============================================================================
 // File queries
 // ============================================================================
 
 /// Upsert an indexed file.
+/// Pass `content_hash: None` during initial insert (deferred commit);
+/// the real hash is set via `finalize_file_hash` after all chunks are inserted.
 pub async fn upsert_file(
     pool: &PgPool,
     project_id: i32,
@@ -82,7 +143,7 @@ pub async fn upsert_file(
     language: &str,
     size_bytes: i64,
     content: Option<&str>,
-    content_hash: i64,
+    content_hash: Option<i64>,
     line_count: i32,
     truncated: bool,
     modified_at: DateTime<Utc>,
@@ -120,15 +181,28 @@ pub async fn upsert_file(
 }
 
 /// Get the content hash for a file path (for skip-if-unchanged check).
+/// Returns `None` if the file is not indexed or has a NULL hash (incomplete indexing).
 pub async fn get_content_hash(pool: &PgPool, path: &str) -> Result<Option<i64>, sqlx::Error> {
-    let row = sqlx::query_scalar::<_, i64>(
+    let row: Option<Option<i64>> = sqlx::query_scalar::<_, Option<i64>>(
         "SELECT content_hash FROM indexed_files WHERE path = $1"
     )
     .bind(path)
     .fetch_optional(pool)
     .await?;
 
-    Ok(row)
+    // flatten: no row → None, row with NULL hash → None, row with hash → Some(hash)
+    Ok(row.flatten())
+}
+
+/// Finalize a file's content hash after all chunks have been inserted.
+/// This completes the two-phase commit: the file is now fully indexed.
+pub async fn finalize_file_hash(pool: &PgPool, file_id: i64, content_hash: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE indexed_files SET content_hash = $1 WHERE id = $2")
+        .bind(content_hash)
+        .bind(file_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Delete old chunks for a file.
@@ -180,6 +254,19 @@ pub async fn delete_file(pool: &PgPool, path: &str) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+/// Batch-delete indexed files by path. Returns the number of rows deleted.
+/// `ON DELETE CASCADE` on `file_chunks.file_id` handles chunk cleanup automatically.
+pub async fn delete_files_batch(pool: &PgPool, paths: &[String]) -> Result<u64, sqlx::Error> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let result = sqlx::query("DELETE FROM indexed_files WHERE path = ANY($1)")
+        .bind(paths)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 // ============================================================================
 // Search queries
 // ============================================================================
@@ -196,45 +283,101 @@ pub struct SearchResult {
 }
 
 /// Semantic search using vector similarity.
+///
+/// Sets `hnsw.ef_search` on the connection for improved recall before executing
+/// the k-NN query. Supports optional filtering by language and/or project name.
 pub async fn semantic_search(
     pool: &PgPool,
     embedding: &[f32],
     limit: i32,
     language: Option<&str>,
+    project: Option<&str>,
+    ef_search: i32,
 ) -> Result<Vec<SearchResult>, sqlx::Error> {
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
 
-    let results = if let Some(lang) = language {
-        sqlx::query_as::<_, SearchResult>(
-            "SELECT f.path, f.relative_path, f.language,
-                    c.content as chunk_content, c.start_line, c.end_line,
-                    1 - (c.embedding <=> $1) as score
-             FROM file_chunks c
-             JOIN indexed_files f ON f.id = c.file_id
-             WHERE f.language = $3
-             ORDER BY c.embedding <=> $1
-             LIMIT $2"
-        )
-        .bind(&embedding_vec)
-        .bind(limit)
-        .bind(lang)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query_as::<_, SearchResult>(
-            "SELECT f.path, f.relative_path, f.language,
-                    c.content as chunk_content, c.start_line, c.end_line,
-                    1 - (c.embedding <=> $1) as score
-             FROM file_chunks c
-             JOIN indexed_files f ON f.id = c.file_id
-             ORDER BY c.embedding <=> $1
-             LIMIT $2"
-        )
-        .bind(&embedding_vec)
-        .bind(limit)
-        .fetch_all(pool)
-        .await?
+    // Acquire a dedicated connection so ef_search applies to our query.
+    // Using SET LOCAL within a transaction keeps it scoped to this operation.
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+
+    // Build the query dynamically based on which filters are present
+    let results = match (language, project) {
+        (Some(lang), Some(proj)) => {
+            sqlx::query_as::<_, SearchResult>(
+                "SELECT f.path, f.relative_path, f.language,
+                        c.content as chunk_content, c.start_line, c.end_line,
+                        1 - (c.embedding <=> $1) as score
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 WHERE f.language = $3 AND p.name = $4
+                 ORDER BY c.embedding <=> $1
+                 LIMIT $2"
+            )
+            .bind(&embedding_vec)
+            .bind(limit)
+            .bind(lang)
+            .bind(proj)
+            .fetch_all(&mut *tx)
+            .await?
+        }
+        (Some(lang), None) => {
+            sqlx::query_as::<_, SearchResult>(
+                "SELECT f.path, f.relative_path, f.language,
+                        c.content as chunk_content, c.start_line, c.end_line,
+                        1 - (c.embedding <=> $1) as score
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 WHERE f.language = $3
+                 ORDER BY c.embedding <=> $1
+                 LIMIT $2"
+            )
+            .bind(&embedding_vec)
+            .bind(limit)
+            .bind(lang)
+            .fetch_all(&mut *tx)
+            .await?
+        }
+        (None, Some(proj)) => {
+            sqlx::query_as::<_, SearchResult>(
+                "SELECT f.path, f.relative_path, f.language,
+                        c.content as chunk_content, c.start_line, c.end_line,
+                        1 - (c.embedding <=> $1) as score
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 WHERE p.name = $3
+                 ORDER BY c.embedding <=> $1
+                 LIMIT $2"
+            )
+            .bind(&embedding_vec)
+            .bind(limit)
+            .bind(proj)
+            .fetch_all(&mut *tx)
+            .await?
+        }
+        (None, None) => {
+            sqlx::query_as::<_, SearchResult>(
+                "SELECT f.path, f.relative_path, f.language,
+                        c.content as chunk_content, c.start_line, c.end_line,
+                        1 - (c.embedding <=> $1) as score
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 ORDER BY c.embedding <=> $1
+                 LIMIT $2"
+            )
+            .bind(&embedding_vec)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?
+        }
     };
+
+    tx.commit().await?;
 
     Ok(results)
 }
@@ -358,6 +501,22 @@ pub struct FileContent {
     pub truncated: bool,
 }
 
+/// Read a single file's content by relative path.
+pub async fn read_file_by_relative_path(
+    pool: &PgPool,
+    relative_path: &str,
+) -> Result<Option<FileContent>, sqlx::Error> {
+    let row = sqlx::query_as::<_, FileContent>(
+        "SELECT path, relative_path, language, content, size_bytes, line_count, truncated
+         FROM indexed_files WHERE relative_path = $1"
+    )
+    .bind(relative_path)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
+}
+
 /// Get file info/metadata.
 pub async fn file_info(pool: &PgPool, path: &str) -> Result<Option<FileInfo>, sqlx::Error> {
     let row = sqlx::query_as::<_, FileInfo>(
@@ -449,6 +608,44 @@ pub async fn total_bytes_indexed(pool: &PgPool) -> Result<u64, sqlx::Error> {
     .fetch_one(pool)
     .await?;
     Ok(total.unwrap_or(0) as u64)
+}
+
+// ============================================================================
+// Completion queries
+// ============================================================================
+
+/// List all distinct project names (for completions).
+pub async fn list_project_names(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT name FROM projects ORDER BY name"
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// List all distinct languages from indexed files (for completions).
+pub async fn list_languages(pool: &PgPool) -> Result<Vec<String>, sqlx::Error> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT language FROM indexed_files ORDER BY language"
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Search file paths by prefix (for completions).
+pub async fn search_file_paths(
+    pool: &PgPool,
+    prefix: &str,
+    limit: i32,
+) -> Result<Vec<String>, sqlx::Error> {
+    let pattern = format!("{}%", prefix);
+    sqlx::query_scalar::<_, String>(
+        "SELECT relative_path FROM indexed_files WHERE relative_path LIKE $1 ORDER BY relative_path LIMIT $2"
+    )
+    .bind(&pattern)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
 }
 
 /// Clean up stale files (files that no longer exist on disk).

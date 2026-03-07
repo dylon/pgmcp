@@ -19,6 +19,17 @@ pub fn create_embedding_model(config: &EmbeddingsConfig) -> Result<TextEmbedding
 
     let options = InitOptions::new(model).with_show_download_progress(true);
 
+    #[cfg(feature = "cuda")]
+    let options = if config.use_gpu {
+        use ort::execution_providers::CUDAExecutionProvider;
+        tracing::info!("CUDA execution provider requested for embedding model");
+        options.with_execution_providers(vec![
+            CUDAExecutionProvider::default().build(),
+        ])
+    } else {
+        options
+    };
+
     let embedding = TextEmbedding::try_new(options)
         .map_err(|e| PgmcpError::Embedding(format!("Failed to initialize embedding model: {}", e)))?;
 

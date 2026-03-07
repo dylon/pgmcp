@@ -151,7 +151,25 @@ pub fn start_indexing(
             let (file_tx, file_rx) = crossbeam_channel::bounded(4096);
             let config_snapshot = config_for_scan.load();
 
-            // Scan in parallel
+            // Load indexed file metadata for scan optimization (Level 1 skip)
+            let metadata_map: std::collections::HashMap<String, crate::db::queries::IndexedFileMeta> =
+                match rt_for_scan.block_on(crate::db::queries::get_all_file_metadata(&db_for_scan)) {
+                    Ok(metas) => {
+                        let len = metas.len();
+                        let mut map = std::collections::HashMap::with_capacity(len);
+                        for meta in metas {
+                            map.insert(meta.path.clone(), meta);
+                        }
+                        info!(indexed_files = len, "Loaded file metadata for scan optimization");
+                        map
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Failed to load file metadata, falling back to full scan");
+                        std::collections::HashMap::new()
+                    }
+                };
+
+            // Walk directories in parallel
             let scan_config = config_snapshot.clone();
             let scan_roots = Arc::clone(&project_roots_for_scan);
             let scan_handle = std::thread::Builder::new()
@@ -161,8 +179,35 @@ pub fn start_indexing(
                 })
                 .expect("Failed to spawn scan walk thread");
 
-            // Process discovered files
+            // Process discovered files with metadata-based filtering
+            let mut total_scanned: u64 = 0;
+            let mut skipped: u64 = 0;
+            let mut submitted: u64 = 0;
+            let mut seen_paths: std::collections::HashSet<String> =
+                std::collections::HashSet::with_capacity(metadata_map.len());
+
             for path in file_rx {
+                total_scanned += 1;
+                seen_paths.insert(path.to_string_lossy().into_owned());
+
+                // Level 1: metadata-based skip check (stat only, no file read)
+                if let Some(db_meta) = metadata_map.get(&*path.to_string_lossy()) {
+                    if let Ok(fs_meta) = std::fs::metadata(&path) {
+                        let fs_size = fs_meta.len() as i64;
+                        let fs_mtime: chrono::DateTime<chrono::Utc> = fs_meta
+                            .modified()
+                            .map(Into::into)
+                            .unwrap_or_else(|_| chrono::Utc::now());
+
+                        if fs_size == db_meta.size_bytes && fs_mtime <= db_meta.modified_at {
+                            skipped += 1;
+                            continue;
+                        }
+                    }
+                }
+
+                submitted += 1;
+
                 let config = Arc::clone(&config_for_scan);
                 let db = db_for_scan.clone();
                 let embed_tx = embed_tx_for_scan.clone();
@@ -190,7 +235,44 @@ pub fn start_indexing(
             }
 
             let _ = scan_handle.join();
-            info!("Initial scan complete");
+
+            // Remove stale files: indexed in DB but no longer found on disk
+            let stale_paths: Vec<String> = metadata_map
+                .keys()
+                .filter(|path| !seen_paths.contains(*path))
+                .cloned()
+                .collect();
+            let stale_count = stale_paths.len() as u64;
+            if !stale_paths.is_empty() {
+                match rt_for_scan.block_on(
+                    crate::db::queries::delete_files_batch(&db_for_scan, &stale_paths),
+                ) {
+                    Ok(deleted) => {
+                        info!(detected = stale_count, deleted, "Removed stale files from index");
+                    }
+                    Err(e) => {
+                        error!(count = stale_count, error = %e, "Failed to remove stale files");
+                    }
+                }
+                stats_for_scan
+                    .files_stale_removed
+                    .fetch_add(stale_count, std::sync::atomic::Ordering::Relaxed);
+            }
+
+            stats_for_scan
+                .files_scanned
+                .fetch_add(total_scanned, std::sync::atomic::Ordering::Relaxed);
+            stats_for_scan
+                .files_skipped
+                .fetch_add(skipped, std::sync::atomic::Ordering::Relaxed);
+
+            info!(
+                total = total_scanned,
+                unchanged = skipped,
+                submitted,
+                stale_removed = stale_count,
+                "Initial scan complete"
+            );
         })
         .expect("Failed to spawn scanner thread");
 

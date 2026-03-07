@@ -72,7 +72,7 @@ pub async fn process_file(
         .to_string_lossy()
         .into_owned();
 
-    // Upsert file
+    // Upsert file with NULL hash (two-phase commit: hash finalized after chunks)
     let file_id = db::queries::upsert_file(
         db_pool,
         project_id,
@@ -81,7 +81,7 @@ pub async fn process_file(
         &language,
         size_bytes,
         stored_content,
-        content_hash,
+        None,
         line_count,
         truncated,
         modified_at,
@@ -99,6 +99,8 @@ pub async fn process_file(
     );
 
     if chunks.is_empty() {
+        // No chunks to embed — finalize hash immediately
+        db::queries::finalize_file_hash(db_pool, file_id, content_hash).await?;
         return Ok(());
     }
 
@@ -117,6 +119,7 @@ pub async fn process_file(
         file_id,
         chunks: chunk_data,
         db_pool: db_pool.clone(),
+        content_hash,
     };
 
     if let Err(e) = embed_tx.send(request) {

@@ -17,6 +17,8 @@ pub struct Config {
     #[serde(default)]
     pub embeddings: EmbeddingsConfig,
     #[serde(default)]
+    pub vector: VectorConfig,
+    #[serde(default)]
     pub mcp: McpConfig,
     #[serde(default)]
     pub metrics: MetricsConfig,
@@ -215,6 +217,9 @@ pub struct EmbeddingsConfig {
     pub batch_size: usize,
     #[serde(default = "default_embed_pool_size")]
     pub pool_size: usize,
+    /// Enable GPU acceleration for embeddings (requires `cuda` feature).
+    #[serde(default)]
+    pub use_gpu: bool,
 }
 
 impl Default for EmbeddingsConfig {
@@ -226,9 +231,40 @@ impl Default for EmbeddingsConfig {
             chunk_overlap_lines: default_chunk_overlap(),
             batch_size: default_batch_size(),
             pool_size: default_embed_pool_size(),
+            use_gpu: false,
         }
     }
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorConfig {
+    /// HNSW index `m` parameter: max number of bi-directional links per node.
+    /// Higher values improve recall at the cost of memory and index build time.
+    #[serde(default = "default_hnsw_m")]
+    pub hnsw_m: i32,
+    /// HNSW index `ef_construction` parameter: size of the dynamic candidate list
+    /// during index construction. Higher values improve recall at the cost of build time.
+    #[serde(default = "default_hnsw_ef_construction")]
+    pub hnsw_ef_construction: i32,
+    /// `ef_search` parameter set at query time: size of the dynamic candidate list
+    /// during search. Higher values improve recall at the cost of query latency.
+    #[serde(default = "default_ef_search")]
+    pub ef_search: i32,
+}
+
+impl Default for VectorConfig {
+    fn default() -> Self {
+        Self {
+            hnsw_m: default_hnsw_m(),
+            hnsw_ef_construction: default_hnsw_ef_construction(),
+            ef_search: default_ef_search(),
+        }
+    }
+}
+
+fn default_hnsw_m() -> i32 { 24 }
+fn default_hnsw_ef_construction() -> i32 { 200 }
+fn default_ef_search() -> i32 { 100 }
 
 fn default_model() -> String { "all-MiniLM-L6-v2".into() }
 fn default_dimensions() -> usize { 384 }
@@ -436,6 +472,7 @@ impl Default for Config {
             indexer: IndexerConfig::default(),
             database: DatabaseConfig::default(),
             embeddings: EmbeddingsConfig::default(),
+            vector: VectorConfig::default(),
             mcp: McpConfig::default(),
             metrics: MetricsConfig::default(),
             logging: LoggingConfig::default(),

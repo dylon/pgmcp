@@ -1,5 +1,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
@@ -50,5 +52,42 @@ impl ShutdownCoordinator {
 impl Default for ShutdownCoordinator {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Join a `std::thread::JoinHandle` with a wall-clock timeout.
+///
+/// Since `JoinHandle::join()` has no native timeout, this spawns a helper thread
+/// that performs the blocking join and signals completion via a crossbeam channel.
+///
+/// Returns:
+/// - `Ok(Ok(()))` — thread exited cleanly within the timeout
+/// - `Ok(Err(panic_payload))` — thread panicked within the timeout
+/// - `Err(helper_handle)` — timeout expired; the helper thread is still blocked on join
+///   and will be cleaned up when the target thread eventually exits (or by `process::exit`)
+pub fn join_with_timeout(
+    handle: JoinHandle<()>,
+    timeout: Duration,
+) -> Result<std::thread::Result<()>, JoinHandle<()>> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+
+    let join_thread = std::thread::Builder::new()
+        .name("pgmcp-join-helper".into())
+        .spawn(move || {
+            let result = handle.join();
+            let _ = tx.send(result);
+        })
+        .expect("Failed to spawn join helper thread");
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => {
+            let _ = join_thread.join();
+            Ok(result)
+        }
+        Err(_) => {
+            // Timeout — helper thread is still blocked on join.
+            // Return the helper handle so the caller can decide what to do.
+            Err(join_thread)
+        }
     }
 }

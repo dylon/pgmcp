@@ -2727,6 +2727,7 @@ dependencies = [
  "libc",
  "notify",
  "num_cpus",
+ "ort",
  "parking_lot",
  "pgvector",
  "predicates",
@@ -2750,6 +2751,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uuid",
  "xxhash-rust",
 ]
 

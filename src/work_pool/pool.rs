@@ -228,6 +228,13 @@ impl WorkPool {
             }
         }
     }
+
+    /// Signal shutdown and return worker handles for joining with custom timeout logic.
+    pub fn shutdown_and_take_handles(&self) -> Vec<JoinHandle<()>> {
+        self.shutdown();
+        let mut guards = self.workers.lock();
+        guards.iter_mut().filter_map(|h| h.take()).collect()
+    }
 }
 
 fn worker_loop(

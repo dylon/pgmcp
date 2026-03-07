@@ -23,6 +23,11 @@ pub struct StatsTracker {
     pub embedding_duration_ms: AtomicU64,
     pub last_index_timestamp: AtomicU64,
 
+    // Scan counters
+    pub files_scanned: AtomicU64,
+    pub files_skipped: AtomicU64,
+    pub files_stale_removed: AtomicU64,
+
     // Pool state
     pub active_work_pool_threads: AtomicU64,
     pub work_pool_queue_depth: AtomicU64,
@@ -46,6 +51,9 @@ impl StatsTracker {
             index_duration_ms: AtomicU64::new(0),
             embedding_duration_ms: AtomicU64::new(0),
             last_index_timestamp: AtomicU64::new(0),
+            files_scanned: AtomicU64::new(0),
+            files_skipped: AtomicU64::new(0),
+            files_stale_removed: AtomicU64::new(0),
             active_work_pool_threads: AtomicU64::new(0),
             work_pool_queue_depth: AtomicU64::new(0),
             uptime_start: Instant::now(),
@@ -66,6 +74,9 @@ impl StatsTracker {
             "grep_searches": self.grep_searches.load(Ordering::Acquire),
             "index_duration_ms": self.index_duration_ms.load(Ordering::Acquire),
             "embedding_duration_ms": self.embedding_duration_ms.load(Ordering::Acquire),
+            "files_scanned": self.files_scanned.load(Ordering::Acquire),
+            "files_skipped": self.files_skipped.load(Ordering::Acquire),
+            "files_stale_removed": self.files_stale_removed.load(Ordering::Acquire),
             "active_work_pool_threads": self.active_work_pool_threads.load(Ordering::Acquire),
             "work_pool_queue_depth": self.work_pool_queue_depth.load(Ordering::Acquire),
             "uptime_secs": self.uptime_start.elapsed().as_secs(),

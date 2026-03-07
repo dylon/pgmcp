@@ -76,7 +76,7 @@ async fn run_test_migrations(pool: &PgPool) {
             language TEXT NOT NULL,
             size_bytes BIGINT NOT NULL,
             content TEXT,
-            content_hash BIGINT NOT NULL,
+            content_hash BIGINT,
             line_count INTEGER NOT NULL,
             truncated BOOLEAN NOT NULL DEFAULT FALSE,
             indexed_at TIMESTAMPTZ DEFAULT NOW(),
