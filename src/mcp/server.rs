@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use rmcp::model::*;
@@ -14,11 +15,22 @@ use rmcp::service::{RequestContext, NotificationContext};
 use serde::Deserialize;
 use sqlx::PgPool;
 
+use tracing::{info, debug, error};
+
 use crate::config::Config;
 use crate::stats::tracker::StatsTracker;
 
 use super::logging::LogBroadcaster;
 use super::tasks::TaskStore;
+
+/// Truncate a string to at most `max_len` bytes on a valid char boundary.
+fn truncate(s: &str, max_len: usize) -> &str {
+    if s.len() <= max_len {
+        s
+    } else {
+        &s[..s.floor_char_boundary(max_len)]
+    }
+}
 
 /// MCP Server state.
 #[derive(Clone)]
@@ -123,19 +135,34 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<SemanticSearchParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         self.stats.mcp_requests.fetch_add(1, Ordering::Relaxed);
         self.stats.semantic_searches.fetch_add(1, Ordering::Relaxed);
 
         let limit = params.limit.unwrap_or(10);
+        info!(
+            tool = "semantic_search",
+            query = %truncate(&params.query, 200),
+            limit,
+            language = params.language.as_deref().unwrap_or("*"),
+            project = params.project.as_deref().unwrap_or("*"),
+            "MCP tool invoked",
+        );
 
         // Embed the query
         let embedding = {
             let model = self.embed_model.lock().await;
             model.embed(vec![&params.query], None)
-                .map_err(|e| McpError::internal_error(format!("Embedding failed: {}", e), None))?
+                .map_err(|e| {
+                    error!(tool = "semantic_search", error = %e, "MCP tool failed");
+                    McpError::internal_error(format!("Embedding failed: {}", e), None)
+                })?
                 .into_iter()
                 .next()
-                .ok_or_else(|| McpError::internal_error("No embedding returned", None))?
+                .ok_or_else(|| {
+                    error!(tool = "semantic_search", "No embedding returned");
+                    McpError::internal_error("No embedding returned", None)
+                })?
         };
 
         let ef_search = self.config.load().vector.ef_search;
@@ -148,10 +175,21 @@ impl McpServer {
             ef_search,
         )
         .await
-        .map_err(|e| McpError::internal_error(format!("Search failed: {}", e), None))?;
+        .map_err(|e| {
+            error!(tool = "semantic_search", error = %e, "MCP tool failed");
+            McpError::internal_error(format!("Search failed: {}", e), None)
+        })?;
 
+        let count = results.len();
         let json = serde_json::to_string_pretty(&results)
             .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
+
+        debug!(
+            tool = "semantic_search",
+            results = count,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "MCP tool completed",
+        );
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -161,10 +199,18 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<TextSearchParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         self.stats.mcp_requests.fetch_add(1, Ordering::Relaxed);
         self.stats.text_searches.fetch_add(1, Ordering::Relaxed);
 
         let limit = params.limit.unwrap_or(10);
+        info!(
+            tool = "text_search",
+            query = %truncate(&params.query, 200),
+            limit,
+            language = params.language.as_deref().unwrap_or("*"),
+            "MCP tool invoked",
+        );
 
         let results = crate::db::queries::text_search(
             &self.db_pool,
@@ -173,10 +219,21 @@ impl McpServer {
             params.language.as_deref(),
         )
         .await
-        .map_err(|e| McpError::internal_error(format!("Search failed: {}", e), None))?;
+        .map_err(|e| {
+            error!(tool = "text_search", error = %e, "MCP tool failed");
+            McpError::internal_error(format!("Search failed: {}", e), None)
+        })?;
 
+        let count = results.len();
         let json = serde_json::to_string_pretty(&results)
             .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
+
+        debug!(
+            tool = "text_search",
+            results = count,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "MCP tool completed",
+        );
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -186,10 +243,18 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<GrepParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         self.stats.mcp_requests.fetch_add(1, Ordering::Relaxed);
         self.stats.grep_searches.fetch_add(1, Ordering::Relaxed);
 
         let limit = params.limit.unwrap_or(10);
+        info!(
+            tool = "grep",
+            pattern = %truncate(&params.pattern, 200),
+            glob = params.glob.as_deref().unwrap_or("*"),
+            limit,
+            "MCP tool invoked",
+        );
 
         let results = crate::db::queries::grep_search(
             &self.db_pool,
@@ -198,10 +263,21 @@ impl McpServer {
             limit,
         )
         .await
-        .map_err(|e| McpError::internal_error(format!("Grep failed: {}", e), None))?;
+        .map_err(|e| {
+            error!(tool = "grep", error = %e, "MCP tool failed");
+            McpError::internal_error(format!("Grep failed: {}", e), None)
+        })?;
 
+        let count = results.len();
         let json = serde_json::to_string_pretty(&results)
             .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
+
+        debug!(
+            tool = "grep",
+            results = count,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "MCP tool completed",
+        );
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -211,11 +287,24 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<ReadFileParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         self.stats.mcp_requests.fetch_add(1, Ordering::Relaxed);
+        info!(tool = "read_file", path = %params.path, "MCP tool invoked");
 
         let result = crate::db::queries::read_file(&self.db_pool, &params.path)
             .await
-            .map_err(|e| McpError::internal_error(format!("Read failed: {}", e), None))?;
+            .map_err(|e| {
+                error!(tool = "read_file", error = %e, "MCP tool failed");
+                McpError::internal_error(format!("Read failed: {}", e), None)
+            })?;
+
+        let found = result.is_some();
+        debug!(
+            tool = "read_file",
+            found,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "MCP tool completed",
+        );
 
         match result {
             Some(file) => {
@@ -232,14 +321,27 @@ impl McpServer {
 
     #[tool(description = "List all discovered projects with file counts.")]
     async fn list_projects(&self) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         self.stats.mcp_requests.fetch_add(1, Ordering::Relaxed);
+        info!(tool = "list_projects", "MCP tool invoked");
 
         let projects = crate::db::queries::list_projects(&self.db_pool)
             .await
-            .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
+            .map_err(|e| {
+                error!(tool = "list_projects", error = %e, "MCP tool failed");
+                McpError::internal_error(format!("Query failed: {}", e), None)
+            })?;
 
+        let count = projects.len();
         let json = serde_json::to_string_pretty(&projects)
             .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
+
+        debug!(
+            tool = "list_projects",
+            results = count,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "MCP tool completed",
+        );
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
@@ -249,13 +351,31 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<ProjectTreeParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         self.stats.mcp_requests.fetch_add(1, Ordering::Relaxed);
 
         let depth = params.depth.unwrap_or(5);
+        info!(
+            tool = "project_tree",
+            project = %params.project,
+            depth,
+            "MCP tool invoked",
+        );
 
         let paths = crate::db::queries::project_tree(&self.db_pool, &params.project, depth)
             .await
-            .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
+            .map_err(|e| {
+                error!(tool = "project_tree", error = %e, "MCP tool failed");
+                McpError::internal_error(format!("Query failed: {}", e), None)
+            })?;
+
+        let count = paths.len();
+        debug!(
+            tool = "project_tree",
+            results = count,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "MCP tool completed",
+        );
 
         let tree = paths.join("\n");
         Ok(CallToolResult::success(vec![Content::text(tree)]))
@@ -266,11 +386,24 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<FileInfoParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         self.stats.mcp_requests.fetch_add(1, Ordering::Relaxed);
+        info!(tool = "file_info", path = %params.path, "MCP tool invoked");
 
         let info = crate::db::queries::file_info(&self.db_pool, &params.path)
             .await
-            .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
+            .map_err(|e| {
+                error!(tool = "file_info", error = %e, "MCP tool failed");
+                McpError::internal_error(format!("Query failed: {}", e), None)
+            })?;
+
+        let found = info.is_some();
+        debug!(
+            tool = "file_info",
+            found,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "MCP tool completed",
+        );
 
         match info {
             Some(info) => {
@@ -287,34 +420,56 @@ impl McpServer {
 
     #[tool(description = "Get overall indexing statistics including file counts, search counts, and pool state.")]
     async fn index_stats(&self) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         self.stats.mcp_requests.fetch_add(1, Ordering::Relaxed);
+        info!(tool = "index_stats", "MCP tool invoked");
 
         let snapshot = self.stats.snapshot();
         let json = serde_json::to_string_pretty(&snapshot)
             .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
+
+        debug!(
+            tool = "index_stats",
+            duration_ms = start.elapsed().as_millis() as u64,
+            "MCP tool completed",
+        );
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
     #[tool(description = "Trigger a full re-index of all workspaces. Clears the existing index and restarts indexing. Can be invoked as a long-running task.")]
     async fn reindex(&self) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         self.stats.mcp_requests.fetch_add(1, Ordering::Relaxed);
+        info!(tool = "reindex", "MCP tool invoked");
 
         // Synchronous (non-task) reindex: clear index directly
         sqlx::query("DELETE FROM file_chunks")
             .execute(&self.db_pool)
             .await
-            .map_err(|e| McpError::internal_error(format!("Failed to clear chunks: {}", e), None))?;
+            .map_err(|e| {
+                error!(tool = "reindex", error = %e, "Failed to clear chunks");
+                McpError::internal_error(format!("Failed to clear chunks: {}", e), None)
+            })?;
 
         sqlx::query("DELETE FROM indexed_files")
             .execute(&self.db_pool)
             .await
-            .map_err(|e| McpError::internal_error(format!("Failed to clear files: {}", e), None))?;
+            .map_err(|e| {
+                error!(tool = "reindex", error = %e, "Failed to clear files");
+                McpError::internal_error(format!("Failed to clear files: {}", e), None)
+            })?;
 
         self.log_broadcaster.log(
             LoggingLevel::Info,
             "pgmcp::reindex",
             serde_json::json!({"message": "Index cleared via reindex tool"}),
+        );
+
+        debug!(
+            tool = "reindex",
+            duration_ms = start.elapsed().as_millis() as u64,
+            "MCP tool completed",
         );
 
         Ok(CallToolResult::success(vec![Content::text(
@@ -327,19 +482,33 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<SearchCommitsParams>,
     ) -> Result<CallToolResult, McpError> {
+        let start = Instant::now();
         self.stats.mcp_requests.fetch_add(1, Ordering::Relaxed);
         self.stats.commit_searches.fetch_add(1, Ordering::Relaxed);
 
         let limit = params.limit.unwrap_or(10);
+        info!(
+            tool = "search_commits",
+            query = %truncate(&params.query, 200),
+            limit,
+            project = params.project.as_deref().unwrap_or("*"),
+            "MCP tool invoked",
+        );
 
         // Embed the query
         let embedding = {
             let model = self.embed_model.lock().await;
             model.embed(vec![&params.query], None)
-                .map_err(|e| McpError::internal_error(format!("Embedding failed: {}", e), None))?
+                .map_err(|e| {
+                    error!(tool = "search_commits", error = %e, "MCP tool failed");
+                    McpError::internal_error(format!("Embedding failed: {}", e), None)
+                })?
                 .into_iter()
                 .next()
-                .ok_or_else(|| McpError::internal_error("No embedding returned", None))?
+                .ok_or_else(|| {
+                    error!(tool = "search_commits", "No embedding returned");
+                    McpError::internal_error("No embedding returned", None)
+                })?
         };
 
         let ef_search = self.config.load().vector.ef_search;
@@ -351,10 +520,21 @@ impl McpServer {
             ef_search,
         )
         .await
-        .map_err(|e| McpError::internal_error(format!("Commit search failed: {}", e), None))?;
+        .map_err(|e| {
+            error!(tool = "search_commits", error = %e, "MCP tool failed");
+            McpError::internal_error(format!("Commit search failed: {}", e), None)
+        })?;
 
+        let count = results.len();
         let json = serde_json::to_string_pretty(&results)
             .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
+
+        debug!(
+            tool = "search_commits",
+            results = count,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "MCP tool completed",
+        );
 
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }

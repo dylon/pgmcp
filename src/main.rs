@@ -150,7 +150,6 @@ async fn main() -> anyhow::Result<()> {
             let config = Config::load(cli.config.as_deref())?;
             logging::init_daemon(&config);
             info!("pgmcp starting in daemon mode");
-            daemon::notify_ready();
             run_server(config, true, config_path).await?;
             daemon::notify_stopping();
         }
@@ -539,6 +538,10 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to bind MCP server to {}: {}", bind_addr, e))?;
+
+        if is_daemon {
+            daemon::notify_ready();
+        }
 
         // Serve until shutdown signal, with a 5s timeout so SSE connections
         // don't prevent shutdown indefinitely.
