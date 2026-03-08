@@ -64,6 +64,31 @@ pub fn chunk_content(
     chunks
 }
 
+/// Chunk a generic JSONL file: each non-empty line becomes one chunk.
+/// Used for JSONL files outside `~/.claude/`.
+pub fn chunk_jsonl_content(content: &str) -> Vec<Chunk> {
+    let mut chunks = Vec::new();
+    let mut chunk_index: i32 = 0;
+
+    for (line_num, line) in content.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let line_1based = (line_num + 1) as i32;
+        chunks.push(Chunk {
+            chunk_index,
+            content: trimmed.to_string(),
+            start_line: line_1based,
+            end_line: line_1based,
+        });
+        chunk_index += 1;
+    }
+
+    chunks
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -113,6 +138,27 @@ mod tests {
         // Verify last chunk covers the end
         let last = chunks.last().expect("should have chunks");
         assert!(last.end_line >= 90); // Should reach near the end
+    }
+
+    #[test]
+    fn test_chunk_jsonl_content() {
+        let jsonl = r#"{"key": "value1"}
+{"key": "value2"}
+
+{"key": "value3"}
+"#;
+        let chunks = chunk_jsonl_content(jsonl);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].chunk_index, 0);
+        assert_eq!(chunks[0].start_line, 1);
+        assert_eq!(chunks[1].start_line, 2);
+        assert_eq!(chunks[2].start_line, 4); // Line 3 was empty
+    }
+
+    #[test]
+    fn test_chunk_jsonl_empty() {
+        assert!(chunk_jsonl_content("").is_empty());
+        assert!(chunk_jsonl_content("  \n  \n").is_empty());
     }
 
     #[test]

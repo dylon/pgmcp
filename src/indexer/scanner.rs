@@ -2,6 +2,7 @@
 //!
 //! Discovers project roots via .git/ directory heuristic.
 //! Respects .gitignore files.
+//! Auto-discovers `~/.claude/` as a synthetic "claude" project.
 
 use std::path::{Path, PathBuf};
 
@@ -10,13 +11,34 @@ use dashmap::DashMap;
 use ignore::WalkBuilder;
 use tracing::{debug, info};
 
-use crate::config::Config;
+use crate::config::{self, Config};
+
+/// Directories inside `~/.claude/` that should be excluded from indexing
+/// (noise: telemetry, debug logs, cache, binary snapshots, etc.).
+const CLAUDE_DIR_EXCLUDES: &[&str] = &[
+    "debug",
+    "shell-snapshots",
+    "paste-cache",
+    "cache",
+    "backups",
+    "plugins",
+    "session-env",
+    "statsig",
+    "telemetry",
+    "todos",
+    "downloads",
+    ".credentials.json",
+    "stats-cache.json",
+    "mcp-needs-auth-cache.json",
+];
 
 /// Scan all configured workspace paths and submit files for indexing.
+/// Also auto-discovers `~/.claude/` if it exists.
 pub fn scan_workspaces(
     config: &Config,
     file_tx: Sender<PathBuf>,
     project_roots: &DashMap<PathBuf, ProjectRoot>,
+    project_overrides: &DashMap<PathBuf, config::ProjectOverride>,
 ) {
     for workspace_path in &config.workspace.paths {
         let workspace = Path::new(workspace_path);
@@ -26,82 +48,218 @@ pub fn scan_workspaces(
         }
 
         info!(path = %workspace_path, "Scanning workspace");
+        scan_single_workspace(workspace, workspace_path, config, &file_tx, project_roots, project_overrides);
+    }
 
-        let mut builder = WalkBuilder::new(workspace);
-        builder.hidden(true); // Skip hidden files (but .gitignore is still read)
-        builder.git_ignore(true);
-        builder.git_global(true);
-        builder.git_exclude(true);
+    // Scan project-level .claude/ directories
+    let project_claude_dirs: Vec<(PathBuf, String)> = project_roots
+        .iter()
+        .filter_map(|entry| {
+            let claude_subdir = entry.key().join(".claude");
+            if claude_subdir.is_dir() {
+                Some((claude_subdir, entry.value().workspace_path.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
 
-        // Add custom exclude patterns
-        for pattern in &config.indexer.exclude_patterns {
-            builder.add_custom_ignore_filename(".pgmcpignore");
-            let mut override_builder = ignore::overrides::OverrideBuilder::new(workspace);
-            let _ = override_builder.add(&format!("!{}", pattern));
+    for (claude_subdir, workspace_path) in project_claude_dirs {
+        let subdir_str = claude_subdir.to_string_lossy().into_owned();
+        info!(path = %subdir_str, "Scanning project-level .claude/ directory");
+        scan_claude_dir(&claude_subdir, &workspace_path, config, &file_tx);
+    }
+
+    // Auto-discover ~/.claude/ if it exists
+    if let Some(claude_dir) = Config::claude_dir() {
+        let claude_path_str = claude_dir.to_string_lossy().into_owned();
+        info!(path = %claude_path_str, "Auto-discovered ~/.claude/ directory");
+
+        // Register as a synthetic project root (no .git/ needed)
+        project_roots.insert(
+            claude_dir.clone(),
+            ProjectRoot {
+                workspace_path: claude_path_str.clone(),
+                name: "claude".into(),
+            },
+        );
+
+        scan_claude_dir(&claude_dir, &claude_path_str, config, &file_tx);
+    }
+}
+
+/// Scan a single workspace directory.
+pub(crate) fn scan_single_workspace(
+    workspace: &Path,
+    workspace_path: &str,
+    config: &Config,
+    file_tx: &Sender<PathBuf>,
+    project_roots: &DashMap<PathBuf, ProjectRoot>,
+    project_overrides: &DashMap<PathBuf, config::ProjectOverride>,
+) {
+    // If the workspace path itself is hidden (starts with '.'), allow hidden files
+    let workspace_is_hidden = workspace
+        .file_name()
+        .map(|n| n.to_string_lossy().starts_with('.'))
+        .unwrap_or(false);
+
+    let mut builder = WalkBuilder::new(workspace);
+    builder.hidden(!workspace_is_hidden); // Skip hidden unless workspace is hidden
+    builder.git_ignore(true);
+    builder.git_global(true);
+    builder.git_exclude(true);
+
+    // Add custom exclude patterns
+    for pattern in &config.indexer.exclude_patterns {
+        builder.add_custom_ignore_filename(".pgmcpignore");
+        let mut override_builder = ignore::overrides::OverrideBuilder::new(workspace);
+        let _ = override_builder.add(&format!("!{}", pattern));
+    }
+
+    // Walk the directory tree
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "Error walking directory");
+                continue;
+            }
+        };
+
+        let path = entry.path();
+
+        // Detect project roots (directories with .git/)
+        if path.is_dir() {
+            if path.join(".git").is_dir() {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "unknown".into());
+
+                project_roots.insert(
+                    path.to_path_buf(),
+                    ProjectRoot {
+                        workspace_path: workspace_path.to_string(),
+                        name,
+                    },
+                );
+
+                // Load project override if .pgmcp.toml exists
+                if let Some(override_config) = config::ProjectOverride::load(path) {
+                    project_overrides.insert(path.to_path_buf(), override_config);
+                }
+
+                debug!(path = %path.display(), "Discovered project root");
+            }
+            continue;
         }
 
-        // Walk the directory tree
-        for entry in builder.build() {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    tracing::warn!(error = %e, "Error walking directory");
-                    continue;
-                }
-            };
+        // Skip non-files
+        if !path.is_file() {
+            continue;
+        }
 
-            let path = entry.path();
+        // Check if this file type is configured
+        if !config.indexer.is_configured_extension(path) {
+            continue;
+        }
 
-            // Detect project roots (directories with .git/)
-            if path.is_dir() {
-                if path.join(".git").is_dir() {
-                    let name = path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "unknown".into());
-
-                    project_roots.insert(
-                        path.to_path_buf(),
-                        ProjectRoot {
-                            workspace_path: workspace_path.clone(),
-                            name,
-                        },
-                    );
-                    debug!(path = %path.display(), "Discovered project root");
-                }
-                continue;
+        // Check exclude patterns
+        let path_str = path.to_string_lossy();
+        let excluded = config.indexer.exclude_patterns.iter().any(|pattern| {
+            if pattern.starts_with('*') {
+                path_str.ends_with(&pattern[1..])
+            } else {
+                path_str.contains(pattern)
             }
+        });
 
-            // Skip non-files
-            if !path.is_file() {
-                continue;
-            }
+        if excluded {
+            continue;
+        }
 
-            // Check if this file type is configured
-            if !config.indexer.is_configured_extension(path) {
-                continue;
-            }
-
-            // Check exclude patterns
-            let path_str = path.to_string_lossy();
-            let excluded = config.indexer.exclude_patterns.iter().any(|pattern| {
-                if pattern.starts_with('*') {
-                    path_str.ends_with(&pattern[1..])
-                } else {
-                    path_str.contains(pattern)
-                }
-            });
-
-            if excluded {
-                continue;
-            }
-
-            // Submit for indexing
-            if file_tx.send(path.to_path_buf()).is_err() {
-                break; // Channel closed
-            }
+        // Submit for indexing
+        if file_tx.send(path.to_path_buf()).is_err() {
+            break; // Channel closed
         }
     }
+}
+
+/// Scan `~/.claude/` with hardcoded noise excludes. Files are submitted directly
+/// without `.gitignore` since `~/.claude/` has no `.git/`.
+fn scan_claude_dir(
+    claude_dir: &Path,
+    workspace_path: &str,
+    config: &Config,
+    file_tx: &Sender<PathBuf>,
+) {
+    let mut builder = WalkBuilder::new(claude_dir);
+    builder.hidden(false); // Allow all files (the dir itself is hidden)
+    builder.git_ignore(false); // No .git/ in ~/.claude/
+    builder.git_global(false);
+    builder.git_exclude(false);
+
+    let mut count: u64 = 0;
+
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "Error walking ~/.claude/");
+                continue;
+            }
+        };
+
+        let path = entry.path();
+
+        if path.is_dir() {
+            continue;
+        }
+
+        if !path.is_file() {
+            continue;
+        }
+
+        // Apply hardcoded Claude dir excludes
+        let path_str = path.to_string_lossy();
+        let excluded = CLAUDE_DIR_EXCLUDES.iter().any(|excl| {
+            // Match as a path component or file name
+            let relative = path.strip_prefix(claude_dir).unwrap_or(path);
+            let rel_str = relative.to_string_lossy();
+            // Match directory component or exact file name
+            rel_str.starts_with(excl) || rel_str.starts_with(&format!("{}/", excl))
+                || relative.file_name().map(|f| f.to_string_lossy() == *excl).unwrap_or(false)
+        });
+
+        if excluded {
+            continue;
+        }
+
+        // Check configured extensions
+        if !config.indexer.is_configured_extension(path) {
+            continue;
+        }
+
+        // Apply global exclude patterns too
+        let global_excluded = config.indexer.exclude_patterns.iter().any(|pattern| {
+            if pattern.starts_with('*') {
+                path_str.ends_with(&pattern[1..])
+            } else {
+                path_str.contains(pattern)
+            }
+        });
+
+        if global_excluded {
+            continue;
+        }
+
+        if file_tx.send(path.to_path_buf()).is_err() {
+            break;
+        }
+        count += 1;
+    }
+
+    info!(files = count, path = %workspace_path, "Scanned ~/.claude/ directory");
 }
 
 /// Find the project root for a given file path.

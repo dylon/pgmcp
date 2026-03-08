@@ -14,7 +14,15 @@ use crate::config::EmbeddingsConfig;
 use crate::error::{PgmcpError, Result};
 use crate::stats::tracker::StatsTracker;
 
-/// A request to embed chunks and store them.
+/// Unified embedding request: either a file chunk or a git commit chunk.
+pub enum EmbedRequestKind {
+    /// File chunks with two-phase commit.
+    File(EmbedRequest),
+    /// Git commit chunks.
+    Commit(EmbedCommitRequest),
+}
+
+/// A request to embed file chunks and store them.
 pub struct EmbedRequest {
     /// File ID in the database.
     pub file_id: i64,
@@ -24,6 +32,16 @@ pub struct EmbedRequest {
     pub db_pool: sqlx::PgPool,
     /// Content hash to finalize after all chunks are inserted (two-phase commit).
     pub content_hash: i64,
+}
+
+/// A request to embed git commit chunks and store them.
+pub struct EmbedCommitRequest {
+    /// Commit ID in the database.
+    pub commit_id: i64,
+    /// Chunk data to embed.
+    pub chunks: Vec<ChunkData>,
+    /// Database pool for upserting.
+    pub db_pool: sqlx::PgPool,
 }
 
 /// Data for a single chunk to embed.
@@ -37,7 +55,7 @@ pub struct ChunkData {
 
 /// Dedicated embedding thread pool.
 pub struct EmbeddingPool {
-    tx: Sender<EmbedRequest>,
+    tx: Sender<EmbedRequestKind>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -50,7 +68,7 @@ impl EmbeddingPool {
     ) -> Result<Self> {
         let pool_size = config.pool_size;
         let batch_size = config.batch_size;
-        let (tx, rx) = bounded::<EmbedRequest>(batch_size * 2);
+        let (tx, rx) = bounded::<EmbedRequestKind>(batch_size * 2);
 
         // Capture the tokio runtime handle so embedding workers can run async DB queries.
         let rt_handle = tokio::runtime::Handle::current();
@@ -79,7 +97,7 @@ impl EmbeddingPool {
     }
 
     /// Get a sender for submitting embedding requests.
-    pub fn sender(&self) -> Sender<EmbedRequest> {
+    pub fn sender(&self) -> Sender<EmbedRequestKind> {
         self.tx.clone()
     }
 
@@ -100,7 +118,7 @@ impl EmbeddingPool {
 
 fn embedding_worker(
     id: usize,
-    rx: Receiver<EmbedRequest>,
+    rx: Receiver<EmbedRequestKind>,
     config: &EmbeddingsConfig,
     stats: &StatsTracker,
     shutdown: &AtomicBool,
@@ -132,57 +150,12 @@ fn embedding_worker(
 
         let start = std::time::Instant::now();
 
-        // Batch embed all chunks
-        let texts: Vec<&str> = request.chunks.iter().map(|c| c.content.as_str()).collect();
-
-        match model.embed(texts, None) {
-            Ok(embeddings) => {
-                let chunks = request.chunks;
-                let db_pool = request.db_pool;
-                let file_id = request.file_id;
-                let content_hash = request.content_hash;
-
-                rt.block_on(async {
-                    let mut all_chunks_ok = true;
-                    for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
-                        if let Err(e) = crate::db::queries::insert_chunk(
-                            &db_pool,
-                            file_id,
-                            chunk.chunk_index,
-                            &chunk.content,
-                            chunk.start_line,
-                            chunk.end_line,
-                            embedding,
-                        )
-                        .await
-                        {
-                            error!(
-                                file_id,
-                                chunk_index = chunk.chunk_index,
-                                error = %e,
-                                "Failed to insert chunk"
-                            );
-                            all_chunks_ok = false;
-                        }
-                    }
-
-                    // Two-phase commit: finalize hash only if all chunks succeeded
-                    if all_chunks_ok {
-                        if let Err(e) = crate::db::queries::finalize_file_hash(
-                            &db_pool, file_id, content_hash,
-                        ).await {
-                            error!(file_id, error = %e, "Failed to finalize content hash");
-                        }
-                    }
-                });
-
-                stats.chunks_embedded.fetch_add(
-                    chunks.len() as u64,
-                    Ordering::Relaxed,
-                );
+        match request {
+            EmbedRequestKind::File(file_req) => {
+                process_file_request(&model, file_req, stats, rt, id);
             }
-            Err(e) => {
-                error!(worker_id = id, error = %e, "Embedding batch failed");
+            EmbedRequestKind::Commit(commit_req) => {
+                process_commit_request(&model, commit_req, stats, rt, id);
             }
         }
 
@@ -193,4 +166,115 @@ fn embedding_worker(
     }
 
     debug!(worker_id = id, "Embedding worker exiting");
+}
+
+fn process_file_request(
+    model: &fastembed::TextEmbedding,
+    request: EmbedRequest,
+    stats: &StatsTracker,
+    rt: &tokio::runtime::Handle,
+    worker_id: usize,
+) {
+    let texts: Vec<&str> = request.chunks.iter().map(|c| c.content.as_str()).collect();
+
+    match model.embed(texts, None) {
+        Ok(embeddings) => {
+            let chunks = request.chunks;
+            let db_pool = request.db_pool;
+            let file_id = request.file_id;
+            let content_hash = request.content_hash;
+
+            rt.block_on(async {
+                let mut all_chunks_ok = true;
+                for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
+                    if let Err(e) = crate::db::queries::insert_chunk(
+                        &db_pool,
+                        file_id,
+                        chunk.chunk_index,
+                        &chunk.content,
+                        chunk.start_line,
+                        chunk.end_line,
+                        embedding,
+                    )
+                    .await
+                    {
+                        error!(
+                            file_id,
+                            chunk_index = chunk.chunk_index,
+                            error = %e,
+                            "Failed to insert chunk"
+                        );
+                        all_chunks_ok = false;
+                    }
+                }
+
+                if all_chunks_ok {
+                    if let Err(e) = crate::db::queries::finalize_file_hash(
+                        &db_pool, file_id, content_hash,
+                    ).await {
+                        error!(file_id, error = %e, "Failed to finalize content hash");
+                    }
+                }
+            });
+
+            stats.chunks_embedded.fetch_add(
+                chunks.len() as u64,
+                Ordering::Relaxed,
+            );
+            stats.embed_file_batches.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            error!(worker_id, error = %e, "File embedding batch failed");
+            stats.embed_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn process_commit_request(
+    model: &fastembed::TextEmbedding,
+    request: EmbedCommitRequest,
+    stats: &StatsTracker,
+    rt: &tokio::runtime::Handle,
+    worker_id: usize,
+) {
+    let texts: Vec<&str> = request.chunks.iter().map(|c| c.content.as_str()).collect();
+
+    match model.embed(texts, None) {
+        Ok(embeddings) => {
+            let chunks = request.chunks;
+            let db_pool = request.db_pool;
+            let commit_id = request.commit_id;
+
+            rt.block_on(async {
+                for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
+                    if let Err(e) = crate::db::queries::insert_git_commit_chunk(
+                        &db_pool,
+                        commit_id,
+                        chunk.chunk_index,
+                        &chunk.content,
+                        embedding,
+                    )
+                    .await
+                    {
+                        error!(
+                            commit_id,
+                            chunk_index = chunk.chunk_index,
+                            error = %e,
+                            "Failed to insert commit chunk"
+                        );
+                    }
+                }
+            });
+
+            stats.chunks_embedded.fetch_add(
+                chunks.len() as u64,
+                Ordering::Relaxed,
+            );
+            stats.embed_commit_batches.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            error!(worker_id, error = %e, "Commit embedding batch failed");
+            stats.embed_errors.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }

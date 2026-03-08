@@ -3,7 +3,7 @@
 ### A high-performance PostgreSQL + pgvector MCP file indexer for Claude Code
 
 pgmcp continuously indexes your source code into PostgreSQL with vector
-embeddings, full-text search indices, and content hashing -- then exposes it all
+embeddings, full-text search indices, and content hashing — then exposes it all
 through the [Model Context Protocol](https://modelcontextprotocol.io/) so Claude
 Code can search, read, and reason over your entire codebase at machine speed.
 
@@ -18,87 +18,98 @@ optimizer, so pgmcp stays responsive whether you have 50 files or 500,000.
 
 ## Features
 
-- **Semantic search** -- vector embeddings via [fastembed](https://github.com/Anush008/fastembed-rs) (all-MiniLM-L6-v2, 384 dimensions)
-- **Full-text search** -- PostgreSQL `tsvector`/`tsquery` with GIN index and TF-IDF ranking
-- **Regex grep** -- server-side `~` operator across indexed file contents
-- **Real-time file watching** -- `notify` crate with debounced event processing
-- **Adaptive thread pool** -- hill-climbing autoscaler with exponential moving averages
-- **Lock-free reactive pipeline** -- crossbeam channels for zero-mutex data flow
-- **Two-phase commit** -- atomic indexing with content hash finalization
-- **Incremental indexing** -- xxHash3 content hashing skips unchanged files
-- **Streamable HTTP transport** -- multi-client daemon mode for shared team indexing
-- **Prometheus metrics** -- `/metrics` endpoint + `pgmcp stats` CLI
-- **systemd integration** -- `sd-notify` ready/stopping protocol
-- **15 file types** -- Rust, Python, TypeScript, JavaScript, Rholang, MeTTa, Prolog, Markdown, TOML, JSON, YAML, and more
-- **Per-project overrides** -- `.pgmcp.toml` in project roots for custom exclusions and file types
-- **CUDA acceleration** -- optional GPU-accelerated embeddings via ONNX Runtime
-- **Auto-RAG context injection** -- `SessionStart` hook injects project context; `UserPromptSubmit` hook injects semantically relevant code snippets on every prompt
-- **REST API** -- `POST /api/search` and `GET /api/context` endpoints alongside the MCP server (daemon mode)
+- **Semantic search** — vector embeddings via [fastembed](https://github.com/Anush008/fastembed-rs) (all-MiniLM-L6-v2, 384 dimensions)
+- **Full-text search** — PostgreSQL `tsvector`/`tsquery` with GIN index and TF-IDF ranking
+- **Regex grep** — server-side `~` operator across indexed file contents
+- **Real-time file watching** — `notify` crate with debounced event processing
+- **Adaptive thread pool** — hill-climbing autoscaler with exponential moving averages
+- **Lock-free reactive pipeline** — crossbeam channels for zero-mutex data flow
+- **Two-phase commit** — atomic indexing with content hash finalization
+- **Incremental indexing** — xxHash3 content hashing skips unchanged files
+- **Streamable HTTP transport** — multi-client daemon mode for shared team indexing
+- **Prometheus metrics** — `/metrics` endpoint + `pgmcp stats` CLI
+- **systemd integration** — `sd-notify` ready/stopping protocol
+- **17 file types** — Rust, Python, TypeScript, JavaScript, Rholang, MeTTa, Prolog, Shell, JSONL, Markdown, TOML, JSON, YAML, and more
+- **Per-project overrides** — `.pgmcp.toml` in project roots for custom exclusions and file types
+- **CUDA acceleration** — optional GPU-accelerated embeddings via ONNX Runtime
+- **Auto-RAG context injection** — `SessionStart` hook injects project context; `UserPromptSubmit` hook injects semantically relevant code snippets on every prompt
+- **REST API** — `POST /api/search` and `GET /api/context` endpoints alongside the MCP server (daemon mode)
+- **`~/.claude/` auto-indexing** — automatically discovers and indexes `~/.claude/` as a synthetic "claude" project with noise filtering
+- **Project-level `.claude/` indexing** — scans each project's `.claude/` subdirectory (memory files, plans, session transcripts) attributed to the parent project
+- **Claude session transcript parsing** — extracts user, assistant, and tool-result messages from Claude JSONL session files
+- **Git history indexing** — per-project opt-in via `.pgmcp.toml`; indexes commit messages and diffs with vector embeddings
+- **Git blame metadata** — tracks blame commit, author, and date on file chunks
+- **HNSW tuning** — configurable `m`, `ef_construction`, and `ef_search` parameters via `[vector]` config section
+- **Config lifecycle** — `pgmcp upgrade-configs` upgrades global config + all indexed project configs; `pgmcp init-project` / `pgmcp upgrade-project` for individual `.pgmcp.toml`
 
 ---
 
 ## Architecture Overview
 
 ```
-                          ┌─────────────────────────────────────────────────────────┐
-                          │                     pgmcp daemon                        │
-                          │                                                         │
-  ┌──────────┐   notify   │  ┌─────────┐  filter ┌──────────┐  debounce             │
-  │  File    ├───events──▶│  │ Watcher ├────────▶│  Event   ├──────────┐            │
-  │  System  │            │  └─────────┘         │  Filter  │          │            │
-  └──────────┘            │                      └──────────┘          │            │
-                          │                                            ▼            │
-                          │  ┌───────────────────────────────────────────────┐      │
-                          │  │            WorkPool (adaptive)                │      │
-                          │  │                                               │      │
-  ┌──────────┐   scan     │  │  ┌─────────┐                                  │      │
-  │ Scanner  ├──(LOW)────▶│  │  │ Worker  │◀── HIGH priority (live events)   │      │
-  │ (bulk)   │            │  │  │  0..N   │                                  │      │
-  └──────────┘            │  │  └────┬────┘◀── LOW priority (scan)           │      │
-                          │  │       │                                       │      │
-                          │  │       │  ┌──────────────────────┐             │      │
-                          │  │       │  │  Scaling Monitor     │             │      │
-                          │  │       │  │  J(N) = objective    │             │      │
-                          │  │       │  │  ±1 hill climber     │             │      │
-                          │  │       │  └──────────────────────┘             │      │
-                          │  └───────┊───────────────────────────────────────┘      │
-                          │          │ process_file                                 │
-                          │          ▼                                              │
-                          │  ┌──────────────┐    ┌──────────────────┐               │
-                          │  │   Chunker    ├───▶│ Embedding Pool   │               │
-                          │  │ (50-line     │    │ (dedicated       │               │
-                          │  │  windows)    │    │  threads, each   │               │
-                          │  └──────────────┘    │  owns a model)   │               │
-                          │                      └────────┬─────────┘               │
-                          │                               │                         │
-                          │                               ▼                         │
-                          │                      ┌──────────────────┐               │
-                          │                      │   PostgreSQL     │               │
-                          │                      │  + pgvector      │               │
-                          │                      │                  │               │
-                          │                      │  projects        │               │
-                          │                      │  indexed_files   │               │
-                          │                      │  file_chunks     │               │
-                          │                      └────────┬─────────┘               │
-                          │                               │                         │
-                          │          ┌────────────────────┘                         │
-                          │          ▼                                              │
-                          │  ┌──────────────────┐   ┌──────────────────┐            │
-                          │  │    MCP Server    │   │    REST API      │            │
-                          │  │  (rmcp v1.1)     │   │  /api/search     │            │
-                          │  │   at /mcp        │   │  /api/context    │            │
-                          │  └───────┬──────────┘   └────────┬─────────┘            │
-                          │          │                       │                      │
-                          └──────────┊───────────────────────┊──────────────────────┘
+                          ┌────────────────────────────────────────────────────┐
+                          │                     pgmcp daemon                   │
+                          │                                                    │
+  ┌──────────┐   notify   │  ┌─────────┐  filter ┌──────────┐  debounce        │
+  │  File    ├───events──▶│  │ Watcher ├────────▶│  Event   ├──────────┐       │
+  │  System  │            │  └─────────┘         │  Filter  │          │       │
+  └──────────┘            │                      └──────────┘          │       │
+                          │                                            ▼       │
+                          │  ┌─────────────────────────────────────────────┐   │
+                          │  │            WorkPool (adaptive)              │   │
+                          │  │                                             │   │
+  ┌──────────┐   scan     │  │  ┌─────────┐                                │   │
+  │ Scanner  ├───(LOW)───▶│  │  │ Worker  │◀── HIGH priority (live events) │   │
+  │ (bulk)   │            │  │  │  0..N   │                                │   │
+  └──────────┘            │  │  └────┬────┴◀── LOW priority (scan)         │   │
+                          │  │       │                                     │   │
+                          │  │       │  ┌──────────────────────┐           │   │
+                          │  │       │  │  Scaling Monitor     │           │   │
+                          │  │       │  │  J(N) = objective    │           │   │
+                          │  │       │  │  ±1 hill climber     │           │   │
+                          │  │       │  └──────────────────────┘           │   │
+                          │  └───────┊─────────────────────────────────────┘   │
+                          │          │ process_file                            │
+                          │          ▼                                         │
+                          │  ┌──────────────┐    ┌──────────────────┐          │
+                          │  │   Chunker    ├───▶│ Embedding Pool   │          │
+                          │  │ (50-line     │    │ (dedicated       │          │
+                          │  │  windows)    │    │  threads, each   │          │
+                          │  └──────────────┘    │  owns a model)   │          │
+                          │                      └────────┬─────────┘          │
+                          │                               │                    │
+                          │                               ▼                    │
+                          │                      ┌──────────────────┐          │
+                          │                      │   PostgreSQL     │          │
+                          │                      │  + pgvector      │          │
+                          │                      │                  │          │
+                          │                      │  projects        │          │
+                          │                      │  indexed_files   │          │
+                          │                      │  file_chunks     │          │
+                          │                      │  git_commits     │          │
+                          │                      │  git_commit_     │          │
+                          │                      │    chunks        │          │
+                          │                      │  pgmcp_metadata  │          │
+                          │                      └────────┬─────────┘          │
+                          │                               │                    │
+                          │          ┌────────────────────┘                    │
+                          │          ▼                                         │
+                          │  ┌──────────────────┐   ┌──────────────────┐       │
+                          │  │    MCP Server    │   │    REST API      │       │
+                          │  │  (rmcp v1.1)     │   │  /api/search     │       │
+                          │  │   at /mcp        │   │  /api/context    │       │
+                          │  └───────┬──────────┘   └────────┬─────────┘       │
+                          │          │                       │                 │
+                          └──────────┊───────────────────────┊─────────────────┘
                                      │                       │
                ┌─────────────────────┼─────────────────┬─────┘
                │                     │                 │
                ▼                     ▼                 ▼
       ┌────────────────┐   ┌────────────────┐  ┌──────────────────────┐
       │  Claude Code   │   │  Claude Code   │  │  Claude Code Hooks   │
-      │  (stdio)       │   │  (HTTP/MCP)    │  │  SessionStart →      │
+      │  (stdio)       │   │  (HTTP/MCP)    │  │  SessionStart ->     │
       └────────────────┘   └────────────────┘  │    pgmcp context CLI │
-                                               │  UserPromptSubmit →  │
+                                               │  UserPromptSubmit -> │
                                                │    /api/search HTTP  │
                                                └──────────────────────┘
 ```
@@ -108,13 +119,13 @@ optimizer, so pgmcp stays responsive whether you have 50 files or 500,000.
 1. **File system events** flow through the watcher, get filtered by extension and
    exclusion patterns, then debounced by path (default 300ms)
 2. **Debounced events** are dispatched at **HIGH** priority to the adaptive WorkPool
-3. **Bulk scan** paths enter at **LOW** priority -- live edits always take precedence
+3. **Bulk scan** paths enter at **LOW** priority — live edits always take precedence
 4. **Workers** read the file, compute xxHash3, check the DB for changes, chunk the
    content into overlapping windows, and submit chunks to the embedding pool
 5. **Embedding workers** (each owning its own model instance) batch-embed chunks and
    upsert them with their vectors into PostgreSQL
 6. **Two-phase commit:** the file's `content_hash` is set to `NULL` during
-   processing and only finalized after all chunks succeed -- crash-safe by design
+   processing and only finalized after all chunks succeed — crash-safe by design
 7. **MCP clients** query the index via semantic search, text search, grep, or
    direct file read over stdio or Streamable HTTP
 
@@ -158,7 +169,7 @@ partial state persists.
 
 pgmcp provides three complementary search strategies:
 
-**Semantic Search** -- finds conceptually related code even when terminology differs.
+**Semantic Search** — finds conceptually related code even when terminology differs.
 The query is embedded into the same 384-dimensional vector space, then ranked by
 cosine similarity via pgvector's HNSW index:
 
@@ -166,7 +177,7 @@ cosine similarity via pgvector's HNSW index:
 score(q, c) = 1 − cosine_distance(embed(q), embed(c))
 ```
 
-**Text Search** -- leverages PostgreSQL's mature full-text search engine. The query
+**Text Search** — leverages PostgreSQL's mature full-text search engine. The query
 is parsed into a `tsquery`, matched against pre-built `tsvector` GIN indices, and
 ranked by TF-IDF:
 
@@ -174,9 +185,88 @@ ranked by TF-IDF:
 rank = ts_rank(to_tsvector('english', content), plainto_tsquery('english', query))
 ```
 
-**Grep** -- server-side regex matching via PostgreSQL's `~` operator. Supports
+**Grep** — server-side regex matching via PostgreSQL's `~` operator. Supports
 optional glob-based file filtering. Best for precise pattern matching when you know
 exactly what you're looking for.
+
+---
+
+## Claude Context Indexing
+
+pgmcp automatically discovers and indexes Claude Code metadata to make session
+history, memory files, and plans searchable alongside your source code.
+
+### Global `~/.claude/` Auto-Discovery
+
+On startup, pgmcp checks whether `~/.claude/` exists and, if so, registers it as
+a synthetic **"claude"** project. All indexable files within are scanned and indexed
+just like any workspace project. This includes:
+
+- Memory files (`CLAUDE.md`, project memory files)
+- Plans and design documents
+- Session transcript JSONL files (`projects/*/` session logs)
+- Hook scripts and configuration files
+
+A hardcoded `CLAUDE_DIR_EXCLUDES` list filters out noise directories that contain
+telemetry, debug logs, cache, binary snapshots, and other non-textual data:
+
+```
+debug, shell-snapshots, paste-cache, cache, backups, plugins,
+session-env, statsig, telemetry, todos, downloads,
+.credentials.json, stats-cache.json, mcp-needs-auth-cache.json
+```
+
+### Project-Level `.claude/` Scanning
+
+For each discovered project, pgmcp also scans its `.claude/` subdirectory (if
+present). Files found there — memory files, plans, session transcripts — are
+indexed as part of the parent project, so searches against that project include
+its Claude Code context.
+
+### Claude JSONL Session Transcript Parsing
+
+Claude Code session transcripts are stored as JSONL files. pgmcp includes a
+dedicated parser (`claude_chunker`) that extracts meaningful messages from these
+files:
+
+- **User messages** — the prompts you sent
+- **Assistant messages** — Claude's responses (text content)
+- **Tool results** — output from tool calls
+
+Each extracted message becomes a separate chunk with its own embedding, making
+session history semantically searchable. Generic (non-Claude) JSONL files are
+chunked one line per chunk.
+
+---
+
+## Git History Indexing
+
+pgmcp can index git commit history (messages and diffs) for projects that opt in,
+making your project's development history searchable via vector embeddings.
+
+### Enabling
+
+Add a `.pgmcp.toml` file to your project root (or use `pgmcp init-project`):
+
+```toml
+[git]
+index_history = true
+```
+
+### How It Works
+
+- **Incremental indexing** — pgmcp tracks the last-indexed commit SHA per project
+  in the `pgmcp_metadata` table. Only new commits since the last run are processed.
+- **Commit extraction** — for each new commit, the subject, body, author, date,
+  and full diff are extracted via `git log`.
+- **Chunking and embedding** — commit content (message + diff) is chunked and
+  embedded into the same vector space as file chunks, stored in `git_commits` and
+  `git_commit_chunks` tables.
+- **Blame metadata** — file chunks are annotated with `blame_commit`,
+  `blame_author`, and `blame_date` columns, linking code to the commit that last
+  touched it.
+- **Cron job** — the `git-history-index` job runs every hour by default
+  (configurable via `git_history_index_interval_secs` in the `[cron]` section).
 
 ---
 
@@ -193,14 +283,14 @@ Each metric is smoothed with an EMA to filter noise:
 ēₜ = α · xₜ + (1 − α) · ēₜ₋₁
 ```
 
-where α = 0.15 (half-life ~ 4.3 samples at 200ms intervals ~ 860ms).
+where α = 0.15 (half-life ≈ 4.3 samples at 200ms intervals ≈ 860ms).
 
 ### Objective Function
 
 The scaling monitor minimizes:
 
 ```
-J(N) = −w_tp · ēma(throughput) + w_qd · ēma(queue_depth)
+J(N) = −w_tp · ema(throughput) + w_qd · ema(queue_depth)
 ```
 
 | Weight | Default | Effect                             |
@@ -261,23 +351,40 @@ stabilize before measuring again.
 │ last_scanned_at TZ │       │ size_bytes    BIGINT   │       │ end_line   INTEGER   │
 └────────────────────┘       │ content       TEXT     │       │ embedding  vector    │
                              │ content_hash  BIGINT   │       │            (384)     │
-                             │ line_count    INTEGER  │       └──────────────────────┘
-                             │ truncated     BOOLEAN  │        UNIQUE(file_id, chunk_index)
-                             │ indexed_at    TZ       │
-                             │ modified_at   TZ       │
-                             └────────────────────────┘
+                             │ line_count    INTEGER  │       │ blame_commit  TEXT   │
+                             │ truncated     BOOLEAN  │       │ blame_author  TEXT   │
+                             │ indexed_at    TZ       │       │ blame_date    TZ     │
+                             │ modified_at   TZ       │       └──────────────────────┘
+                             └────────────────────────┘        UNIQUE(file_id, chunk_index)
+
+┌────────────────────┐       ┌────────────────────────┐       ┌──────────────────────┐
+│   git_commits      │       │  git_commit_chunks     │       │  pgmcp_metadata      │
+├────────────────────┤       ├────────────────────────┤       ├──────────────────────┤
+│ id       BIGSERIAL │──┐    │ id        BIGSERIAL    │       │ key    TEXT (PK)     │
+│ project_id INTEGER │  │    │ commit_id BIGINT       │       │ value  TEXT          │
+│ commit_hash  TEXT  │  └───▶│ chunk_index INTEGER    │       └──────────────────────┘
+│ author       TEXT  │       │ content   TEXT         │
+│ author_date  TZ    │       │ embedding vector(384)  │
+│ subject      TEXT  │       └────────────────────────┘
+│ body         TEXT  │        UNIQUE(commit_id, chunk_index)
+└────────────────────┘
+ UNIQUE(project_id, commit_hash)
 ```
 
 **Indices:**
 
-| Index                    | Type                             | Purpose                               |
-|--------------------------|----------------------------------|---------------------------------------|
-| `idx_chunks_embedding`   | HNSW (m=24, ef_construction=200) | Cosine similarity for semantic search |
-| `idx_files_fts`          | GIN (tsvector)                   | Full-text search on file content      |
-| `idx_files_path_trgm`    | GIN (pg_trgm)                    | Trigram similarity for path matching  |
-| `idx_files_content_hash` | B-tree                           | Fast skip-if-unchanged lookups        |
-| `idx_files_project`      | B-tree                           | Filter files by project               |
-| `idx_files_language`     | B-tree                           | Filter files by language              |
+| Index                             | Type                             | Purpose                                   |
+|-----------------------------------|----------------------------------|-------------------------------------------|
+| `idx_chunks_embedding`            | HNSW (m=24, ef_construction=200) | Cosine similarity for semantic search     |
+| `idx_git_commit_chunks_embedding` | HNSW (m=24, ef_construction=200) | Cosine similarity for git commit searches |
+| `idx_files_fts`                   | GIN (tsvector)                   | Full-text search on file content          |
+| `idx_files_path_trgm`             | GIN (pg_trgm)                    | Trigram similarity for path matching      |
+| `idx_files_content_hash`          | B-tree                           | Fast skip-if-unchanged lookups            |
+| `idx_files_project`               | B-tree                           | Filter files by project                   |
+| `idx_files_language`              | B-tree                           | Filter files by language                  |
+| `idx_git_commits_project`         | B-tree                           | Filter git commits by project             |
+| `idx_git_commits_hash`            | B-tree                           | Lookup git commits by hash                |
+| `idx_git_commit_chunks_commit`    | B-tree                           | Filter git commit chunks by commit        |
 
 ---
 
@@ -319,7 +426,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 CREATE EXTENSION IF NOT EXISTS pg_trgm;
 ```
 
-pgmcp runs migrations automatically on startup -- the extensions just need to exist.
+pgmcp runs migrations automatically on startup — the extensions just need to exist.
 
 ---
 
@@ -360,7 +467,7 @@ language = "rust"
 extension = "py"
 language = "python"
 
-# ... 15 file types configured by default
+# ... 17 file types configured by default
 
 [indexer]
 exclude_patterns = ["node_modules", "target", ".git", "__pycache__", "*.lock"]
@@ -382,6 +489,11 @@ chunk_overlap_lines = 10
 batch_size = 32
 pool_size = 2
 use_gpu = false
+
+[vector]
+hnsw_m = 24
+hnsw_ef_construction = 200
+ef_search = 100
 
 [mcp]
 transport = "stdio"
@@ -409,6 +521,7 @@ stale_cleanup_interval_secs = 3600
 integrity_check_interval_secs = 86400
 stats_aggregation_interval_secs = 60
 db_maintenance_interval_secs = 604800
+git_history_index_interval_secs = 3600
 ```
 
 ### Configuration Reference
@@ -432,6 +545,9 @@ db_maintenance_interval_secs = 604800
 | `embeddings` | `batch_size`                      | `32`                                | Embedding batch size                                       |
 | `embeddings` | `pool_size`                       | `2`                                 | Dedicated embedding threads                                |
 | `embeddings` | `use_gpu`                         | `false`                             | Enable CUDA (requires `cuda` feature)                      |
+| `vector`     | `hnsw_m`                          | `24`                                | HNSW max bi-directional links per node                     |
+| `vector`     | `hnsw_ef_construction`            | `200`                               | HNSW candidate list size during construction               |
+| `vector`     | `ef_search`                       | `100`                               | HNSW candidate list size during search                     |
 | `mcp`        | `transport`                       | `stdio`                             | Transport mode                                             |
 | `mcp`        | `host`                            | `127.0.0.1`                         | Daemon bind address                                        |
 | `mcp`        | `port`                            | `3100`                              | Daemon port                                                |
@@ -446,6 +562,38 @@ db_maintenance_interval_secs = 604800
 | `cron`       | `integrity_check_interval_secs`   | `86400`                             | Interval to clean up incomplete indexing                   |
 | `cron`       | `stats_aggregation_interval_secs` | `60`                                | Interval to refresh stats counters                         |
 | `cron`       | `db_maintenance_interval_secs`    | `604800`                            | Interval for VACUUM ANALYZE                                |
+| `cron`       | `git_history_index_interval_secs` | `3600`                              | Interval for git history indexing                          |
+
+### Per-Project Configuration (`.pgmcp.toml`)
+
+Each project can have a `.pgmcp.toml` file in its root directory to override
+global settings and enable project-specific features.
+
+**Supported sections:**
+
+- **`[indexer]`** — override `exclude_patterns`, `file_types`, and
+  `max_file_size_bytes` for this project only
+- **`[git]`** — enable git history indexing for this project
+
+**Example `.pgmcp.toml`:**
+
+```toml
+[indexer]
+exclude_patterns = ["vendor", "dist"]
+max_file_size_bytes = 2097152
+
+[git]
+index_history = true
+```
+
+**Managing `.pgmcp.toml`:**
+
+```bash
+pgmcp init-project              # Create .pgmcp.toml in $PWD
+pgmcp init-project --cwd DIR    # Create .pgmcp.toml in DIR
+pgmcp upgrade-project           # Merge new defaults into existing .pgmcp.toml
+pgmcp upgrade-project --cwd DIR # Merge new defaults in DIR
+```
 
 ### Environment Variables
 
@@ -461,13 +609,20 @@ db_maintenance_interval_secs = 604800
 ### CLI Commands
 
 ```bash
-pgmcp init       # Generate default config at ~/.config/pgmcp/config.toml
-pgmcp serve      # Run in foreground (stdout logging, stdio MCP transport)
-pgmcp daemon     # Run as daemon (file logging, HTTP MCP transport, sd-notify)
-pgmcp stats      # Print statistics from the database
-pgmcp reindex    # Clear the index and restart to re-index everything
-pgmcp context    # Print project context for current directory (for hooks)
+pgmcp init              # Generate default config at ~/.config/pgmcp/config.toml
+pgmcp upgrade-configs        # Upgrade global config + all indexed project configs
+pgmcp upgrade-configs -i     # Same, but prompt before each project config
+pgmcp serve             # Run in foreground (stdout logging, stdio MCP transport)
+pgmcp daemon            # Run as daemon (file logging, HTTP MCP transport, sd-notify)
+pgmcp stats             # Print statistics from the database
+pgmcp reindex           # Clear the index and restart to re-index everything
+pgmcp context           # Print project context for current directory (for hooks)
+pgmcp init-project      # Create .pgmcp.toml in current project directory
+pgmcp upgrade-project   # Merge new .pgmcp.toml defaults into existing one
 ```
+
+Both `init-project` and `upgrade-project` accept `--cwd DIR` to specify the
+project directory (defaults to `$PWD`).
 
 #### `pgmcp context`
 
@@ -475,10 +630,10 @@ Prints a markdown summary of the project matching the current working directory,
 including file count, language breakdown, and file tree. Designed to be called by
 Claude Code hooks to inject project context automatically.
 
-| Flag      | Default  | Description                                       |
-|-----------|----------|---------------------------------------------------|
-| `--cwd`   | `$PWD`   | Working directory to find project for              |
-| `--depth` | `3`      | Maximum depth for file tree                        |
+| Flag      | Default | Description                           |
+|-----------|---------|---------------------------------------|
+| `--cwd`   | `$PWD`  | Working directory to find project for |
+| `--depth` | `3`     | Maximum depth for file tree           |
 
 ### Running as a Daemon
 
@@ -520,7 +675,7 @@ HTTP at `/mcp`.
 
 ### Configuring Claude Code CLI
 
-#### HTTP Transport (daemon mode -- recommended)
+#### HTTP Transport (daemon mode — recommended)
 
 ```bash
 claude mcp add --transport http pgmcp http://localhost:3100/mcp
@@ -539,7 +694,7 @@ Or add to `.mcp.json` in your project root:
 }
 ```
 
-#### stdio Transport (foreground mode -- debugging)
+#### stdio Transport (foreground mode — debugging)
 
 ```bash
 claude mcp add --transport stdio pgmcp /usr/local/bin/pgmcp serve
@@ -555,7 +710,7 @@ claude mcp list
 ### Auto-RAG: Claude Code Hooks
 
 pgmcp can automatically inject relevant context into every Claude Code session
-and prompt via two hooks. No manual tool calls needed -- Claude sees project
+and prompt via two hooks. No manual tool calls needed — Claude sees project
 structure on session start and semantically relevant code on every prompt.
 
 #### SessionStart Hook
@@ -614,7 +769,7 @@ executable (`chmod +x`):
 
 ```bash
 #!/bin/bash
-# pgmcp RAG hook — injects relevant indexed code into Claude's context
+# pgmcp RAG hook -- injects relevant indexed code into Claude's context
 # Reads user prompt from stdin JSON, queries pgmcp daemon for relevant snippets
 
 set -e
@@ -652,7 +807,7 @@ Requires `jq` and `curl` on the system PATH.
 
 In daemon mode, pgmcp exposes two REST API endpoints alongside the MCP server.
 
-#### `POST /api/search` -- Semantic Search
+#### `POST /api/search` — Semantic Search
 
 Search indexed files by conceptual similarity.
 
@@ -692,7 +847,7 @@ curl -s http://localhost:3100/api/search \
   -d '{"query": "database connection pool", "limit": 3}'
 ```
 
-#### `GET /api/context` -- Project Context
+#### `GET /api/context` — Project Context
 
 Retrieve project context for a given working directory.
 
@@ -700,7 +855,7 @@ Retrieve project context for a given working directory.
 
 | Parameter | Required | Default | Description                           |
 |-----------|----------|---------|---------------------------------------|
-| `cwd`     | Yes      | --      | Working directory to find project for |
+| `cwd`     | Yes      | —       | Working directory to find project for |
 | `depth`   | No       | `3`     | Maximum depth for file tree           |
 
 **Response (project found):**
@@ -837,14 +992,15 @@ Prints a summary of indexed files, projects, chunks, and bytes from the database
 
 ## Maintenance Jobs
 
-pgmcp runs four automated maintenance jobs via a lock-free cron state machine:
+pgmcp runs five automated maintenance jobs via a lock-free cron state machine:
 
-| Job                 | Default Interval | Description                                                              |
-|---------------------|------------------|--------------------------------------------------------------------------|
-| `stale-cleanup`     | 1 hour           | Remove files from the index that no longer exist on disk                 |
-| `integrity-check`   | 24 hours         | Delete files with `NULL` content_hash (incomplete indexing from crashes) |
-| `stats-aggregation` | 60 seconds       | Refresh in-memory statistics counters from the database                  |
-| `db-maintenance`    | 7 days           | Run `VACUUM ANALYZE` on `indexed_files` and `file_chunks`                |
+| Job                   | Default Interval | Description                                                              |
+|-----------------------|------------------|--------------------------------------------------------------------------|
+| `stale-cleanup`       | 1 hour           | Remove files from the index that no longer exist on disk                 |
+| `integrity-check`     | 24 hours         | Delete files with `NULL` content_hash (incomplete indexing from crashes) |
+| `stats-aggregation`   | 60 seconds       | Refresh in-memory statistics counters from the database                  |
+| `db-maintenance`      | 7 days           | Run `VACUUM ANALYZE` on `indexed_files` and `file_chunks`                |
+| `git-history-index`   | 1 hour           | Incrementally index git commit history for opted-in projects             |
 
 All intervals are configurable in the `[cron]` section of the config file.
 
@@ -853,7 +1009,7 @@ All intervals are configurable in the `[cron]` section of the config file.
 ## Testing
 
 ```bash
-# Unit tests + property-based tests (61 tests, no external dependencies)
+# Unit tests + property-based tests (88 tests: 72 unit + 16 proptest, no external dependencies)
 cargo test --bin pgmcp
 
 # Integration tests (requires Docker with PostgreSQL + pgvector)

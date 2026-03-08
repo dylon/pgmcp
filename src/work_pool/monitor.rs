@@ -83,6 +83,7 @@ pub fn run_scaling_monitor(
                     actual,
                     "Scaling monitor: unpark"
                 );
+                stats.work_pool_scale_ups.fetch_add(1, Ordering::Relaxed);
             }
             ScaleAction::Park => {
                 let actual = pool.park_n(decision.count);
@@ -91,6 +92,7 @@ pub fn run_scaling_monitor(
                     actual,
                     "Scaling monitor: park"
                 );
+                stats.work_pool_scale_downs.fetch_add(1, Ordering::Relaxed);
             }
             ScaleAction::Hold => {}
         }
@@ -102,5 +104,8 @@ pub fn run_scaling_monitor(
         stats
             .work_pool_queue_depth
             .store(pool.queue_depth() as u64, Ordering::Relaxed);
+        stats
+            .work_pool_tasks_completed
+            .store(completed, Ordering::Relaxed);
     }
 }

@@ -98,6 +98,63 @@ pub async fn run_migrations(pool: &PgPool, vector_config: &VectorConfig) -> Resu
     // Drop and recreate if the index params have changed (m, ef_construction).
     ensure_hnsw_index(pool, vector_config).await?;
 
+    // ================================================================
+    // Git history tables
+    // ================================================================
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS git_commits (
+            id BIGSERIAL PRIMARY KEY,
+            project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            commit_hash TEXT NOT NULL,
+            author TEXT NOT NULL,
+            author_date TIMESTAMPTZ NOT NULL,
+            subject TEXT NOT NULL,
+            body TEXT,
+            UNIQUE (project_id, commit_hash)
+        )"
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS git_commit_chunks (
+            id BIGSERIAL PRIMARY KEY,
+            commit_id BIGINT REFERENCES git_commits(id) ON DELETE CASCADE,
+            chunk_index INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            embedding vector(384) NOT NULL,
+            UNIQUE (commit_id, chunk_index)
+        )"
+    )
+    .execute(pool)
+    .await?;
+
+    // Blame metadata on file_chunks (idempotent ALTER)
+    let _ = sqlx::query("ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS blame_commit TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS blame_author TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS blame_date TIMESTAMPTZ")
+        .execute(pool)
+        .await;
+
+    // Indexes for git tables
+    let git_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_git_commits_project ON git_commits(project_id)",
+        "CREATE INDEX IF NOT EXISTS idx_git_commits_hash ON git_commits(commit_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_git_commit_chunks_commit ON git_commit_chunks(commit_id)",
+    ];
+
+    for idx_sql in &git_indexes {
+        sqlx::query(idx_sql).execute(pool).await?;
+    }
+
+    // HNSW index for git commit chunk embeddings
+    ensure_git_commit_hnsw_index(pool, vector_config).await?;
+
     Ok(())
 }
 
@@ -155,6 +212,44 @@ async fn ensure_hnsw_index(pool: &PgPool, config: &VectorConfig) -> Result<(), s
             hnsw_ef_construction = config.hnsw_ef_construction,
             "HNSW index created/rebuilt with updated parameters"
         );
+    }
+
+    Ok(())
+}
+
+/// Ensure HNSW index on git_commit_chunks embeddings.
+async fn ensure_git_commit_hnsw_index(pool: &PgPool, config: &VectorConfig) -> Result<(), sqlx::Error> {
+    let current_params = format!("m={},ef_construction={}", config.hnsw_m, config.hnsw_ef_construction);
+
+    let stored: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'git_hnsw_params'"
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let needs_rebuild = stored.as_deref() != Some(&current_params);
+
+    if needs_rebuild {
+        let _ = sqlx::query("DROP INDEX IF EXISTS idx_git_commit_chunks_embedding")
+            .execute(pool)
+            .await;
+
+        let create_sql = format!(
+            "CREATE INDEX idx_git_commit_chunks_embedding ON git_commit_chunks \
+             USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
+            config.hnsw_m, config.hnsw_ef_construction
+        );
+        let _ = sqlx::query(&create_sql).execute(pool).await;
+
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value) VALUES ('git_hnsw_params', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+        )
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+
+        tracing::info!("Git commit chunks HNSW index created/rebuilt");
     }
 
     Ok(())

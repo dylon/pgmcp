@@ -13,6 +13,7 @@ use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 use tracing::{error, warn};
 
 use crate::config::CronConfig;
+use crate::embed::pool::{EmbedCommitRequest, EmbedRequestKind};
 use crate::stats::tracker::StatsTracker;
 
 // ============================================================================
@@ -145,6 +146,7 @@ pub struct CronStateMachine {
     terminating: Arc<AtomicBool>,
     channel_disconnected: bool,
     ready_tx: Option<Sender<()>>,
+    stats: Option<Arc<StatsTracker>>,
 }
 
 impl CronStateMachine {
@@ -155,6 +157,7 @@ impl CronStateMachine {
         terminating: Arc<AtomicBool>,
         poll_interval_ms: u64,
         ready_tx: Option<Sender<()>>,
+        stats: Option<Arc<StatsTracker>>,
     ) -> Self {
         Self {
             state: CronState::CheckEvents,
@@ -164,6 +167,7 @@ impl CronStateMachine {
             terminating,
             channel_disconnected: false,
             ready_tx,
+            stats,
         }
     }
 
@@ -307,11 +311,19 @@ impl CronStateMachine {
         let Some(task) = self.queue.pop() else {
             return;
         };
-        Self::execute_inline(task, &mut self.queue);
+        Self::execute_inline(task, &mut self.queue, &self.stats);
     }
 
-    fn execute_inline(mut task: ScheduledTask, queue: &mut BinaryHeap<ScheduledTask>) {
+    fn execute_inline(
+        mut task: ScheduledTask,
+        queue: &mut BinaryHeap<ScheduledTask>,
+        stats: &Option<Arc<StatsTracker>>,
+    ) {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (task.task)()));
+
+        if let Some(s) = stats {
+            s.cron_executions.fetch_add(1, AtomicOrdering::Relaxed);
+        }
 
         match result {
             Ok(true) => {
@@ -323,6 +335,9 @@ impl CronStateMachine {
             Ok(false) => {}
             Err(e) => {
                 error!(task_name = task.metadata.name(), panic = ?e, "Task panicked");
+                if let Some(s) = stats {
+                    s.cron_panics.fetch_add(1, AtomicOrdering::Relaxed);
+                }
             }
         }
     }
@@ -426,13 +441,15 @@ impl CronHandle {
 
 pub fn spawn_cron(
     terminating: Arc<AtomicBool>,
+    stats: Option<Arc<StatsTracker>>,
 ) -> (CronHandle, JoinHandle<()>, Receiver<()>) {
-    spawn_cron_with_interval(terminating, CronStateMachine::DEFAULT_POLL_INTERVAL_MS)
+    spawn_cron_with_interval(terminating, CronStateMachine::DEFAULT_POLL_INTERVAL_MS, stats)
 }
 
 pub fn spawn_cron_with_interval(
     terminating: Arc<AtomicBool>,
     poll_interval_ms: u64,
+    stats: Option<Arc<StatsTracker>>,
 ) -> (CronHandle, JoinHandle<()>, Receiver<()>) {
     let (task_tx, task_rx) = unbounded::<ScheduledTask>();
     let (ready_tx, ready_rx) = unbounded::<()>();
@@ -447,6 +464,7 @@ pub fn spawn_cron_with_interval(
                 terminating_clone,
                 poll_interval_ms,
                 Some(ready_tx),
+                stats,
             );
             sm.run();
         })
@@ -476,6 +494,7 @@ pub fn schedule_maintenance_jobs(
     stats: Arc<StatsTracker>,
     config: &CronConfig,
     rt: tokio::runtime::Handle,
+    embed_tx: crossbeam_channel::Sender<EmbedRequestKind>,
 ) {
     // Stats aggregation
     let stats_clone = Arc::clone(&stats);
@@ -551,7 +570,7 @@ pub fn schedule_maintenance_jobs(
 
     // DB maintenance (VACUUM ANALYZE)
     let db_clone = db_pool.clone();
-    let rt_clone = rt;
+    let rt_clone = rt.clone();
     handle.schedule_recurring(
         config.db_maintenance_interval_secs * 1000,
         config.db_maintenance_interval_secs * 1000,
@@ -575,6 +594,68 @@ pub fn schedule_maintenance_jobs(
             true
         },
     );
+
+    // Git history indexing
+    let db_clone = db_pool.clone();
+    let rt_clone = rt;
+
+    // Create a commit-specific sender by wrapping EmbedCommitRequest → EmbedRequestKind
+    let (commit_tx, commit_rx) = crossbeam_channel::bounded::<EmbedCommitRequest>(64);
+    let kind_tx = embed_tx;
+    std::thread::Builder::new()
+        .name("pgmcp-git-embed-adapter".into())
+        .spawn(move || {
+            for req in commit_rx {
+                if kind_tx.send(EmbedRequestKind::Commit(req)).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("Failed to spawn git embed adapter thread");
+
+    let stats_for_git = Arc::clone(&stats);
+    handle.schedule_recurring(
+        10_000, // 10s initial delay (let initial scan settle)
+        config.git_history_index_interval_secs * 1000,
+        "git-history-index",
+        move || {
+            let db = db_clone.clone();
+            let tx = commit_tx.clone();
+            let stats = Arc::clone(&stats_for_git);
+            rt_clone.block_on(async {
+                match crate::db::queries::get_git_enabled_projects(&db).await {
+                    Ok(projects) => {
+                        for (project_id, project_path) in &projects {
+                            let project_root = std::path::Path::new(project_path);
+                            if !crate::indexer::git_indexer::is_git_history_enabled(project_root) {
+                                continue;
+                            }
+
+                            if let Err(e) = crate::indexer::git_indexer::index_git_history(
+                                project_root,
+                                *project_id,
+                                &db,
+                                &tx,
+                                &stats,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    project = %project_path,
+                                    error = %e,
+                                    "Git history indexing failed"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to list projects for git indexing: {}", e);
+                    }
+                }
+            });
+            true
+        },
+    );
 }
 
 // ============================================================================
@@ -591,7 +672,7 @@ mod tests {
     fn test_state_transitions() {
         let (_, rx) = unbounded::<ScheduledTask>();
         let terminating = Arc::new(AtomicBool::new(false));
-        let sm = CronStateMachine::new(rx, terminating, 100, None);
+        let sm = CronStateMachine::new(rx, terminating, 100, None, None);
         assert_eq!(sm.current_state(), CronState::CheckEvents);
     }
 
@@ -599,7 +680,7 @@ mod tests {
     fn test_termination_from_any_state() {
         let (_, rx) = unbounded::<ScheduledTask>();
         let terminating = Arc::new(AtomicBool::new(false));
-        let mut sm = CronStateMachine::new(rx, terminating.clone(), 100, None);
+        let mut sm = CronStateMachine::new(rx, terminating.clone(), 100, None, None);
         terminating.store(true, AtomicOrdering::Release);
         sm.run();
         assert_eq!(sm.current_state(), CronState::Terminated);
@@ -608,7 +689,7 @@ mod tests {
     #[test]
     fn test_concurrent_task_submission() {
         let terminating = Arc::new(AtomicBool::new(false));
-        let (handle, thread, _ready) = spawn_cron(Arc::clone(&terminating));
+        let (handle, thread, _ready) = spawn_cron(Arc::clone(&terminating), None);
         let counter = Arc::new(AtomicU64::new(0));
 
         let handles: Vec<_> = (0..10)
@@ -642,7 +723,7 @@ mod tests {
     #[test]
     fn test_recurring_task() {
         let terminating = Arc::new(AtomicBool::new(false));
-        let (handle, thread, _ready) = spawn_cron_with_interval(Arc::clone(&terminating), 10);
+        let (handle, thread, _ready) = spawn_cron_with_interval(Arc::clone(&terminating), 10, None);
         let counter = Arc::new(AtomicU64::new(0));
         let c = Arc::clone(&counter);
 
@@ -661,7 +742,7 @@ mod tests {
     #[test]
     fn test_one_shot_task() {
         let terminating = Arc::new(AtomicBool::new(false));
-        let (handle, thread, _ready) = spawn_cron_with_interval(Arc::clone(&terminating), 10);
+        let (handle, thread, _ready) = spawn_cron_with_interval(Arc::clone(&terminating), 10, None);
         let counter = Arc::new(AtomicU64::new(0));
         let c = Arc::clone(&counter);
 
@@ -679,7 +760,7 @@ mod tests {
     #[test]
     fn test_panic_safety() {
         let terminating = Arc::new(AtomicBool::new(false));
-        let (handle, thread, ready_rx) = spawn_cron_with_interval(Arc::clone(&terminating), 10);
+        let (handle, thread, ready_rx) = spawn_cron_with_interval(Arc::clone(&terminating), 10, None);
         ready_rx.recv().expect("Cron thread failed to start");
 
         let counter = Arc::new(AtomicU64::new(0));
@@ -718,7 +799,7 @@ mod tests {
     #[test]
     fn test_shutdown_flag() {
         let terminating = Arc::new(AtomicBool::new(false));
-        let (handle, thread, _ready) = spawn_cron(Arc::clone(&terminating));
+        let (handle, thread, _ready) = spawn_cron(Arc::clone(&terminating), None);
         assert!(!handle.is_shutting_down());
         handle.request_shutdown();
         assert!(handle.is_shutting_down());

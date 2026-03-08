@@ -9,8 +9,8 @@ use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::Config;
 use crate::db;
-use crate::embed::pool::{ChunkData, EmbedRequest};
-use crate::indexer::chunker;
+use crate::embed::pool::{ChunkData, EmbedRequest, EmbedRequestKind};
+use crate::indexer::{chunker, claude_chunker};
 use crate::stats::tracker::StatsTracker;
 
 /// Process a single file: read, hash, check if changed, chunk, embed, upsert.
@@ -20,8 +20,9 @@ pub async fn process_file(
     workspace_path: &str,
     config: &Config,
     db_pool: &sqlx::PgPool,
-    embed_tx: &Sender<EmbedRequest>,
+    embed_tx: &Sender<EmbedRequestKind>,
     stats: &StatsTracker,
+    max_file_size_override: Option<u64>,
 ) -> Result<(), crate::error::PgmcpError> {
     let path_str = path.to_string_lossy();
 
@@ -57,7 +58,8 @@ pub async fn process_file(
     }
 
     // Determine if file should be truncated
-    let truncated = size_bytes > config.indexer.max_file_size_bytes as i64;
+    let max_size = max_file_size_override.unwrap_or(config.indexer.max_file_size_bytes);
+    let truncated = size_bytes > max_size as i64;
     let stored_content = if truncated {
         None
     } else {
@@ -91,12 +93,18 @@ pub async fn process_file(
     // Delete old chunks
     db::queries::delete_file_chunks(db_pool, file_id).await?;
 
-    // Chunk the content
-    let chunks = chunker::chunk_content(
-        &content,
-        config.embeddings.chunk_size_lines,
-        config.embeddings.chunk_overlap_lines,
-    );
+    // Chunk the content, routing to the appropriate chunker
+    let chunks = if &*language == "jsonl" && claude_chunker::is_claude_session_transcript(path) {
+        claude_chunker::chunk_claude_jsonl(&content)
+    } else if &*language == "jsonl" {
+        chunker::chunk_jsonl_content(&content)
+    } else {
+        chunker::chunk_content(
+            &content,
+            config.embeddings.chunk_size_lines,
+            config.embeddings.chunk_overlap_lines,
+        )
+    };
 
     if chunks.is_empty() {
         // No chunks to embed — finalize hash immediately
@@ -115,12 +123,12 @@ pub async fn process_file(
         })
         .collect();
 
-    let request = EmbedRequest {
+    let request = EmbedRequestKind::File(EmbedRequest {
         file_id,
         chunks: chunk_data,
         db_pool: db_pool.clone(),
         content_hash,
-    };
+    });
 
     if let Err(e) = embed_tx.send(request) {
         error!(path = %path_str, error = %e, "Failed to submit embedding request");

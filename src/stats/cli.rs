@@ -16,17 +16,45 @@ pub async fn print_stats(config: &Config) -> anyhow::Result<()> {
         Ok(body) => {
             println!("\npgmcp Statistics");
             println!("{}", "=".repeat(50));
-            // Parse Prometheus text format and display as table
-            for line in body.lines() {
-                if line.starts_with('#') || line.is_empty() {
+
+            // Parse Prometheus text format into (key, value) pairs
+            let metrics: Vec<(&str, &str)> = body
+                .lines()
+                .filter(|l| !l.starts_with('#') && !l.is_empty())
+                .filter_map(|l| l.split_once(' '))
+                .collect();
+
+            // Group definitions: (section_name, prefix_match)
+            let groups: &[(&str, &[&str])] = &[
+                ("Indexing", &["pgmcp_files_indexed", "pgmcp_files_failed", "pgmcp_chunks_embedded", "pgmcp_bytes_processed", "pgmcp_index_duration", "pgmcp_embedding_duration", "pgmcp_last_index"]),
+                ("MCP", &["pgmcp_mcp_", "pgmcp_semantic_", "pgmcp_text_", "pgmcp_grep_"]),
+                ("Scan", &["pgmcp_files_scanned", "pgmcp_files_skipped", "pgmcp_files_stale"]),
+                ("Work Pool", &["pgmcp_active_threads", "pgmcp_queue_depth", "pgmcp_work_pool_"]),
+                ("Embedding Pool", &["pgmcp_embed_"]),
+                ("Cron", &["pgmcp_cron_"]),
+                ("Git History", &["pgmcp_git_"]),
+                ("Config Watcher", &["pgmcp_config_"]),
+                ("File Watcher", &["pgmcp_watcher_"]),
+                ("System", &["pgmcp_uptime_"]),
+            ];
+
+            for (section, prefixes) in groups {
+                let section_metrics: Vec<_> = metrics
+                    .iter()
+                    .filter(|(key, _)| prefixes.iter().any(|p| key.starts_with(p)))
+                    .collect();
+
+                if section_metrics.is_empty() {
                     continue;
                 }
-                if let Some((key, value)) = line.split_once(' ') {
+
+                println!("\n  {}:", section);
+                for (key, value) in section_metrics {
                     let display_key = key
                         .strip_prefix("pgmcp_")
                         .unwrap_or(key)
                         .replace('_', " ");
-                    println!("  {:<30} {}", display_key, value);
+                    println!("    {:<34} {}", display_key, value);
                 }
             }
         }

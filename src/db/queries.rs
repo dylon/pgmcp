@@ -648,6 +648,204 @@ pub async fn search_file_paths(
     .await
 }
 
+// ============================================================================
+// Git history queries
+// ============================================================================
+
+/// Upsert a git commit. Returns the commit row ID.
+pub async fn upsert_git_commit(
+    pool: &PgPool,
+    project_id: i32,
+    commit_hash: &str,
+    author: &str,
+    author_date: DateTime<Utc>,
+    subject: &str,
+    body: Option<&str>,
+) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO git_commits (project_id, commit_hash, author, author_date, subject, body)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (project_id, commit_hash) DO UPDATE SET
+            author = EXCLUDED.author,
+            author_date = EXCLUDED.author_date,
+            subject = EXCLUDED.subject,
+            body = EXCLUDED.body
+         RETURNING id"
+    )
+    .bind(project_id)
+    .bind(commit_hash)
+    .bind(author)
+    .bind(author_date)
+    .bind(subject)
+    .bind(body)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row)
+}
+
+/// Insert a git commit chunk with its embedding.
+pub async fn insert_git_commit_chunk(
+    pool: &PgPool,
+    commit_id: i64,
+    chunk_index: i32,
+    content: &str,
+    embedding: &[f32],
+) -> Result<(), sqlx::Error> {
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+    sqlx::query(
+        "INSERT INTO git_commit_chunks (commit_id, chunk_index, content, embedding)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (commit_id, chunk_index) DO UPDATE SET
+            content = EXCLUDED.content,
+            embedding = EXCLUDED.embedding"
+    )
+    .bind(commit_id)
+    .bind(chunk_index)
+    .bind(content)
+    .bind(embedding_vec)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Get the last indexed git commit SHA for a project.
+pub async fn get_git_last_commit(pool: &PgPool, project_id: i32) -> Result<Option<String>, sqlx::Error> {
+    let key = format!("git_last_commit:{}", project_id);
+    sqlx::query_scalar::<_, String>(
+        "SELECT value FROM pgmcp_metadata WHERE key = $1"
+    )
+    .bind(&key)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Set the last indexed git commit SHA for a project.
+pub async fn set_git_last_commit(pool: &PgPool, project_id: i32, sha: &str) -> Result<(), sqlx::Error> {
+    let key = format!("git_last_commit:{}", project_id);
+    sqlx::query(
+        "INSERT INTO pgmcp_metadata (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"
+    )
+    .bind(&key)
+    .bind(sha)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Update blame metadata on file_chunks for a given file.
+pub async fn update_blame_for_file(
+    pool: &PgPool,
+    file_id: i64,
+    blame_commit: &str,
+    blame_author: &str,
+    blame_date: DateTime<Utc>,
+    start_line: i32,
+    end_line: i32,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE file_chunks SET blame_commit = $1, blame_author = $2, blame_date = $3
+         WHERE file_id = $4 AND start_line <= $6 AND end_line >= $5"
+    )
+    .bind(blame_commit)
+    .bind(blame_author)
+    .bind(blame_date)
+    .bind(file_id)
+    .bind(start_line)
+    .bind(end_line)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Semantic search across git commit chunks.
+pub async fn semantic_search_commits(
+    pool: &PgPool,
+    embedding: &[f32],
+    limit: i32,
+    project: Option<&str>,
+    ef_search: i32,
+) -> Result<Vec<CommitSearchResult>, sqlx::Error> {
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+
+    let results = if let Some(proj) = project {
+        sqlx::query_as::<_, CommitSearchResult>(
+            "SELECT g.commit_hash, g.author, g.author_date, g.subject,
+                    cc.content as chunk_content,
+                    1 - (cc.embedding <=> $1) as score,
+                    p.name as project_name
+             FROM git_commit_chunks cc
+             JOIN git_commits g ON g.id = cc.commit_id
+             JOIN projects p ON p.id = g.project_id
+             WHERE p.name = $3
+             ORDER BY cc.embedding <=> $1
+             LIMIT $2"
+        )
+        .bind(&embedding_vec)
+        .bind(limit)
+        .bind(proj)
+        .fetch_all(&mut *tx)
+        .await?
+    } else {
+        sqlx::query_as::<_, CommitSearchResult>(
+            "SELECT g.commit_hash, g.author, g.author_date, g.subject,
+                    cc.content as chunk_content,
+                    1 - (cc.embedding <=> $1) as score,
+                    p.name as project_name
+             FROM git_commit_chunks cc
+             JOIN git_commits g ON g.id = cc.commit_id
+             JOIN projects p ON p.id = g.project_id
+             ORDER BY cc.embedding <=> $1
+             LIMIT $2"
+        )
+        .bind(&embedding_vec)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?
+    };
+
+    tx.commit().await?;
+    Ok(results)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct CommitSearchResult {
+    pub commit_hash: String,
+    pub author: String,
+    pub author_date: DateTime<Utc>,
+    pub subject: String,
+    pub chunk_content: String,
+    pub score: Option<f64>,
+    pub project_name: String,
+}
+
+/// Get the file_id for a given absolute path.
+pub async fn get_file_id_by_path(pool: &PgPool, path: &str) -> Result<Option<i64>, sqlx::Error> {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM indexed_files WHERE path = $1"
+    )
+    .bind(path)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Get all projects that have git history indexing enabled (via .pgmcp.toml).
+/// Returns (project_id, project_path) pairs.
+pub async fn get_git_enabled_projects(pool: &PgPool) -> Result<Vec<(i32, String)>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, (i32, String)>(
+        "SELECT id, path FROM projects ORDER BY name"
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// Clean up stale files (files that no longer exist on disk).
 pub async fn cleanup_stale_files(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let paths = sqlx::query_scalar::<_, String>(

@@ -2,11 +2,12 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use toml::Value as TomlValue;
 
 use crate::error::{PgmcpError, Result};
 
 /// Top-level configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub workspace: WorkspaceConfig,
@@ -30,7 +31,7 @@ pub struct Config {
     pub cron: CronConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     #[serde(default = "default_workspace_paths")]
     pub paths: Vec<String>,
@@ -48,13 +49,13 @@ fn default_workspace_paths() -> Vec<String> {
     vec![]
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FileTypeMapping {
     pub extension: String,
     pub language: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IndexerConfig {
     #[serde(default = "default_file_types")]
     pub file_types: Vec<FileTypeMapping>,
@@ -125,6 +126,8 @@ fn default_file_types() -> Vec<FileTypeMapping> {
         FileTypeMapping { extension: "json".into(), language: "json".into() },
         FileTypeMapping { extension: "yaml".into(), language: "yaml".into() },
         FileTypeMapping { extension: "yml".into(), language: "yaml".into() },
+        FileTypeMapping { extension: "sh".into(), language: "shell".into() },
+        FileTypeMapping { extension: "jsonl".into(), language: "jsonl".into() },
     ]
 }
 
@@ -146,7 +149,7 @@ fn default_exclude_patterns() -> Vec<String> {
     ]
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     #[serde(default = "default_db_host")]
     pub host: String,
@@ -203,7 +206,7 @@ fn default_db_name() -> String { "pgmcp".into() }
 fn default_db_user() -> String { "pgmcp".into() }
 fn default_max_connections() -> u32 { 20 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingsConfig {
     #[serde(default = "default_model")]
     pub model: String,
@@ -236,7 +239,7 @@ impl Default for EmbeddingsConfig {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VectorConfig {
     /// HNSW index `m` parameter: max number of bi-directional links per node.
     /// Higher values improve recall at the cost of memory and index build time.
@@ -273,7 +276,7 @@ fn default_chunk_overlap() -> usize { 10 }
 fn default_batch_size() -> usize { 32 }
 fn default_embed_pool_size() -> usize { 2 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct McpConfig {
     #[serde(default = "default_transport")]
     pub transport: String,
@@ -299,7 +302,7 @@ fn default_transport() -> String { "stdio".into() }
 fn default_mcp_host() -> String { "127.0.0.1".into() }
 fn default_mcp_port() -> u16 { 3100 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MetricsConfig {
     #[serde(default = "default_http_enabled")]
     pub http_enabled: bool,
@@ -323,7 +326,7 @@ fn default_http_enabled() -> bool { true }
 fn default_http_port() -> u16 { 9464 }
 fn default_http_bind() -> String { "127.0.0.1".into() }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LoggingConfig {
     #[serde(default = "default_log_file")]
     pub file: String,
@@ -351,7 +354,7 @@ fn default_log_level() -> String { "info".into() }
 fn default_rotation() -> String { "daily".into() }
 fn default_max_log_files() -> u32 { 7 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkPoolConfig {
     #[serde(default = "default_min_threads")]
     pub min_threads: usize,
@@ -392,7 +395,7 @@ impl WorkPoolConfig {
 
 fn default_min_threads() -> usize { 2 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CronConfig {
     #[serde(default = "default_stale_cleanup")]
     pub stale_cleanup_interval_secs: u64,
@@ -402,6 +405,8 @@ pub struct CronConfig {
     pub stats_aggregation_interval_secs: u64,
     #[serde(default = "default_db_maintenance")]
     pub db_maintenance_interval_secs: u64,
+    #[serde(default = "default_git_history_index")]
+    pub git_history_index_interval_secs: u64,
 }
 
 impl Default for CronConfig {
@@ -411,6 +416,7 @@ impl Default for CronConfig {
             integrity_check_interval_secs: default_integrity_check(),
             stats_aggregation_interval_secs: default_stats_aggregation(),
             db_maintenance_interval_secs: default_db_maintenance(),
+            git_history_index_interval_secs: default_git_history_index(),
         }
     }
 }
@@ -419,6 +425,7 @@ fn default_stale_cleanup() -> u64 { 3600 }
 fn default_integrity_check() -> u64 { 86400 }
 fn default_stats_aggregation() -> u64 { 60 }
 fn default_db_maintenance() -> u64 { 604_800 }
+fn default_git_history_index() -> u64 { 3600 }
 
 impl Config {
     /// Load configuration from the default path or the specified path.
@@ -436,6 +443,14 @@ impl Config {
             std::fs::read_to_string(&config_path).map_err(|e| PgmcpError::file_io(&config_path, e))?;
         let config: Config = toml::from_str(&content)?;
         Ok(config)
+    }
+
+    /// Resolve the config file path from an optional user-provided path or the default.
+    pub fn resolve_path(custom: Option<&Path>) -> PathBuf {
+        match custom {
+            Some(p) => p.to_path_buf(),
+            None => Self::default_config_path(),
+        }
     }
 
     /// Default config file path: ~/.config/pgmcp/config.toml
@@ -463,6 +478,75 @@ impl Config {
             .map_err(|e| PgmcpError::file_io(&path, e))?;
         Ok(path)
     }
+
+    /// Return the `~/.claude/` directory if it exists.
+    pub fn claude_dir() -> Option<PathBuf> {
+        dirs::home_dir().map(|h| h.join(".claude")).filter(|p| p.is_dir())
+    }
+
+    /// Upgrade an existing config file by merging new defaults while preserving
+    /// user customizations. Returns the path that was written.
+    pub fn upgrade(path: Option<&Path>) -> Result<PathBuf> {
+        let config_path = match path {
+            Some(p) => p.to_path_buf(),
+            None => Self::default_config_path(),
+        };
+
+        let defaults_toml: TomlValue = toml::from_str(&Self::default_toml())
+            .expect("Default config must be valid TOML");
+
+        if config_path.exists() {
+            let user_content = std::fs::read_to_string(&config_path)
+                .map_err(|e| PgmcpError::file_io(&config_path, e))?;
+            let user_toml: TomlValue = toml::from_str(&user_content)?;
+            let merged = merge_toml_values(defaults_toml, user_toml);
+            let output = toml::to_string_pretty(&merged)
+                .expect("Merged TOML must serialize");
+            std::fs::write(&config_path, output)
+                .map_err(|e| PgmcpError::file_io(&config_path, e))?;
+        } else {
+            // No existing config — just write defaults
+            if let Some(parent) = config_path.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| PgmcpError::file_io(parent, e))?;
+            }
+            std::fs::write(&config_path, Self::default_toml())
+                .map_err(|e| PgmcpError::file_io(&config_path, e))?;
+        }
+
+        Ok(config_path)
+    }
+}
+
+/// Recursively merge two TOML values. `user` values take precedence over `defaults`.
+/// - Tables: recursively merged; new default keys are added; user keys preserved.
+/// - Arrays: user entries kept, new default entries (not already present) appended.
+/// - Scalars: user value wins.
+fn merge_toml_values(defaults: TomlValue, user: TomlValue) -> TomlValue {
+    match (defaults, user) {
+        (TomlValue::Table(mut def_table), TomlValue::Table(user_table)) => {
+            for (key, user_val) in user_table {
+                let merged = if let Some(def_val) = def_table.remove(&key) {
+                    merge_toml_values(def_val, user_val)
+                } else {
+                    user_val
+                };
+                def_table.insert(key, merged);
+            }
+            TomlValue::Table(def_table)
+        }
+        (TomlValue::Array(def_arr), TomlValue::Array(user_arr)) => {
+            let mut merged = user_arr;
+            for def_item in def_arr {
+                if !merged.contains(&def_item) {
+                    merged.push(def_item);
+                }
+            }
+            TomlValue::Array(merged)
+        }
+        // User scalar wins over default scalar
+        (_defaults, user) => user,
+    }
 }
 
 impl Default for Config {
@@ -483,22 +567,36 @@ impl Default for Config {
 }
 
 /// Per-project override config (.pgmcp.toml in project root).
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ProjectOverride {
     #[serde(default)]
     pub indexer: Option<ProjectIndexerOverride>,
+    #[serde(default)]
+    pub git: Option<GitConfig>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProjectIndexerOverride {
     pub exclude_patterns: Option<Vec<String>>,
     pub file_types: Option<Vec<FileTypeMapping>>,
     pub max_file_size_bytes: Option<u64>,
 }
 
+/// Git history indexing configuration for a project.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GitConfig {
+    /// Enable git history indexing (commit messages + diffs) for this project.
+    #[serde(default)]
+    pub index_history: bool,
+}
+
+impl Default for GitConfig {
+    fn default() -> Self {
+        Self { index_history: false }
+    }
+}
+
 impl ProjectOverride {
-    #[allow(dead_code)]
     pub fn load(project_root: &Path) -> Option<Self> {
         let path = project_root.join(".pgmcp.toml");
         if !path.exists() {
@@ -506,6 +604,48 @@ impl ProjectOverride {
         }
         let content = std::fs::read_to_string(&path).ok()?;
         toml::from_str(&content).ok()
+    }
+
+    /// Default per-project config TOML content.
+    pub fn default_toml() -> String {
+        let default = ProjectOverride {
+            indexer: None,
+            git: Some(GitConfig::default()),
+        };
+        toml::to_string_pretty(&default).expect("Failed to serialize default project override")
+    }
+
+    /// Write the default .pgmcp.toml to a project root.
+    pub fn write_default(project_root: &Path) -> Result<PathBuf> {
+        let path = project_root.join(".pgmcp.toml");
+        std::fs::write(&path, Self::default_toml())
+            .map_err(|e| PgmcpError::file_io(&path, e))?;
+        Ok(path)
+    }
+
+    /// Upgrade an existing .pgmcp.toml by merging new defaults while preserving
+    /// user customizations.
+    pub fn upgrade(project_root: &Path) -> Result<PathBuf> {
+        let path = project_root.join(".pgmcp.toml");
+
+        let defaults_toml: TomlValue = toml::from_str(&Self::default_toml())
+            .expect("Default project override must be valid TOML");
+
+        if path.exists() {
+            let user_content = std::fs::read_to_string(&path)
+                .map_err(|e| PgmcpError::file_io(&path, e))?;
+            let user_toml: TomlValue = toml::from_str(&user_content)?;
+            let merged = merge_toml_values(defaults_toml, user_toml);
+            let output = toml::to_string_pretty(&merged)
+                .expect("Merged TOML must serialize");
+            std::fs::write(&path, output)
+                .map_err(|e| PgmcpError::file_io(&path, e))?;
+        } else {
+            std::fs::write(&path, Self::default_toml())
+                .map_err(|e| PgmcpError::file_io(&path, e))?;
+        }
+
+        Ok(path)
     }
 }
 
@@ -555,5 +695,89 @@ mod tests {
         assert_eq!(wpc.min_threads, 2);
         assert!(wpc.resolved_max_threads() >= 1);
         assert_eq!(wpc.resolved_initial_threads(), 2);
+    }
+
+    #[test]
+    fn test_new_file_types() {
+        let config = IndexerConfig::default();
+        assert!(config.is_configured_extension(Path::new("script.sh")));
+        assert!(config.is_configured_extension(Path::new("data.jsonl")));
+        assert_eq!(config.language_for_path(Path::new("script.sh")), Some("shell".into()));
+        assert_eq!(config.language_for_path(Path::new("data.jsonl")), Some("jsonl".into()));
+    }
+
+    #[test]
+    fn test_merge_toml_scalars_user_wins() {
+        let defaults: TomlValue = toml::from_str(r#"key = "default""#).expect("parse");
+        let user: TomlValue = toml::from_str(r#"key = "custom""#).expect("parse");
+        let merged = merge_toml_values(defaults, user);
+        assert_eq!(merged["key"].as_str(), Some("custom"));
+    }
+
+    #[test]
+    fn test_merge_toml_tables_add_new_keys() {
+        let defaults: TomlValue = toml::from_str(r#"
+            [section]
+            existing = "default"
+            new_key = "added"
+        "#).expect("parse");
+        let user: TomlValue = toml::from_str(r#"
+            [section]
+            existing = "custom"
+        "#).expect("parse");
+        let merged = merge_toml_values(defaults, user);
+        assert_eq!(merged["section"]["existing"].as_str(), Some("custom"));
+        assert_eq!(merged["section"]["new_key"].as_str(), Some("added"));
+    }
+
+    #[test]
+    fn test_merge_toml_arrays_union() {
+        let defaults: TomlValue = toml::from_str(r#"
+            items = ["a", "b", "c"]
+        "#).expect("parse");
+        let user: TomlValue = toml::from_str(r#"
+            items = ["b", "d"]
+        "#).expect("parse");
+        let merged = merge_toml_values(defaults, user);
+        let arr = merged["items"].as_array().expect("should be array");
+        assert!(arr.contains(&TomlValue::String("b".into())));
+        assert!(arr.contains(&TomlValue::String("d".into())));
+        assert!(arr.contains(&TomlValue::String("a".into())));
+        assert!(arr.contains(&TomlValue::String("c".into())));
+    }
+
+    #[test]
+    fn test_merge_toml_preserves_user_only_keys() {
+        let defaults: TomlValue = toml::from_str(r#"a = 1"#).expect("parse");
+        let user: TomlValue = toml::from_str(r#"
+            a = 2
+            user_only = 42
+        "#).expect("parse");
+        let merged = merge_toml_values(defaults, user);
+        assert_eq!(merged["a"].as_integer(), Some(2));
+        assert_eq!(merged["user_only"].as_integer(), Some(42));
+    }
+
+    #[test]
+    fn test_project_override_default_toml_parses() {
+        let toml_str = ProjectOverride::default_toml();
+        let _parsed: ProjectOverride = toml::from_str(&toml_str)
+            .expect("Default project override TOML should parse");
+    }
+
+    #[test]
+    fn test_project_override_with_git_config() {
+        let toml_str = r#"
+            [git]
+            index_history = true
+        "#;
+        let parsed: ProjectOverride = toml::from_str(toml_str).expect("parse");
+        assert!(parsed.git.expect("git section should be present").index_history);
+    }
+
+    #[test]
+    fn test_git_history_cron_default() {
+        let config = CronConfig::default();
+        assert_eq!(config.git_history_index_interval_secs, 3600);
     }
 }

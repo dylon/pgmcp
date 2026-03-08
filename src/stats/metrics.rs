@@ -52,6 +52,51 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
          # HELP pgmcp_queue_depth Work pool queue depth\n\
          # TYPE pgmcp_queue_depth gauge\n\
          pgmcp_queue_depth {}\n\
+         # HELP pgmcp_cron_executions Total cron task executions\n\
+         # TYPE pgmcp_cron_executions counter\n\
+         pgmcp_cron_executions {}\n\
+         # HELP pgmcp_cron_panics Total cron task panics caught\n\
+         # TYPE pgmcp_cron_panics counter\n\
+         pgmcp_cron_panics {}\n\
+         # HELP pgmcp_git_commits_indexed Total git commits indexed\n\
+         # TYPE pgmcp_git_commits_indexed counter\n\
+         pgmcp_git_commits_indexed {}\n\
+         # HELP pgmcp_git_commits_failed Total git commits failed\n\
+         # TYPE pgmcp_git_commits_failed counter\n\
+         pgmcp_git_commits_failed {}\n\
+         # HELP pgmcp_config_reloads Total successful config reloads\n\
+         # TYPE pgmcp_config_reloads counter\n\
+         pgmcp_config_reloads {}\n\
+         # HELP pgmcp_config_reload_errors Total failed config reload attempts\n\
+         # TYPE pgmcp_config_reload_errors counter\n\
+         pgmcp_config_reload_errors {}\n\
+         # HELP pgmcp_embed_file_batches Total successful file embedding batches\n\
+         # TYPE pgmcp_embed_file_batches counter\n\
+         pgmcp_embed_file_batches {}\n\
+         # HELP pgmcp_embed_commit_batches Total successful commit embedding batches\n\
+         # TYPE pgmcp_embed_commit_batches counter\n\
+         pgmcp_embed_commit_batches {}\n\
+         # HELP pgmcp_embed_errors Total failed embedding calls\n\
+         # TYPE pgmcp_embed_errors counter\n\
+         pgmcp_embed_errors {}\n\
+         # HELP pgmcp_watcher_events_received Total raw file watcher events\n\
+         # TYPE pgmcp_watcher_events_received counter\n\
+         pgmcp_watcher_events_received {}\n\
+         # HELP pgmcp_watcher_events_filtered Total file watcher events passing filters\n\
+         # TYPE pgmcp_watcher_events_filtered counter\n\
+         pgmcp_watcher_events_filtered {}\n\
+         # HELP pgmcp_watcher_events_debounced Total file watcher events after debounce\n\
+         # TYPE pgmcp_watcher_events_debounced counter\n\
+         pgmcp_watcher_events_debounced {}\n\
+         # HELP pgmcp_work_pool_tasks_completed Total work pool tasks completed\n\
+         # TYPE pgmcp_work_pool_tasks_completed counter\n\
+         pgmcp_work_pool_tasks_completed {}\n\
+         # HELP pgmcp_work_pool_scale_ups Total work pool scale-up actions\n\
+         # TYPE pgmcp_work_pool_scale_ups counter\n\
+         pgmcp_work_pool_scale_ups {}\n\
+         # HELP pgmcp_work_pool_scale_downs Total work pool scale-down actions\n\
+         # TYPE pgmcp_work_pool_scale_downs counter\n\
+         pgmcp_work_pool_scale_downs {}\n\
          # HELP pgmcp_uptime_seconds Server uptime in seconds\n\
          # TYPE pgmcp_uptime_seconds gauge\n\
          pgmcp_uptime_seconds {}\n",
@@ -66,6 +111,21 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
         s.grep_searches.load(Ordering::Relaxed),
         s.active_work_pool_threads.load(Ordering::Relaxed),
         s.work_pool_queue_depth.load(Ordering::Relaxed),
+        s.cron_executions.load(Ordering::Relaxed),
+        s.cron_panics.load(Ordering::Relaxed),
+        s.git_commits_indexed.load(Ordering::Relaxed),
+        s.git_commits_failed.load(Ordering::Relaxed),
+        s.config_reloads.load(Ordering::Relaxed),
+        s.config_reload_errors.load(Ordering::Relaxed),
+        s.embed_file_batches.load(Ordering::Relaxed),
+        s.embed_commit_batches.load(Ordering::Relaxed),
+        s.embed_errors.load(Ordering::Relaxed),
+        s.watcher_events_received.load(Ordering::Relaxed),
+        s.watcher_events_filtered.load(Ordering::Relaxed),
+        s.watcher_events_debounced.load(Ordering::Relaxed),
+        s.work_pool_tasks_completed.load(Ordering::Relaxed),
+        s.work_pool_scale_ups.load(Ordering::Relaxed),
+        s.work_pool_scale_downs.load(Ordering::Relaxed),
         s.uptime_start.elapsed().as_secs(),
     )
 }

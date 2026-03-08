@@ -68,6 +68,16 @@ pub struct GrepParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchCommitsParams {
+    #[schemars(description = "Search query text (matched by semantic similarity against commit messages and diffs)")]
+    pub query: String,
+    #[schemars(description = "Maximum number of results (default: 10)")]
+    pub limit: Option<i32>,
+    #[schemars(description = "Filter by project name")]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadFileParams {
     #[schemars(description = "Absolute path of the file to read")]
     pub path: String,
@@ -108,7 +118,7 @@ impl McpServer {
         }
     }
 
-    #[tool(description = "Search indexed code using semantic similarity (vector embeddings). Best for conceptual queries like 'error handling' or 'database connection setup'.")]
+    #[tool(description = "Search indexed code using semantic similarity (vector embeddings). Best for conceptual queries like 'error handling' or 'database connection setup'. Filter by project name to scope results. Use project: \"claude\" to search Claude Code session transcripts, memory files, and plans from ~/.claude/.")]
     async fn semantic_search(
         &self,
         Parameters(params): Parameters<SemanticSearchParams>,
@@ -146,7 +156,7 @@ impl McpServer {
         Ok(CallToolResult::success(vec![Content::text(json)]))
     }
 
-    #[tool(description = "Search indexed code using PostgreSQL full-text search. Best for exact keyword matches.")]
+    #[tool(description = "Search indexed code using PostgreSQL full-text search. Best for exact keyword matches. Searches all indexed projects including Claude Code session transcripts (use the \"claude\" project).")]
     async fn text_search(
         &self,
         Parameters(params): Parameters<TextSearchParams>,
@@ -311,6 +321,43 @@ impl McpServer {
             "Index cleared. Files will be re-indexed automatically by the background scanner.",
         )]))
     }
+
+    #[tool(description = "Search git commit history using semantic similarity. Finds commits by meaning — query with concepts like 'fix database timeout' or 'add authentication'. Returns commit hash, author, date, subject, and matching diff/message content. Requires per-project opt-in via [git] index_history = true in .pgmcp.toml.")]
+    async fn search_commits(
+        &self,
+        Parameters(params): Parameters<SearchCommitsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats.mcp_requests.fetch_add(1, Ordering::Relaxed);
+        self.stats.commit_searches.fetch_add(1, Ordering::Relaxed);
+
+        let limit = params.limit.unwrap_or(10);
+
+        // Embed the query
+        let embedding = {
+            let model = self.embed_model.lock().await;
+            model.embed(vec![&params.query], None)
+                .map_err(|e| McpError::internal_error(format!("Embedding failed: {}", e), None))?
+                .into_iter()
+                .next()
+                .ok_or_else(|| McpError::internal_error("No embedding returned", None))?
+        };
+
+        let ef_search = self.config.load().vector.ef_search;
+        let results = crate::db::queries::semantic_search_commits(
+            &self.db_pool,
+            &embedding,
+            limit,
+            params.project.as_deref(),
+            ef_search,
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("Commit search failed: {}", e), None))?;
+
+        let json = serde_json::to_string_pretty(&results)
+            .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
+
+        Ok(CallToolResult::success(vec![Content::text(json)]))
+    }
 }
 
 #[tool_handler]
@@ -342,7 +389,15 @@ impl ServerHandler for McpServer {
              - Checking indexing health: use index_stats\n\n\
              Built-in tools (Grep/Glob/Read) are better for single-file or single-directory operations \
              in the current working directory. pgmcp is better for broad, cross-project exploration \
-             and semantic understanding of the codebase.",
+             and semantic understanding of the codebase.\n\n\
+             GIT HISTORY:\n\
+             - search_commits: semantic search over git commit messages and diffs — find when \
+               a feature was added, a bug was fixed, or how code evolved. Requires per-project \
+               opt-in via [git] index_history = true in .pgmcp.toml.\n\n\
+             CLAUDE SESSION HISTORY:\n\
+             - The \"claude\" project indexes ~/.claude/ (session transcripts, memory files, \
+               plans). Use semantic_search or text_search with project: \"claude\" to search \
+               past conversations, decisions, and context from previous Claude Code sessions.",
         )
     }
 

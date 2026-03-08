@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use clap::{Parser, Subcommand};
+use dashmap::DashMap;
 use tracing::info;
 
 use rmcp::ServiceExt;
@@ -53,6 +54,25 @@ enum Commands {
     Reindex,
     /// Generate default config at ~/.config/pgmcp/config.toml
     Init,
+    /// Upgrade all configs: global config.toml + .pgmcp.toml in all indexed projects
+    #[command(alias = "upgrade-config")]
+    UpgradeConfigs {
+        /// Prompt before upgrading each project's .pgmcp.toml
+        #[arg(short, long)]
+        interactive: bool,
+    },
+    /// Initialize .pgmcp.toml in the current project
+    InitProject {
+        /// Project directory (defaults to $PWD)
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
+    /// Upgrade .pgmcp.toml with new defaults (preserves customizations)
+    UpgradeProject {
+        /// Project directory (defaults to $PWD)
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+    },
     /// Print project context for the current working directory (for Claude Code hooks)
     Context {
         /// Working directory to find project for (defaults to $PWD)
@@ -75,19 +95,63 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
 
+        Commands::UpgradeConfigs { interactive } => {
+            // Phase 1: Always upgrade global config
+            let global_path = Config::upgrade(cli.config.as_deref())?;
+            println!("Global configuration upgraded: {}", global_path.display());
+
+            // Phase 2: Load freshly-upgraded config for DB connection
+            let config = Config::load(cli.config.as_deref())?;
+
+            // Phase 3: DB-driven project discovery + upgrade
+            println!("Connecting to database for project discovery...");
+            match upgrade_all_project_configs(&config.database, interactive).await {
+                Ok(()) => {}
+                Err(e) => {
+                    eprintln!(
+                        "Warning: Could not upgrade project configs: {}\n\
+                         Use `pgmcp upgrade-project --cwd <DIR>` for individual projects.",
+                        e
+                    );
+                }
+            }
+
+            return Ok(());
+        }
+
+        Commands::InitProject { cwd } => {
+            let project_root = cwd.unwrap_or_else(|| {
+                std::env::current_dir().expect("Failed to get current directory")
+            });
+            let path = config::ProjectOverride::write_default(&project_root)?;
+            println!("Project config written to: {}", path.display());
+            return Ok(());
+        }
+
+        Commands::UpgradeProject { cwd } => {
+            let project_root = cwd.unwrap_or_else(|| {
+                std::env::current_dir().expect("Failed to get current directory")
+            });
+            let path = config::ProjectOverride::upgrade(&project_root)?;
+            println!("Project config upgraded: {}", path.display());
+            return Ok(());
+        }
+
         Commands::Serve => {
+            let config_path = Config::resolve_path(cli.config.as_deref());
             let config = Config::load(cli.config.as_deref())?;
             logging::init_foreground(&config);
             info!("pgmcp starting in foreground mode");
-            run_server(config, false).await?;
+            run_server(config, false, config_path).await?;
         }
 
         Commands::Daemon => {
+            let config_path = Config::resolve_path(cli.config.as_deref());
             let config = Config::load(cli.config.as_deref())?;
             logging::init_daemon(&config);
             info!("pgmcp starting in daemon mode");
             daemon::notify_ready();
-            run_server(config, true).await?;
+            run_server(config, true, config_path).await?;
             daemon::notify_stopping();
         }
 
@@ -101,13 +165,23 @@ async fn main() -> anyhow::Result<()> {
             println!("Triggering full re-index of all workspaces...");
             let pool = db::pool::create_pool(&config.database).await?;
             db::migrations::run_migrations(&pool, &config.vector).await?;
+            sqlx::query("DELETE FROM git_commit_chunks")
+                .execute(&pool)
+                .await?;
+            sqlx::query("DELETE FROM git_commits")
+                .execute(&pool)
+                .await?;
             sqlx::query("DELETE FROM file_chunks")
                 .execute(&pool)
                 .await?;
             sqlx::query("DELETE FROM indexed_files")
                 .execute(&pool)
                 .await?;
-            println!("Index cleared. Restart pgmcp to re-index.");
+            // Clear git last commit markers
+            sqlx::query("DELETE FROM pgmcp_metadata WHERE key LIKE 'git_last_commit:%'")
+                .execute(&pool)
+                .await?;
+            println!("Index cleared (files + git history). Restart pgmcp to re-index.");
         }
 
         Commands::Context { cwd, depth } => {
@@ -176,7 +250,9 @@ async fn run_context_command(
 
             println!();
             println!("### Available pgmcp tools");
-            println!("Use ToolSearch to load: semantic_search, text_search, grep, read_file, list_projects, project_tree, file_info, index_stats, reindex");
+            println!("Use ToolSearch to load: semantic_search, text_search, grep, read_file, list_projects, project_tree, file_info, index_stats, reindex, search_commits");
+            println!();
+            println!("**Tip:** Use search_commits for git history. Use semantic_search with project: \"claude\" for past Claude Code sessions/memory.");
         }
         None => {
             println!("## pgmcp: No indexed project found for {}", cwd_str);
@@ -197,14 +273,83 @@ async fn run_context_command(
             }
             println!();
             println!("### Available pgmcp tools");
-            println!("Use ToolSearch to load: semantic_search, text_search, grep, read_file, list_projects, project_tree, file_info, index_stats, reindex");
+            println!("Use ToolSearch to load: semantic_search, text_search, grep, read_file, list_projects, project_tree, file_info, index_stats, reindex, search_commits");
+            println!();
+            println!("**Tip:** Use search_commits for git history. Use semantic_search with project: \"claude\" for past Claude Code sessions/memory.");
         }
     }
 
     Ok(())
 }
 
-async fn run_server(config: Config, is_daemon: bool) -> anyhow::Result<()> {
+async fn upgrade_all_project_configs(
+    db_config: &config::DatabaseConfig,
+    interactive: bool,
+) -> anyhow::Result<()> {
+    let pool = db::pool::create_pool(db_config)
+        .await
+        .map_err(|e| anyhow::anyhow!("Database connection failed: {}", e))?;
+
+    let projects = db::queries::list_projects(&pool)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to list projects: {}", e))?;
+
+    if projects.is_empty() {
+        println!("No indexed projects found.");
+        return Ok(());
+    }
+
+    let mut upgraded = 0u32;
+    let mut skipped = 0u32;
+    let mut failed = 0u32;
+
+    for project in &projects {
+        let project_root = std::path::Path::new(&project.path);
+        let pgmcp_toml = project_root.join(".pgmcp.toml");
+
+        if !pgmcp_toml.exists() {
+            skipped += 1;
+            continue;
+        }
+
+        if interactive {
+            eprint!(
+                "Upgrade .pgmcp.toml in {} ({})? [y/N] ",
+                project.name, project.path
+            );
+            use std::io::Write;
+            std::io::stderr().flush()?;
+
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            let answer = answer.trim().to_lowercase();
+            if answer != "y" && answer != "yes" {
+                println!("  Skipped {} (declined)", project.name);
+                skipped += 1;
+                continue;
+            }
+        }
+
+        match config::ProjectOverride::upgrade(project_root) {
+            Ok(path) => {
+                println!("  Upgraded: {} ({})", project.name, path.display());
+                upgraded += 1;
+            }
+            Err(e) => {
+                eprintln!("  Failed: {} ({}): {}", project.name, project.path, e);
+                failed += 1;
+            }
+        }
+    }
+
+    println!(
+        "\nProject configs: {} upgraded, {} skipped, {} failed",
+        upgraded, skipped, failed
+    );
+    Ok(())
+}
+
+async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> anyhow::Result<()> {
     let shutdown = ShutdownCoordinator::new();
     let config = Arc::new(ArcSwap::from_pointee(config));
 
@@ -290,28 +435,46 @@ async fn run_server(config: Config, is_daemon: bool) -> anyhow::Result<()> {
     // 7. Start cron scheduler
     let (cron_handle, cron_thread, cron_ready) = cron::scheduler::spawn_cron(
         shutdown.terminating_flag(),
+        Some(Arc::clone(&stats_tracker)),
     );
     cron_ready
         .recv()
         .expect("Cron scheduler failed to start");
 
     // Schedule cron jobs
+    let embed_sender = embed_pool.sender();
     cron::scheduler::schedule_maintenance_jobs(
         &cron_handle,
         db_pool.clone(),
         Arc::clone(&stats_tracker),
         &config_snapshot.cron,
         tokio::runtime::Handle::current(),
+        embed_sender.clone(),
     );
 
     // 8. Start file watcher + scanner
+    let project_overrides: Arc<DashMap<PathBuf, config::ProjectOverride>> =
+        Arc::new(DashMap::new());
+    let (watcher_cmd_tx, watcher_cmd_rx) = crossbeam_channel::bounded(64);
+
     let indexer_handle = indexer::event_processor::start_indexing(
         Arc::clone(&config),
         db_pool.clone(),
         Arc::clone(&work_pool),
-        embed_pool.sender(),
+        embed_sender,
         Arc::clone(&stats_tracker),
         shutdown.clone(),
+        Arc::clone(&project_overrides),
+        watcher_cmd_rx,
+    )?;
+
+    // 8b. Start config file watcher for hot-reload
+    let _config_watcher_handle = indexer::config_watcher::start_config_watcher(
+        Arc::clone(&config),
+        config_path,
+        watcher_cmd_tx,
+        shutdown.terminating_flag(),
+        Arc::clone(&stats_tracker),
     )?;
 
     // 9. Start metrics HTTP server (if enabled)
@@ -428,6 +591,9 @@ async fn run_server(config: Config, is_daemon: bool) -> anyhow::Result<()> {
     shutdown.signal_shutdown();
 
     let component_timeout = Duration::from_secs(5);
+
+    // Stop config watcher (must drop before indexer to close watcher_cmd channel)
+    drop(_config_watcher_handle);
 
     // Stop file watcher
     drop(indexer_handle);
