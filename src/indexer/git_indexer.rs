@@ -60,7 +60,11 @@ pub async fn index_git_history(
     }
 
     let output = cmd.output().map_err(|e| {
-        crate::error::PgmcpError::Other(format!("Failed to run git log in {}: {}", project_root.display(), e))
+        crate::error::PgmcpError::Other(format!(
+            "Failed to run git log in {}: {}",
+            project_root.display(),
+            e
+        ))
     })?;
 
     if !output.status.success() {
@@ -103,11 +107,11 @@ pub async fn index_git_history(
             chunk_text.push_str(&commit.body);
             chunk_text.push('\n');
         }
-        if let Some(ref diff_text) = diff {
-            if diff_text.len() <= MAX_DIFF_BYTES {
-                chunk_text.push_str("\n---\n");
-                chunk_text.push_str(diff_text);
-            }
+        if let Some(ref diff_text) = diff
+            && diff_text.len() <= MAX_DIFF_BYTES
+        {
+            chunk_text.push_str("\n---\n");
+            chunk_text.push_str(diff_text);
         }
 
         // Upsert commit in DB
@@ -123,17 +127,28 @@ pub async fn index_git_history(
             &commit.author,
             author_date,
             &commit.subject,
-            if commit.body.is_empty() { None } else { Some(&commit.body) },
+            if commit.body.is_empty() {
+                None
+            } else {
+                Some(&commit.body)
+            },
         )
         .await
         {
             Ok(id) => id,
             Err(e) => {
                 error!(hash = %commit.hash, error = %e, "Failed to upsert git commit");
-                stats.git_commits_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                stats
+                    .git_commits_failed
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
         };
+
+        // Index files changed in this commit
+        if let Err(e) = index_commit_files(db_pool, project_root, commit_id, &commit.hash).await {
+            debug!(hash = %commit.hash, error = %e, "Failed to index commit files");
+        }
 
         // Submit for embedding
         let chunk = ChunkData {
@@ -151,17 +166,25 @@ pub async fn index_git_history(
 
         if let Err(e) = embed_tx.send(request) {
             error!(hash = %commit.hash, error = %e, "Failed to submit commit for embedding");
-            stats.git_commits_failed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats
+                .git_commits_failed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         } else {
-            stats.git_commits_indexed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stats
+                .git_commits_indexed
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
+    // Backfill git_commit_files for any commits that were previously indexed
+    // without file change tracking
+    backfill_commit_files(db_pool, project_root, project_id).await;
+
     // Update last indexed commit
-    if let Some(sha) = newest_sha {
-        if let Err(e) = db::queries::set_git_last_commit(db_pool, project_id, &sha).await {
-            error!(project_id, error = %e, "Failed to update last indexed commit");
-        }
+    if let Some(sha) = newest_sha
+        && let Err(e) = db::queries::set_git_last_commit(db_pool, project_id, &sha).await
+    {
+        error!(project_id, error = %e, "Failed to update last indexed commit");
     }
 
     Ok(())
@@ -175,9 +198,7 @@ pub async fn update_blame_metadata(
     file_id: i64,
     db_pool: &sqlx::PgPool,
 ) -> Result<(), crate::error::PgmcpError> {
-    let relative = file_path
-        .strip_prefix(project_root)
-        .unwrap_or(file_path);
+    let relative = file_path.strip_prefix(project_root).unwrap_or(file_path);
 
     let output = Command::new("git")
         .current_dir(project_root)
@@ -188,7 +209,8 @@ pub async fn update_blame_metadata(
         .map_err(|e| {
             crate::error::PgmcpError::Other(format!(
                 "Failed to run git blame on {}: {}",
-                file_path.display(), e
+                file_path.display(),
+                e
             ))
         })?;
 
@@ -224,6 +246,95 @@ pub fn is_git_history_enabled(project_root: &Path) -> bool {
         .and_then(|o| o.git)
         .map(|g| g.index_history)
         .unwrap_or(false)
+}
+
+/// Extract files changed in a commit using `git diff-tree` and store them.
+async fn index_commit_files(
+    db_pool: &sqlx::PgPool,
+    repo_path: &Path,
+    commit_db_id: i64,
+    commit_hash: &str,
+) -> Result<(), crate::error::PgmcpError> {
+    let output = Command::new("git")
+        .args([
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            commit_hash,
+        ])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| {
+            crate::error::PgmcpError::Other(format!(
+                "Failed to run git diff-tree for {}: {}",
+                commit_hash, e
+            ))
+        })?;
+
+    if !output.status.success() {
+        return Ok(());
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Format: "M\tsrc/foo.rs" or "R100\told\tnew" (rename with score)
+        let parts: Vec<&str> = line.splitn(2, '\t').collect();
+        if parts.len() < 2 {
+            continue;
+        }
+        let change_type = parts[0].chars().next().unwrap_or('M');
+        let file_path = if change_type == 'R' || change_type == 'C' {
+            // For renames/copies, the new path is the second tab-delimited field
+            parts[1].split('\t').next_back().unwrap_or(parts[1])
+        } else {
+            parts[1]
+        };
+
+        if let Err(e) =
+            db::queries::insert_commit_file(db_pool, commit_db_id, file_path, change_type).await
+        {
+            debug!(
+                commit_hash,
+                file_path,
+                error = %e,
+                "Failed to insert commit file"
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Backfill `git_commit_files` for commits that were indexed before file tracking was added.
+async fn backfill_commit_files(db_pool: &sqlx::PgPool, repo_path: &Path, project_id: i32) {
+    let missing = match db::queries::get_commits_missing_files(db_pool, project_id).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            debug!(project_id, error = %e, "Failed to query commits missing files");
+            return;
+        }
+    };
+
+    if missing.is_empty() {
+        return;
+    }
+
+    info!(
+        project_id,
+        count = missing.len(),
+        "Backfilling git_commit_files for previously indexed commits"
+    );
+
+    for (commit_db_id, commit_hash) in &missing {
+        if let Err(e) = index_commit_files(db_pool, repo_path, *commit_db_id, commit_hash).await {
+            debug!(commit_hash, error = %e, "Failed to backfill commit files");
+        }
+    }
 }
 
 // ============================================================================
@@ -325,8 +436,7 @@ fn parse_blame_porcelain(output: &str) -> Vec<BlameEntry> {
         } else if line.starts_with('\t') {
             // Content line — this marks the end of a blame block
             if !current_hash.is_empty() && current_line > 0 {
-                let date = DateTime::from_timestamp(current_timestamp, 0)
-                    .unwrap_or_else(|| Utc::now());
+                let date = DateTime::from_timestamp(current_timestamp, 0).unwrap_or_else(Utc::now);
                 entries.push(BlameEntry {
                     commit_hash: current_hash.clone(),
                     author: current_author.clone(),
@@ -342,11 +452,12 @@ fn parse_blame_porcelain(output: &str) -> Vec<BlameEntry> {
     entries.sort_by_key(|e| e.start_line);
     let mut merged: Vec<BlameEntry> = Vec::new();
     for entry in entries {
-        if let Some(last) = merged.last_mut() {
-            if last.commit_hash == entry.commit_hash && last.end_line + 1 >= entry.start_line {
-                last.end_line = last.end_line.max(entry.end_line);
-                continue;
-            }
+        if let Some(last) = merged.last_mut()
+            && last.commit_hash == entry.commit_hash
+            && last.end_line + 1 >= entry.start_line
+        {
+            last.end_line = last.end_line.max(entry.end_line);
+            continue;
         }
         merged.push(entry);
     }

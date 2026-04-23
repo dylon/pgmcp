@@ -8,13 +8,10 @@ use std::hash::Hash;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver};
+use crossbeam_channel::{Receiver, bounded};
 
 /// Buffer items until `count` is reached, then emit as a Vec.
-pub fn buffer_count<T: Send + 'static>(
-    rx: Receiver<T>,
-    count: usize,
-) -> Receiver<Vec<T>> {
+pub fn buffer_count<T: Send + 'static>(rx: Receiver<T>, count: usize) -> Receiver<Vec<T>> {
     let (tx, out_rx) = bounded(64);
 
     thread::Builder::new()
@@ -42,10 +39,7 @@ pub fn buffer_count<T: Send + 'static>(
 
 /// Buffer items for a duration, then emit as a Vec.
 #[allow(dead_code)]
-pub fn buffer_time<T: Send + 'static>(
-    rx: Receiver<T>,
-    duration: Duration,
-) -> Receiver<Vec<T>> {
+pub fn buffer_time<T: Send + 'static>(rx: Receiver<T>, duration: Duration) -> Receiver<Vec<T>> {
     let (tx, out_rx) = bounded(64);
 
     thread::Builder::new()
@@ -84,10 +78,7 @@ pub fn buffer_time<T: Send + 'static>(
 }
 
 /// Throttle: emit the first item, then suppress for `duration`.
-pub fn throttle_first<T: Send + 'static>(
-    rx: Receiver<T>,
-    duration: Duration,
-) -> Receiver<T> {
+pub fn throttle_first<T: Send + 'static>(rx: Receiver<T>, duration: Duration) -> Receiver<T> {
     let (tx, out_rx) = bounded(256);
 
     thread::Builder::new()
@@ -138,11 +129,7 @@ pub fn distinct_until_changed<T: Send + PartialEq + Clone + 'static>(
 }
 
 /// Debounce by key: for each unique key, only emit after `duration` of silence.
-pub fn debounce_by_key<T, K, F>(
-    rx: Receiver<T>,
-    duration: Duration,
-    key_fn: F,
-) -> Receiver<T>
+pub fn debounce_by_key<T, K, F>(rx: Receiver<T>, duration: Duration, key_fn: F) -> Receiver<T>
 where
     T: Send + 'static,
     K: Eq + Hash + Send + 'static,
@@ -230,7 +217,9 @@ mod tests {
         tx.send(2).expect("send failed");
         tx.send(3).expect("send failed");
 
-        let first = throttled.recv_timeout(Duration::from_millis(50)).expect("recv failed");
+        let first = throttled
+            .recv_timeout(Duration::from_millis(50))
+            .expect("recv failed");
         assert_eq!(first, 1);
 
         // 2 and 3 should be suppressed

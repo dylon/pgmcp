@@ -6,11 +6,12 @@ use arc_swap::ArcSwap;
 use sqlx::PgPool;
 
 use crate::config::Config;
+use crate::embed::pool::QueryEmbedder;
 
 /// Shared state for REST API handlers.
 #[derive(Clone)]
 pub struct ApiState {
     pub db_pool: PgPool,
-    pub embed_model: Arc<tokio::sync::Mutex<fastembed::TextEmbedding>>,
+    pub query_embedder: QueryEmbedder,
     pub config: Arc<ArcSwap<Config>>,
 }

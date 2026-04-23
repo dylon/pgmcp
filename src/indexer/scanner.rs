@@ -48,7 +48,14 @@ pub fn scan_workspaces(
         }
 
         info!(path = %workspace_path, "Scanning workspace");
-        scan_single_workspace(workspace, workspace_path, config, &file_tx, project_roots, project_overrides);
+        scan_single_workspace(
+            workspace,
+            workspace_path,
+            config,
+            &file_tx,
+            project_roots,
+            project_overrides,
+        );
     }
 
     // Scan project-level .claude/ directories
@@ -167,8 +174,8 @@ pub(crate) fn scan_single_workspace(
         // Check exclude patterns
         let path_str = path.to_string_lossy();
         let excluded = config.indexer.exclude_patterns.iter().any(|pattern| {
-            if pattern.starts_with('*') {
-                path_str.ends_with(&pattern[1..])
+            if let Some(suffix) = pattern.strip_prefix('*') {
+                path_str.ends_with(suffix)
             } else {
                 path_str.contains(pattern)
             }
@@ -227,8 +234,12 @@ fn scan_claude_dir(
             let relative = path.strip_prefix(claude_dir).unwrap_or(path);
             let rel_str = relative.to_string_lossy();
             // Match directory component or exact file name
-            rel_str.starts_with(excl) || rel_str.starts_with(&format!("{}/", excl))
-                || relative.file_name().map(|f| f.to_string_lossy() == *excl).unwrap_or(false)
+            rel_str.starts_with(excl)
+                || rel_str.starts_with(&format!("{}/", excl))
+                || relative
+                    .file_name()
+                    .map(|f| f.to_string_lossy() == *excl)
+                    .unwrap_or(false)
         });
 
         if excluded {
@@ -242,8 +253,8 @@ fn scan_claude_dir(
 
         // Apply global exclude patterns too
         let global_excluded = config.indexer.exclude_patterns.iter().any(|pattern| {
-            if pattern.starts_with('*') {
-                path_str.ends_with(&pattern[1..])
+            if let Some(suffix) = pattern.strip_prefix('*') {
+                path_str.ends_with(suffix)
             } else {
                 path_str.contains(pattern)
             }

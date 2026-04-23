@@ -14,7 +14,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Send a JSON-RPC message to the subprocess and read the response.
 fn send_jsonrpc(
@@ -89,7 +89,10 @@ fn test_mcp_initialize_and_list_tools() {
 
     let response = send_jsonrpc(&mut stdin, &mut reader, &init_request);
     if let Some(resp) = &response {
-        assert!(resp.get("result").is_some(), "initialize should have result");
+        assert!(
+            resp.get("result").is_some(),
+            "initialize should have result"
+        );
         let result = &resp["result"];
         assert_eq!(result["serverInfo"]["name"], "pgmcp");
     }
@@ -113,21 +116,40 @@ fn test_mcp_initialize_and_list_tools() {
 
     let response = send_jsonrpc(&mut stdin, &mut reader, &list_tools);
     if let Some(resp) = &response {
-        assert!(resp.get("result").is_some(), "tools/list should have result");
+        assert!(
+            resp.get("result").is_some(),
+            "tools/list should have result"
+        );
         let tools = resp["result"]["tools"].as_array().expect("tools array");
-        let tool_names: Vec<&str> = tools.iter()
+        let tool_names: Vec<&str> = tools
+            .iter()
             .map(|t| t["name"].as_str().expect("tool name"))
             .collect();
 
         // Verify expected tools are present
-        assert!(tool_names.contains(&"semantic_search"), "should have semantic_search");
-        assert!(tool_names.contains(&"text_search"), "should have text_search");
+        assert!(
+            tool_names.contains(&"semantic_search"),
+            "should have semantic_search"
+        );
+        assert!(
+            tool_names.contains(&"text_search"),
+            "should have text_search"
+        );
         assert!(tool_names.contains(&"grep"), "should have grep");
         assert!(tool_names.contains(&"read_file"), "should have read_file");
-        assert!(tool_names.contains(&"list_projects"), "should have list_projects");
-        assert!(tool_names.contains(&"project_tree"), "should have project_tree");
+        assert!(
+            tool_names.contains(&"list_projects"),
+            "should have list_projects"
+        );
+        assert!(
+            tool_names.contains(&"project_tree"),
+            "should have project_tree"
+        );
         assert!(tool_names.contains(&"file_info"), "should have file_info");
-        assert!(tool_names.contains(&"index_stats"), "should have index_stats");
+        assert!(
+            tool_names.contains(&"index_stats"),
+            "should have index_stats"
+        );
     }
 
     // Call index_stats tool
@@ -143,7 +165,10 @@ fn test_mcp_initialize_and_list_tools() {
 
     let response = send_jsonrpc(&mut stdin, &mut reader, &stats_call);
     if let Some(resp) = &response {
-        assert!(resp.get("result").is_some(), "index_stats should have result");
+        assert!(
+            resp.get("result").is_some(),
+            "index_stats should have result"
+        );
     }
 
     // Clean up
@@ -204,8 +229,10 @@ fn test_mcp_list_projects() {
 
     let response = send_jsonrpc(&mut stdin, &mut reader, &call);
     if let Some(resp) = &response {
-        assert!(resp.get("result").is_some() || resp.get("error").is_some(),
-            "should have result or error");
+        assert!(
+            resp.get("result").is_some() || resp.get("error").is_some(),
+            "should have result or error"
+        );
     }
 
     drop(stdin);

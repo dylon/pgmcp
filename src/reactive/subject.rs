@@ -2,7 +2,7 @@
 //!
 //! Emits values to all subscribers via a crossbeam channel.
 
-use crossbeam_channel::{bounded, Sender, Receiver};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use super::observable::Observable;
 

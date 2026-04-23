@@ -4,8 +4,8 @@
 //! - `{name}` → project names
 //! - `{path}` → file relative paths
 
-use rmcp::model::*;
 use rmcp::ErrorData as McpError;
+use rmcp::model::*;
 use sqlx::PgPool;
 
 /// Handle a completion request by matching the reference and argument.
@@ -39,10 +39,7 @@ pub async fn handle_complete(
     Ok(CompleteResult::new(completion))
 }
 
-async fn complete_project_names(
-    db_pool: &PgPool,
-    prefix: &str,
-) -> Result<Vec<String>, McpError> {
+async fn complete_project_names(db_pool: &PgPool, prefix: &str) -> Result<Vec<String>, McpError> {
     let names = crate::db::queries::list_project_names(db_pool)
         .await
         .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
@@ -56,17 +53,11 @@ async fn complete_project_names(
     Ok(filtered)
 }
 
-async fn complete_file_paths(
-    db_pool: &PgPool,
-    prefix: &str,
-) -> Result<Vec<String>, McpError> {
-    let paths = crate::db::queries::search_file_paths(
-        db_pool,
-        prefix,
-        CompletionInfo::MAX_VALUES as i32,
-    )
-    .await
-    .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
+async fn complete_file_paths(db_pool: &PgPool, prefix: &str) -> Result<Vec<String>, McpError> {
+    let paths =
+        crate::db::queries::search_file_paths(db_pool, prefix, CompletionInfo::MAX_VALUES as i32)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
 
     Ok(paths)
 }

@@ -40,25 +40,16 @@ pub async fn search(
     let limit = req.limit.unwrap_or(5);
 
     // Embed the query
-    let embedding = {
-        let model = state.embed_model.lock().await;
-        model
-            .embed(vec![&req.query], None)
-            .map_err(|e| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Embedding failed: {}", e),
-                )
-            })?
-            .into_iter()
-            .next()
-            .ok_or_else(|| {
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "No embedding returned".to_string(),
-                )
-            })?
-    };
+    let embedding = state
+        .query_embedder
+        .embed_query(req.query.clone())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Embedding failed: {}", e),
+            )
+        })?;
 
     let ef_search = state.config.load().vector.ef_search;
     let results = queries::semantic_search(
@@ -177,9 +168,9 @@ pub async fn context(
                     name: p.name,
                     path: p.path,
                     file_count: p.file_count.unwrap_or(0),
-                    last_scanned: p.last_scanned_at.map(|t| {
-                        t.format("%Y-%m-%d %H:%M:%S UTC").to_string()
-                    }),
+                    last_scanned: p
+                        .last_scanned_at
+                        .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string()),
                     languages: languages
                         .into_iter()
                         .map(|l| LanguageEntry {
@@ -193,14 +184,12 @@ pub async fn context(
             }))
         }
         None => {
-            let projects = queries::list_projects(&state.db_pool)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("List projects failed: {}", e),
-                    )
-                })?;
+            let projects = queries::list_projects(&state.db_pool).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("List projects failed: {}", e),
+                )
+            })?;
 
             Ok(Json(ContextResponse {
                 found: false,

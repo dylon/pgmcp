@@ -9,8 +9,8 @@
 //! - WatcherCommand processing for dynamic workspace watch/unwatch/rescan
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -20,7 +20,8 @@ use notify::{RecursiveMode, Watcher};
 use tracing::{error, info, warn};
 
 use crate::config::{self, Config};
-use crate::embed::pool::EmbedRequestKind;
+use crate::daemon_state::{DaemonLifecycle, DaemonPhase};
+use crate::embed::pool::EmbedIndexRequest;
 use crate::indexer::{config_watcher::WatcherCommand, scanner, watcher};
 use crate::reactive::operators;
 use crate::shutdown::ShutdownCoordinator;
@@ -48,11 +49,12 @@ pub fn start_indexing(
     config: Arc<ArcSwap<Config>>,
     db_pool: sqlx::PgPool,
     work_pool: Arc<WorkPool>,
-    embed_tx: Sender<EmbedRequestKind>,
+    embed_tx: Sender<EmbedIndexRequest>,
     stats: Arc<StatsTracker>,
     shutdown: ShutdownCoordinator,
     project_overrides: Arc<DashMap<PathBuf, config::ProjectOverride>>,
     watcher_cmd_rx: crossbeam_channel::Receiver<WatcherCommand>,
+    lifecycle: DaemonLifecycle,
 ) -> Result<IndexerHandle, crate::error::PgmcpError> {
     let config_snapshot = config.load();
     let project_roots: Arc<DashMap<PathBuf, scanner::ProjectRoot>> = Arc::new(DashMap::new());
@@ -93,54 +95,41 @@ pub fn start_indexing(
                     let cfg = config_for_filter.load();
 
                     // Detect .pgmcp.toml changes → update override cache
-                    if event.path.file_name()
-                        == Some(std::ffi::OsStr::new(".pgmcp.toml"))
+                    if event.path.file_name() == Some(std::ffi::OsStr::new(".pgmcp.toml"))
+                        && let Some(project_root) = event.path.parent()
                     {
-                        if let Some(project_root) = event.path.parent() {
-                            match event.kind {
-                                watcher::FileEventKind::Create
-                                | watcher::FileEventKind::Modify => {
-                                    if let Some(ovr) =
-                                        config::ProjectOverride::load(project_root)
-                                    {
-                                        project_overrides_for_filter.insert(
-                                            project_root.to_path_buf(),
-                                            ovr,
-                                        );
-                                        info!(
-                                            path = %project_root.display(),
-                                            "Loaded project config override"
-                                        );
-                                    }
-                                }
-                                watcher::FileEventKind::Remove => {
+                        match event.kind {
+                            watcher::FileEventKind::Create | watcher::FileEventKind::Modify => {
+                                if let Some(ovr) = config::ProjectOverride::load(project_root) {
                                     project_overrides_for_filter
-                                        .remove(&project_root.to_path_buf());
+                                        .insert(project_root.to_path_buf(), ovr);
                                     info!(
                                         path = %project_root.display(),
-                                        "Removed project config override"
+                                        "Loaded project config override"
                                     );
                                 }
                             }
+                            watcher::FileEventKind::Remove => {
+                                project_overrides_for_filter.remove(&project_root.to_path_buf());
+                                info!(
+                                    path = %project_root.display(),
+                                    "Removed project config override"
+                                );
+                            }
                         }
-                        // Fall through — still index the .pgmcp.toml as a regular file
                     }
+                    // Fall through — still index the .pgmcp.toml as a regular file
 
                     // Look up project override for this file
-                    let project_override = scanner::find_project_root(
-                        &event.path,
-                        &project_roots_for_filter,
-                    )
-                    .and_then(|(root, _)| {
-                        project_overrides_for_filter
-                            .get(&root)
-                            .map(|r| r.clone())
-                    });
+                    let project_override =
+                        scanner::find_project_root(&event.path, &project_roots_for_filter)
+                            .and_then(|(root, _)| {
+                                project_overrides_for_filter.get(&root).map(|r| r.clone())
+                            });
 
                     // Extension check: global OR project-level file_types
                     if event.kind != watcher::FileEventKind::Remove {
-                        let global_match =
-                            cfg.indexer.is_configured_extension(&event.path);
+                        let global_match = cfg.indexer.is_configured_extension(&event.path);
                         let project_match = project_override
                             .as_ref()
                             .and_then(|o| o.indexer.as_ref())
@@ -171,9 +160,7 @@ pub fn start_indexing(
                             .as_ref()
                             .and_then(|o| o.indexer.as_ref())
                             .and_then(|i| i.exclude_patterns.as_ref())
-                            .map(|patterns| {
-                                patterns.iter().any(|p| check_pattern(p, &path_str))
-                            })
+                            .map(|patterns| patterns.iter().any(|p| check_pattern(p, &path_str)))
                             .unwrap_or(false);
 
                     if excluded {
@@ -183,7 +170,9 @@ pub fn start_indexing(
                     if tx.send(event).is_err() {
                         break;
                     }
-                    stats_for_filter.watcher_events_filtered.fetch_add(1, Ordering::Relaxed);
+                    stats_for_filter
+                        .watcher_events_filtered
+                        .fetch_add(1, Ordering::Relaxed);
                 }
             })
             .expect("Failed to spawn event filter thread");
@@ -210,9 +199,11 @@ pub fn start_indexing(
     let project_overrides_for_events = Arc::clone(&project_overrides);
 
     let rt_for_events = rt_handle.clone();
-    let event_sub = crate::reactive::observable::Observable::from_receiver(debounced_rx)
-        .subscribe(move |event: watcher::FileEvent| {
-            stats_for_debounce.watcher_events_debounced.fetch_add(1, Ordering::Relaxed);
+    let event_sub = crate::reactive::observable::Observable::from_receiver(debounced_rx).subscribe(
+        move |event: watcher::FileEvent| {
+            stats_for_debounce
+                .watcher_events_debounced
+                .fetch_add(1, Ordering::Relaxed);
 
             let path = event.path.clone();
             let config = Arc::clone(&config_for_events);
@@ -241,7 +232,8 @@ pub fn start_indexing(
                 },
                 Priority::High,
             );
-        });
+        },
+    );
 
     // 5. Start initial scan in background
     let config_for_scan = Arc::clone(&config);
@@ -253,6 +245,7 @@ pub fn start_indexing(
     let project_overrides_for_scan = Arc::clone(&project_overrides);
     let rt_for_scan = rt_handle.clone();
 
+    let lifecycle_for_scan = lifecycle;
     std::thread::Builder::new()
         .name("pgmcp-scanner".into())
         .spawn(move || {
@@ -263,8 +256,7 @@ pub fn start_indexing(
             let metadata_map: std::collections::HashMap<
                 String,
                 crate::db::queries::IndexedFileMeta,
-            > = match rt_for_scan
-                .block_on(crate::db::queries::get_all_file_metadata(&db_for_scan))
+            > = match rt_for_scan.block_on(crate::db::queries::get_all_file_metadata(&db_for_scan))
             {
                 Ok(metas) => {
                     let len = metas.len();
@@ -294,12 +286,7 @@ pub fn start_indexing(
             let scan_handle = std::thread::Builder::new()
                 .name("pgmcp-scan-walk".into())
                 .spawn(move || {
-                    scanner::scan_workspaces(
-                        &scan_config,
-                        file_tx,
-                        &scan_roots,
-                        &scan_overrides,
-                    );
+                    scanner::scan_workspaces(&scan_config, file_tx, &scan_roots, &scan_overrides);
                 })
                 .expect("Failed to spawn scan walk thread");
 
@@ -315,18 +302,18 @@ pub fn start_indexing(
                 seen_paths.insert(path.to_string_lossy().into_owned());
 
                 // Level 1: metadata-based skip check (stat only, no file read)
-                if let Some(db_meta) = metadata_map.get(&*path.to_string_lossy()) {
-                    if let Ok(fs_meta) = std::fs::metadata(&path) {
-                        let fs_size = fs_meta.len() as i64;
-                        let fs_mtime: chrono::DateTime<chrono::Utc> = fs_meta
-                            .modified()
-                            .map(Into::into)
-                            .unwrap_or_else(|_| chrono::Utc::now());
+                if let Some(db_meta) = metadata_map.get(&*path.to_string_lossy())
+                    && let Ok(fs_meta) = std::fs::metadata(&path)
+                {
+                    let fs_size = fs_meta.len() as i64;
+                    let fs_mtime: chrono::DateTime<chrono::Utc> = fs_meta
+                        .modified()
+                        .map(Into::into)
+                        .unwrap_or_else(|_| chrono::Utc::now());
 
-                        if fs_size == db_meta.size_bytes && fs_mtime <= db_meta.modified_at {
-                            skipped += 1;
-                            continue;
-                        }
+                    if fs_size == db_meta.size_bytes && fs_mtime <= db_meta.modified_at {
+                        skipped += 1;
+                        continue;
                     }
                 }
 
@@ -387,6 +374,22 @@ pub fn start_indexing(
                 stats_for_scan
                     .files_stale_removed
                     .fetch_add(stale_count, Ordering::Relaxed);
+
+                // Clean up projects left empty after stale file removal
+                match rt_for_scan
+                    .block_on(crate::db::queries::cleanup_orphaned_projects(&db_for_scan))
+                {
+                    Ok(deleted) if deleted > 0 => {
+                        info!(
+                            projects_removed = deleted,
+                            "Cleaned up orphaned projects after stale file removal"
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!(error = %e, "Failed to clean up orphaned projects");
+                    }
+                }
             }
 
             stats_for_scan
@@ -403,6 +406,9 @@ pub fn start_indexing(
                 stale_removed = stale_count,
                 "Initial scan complete"
             );
+
+            // Signal that the daemon is ready for full operation
+            lifecycle_for_scan.transition(DaemonPhase::Ready);
         })
         .expect("Failed to spawn scanner thread");
 
@@ -460,6 +466,27 @@ pub fn start_indexing(
                                 }
                             }
                         }
+                        // Clean up DB: delete all projects under this workspace path
+                        let ws = path.to_string_lossy().to_string();
+                        match rt_for_cmd.block_on(
+                            crate::db::queries::delete_projects_by_workspace(&db_for_cmd, &ws)
+                        ) {
+                            Ok(deleted) if deleted > 0 => {
+                                info!(
+                                    workspace = %path.display(),
+                                    projects_removed = deleted,
+                                    "Cleaned up projects for removed workspace (cascaded to files, chunks, commits)"
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                error!(
+                                    workspace = %path.display(),
+                                    error = %e,
+                                    "Failed to clean up projects for removed workspace"
+                                );
+                            }
+                        }
                     }
                     WatcherCommand::Rescan(path) => {
                         rescan_workspace(
@@ -489,8 +516,8 @@ pub fn start_indexing(
 
 /// Check if a glob-like pattern matches a path string.
 fn check_pattern(pattern: &str, path_str: &str) -> bool {
-    if pattern.starts_with('*') {
-        path_str.ends_with(&pattern[1..])
+    if let Some(suffix) = pattern.strip_prefix('*') {
+        path_str.ends_with(suffix)
     } else {
         path_str.contains(pattern)
     }
@@ -503,7 +530,7 @@ fn rescan_workspace(
     config: &Arc<ArcSwap<Config>>,
     work_pool: &Arc<WorkPool>,
     db_pool: &sqlx::PgPool,
-    embed_tx: &Sender<EmbedRequestKind>,
+    embed_tx: &Sender<EmbedIndexRequest>,
     stats: &Arc<StatsTracker>,
     project_roots: &Arc<DashMap<PathBuf, scanner::ProjectRoot>>,
     project_overrides: &Arc<DashMap<PathBuf, config::ProjectOverride>>,
@@ -571,11 +598,11 @@ fn rescan_workspace(
 }
 
 pub(crate) async fn handle_file_event(
-    path: &PathBuf,
+    path: &Path,
     kind: &watcher::FileEventKind,
     config: &Config,
     db_pool: &sqlx::PgPool,
-    embed_tx: &Sender<EmbedRequestKind>,
+    embed_tx: &Sender<EmbedIndexRequest>,
     stats: &StatsTracker,
     project_roots: &DashMap<PathBuf, scanner::ProjectRoot>,
     project_overrides: &DashMap<PathBuf, config::ProjectOverride>,
@@ -616,12 +643,7 @@ pub(crate) async fn handle_file_event(
                     }
                     None => {
                         // No project root found, use the workspace path
-                        let workspace = config
-                            .workspace
-                            .paths
-                            .first()
-                            .cloned()
-                            .unwrap_or_default();
+                        let workspace = config.workspace.paths.first().cloned().unwrap_or_default();
                         match crate::db::queries::upsert_project(
                             db_pool, &workspace, &workspace, "default",
                         )
@@ -657,9 +679,7 @@ pub(crate) async fn handle_file_event(
             {
                 let path_str = path.to_string_lossy();
                 error!(path = %path_str, error = %e, "Failed to process file");
-                stats
-                    .files_failed
-                    .fetch_add(1, Ordering::Relaxed);
+                stats.files_failed.fetch_add(1, Ordering::Relaxed);
             }
         }
     }

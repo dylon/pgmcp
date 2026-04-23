@@ -1,0 +1,9 @@
+[alias]
+# Convenience wrappers for individual verification gates. The full verify
+# sequence (including formatting, CPU-only build, and GPU smokes) lives in
+# `scripts/verify.sh` and is enforced by the pre-push hook at `.githooks/pre-push`.
+# Enable the hook per clone with:  git config core.hooksPath .githooks
+verify-build  = "build --all-targets"
+verify-clippy = "clippy --all-targets -- -D warnings"
+verify-test   = "test --release --bin pgmcp"
+smoke         = "run --release --example gpu_smoke"

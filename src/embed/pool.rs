@@ -1,21 +1,23 @@
-//! Dedicated embedding thread pool with batch processing.
+//! Dedicated embedding thread pool with batch processing and priority query channel.
 //!
 //! Each embedding thread owns its own TextEmbedding model instance (no sharing, no locks).
-//! A bounded crossbeam channel provides backpressure.
+//! Two bounded crossbeam channels provide backpressure:
+//! - **query channel** (priority): MCP/API query-time embeddings, drained first
+//! - **index channel**: bulk file/commit chunk embeddings
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 
-use crossbeam_channel::{bounded, Sender, Receiver};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use tracing::{debug, error, info};
 
 use crate::config::EmbeddingsConfig;
 use crate::error::{PgmcpError, Result};
 use crate::stats::tracker::StatsTracker;
 
-/// Unified embedding request: either a file chunk or a git commit chunk.
-pub enum EmbedRequestKind {
+/// Indexing embedding request: either a file chunk or a git commit chunk.
+pub enum EmbedIndexRequest {
     /// File chunks with two-phase commit.
     File(EmbedRequest),
     /// Git commit chunks.
@@ -53,9 +55,40 @@ pub struct ChunkData {
     pub end_line: i32,
 }
 
-/// Dedicated embedding thread pool.
+/// A query-time embedding request with a oneshot reply channel.
+pub struct EmbedQueryRequest {
+    pub text: String,
+    pub reply: tokio::sync::oneshot::Sender<Result<Vec<f32>>>,
+}
+
+/// Cloneable handle for submitting query-time embedding requests.
+/// Routes through the embed pool's priority query channel.
+#[derive(Clone)]
+pub struct QueryEmbedder {
+    tx: Sender<EmbedQueryRequest>,
+}
+
+impl QueryEmbedder {
+    /// Embed a single query string. Returns the embedding vector.
+    /// Blocks until a pool worker processes the request.
+    pub async fn embed_query(&self, text: String) -> Result<Vec<f32>> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EmbedQueryRequest {
+                text,
+                reply: reply_tx,
+            })
+            .map_err(|_| PgmcpError::Embedding("Embed pool shut down".into()))?;
+        reply_rx
+            .await
+            .map_err(|_| PgmcpError::Embedding("Embed worker dropped reply".into()))?
+    }
+}
+
+/// Dedicated embedding thread pool with dual channels (query priority + index).
 pub struct EmbeddingPool {
-    tx: Sender<EmbedRequestKind>,
+    index_tx: Sender<EmbedIndexRequest>,
+    query_tx: Sender<EmbedQueryRequest>,
     workers: Vec<JoinHandle<()>>,
 }
 
@@ -68,7 +101,8 @@ impl EmbeddingPool {
     ) -> Result<Self> {
         let pool_size = config.pool_size;
         let batch_size = config.batch_size;
-        let (tx, rx) = bounded::<EmbedRequestKind>(batch_size * 2);
+        let (index_tx, index_rx) = bounded::<EmbedIndexRequest>(batch_size * 2);
+        let (query_tx, query_rx) = bounded::<EmbedQueryRequest>(8);
 
         // Capture the tokio runtime handle so embedding workers can run async DB queries.
         let rt_handle = tokio::runtime::Handle::current();
@@ -76,7 +110,8 @@ impl EmbeddingPool {
         let mut workers = Vec::with_capacity(pool_size);
 
         for i in 0..pool_size {
-            let rx = rx.clone();
+            let index_rx = index_rx.clone();
+            let query_rx = query_rx.clone();
             let config = config.clone();
             let stats = Arc::clone(&stats);
             let shutdown = Arc::clone(&shutdown);
@@ -85,25 +120,44 @@ impl EmbeddingPool {
             let handle = thread::Builder::new()
                 .name(format!("pgmcp-embed-{}", i))
                 .spawn(move || {
-                    embedding_worker(i, rx, &config, &stats, &shutdown, &rt);
+                    embedding_worker(i, index_rx, query_rx, &config, &stats, &shutdown, &rt);
                 })
-                .map_err(|e| PgmcpError::Other(format!("Failed to spawn embedding worker: {}", e)))?;
+                .map_err(|e| {
+                    PgmcpError::Other(format!("Failed to spawn embedding worker: {}", e))
+                })?;
 
             workers.push(handle);
         }
 
         info!(pool_size, "Embedding pool started");
-        Ok(Self { tx, workers })
+        Ok(Self {
+            index_tx,
+            query_tx,
+            workers,
+        })
     }
 
-    /// Get a sender for submitting embedding requests.
-    pub fn sender(&self) -> Sender<EmbedRequestKind> {
-        self.tx.clone()
+    /// Sender for indexing requests (file chunks, git commits).
+    pub fn index_sender(&self) -> Sender<EmbedIndexRequest> {
+        self.index_tx.clone()
+    }
+
+    /// Backward-compatible alias for `index_sender()`.
+    pub fn sender(&self) -> Sender<EmbedIndexRequest> {
+        self.index_sender()
+    }
+
+    /// Query embedder handle for MCP/API query-time embeddings.
+    pub fn query_embedder(&self) -> QueryEmbedder {
+        QueryEmbedder {
+            tx: self.query_tx.clone(),
+        }
     }
 
     /// Signal shutdown and return worker handles for joining with custom timeout logic.
     pub fn shutdown_take_handles(self) -> Vec<JoinHandle<()>> {
-        drop(self.tx);
+        drop(self.index_tx);
+        drop(self.query_tx);
         self.workers
     }
 
@@ -118,7 +172,8 @@ impl EmbeddingPool {
 
 fn embedding_worker(
     id: usize,
-    rx: Receiver<EmbedRequestKind>,
+    index_rx: Receiver<EmbedIndexRequest>,
+    query_rx: Receiver<EmbedQueryRequest>,
     config: &EmbeddingsConfig,
     stats: &StatsTracker,
     shutdown: &AtomicBool,
@@ -136,36 +191,72 @@ fn embedding_worker(
     debug!(worker_id = id, "Embedding worker started");
 
     loop {
-        // Check shutdown before blocking on recv
         if shutdown.load(Ordering::Acquire) {
             break;
         }
 
-        // Use recv_timeout so we can periodically check the shutdown flag
-        let request = match rx.recv_timeout(std::time::Duration::from_millis(500)) {
-            Ok(req) => req,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-        };
-
-        let start = std::time::Instant::now();
-
-        match request {
-            EmbedRequestKind::File(file_req) => {
-                process_file_request(&model, file_req, stats, rt, id);
-            }
-            EmbedRequestKind::Commit(commit_req) => {
-                process_commit_request(&model, commit_req, stats, rt, id);
+        // Priority: drain ALL pending query requests first
+        loop {
+            match query_rx.try_recv() {
+                Ok(req) => process_query_request(&model, req, stats),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => return,
             }
         }
 
-        let elapsed = start.elapsed().as_millis() as u64;
-        stats
-            .embedding_duration_ms
-            .fetch_add(elapsed, Ordering::Relaxed);
+        // Then select between query (priority) and index channels, with timeout
+        crossbeam_channel::select! {
+            recv(query_rx) -> msg => {
+                match msg {
+                    Ok(req) => process_query_request(&model, req, stats),
+                    Err(_) => return,
+                }
+            }
+            recv(index_rx) -> msg => {
+                match msg {
+                    Ok(req) => {
+                        let start = std::time::Instant::now();
+                        match req {
+                            EmbedIndexRequest::File(file_req) => {
+                                process_file_request(&model, file_req, stats, rt, id);
+                            }
+                            EmbedIndexRequest::Commit(commit_req) => {
+                                process_commit_request(&model, commit_req, stats, rt, id);
+                            }
+                        }
+                        let elapsed = start.elapsed().as_millis() as u64;
+                        stats.embedding_duration_ms.fetch_add(elapsed, Ordering::Relaxed);
+                    }
+                    Err(_) => return,
+                }
+            }
+            default(std::time::Duration::from_millis(500)) => {}
+        }
     }
 
     debug!(worker_id = id, "Embedding worker exiting");
+}
+
+fn process_query_request(
+    model: &fastembed::TextEmbedding,
+    request: EmbedQueryRequest,
+    stats: &StatsTracker,
+) {
+    let result = model
+        .embed(vec![&request.text], None)
+        .map_err(|e| PgmcpError::Embedding(format!("Embedding failed: {}", e)))
+        .and_then(|mut vecs| {
+            vecs.pop()
+                .ok_or_else(|| PgmcpError::Embedding("No embedding returned".into()))
+        });
+
+    if result.is_ok() {
+        stats.embed_query_count.fetch_add(1, Ordering::Relaxed);
+    } else {
+        stats.embed_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    let _ = request.reply.send(result);
 }
 
 fn process_file_request(
@@ -208,19 +299,18 @@ fn process_file_request(
                     }
                 }
 
-                if all_chunks_ok {
-                    if let Err(e) = crate::db::queries::finalize_file_hash(
-                        &db_pool, file_id, content_hash,
-                    ).await {
-                        error!(file_id, error = %e, "Failed to finalize content hash");
-                    }
+                if all_chunks_ok
+                    && let Err(e) =
+                        crate::db::queries::finalize_file_hash(&db_pool, file_id, content_hash)
+                            .await
+                {
+                    error!(file_id, error = %e, "Failed to finalize content hash");
                 }
             });
 
-            stats.chunks_embedded.fetch_add(
-                chunks.len() as u64,
-                Ordering::Relaxed,
-            );
+            stats
+                .chunks_embedded
+                .fetch_add(chunks.len() as u64, Ordering::Relaxed);
             stats.embed_file_batches.fetch_add(1, Ordering::Relaxed);
         }
         Err(e) => {
@@ -266,10 +356,9 @@ fn process_commit_request(
                 }
             });
 
-            stats.chunks_embedded.fetch_add(
-                chunks.len() as u64,
-                Ordering::Relaxed,
-            );
+            stats
+                .chunks_embedded
+                .fetch_add(chunks.len() as u64, Ordering::Relaxed);
             stats.embed_commit_batches.fetch_add(1, Ordering::Relaxed);
         }
         Err(e) => {

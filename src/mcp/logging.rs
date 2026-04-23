@@ -3,13 +3,13 @@
 //! Uses atomic level filtering for lock-free reads from indexer threads,
 //! and `ArcSwap<Vec<Peer>>` for lock-free peer list updates.
 
-use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use arc_swap::ArcSwap;
+use rmcp::RoleServer;
 use rmcp::model::{LoggingLevel, LoggingMessageNotificationParam};
 use rmcp::service::Peer;
-use rmcp::RoleServer;
 
 /// Maps `LoggingLevel` to a u8 for atomic comparison.
 fn level_to_u8(level: &LoggingLevel) -> u8 {
@@ -33,6 +33,12 @@ pub struct LogBroadcaster {
     level: AtomicU8,
     /// Connected peers. Uses ArcSwap for lock-free reads and COW updates.
     peers: ArcSwap<Vec<Peer<RoleServer>>>,
+}
+
+impl Default for LogBroadcaster {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LogBroadcaster {
@@ -76,8 +82,7 @@ impl LogBroadcaster {
             return;
         }
 
-        let param = LoggingMessageNotificationParam::new(level, data)
-            .with_logger(logger);
+        let param = LoggingMessageNotificationParam::new(level, data).with_logger(logger);
 
         for peer in peers.iter() {
             if peer.is_transport_closed() {

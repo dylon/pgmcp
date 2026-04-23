@@ -1,0 +1,269 @@
+//! Reactive daemon lifecycle state machine.
+//!
+//! Combines an atomic state register (lock-free reads from any thread)
+//! with reactive event emission (subscribers react to phase transitions).
+//!
+//! State register: AtomicU8 — always reflects the current phase, readable
+//! even if the daemon is defunct or the channel is disconnected.
+//!
+//! Event emitter: Subject<DaemonPhase> — broadcasts transitions to all
+//! subscribers. Components can use crossbeam::select! to multiplex
+//! lifecycle events with their own work channels.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use crossbeam_channel::Receiver;
+
+use crate::reactive::subject::Subject;
+
+/// Ordered lifecycle phases.
+/// repr(u8) for AtomicU8 storage.
+/// PartialOrd enables `is_at_least()` comparisons.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DaemonPhase {
+    /// DB, model, pools created; not yet scanning files
+    Initializing = 0,
+    /// Initial file scan + embedding in progress
+    Scanning = 1,
+    /// Initial scan complete; all systems nominal
+    Ready = 2,
+    /// Orderly shutdown in progress
+    Terminating = 3,
+    /// Unrecoverable error; daemon is defunct
+    Defunct = 4,
+}
+
+impl DaemonPhase {
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Initializing,
+            1 => Self::Scanning,
+            2 => Self::Ready,
+            3 => Self::Terminating,
+            _ => Self::Defunct,
+        }
+    }
+
+    /// Human-readable label for logging.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Initializing => "initializing",
+            Self::Scanning => "scanning",
+            Self::Ready => "ready",
+            Self::Terminating => "terminating",
+            Self::Defunct => "defunct",
+        }
+    }
+}
+
+impl std::fmt::Display for DaemonPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Shared handle for the daemon lifecycle.
+///
+/// Clone-cheap (all fields are Arc). Pass to any component that needs
+/// to read, transition, or subscribe to lifecycle state.
+#[derive(Clone)]
+pub struct DaemonLifecycle {
+    /// Atomic state register — always reflects current phase.
+    phase: Arc<AtomicU8>,
+    /// Reactive event channel — broadcasts phase transitions.
+    subject: Arc<Subject<DaemonPhase>>,
+}
+
+impl Default for DaemonLifecycle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DaemonLifecycle {
+    pub fn new() -> Self {
+        Self {
+            phase: Arc::new(AtomicU8::new(DaemonPhase::Initializing as u8)),
+            subject: Arc::new(Subject::new(16)),
+        }
+    }
+
+    /// Atomically transition to a new phase and broadcast the event.
+    ///
+    /// Uses `fetch_max` to enforce monotonic forward transitions —
+    /// a component cannot move the daemon backwards (e.g. Ready → Scanning).
+    /// Exception: `Defunct` (4) can be set from any state.
+    ///
+    /// Returns the previous phase.
+    pub fn transition(&self, to: DaemonPhase) -> DaemonPhase {
+        let prev = self.phase.fetch_max(to as u8, Ordering::AcqRel);
+        let prev_phase = DaemonPhase::from_u8(prev);
+        if prev_phase != to && prev < to as u8 {
+            tracing::info!(
+                from = %prev_phase,
+                to = %to,
+                "Daemon phase transition"
+            );
+            self.subject.next(to);
+        }
+        prev_phase
+    }
+
+    /// Current phase (lock-free atomic read).
+    /// Safe to call from any thread, any time — even if daemon is defunct.
+    pub fn current(&self) -> DaemonPhase {
+        DaemonPhase::from_u8(self.phase.load(Ordering::Acquire))
+    }
+
+    /// Check if daemon has reached at least the given phase.
+    pub fn is_at_least(&self, phase: DaemonPhase) -> bool {
+        self.current() >= phase
+    }
+
+    /// True if the daemon is in a healthy running state (Ready).
+    #[allow(dead_code)] // Used by tests and future health-check endpoints
+    pub fn is_healthy(&self) -> bool {
+        self.current() == DaemonPhase::Ready
+    }
+
+    /// True if the daemon is shutting down or defunct.
+    pub fn is_stopping(&self) -> bool {
+        self.current() >= DaemonPhase::Terminating
+    }
+
+    /// Subscribe to phase transition events.
+    ///
+    /// Returns a crossbeam Receiver. Use in `crossbeam::select!` to
+    /// multiplex with work channels, or iterate to react to each transition.
+    #[allow(dead_code)] // Used by tests and future reactive components
+    pub fn subscribe(&self) -> Receiver<DaemonPhase> {
+        self.subject.receiver()
+    }
+
+    /// Block until the daemon reaches at least the given phase.
+    ///
+    /// Returns `true` if the target phase was reached.
+    /// Returns `false` if the daemon became defunct or the channel disconnected
+    /// before reaching the target.
+    #[allow(dead_code)] // Used by tests and future blocking waiters
+    pub fn wait_for(&self, target: DaemonPhase) -> bool {
+        let current = self.current();
+        // Already at or past the target — but Terminating/Defunct mean failure
+        // unless the target itself is Terminating/Defunct.
+        if current >= target {
+            // If we reached the exact target or a healthy superset, succeed.
+            // If we overshot into Terminating/Defunct while waiting for a
+            // healthy phase (Scanning/Ready), that's a failure.
+            return current == target
+                || target >= DaemonPhase::Terminating
+                || current < DaemonPhase::Terminating;
+        }
+        let rx = self.subscribe();
+        for phase in rx {
+            if phase == target {
+                return true;
+            }
+            // If we reach a healthy phase past the target, succeed
+            if phase > target && phase < DaemonPhase::Terminating {
+                return true;
+            }
+            // If we hit Terminating/Defunct while waiting for a healthy phase, fail
+            if phase >= DaemonPhase::Terminating && target < DaemonPhase::Terminating {
+                return false;
+            }
+        }
+        // Channel disconnected — final check
+        let final_phase = self.current();
+        final_phase >= target
+            && (target >= DaemonPhase::Terminating || final_phase < DaemonPhase::Terminating)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_initial_phase() {
+        let lc = DaemonLifecycle::new();
+        assert_eq!(lc.current(), DaemonPhase::Initializing);
+        assert!(!lc.is_at_least(DaemonPhase::Ready));
+        assert!(!lc.is_healthy());
+        assert!(!lc.is_stopping());
+    }
+
+    #[test]
+    fn test_forward_transitions() {
+        let lc = DaemonLifecycle::new();
+        let prev = lc.transition(DaemonPhase::Scanning);
+        assert_eq!(prev, DaemonPhase::Initializing);
+        assert_eq!(lc.current(), DaemonPhase::Scanning);
+
+        lc.transition(DaemonPhase::Ready);
+        assert_eq!(lc.current(), DaemonPhase::Ready);
+        assert!(lc.is_at_least(DaemonPhase::Ready));
+        assert!(lc.is_healthy());
+    }
+
+    #[test]
+    fn test_backward_transition_rejected() {
+        let lc = DaemonLifecycle::new();
+        lc.transition(DaemonPhase::Ready);
+        let prev = lc.transition(DaemonPhase::Scanning); // backward — should be rejected
+        assert_eq!(prev, DaemonPhase::Ready); // fetch_max kept Ready
+        assert_eq!(lc.current(), DaemonPhase::Ready); // still Ready
+    }
+
+    #[test]
+    fn test_defunct_from_any_state() {
+        let lc = DaemonLifecycle::new();
+        lc.transition(DaemonPhase::Ready);
+        lc.transition(DaemonPhase::Defunct);
+        assert_eq!(lc.current(), DaemonPhase::Defunct);
+        assert!(lc.is_stopping());
+    }
+
+    #[test]
+    fn test_subscriber_receives_transitions() {
+        let lc = DaemonLifecycle::new();
+        let rx = lc.subscribe();
+        lc.transition(DaemonPhase::Scanning);
+        lc.transition(DaemonPhase::Ready);
+        assert_eq!(
+            rx.recv().expect("should receive Scanning"),
+            DaemonPhase::Scanning
+        );
+        assert_eq!(rx.recv().expect("should receive Ready"), DaemonPhase::Ready);
+    }
+
+    #[test]
+    fn test_wait_for_already_reached() {
+        let lc = DaemonLifecycle::new();
+        lc.transition(DaemonPhase::Ready);
+        assert!(lc.wait_for(DaemonPhase::Ready)); // immediate
+    }
+
+    #[test]
+    fn test_wait_for_with_thread() {
+        let lc = DaemonLifecycle::new();
+        let lc_clone = lc.clone();
+        let handle = std::thread::spawn(move || lc_clone.wait_for(DaemonPhase::Ready));
+        // Small delay then transition
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        lc.transition(DaemonPhase::Scanning);
+        lc.transition(DaemonPhase::Ready);
+        assert!(handle.join().expect("thread should not panic"));
+    }
+
+    #[test]
+    fn test_wait_for_defunct_returns_false() {
+        let lc = DaemonLifecycle::new();
+        let lc_clone = lc.clone();
+        let handle = std::thread::spawn(move || lc_clone.wait_for(DaemonPhase::Ready));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        lc.transition(DaemonPhase::Defunct);
+        assert!(!handle.join().expect("thread should not panic"));
+    }
+}

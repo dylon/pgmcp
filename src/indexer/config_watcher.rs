@@ -7,8 +7,8 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::Sender;
@@ -61,8 +61,8 @@ pub fn start_config_watcher(
 
     let tx = event_tx;
     let filename_for_watcher = config_filename;
-    let mut watcher = notify::recommended_watcher(
-        move |res: Result<notify::Event, notify::Error>| {
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
                 match event.kind {
                     notify::EventKind::Create(_)
@@ -77,13 +77,11 @@ pub fn start_config_watcher(
                     _ => {}
                 }
             }
-        },
-    )?;
+        })?;
 
     // Create config dir if it doesn't exist
     if !config_dir.exists() {
-        std::fs::create_dir_all(&config_dir)
-            .map_err(|e| PgmcpError::file_io(&config_dir, e))?;
+        std::fs::create_dir_all(&config_dir).map_err(|e| PgmcpError::file_io(&config_dir, e))?;
     }
 
     watcher.watch(&config_dir, RecursiveMode::NonRecursive)?;
@@ -92,7 +90,14 @@ pub fn start_config_watcher(
     let handler = std::thread::Builder::new()
         .name("pgmcp-config-watcher".into())
         .spawn(move || {
-            config_watcher_loop(config, config_path, event_rx, watcher_cmd_tx, shutdown, stats);
+            config_watcher_loop(
+                config,
+                config_path,
+                event_rx,
+                watcher_cmd_tx,
+                shutdown,
+                stats,
+            );
         })
         .map_err(|e| PgmcpError::Other(format!("Failed to spawn config watcher thread: {}", e)))?;
 

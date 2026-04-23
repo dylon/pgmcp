@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Pre-push hook. Runs scripts/verify.sh and blocks the push on failure.
+#
+# Activate once per clone with:
+#   git config core.hooksPath .githooks
+#
+# Bypass is `git push --no-verify` (emergencies only).
+
+set -euo pipefail
+exec "$(git rev-parse --show-toplevel)/scripts/verify.sh"

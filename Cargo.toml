@@ -5,11 +5,16 @@ edition = "2024"
 description = "PostgreSQL + pgvector MCP File Indexer for Claude Code"
 license = "Apache-2.0"
 
+# CUDA is a mandatory dependency. The daemon is split into a CUDA backend
+# (GPU FCM) and a CPU fallback backend that cooperate at runtime — both
+# are always compiled. A pure-CPU build mode is intentionally NOT provided;
+# the FcmBackend trait in src/cron/fcm_backend/ is the seam where a future
+# non-CUDA implementation could be plugged in without feature gates.
 [features]
-default = []
-cuda = ["ort/cuda"]
 
 [dependencies]
+# ONNX Runtime — GPU-accelerated embedding inference via CUDA execution provider.
+# CUDA is mandatory; `ort/cuda` is unconditional.
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -24,7 +29,7 @@ pgvector = { version = "0.4", features = ["sqlx"] }
 
 # Embeddings
 fastembed = "4"
-ort = { version = "=2.0.0-rc.9", default-features = false }
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["cuda"] }
 
 # Filesystem
 notify = "7"
@@ -51,7 +56,6 @@ clap = { version = "4", features = ["derive"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tracing-appender = "0.2"
 
 # Metrics
 prometheus = "0.13"
@@ -68,6 +72,18 @@ anyhow = "1"
 regex = "1"
 libc = "0.2"
 uuid = { version = "1", features = ["v4"] }
+rand = "0.9"
+ndarray = { version = "0.16", features = ["blas"] }
+petgraph = "0.7"
+memmap2 = "0.9"
+futures = "0.3"
+tempfile = "3"
+cudarc = { version = "0.19.4", features = ["cublas", "cublaslt", "cuda-version-from-build-system", "f16"] }
+half = "2"
+heed = "0.20"
+bincode = "1"
+blas-src = { version = "0.10", features = ["intel-mkl"] }
+intel-mkl-src = { version = "0.8", features = ["mkl-dynamic-lp64-seq"] }
 
 [dev-dependencies]
 proptest = "1"
@@ -85,3 +101,7 @@ path = "tests/integration.rs"
 [[test]]
 name = "mcp_protocol"
 path = "tests/mcp_protocol.rs"
+
+[[test]]
+name = "gpu_fallback_smoke"
+path = "tests/gpu_fallback_smoke.rs"

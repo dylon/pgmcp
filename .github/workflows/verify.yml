@@ -1,0 +1,33 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# CUDA is mandatory. CI requires a self-hosted runner with the CUDA toolkit
+# (nvcc + libcudart + libcublas + libcublasLt) and an NVIDIA GPU available.
+# The gates mirror `scripts/verify.sh` exactly.
+
+jobs:
+  cuda:
+    name: CUDA gates
+    runs-on: [self-hosted, linux, cuda]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-cuda-${{ hashFiles('**/Cargo.lock') }}
+
+      - run: ./scripts/verify.sh

@@ -12,11 +12,7 @@ use serde_json::Value;
 use super::chunker::Chunk;
 
 /// Known message types in Claude session transcripts that we skip.
-const SKIP_TYPES: &[&str] = &[
-    "progress",
-    "queue-operation",
-    "file-history-snapshot",
-];
+const SKIP_TYPES: &[&str] = &["progress", "queue-operation", "file-history-snapshot"];
 
 /// Parse a Claude session transcript JSONL file into chunks.
 /// Each user/assistant message becomes one chunk.
@@ -38,7 +34,7 @@ pub fn chunk_claude_jsonl(content: &str) -> Vec<Chunk> {
 
         // Check if this is a type we should skip
         let entry_type = entry.get("type").and_then(Value::as_str).unwrap_or("");
-        if SKIP_TYPES.iter().any(|&t| t == entry_type) {
+        if SKIP_TYPES.contains(&entry_type) {
             continue;
         }
 
@@ -98,10 +94,10 @@ fn extract_message_text(entry: &Value) -> String {
                     return format!("[{}] {}", tool_name, text);
                 }
             }
-            if let Some(result) = entry.get("result").and_then(Value::as_str) {
-                if result.len() < 10_000 {
-                    return format!("[{}] {}", tool_name, result);
-                }
+            if let Some(result) = entry.get("result").and_then(Value::as_str)
+                && result.len() < 10_000
+            {
+                return format!("[{}] {}", tool_name, result);
             }
             String::new()
         }
@@ -278,9 +274,12 @@ mod tests {
     #[test]
     fn test_chunk_claude_jsonl_multiple_messages() {
         let jsonl = concat!(
-            r#"{"type": "user", "message": "question 1"}"#, "\n",
-            r#"{"type": "assistant", "message": "answer 1"}"#, "\n",
-            r#"{"type": "user", "message": "question 2"}"#, "\n",
+            r#"{"type": "user", "message": "question 1"}"#,
+            "\n",
+            r#"{"type": "assistant", "message": "answer 1"}"#,
+            "\n",
+            r#"{"type": "user", "message": "question 2"}"#,
+            "\n",
         );
         let chunks = chunk_claude_jsonl(jsonl);
         assert_eq!(chunks.len(), 3);
@@ -292,9 +291,12 @@ mod tests {
     #[test]
     fn test_parse_file_history_map() {
         let jsonl = concat!(
-            r#"{"type": "file-history-snapshot", "filePath": "/home/user/project/main.rs", "backupFileName": "abc123@v1", "sessionId": "sess-1"}"#, "\n",
-            r#"{"type": "file-history-snapshot", "filePath": "/home/user/project/main.rs", "backupFileName": "abc123@v2", "sessionId": "sess-1"}"#, "\n",
-            r#"{"type": "user", "message": "edit main.rs"}"#, "\n",
+            r#"{"type": "file-history-snapshot", "filePath": "/home/user/project/main.rs", "backupFileName": "abc123@v1", "sessionId": "sess-1"}"#,
+            "\n",
+            r#"{"type": "file-history-snapshot", "filePath": "/home/user/project/main.rs", "backupFileName": "abc123@v2", "sessionId": "sess-1"}"#,
+            "\n",
+            r#"{"type": "user", "message": "edit main.rs"}"#,
+            "\n",
         );
         let map = parse_file_history_map(jsonl);
         assert_eq!(map.len(), 2);
@@ -330,7 +332,8 @@ mod tests {
     fn test_invalid_json_lines_skipped() {
         let jsonl = concat!(
             "not json\n",
-            r#"{"type": "user", "message": "valid"}"#, "\n",
+            r#"{"type": "user", "message": "valid"}"#,
+            "\n",
             "also not json\n",
         );
         let chunks = chunk_claude_jsonl(jsonl);

@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use axum::{Router, routing::get, extract::State};
+use axum::{Router, extract::State, routing::get};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -99,7 +99,16 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
          pgmcp_work_pool_scale_downs {}\n\
          # HELP pgmcp_uptime_seconds Server uptime in seconds\n\
          # TYPE pgmcp_uptime_seconds gauge\n\
-         pgmcp_uptime_seconds {}\n",
+         pgmcp_uptime_seconds {}\n\
+         # HELP pgmcp_current_rss_bytes Current resident set size in bytes (sampled every 500ms)\n\
+         # TYPE pgmcp_current_rss_bytes gauge\n\
+         pgmcp_current_rss_bytes {}\n\
+         # HELP pgmcp_peak_rss_bytes Peak resident set size in bytes since daemon start\n\
+         # TYPE pgmcp_peak_rss_bytes gauge\n\
+         pgmcp_peak_rss_bytes {}\n\
+         # HELP pgmcp_heavy_cron_running 1 if a heavy cron body is currently executing, 0 otherwise\n\
+         # TYPE pgmcp_heavy_cron_running gauge\n\
+         pgmcp_heavy_cron_running {}\n",
         s.files_indexed.load(Ordering::Relaxed),
         s.files_failed.load(Ordering::Relaxed),
         s.chunks_embedded.load(Ordering::Relaxed),
@@ -127,6 +136,13 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
         s.work_pool_scale_ups.load(Ordering::Relaxed),
         s.work_pool_scale_downs.load(Ordering::Relaxed),
         s.uptime_start.elapsed().as_secs(),
+        s.current_rss_bytes.load(Ordering::Relaxed),
+        s.peak_rss_bytes.load(Ordering::Relaxed),
+        if s.heavy_cron_running.load(Ordering::Relaxed) {
+            1
+        } else {
+            0
+        },
     )
 }
 

@@ -6,12 +6,12 @@
 //!
 //! Workers try_recv HIGH first, then LOW. When both empty, park via WorkerPark.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use crossbeam_channel::{unbounded, Sender, Receiver, TryRecvError};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
 use parking_lot::Mutex;
 use tracing::{debug, trace};
 
@@ -84,10 +84,10 @@ impl WorkPool {
 
         // Spawn all worker threads
         let mut handles = Vec::with_capacity(max_threads);
-        for i in 0..max_threads {
+        for (i, park_slot) in worker_parks.iter().enumerate().take(max_threads) {
             let high_rx = high_rx.clone();
             let low_rx = low_rx.clone();
-            let park = Arc::clone(&worker_parks[i]);
+            let park = Arc::clone(park_slot);
             let shutdown = Arc::clone(&shutdown);
             let tasks_completed = Arc::clone(&pool.tasks_completed);
 
@@ -264,10 +264,7 @@ fn worker_loop(
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => None,
             },
-            Err(TryRecvError::Disconnected) => match low_rx.try_recv() {
-                Ok(task) => Some(task),
-                Err(_) => None,
-            },
+            Err(TryRecvError::Disconnected) => low_rx.try_recv().ok(),
         };
 
         match task {

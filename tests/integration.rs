@@ -26,7 +26,10 @@ async fn setup_db() -> (PgPool, testcontainers::ContainerAsync<Postgres>) {
         .await
         .expect("Failed to get postgres port");
 
-    let url = format!("postgres://postgres:postgres@127.0.0.1:{}/postgres", host_port);
+    let url = format!(
+        "postgres://postgres:postgres@127.0.0.1:{}/postgres",
+        host_port
+    );
 
     let pool = sqlx::PgPool::connect(&url)
         .await
@@ -39,7 +42,9 @@ async fn setup_db() -> (PgPool, testcontainers::ContainerAsync<Postgres>) {
         .await;
 
     if has_pgvector.is_err() {
-        eprintln!("WARNING: pgvector extension not available in test container. Some tests will be skipped.");
+        eprintln!(
+            "WARNING: pgvector extension not available in test container. Some tests will be skipped."
+        );
     }
 
     // Create pg_trgm extension
@@ -61,7 +66,7 @@ async fn run_test_migrations(pool: &PgPool) {
             name TEXT NOT NULL,
             discovered_at TIMESTAMPTZ DEFAULT NOW(),
             last_scanned_at TIMESTAMPTZ
-        )"
+        )",
     )
     .execute(pool)
     .await
@@ -81,7 +86,7 @@ async fn run_test_migrations(pool: &PgPool) {
             truncated BOOLEAN NOT NULL DEFAULT FALSE,
             indexed_at TIMESTAMPTZ DEFAULT NOW(),
             modified_at TIMESTAMPTZ NOT NULL
-        )"
+        )",
     )
     .execute(pool)
     .await
@@ -104,7 +109,7 @@ async fn run_test_migrations(pool: &PgPool) {
                 end_line INTEGER NOT NULL,
                 embedding vector(384) NOT NULL,
                 UNIQUE (file_id, chunk_index)
-            )"
+            )",
         )
         .execute(pool)
         .await
@@ -120,20 +125,27 @@ async fn run_test_migrations(pool: &PgPool) {
     .expect("Failed to create FTS index");
 
     // Create content_hash index
-    sqlx::query(
-        "CREATE INDEX IF NOT EXISTS idx_files_content_hash ON indexed_files(content_hash)"
-    )
-    .execute(pool)
-    .await
-    .expect("Failed to create content_hash index");
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_content_hash ON indexed_files(content_hash)")
+        .execute(pool)
+        .await
+        .expect("Failed to create content_hash index");
 }
 
 /// Helper to create temporary files for indexing tests.
 fn create_test_files(dir: &Path) -> Vec<(String, &'static str)> {
     let files = vec![
-        ("src/main.rs", "fn main() {\n    println!(\"Hello, world!\");\n}\n"),
-        ("src/lib.rs", "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub fn multiply(a: i32, b: i32) -> i32 {\n    a * b\n}\n"),
-        ("README.md", "# Test Project\n\nThis is a test project for pgmcp integration tests.\n"),
+        (
+            "src/main.rs",
+            "fn main() {\n    println!(\"Hello, world!\");\n}\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n\npub fn multiply(a: i32, b: i32) -> i32 {\n    a * b\n}\n",
+        ),
+        (
+            "README.md",
+            "# Test Project\n\nThis is a test project for pgmcp integration tests.\n",
+        ),
     ];
 
     for (path, content) in &files {
@@ -161,7 +173,7 @@ async fn test_project_upsert_and_list() {
     let project_id: i32 = sqlx::query_scalar(
         "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3)
          ON CONFLICT (path) DO UPDATE SET workspace_path = $1
-         RETURNING id"
+         RETURNING id",
     )
     .bind("/workspace")
     .bind("/workspace/test-project")
@@ -189,7 +201,7 @@ async fn test_file_upsert_and_content_hash() {
 
     // Create project
     let project_id: i32 = sqlx::query_scalar(
-        "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3) RETURNING id"
+        "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3) RETURNING id",
     )
     .bind("/workspace")
     .bind("/workspace/proj")
@@ -244,13 +256,12 @@ async fn test_file_upsert_and_content_hash() {
     assert_eq!(file_id, file_id_2, "Upsert must be idempotent");
 
     // Check content hash retrieval
-    let stored_hash: Option<i64> = sqlx::query_scalar(
-        "SELECT content_hash FROM indexed_files WHERE path = $1"
-    )
-    .bind("/workspace/proj/main.rs")
-    .fetch_optional(&pool)
-    .await
-    .expect("Failed to query content_hash");
+    let stored_hash: Option<i64> =
+        sqlx::query_scalar("SELECT content_hash FROM indexed_files WHERE path = $1")
+            .bind("/workspace/proj/main.rs")
+            .fetch_optional(&pool)
+            .await
+            .expect("Failed to query content_hash");
 
     assert_eq!(stored_hash, Some(content_hash));
 }
@@ -263,7 +274,7 @@ async fn test_full_text_search() {
 
     // Create project and file
     let project_id: i32 = sqlx::query_scalar(
-        "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3) RETURNING id"
+        "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3) RETURNING id",
     )
     .bind("/ws")
     .bind("/ws/proj")
@@ -311,7 +322,7 @@ async fn test_regex_search() {
     run_test_migrations(&pool).await;
 
     let project_id: i32 = sqlx::query_scalar(
-        "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3) RETURNING id"
+        "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3) RETURNING id",
     )
     .bind("/ws")
     .bind("/ws/proj")
@@ -340,13 +351,12 @@ async fn test_regex_search() {
     .expect("insert file");
 
     // Regex search for struct definitions
-    let results: Vec<(String,)> = sqlx::query_as(
-        "SELECT path FROM indexed_files WHERE content ~ $1"
-    )
-    .bind("struct\\s+\\w+")
-    .fetch_all(&pool)
-    .await
-    .expect("regex query failed");
+    let results: Vec<(String,)> =
+        sqlx::query_as("SELECT path FROM indexed_files WHERE content ~ $1")
+            .bind("struct\\s+\\w+")
+            .fetch_all(&pool)
+            .await
+            .expect("regex query failed");
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].0, "/ws/proj/types.rs");
@@ -362,7 +372,7 @@ async fn test_stale_file_cleanup() {
     let test_files = create_test_files(temp_dir.path());
 
     let project_id: i32 = sqlx::query_scalar(
-        "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3) RETURNING id"
+        "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3) RETURNING id",
     )
     .bind(temp_dir.path().to_str().expect("path"))
     .bind(temp_dir.path().to_str().expect("path"))
@@ -375,7 +385,11 @@ async fn test_stale_file_cleanup() {
     for (rel_path, content) in &test_files {
         let full_path = temp_dir.path().join(rel_path);
         let hash = xxhash_rust::xxh3::xxh3_64(content.as_bytes()) as i64;
-        let lang = if rel_path.ends_with(".rs") { "rust" } else { "markdown" };
+        let lang = if rel_path.ends_with(".rs") {
+            "rust"
+        } else {
+            "markdown"
+        };
 
         sqlx::query(
             "INSERT INTO indexed_files (project_id, path, relative_path, language, size_bytes, content, content_hash, line_count, modified_at)
@@ -406,12 +420,10 @@ async fn test_stale_file_cleanup() {
     std::fs::remove_file(&deleted_path).expect("remove file");
 
     // Simulate stale cleanup: remove indexed files that no longer exist on disk
-    let all_paths: Vec<(i64, String)> = sqlx::query_as(
-        "SELECT id, path FROM indexed_files"
-    )
-    .fetch_all(&pool)
-    .await
-    .expect("fetch paths");
+    let all_paths: Vec<(i64, String)> = sqlx::query_as("SELECT id, path FROM indexed_files")
+        .fetch_all(&pool)
+        .await
+        .expect("fetch paths");
 
     for (id, path) in &all_paths {
         if !Path::new(path).exists() {

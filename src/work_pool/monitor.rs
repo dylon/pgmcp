@@ -3,8 +3,8 @@
 //! Two-term objective: J(N) = -w_tp * ema_tp + w_qd * ema_qd
 //! Runs on a dedicated thread at 200ms intervals.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -33,11 +33,7 @@ const THROUGHPUT_WEIGHT: f64 = 1.0;
 const QUEUE_DEPTH_WEIGHT: f64 = 2.0;
 
 /// Run the scaling monitor loop on the current thread.
-pub fn run_scaling_monitor(
-    pool: &WorkPool,
-    shutdown: Arc<AtomicBool>,
-    stats: &StatsTracker,
-) {
+pub fn run_scaling_monitor(pool: &WorkPool, shutdown: Arc<AtomicBool>, stats: &StatsTracker) {
     let mut ema_throughput = Ema::new(EMA_ALPHA);
     let mut ema_queue_depth = Ema::new(EMA_ALPHA);
     let mut climber = HillClimber::new(
@@ -80,18 +76,13 @@ pub fn run_scaling_monitor(
                 let actual = pool.unpark_n(decision.count);
                 trace!(
                     requested = decision.count,
-                    actual,
-                    "Scaling monitor: unpark"
+                    actual, "Scaling monitor: unpark"
                 );
                 stats.work_pool_scale_ups.fetch_add(1, Ordering::Relaxed);
             }
             ScaleAction::Park => {
                 let actual = pool.park_n(decision.count);
-                trace!(
-                    requested = decision.count,
-                    actual,
-                    "Scaling monitor: park"
-                );
+                trace!(requested = decision.count, actual, "Scaling monitor: park");
                 stats.work_pool_scale_downs.fetch_add(1, Ordering::Relaxed);
             }
             ScaleAction::Hold => {}

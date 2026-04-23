@@ -1,7 +1,7 @@
 //! Subscription handle for reactive streams.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Handle to cancel a subscription. Drop to unsubscribe.
 /// Uses AtomicBool for lock-free cancellation.

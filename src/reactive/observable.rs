@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
 
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{Receiver, Sender, bounded};
 
 use super::subscription::Subscription;
 
@@ -39,10 +39,8 @@ impl<T: Send + 'static> Observable<T> {
             .name("rx-filter".into())
             .spawn(move || {
                 for item in rx {
-                    if pred(&item) {
-                        if tx.send(item).is_err() {
-                            break;
-                        }
+                    if pred(&item) && tx.send(item).is_err() {
+                        break;
                     }
                 }
             })
@@ -52,10 +50,7 @@ impl<T: Send + 'static> Observable<T> {
     }
 
     /// Map values through a function.
-    pub fn map<U: Send + 'static>(
-        self,
-        f: impl Fn(T) -> U + Send + 'static,
-    ) -> Observable<U> {
+    pub fn map<U: Send + 'static>(self, f: impl Fn(T) -> U + Send + 'static) -> Observable<U> {
         let (tx, new_obs) = Observable::channel(256);
         let rx = self.rx;
 

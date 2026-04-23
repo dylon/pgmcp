@@ -1,6 +1,6 @@
 //! Database connection pool management.
 
-use sqlx::postgres::{PgPoolOptions, PgPool};
+use sqlx::postgres::{PgPool, PgPoolOptions};
 
 use crate::config::DatabaseConfig;
 
@@ -17,8 +17,6 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<PgPool, sqlx::Error>
 
 /// Health check — run a simple query to verify connectivity.
 pub async fn health_check(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query("SELECT 1")
-        .execute(pool)
-        .await?;
+    sqlx::query("SELECT 1").execute(pool).await?;
     Ok(())
 }

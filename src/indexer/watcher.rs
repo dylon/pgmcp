@@ -33,8 +33,8 @@ pub fn start_watching(
 ) -> Result<RecommendedWatcher, notify::Error> {
     let tx = event_tx.clone();
 
-    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        match res {
+    let mut watcher =
+        notify::recommended_watcher(move |res: Result<Event, notify::Error>| match res {
             Ok(event) => {
                 let kind = match event.kind {
                     EventKind::Create(_) => Some(FileEventKind::Create),
@@ -46,11 +46,10 @@ pub fn start_watching(
                 if let Some(kind) = kind {
                     for path in event.paths {
                         if path.is_file() || kind == FileEventKind::Remove {
-                            stats.watcher_events_received.fetch_add(1, Ordering::Relaxed);
-                            let _ = tx.send(FileEvent {
-                                path,
-                                kind,
-                            });
+                            stats
+                                .watcher_events_received
+                                .fetch_add(1, Ordering::Relaxed);
+                            let _ = tx.send(FileEvent { path, kind });
                         }
                     }
                 }
@@ -58,8 +57,7 @@ pub fn start_watching(
             Err(e) => {
                 error!(error = %e, "File watcher error");
             }
-        }
-    })?;
+        })?;
 
     for workspace_path in workspace_paths {
         let path = Path::new(workspace_path);

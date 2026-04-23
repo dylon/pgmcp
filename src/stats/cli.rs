@@ -26,10 +26,43 @@ pub async fn print_stats(config: &Config) -> anyhow::Result<()> {
 
             // Group definitions: (section_name, prefix_match)
             let groups: &[(&str, &[&str])] = &[
-                ("Indexing", &["pgmcp_files_indexed", "pgmcp_files_failed", "pgmcp_chunks_embedded", "pgmcp_bytes_processed", "pgmcp_index_duration", "pgmcp_embedding_duration", "pgmcp_last_index"]),
-                ("MCP", &["pgmcp_mcp_", "pgmcp_semantic_", "pgmcp_text_", "pgmcp_grep_"]),
-                ("Scan", &["pgmcp_files_scanned", "pgmcp_files_skipped", "pgmcp_files_stale"]),
-                ("Work Pool", &["pgmcp_active_threads", "pgmcp_queue_depth", "pgmcp_work_pool_"]),
+                (
+                    "Indexing",
+                    &[
+                        "pgmcp_files_indexed",
+                        "pgmcp_files_failed",
+                        "pgmcp_chunks_embedded",
+                        "pgmcp_bytes_processed",
+                        "pgmcp_index_duration",
+                        "pgmcp_embedding_duration",
+                        "pgmcp_last_index",
+                    ],
+                ),
+                (
+                    "MCP",
+                    &[
+                        "pgmcp_mcp_",
+                        "pgmcp_semantic_",
+                        "pgmcp_text_",
+                        "pgmcp_grep_",
+                    ],
+                ),
+                (
+                    "Scan",
+                    &[
+                        "pgmcp_files_scanned",
+                        "pgmcp_files_skipped",
+                        "pgmcp_files_stale",
+                    ],
+                ),
+                (
+                    "Work Pool",
+                    &[
+                        "pgmcp_active_threads",
+                        "pgmcp_queue_depth",
+                        "pgmcp_work_pool_",
+                    ],
+                ),
                 ("Embedding Pool", &["pgmcp_embed_"]),
                 ("Cron", &["pgmcp_cron_"]),
                 ("Git History", &["pgmcp_git_"]),
@@ -50,10 +83,7 @@ pub async fn print_stats(config: &Config) -> anyhow::Result<()> {
 
                 println!("\n  {}:", section);
                 for (key, value) in section_metrics {
-                    let display_key = key
-                        .strip_prefix("pgmcp_")
-                        .unwrap_or(key)
-                        .replace('_', " ");
+                    let display_key = key.strip_prefix("pgmcp_").unwrap_or(key).replace('_', " ");
                     println!("    {:<34} {}", display_key, value);
                 }
             }
@@ -91,11 +121,7 @@ async fn reqwest_get(url: &str) -> anyhow::Result<String> {
     reader.read_to_string(&mut response).await?;
 
     // Extract body (after double CRLF)
-    let body = response
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .to_string();
+    let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
 
     Ok(body)
 }
