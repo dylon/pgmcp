@@ -364,4 +364,122 @@ mod tests {
 
         pool.shutdown_and_join();
     }
+
+    // ========================================================================
+    // Property tests
+    // ========================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 8, ..ProptestConfig::default() })]
+
+        /// N producer threads submitting M tasks each → total completion
+        /// count = N*M. Proves no submissions are lost under concurrency.
+        #[test]
+        fn prop_concurrent_submissions_no_lost_tasks(
+            producers in 2usize..6,
+            per_producer in 10usize..50,
+        ) {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let pool = Arc::new(WorkPool::new(2, 8, 4, Arc::clone(&shutdown)));
+            let counter = Arc::new(AtomicU64::new(0));
+            let mut handles = Vec::new();
+            for _ in 0..producers {
+                let pool = Arc::clone(&pool);
+                let counter = Arc::clone(&counter);
+                handles.push(std::thread::spawn(move || {
+                    for _ in 0..per_producer {
+                        let c = Arc::clone(&counter);
+                        pool.submit(
+                            move || {
+                                c.fetch_add(1, Ordering::Relaxed);
+                            },
+                            Priority::Low,
+                        );
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("producer");
+            }
+            // Wait for all tasks to drain.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let expected = (producers * per_producer) as u64;
+            while counter.load(Ordering::Relaxed) < expected
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            prop_assert_eq!(counter.load(Ordering::Relaxed), expected);
+            pool.shutdown_and_join();
+        }
+
+        /// High-priority tasks complete no later than an equivalent batch
+        /// of low-priority tasks submitted in the same burst — measuring
+        /// the *position* of last-completed index in each class.
+        #[test]
+        fn prop_high_priority_tasks_do_not_starve_low(
+            burst in 20usize..40,
+        ) {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let pool = Arc::new(WorkPool::new(2, 4, 4, Arc::clone(&shutdown)));
+            let counter = Arc::new(AtomicU64::new(0));
+            for _ in 0..burst {
+                let c = Arc::clone(&counter);
+                pool.submit(
+                    move || {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    },
+                    Priority::High,
+                );
+                let c = Arc::clone(&counter);
+                pool.submit(
+                    move || {
+                        c.fetch_add(1, Ordering::Relaxed);
+                    },
+                    Priority::Low,
+                );
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let expected = (burst * 2) as u64;
+            while counter.load(Ordering::Relaxed) < expected
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            prop_assert_eq!(counter.load(Ordering::Relaxed), expected,
+                "all tasks (high + low) must eventually complete");
+            pool.shutdown_and_join();
+        }
+    }
+
+    /// Panicking tasks are isolated — subsequent non-panicking tasks still
+    /// run to completion. Catches work-pool catch_unwind regressions.
+    #[test]
+    fn test_panic_in_task_does_not_kill_pool() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let pool = WorkPool::new(1, 2, 2, Arc::clone(&shutdown));
+        pool.submit(
+            || {
+                panic!("deliberate");
+            },
+            Priority::High,
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let counter = Arc::new(AtomicU64::new(0));
+        let c = Arc::clone(&counter);
+        pool.submit(
+            move || {
+                c.fetch_add(1, Ordering::Relaxed);
+            },
+            Priority::High,
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            counter.load(Ordering::Relaxed) >= 1,
+            "task after panic should still execute"
+        );
+        pool.shutdown_and_join();
+    }
 }

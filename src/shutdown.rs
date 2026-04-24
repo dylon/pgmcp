@@ -91,3 +91,80 @@ pub fn join_with_timeout(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    #[tokio::test]
+    async fn signal_shutdown_flips_terminating_and_cancels_token() {
+        let coord = ShutdownCoordinator::new();
+        assert!(!coord.is_terminating());
+        let token = coord.cancellation_token();
+        assert!(!token.is_cancelled());
+        coord.signal_shutdown();
+        assert!(coord.is_terminating());
+        assert!(token.is_cancelled());
+    }
+
+    #[test]
+    fn terminating_flag_propagates_to_clones() {
+        let coord_a = ShutdownCoordinator::new();
+        let coord_b = coord_a.clone();
+        let flag_b = coord_b.terminating_flag();
+        assert!(!flag_b.load(Ordering::Acquire));
+        coord_a.signal_shutdown();
+        assert!(
+            flag_b.load(Ordering::Acquire),
+            "flag from clone must see update from original"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_token_cancels_tokio_select() {
+        let coord = ShutdownCoordinator::new();
+        let token = coord.cancellation_token();
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_c = Arc::clone(&fired);
+        let handle = tokio::spawn(async move {
+            token.cancelled().await;
+            fired_c.store(true, Ordering::Release);
+        });
+        coord.signal_shutdown();
+        handle.await.expect("task completes");
+        assert!(fired.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn join_with_timeout_returns_ok_for_fast_thread() {
+        let handle = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(10));
+        });
+        let result = join_with_timeout(handle, Duration::from_secs(1));
+        assert!(result.is_ok(), "fast thread should join within timeout");
+        assert!(result.expect("ok branch").is_ok());
+    }
+
+    #[test]
+    fn join_with_timeout_returns_err_on_overrun() {
+        let handle = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_secs(3));
+        });
+        let result = join_with_timeout(handle, Duration::from_millis(100));
+        assert!(
+            result.is_err(),
+            "slow thread should return timeout (helper thread)"
+        );
+    }
+
+    #[test]
+    fn join_with_timeout_surfaces_panic_not_hang() {
+        let handle = std::thread::spawn(|| {
+            panic!("deliberate panic for test");
+        });
+        let result = join_with_timeout(handle, Duration::from_secs(1));
+        let inner = result.expect("ok branch — panic finishes fast");
+        assert!(inner.is_err(), "panic must surface as Err(JoinError)");
+    }
+}

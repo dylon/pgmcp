@@ -266,4 +266,86 @@ mod tests {
         lc.transition(DaemonPhase::Defunct);
         assert!(!handle.join().expect("thread should not panic"));
     }
+
+    // ========================================================================
+    // Property tests
+    // ========================================================================
+
+    use proptest::prelude::*;
+
+    fn phase_strategy() -> impl Strategy<Value = DaemonPhase> {
+        prop_oneof![
+            Just(DaemonPhase::Initializing),
+            Just(DaemonPhase::Scanning),
+            Just(DaemonPhase::Ready),
+            Just(DaemonPhase::Terminating),
+            Just(DaemonPhase::Defunct),
+        ]
+    }
+
+    proptest! {
+        /// For any sequence of transitions, the final phase equals the
+        /// max(seq). Proves the fetch_max-based transition semantics.
+        #[test]
+        fn prop_final_phase_is_max_of_requested(
+            transitions in prop::collection::vec(phase_strategy(), 1..10usize),
+        ) {
+            let lc = DaemonLifecycle::new();
+            let mut max_seen = DaemonPhase::Initializing;
+            for p in &transitions {
+                lc.transition(*p);
+                if *p > max_seen {
+                    max_seen = *p;
+                }
+            }
+            prop_assert_eq!(lc.current(), max_seen);
+        }
+
+        /// Backward transitions are ignored (monotone non-decreasing).
+        #[test]
+        fn prop_backward_transitions_ignored(
+            forward in phase_strategy(),
+            backward in phase_strategy(),
+        ) {
+            prop_assume!(backward < forward);
+            let lc = DaemonLifecycle::new();
+            lc.transition(forward);
+            let prev = lc.current();
+            lc.transition(backward);
+            prop_assert_eq!(lc.current(), prev,
+                "backward transition changed state: {:?} → {:?}", prev, lc.current());
+        }
+
+        /// Every subscriber receives every transition — no messages lost.
+        /// Uses indexed picks so the monotone chain is chosen, not
+        /// filtered, avoiding global-reject blowups.
+        #[test]
+        fn prop_subject_broadcasts_monotone_transitions(
+            i in 1usize..=3,  // start index in the monotone chain
+            j in 2usize..=4,  // middle index
+            k in 3usize..=4,  // end index
+        ) {
+            let chain = [
+                DaemonPhase::Initializing,
+                DaemonPhase::Scanning,
+                DaemonPhase::Ready,
+                DaemonPhase::Terminating,
+                DaemonPhase::Defunct,
+            ];
+            // Enforce ordering i < j < k
+            let (start, middle, end) = if i < j && j < k {
+                (chain[i], chain[j], chain[k])
+            } else {
+                return Ok(());
+            };
+            let lc = DaemonLifecycle::new();
+            let rx = lc.subscribe();
+            lc.transition(start);
+            lc.transition(middle);
+            lc.transition(end);
+            prop_assert_eq!(rx.recv().expect("start"), start);
+            prop_assert_eq!(rx.recv().expect("middle"), middle);
+            prop_assert_eq!(rx.recv().expect("end"), end);
+        }
+    }
 }

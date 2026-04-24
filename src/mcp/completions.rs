@@ -6,11 +6,12 @@
 
 use rmcp::ErrorData as McpError;
 use rmcp::model::*;
-use sqlx::PgPool;
+
+use crate::db::DbClient;
 
 /// Handle a completion request by matching the reference and argument.
 pub async fn handle_complete(
-    db_pool: &PgPool,
+    db: &dyn DbClient,
     request: CompleteRequestParams,
 ) -> Result<CompleteResult, McpError> {
     let values = match &request.r#ref {
@@ -20,9 +21,9 @@ pub async fn handle_complete(
             let prefix = &request.argument.value;
 
             if uri.contains("{name}") && arg_name == "name" {
-                complete_project_names(db_pool, prefix).await?
+                complete_project_names(db, prefix).await?
             } else if uri.contains("{path}") && arg_name == "path" {
-                complete_file_paths(db_pool, prefix).await?
+                complete_file_paths(db, prefix).await?
             } else {
                 Vec::new()
             }
@@ -39,8 +40,9 @@ pub async fn handle_complete(
     Ok(CompleteResult::new(completion))
 }
 
-async fn complete_project_names(db_pool: &PgPool, prefix: &str) -> Result<Vec<String>, McpError> {
-    let names = crate::db::queries::list_project_names(db_pool)
+async fn complete_project_names(db: &dyn DbClient, prefix: &str) -> Result<Vec<String>, McpError> {
+    let names = db
+        .list_project_names()
         .await
         .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
 
@@ -53,11 +55,8 @@ async fn complete_project_names(db_pool: &PgPool, prefix: &str) -> Result<Vec<St
     Ok(filtered)
 }
 
-async fn complete_file_paths(db_pool: &PgPool, prefix: &str) -> Result<Vec<String>, McpError> {
-    let paths =
-        crate::db::queries::search_file_paths(db_pool, prefix, CompletionInfo::MAX_VALUES as i32)
-            .await
-            .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
-
-    Ok(paths)
+async fn complete_file_paths(db: &dyn DbClient, prefix: &str) -> Result<Vec<String>, McpError> {
+    db.search_file_paths(prefix, CompletionInfo::MAX_VALUES as i32)
+        .await
+        .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))
 }

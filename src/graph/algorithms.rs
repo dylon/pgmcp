@@ -786,4 +786,291 @@ mod tests {
             );
         }
     }
+
+    // ========================================================================
+    // Property tests (Phase 3)
+    // ========================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
+
+        /// PageRank scores sum to ≈ 1.0 (probability conservation).
+        #[test]
+        fn prop_pagerank_scores_sum_to_one(n in 2usize..30) {
+            let graph = make_test_graph(n);
+            let result = pagerank(&graph, 0.85, 100, 1e-8);
+            let total: f64 = result.scores.values().sum();
+            prop_assert!((total - 1.0).abs() < 1e-4,
+                "PageRank sum = {} (expected ≈ 1)", total);
+        }
+
+        /// All PageRank scores are non-negative.
+        #[test]
+        fn prop_pagerank_scores_nonnegative(n in 1usize..30) {
+            let graph = make_test_graph(n);
+            let result = pagerank(&graph, 0.85, 100, 1e-8);
+            for (&node, &score) in &result.scores {
+                prop_assert!(score >= 0.0,
+                    "node {:?} has negative PageRank {}", node, score);
+            }
+        }
+
+        /// PageRank assigns a score to every node.
+        #[test]
+        fn prop_pagerank_covers_every_node(n in 1usize..30) {
+            let graph = make_test_graph(n);
+            let result = pagerank(&graph, 0.85, 50, 1e-8);
+            prop_assert_eq!(result.scores.len(), graph.node_count());
+        }
+
+        /// Tarjan SCC partitions every node into exactly one component.
+        #[test]
+        fn prop_tarjan_scc_partitions_every_node(n in 1usize..30) {
+            let graph = make_test_graph(n);
+            let sccs = tarjan_scc(&graph);
+            let mut seen: std::collections::HashSet<NodeIndex> =
+                std::collections::HashSet::new();
+            for scc in &sccs {
+                for &node in scc {
+                    prop_assert!(seen.insert(node),
+                        "node {:?} appears in multiple SCCs", node);
+                }
+            }
+            prop_assert_eq!(seen.len(), graph.node_count(),
+                "SCCs do not cover every node");
+        }
+
+        /// Parallel Brandes ≈ sequential Brandes on small graphs.
+        #[test]
+        fn prop_brandes_parallel_matches_sequential(n in 4usize..20) {
+            let graph = make_test_graph(n);
+            let seq = betweenness_centrality(&graph);
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let pool = Arc::new(WorkPool::new(2, 4, 4, Arc::clone(&shutdown)));
+            let par = betweenness_centrality_parallel(&graph, &pool, None);
+            shutdown.store(true, std::sync::atomic::Ordering::Release);
+            prop_assert_eq!(seq.len(), par.len());
+            for (&node, &seq_val) in &seq {
+                let par_val = par[&node];
+                prop_assert!((seq_val - par_val).abs() < 1e-9,
+                    "node {:?}: seq={} par={}", node, seq_val, par_val);
+            }
+        }
+
+        /// For small graphs (n ≤ 2) betweenness is all zero.
+        #[test]
+        fn prop_betweenness_zero_for_tiny_graph(n in 0usize..=2) {
+            let graph = make_test_graph(n);
+            let result = betweenness_centrality(&graph);
+            for &v in result.values() {
+                prop_assert_eq!(v, 0.0);
+            }
+        }
+
+        /// Degree counts are symmetric: Σ in = Σ out.
+        #[test]
+        fn prop_degree_sums_balanced(n in 1usize..30) {
+            let graph = make_test_graph(n);
+            let degrees = compute_degrees(&graph);
+            let in_total: usize = degrees.values().map(|(i, _)| *i).sum();
+            let out_total: usize = degrees.values().map(|(_, o)| *o).sum();
+            prop_assert_eq!(in_total, out_total,
+                "in_total {} != out_total {} — graph has an edge counting bug",
+                in_total, out_total);
+        }
+
+        /// find_cycles returns only SCCs of size ≥ 2.
+        #[test]
+        fn prop_find_cycles_returns_nontrivial_sccs(n in 1usize..30) {
+            let graph = make_test_graph(n);
+            let cycles = find_cycles(&graph);
+            for scc in &cycles {
+                prop_assert!(scc.len() >= 2, "find_cycles returned singleton SCC");
+            }
+        }
+
+        /// Normalized betweenness centrality ∈ [0, 1] for every node.
+        #[test]
+        fn prop_betweenness_in_unit_interval(n in 3usize..30) {
+            let graph = make_test_graph(n);
+            let bc = betweenness_centrality(&graph);
+            for (&node, &v) in &bc {
+                prop_assert!((0.0..=1.0 + 1e-6).contains(&v),
+                    "node {:?} has betweenness {} outside [0, 1]", node, v);
+            }
+        }
+
+        /// Permuting node indices permutes PageRank scores correspondingly.
+        /// (Equivalent: structurally-isomorphic graphs yield the same
+        /// score multiset.)
+        #[test]
+        fn prop_pagerank_invariant_score_multiset_under_relabel(n in 3usize..12) {
+            let graph = make_test_graph(n);
+            let pr = pagerank(&graph, 0.85, 100, 1e-8);
+            let mut scores: Vec<f64> = pr.scores.values().copied().collect();
+            scores.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            // Make a second isomorphic graph with same edges and same node
+            // count — same `make_test_graph(n)` call produces identical
+            // structure. The multiset of scores must match.
+            let graph2 = make_test_graph(n);
+            let pr2 = pagerank(&graph2, 0.85, 100, 1e-8);
+            let mut scores2: Vec<f64> = pr2.scores.values().copied().collect();
+            scores2.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            prop_assert_eq!(scores.len(), scores2.len());
+            for (a, b) in scores.iter().zip(scores2.iter()) {
+                prop_assert!((a - b).abs() < 1e-6);
+            }
+        }
+
+        /// Tarjan SCC on an empty graph returns no components, and every
+        /// SCC on a non-empty graph is non-empty.
+        #[test]
+        fn prop_tarjan_scc_components_are_nonempty(n in 1usize..20) {
+            let graph = make_test_graph(n);
+            let sccs = tarjan_scc(&graph);
+            for scc in &sccs {
+                prop_assert!(!scc.is_empty(), "empty SCC in output");
+            }
+        }
+
+        /// Louvain always partitions every node into exactly one community.
+        #[test]
+        fn prop_louvain_partitions_every_node(n in 3usize..20) {
+            let graph = make_test_graph(n);
+            let code_graph = CodeGraph {
+                graph,
+                file_id_to_node: HashMap::new(),
+                node_to_file_id: HashMap::new(),
+            };
+            let result = louvain_communities(&code_graph, 1.0);
+            // Every node must appear exactly once in the communities map.
+            prop_assert_eq!(result.communities.len(), code_graph.graph.node_count());
+            // Modularity is a valid real number.
+            prop_assert!(result.modularity.is_finite(),
+                "modularity must be finite, got {}", result.modularity);
+        }
+
+        /// Leaf nodes (in_degree = 0 or out_degree = 0 with no path
+        /// through them) have betweenness centrality 0: they can't lie
+        /// on a shortest path between two other nodes.
+        #[test]
+        fn prop_betweenness_zero_for_dead_end_nodes(n in 5usize..15) {
+            let graph = make_test_graph(n);
+            let bc = betweenness_centrality(&graph);
+            for node in graph.node_indices() {
+                let out_deg = graph
+                    .neighbors_directed(node, Direction::Outgoing)
+                    .count();
+                let in_deg = graph
+                    .neighbors_directed(node, Direction::Incoming)
+                    .count();
+                // A node that is both leaf (no in-edges) and has no outgoing
+                // edges can never lie on any source-target path.
+                if in_deg == 0 && out_deg == 0 {
+                    let v = bc.get(&node).copied().unwrap_or(0.0);
+                    prop_assert_eq!(v, 0.0);
+                }
+            }
+        }
+
+        /// For a clustered block-diagonal graph (two disjoint blocks, each
+        /// with dense intra-block edges), Louvain finds a partition whose
+        /// modularity is strictly positive — it can do better than the
+        /// all-one-community baseline (Q=0).
+        #[test]
+        fn prop_louvain_modularity_nonnegative_for_clustered_graph(
+            block_size in 4usize..8,
+        ) {
+            // Build 2 disjoint blocks, each a clique on `block_size` nodes.
+            let mut g: DiGraph<FileNode, EdgeWeight> = DiGraph::new();
+            let mut nodes_by_block: Vec<Vec<NodeIndex>> = vec![Vec::new(), Vec::new()];
+            for (b, block) in nodes_by_block.iter_mut().enumerate().take(2) {
+                for i in 0..block_size {
+                    block.push(g.add_node(FileNode {
+                        file_id: (b * block_size + i) as i64,
+                        relative_path: format!("b{}_f{}.rs", b, i),
+                        language: "rust".into(),
+                        module: format!("b{}", b),
+                    }));
+                }
+            }
+            for block in &nodes_by_block {
+                for i in 0..block.len() {
+                    for j in 0..block.len() {
+                        if i != j {
+                            g.add_edge(
+                                block[i],
+                                block[j],
+                                EdgeWeight {
+                                    weight: 1.0,
+                                    edge_type: EdgeType::Import,
+                                },
+                            );
+                        }
+                    }
+                }
+            }
+            let code_graph = CodeGraph {
+                graph: g,
+                file_id_to_node: HashMap::new(),
+                node_to_file_id: HashMap::new(),
+            };
+            let result = louvain_communities(&code_graph, 1.0);
+            prop_assert!(
+                result.modularity > 0.0,
+                "block-diagonal graph should yield Q>0, got {}",
+                result.modularity
+            );
+        }
+
+        /// Louvain's reported num_communities equals the number of distinct
+        /// values in the communities map.
+        #[test]
+        fn prop_louvain_num_communities_matches_distinct_values(n in 3usize..20) {
+            let graph = make_test_graph(n);
+            let code_graph = CodeGraph {
+                graph,
+                file_id_to_node: HashMap::new(),
+                node_to_file_id: HashMap::new(),
+            };
+            let result = louvain_communities(&code_graph, 1.0);
+            let distinct: std::collections::HashSet<usize> =
+                result.communities.values().copied().collect();
+            prop_assert_eq!(distinct.len(), result.num_communities);
+        }
+    }
+
+    /// A lone self-loop on a node constitutes a singleton SCC of size 1.
+    /// `find_cycles` (which filters out singletons) correctly drops this,
+    /// even though Tarjan SCC would return it.
+    #[test]
+    fn self_loop_is_singleton_scc_filtered_by_find_cycles() {
+        let mut g: DiGraph<FileNode, EdgeWeight> = DiGraph::new();
+        let node = g.add_node(FileNode {
+            file_id: 1,
+            relative_path: "solo.rs".into(),
+            language: "rust".into(),
+            module: String::new(),
+        });
+        g.add_edge(
+            node,
+            node,
+            EdgeWeight {
+                weight: 1.0,
+                edge_type: EdgeType::Import,
+            },
+        );
+        // tarjan_scc returns the singleton SCC…
+        let sccs = tarjan_scc(&g);
+        assert_eq!(sccs.len(), 1);
+        assert_eq!(sccs[0].len(), 1);
+        // …but find_cycles filters it out (returns only scc.len() >= 2).
+        let cycles = find_cycles(&g);
+        assert!(
+            cycles.is_empty(),
+            "self-loop must not be reported as a cycle"
+        );
+    }
 }

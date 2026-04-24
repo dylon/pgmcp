@@ -42,17 +42,25 @@ run_gate() {
     echo
 }
 
-run_gate "Gate 1/6: cargo fmt --check" \
+run_gate "Gate 1/8: cargo fmt --check" \
     cargo fmt --check
-run_gate "Gate 2/6: cargo build --all-targets" \
+run_gate "Gate 2/8: cargo build --all-targets" \
     cargo build --all-targets
-run_gate "Gate 3/6: cargo clippy --all-targets -- -D warnings" \
+run_gate "Gate 3/8: cargo clippy --all-targets -- -D warnings" \
     cargo clippy --all-targets -- -D warnings
-run_gate "Gate 4/6: cargo test --release --bin pgmcp" \
+run_gate "Gate 4/8: cargo test --release --bin pgmcp" \
     cargo test --release --bin pgmcp
-run_gate "Gate 5/6: cargo test --release --test gpu_fallback_smoke -- --ignored" \
+run_gate "Gate 5/8: cargo test --release -p pgmcp-testing" \
+    cargo test --release -p pgmcp-testing
+run_gate "Gate 6/8: cargo test --release --test gpu_fallback_smoke -- --ignored" \
     cargo test --release --test gpu_fallback_smoke -- --ignored
-run_gate "Gate 6/6: cargo smoke (GPU smoke scenarios)" \
+run_gate "Gate 7/8: cargo smoke (GPU smoke scenarios)" \
     cargo smoke
+# Gate 8: run every `tests/*.rs` across the workspace. Tier-C real-DB tests
+# self-skip via `require_test_*!()` when `PGMCP_TEST_DATABASE_URL` is unset,
+# so this stays green for contributors without a local Postgres+pgvector
+# install; with the env var set, it becomes a full integration check.
+run_gate "Gate 8/8: cargo test --release --tests" \
+    cargo test --release --tests
 
 echo "verify.sh: all gates passed"

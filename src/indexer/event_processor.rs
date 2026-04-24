@@ -20,6 +20,7 @@ use notify::{RecursiveMode, Watcher};
 use tracing::{error, info, warn};
 
 use crate::config::{self, Config};
+use crate::context::SystemContext;
 use crate::daemon_state::{DaemonLifecycle, DaemonPhase};
 use crate::embed::pool::EmbedIndexRequest;
 use crate::indexer::{config_watcher::WatcherCommand, scanner, watcher};
@@ -45,17 +46,25 @@ impl IndexerHandle {
 }
 
 /// Start the full indexing pipeline.
+///
+/// Replaces the previous 9-parameter signature. The bundled subsystems
+/// (db, stats, config) come in via `ctx`; the indexer-specific deps
+/// (work_pool, embed_tx, shutdown, project_overrides, watcher_cmd_rx,
+/// lifecycle) stay separate because they aren't used by tools or the
+/// REST API and don't belong in the shared `SystemContext`.
+#[allow(clippy::too_many_arguments)]
 pub fn start_indexing(
-    config: Arc<ArcSwap<Config>>,
-    db_pool: sqlx::PgPool,
+    ctx: SystemContext,
     work_pool: Arc<WorkPool>,
     embed_tx: Sender<EmbedIndexRequest>,
-    stats: Arc<StatsTracker>,
     shutdown: ShutdownCoordinator,
     project_overrides: Arc<DashMap<PathBuf, config::ProjectOverride>>,
     watcher_cmd_rx: crossbeam_channel::Receiver<WatcherCommand>,
     lifecycle: DaemonLifecycle,
 ) -> Result<IndexerHandle, crate::error::PgmcpError> {
+    let config = Arc::clone(ctx.config());
+    let db = Arc::clone(ctx.db());
+    let stats = Arc::clone(ctx.stats());
     let config_snapshot = config.load();
     let project_roots: Arc<DashMap<PathBuf, scanner::ProjectRoot>> = Arc::new(DashMap::new());
 
@@ -191,7 +200,7 @@ pub fn start_indexing(
     // 4. Subscribe to debounced events and dispatch to work pool
     let work_pool_for_events = Arc::clone(&work_pool);
     let config_for_events = Arc::clone(&config);
-    let db_for_events = db_pool.clone();
+    let db_for_events = Arc::clone(&db);
     let embed_tx_for_events = embed_tx.clone();
     let stats_for_events = Arc::clone(&stats);
     let stats_for_debounce = Arc::clone(&stats);
@@ -238,7 +247,7 @@ pub fn start_indexing(
     // 5. Start initial scan in background
     let config_for_scan = Arc::clone(&config);
     let work_pool_for_scan = Arc::clone(&work_pool);
-    let db_for_scan = db_pool.clone();
+    let db_for_scan = Arc::clone(&db);
     let embed_tx_for_scan = embed_tx.clone();
     let stats_for_scan = Arc::clone(&stats);
     let project_roots_for_scan = Arc::clone(&project_roots);
@@ -256,8 +265,7 @@ pub fn start_indexing(
             let metadata_map: std::collections::HashMap<
                 String,
                 crate::db::queries::IndexedFileMeta,
-            > = match rt_for_scan.block_on(crate::db::queries::get_all_file_metadata(&db_for_scan))
-            {
+            > = match rt_for_scan.block_on(db_for_scan.get_all_file_metadata()) {
                 Ok(metas) => {
                     let len = metas.len();
                     let mut map = std::collections::HashMap::with_capacity(len);
@@ -357,10 +365,7 @@ pub fn start_indexing(
                 .collect();
             let stale_count = stale_paths.len() as u64;
             if !stale_paths.is_empty() {
-                match rt_for_scan.block_on(crate::db::queries::delete_files_batch(
-                    &db_for_scan,
-                    &stale_paths,
-                )) {
+                match rt_for_scan.block_on(db_for_scan.delete_files_batch(&stale_paths)) {
                     Ok(deleted) => {
                         info!(
                             detected = stale_count,
@@ -376,9 +381,7 @@ pub fn start_indexing(
                     .fetch_add(stale_count, Ordering::Relaxed);
 
                 // Clean up projects left empty after stale file removal
-                match rt_for_scan
-                    .block_on(crate::db::queries::cleanup_orphaned_projects(&db_for_scan))
-                {
+                match rt_for_scan.block_on(db_for_scan.cleanup_orphaned_projects()) {
                     Ok(deleted) if deleted > 0 => {
                         info!(
                             projects_removed = deleted,
@@ -416,7 +419,7 @@ pub fn start_indexing(
     let watcher_for_cmd = Arc::clone(&watcher_handle);
     let config_for_cmd = Arc::clone(&config);
     let work_pool_for_cmd = Arc::clone(&work_pool);
-    let db_for_cmd = db_pool;
+    let db_for_cmd = db;
     let embed_tx_for_cmd = embed_tx;
     let stats_for_cmd = Arc::clone(&stats);
     let roots_for_cmd = Arc::clone(&project_roots);
@@ -468,9 +471,9 @@ pub fn start_indexing(
                         }
                         // Clean up DB: delete all projects under this workspace path
                         let ws = path.to_string_lossy().to_string();
-                        match rt_for_cmd.block_on(
-                            crate::db::queries::delete_projects_by_workspace(&db_for_cmd, &ws)
-                        ) {
+                        match rt_for_cmd
+                            .block_on(db_for_cmd.delete_projects_by_workspace(&ws))
+                        {
                             Ok(deleted) if deleted > 0 => {
                                 info!(
                                     workspace = %path.display(),
@@ -529,7 +532,7 @@ fn rescan_workspace(
     workspace_path: &Path,
     config: &Arc<ArcSwap<Config>>,
     work_pool: &Arc<WorkPool>,
-    db_pool: &sqlx::PgPool,
+    db: &Arc<dyn crate::db::DbClient>,
     embed_tx: &Sender<EmbedIndexRequest>,
     stats: &Arc<StatsTracker>,
     project_roots: &Arc<DashMap<PathBuf, scanner::ProjectRoot>>,
@@ -566,7 +569,7 @@ fn rescan_workspace(
     for path in file_rx {
         count += 1;
         let config = Arc::clone(config);
-        let db = db_pool.clone();
+        let db = Arc::clone(db);
         let embed_tx = embed_tx.clone();
         let stats = Arc::clone(stats);
         let roots = Arc::clone(project_roots);
@@ -601,7 +604,7 @@ pub(crate) async fn handle_file_event(
     path: &Path,
     kind: &watcher::FileEventKind,
     config: &Config,
-    db_pool: &sqlx::PgPool,
+    db: &Arc<dyn crate::db::DbClient>,
     embed_tx: &Sender<EmbedIndexRequest>,
     stats: &StatsTracker,
     project_roots: &DashMap<PathBuf, scanner::ProjectRoot>,
@@ -610,7 +613,7 @@ pub(crate) async fn handle_file_event(
     match kind {
         watcher::FileEventKind::Remove => {
             let path_str = path.to_string_lossy();
-            if let Err(e) = crate::db::queries::delete_file(db_pool, &path_str).await {
+            if let Err(e) = db.delete_file(&path_str).await {
                 error!(path = %path_str, error = %e, "Failed to delete file from index");
             }
         }
@@ -622,13 +625,13 @@ pub(crate) async fn handle_file_event(
                         let root = root_info.clone();
                         drop(root_info); // Release DashMap ref
 
-                        match crate::db::queries::upsert_project(
-                            db_pool,
-                            &root.workspace_path,
-                            &root_path.to_string_lossy(),
-                            &root.name,
-                        )
-                        .await
+                        match db
+                            .upsert_project(
+                                &root.workspace_path,
+                                &root_path.to_string_lossy(),
+                                &root.name,
+                            )
+                            .await
                         {
                             Ok(id) => (
                                 id,
@@ -644,11 +647,7 @@ pub(crate) async fn handle_file_event(
                     None => {
                         // No project root found, use the workspace path
                         let workspace = config.workspace.paths.first().cloned().unwrap_or_default();
-                        match crate::db::queries::upsert_project(
-                            db_pool, &workspace, &workspace, "default",
-                        )
-                        .await
-                        {
+                        match db.upsert_project(&workspace, &workspace, "default").await {
                             Ok(id) => (id, workspace, None),
                             Err(e) => {
                                 error!(error = %e, "Failed to upsert default project");
@@ -670,7 +669,7 @@ pub(crate) async fn handle_file_event(
                 project_id,
                 &workspace_path,
                 config,
-                db_pool,
+                db,
                 embed_tx,
                 stats,
                 max_file_size_override,

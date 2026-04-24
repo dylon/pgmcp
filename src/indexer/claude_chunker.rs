@@ -350,4 +350,145 @@ mod tests {
         let chunks = chunk_claude_jsonl(&jsonl);
         assert!(chunks.is_empty());
     }
+
+    // ========================================================================
+    // Property-based tests
+    // ========================================================================
+
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    proptest! {
+        /// Entries whose `type` is in SKIP_TYPES are never emitted — the
+        /// output prefixes (`[user]`, `[assistant]`, `[<tool>]`) would never
+        /// start with "[progress]" etc.
+        #[test]
+        fn prop_skip_types_never_appear_in_output(
+            skip_type_idx in 0usize..SKIP_TYPES.len(),
+            count in 1usize..20,
+        ) {
+            let skip_type = SKIP_TYPES[skip_type_idx];
+            let mut lines = Vec::new();
+            for _ in 0..count {
+                lines.push(json!({
+                    "type": skip_type,
+                    "message": "this content must never be emitted",
+                }).to_string());
+            }
+            let input = lines.join("\n");
+            let chunks = chunk_claude_jsonl(&input);
+            prop_assert!(chunks.is_empty(),
+                "skip type {} must not emit any chunks, got {}",
+                skip_type, chunks.len());
+        }
+
+        /// Chunk indices are always dense and sequential [0, 1, …, n-1].
+        #[test]
+        fn prop_chunk_indices_are_dense_and_sequential(
+            messages in prop::collection::vec(("[a-zA-Z0-9 ]{1,40}", 0u8..3), 0..30usize),
+        ) {
+            let mut lines = Vec::new();
+            for (text, kind) in &messages {
+                let role = match kind {
+                    0 => "user",
+                    1 => "assistant",
+                    _ => "tool_result",
+                };
+                let entry = if *kind == 2 {
+                    json!({ "type": role, "name": "Tool", "result": text })
+                } else {
+                    json!({ "type": role, "message": text })
+                };
+                lines.push(entry.to_string());
+            }
+            let input = lines.join("\n");
+            let chunks = chunk_claude_jsonl(&input);
+            for (i, chunk) in chunks.iter().enumerate() {
+                prop_assert_eq!(chunk.chunk_index, i as i32);
+            }
+        }
+
+        /// User messages emit `[user] …` and assistant messages emit
+        /// `[assistant] …`. Role prefix is preserved across any mix.
+        #[test]
+        fn prop_user_and_assistant_chunks_preserve_role(
+            picks in prop::collection::vec(any::<bool>(), 1..30usize),
+        ) {
+            let mut lines = Vec::new();
+            let mut expected_prefixes = Vec::new();
+            for (i, is_user) in picks.iter().enumerate() {
+                let role = if *is_user { "user" } else { "assistant" };
+                let prefix = if *is_user { "[user]" } else { "[assistant]" };
+                expected_prefixes.push(prefix);
+                lines.push(json!({
+                    "type": role,
+                    "message": format!("message-{}", i),
+                }).to_string());
+            }
+            let input = lines.join("\n");
+            let chunks = chunk_claude_jsonl(&input);
+            prop_assert_eq!(chunks.len(), expected_prefixes.len());
+            for (chunk, prefix) in chunks.iter().zip(expected_prefixes.iter()) {
+                prop_assert!(chunk.content.starts_with(prefix),
+                    "chunk `{}` should start with `{}`", chunk.content, prefix);
+            }
+        }
+
+        /// Round-trip: building a file-history map from synthetic
+        /// `file-history-snapshot` lines must produce exactly the input
+        /// entries, keyed by `backupFileName`.
+        #[test]
+        fn prop_parse_file_history_map_round_trips(
+            entries in prop::collection::vec(
+                ("[a-z0-9]{4,12}", 1u32..5, "[a-zA-Z0-9/._]{3,40}", "[a-z0-9-]{4,20}"),
+                0..20usize,
+            ),
+        ) {
+            // De-dupe on backup filename = hash@vN (proptest may generate dups).
+            let mut seen = std::collections::HashSet::new();
+            let mut unique = Vec::new();
+            for (hash, version, path, session) in &entries {
+                let backup = format!("{}@v{}", hash, version);
+                if seen.insert(backup.clone()) {
+                    unique.push((hash.clone(), *version, path.clone(), session.clone(), backup));
+                }
+            }
+            let mut lines = Vec::new();
+            for (_hash, _version, path, session, backup) in &unique {
+                lines.push(json!({
+                    "type": "file-history-snapshot",
+                    "filePath": path,
+                    "backupFileName": backup,
+                    "sessionId": session,
+                }).to_string());
+            }
+            let input = lines.join("\n");
+            let map = parse_file_history_map(&input);
+            prop_assert_eq!(map.len(), unique.len());
+            for (_hash, version, path, _session, backup) in &unique {
+                let entry = map.get(backup).expect("entry present");
+                prop_assert_eq!(&entry.original_path, path);
+                prop_assert_eq!(entry.version, *version);
+                prop_assert_eq!(&entry.backup_filename, backup);
+            }
+        }
+
+        /// Any `hash@vN` with a well-formed N produces `version = N`.
+        #[test]
+        fn prop_version_extraction_from_hash_at_n(
+            hash in "[a-f0-9]{4,16}",
+            n in 1u32..1000,
+        ) {
+            let backup = format!("{}@v{}", hash, n);
+            let jsonl = json!({
+                "type": "file-history-snapshot",
+                "filePath": "/x.rs",
+                "backupFileName": backup,
+                "sessionId": "s",
+            }).to_string();
+            let map = parse_file_history_map(&jsonl);
+            let entry = map.get(&backup).expect("present");
+            prop_assert_eq!(entry.version, n);
+        }
+    }
 }

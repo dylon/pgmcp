@@ -522,4 +522,91 @@ mod tests {
         assert!(store.load_centroids("global").unwrap().is_empty());
         assert!(store.load_assignment(1).unwrap().is_none());
     }
+
+    // ========================================================================
+    // Property tests
+    // ========================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 16, ..ProptestConfig::default() })]
+
+        /// store_centroids → load_centroids returns the same records
+        /// (up to ordering and bitwise equality on the f32 centroid data).
+        #[test]
+        fn prop_centroid_round_trip(
+            k in 1usize..5,
+            d in 1usize..8,
+        ) {
+            let dir = TempDir::new().unwrap();
+            let store = CentroidStore::open(dir.path().join("rt.lmdb")).unwrap();
+            let records: Vec<StoredCentroid> = (0..k)
+                .map(|i| StoredCentroid {
+                    scope: "rt".into(),
+                    centroid: (0..d).map(|j| ((i * d + j) as f32).sin()).collect(),
+                    created_at: 1000 + i as i64,
+                    d,
+                    k_total: k,
+                })
+                .collect();
+            store.store_centroids("rt", &records).unwrap();
+
+            let loaded = store.load_centroids("rt").unwrap();
+            prop_assert_eq!(loaded.len(), records.len());
+            // Every input centroid must appear in output (order not specified).
+            for orig in &records {
+                let found = loaded.iter().any(|l| {
+                    l.centroid.len() == orig.centroid.len()
+                        && l.centroid
+                            .iter()
+                            .zip(orig.centroid.iter())
+                            .all(|(a, b)| (a - b).abs() < 1e-6)
+                });
+                let dim = orig.d;
+                prop_assert!(found, "round-trip lost centroid with d={}", dim);
+            }
+        }
+
+        /// store_assignment → load_assignment returns exactly what was stored.
+        #[test]
+        fn prop_assignment_round_trip(
+            chunk_id in 1i64..10_000,
+            n_entries in 1usize..5,
+        ) {
+            let dir = TempDir::new().unwrap();
+            let store = CentroidStore::open(dir.path().join("rt2.lmdb")).unwrap();
+            let entries: Vec<AssignmentEntry> = (0..n_entries)
+                .map(|i| AssignmentEntry {
+                    topic_id: i as u32,
+                    membership: ((i + 1) as f32 * 0.1).clamp(0.0, 1.0),
+                })
+                .collect();
+            store.store_assignment(chunk_id, &entries).unwrap();
+            let loaded = store.load_assignment(chunk_id).unwrap().expect("present");
+            prop_assert_eq!(loaded.len(), entries.len());
+            for (l, e) in loaded.iter().zip(entries.iter()) {
+                prop_assert_eq!(l.topic_id, e.topic_id);
+                prop_assert!((l.membership - e.membership).abs() < 1e-6);
+            }
+        }
+
+        /// store_membership_dense → load_membership_dense recovers the full
+        /// vector bit-identically (within f32 tolerance).
+        #[test]
+        fn prop_membership_dense_round_trip(
+            chunk_id in 1i64..10_000,
+            dim in 1usize..64,
+        ) {
+            let dir = TempDir::new().unwrap();
+            let store = CentroidStore::open(dir.path().join("rt3.lmdb")).unwrap();
+            let membership: Vec<f32> = (0..dim).map(|i| (i as f32) * 0.01).collect();
+            store.store_membership_dense(chunk_id, &membership).unwrap();
+            let loaded = store.load_membership_dense(chunk_id).unwrap().expect("present");
+            prop_assert_eq!(loaded.len(), membership.len());
+            for (l, m) in loaded.iter().zip(membership.iter()) {
+                prop_assert!((l - m).abs() < 1e-6);
+            }
+        }
+    }
 } // keep Bytes import alive for potential future use

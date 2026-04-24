@@ -6,13 +6,14 @@
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use crossbeam_channel::Sender;
 use tracing::{debug, error, info, warn};
 
 use crate::config::ProjectOverride;
-use crate::db;
+use crate::db::DbClient;
 use crate::embed::pool::{ChunkData, EmbedCommitRequest};
 use crate::stats::tracker::StatsTracker;
 
@@ -28,7 +29,7 @@ const COMMIT_SEP: &str = "\x1e"; // ASCII Record Separator
 pub async fn index_git_history(
     project_root: &Path,
     project_id: i32,
-    db_pool: &sqlx::PgPool,
+    db: &Arc<dyn DbClient>,
     embed_tx: &Sender<EmbedCommitRequest>,
     stats: &StatsTracker,
 ) -> Result<(), crate::error::PgmcpError> {
@@ -38,9 +39,7 @@ pub async fn index_git_history(
     }
 
     // Get last indexed commit
-    let last_sha = db::queries::get_git_last_commit(db_pool, project_id)
-        .await
-        .unwrap_or(None);
+    let last_sha = db.get_git_last_commit(project_id).await.unwrap_or(None);
 
     // Build git log command
     let format_str = format!(
@@ -120,20 +119,20 @@ pub async fn index_git_history(
             .parse::<DateTime<Utc>>()
             .unwrap_or_else(|_| Utc::now());
 
-        let commit_id = match db::queries::upsert_git_commit(
-            db_pool,
-            project_id,
-            &commit.hash,
-            &commit.author,
-            author_date,
-            &commit.subject,
-            if commit.body.is_empty() {
-                None
-            } else {
-                Some(&commit.body)
-            },
-        )
-        .await
+        let commit_id = match db
+            .upsert_git_commit(
+                project_id,
+                &commit.hash,
+                &commit.author,
+                author_date,
+                &commit.subject,
+                if commit.body.is_empty() {
+                    None
+                } else {
+                    Some(&commit.body)
+                },
+            )
+            .await
         {
             Ok(id) => id,
             Err(e) => {
@@ -146,7 +145,8 @@ pub async fn index_git_history(
         };
 
         // Index files changed in this commit
-        if let Err(e) = index_commit_files(db_pool, project_root, commit_id, &commit.hash).await {
+        if let Err(e) = index_commit_files(db.as_ref(), project_root, commit_id, &commit.hash).await
+        {
             debug!(hash = %commit.hash, error = %e, "Failed to index commit files");
         }
 
@@ -161,7 +161,7 @@ pub async fn index_git_history(
         let request = EmbedCommitRequest {
             commit_id,
             chunks: vec![chunk],
-            db_pool: db_pool.clone(),
+            db: Arc::clone(db),
         };
 
         if let Err(e) = embed_tx.send(request) {
@@ -178,11 +178,11 @@ pub async fn index_git_history(
 
     // Backfill git_commit_files for any commits that were previously indexed
     // without file change tracking
-    backfill_commit_files(db_pool, project_root, project_id).await;
+    backfill_commit_files(db.as_ref(), project_root, project_id).await;
 
     // Update last indexed commit
     if let Some(sha) = newest_sha
-        && let Err(e) = db::queries::set_git_last_commit(db_pool, project_id, &sha).await
+        && let Err(e) = db.set_git_last_commit(project_id, &sha).await
     {
         error!(project_id, error = %e, "Failed to update last indexed commit");
     }
@@ -196,7 +196,7 @@ pub async fn update_blame_metadata(
     project_root: &Path,
     file_path: &Path,
     file_id: i64,
-    db_pool: &sqlx::PgPool,
+    db: &dyn DbClient,
 ) -> Result<(), crate::error::PgmcpError> {
     let relative = file_path.strip_prefix(project_root).unwrap_or(file_path);
 
@@ -222,16 +222,16 @@ pub async fn update_blame_metadata(
     let blame_entries = parse_blame_porcelain(&blame_output);
 
     for entry in &blame_entries {
-        if let Err(e) = db::queries::update_blame_for_file(
-            db_pool,
-            file_id,
-            &entry.commit_hash,
-            &entry.author,
-            entry.date,
-            entry.start_line,
-            entry.end_line,
-        )
-        .await
+        if let Err(e) = db
+            .update_blame_for_file(
+                file_id,
+                &entry.commit_hash,
+                &entry.author,
+                entry.date,
+                entry.start_line,
+                entry.end_line,
+            )
+            .await
         {
             debug!(file_id, error = %e, "Failed to update blame metadata");
         }
@@ -250,7 +250,7 @@ pub fn is_git_history_enabled(project_root: &Path) -> bool {
 
 /// Extract files changed in a commit using `git diff-tree` and store them.
 async fn index_commit_files(
-    db_pool: &sqlx::PgPool,
+    db: &dyn DbClient,
     repo_path: &Path,
     commit_db_id: i64,
     commit_hash: &str,
@@ -295,8 +295,9 @@ async fn index_commit_files(
             parts[1]
         };
 
-        if let Err(e) =
-            db::queries::insert_commit_file(db_pool, commit_db_id, file_path, change_type).await
+        if let Err(e) = db
+            .insert_commit_file(commit_db_id, file_path, change_type)
+            .await
         {
             debug!(
                 commit_hash,
@@ -311,8 +312,8 @@ async fn index_commit_files(
 }
 
 /// Backfill `git_commit_files` for commits that were indexed before file tracking was added.
-async fn backfill_commit_files(db_pool: &sqlx::PgPool, repo_path: &Path, project_id: i32) {
-    let missing = match db::queries::get_commits_missing_files(db_pool, project_id).await {
+async fn backfill_commit_files(db: &dyn DbClient, repo_path: &Path, project_id: i32) {
+    let missing = match db.get_commits_missing_files(project_id).await {
         Ok(rows) => rows,
         Err(e) => {
             debug!(project_id, error = %e, "Failed to query commits missing files");
@@ -331,7 +332,7 @@ async fn backfill_commit_files(db_pool: &sqlx::PgPool, repo_path: &Path, project
     );
 
     for (commit_db_id, commit_hash) in &missing {
-        if let Err(e) = index_commit_files(db_pool, repo_path, *commit_db_id, commit_hash).await {
+        if let Err(e) = index_commit_files(db, repo_path, *commit_db_id, commit_hash).await {
             debug!(commit_hash, error = %e, "Failed to backfill commit files");
         }
     }

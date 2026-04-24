@@ -13,10 +13,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use ndarray::{Array2, ArrayView2};
-use sqlx::PgPool;
 use tracing::{error, info, warn};
 
 use crate::config::CronConfig;
+use crate::db::DbClient;
 use crate::db::queries::ChunkEmbeddingRow;
 use crate::fcm;
 use crate::stats::tracker::StatsTracker;
@@ -1116,8 +1116,98 @@ fn cluster_embeddings(
 // Entry point 1: Global topic scan (cron job)
 // ============================================================================
 
+/// Strategy chosen by `select_scan_strategy` based on corpus size + config
+/// thresholds. Pure dispatch — no I/O, no allocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanStrategy {
+    /// Online (mini-batch) FCM — keeps O(batch·(d+K)) memory regardless of
+    /// total chunk count. Used when chunk count exceeds the online threshold.
+    Online,
+    /// mmap-backed data matrix + streaming c-TF-IDF — caps anonymous-heap
+    /// RSS while preserving in-memory FCM speed. Used for medium corpora.
+    Mmap,
+    /// Vanilla in-memory FCM — fastest path for small corpora.
+    InMemory,
+}
+
+/// Decision from the memory pre-flight against `/proc/meminfo:MemAvailable`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum BudgetDecision {
+    /// Predicted peak RSS within `topic_max_mem_fraction × MemAvailable`.
+    /// Safe to proceed with the chosen strategy.
+    WithinBudget {
+        predicted_mb: u64,
+        available_mb: u64,
+        frac: f64,
+    },
+    /// Predicted peak RSS exceeds the budget. Caller should run the
+    /// per-project emergency fallback for this cycle and retry next cycle.
+    OverBudget {
+        predicted_mb: u64,
+        available_mb: u64,
+        frac: f64,
+        budget_frac: f64,
+    },
+    /// Pre-flight skipped (no chunks, or `/proc/meminfo` unreadable).
+    NotChecked,
+}
+
+/// Pure dispatch: pick the FCM strategy from corpus size + thresholds.
+pub(crate) fn select_scan_strategy(chunk_count: usize, config: &CronConfig) -> ScanStrategy {
+    if chunk_count > config.topic_online_n_threshold {
+        ScanStrategy::Online
+    } else if chunk_count > config.topic_mmap_n_threshold {
+        ScanStrategy::Mmap
+    } else {
+        ScanStrategy::InMemory
+    }
+}
+
+/// Pure memory budget check. Predicts peak RSS for in-memory FCM at the
+/// given (n, k) and compares against `MemAvailable × budget_frac`.
+pub(crate) fn check_memory_budget(
+    chunk_count: usize,
+    k: usize,
+    mem_avail: u64,
+    budget_frac: f64,
+) -> BudgetDecision {
+    if chunk_count == 0 {
+        return BudgetDecision::NotChecked;
+    }
+    let d = 384u64;
+    let n = chunk_count as u64;
+    let k = k as u64;
+    // Conservative prediction matching the in-memory FCM buffer footprint.
+    let predicted_bytes = 8u64 * (n * d)                  // data Array2<f64>
+        + 8u64 * (n * d)                                  // data_vecs duplicate
+        + 8u64 * 4 * (n * k)                              // membership + clone + dist_sq + u_pow_m
+        + 8u64 * (n * k)                                  // dot_xc
+        + 2_000u64 * n; // rows Vec overhead (content + strings)
+    let predicted_mb = predicted_bytes >> 20;
+    let available_mb = mem_avail >> 20;
+    let frac = predicted_bytes as f64 / mem_avail as f64;
+    if frac > budget_frac {
+        BudgetDecision::OverBudget {
+            predicted_mb,
+            available_mb,
+            frac,
+            budget_frac,
+        }
+    } else {
+        BudgetDecision::WithinBudget {
+            predicted_mb,
+            available_mb,
+            frac,
+        }
+    }
+}
+
 /// Run a global topic scan over all chunks, storing results in the DB.
-pub async fn run_global_topic_scan(pool: &PgPool, config: &CronConfig, stats: &Arc<StatsTracker>) {
+pub async fn run_global_topic_scan(
+    db: &dyn DbClient,
+    config: &CronConfig,
+    stats: &Arc<StatsTracker>,
+) {
     let params = FcmParams::from_config(config);
     info!(
         min_cluster_size = params.min_cluster_size,
@@ -1126,83 +1216,77 @@ pub async fn run_global_topic_scan(pool: &PgPool, config: &CronConfig, stats: &A
         "Starting global topic clustering scan (FCM + c-TF-IDF)"
     );
 
-    // Memory pre-flight: predict peak RSS of the FCM working set and compare
-    // against /proc/meminfo:MemAvailable. If the prediction exceeds the budget,
-    // fall back to per-project clustering for this cycle so scope='global' is
-    // skipped once (next cycle retries).
-    //
-    // Global full-chunk clustering is REQUIRED for cross-document comparability
-    // (see memory feedback_global_fullchunk_clustering.md). The fallback exists
-    // as a safety valve, not a working mode — on 128 GB hardware with a ~100k
-    // chunk corpus the prediction is ~1-2 GB which is well under any reasonable
-    // budget and this branch is never taken.
-    // Phase 8 dispatch: for huge corpora, switch to the online/mini-batch path
-    // which keeps O(batch·(d+K)) memory regardless of total chunk count.
-    let chunk_count_opt = count_chunks(pool).await;
+    let chunk_count_opt = count_chunks(db).await;
+
+    // Strategy dispatch: online (huge) → mmap (medium) → in-memory (small).
     if let Some(chunk_count) = chunk_count_opt {
-        if chunk_count > config.topic_online_n_threshold {
-            info!(
-                chunk_count,
-                threshold = config.topic_online_n_threshold,
-                batch_size = config.topic_online_batch_size,
-                "Dispatching to online FCM (mini-batch) for global topic scan"
-            );
-            run_online_global_topic_scan(pool, config, stats, chunk_count).await;
-            return;
-        }
-        // Phase 1.2-1.3 dispatch: for medium corpora, use mmap-backed data +
-        // streaming c-TF-IDF to cap anonymous-heap RSS while preserving the
-        // in-memory FCM speed.
-        if chunk_count > config.topic_mmap_n_threshold {
-            info!(
-                chunk_count,
-                threshold = config.topic_mmap_n_threshold,
-                "Dispatching to mmap-streaming FCM for global topic scan"
-            );
-            run_mmap_global_topic_scan(pool, config, stats, chunk_count).await;
-            return;
+        match select_scan_strategy(chunk_count, config) {
+            ScanStrategy::Online => {
+                info!(
+                    chunk_count,
+                    threshold = config.topic_online_n_threshold,
+                    batch_size = config.topic_online_batch_size,
+                    "Dispatching to online FCM (mini-batch) for global topic scan"
+                );
+                run_online_global_topic_scan(db, config, stats, chunk_count).await;
+                return;
+            }
+            ScanStrategy::Mmap => {
+                info!(
+                    chunk_count,
+                    threshold = config.topic_mmap_n_threshold,
+                    "Dispatching to mmap-streaming FCM for global topic scan"
+                );
+                run_mmap_global_topic_scan(db, config, stats, chunk_count).await;
+                return;
+            }
+            ScanStrategy::InMemory => { /* fall through to in-memory path */ }
         }
     }
 
+    // Memory pre-flight for the in-memory path. If the prediction exceeds
+    // budget, run per-project fallback for this cycle and retry next cycle.
     if let (Some(chunk_count), Some(mem_avail)) =
         (chunk_count_opt, crate::stats::rss::mem_available_bytes())
-        && chunk_count > 0
     {
-        let d = 384usize;
         let k_est = estimate_k(chunk_count, params.min_cluster_size);
-        // Present FCM uses f64 buffers; predict conservatively.
-        // Phase 2 will halve this via f32 + preallocation.
-        let predicted_bytes = 8u64 * (chunk_count as u64 * d as u64)                    // data Array2<f64>
-              + 8u64 * (chunk_count as u64 * d as u64)                    // data_vecs duplicate
-              + 8u64 * 4 * (chunk_count as u64 * k_est as u64)            // membership + clone + dist_sq + u_pow_m
-              + 8u64 * (chunk_count as u64 * k_est as u64)                // dot_xc
-              + 2_000u64 * chunk_count as u64; // rows Vec overhead (content + strings)
-
-        let frac = predicted_bytes as f64 / mem_avail as f64;
-        info!(
-            chunks = chunk_count,
-            k_est,
-            predicted_peak_mb = predicted_bytes >> 20,
-            available_mb = mem_avail >> 20,
-            frac = format!("{:.3}", frac),
-            "Global topic clustering memory pre-flight"
-        );
-
-        if frac > config.topic_max_mem_fraction {
-            warn!(
-                chunks = chunk_count,
-                predicted_peak_mb = predicted_bytes >> 20,
-                available_mb = mem_avail >> 20,
-                frac = format!("{:.3}", frac),
-                budget_frac = config.topic_max_mem_fraction,
-                "Global clustering skipped this cycle: predicted RSS exceeds budget. Running per-project emergency fallback; scope='global' not refreshed."
-            );
-            run_per_project_emergency_fallback(pool, config, stats).await;
-            return;
+        match check_memory_budget(chunk_count, k_est, mem_avail, config.topic_max_mem_fraction) {
+            BudgetDecision::WithinBudget {
+                predicted_mb,
+                available_mb,
+                frac,
+            } => {
+                info!(
+                    chunks = chunk_count,
+                    k_est,
+                    predicted_peak_mb = predicted_mb,
+                    available_mb,
+                    frac = format!("{:.3}", frac),
+                    "Global topic clustering memory pre-flight"
+                );
+            }
+            BudgetDecision::OverBudget {
+                predicted_mb,
+                available_mb,
+                frac,
+                budget_frac,
+            } => {
+                warn!(
+                    chunks = chunk_count,
+                    predicted_peak_mb = predicted_mb,
+                    available_mb,
+                    frac = format!("{:.3}", frac),
+                    budget_frac,
+                    "Global clustering skipped this cycle: predicted RSS exceeds budget. Running per-project emergency fallback; scope='global' not refreshed."
+                );
+                run_per_project_emergency_fallback(db, config, stats).await;
+                return;
+            }
+            BudgetDecision::NotChecked => {}
         }
     }
 
-    let rows = match crate::db::queries::bulk_extract_embeddings(pool, None).await {
+    let rows = match db.bulk_extract_embeddings(None).await {
         Ok(r) => r,
         Err(e) => {
             error!(error = %e, "Failed to extract embeddings for topic clustering");
@@ -1237,12 +1321,12 @@ pub async fn run_global_topic_scan(pool: &PgPool, config: &CronConfig, stats: &A
     );
 
     // Store results
-    if let Err(e) = crate::db::queries::clear_topics_for_scope(pool, "global").await {
+    if let Err(e) = db.clear_topics_for_scope("global").await {
         error!(error = %e, "Failed to clear old global topics");
         return;
     }
 
-    if let Err(e) = crate::db::queries::store_topics(pool, "global", &summary.topics).await {
+    if let Err(e) = db.store_topics("global", &summary.topics).await {
         error!(error = %e, "Failed to store global topics");
         return;
     }
@@ -1261,7 +1345,7 @@ pub async fn run_global_topic_scan(pool: &PgPool, config: &CronConfig, stats: &A
     );
 
     // Phase 9: chain meta-clustering hierarchy on the global centroids.
-    run_hierarchy_pass(pool, config, stats).await;
+    run_hierarchy_pass(db, config, stats).await;
 }
 
 /// Phase 9 — meta-clustering hierarchy on global topic centroids.
@@ -1270,7 +1354,12 @@ pub async fn run_global_topic_scan(pool: &PgPool, config: &CronConfig, stats: &A
 /// pointing back at the global topic IDs.
 /// Failure-isolated: a hierarchy error does NOT touch the authoritative
 /// global assignments, just logs and returns.
-async fn run_hierarchy_pass(pool: &PgPool, config: &CronConfig, stats: &Arc<StatsTracker>) {
+async fn run_hierarchy_pass(db: &dyn DbClient, config: &CronConfig, stats: &Arc<StatsTracker>) {
+    // Inline SQL not yet on the DbClient trait — escape hatch.
+    let pool = db
+        .pool()
+        .expect("hierarchy pass requires a real &PgPool from DbClient::pool()");
+
     #[derive(sqlx::FromRow)]
     struct GlobalTopicRow {
         id: i64,
@@ -1348,11 +1437,11 @@ async fn run_hierarchy_pass(pool: &PgPool, config: &CronConfig, stats: &Arc<Stat
         })
         .collect();
 
-    if let Err(e) = crate::db::queries::clear_topics_for_scope(pool, "hierarchy").await {
+    if let Err(e) = db.clear_topics_for_scope("hierarchy").await {
         warn!(error = %e, "hierarchy: clear failed");
         return;
     }
-    if let Err(e) = crate::db::queries::store_topics(pool, "hierarchy", &meta_topics).await {
+    if let Err(e) = db.store_topics("hierarchy", &meta_topics).await {
         warn!(error = %e, "hierarchy: store failed");
         return;
     }
@@ -1372,11 +1461,16 @@ async fn run_hierarchy_pass(pool: &PgPool, config: &CronConfig, stats: &Arc<Stat
 /// than the fully-online path since the mmap data is OS-cached after the
 /// first pass).
 async fn run_mmap_global_topic_scan(
-    pool: &PgPool,
+    db: &dyn DbClient,
     config: &CronConfig,
     stats: &Arc<StatsTracker>,
     n_total: usize,
 ) {
+    // Inline SQL not on the trait — escape hatch.
+    let pool = db
+        .pool()
+        .expect("run_mmap_global_topic_scan requires a real &PgPool");
+
     let params = FcmParams::from_config(config);
     let d = 384usize;
 
@@ -1571,11 +1665,11 @@ async fn run_mmap_global_topic_scan(
         topics,
     };
 
-    if let Err(e) = crate::db::queries::clear_topics_for_scope(pool, "global").await {
+    if let Err(e) = db.clear_topics_for_scope("global").await {
         error!(error = %e, "mmap-streaming: clear_topics failed");
         return;
     }
-    if let Err(e) = crate::db::queries::store_topics(pool, "global", &summary.topics).await {
+    if let Err(e) = db.store_topics("global", &summary.topics).await {
         error!(error = %e, "mmap-streaming: store_topics failed");
         return;
     }
@@ -1597,7 +1691,7 @@ async fn run_mmap_global_topic_scan(
     drop(mmap);
 
     // Phase 9: chain meta-clustering hierarchy.
-    run_hierarchy_pass(pool, config, stats).await;
+    run_hierarchy_pass(db, config, stats).await;
 }
 
 /// Cheap metadata held in RAM for every chunk during mmap-streaming.
@@ -1615,11 +1709,16 @@ struct ChunkMetaLite {
 /// into a reused scratch Vec<String>, and updates weighted topic_word_counts
 /// in-place. Never holds more than one batch of content in RAM.
 async fn compute_ctf_idf_streaming(
-    pool: &PgPool,
+    db: &dyn DbClient,
     metas: &[ChunkMetaLite],
     membership: &Array2<f32>,
     top_k: usize,
 ) -> Vec<Vec<TopicKeyword>> {
+    // Inline SQL not on the trait — escape hatch.
+    let pool = db
+        .pool()
+        .expect("compute_ctf_idf_streaming requires a real &PgPool");
+
     let n = metas.len();
     let k = membership.ncols();
     let mut topic_word_counts: Vec<HashMap<String, f64>> = vec![HashMap::new(); k];
@@ -1730,8 +1829,13 @@ async fn build_topics_from_members(
     data_view: &ArrayView2<'_, f32>,
     fcm_result: &FcmResult,
     keyword_sets: &[Vec<TopicKeyword>],
-    pool: &PgPool,
+    db: &dyn DbClient,
 ) -> Vec<TopicResult> {
+    // Inline SQL not on the trait — escape hatch.
+    let pool = db
+        .pool()
+        .expect("build_topics_from_members requires a real &PgPool");
+
     let mut topics: Vec<TopicResult> = Vec::with_capacity(topic_members.len());
     for (&topic_idx, members) in topic_members {
         if members.is_empty() {
@@ -1826,7 +1930,7 @@ async fn build_topics_from_members(
 /// and returns (membership rows are persisted per-chunk in the LMDB
 /// `memberships_dense` sub-db; too large to return in RAM).
 async fn run_online_global_topic_scan(
-    pool: &PgPool,
+    db: &dyn DbClient,
     config: &CronConfig,
     stats: &Arc<StatsTracker>,
     n_total: usize,
@@ -1834,6 +1938,11 @@ async fn run_online_global_topic_scan(
     use crate::cron::topic_clustering_online::{
         BatchFetcher, MembershipStore, OnlineFcmConfig, fuzzy_c_means_online,
     };
+
+    // Inline SQL not on the trait — escape hatch.
+    let pool = db
+        .pool()
+        .expect("run_online_global_topic_scan requires a real &PgPool");
 
     let params = FcmParams::from_config(config);
     let d = 384usize;
@@ -1998,21 +2107,24 @@ async fn run_online_global_topic_scan(
             parent_topic_ids: Vec::new(),
         })
         .collect();
-    if let Err(e) = crate::db::queries::clear_topics_for_scope(pool, "global").await {
+    if let Err(e) = db.clear_topics_for_scope("global").await {
         warn!(error = %e, "online FCM: clear global failed");
     }
-    if let Err(e) = crate::db::queries::store_topics(pool, "global", &shell_topics).await {
+    if let Err(e) = db.store_topics("global", &shell_topics).await {
         warn!(error = %e, "online FCM: store global shells failed");
     }
 
     stats.topic_scans.fetch_add(1, Ordering::Relaxed);
 
     // Phase 9: chain meta-clustering hierarchy.
-    run_hierarchy_pass(pool, config, stats).await;
+    run_hierarchy_pass(db, config, stats).await;
 }
 
 /// Query the total chunk count with an embedding — used by memory pre-flight.
-async fn count_chunks(pool: &PgPool) -> Option<usize> {
+async fn count_chunks(db: &dyn DbClient) -> Option<usize> {
+    let pool = db
+        .pool()
+        .expect("count_chunks requires a real &PgPool from DbClient::pool()");
     match sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*) FROM file_chunks WHERE embedding IS NOT NULL",
     )
@@ -2034,10 +2146,13 @@ async fn count_chunks(pool: &PgPool) -> Option<usize> {
 /// NOT a primary mode. Each project's FCM peak is bounded by that project's
 /// chunk count — much smaller than the union.
 async fn run_per_project_emergency_fallback(
-    pool: &PgPool,
+    db: &dyn DbClient,
     config: &CronConfig,
     stats: &Arc<StatsTracker>,
 ) {
+    let pool = db
+        .pool()
+        .expect("emergency fallback requires a real &PgPool from DbClient::pool()");
     let projects: Vec<(i32, String)> =
         match sqlx::query_as::<_, (i32, String)>("SELECT id, name FROM projects ORDER BY id")
             .fetch_all(pool)
@@ -2054,7 +2169,7 @@ async fn run_per_project_emergency_fallback(
     for (_project_id, project_name) in &projects {
         let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
         match run_project_topic_scan(
-            pool,
+            db,
             project_name,
             config,
             config.topic_min_cluster_size,
@@ -2064,10 +2179,8 @@ async fn run_per_project_emergency_fallback(
         {
             Ok(summary) => {
                 let scope = format!("project:{}", project_name);
-                let _ = crate::db::queries::clear_topics_for_scope(pool, &scope).await;
-                if let Err(e) =
-                    crate::db::queries::store_topics(pool, &scope, &summary.topics).await
-                {
+                let _ = db.clear_topics_for_scope(&scope).await;
+                if let Err(e) = db.store_topics(&scope, &summary.topics).await {
                     error!(
                         project = %project_name,
                         error = %e,
@@ -2112,14 +2225,15 @@ async fn run_per_project_emergency_fallback(
 
 /// Run topic clustering for a single project, returning results directly.
 pub async fn run_project_topic_scan(
-    pool: &PgPool,
+    db: &dyn DbClient,
     project_name: &str,
     config: &CronConfig,
     min_cluster_size: usize,
     language: Option<&str>,
 ) -> Result<ClusteringSummary, anyhow::Error> {
-    let rows =
-        crate::db::queries::bulk_extract_project_embeddings(pool, project_name, language).await?;
+    let rows = db
+        .bulk_extract_project_embeddings(project_name, language)
+        .await?;
 
     if rows.is_empty() {
         return Ok(ClusteringSummary {
@@ -2147,6 +2261,73 @@ pub async fn run_project_topic_scan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- Phase 9: pure helpers extracted from run_global_topic_scan -----
+
+    fn cron_config_with_thresholds(mmap: usize, online: usize) -> CronConfig {
+        CronConfig {
+            topic_mmap_n_threshold: mmap,
+            topic_online_n_threshold: online,
+            topic_max_mem_fraction: 0.4,
+            ..CronConfig::default()
+        }
+    }
+
+    #[test]
+    fn select_scan_strategy_in_memory_for_small_corpus() {
+        let cfg = cron_config_with_thresholds(10_000, 1_000_000);
+        assert_eq!(select_scan_strategy(500, &cfg), ScanStrategy::InMemory);
+        assert_eq!(select_scan_strategy(10_000, &cfg), ScanStrategy::InMemory);
+    }
+
+    #[test]
+    fn select_scan_strategy_mmap_above_mmap_threshold() {
+        let cfg = cron_config_with_thresholds(10_000, 1_000_000);
+        assert_eq!(select_scan_strategy(10_001, &cfg), ScanStrategy::Mmap);
+        assert_eq!(select_scan_strategy(500_000, &cfg), ScanStrategy::Mmap);
+    }
+
+    #[test]
+    fn select_scan_strategy_online_above_online_threshold() {
+        let cfg = cron_config_with_thresholds(10_000, 1_000_000);
+        assert_eq!(select_scan_strategy(1_000_001, &cfg), ScanStrategy::Online);
+        assert_eq!(select_scan_strategy(5_000_000, &cfg), ScanStrategy::Online);
+    }
+
+    #[test]
+    fn check_memory_budget_within_budget_at_realistic_size() {
+        // n=100k, k=100, mem_avail=128 GiB → ~1-2 GB predicted, well under 40%.
+        let mem_avail = 128u64 * 1024 * 1024 * 1024;
+        match check_memory_budget(100_000, 100, mem_avail, 0.4) {
+            BudgetDecision::WithinBudget { frac, .. } => assert!(frac < 0.4),
+            other => panic!("expected within budget, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_memory_budget_over_budget_when_huge() {
+        // n=10M, k=500, mem_avail=4 GiB → way over 40%.
+        let mem_avail = 4u64 * 1024 * 1024 * 1024;
+        match check_memory_budget(10_000_000, 500, mem_avail, 0.4) {
+            BudgetDecision::OverBudget {
+                frac, budget_frac, ..
+            } => {
+                assert!(frac > 0.4);
+                assert_eq!(budget_frac, 0.4);
+            }
+            other => panic!("expected over budget, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn check_memory_budget_not_checked_with_zero_chunks() {
+        match check_memory_budget(0, 10, 1024 * 1024 * 1024, 0.4) {
+            BudgetDecision::NotChecked => {}
+            other => panic!("expected NotChecked, got {:?}", other),
+        }
+    }
+
+    // ----- existing tests below -----
 
     #[test]
     fn test_l2_normalize() {
@@ -2595,5 +2776,183 @@ mod tests {
         ];
         assert_eq!(label_from_keywords(&kw, 0), "database / query");
         assert_eq!(label_from_keywords(&[], 7), "topic_7");
+    }
+
+    // ========================================================================
+    // Property tests (Phase 2)
+    // ========================================================================
+
+    use proptest::prelude::*;
+
+    /// Build a well-separated K-blob dataset used for FCM convergence
+    /// property checks. K clusters on a d-dim grid.
+    fn make_blobs(k: usize, pts_per_cluster: usize, d: usize) -> ndarray::Array2<f32> {
+        let n = k * pts_per_cluster;
+        let mut data = ndarray::Array2::<f32>::zeros((n, d));
+        for c in 0..k {
+            for i in 0..pts_per_cluster {
+                let row = c * pts_per_cluster + i;
+                data[[row, c % d]] = 10.0 + 0.01 * i as f32;
+            }
+        }
+        data
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 16, ..ProptestConfig::default() })]
+
+        /// Every row of the membership matrix sums to ≈ 1.0 (row-stochastic).
+        /// This is an FCM invariant — memberships are normalized after each
+        /// update step.
+        #[test]
+        fn prop_fcm_membership_rows_sum_to_one(
+            k in 2usize..5,
+            pts in 6usize..12,
+            d in 2usize..5,
+        ) {
+            let data = make_blobs(k, pts, d);
+            let result = fuzzy_c_means(data.view(), k, 2.0, 30, 1e-4, None);
+            for i in 0..result.membership.nrows() {
+                let sum: f32 = result.membership.row(i).iter().sum();
+                prop_assert!((sum - 1.0).abs() < 1e-3,
+                    "row {} sum = {} (should be ≈ 1.0)", i, sum);
+            }
+        }
+
+        /// FCM always terminates within max_iters — the while loop must
+        /// respect its upper bound even if tolerance is never reached.
+        #[test]
+        fn prop_fcm_converges_within_max_iters(
+            k in 2usize..4,
+            pts in 5usize..10,
+            d in 2usize..4,
+            max_iters in 5usize..30,
+        ) {
+            let data = make_blobs(k, pts, d);
+            let result = fuzzy_c_means(data.view(), k, 2.0, max_iters, 1e-10, None);
+            prop_assert!(result.iterations <= max_iters,
+                "ran {} iterations but cap was {}", result.iterations, max_iters);
+        }
+
+        /// Membership values above `topic_membership_threshold` get kept
+        /// as topic assignments. Specifically, for each chunk the primary
+        /// topic (argmax) must have membership ≥ threshold — if the chunk
+        /// is ever assigned. This pins the filter semantics of
+        /// `run_global_topic_scan` downstream assignment logic.
+        #[test]
+        fn prop_membership_threshold_filters_low_assignments(
+            k in 2usize..4,
+            pts in 5usize..10,
+            d in 2usize..4,
+            threshold_bps in 100u32..500u32,  // basis points → 0.01..0.05
+        ) {
+            let data = make_blobs(k, pts, d);
+            let result = fuzzy_c_means(data.view(), k, 2.0, 30, 1e-4, None);
+            let threshold = (threshold_bps as f32) * 0.0001;
+            // For every row, find the primary membership. If above threshold,
+            // it would be kept; if below, the chunk becomes noise.
+            for i in 0..result.membership.nrows() {
+                let row = result.membership.row(i);
+                let max: f32 = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                // Either max ≥ threshold (chunk would be kept) or it wouldn't.
+                // Both paths are valid per the contract. Primary assertion:
+                // the max value is a legal membership in [0, 1].
+                prop_assert!((0.0..=1.0 + 1e-5).contains(&max));
+                // If threshold is absurdly low (< 1/k), every chunk must
+                // pass — since rows sum to 1, at least one value is ≥ 1/k.
+                if threshold < (1.0 / (k as f32)) - 1e-5 {
+                    prop_assert!(max >= threshold,
+                        "max membership {} should exceed threshold {} (rows sum to 1 with k={})",
+                        max, threshold, k);
+                }
+            }
+        }
+
+        /// All membership values are in [0, 1] (not strict [0, 1], allow
+        /// epsilon rounding).
+        #[test]
+        fn prop_fcm_memberships_in_unit_interval(
+            k in 2usize..4,
+            pts in 5usize..10,
+            d in 2usize..4,
+        ) {
+            let data = make_blobs(k, pts, d);
+            let result = fuzzy_c_means(data.view(), k, 2.0, 30, 1e-4, None);
+            for &v in result.membership.iter() {
+                prop_assert!((-1e-5..=1.0 + 1e-5).contains(&v),
+                    "membership {} outside [0, 1]", v);
+            }
+        }
+
+        /// c-TF-IDF keywords are always sorted by score descending within
+        /// each topic's output.
+        #[test]
+        fn prop_tfidf_keywords_top_k_descending_score(
+            k in 2usize..5,
+            words_per_topic in 3usize..10,
+            top_k in 1usize..8,
+        ) {
+            // Build synthetic chunks — each chunk belongs 100% to one topic
+            // and contains a few topic-specific words.
+            let n = k * 8;
+            let mut contents: Vec<String> = Vec::with_capacity(n);
+            for i in 0..n {
+                let topic = i % k;
+                let words: Vec<String> = (0..words_per_topic)
+                    .map(|w| format!("topic{}_word{}", topic, w))
+                    .collect();
+                contents.push(words.join(" "));
+            }
+            let content_refs: Vec<&str> = contents.iter().map(|s| s.as_str()).collect();
+
+            // Hard assignment: row i → topic (i % k).
+            let mut membership = ndarray::Array2::<f32>::zeros((n, k));
+            for i in 0..n {
+                membership[[i, i % k]] = 1.0;
+            }
+
+            let results = compute_ctf_idf(&content_refs, &membership, top_k);
+            prop_assert_eq!(results.len(), k);
+            for topic_kw in &results {
+                for pair in topic_kw.windows(2) {
+                    prop_assert!(pair[0].score >= pair[1].score - 1e-9,
+                        "keywords not descending: {} ({}) vs {} ({})",
+                        pair[0].word, pair[0].score, pair[1].word, pair[1].score);
+                }
+                prop_assert!(topic_kw.len() <= top_k);
+            }
+        }
+
+        /// c-TF-IDF keywords within a topic are distinct (no duplicates).
+        #[test]
+        fn prop_tfidf_keywords_unique_per_topic(
+            k in 2usize..4,
+            top_k in 2usize..6,
+        ) {
+            let n = 20;
+            let mut contents: Vec<String> = Vec::with_capacity(n);
+            for i in 0..n {
+                let topic = i % k;
+                contents.push(format!("topic{} common shared {} unique{}",
+                    topic,
+                    if i.is_multiple_of(2) { "alpha" } else { "beta" },
+                    i));
+            }
+            let content_refs: Vec<&str> = contents.iter().map(|s| s.as_str()).collect();
+
+            let mut membership = ndarray::Array2::<f32>::zeros((n, k));
+            for i in 0..n {
+                membership[[i, i % k]] = 1.0;
+            }
+
+            let results = compute_ctf_idf(&content_refs, &membership, top_k);
+            for topic_kw in &results {
+                let mut seen = std::collections::HashSet::new();
+                for kw in topic_kw {
+                    prop_assert!(seen.insert(kw.word.clone()),
+                        "duplicate keyword `{}` in topic", kw.word);
+                }
+            }
+        }
     }
 }

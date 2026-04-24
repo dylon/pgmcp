@@ -8,10 +8,10 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use sqlx::PgPool;
 use tracing::{error, info, warn};
 
 use crate::config::CronConfig;
+use crate::db::DbClient;
 use crate::stats::tracker::StatsTracker;
 
 /// Run a full batch similarity scan.
@@ -22,7 +22,7 @@ use crate::stats::tracker::StatsTracker;
 /// The table is truncated before each full scan to remove stale pairs from
 /// deleted/re-indexed files.
 pub async fn run_similarity_scan(
-    pool: &PgPool,
+    db: &dyn DbClient,
     config: &CronConfig,
     ef_search: i32,
     stats: &Arc<StatsTracker>,
@@ -37,12 +37,12 @@ pub async fn run_similarity_scan(
     );
 
     // Truncate the table for a fresh scan
-    if let Err(e) = crate::db::queries::clear_similarity_table(pool).await {
+    if let Err(e) = db.clear_similarity_table().await {
         error!(error = %e, "Failed to clear similarity table");
         return;
     }
 
-    let max_id = match crate::db::queries::max_chunk_id(pool).await {
+    let max_id = match db.max_chunk_id().await {
         Ok(id) => id,
         Err(e) => {
             error!(error = %e, "Failed to get max chunk ID");
@@ -64,10 +64,9 @@ pub async fn run_similarity_scan(
             break;
         }
 
-        let neighbors = match crate::db::queries::batch_find_cross_project_neighbors(
-            pool, last_id, batch_size, top_k, threshold, ef_search,
-        )
-        .await
+        let neighbors = match db
+            .batch_find_cross_project_neighbors(last_id, batch_size, top_k, threshold, ef_search)
+            .await
         {
             Ok(rows) => rows,
             Err(e) => {
@@ -96,7 +95,7 @@ pub async fn run_similarity_scan(
             continue;
         }
 
-        match crate::db::queries::insert_similarity_pairs(pool, &neighbors).await {
+        match db.insert_similarity_pairs(&neighbors).await {
             Ok(inserted) => {
                 total_pairs += inserted;
             }

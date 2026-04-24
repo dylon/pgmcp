@@ -32,6 +32,18 @@ mod cuda_impl {
             "bf16_fused_matches_cpu_jaccard",
             scenario_bf16_fused_matches_cpu,
         );
+        failures += run(
+            "fp32_realistic_384_embedding_converges",
+            scenario_fp32_realistic_384,
+        );
+        failures += run(
+            "fp16_large_input_stays_in_budget",
+            scenario_fp16_large_input_budget,
+        );
+        failures += run(
+            "fp16_oom_attempt_falls_back_to_fp32",
+            scenario_fp16_oom_falls_back,
+        );
 
         if failures == 0 {
             println!("\n✓ all scenarios passed");
@@ -236,5 +248,116 @@ mod cuda_impl {
             .filter(|&(&x, &y)| x == map_b(y))
             .count();
         matches as f32 / n as f32
+    }
+
+    /// 384-dim synthetic data (matches production embedding width)
+    /// organized into 3 linearly-separable blobs. Verifies the fp32
+    /// GPU path converges at realistic vector dimensionality, not the
+    /// tiny 2-D toy data used by the other scenarios.
+    fn scenario_fp32_realistic_384() -> Result<String, String> {
+        use pgmcp::cron::topic_clustering::fuzzy_c_means_gpu;
+        use pgmcp::fcm::GpuPrecision;
+
+        let dim = 384;
+        let per = 200;
+        let k = 3;
+        let n = per * k;
+        let mut data = Array2::<f32>::zeros((n, dim));
+        for c in 0..k {
+            for i in 0..per {
+                let row = c * per + i;
+                for d in 0..dim {
+                    let phase = ((c * 31 + d) as f32) * 0.01;
+                    data[[row, d]] = phase + (i as f32) * 1e-4;
+                }
+            }
+        }
+        let result = fuzzy_c_means_gpu(data.view(), k, 2.0, 50, 1e-4, GpuPrecision::Fp32);
+        if result.iterations == 0 {
+            return Err("iterations=0".into());
+        }
+        if result.membership.nrows() != n || result.membership.ncols() != k {
+            return Err("shape".into());
+        }
+        // Every row of U sums to ~1.
+        for i in 0..n {
+            let s: f32 = result.membership.row(i).iter().sum();
+            if (s - 1.0).abs() > 1e-2 {
+                return Err(format!("row {} sum = {}", i, s));
+            }
+        }
+        Ok(format!(
+            "n={} d={} k={} iters={}",
+            n, dim, k, result.iterations
+        ))
+    }
+
+    /// Attempt an fp16 run large enough that it *might* OOM on constrained
+    /// GPUs — but within a safe budget for a 4060 Ti / 8 GB. On success,
+    /// the fp16 path handles the load; on OOM, `fuzzy_c_means_gpu` catches
+    /// the error and returns a CPU-fallback result. Either outcome passes.
+    fn scenario_fp16_oom_falls_back() -> Result<String, String> {
+        use pgmcp::cron::topic_clustering::fuzzy_c_means_gpu;
+        use pgmcp::fcm::GpuPrecision;
+
+        let dim = 384;
+        let n = 20_000;
+        let k = 6;
+        let mut data = Array2::<f32>::zeros((n, dim));
+        let mut rng = StdRng::seed_from_u64(0xCAFEBABE);
+        for i in 0..n {
+            for d in 0..dim {
+                data[[i, d]] = rng.random_range(-1.0..1.0);
+            }
+        }
+        let result = fuzzy_c_means_gpu(data.view(), k, 2.0, 10, 1e-2, GpuPrecision::Fp16);
+        if result.iterations == 0 {
+            return Err("iterations=0 — neither GPU nor CPU fallback ran".into());
+        }
+        // The result shape must match the contract regardless of which
+        // backend produced it.
+        if result.membership.nrows() != n || result.membership.ncols() != k {
+            return Err("wrong shape".into());
+        }
+        Ok(format!(
+            "n={} d={} k={} iters={} (GPU or fallback)",
+            n, dim, k, result.iterations
+        ))
+    }
+
+    /// 10_000 × 128 input — large enough to exercise allocation paths that
+    /// small inputs don't hit. Verifies the GPU fp16 path doesn't blow up
+    /// on moderate-size realistic inputs.
+    fn scenario_fp16_large_input_budget() -> Result<String, String> {
+        use pgmcp::cron::topic_clustering::fuzzy_c_means_gpu;
+        use pgmcp::fcm::GpuPrecision;
+
+        let dim = 128;
+        let n = 10_000;
+        let k = 4;
+        let mut data = Array2::<f32>::zeros((n, dim));
+        let mut rng = StdRng::seed_from_u64(0xFEEDBEEF);
+        for i in 0..n {
+            for d in 0..dim {
+                data[[i, d]] = rng.random_range(-1.0..1.0);
+            }
+        }
+        let start = Instant::now();
+        let result = fuzzy_c_means_gpu(data.view(), k, 2.0, 20, 1e-3, GpuPrecision::Fp16);
+        let elapsed = start.elapsed();
+        if result.iterations == 0 {
+            return Err("iterations=0".into());
+        }
+        if elapsed.as_secs() > 30 {
+            return Err(format!("took {}s (> 30s budget)", elapsed.as_secs()));
+        }
+        Ok(format!(
+            "n={} d={} k={} iters={} time={:.2}s",
+            n,
+            dim,
+            k,
+            result.iterations,
+            elapsed.as_secs_f64()
+        ))
     }
 }

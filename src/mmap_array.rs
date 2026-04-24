@@ -274,4 +274,53 @@ mod tests {
         };
         assert!(!path.exists(), "scratch file should be unlinked after drop");
     }
+
+    // ========================================================================
+    // Property tests
+    // ========================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 32, ..ProptestConfig::default() })]
+
+        /// Write values into an `MmapArrayF32` via `view_mut` and read them
+        /// back through `view`. Writes through the mmap and reads through
+        /// the same mmap must return the same values.
+        #[test]
+        fn prop_round_trip_write_read_identity(
+            n in 1usize..16,
+            d in 1usize..32,
+        ) {
+            let dir = TempDir::new().unwrap();
+            let mut arr = MmapArrayF32::new(n, d, dir.path()).unwrap();
+            for i in 0..n {
+                for j in 0..d {
+                    arr.view_mut()[[i, j]] = (i as f32) * 1000.0 + (j as f32);
+                }
+            }
+            let v = arr.view();
+            for i in 0..n {
+                for j in 0..d {
+                    let expected = (i as f32) * 1000.0 + (j as f32);
+                    let got = v[[i, j]];
+                    prop_assert!((got - expected).abs() < 1e-6,
+                        "[{},{}]: expected {}, got {}", i, j, expected, got);
+                }
+            }
+        }
+
+        /// A freshly created `MmapArrayF32` is zero-initialised.
+        #[test]
+        fn prop_zero_initialized_after_create(
+            n in 1usize..16,
+            d in 1usize..32,
+        ) {
+            let dir = TempDir::new().unwrap();
+            let arr = MmapArrayF32::new(n, d, dir.path()).unwrap();
+            for &v in arr.view().iter() {
+                prop_assert_eq!(v, 0.0);
+            }
+        }
+    }
 }

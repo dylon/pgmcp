@@ -521,9 +521,10 @@ pub fn spawn_cron_with_interval(
 /// plain `std::thread`) can spawn async database work. Passing it explicitly
 /// avoids the `try_current()` pitfall — `Handle::try_current()` always fails on
 /// non-tokio threads.
+#[allow(clippy::too_many_arguments)]
 pub fn schedule_maintenance_jobs(
     handle: &CronHandle,
-    db_pool: sqlx::PgPool,
+    db: Arc<dyn crate::db::DbClient>,
     stats: Arc<StatsTracker>,
     config: &CronConfig,
     rt: tokio::runtime::Handle,
@@ -533,7 +534,7 @@ pub fn schedule_maintenance_jobs(
 ) {
     // Stats aggregation (light — runs unconditionally)
     let stats_clone = Arc::clone(&stats);
-    let db_clone = db_pool.clone();
+    let db_clone = Arc::clone(&db);
     let rt_clone = rt.clone();
     let lc = lifecycle.clone();
     handle.schedule_recurring(
@@ -547,7 +548,7 @@ pub fn schedule_maintenance_jobs(
             let db = db_clone.clone();
             let stats = Arc::clone(&stats_clone);
             rt_clone.spawn(async move {
-                if let Ok(count) = crate::db::queries::count_indexed_files(&db).await {
+                if let Ok(count) = db.count_indexed_files().await {
                     stats
                         .files_indexed
                         .store(count, std::sync::atomic::Ordering::Relaxed);
@@ -558,7 +559,7 @@ pub fn schedule_maintenance_jobs(
     );
 
     // Stale file cleanup + orphaned project cleanup (light — runs unconditionally)
-    let db_clone = db_pool.clone();
+    let db_clone = Arc::clone(&db);
     let rt_clone = rt.clone();
     let lc = lifecycle.clone();
     handle.schedule_recurring(
@@ -571,7 +572,7 @@ pub fn schedule_maintenance_jobs(
             }
             let db = db_clone.clone();
             rt_clone.spawn(async move {
-                match crate::db::queries::cleanup_stale_files(&db).await {
+                match db.cleanup_stale_files().await {
                     Ok(count) => {
                         if count > 0 {
                             tracing::info!(count, "Cleaned up stale files");
@@ -580,7 +581,7 @@ pub fn schedule_maintenance_jobs(
                     Err(e) => tracing::error!("Stale cleanup failed: {}", e),
                 }
                 // Clean up projects left with zero indexed files
-                match crate::db::queries::cleanup_orphaned_projects(&db).await {
+                match db.cleanup_orphaned_projects().await {
                     Ok(count) => {
                         if count > 0 {
                             tracing::info!(count, "Cleaned up orphaned projects");
@@ -596,7 +597,7 @@ pub fn schedule_maintenance_jobs(
     // Integrity check: clean up files with incomplete indexing (NULL content_hash).
     // These are files where pgmcp was killed between upsert and embedding completion.
     // Deleting them causes re-indexing on the next scan; ON DELETE CASCADE cleans partial chunks.
-    let db_clone = db_pool.clone();
+    let db_clone = Arc::clone(&db);
     let rt_clone = rt.clone();
     let lc = lifecycle.clone();
     handle.schedule_recurring(
@@ -610,7 +611,7 @@ pub fn schedule_maintenance_jobs(
             let db = db_clone.clone();
             rt_clone.spawn(async move {
                 match sqlx::query("DELETE FROM indexed_files WHERE content_hash IS NULL")
-                    .execute(&db)
+                    .execute(db.pool().expect("inline SQL needs PgPool"))
                     .await
                 {
                     Ok(result) => {
@@ -627,7 +628,7 @@ pub fn schedule_maintenance_jobs(
     );
 
     // DB maintenance (VACUUM ANALYZE) (light — runs unconditionally)
-    let db_clone = db_pool.clone();
+    let db_clone = Arc::clone(&db);
     let rt_clone = rt.clone();
     let lc = lifecycle.clone();
     handle.schedule_recurring(
@@ -641,12 +642,15 @@ pub fn schedule_maintenance_jobs(
             let db = db_clone.clone();
             rt_clone.spawn(async move {
                 if let Err(e) = sqlx::query("VACUUM ANALYZE indexed_files")
-                    .execute(&db)
+                    .execute(db.pool().expect("inline SQL needs PgPool"))
                     .await
                 {
                     tracing::error!("DB maintenance failed: {}", e);
                 }
-                if let Err(e) = sqlx::query("VACUUM ANALYZE file_chunks").execute(&db).await {
+                if let Err(e) = sqlx::query("VACUUM ANALYZE file_chunks")
+                    .execute(db.pool().expect("inline SQL needs PgPool"))
+                    .await
+                {
                     tracing::error!("DB maintenance (chunks) failed: {}", e);
                 }
             });
@@ -655,7 +659,7 @@ pub fn schedule_maintenance_jobs(
     );
 
     // Git history indexing (heavy — gates on Ready)
-    let db_clone = db_pool.clone();
+    let db_clone = Arc::clone(&db);
     let rt_clone = rt.clone();
 
     // Create a commit-specific sender by wrapping EmbedCommitRequest → EmbedIndexRequest
@@ -714,7 +718,7 @@ pub fn schedule_maintenance_jobs(
             let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
             let t0 = Instant::now();
             rt_clone.block_on(async {
-                match crate::db::queries::get_git_enabled_projects(&db).await {
+                match db.get_git_enabled_projects().await {
                     Ok(projects) => {
                         for (project_id, project_path) in &projects {
                             let project_root = std::path::Path::new(project_path);
@@ -758,7 +762,7 @@ pub fn schedule_maintenance_jobs(
     );
 
     // Cross-project similarity scan (heavy — gates on Ready + heavy_cron_lock)
-    let db_clone_sim = db_pool.clone();
+    let db_clone_sim = Arc::clone(&db);
     let rt_clone_sim = rt.clone();
     let stats_for_sim = Arc::clone(&stats);
     let sim_interval = config.similarity_scan_interval_secs;
@@ -807,7 +811,8 @@ pub fn schedule_maintenance_jobs(
         let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
         let t0 = Instant::now();
         rt_clone_sim.block_on(async {
-            crate::cron::similarity::run_similarity_scan(&db, &cfg, sim_ef_search, &stats).await;
+            crate::cron::similarity::run_similarity_scan(db.as_ref(), &cfg, sim_ef_search, &stats)
+                .await;
         });
         let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
         tracing::info!(
@@ -822,7 +827,7 @@ pub fn schedule_maintenance_jobs(
     });
 
     // Graph analysis (import extraction, PageRank, betweenness, coupling)
-    let db_clone_graph = db_pool.clone();
+    let db_clone_graph = Arc::clone(&db);
     let rt_clone_graph = rt.clone();
     let stats_for_graph = Arc::clone(&stats);
     let graph_interval = config.graph_analysis_interval_secs;
@@ -857,7 +862,7 @@ pub fn schedule_maintenance_jobs(
         let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
         let t0 = Instant::now();
         rt_clone_graph.block_on(async {
-            crate::cron::graph_analysis::run_graph_analysis(&db, &stats, wp).await;
+            crate::cron::graph_analysis::run_graph_analysis(db.as_ref(), &stats, wp).await;
         });
         let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
         tracing::info!(
@@ -872,7 +877,7 @@ pub fn schedule_maintenance_jobs(
     });
 
     // Topic clustering (global full-chunk — always produces scope = "global")
-    let db_clone_topic = db_pool; // final move
+    let db_clone_topic = db; // final move // final move
     let rt_clone_topic = rt; // final move
     let stats_for_topic = stats; // final move
     let topic_interval = config.topic_scan_interval_secs;
@@ -923,7 +928,8 @@ pub fn schedule_maintenance_jobs(
             let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
             let t0 = Instant::now();
             rt_clone_topic.block_on(async {
-                crate::cron::topic_clustering::run_global_topic_scan(&db, &cfg, &stats).await;
+                crate::cron::topic_clustering::run_global_topic_scan(db.as_ref(), &cfg, &stats)
+                    .await;
             });
             let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
             tracing::info!(
@@ -1106,5 +1112,62 @@ mod tests {
         handle.request_shutdown();
         assert!(handle.is_shutting_down());
         thread.join().expect("Cron thread panicked");
+    }
+
+    // ========================================================================
+    // Property tests
+    // ========================================================================
+
+    use proptest::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 4, ..ProptestConfig::default() })]
+
+        /// For any interleaving of one-shot task submissions across
+        /// multiple producer threads, every submitted task runs to
+        /// completion exactly once.
+        #[test]
+        fn prop_arbitrary_task_interleavings_all_complete(
+            producers in 2usize..4,
+            per_producer in 3usize..8,
+        ) {
+            let terminating = Arc::new(AtomicBool::new(false));
+            let (handle, thread, ready) = spawn_cron(Arc::clone(&terminating), None);
+            ready.recv().expect("cron ready");
+
+            let counter = Arc::new(AtomicUsize::new(0));
+            let mut producer_handles = Vec::new();
+            for _ in 0..producers {
+                let handle = handle.clone();
+                let counter = Arc::clone(&counter);
+                producer_handles.push(std::thread::spawn(move || {
+                    for idx in 0..per_producer {
+                        let c = Arc::clone(&counter);
+                        handle.schedule_once(0, &format!("soak_{}", idx), move || {
+                            c.fetch_add(1, Ordering::Relaxed);
+                            false
+                        });
+                    }
+                }));
+            }
+            for ph in producer_handles {
+                ph.join().expect("producer");
+            }
+
+            // Wait up to 5s for all tasks to drain.
+            let expected = producers * per_producer;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while counter.load(Ordering::Relaxed) < expected
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let final_count = counter.load(Ordering::Relaxed);
+            handle.request_shutdown();
+            thread.join().expect("cron thread");
+            prop_assert_eq!(final_count, expected,
+                "lost {} of {} submitted tasks", expected - final_count, expected);
+        }
     }
 }

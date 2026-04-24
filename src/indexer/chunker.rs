@@ -293,5 +293,166 @@ mod tests {
             prop_assert_eq!(chunks[0].start_line, 1);
             prop_assert_eq!(chunks[0].end_line, 1);
         }
+
+        /// Non-final adjacent chunks must overlap by exactly `overlap` lines.
+        /// The final chunk may be shorter (cut off near end-of-input), so
+        /// we only check the invariant for pairs where the second chunk
+        /// occupies a full window.
+        #[test]
+        fn prop_chunk_overlap_within_bounds(
+            (content, _total_lines) in content_strategy(),
+            (chunk_size, overlap) in chunk_params_strategy(),
+        ) {
+            let chunks = chunk_content(&content, chunk_size, overlap);
+            for pair in chunks.windows(2) {
+                let next_is_full = (pair[1].end_line - pair[1].start_line + 1) as usize == chunk_size;
+                if next_is_full {
+                    // start_2 = start_1 + (chunk_size - overlap)
+                    // → end_1 - start_2 + 1 = overlap
+                    let actual_overlap = pair[0].end_line - pair[1].start_line + 1;
+                    prop_assert_eq!(
+                        actual_overlap as usize, overlap,
+                        "adjacent full-size chunks must overlap by exactly {} lines, got {}",
+                        overlap, actual_overlap,
+                    );
+                }
+            }
+        }
+
+        /// Every input line that belongs to at least one chunk appears in the
+        /// deduplicated line set reconstructed from all chunks. For non-tiny
+        /// inputs, this is equivalent to "no line is dropped."
+        #[test]
+        fn prop_chunks_recombine_to_input(
+            (content, total_lines) in content_strategy(),
+            (chunk_size, overlap) in chunk_params_strategy(),
+        ) {
+            let chunks = chunk_content(&content, chunk_size, overlap);
+            let mut covered = vec![false; total_lines];
+            for chunk in &chunks {
+                let start = (chunk.start_line as usize).saturating_sub(1);
+                let end = chunk.end_line as usize; // exclusive in 0-based
+                for c in covered.iter_mut().take(end.min(total_lines)).skip(start) {
+                    *c = true;
+                }
+            }
+            // Within the trim window allowed by the "avoid tiny trailing chunk"
+            // logic, every line up to the last chunk's end_line should be covered.
+            let last_end = chunks.last().map(|c| c.end_line as usize).unwrap_or(0);
+            for (i, is_covered) in covered.iter().take(last_end).enumerate() {
+                prop_assert!(is_covered, "line {} (0-based) not covered by any chunk", i);
+            }
+        }
+
+        // ====================================================================
+        // Proptests for chunk_jsonl_content
+        // ====================================================================
+
+        /// The number of emitted chunks equals the number of non-blank
+        /// (after-trim) lines in the input.
+        #[test]
+        fn prop_chunk_jsonl_one_chunk_per_nonempty_line(
+            lines in prop::collection::vec("[ \t]*([a-zA-Z0-9{}\": ,]{0,60})[ \t]*", 0..100usize),
+        ) {
+            let content = lines.join("\n");
+            let expected_count = lines.iter().filter(|l| !l.trim().is_empty()).count();
+            let chunks = chunk_jsonl_content(&content);
+            prop_assert_eq!(chunks.len(), expected_count,
+                "jsonl chunker must emit one chunk per non-empty trimmed line");
+        }
+
+        /// Every jsonl chunk spans exactly one input line (start_line == end_line).
+        #[test]
+        fn prop_chunk_jsonl_chunks_are_single_lined(
+            lines in prop::collection::vec("[a-zA-Z0-9 ]{1,40}", 1..50usize),
+        ) {
+            let content = lines.join("\n");
+            let chunks = chunk_jsonl_content(&content);
+            for chunk in &chunks {
+                prop_assert_eq!(chunk.start_line, chunk.end_line,
+                    "jsonl chunk must span exactly one line: {}..{}",
+                    chunk.start_line, chunk.end_line);
+            }
+        }
+
+        /// jsonl chunk indices are dense [0, 1, 2, …, n-1].
+        #[test]
+        fn prop_chunk_jsonl_indices_dense_and_sequential(
+            lines in prop::collection::vec("[a-zA-Z0-9]{1,30}", 0..50usize),
+        ) {
+            let content = lines.join("\n");
+            let chunks = chunk_jsonl_content(&content);
+            for (i, chunk) in chunks.iter().enumerate() {
+                prop_assert_eq!(chunk.chunk_index, i as i32);
+            }
+        }
+
+        /// jsonl chunk content is always the trimmed form of its source line.
+        #[test]
+        fn prop_chunk_jsonl_content_is_trimmed(
+            lines in prop::collection::vec("[a-zA-Z0-9]{1,20}", 1..20usize),
+            lpad in 0usize..5,
+            rpad in 0usize..5,
+        ) {
+            let padded: Vec<String> = lines.iter()
+                .map(|l| format!("{}{}{}", " ".repeat(lpad), l, " ".repeat(rpad)))
+                .collect();
+            let content = padded.join("\n");
+            let chunks = chunk_jsonl_content(&content);
+            for (i, chunk) in chunks.iter().enumerate() {
+                prop_assert_eq!(&chunk.content, &lines[i],
+                    "jsonl chunk {} content must equal trimmed source line", i);
+            }
+        }
+    }
+
+    // ========================================================================
+    // Examples: CRLF normalization and BOM handling
+    // ========================================================================
+
+    /// Single-chunk fast path: the chunker passes the original content
+    /// through verbatim, CRLF and all — no rejoining happens. Line counts
+    /// are still correct because `str::lines()` handles both line endings.
+    #[test]
+    fn test_crlf_preserved_in_single_chunk_fast_path() {
+        let content = "line1\r\nline2\r\nline3";
+        let chunks = chunk_content(content, 10, 0);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].start_line, 1);
+        assert_eq!(chunks[0].end_line, 3);
+        // Original content is returned as-is — not rejoined.
+        assert_eq!(chunks[0].content, content);
+    }
+
+    /// Multi-chunk path: when the chunker splits and rejoins with `\n`,
+    /// the rejoined content no longer has CRLFs between the lines within a
+    /// chunk. This documents actual behavior — downstream embedders see
+    /// LF-separated content when a file is split.
+    #[test]
+    fn test_crlf_normalized_to_lf_when_rejoined_across_chunks() {
+        let lines: Vec<String> = (1..=20).map(|i| format!("line{}\r", i)).collect();
+        let content = lines.join("\n"); // "line1\r\nline2\r\n..."
+        let chunks = chunk_content(&content, 5, 0);
+        assert!(chunks.len() >= 2, "expected multi-chunk split");
+        // Rejoined content uses \n, so no CRLF survives between lines
+        // within a single chunk.
+        for chunk in &chunks {
+            assert!(
+                !chunk.content.contains("\r\n"),
+                "rejoined chunk should not contain CRLF: {:?}",
+                chunk.content
+            );
+        }
+    }
+
+    /// A UTF-8 BOM at the start of a file is preserved as part of the first
+    /// line — not stripped. Embeddings trained on code will still match.
+    #[test]
+    fn test_utf8_bom_preserved_in_first_chunk() {
+        let content = "\u{FEFF}fn main() {}\nfn foo() {}";
+        let chunks = chunk_content(content, 10, 0);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].content.starts_with('\u{FEFF}'));
+        assert_eq!(chunks[0].start_line, 1);
     }
 }

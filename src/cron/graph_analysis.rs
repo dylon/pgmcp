@@ -11,6 +11,7 @@ use std::sync::atomic::Ordering;
 use sqlx::PgPool;
 use tracing::{error, info};
 
+use crate::db::DbClient;
 use crate::graph::algorithms;
 use crate::graph::builder::{FileMetaRow, GraphEdgeRow};
 use crate::graph::import_extractor;
@@ -45,10 +46,20 @@ const CONTENT_BATCH_SIZE: usize = 256;
 /// centrality is parallelized across the pool (Phase 6). When `None`, falls
 /// back to the sequential single-threaded implementation.
 pub async fn run_graph_analysis(
-    pool: &PgPool,
+    db: &dyn DbClient,
     stats: &Arc<StatsTracker>,
     work_pool: Option<Arc<crate::work_pool::pool::WorkPool>>,
 ) {
+    // Graph analysis is built on inline SQL (see this file's many
+    // `sqlx::query(...).fetch_all(pool)` sites). The DbClient trait does
+    // not yet model these queries; until it does, we unwrap a real PgPool
+    // here. With the production `impl DbClient for PgPool`, this is the
+    // backing pool. With a mock backend (no inline SQL support), this
+    // panics — graph analysis is not unit-testable through the trait.
+    let pool = db
+        .pool()
+        .expect("graph_analysis requires a real &PgPool — DbClient backend must be PgPool-backed");
+
     info!("Starting graph analysis cron job");
     let start = std::time::Instant::now();
 

@@ -1,6 +1,7 @@
 //! File processing pipeline: read -> xxHash3 -> check DB -> chunk -> embed -> upsert.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use crossbeam_channel::Sender;
@@ -8,18 +9,19 @@ use tracing::{debug, error, trace};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::Config;
-use crate::db;
+use crate::db::DbClient;
 use crate::embed::pool::{ChunkData, EmbedIndexRequest, EmbedRequest};
 use crate::indexer::{chunker, claude_chunker};
 use crate::stats::tracker::StatsTracker;
 
 /// Process a single file: read, hash, check if changed, chunk, embed, upsert.
+#[allow(clippy::too_many_arguments)]
 pub async fn process_file(
     path: &Path,
     project_id: i32,
     workspace_path: &str,
     config: &Config,
-    db_pool: &sqlx::PgPool,
+    db: &Arc<dyn DbClient>,
     embed_tx: &Sender<EmbedIndexRequest>,
     stats: &StatsTracker,
     max_file_size_override: Option<u64>,
@@ -58,7 +60,7 @@ pub async fn process_file(
         hash_buf[8..].copy_from_slice(&mtime_nanos.to_le_bytes());
         let content_hash = xxh3_64(&hash_buf) as i64;
 
-        if let Ok(Some(existing_hash)) = db::queries::get_content_hash(db_pool, &path_str).await
+        if let Ok(Some(existing_hash)) = db.get_content_hash(&path_str).await
             && existing_hash == content_hash
         {
             trace!(path = %path_str, "Large file unchanged, skipping");
@@ -71,22 +73,22 @@ pub async fn process_file(
             .to_string_lossy()
             .into_owned();
 
-        let file_id = db::queries::upsert_file(
-            db_pool,
-            project_id,
-            &path_str,
-            &relative_path,
-            &language,
-            size_bytes,
-            None,
-            Some(content_hash),
-            0,
-            true,
-            modified_at,
-        )
-        .await?;
+        let file_id = db
+            .upsert_file(
+                project_id,
+                &path_str,
+                &relative_path,
+                &language,
+                size_bytes,
+                None,
+                Some(content_hash),
+                0,
+                true,
+                modified_at,
+            )
+            .await?;
 
-        db::queries::delete_file_chunks(db_pool, file_id).await?;
+        db.delete_file_chunks(file_id).await?;
 
         debug!(
             path = %path_str,
@@ -109,7 +111,7 @@ pub async fn process_file(
     let content_hash = xxh3_64(content.as_bytes()) as i64;
 
     // Check if content has changed
-    if let Ok(Some(existing_hash)) = db::queries::get_content_hash(db_pool, &path_str).await
+    if let Ok(Some(existing_hash)) = db.get_content_hash(&path_str).await
         && existing_hash == content_hash
     {
         trace!(path = %path_str, "File unchanged, skipping");
@@ -129,23 +131,23 @@ pub async fn process_file(
         .into_owned();
 
     // Upsert file with NULL hash (two-phase commit: hash finalized after chunks)
-    let file_id = db::queries::upsert_file(
-        db_pool,
-        project_id,
-        &path_str,
-        &relative_path,
-        &language,
-        size_bytes,
-        stored_content,
-        None,
-        line_count,
-        truncated,
-        modified_at,
-    )
-    .await?;
+    let file_id = db
+        .upsert_file(
+            project_id,
+            &path_str,
+            &relative_path,
+            &language,
+            size_bytes,
+            stored_content,
+            None,
+            line_count,
+            truncated,
+            modified_at,
+        )
+        .await?;
 
     // Delete old chunks
-    db::queries::delete_file_chunks(db_pool, file_id).await?;
+    db.delete_file_chunks(file_id).await?;
 
     // Chunk the content, routing to the appropriate chunker
     let chunks = if &*language == "jsonl" && claude_chunker::is_claude_session_transcript(path) {
@@ -162,7 +164,7 @@ pub async fn process_file(
 
     if chunks.is_empty() {
         // No chunks to embed — finalize hash immediately
-        db::queries::finalize_file_hash(db_pool, file_id, content_hash).await?;
+        db.finalize_file_hash(file_id, content_hash).await?;
         return Ok(());
     }
 
@@ -180,7 +182,7 @@ pub async fn process_file(
     let request = EmbedIndexRequest::File(EmbedRequest {
         file_id,
         chunks: chunk_data,
-        db_pool: db_pool.clone(),
+        db: Arc::clone(db),
         content_hash,
     });
 

@@ -372,4 +372,81 @@ mod tests {
             prop_assert_eq!(results[0], items[0]);
         }
     }
+
+    // ========================================================================
+    // Proptests: buffer_time + debounce_by_key
+    // ========================================================================
+
+    proptest! {
+        /// buffer_time flushes items it has accumulated when the window
+        /// elapses. Every item sent before the deadline is present in the
+        /// concatenated output.
+        #[test]
+        fn prop_buffer_time_delivers_all_items(
+            items in prop::collection::vec(any::<i32>(), 1..30usize),
+        ) {
+            let (tx, rx) = unbounded();
+            let buffered = buffer_time(rx, Duration::from_millis(20));
+            for &item in &items {
+                tx.send(item).expect("send");
+            }
+            drop(tx);
+            let mut out: Vec<i32> = Vec::new();
+            while let Ok(batch) = buffered.recv_timeout(Duration::from_millis(500)) {
+                out.extend(batch);
+            }
+            prop_assert_eq!(out.len(), items.len(),
+                "buffer_time must preserve all items: got {:?}, expected {:?}", out, items);
+        }
+
+        /// debounce_by_key coalesces repeated sends on the same key within
+        /// a window into one emission. For distinct keys, every key is
+        /// represented at least once in the output.
+        #[test]
+        fn prop_debounce_by_key_emits_at_least_one_per_key(
+            keys in prop::collection::vec(0u32..5, 1..30usize),
+        ) {
+            let (tx, rx) = unbounded();
+            let debounced = debounce_by_key(rx, Duration::from_millis(50), |k: &u32| *k);
+            for &k in &keys {
+                tx.send(k).expect("send");
+            }
+            drop(tx);
+            let mut out = Vec::new();
+            while let Ok(v) = debounced.recv_timeout(Duration::from_millis(500)) {
+                out.push(v);
+            }
+            let in_keys: std::collections::HashSet<u32> = keys.iter().copied().collect();
+            let out_keys: std::collections::HashSet<u32> = out.iter().copied().collect();
+            for k in &in_keys {
+                prop_assert!(out_keys.contains(k),
+                    "key {} never emitted: input={:?}, output={:?}", k, keys, out);
+            }
+            // Output count ≤ input count (coalescing never invents items).
+            prop_assert!(out.len() <= keys.len());
+        }
+
+        /// throttle_first emits exactly one item per throttle window.
+        /// When the total send window < throttle_interval, exactly one
+        /// item lands.
+        #[test]
+        fn prop_throttle_first_emits_one_per_window(
+            items in prop::collection::vec(any::<i32>(), 2..10usize),
+        ) {
+            let (tx, rx) = unbounded();
+            let throttled = throttle_first(rx, Duration::from_millis(500));
+            for &item in &items {
+                tx.send(item).expect("send");
+            }
+            drop(tx);
+            let mut out: Vec<i32> = Vec::new();
+            while let Ok(v) = throttled.recv_timeout(Duration::from_millis(200)) {
+                out.push(v);
+            }
+            // With a 500ms window and instant sends, exactly 1 item emits
+            // before the window closes (the first one).
+            prop_assert_eq!(out.len(), 1);
+            prop_assert_eq!(out[0], items[0]);
+        }
+    }
 }

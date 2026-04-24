@@ -18,7 +18,9 @@ extern crate blas_src;
 extern crate intel_mkl_src;
 
 pub mod api;
+pub mod cli;
 pub mod config;
+pub mod context;
 pub mod cron;
 pub mod daemon;
 pub mod daemon_state;

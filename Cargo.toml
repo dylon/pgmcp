@@ -1,3 +1,9 @@
+# Workspace root. The main `pgmcp` crate lives at the root for git/CI
+# continuity; `pgmcp-testing` is a sibling member providing test fixtures
+# (mocks, factories) consumed via [dev-dependencies] below.
+[workspace]
+members = [".", "pgmcp-testing"]
+
 [package]
 name = "pgmcp"
 version = "0.1.0"
@@ -8,8 +14,8 @@ license = "Apache-2.0"
 # CUDA is a mandatory dependency. The daemon is split into a CUDA backend
 # (GPU FCM) and a CPU fallback backend that cooperate at runtime — both
 # are always compiled. A pure-CPU build mode is intentionally NOT provided;
-# the FcmBackend trait in src/cron/fcm_backend/ is the seam where a future
-# non-CUDA implementation could be plugged in without feature gates.
+# the FcmBackend trait in src/fcm/ is the seam where a future non-CUDA
+# implementation could be plugged in without feature gates.
 [features]
 
 [dependencies]
@@ -84,6 +90,9 @@ heed = "0.20"
 bincode = "1"
 blas-src = { version = "0.10", features = ["intel-mkl"] }
 intel-mkl-src = { version = "0.8", features = ["mkl-dynamic-lp64-seq"] }
+# Already a transitive dep via sqlx; promoted to direct so the DbClient trait
+# can use #[async_trait] on its method signatures.
+async-trait = "0.1"
 
 [dev-dependencies]
 proptest = "1"
@@ -91,16 +100,15 @@ tokio-test = "0.4"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
-testcontainers = "0.23"
-testcontainers-modules = { version = "0.11", features = ["postgres"] }
-
-[[test]]
-name = "integration"
-path = "tests/integration.rs"
-
-[[test]]
-name = "mcp_protocol"
-path = "tests/mcp_protocol.rs"
+# Note: `pgmcp-testing` is intentionally NOT a dev-dependency of this crate.
+# Cargo cannot resolve the cycle pgmcp ↔ pgmcp-testing without two separate
+# compilations of `pgmcp`. Cross-crate tests that exercise pgmcp's public API
+# (e.g. `McpServer`) using `pgmcp-testing` mocks live under
+# `pgmcp-testing/tests/`, where the dependency edge is one-way (testing →
+# main) and the cycle does not arise.
+#
+# Real-Postgres integration tests (no Docker) also live under
+# `pgmcp-testing/tests/` — see `tests/README.md` for the local setup.
 
 [[test]]
 name = "gpu_fallback_smoke"

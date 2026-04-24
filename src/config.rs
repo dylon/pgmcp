@@ -1134,4 +1134,83 @@ mod tests {
         assert!((config.topic_membership_threshold - 0.05).abs() < f64::EPSILON);
         assert_eq!(config.topic_label_top_k, 5);
     }
+
+    // ========================================================================
+    // Property tests for merge_toml_values
+    // ========================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Scalar merge: user value always wins.
+        #[test]
+        fn prop_merge_user_scalar_wins(def in -100i64..100, user in -100i64..100) {
+            let d = TomlValue::Integer(def);
+            let u = TomlValue::Integer(user);
+            let merged = merge_toml_values(d, u);
+            prop_assert_eq!(merged.as_integer(), Some(user));
+        }
+
+        /// Array merge: result starts with user verbatim (including any
+        /// duplicates the user wrote), then appends default items not
+        /// already in user. User items always appear first.
+        #[test]
+        fn prop_merge_array_appends_missing_defaults(
+            def in prop::collection::vec(0i64..20, 0..10),
+            user in prop::collection::vec(0i64..20, 0..10),
+        ) {
+            let d = TomlValue::Array(def.iter().map(|&x| TomlValue::Integer(x)).collect());
+            let u = TomlValue::Array(user.iter().map(|&x| TomlValue::Integer(x)).collect());
+            let merged = merge_toml_values(d, u);
+            let arr = merged.as_array().expect("array");
+            // User portion is a verbatim prefix of the merged output.
+            for (i, &v) in user.iter().enumerate() {
+                prop_assert_eq!(arr[i].as_integer(), Some(v),
+                    "user item {} at pos {} changed", v, i);
+            }
+            // Every default value appears somewhere (either because it was
+            // already in user or because it was appended).
+            for &v in &def {
+                prop_assert!(arr.iter().any(|x| x.as_integer() == Some(v)),
+                    "default value {} missing from merged array", v);
+            }
+            // Length is bounded above by |user| + |def| — no accidental
+            // multiplication.
+            prop_assert!(arr.len() <= user.len() + def.len());
+        }
+
+        /// Table merge: keys only in user end up in result, keys only in
+        /// default end up in result, keys in both are recursively merged.
+        #[test]
+        fn prop_merge_tables_preserve_both_sides(
+            def_key in "[a-z]{1,6}",
+            user_key in "[a-z]{1,6}",
+            def_val in 0i64..100,
+            user_val in 0i64..100,
+        ) {
+            prop_assume!(def_key != user_key);
+            let mut d_table = toml::map::Map::new();
+            d_table.insert(def_key.clone(), TomlValue::Integer(def_val));
+            let d = TomlValue::Table(d_table);
+
+            let mut u_table = toml::map::Map::new();
+            u_table.insert(user_key.clone(), TomlValue::Integer(user_val));
+            let u = TomlValue::Table(u_table);
+
+            let merged = merge_toml_values(d, u);
+            let t = merged.as_table().expect("table");
+            prop_assert_eq!(t.get(&def_key).and_then(|v| v.as_integer()), Some(def_val));
+            prop_assert_eq!(t.get(&user_key).and_then(|v| v.as_integer()), Some(user_val));
+        }
+
+        /// Idempotence: merge(merge(d, u), u) == merge(d, u) for scalars.
+        #[test]
+        fn prop_merge_idempotent_for_scalars(def in 0i64..100, user in 0i64..100) {
+            let d = TomlValue::Integer(def);
+            let u = TomlValue::Integer(user);
+            let first = merge_toml_values(d.clone(), u.clone());
+            let again = merge_toml_values(first.clone(), u);
+            prop_assert_eq!(first.as_integer(), again.as_integer());
+        }
+    }
 }

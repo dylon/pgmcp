@@ -13,6 +13,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use tracing::{debug, error, info};
 
 use crate::config::EmbeddingsConfig;
+use crate::db::DbClient;
 use crate::error::{PgmcpError, Result};
 use crate::stats::tracker::StatsTracker;
 
@@ -30,8 +31,8 @@ pub struct EmbedRequest {
     pub file_id: i64,
     /// Chunk index, content, start/end lines.
     pub chunks: Vec<ChunkData>,
-    /// Database pool for upserting.
-    pub db_pool: sqlx::PgPool,
+    /// Database client for upserting (Send+Sync via Arc<dyn DbClient>).
+    pub db: Arc<dyn DbClient>,
     /// Content hash to finalize after all chunks are inserted (two-phase commit).
     pub content_hash: i64,
 }
@@ -42,8 +43,8 @@ pub struct EmbedCommitRequest {
     pub commit_id: i64,
     /// Chunk data to embed.
     pub chunks: Vec<ChunkData>,
-    /// Database pool for upserting.
-    pub db_pool: sqlx::PgPool,
+    /// Database client for upserting.
+    pub db: Arc<dyn DbClient>,
 }
 
 /// Data for a single chunk to embed.
@@ -271,23 +272,23 @@ fn process_file_request(
     match model.embed(texts, None) {
         Ok(embeddings) => {
             let chunks = request.chunks;
-            let db_pool = request.db_pool;
+            let db = request.db;
             let file_id = request.file_id;
             let content_hash = request.content_hash;
 
             rt.block_on(async {
                 let mut all_chunks_ok = true;
                 for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
-                    if let Err(e) = crate::db::queries::insert_chunk(
-                        &db_pool,
-                        file_id,
-                        chunk.chunk_index,
-                        &chunk.content,
-                        chunk.start_line,
-                        chunk.end_line,
-                        embedding,
-                    )
-                    .await
+                    if let Err(e) = db
+                        .insert_chunk(
+                            file_id,
+                            chunk.chunk_index,
+                            &chunk.content,
+                            chunk.start_line,
+                            chunk.end_line,
+                            embedding,
+                        )
+                        .await
                     {
                         error!(
                             file_id,
@@ -299,10 +300,7 @@ fn process_file_request(
                     }
                 }
 
-                if all_chunks_ok
-                    && let Err(e) =
-                        crate::db::queries::finalize_file_hash(&db_pool, file_id, content_hash)
-                            .await
+                if all_chunks_ok && let Err(e) = db.finalize_file_hash(file_id, content_hash).await
                 {
                     error!(file_id, error = %e, "Failed to finalize content hash");
                 }
@@ -332,19 +330,19 @@ fn process_commit_request(
     match model.embed(texts, None) {
         Ok(embeddings) => {
             let chunks = request.chunks;
-            let db_pool = request.db_pool;
+            let db = request.db;
             let commit_id = request.commit_id;
 
             rt.block_on(async {
                 for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
-                    if let Err(e) = crate::db::queries::insert_git_commit_chunk(
-                        &db_pool,
-                        commit_id,
-                        chunk.chunk_index,
-                        &chunk.content,
-                        embedding,
-                    )
-                    .await
+                    if let Err(e) = db
+                        .insert_git_commit_chunk(
+                            commit_id,
+                            chunk.chunk_index,
+                            &chunk.content,
+                            embedding,
+                        )
+                        .await
                     {
                         error!(
                             commit_id,

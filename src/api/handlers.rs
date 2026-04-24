@@ -6,7 +6,6 @@ use axum::http::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use super::ApiState;
-use crate::db::queries;
 
 // ============================================================================
 // POST /api/search — Semantic search
@@ -52,21 +51,22 @@ pub async fn search(
         })?;
 
     let ef_search = state.config.load().vector.ef_search;
-    let results = queries::semantic_search(
-        &state.db_pool,
-        &embedding,
-        limit,
-        req.language.as_deref(),
-        req.project.as_deref(),
-        ef_search,
-    )
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Search failed: {}", e),
+    let results = state
+        .db
+        .semantic_search(
+            &embedding,
+            limit,
+            req.language.as_deref(),
+            req.project.as_deref(),
+            ef_search,
         )
-    })?;
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Search failed: {}", e),
+            )
+        })?;
 
     let items: Vec<SearchResultItem> = results
         .into_iter()
@@ -133,7 +133,9 @@ pub async fn context(
         format!("{}/", params.cwd)
     };
 
-    let project = queries::find_project_by_cwd(&state.db_pool, &cwd_normalized)
+    let project = state
+        .db
+        .find_project_by_cwd(&cwd_normalized)
         .await
         .map_err(|e| {
             (
@@ -144,23 +146,19 @@ pub async fn context(
 
     match project {
         Some(p) => {
-            let languages = queries::language_summary(&state.db_pool, &p.name)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Language query failed: {}", e),
-                    )
-                })?;
+            let languages = state.db.language_summary(&p.name).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Language query failed: {}", e),
+                )
+            })?;
 
-            let tree = queries::project_tree(&state.db_pool, &p.name, depth)
-                .await
-                .map_err(|e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Tree query failed: {}", e),
-                    )
-                })?;
+            let tree = state.db.project_tree(&p.name, depth).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Tree query failed: {}", e),
+                )
+            })?;
 
             Ok(Json(ContextResponse {
                 found: true,
@@ -184,7 +182,7 @@ pub async fn context(
             }))
         }
         None => {
-            let projects = queries::list_projects(&state.db_pool).await.map_err(|e| {
+            let projects = state.db.list_projects().await.map_err(|e| {
                 (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     format!("List projects failed: {}", e),

@@ -186,3 +186,214 @@ pub fn update_abstractness(
         module.distance_from_main_sequence = (module.abstractness + module.instability - 1.0).abs();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::{CodeGraph, EdgeType, EdgeWeight, FileNode};
+    use proptest::prelude::*;
+
+    fn make_graph(files: Vec<(i64, &str, &str)>, edges: Vec<(i64, i64)>) -> CodeGraph {
+        let mut cg = CodeGraph::new();
+        for (file_id, path, language) in files {
+            let module = path
+                .rsplit_once('/')
+                .map(|(d, _)| d)
+                .unwrap_or("")
+                .to_string();
+            cg.ensure_node(FileNode {
+                file_id,
+                relative_path: path.to_string(),
+                language: language.to_string(),
+                module,
+            });
+        }
+        for (src, dst) in edges {
+            let s = cg.file_id_to_node[&src];
+            let d = cg.file_id_to_node[&dst];
+            cg.add_edge(
+                s,
+                d,
+                EdgeWeight {
+                    weight: 1.0,
+                    edge_type: EdgeType::Import,
+                },
+            );
+        }
+        cg
+    }
+
+    #[test]
+    fn is_abstract_file_detects_rust_trait() {
+        assert!(is_abstract_file("pub trait Foo { fn bar(&self); }", "rust"));
+        assert!(is_abstract_file("trait Bar {}", "rust"));
+        assert!(!is_abstract_file("struct Foo;", "rust"));
+    }
+
+    #[test]
+    fn is_abstract_file_detects_java_interface_and_abstract_class() {
+        assert!(is_abstract_file("public interface Foo {}", "java"));
+        assert!(is_abstract_file("abstract class Bar {}", "java"));
+        assert!(!is_abstract_file("class Concrete {}", "java"));
+    }
+
+    #[test]
+    fn is_abstract_file_unknown_language_is_false() {
+        assert!(!is_abstract_file("trait Foo {}", "ruby"));
+        assert!(!is_abstract_file("", "rust"));
+    }
+
+    #[test]
+    fn truncate_module_honors_depth() {
+        assert_eq!(truncate_module("a/b/c/d", 0), "");
+        assert_eq!(truncate_module("a/b/c/d", 1), "a");
+        assert_eq!(truncate_module("a/b/c/d", 2), "a/b");
+        assert_eq!(truncate_module("a/b/c/d", 10), "a/b/c/d");
+        assert_eq!(truncate_module("", 3), "");
+    }
+
+    #[test]
+    fn compute_metrics_two_modules_simple() {
+        // a/foo.rs --(import)--> b/bar.rs ; two modules, Ce=1, Ca=1
+        let graph = make_graph(
+            vec![(1, "a/foo.rs", "rust"), (2, "b/bar.rs", "rust")],
+            vec![(1, 2)],
+        );
+        let metrics = compute_module_metrics(&graph, 1);
+        assert_eq!(metrics.len(), 2);
+        let a = metrics.iter().find(|m| m.module_path == "a").expect("a");
+        let b = metrics.iter().find(|m| m.module_path == "b").expect("b");
+        assert_eq!(a.efferent_coupling, 1);
+        assert_eq!(a.afferent_coupling, 0);
+        assert_eq!(b.efferent_coupling, 0);
+        assert_eq!(b.afferent_coupling, 1);
+        assert_eq!(a.instability, 1.0);
+        assert_eq!(b.instability, 0.0);
+    }
+
+    #[test]
+    fn update_abstractness_writes_distance_from_main_sequence() {
+        let mut metrics = vec![ModuleMetrics {
+            module_path: "m".into(),
+            file_count: 4,
+            afferent_coupling: 1,
+            efferent_coupling: 3,
+            instability: 0.75,
+            abstractness: 0.0,
+            distance_from_main_sequence: 0.0,
+            cohesion: None,
+            files: vec!["a".into(), "b".into(), "c".into(), "d".into()],
+        }];
+        let mut abs = HashMap::new();
+        abs.insert("a".to_string(), true);
+        update_abstractness(&mut metrics, &abs);
+        assert!((metrics[0].abstractness - 0.25).abs() < 1e-9);
+        // D* = |A + I - 1| = |0.25 + 0.75 - 1| = 0.0
+        assert!(metrics[0].distance_from_main_sequence < 1e-9);
+    }
+
+    // ========================================================================
+    // Property tests
+    // ========================================================================
+
+    proptest! {
+        /// Ca and Ce are always non-negative (usize counts by definition).
+        /// Instability is in [0, 1].
+        #[test]
+        fn prop_instability_in_unit_interval(
+            num_modules in 2usize..5,
+            edges_per_pair in 0usize..3,
+        ) {
+            // Build num_modules directories, 2 files each. Connect them in a
+            // chain with `edges_per_pair` edges per adjacent module pair.
+            let mut files = Vec::new();
+            let mut next_id = 1i64;
+            for m in 0..num_modules {
+                for f in 0..2 {
+                    files.push((next_id, format!("m{}/f{}.rs", m, f)));
+                    next_id += 1;
+                }
+            }
+            let files_refs: Vec<(i64, &str, &str)> = files.iter()
+                .map(|(id, p)| (*id, p.as_str(), "rust"))
+                .collect();
+            let mut edges = Vec::new();
+            for m in 0..num_modules.saturating_sub(1) {
+                for _ in 0..edges_per_pair {
+                    let src_id = (m * 2 + 1) as i64;
+                    let dst_id = ((m + 1) * 2 + 1) as i64;
+                    edges.push((src_id, dst_id));
+                }
+            }
+            let graph = make_graph(files_refs, edges);
+            let metrics = compute_module_metrics(&graph, 1);
+            for m in &metrics {
+                prop_assert!((0.0..=1.0).contains(&m.instability),
+                    "instability {} outside [0, 1]", m.instability);
+                prop_assert!((0.0..=1.0).contains(&m.abstractness),
+                    "abstractness {} outside [0, 1]", m.abstractness);
+            }
+        }
+
+        /// D* = |A + I − 1| is always in [0, 1].
+        #[test]
+        fn prop_distance_from_main_sequence_in_unit_interval(
+            instability in 0.0f64..=1.0,
+            abstractness in 0.0f64..=1.0,
+        ) {
+            let mut m = vec![ModuleMetrics {
+                module_path: "m".into(),
+                file_count: 1,
+                afferent_coupling: 0,
+                efferent_coupling: 0,
+                instability,
+                abstractness: 0.0,
+                distance_from_main_sequence: 0.0,
+                cohesion: None,
+                files: vec!["f".into()],
+            }];
+            let mut abs = HashMap::new();
+            abs.insert("f".to_string(), abstractness >= 0.5);
+            update_abstractness(&mut m, &abs);
+            let d_star = m[0].distance_from_main_sequence;
+            prop_assert!((0.0..=1.0).contains(&d_star),
+                "D* = {} outside [0, 1]", d_star);
+        }
+
+        /// Every input file appears in exactly one module bucket.
+        #[test]
+        fn prop_metrics_partition_all_files(
+            num_files in 1usize..20,
+            module_depth in 1usize..4,
+        ) {
+            let files: Vec<(i64, String)> = (0..num_files)
+                .map(|i| (i as i64 + 1, format!("a/b/c/file{}.rs", i)))
+                .collect();
+            let files_refs: Vec<(i64, &str, &str)> = files.iter()
+                .map(|(id, p)| (*id, p.as_str(), "rust"))
+                .collect();
+            let graph = make_graph(files_refs, vec![]);
+            let metrics = compute_module_metrics(&graph, module_depth);
+            let total_files: usize = metrics.iter().map(|m| m.file_count).sum();
+            prop_assert_eq!(total_files, num_files);
+        }
+
+        /// truncate_module never produces more than `depth` slashes + 1 segment.
+        #[test]
+        fn prop_truncate_module_never_exceeds_depth(
+            parts in prop::collection::vec("[a-z]{1,8}", 0..10usize),
+            depth in 0usize..6,
+        ) {
+            let module = parts.join("/");
+            let truncated = truncate_module(&module, depth);
+            if depth == 0 {
+                prop_assert_eq!(&truncated, "");
+            } else if !truncated.is_empty() {
+                let seg_count = truncated.split('/').count();
+                prop_assert!(seg_count <= depth,
+                    "truncate_module({:?}, {}) = {:?} has {} segments",
+                    module, depth, truncated, seg_count);
+            }
+        }
+    }
+}

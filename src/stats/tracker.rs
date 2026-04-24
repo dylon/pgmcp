@@ -395,4 +395,56 @@ mod tests {
         assert_eq!(snap["mcp_requests"], 0);
         assert!(snap["uptime_secs"].as_u64().is_some());
     }
+
+    // ========================================================================
+    // Concurrency property tests
+    // ========================================================================
+
+    use proptest::prelude::*;
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    proptest! {
+        #![proptest_config(ProptestConfig { cases: 8, ..ProptestConfig::default() })]
+
+        /// N producer threads × M increments each = counter is exactly N*M.
+        /// Proves fetch_add(1, Relaxed) loses no updates under contention.
+        #[test]
+        fn prop_concurrent_increments_are_not_lost(
+            producers in 2usize..8,
+            per_producer in 100usize..500,
+        ) {
+            let tracker = Arc::new(StatsTracker::new());
+            let mut handles = Vec::new();
+            for _ in 0..producers {
+                let t = Arc::clone(&tracker);
+                handles.push(std::thread::spawn(move || {
+                    for _ in 0..per_producer {
+                        t.files_indexed.fetch_add(1, Ordering::Relaxed);
+                    }
+                }));
+            }
+            for h in handles {
+                h.join().expect("thread join");
+            }
+            let total = tracker.files_indexed.load(Ordering::Relaxed);
+            prop_assert_eq!(total as usize, producers * per_producer);
+        }
+
+        /// Read-after-write monotonicity: every read value ≥ previously read.
+        #[test]
+        fn prop_counter_monotonically_non_decreasing(
+            increments in prop::collection::vec(1u64..100, 5..20usize),
+        ) {
+            let tracker = StatsTracker::new();
+            let mut last = 0u64;
+            for inc in &increments {
+                tracker.files_indexed.fetch_add(*inc, Ordering::Relaxed);
+                let now = tracker.files_indexed.load(Ordering::Relaxed);
+                prop_assert!(now >= last,
+                    "counter decreased: {} -> {}", last, now);
+                last = now;
+            }
+        }
+    }
 }

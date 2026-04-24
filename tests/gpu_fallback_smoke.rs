@@ -69,3 +69,54 @@ fn gpu_init_failure_falls_back_to_cpu() {
         dist_sq.sqrt()
     );
 }
+
+/// Same fallback path, but driven with deterministic 384-dim "realistic"
+/// embeddings (matching production vector dimensionality) instead of
+/// synthetic 2-D blobs. Proves the CPU fallback converges on data whose
+/// shape matches what pgmcp actually indexes.
+#[test]
+#[ignore = "requires CUDA feature; forces GPU-unavailable to exercise fallback with real-width vectors"]
+fn gpu_init_failure_with_realistic_embeddings_falls_back_to_cpu() {
+    // SAFETY: single-threaded in this test binary before CUDA init.
+    unsafe {
+        std::env::set_var("CUDA_VISIBLE_DEVICES", "");
+    }
+    let dim = 384;
+    let per_cluster = 200;
+    let k_true = 3;
+    let n = per_cluster * k_true;
+    let mut data = Array2::<f32>::zeros((n, dim));
+    // Hash-seeded deterministic offsets (same logic as
+    // `DeterministicEmbeddingBackend`): each cluster uses a distinct
+    // per-dim offset so the blobs are linearly separable in 384-D.
+    for c in 0..k_true {
+        for i in 0..per_cluster {
+            let row = c * per_cluster + i;
+            for d in 0..dim {
+                let phase = ((c * 31 + d) as f32) * 0.01;
+                data[[row, d]] = phase + (i as f32) * 1e-4;
+            }
+        }
+    }
+    let result = pgmcp::cron::topic_clustering::fuzzy_c_means_gpu(
+        data.view(),
+        k_true,
+        2.0,
+        50,
+        1e-4,
+        pgmcp::fcm::GpuPrecision::Fp16,
+    );
+    assert!(result.iterations > 0);
+    assert_eq!(result.membership.nrows(), n);
+    assert_eq!(result.membership.ncols(), k_true);
+    // Every row of U sums to ~1 (FCM invariant).
+    for i in 0..n {
+        let sum: f32 = result.membership.row(i).iter().sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-3,
+            "row {} sum = {} (expected ≈ 1)",
+            i,
+            sum
+        );
+    }
+}
