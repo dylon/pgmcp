@@ -79,7 +79,7 @@ regex = "1"
 libc = "0.2"
 uuid = { version = "1", features = ["v4"] }
 rand = "0.9"
-ndarray = { version = "0.16", features = ["blas"] }
+ndarray = { version = "0.16", features = ["blas", "serde"] }
 petgraph = "0.7"
 memmap2 = "0.9"
 futures = "0.3"

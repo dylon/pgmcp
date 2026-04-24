@@ -40,7 +40,7 @@ pub mod cuda;
 pub type CancelFn<'a> = Option<&'a (dyn Fn() -> bool + Sync)>;
 
 /// Result of a Fuzzy C-Means run.
-#[derive(Debug)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FcmResult {
     /// Membership matrix (n × K), rows sum to 1.0.
     pub membership: Array2<f32>,
@@ -207,12 +207,38 @@ pub fn make_backend(
 // ============================================================================
 
 /// Select K initial centroids from data using k-means++ seeding.
+///
+/// Backwards-compatible entry point — calls into
+/// [`kmeans_plus_plus_init_seeded`] with `seed = None`, which draws
+/// from `rand::rng()` (the system RNG).
 pub fn kmeans_plus_plus_init(data: ArrayView2<f32>, k: usize) -> Array2<f32> {
+    kmeans_plus_plus_init_seeded(data, k, None)
+}
+
+/// Select K initial centroids from data using k-means++ seeding, with
+/// an optional deterministic RNG seed.
+///
+/// When `seed` is `Some(s)`, the implementation uses
+/// `rand::rngs::StdRng::seed_from_u64(s)` so the selection is
+/// reproducible — required for golden-file fixtures that pin FCM
+/// output bit-for-bit.
+pub fn kmeans_plus_plus_init_seeded(
+    data: ArrayView2<f32>,
+    k: usize,
+    seed: Option<u64>,
+) -> Array2<f32> {
     use rand::Rng;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     let n = data.nrows();
     let d = data.ncols();
-    let mut rng = rand::rng();
+    // Boxed trait object lets the loop body stay flat regardless of
+    // which RNG flavour we use.
+    let mut rng: Box<dyn rand::RngCore> = match seed {
+        Some(s) => Box::new(StdRng::seed_from_u64(s)),
+        None => Box::new(rand::rng()),
+    };
     let mut centroids = Array2::<f32>::zeros((k, d));
 
     let first = rng.random_range(0..n);
@@ -265,11 +291,16 @@ pub fn kmeans_plus_plus_init(data: ArrayView2<f32>, k: usize) -> Array2<f32> {
 /// The backend handles only the two GEMM-heavy steps (compute_distances,
 /// update_centroids). Membership update happens elementwise on the CPU.
 ///
-/// `data_for_init` is used **only** by `kmeans_plus_plus_init` when
-/// `initial_centroids` is `None` — the actual compute data is owned by
-/// the backend and uploaded at construction time.
+/// `data_for_init` is used **only** by `kmeans_plus_plus_init_seeded`
+/// when `initial_centroids` is `None` — the actual compute data is
+/// owned by the backend and uploaded at construction time.
+///
+/// `seed` makes the k-means++ initialiser reproducible: pass `Some(s)`
+/// for deterministic cold-starts (golden fixtures, regression tests),
+/// `None` to preserve the default non-deterministic `rand::rng()`
+/// behaviour.
 #[allow(clippy::too_many_arguments)]
-pub fn run(
+pub fn run_seeded(
     backend: &mut dyn FcmBackend,
     data_for_init: ArrayView2<'_, f32>,
     k: usize,
@@ -278,6 +309,7 @@ pub fn run(
     tolerance: f64,
     should_cancel: CancelFn<'_>,
     initial_centroids: Option<Array2<f32>>,
+    seed: Option<u64>,
 ) -> Result<FcmResult, FcmError> {
     let n = backend.n();
     let d = backend.d();
@@ -309,7 +341,7 @@ pub fn run(
         }
         _ => {
             info!(k, d, backend = backend.name(), "FCM cold-start (k-means++)");
-            kmeans_plus_plus_init(data_for_init, k)
+            kmeans_plus_plus_init_seeded(data_for_init, k, seed)
         }
     };
 

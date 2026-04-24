@@ -1,7 +1,7 @@
 //! Line-based content chunking with configurable size and overlap.
 
 /// A chunk of file content.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Chunk {
     /// Zero-based chunk index.
     pub chunk_index: i32,

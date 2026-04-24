@@ -27,6 +27,7 @@
 pub mod cli_harness;
 pub mod db_harness;
 pub mod fixtures;
+pub mod golden;
 pub mod mocks;
 pub mod pool_tool_helpers;
 pub mod proptest_config;

@@ -5,7 +5,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 /// A raw import extracted from source code.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RawImport {
     /// The raw import path as written in source (e.g., "crate::db::queries").
     pub raw_path: String,

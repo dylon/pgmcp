@@ -16,7 +16,7 @@ pgmcp = { path = ".." }
 # Mock state needs the same async + serde shapes as the production code.
 async-trait = "0.1"
 parking_lot = "0.12"
-ndarray = { version = "0.16", features = ["blas"] }
+ndarray = { version = "0.16", features = ["blas", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono"] }
@@ -39,9 +39,17 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 libc = "0.2"
 arc-swap = "1"
 rmcp = { version = "1.1", features = ["server"] }
+postcard = { version = "1", features = ["use-std"] }
+petgraph = "0.7"
 
 [dev-dependencies]
 arc-swap = "1"
 rmcp = { version = "1.1", features = ["server"] }
 assert_cmd = "2"
 predicates = "3"
+
+# Use a hyphenated name for the CLI command while keeping the source
+# file `regen_goldens.rs` underscored (rustc idiomatic).
+[[bin]]
+name = "regen-goldens"
+path = "src/bin/regen_goldens.rs"

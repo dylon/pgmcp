@@ -102,12 +102,12 @@ pub fn estimate_k(n: usize, min_cluster_size: usize) -> usize {
 // re-exported at the top of this file for backwards compatibility.
 
 // ============================================================================
-// Fuzzy C-Means (thin adapters; canonical loop is crate::fcm::run)
+// Fuzzy C-Means (thin adapters; canonical loop is crate::fcm::run_seeded)
 // ============================================================================
 
 /// Run Fuzzy C-Means clustering on L2-normalized f32 data.
 ///
-/// Thin adapter over [`crate::fcm::run`] — constructs a CUDA backend with
+/// Thin adapter over [`crate::fcm::run_seeded`] — constructs a CUDA backend with
 /// fp32 precision (mid-iteration arithmetic stays in f32, which matches the
 /// precision callers expect from the pre-backend CPU path) and runs the
 /// canonical FCM iteration loop. On CUDA init failure, falls back to CPU.
@@ -146,6 +146,7 @@ fn dispatch_fcm(
         None,
         warm_centroids,
         fcm::BackendChoice::Cuda(precision),
+        None,
     )
 }
 
@@ -168,6 +169,7 @@ pub fn fuzzy_c_means_gpu(
         None,
         None,
         fcm::BackendChoice::Cuda(precision),
+        None,
     )
 }
 
@@ -192,11 +194,38 @@ pub fn fuzzy_c_means_with_init(
         should_cancel,
         initial_centroids,
         fcm::BackendChoice::Cuda(GpuPrecision::Fp32),
+        None,
+    )
+}
+
+/// Seeded FCM entry for reproducible cold-starts. Used by the
+/// golden-fixture harness — running this with a fixed `seed` on the
+/// same data yields bit-identical centroids (modulo GEMM rounding
+/// under the configured `tolerance`).
+#[allow(clippy::too_many_arguments)]
+pub fn fuzzy_c_means_seeded(
+    data: ArrayView2<f32>,
+    k: usize,
+    m: f64,
+    max_iters: usize,
+    tolerance: f64,
+    seed: u64,
+) -> FcmResult {
+    run_through_backend(
+        data,
+        k,
+        m,
+        max_iters,
+        tolerance,
+        None,
+        None,
+        fcm::BackendChoice::Cpu,
+        Some(seed),
     )
 }
 
 /// Shared body: build a backend with the requested choice, then run the
-/// canonical FCM loop in `crate::fcm::run`. On any error (backend
+/// canonical FCM loop in `crate::fcm::run_seeded`. On any error (backend
 /// construction, mid-iteration kernel launch), log and fall back to CPU —
 /// the fallback goes through a fresh `CpuFcmBackend` constructed from
 /// a full data clone, so callers always see an `FcmResult` (never propagate
@@ -211,6 +240,7 @@ fn run_through_backend(
     should_cancel: CancelFn<'_>,
     warm_centroids: Option<Array2<f32>>,
     choice: fcm::BackendChoice,
+    seed: Option<u64>,
 ) -> FcmResult {
     let data_owned = data.to_owned();
 
@@ -225,7 +255,7 @@ fn run_through_backend(
         }
     };
 
-    match fcm::run(
+    match fcm::run_seeded(
         &mut *backend,
         data,
         k,
@@ -234,6 +264,7 @@ fn run_through_backend(
         tolerance,
         should_cancel,
         warm_centroids.clone(),
+        seed,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -243,7 +274,7 @@ fn run_through_backend(
             );
             // Retry on CPU with a fresh backend.
             match fcm::make_backend(data_owned, k, fcm::BackendChoice::Cpu) {
-                Ok(mut cpu_backend) => fcm::run(
+                Ok(mut cpu_backend) => fcm::run_seeded(
                     &mut *cpu_backend,
                     data,
                     k,
@@ -252,6 +283,7 @@ fn run_through_backend(
                     tolerance,
                     should_cancel,
                     warm_centroids,
+                    seed,
                 )
                 .unwrap_or_else(|e| {
                     error!(error = %e, "CPU backend also failed");
@@ -450,7 +482,7 @@ fn tokenize(content: &str) -> Vec<String> {
 }
 
 /// A single topic's keyword with its score.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TopicKeyword {
     pub word: String,
     pub score: f64,
@@ -553,10 +585,14 @@ pub fn compute_ctf_idf(
             })
             .collect();
 
+        // Sort by score descending; break ties on word ascending so the
+        // output is deterministic regardless of HashMap iteration order
+        // (golden-fixture tests depend on this).
         scored.sort_by(|a, b| {
             b.score
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.word.cmp(&b.word))
         });
         scored.truncate(top_k);
         results.push(scored);

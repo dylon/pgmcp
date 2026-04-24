@@ -852,7 +852,7 @@ impl Config {
 /// - Tables: recursively merged; new default keys are added; user keys preserved.
 /// - Arrays: user entries kept, new default entries (not already present) appended.
 /// - Scalars: user value wins.
-fn merge_toml_values(defaults: TomlValue, user: TomlValue) -> TomlValue {
+pub fn merge_toml_values(defaults: TomlValue, user: TomlValue) -> TomlValue {
     match (defaults, user) {
         (TomlValue::Table(mut def_table), TomlValue::Table(user_table)) => {
             for (key, user_val) in user_table {

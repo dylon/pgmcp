@@ -8,9 +8,17 @@
 //!   keyed by an arbitrary seed string. Useful for setting up
 //!   `MockDbClient::semantic_search_results` with realistic-looking
 //!   embeddings without invoking a real model.
+//! - [`synthetic_corpus`] — the 30-chunk topic-clustering corpus and
+//!   the 5-file graph corpus used by the Phase G/H/I/J oracles.
+//! - [`synthetic_git_history`] — planted co-change patterns
+//!   (Jaccard 1.0, 0.5, 0.0) used by the Phase I `find_coupled_files`
+//!   oracle.
 //!
 //! Phase 5 will add `test_context()` returning a `SystemContext` backed by
 //! `MockDbClient` + `DeterministicEmbeddingBackend`. That belongs here.
+
+pub mod synthetic_corpus;
+pub mod synthetic_git_history;
 
 use pgmcp::config::Config;
 

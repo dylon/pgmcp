@@ -15,6 +15,27 @@ use tracing::{debug, error, info, warn};
 use crate::context::SystemContext;
 use crate::mcp::server::*;
 
+/// Reciprocal Rank Fusion constant. Standard literature value (Cormack
+/// et al., "Reciprocal Rank Fusion outperforms Condorcet and individual
+/// Rank Learning Methods", SIGIR 2009). Higher k flattens the score
+/// curve so lower-ranked results contribute relatively more; lower k
+/// emphasizes the top of each list.
+pub const RRF_K: f64 = 60.0;
+
+/// Per-result RRF contribution from a ranked list.
+///
+///   `score = weight / (k + rank + 1)`
+///
+/// `rank` is 0-indexed (top result has rank 0). `weight` lets callers
+/// blend two sources with different importance (e.g. BM25 vs vector).
+///
+/// Extracted as a pub helper so oracle tests can pin the formula
+/// without spinning up the full hybrid_search tool.
+#[inline]
+pub fn rrf_score(weight: f64, k: f64, rank: usize) -> f64 {
+    weight / (k + rank as f64 + 1.0)
+}
+
 pub async fn tool_hybrid_search(
     ctx: &SystemContext,
     params: HybridSearchParams,
@@ -69,15 +90,14 @@ pub async fn tool_hybrid_search(
         .await
         .map_err(|e| McpError::internal_error(format!("Semantic search failed: {}", e), None))?;
 
-    // Reciprocal Rank Fusion (RRF) with k=60
-    let k = 60.0;
+    // Reciprocal Rank Fusion. See `RRF_K` and `rrf_score` above.
     let mut rrf_scores: std::collections::HashMap<String, (f64, serde_json::Value)> =
         std::collections::HashMap::new();
 
     // Score text search results
     for (rank, result) in text_results.iter().enumerate() {
         let key = format!("text:{}:{}", result.relative_path, rank);
-        let rrf = bm25_weight / (k + rank as f64 + 1.0);
+        let rrf = rrf_score(bm25_weight, RRF_K, rank);
         let snippet = result.content.as_deref().unwrap_or("");
         let entry = rrf_scores.entry(key).or_insert((
             0.0,
@@ -95,7 +115,7 @@ pub async fn tool_hybrid_search(
     // Score semantic search results
     for (rank, result) in semantic_results.iter().enumerate() {
         let key = format!("semantic:{}:{}", result.relative_path, result.start_line);
-        let rrf = semantic_weight / (k + rank as f64 + 1.0);
+        let rrf = rrf_score(semantic_weight, RRF_K, rank);
         let entry = rrf_scores.entry(key).or_insert((
             0.0,
             serde_json::json!({

@@ -401,15 +401,17 @@ mod tests {
         }
 
         /// Repeated keys preserve argv order in the resulting array.
-        /// The regex excludes strings that would auto-parse as numbers,
-        /// bools, or special floats ("nan", "inf") — parse_tool_args
-        /// intentionally type-coerces those, which would make the
-        /// as_str() round-trip lose information.
+        /// `parse_tool_args` auto-coerces values through `i64::from_str`
+        /// → `f64::from_str` → `"true"`/`"false"` → `String`. Rust's
+        /// `f64::from_str` accepts `inf`, `infinity`, `nan` (case-
+        /// insensitive) in addition to all numeric forms, so a generated
+        /// value like `"inf"` would land in the Number branch and
+        /// `as_str()` would return None. The `x_` prefix below is
+        /// non-numeric/non-bool by construction — every generated
+        /// value falls cleanly into the String branch.
         #[test]
         fn prop_repeated_keys_preserve_order(
-            // Start with a letter so we can't accidentally match "true",
-            // "false", "nan", "inf" (all lowercase).
-            values in prop::collection::vec("[g-m][a-z]{1,6}", 2..8usize),
+            values in prop::collection::vec("x_[a-z0-9]{1,6}", 2..8usize),
         ) {
             let args: Vec<String> = values.iter().map(|v| format!("k={}", v)).collect();
             let parsed = parse_tool_args(&args);
