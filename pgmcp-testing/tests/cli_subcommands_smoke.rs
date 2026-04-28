@@ -595,11 +595,12 @@ async fn cli_upgrade_configs_bulk_upgrades_all_projects() {
 }
 
 #[tokio::test]
-async fn cli_stats_prints_something_or_exits_cleanly() {
-    // `stats` hits the daemon if running and falls back otherwise; this
+async fn cli_statistics_prints_something_or_exits_cleanly() {
+    // `statistics` (renamed from `stats`; the short form is preserved as
+    // an alias) hits the daemon if running and falls back otherwise; this
     // smoke test doesn't start a daemon, so we just assert that the
     // subcommand exits cleanly (success or graceful failure — never a
-    // panic).
+    // panic). Both forms must work.
     let binary = match find_pgmcp_binary() {
         Some(b) => b,
         None => {
@@ -608,18 +609,20 @@ async fn cli_stats_prints_something_or_exits_cleanly() {
         }
     };
     let home = TempDir::new().expect("home");
-    let output = pgmcp(&binary)
-        .env("HOME", home.path())
-        .args(["stats"])
-        .output()
-        .expect("run");
-    // Either success (daemon found somewhere) or clean failure — both
-    // acceptable. What we reject is a segfault or panic.
-    assert!(
-        output.status.code().is_some(),
-        "process should exit with a normal code, got {:?}",
-        output.status
-    );
+    for subcommand in ["statistics", "stats"] {
+        let output = pgmcp(&binary)
+            .env("HOME", home.path())
+            .args([subcommand])
+            .output()
+            .expect("run");
+        // Either success (daemon found somewhere) or clean failure — both
+        // acceptable. What we reject is a segfault or panic.
+        assert!(
+            output.status.code().is_some(),
+            "{subcommand}: process should exit with a normal code, got {:?}",
+            output.status
+        );
+    }
 }
 
 #[tokio::test]
@@ -672,4 +675,139 @@ async fn cli_reindex_clears_file_chunks_and_indexed_files() {
         .await
         .expect("count");
     assert_eq!(count, 0, "reindex did not clear indexed_files");
+}
+
+// ============================================================================
+// `status` — daemon + model state snapshot (DB-fallback path)
+// ============================================================================
+
+#[tokio::test]
+async fn cli_status_default_renders_all_sections_via_db_fallback() {
+    let db = require_test_db!();
+    let binary = match find_pgmcp_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!("SKIPPED: pgmcp binary not found");
+            return;
+        }
+    };
+    let home = TempDir::new().expect("home");
+    write_home_config(home.path(), &db.connection_url());
+    // No daemon running on this test config's mcp.port — exercises
+    // the DB-fallback path. Output must still include every section.
+    let output = pgmcp(&binary)
+        .env("HOME", home.path())
+        .args(["status"])
+        .output()
+        .expect("run");
+    assert!(
+        output.status.success(),
+        "status should exit 0; stderr:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for header in [
+        "Daemon:",
+        "Database:",
+        "Embeddings:",
+        "Topics:",
+        "Cross-project similarity:",
+        "Graph:",
+        "Git history:",
+    ] {
+        assert!(
+            stdout.contains(header),
+            "expected section `{header}` in output:\n{stdout}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cli_status_topics_filter_omits_other_sections() {
+    let db = require_test_db!();
+    let binary = match find_pgmcp_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!("SKIPPED: pgmcp binary not found");
+            return;
+        }
+    };
+    let home = TempDir::new().expect("home");
+    write_home_config(home.path(), &db.connection_url());
+    let output = pgmcp(&binary)
+        .env("HOME", home.path())
+        .args(["status", "topics"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Topics:"),
+        "Topics section missing:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("Daemon:") && !stdout.contains("Database:"),
+        "filtered output should NOT contain other sections; got:\n{stdout}"
+    );
+}
+
+#[tokio::test]
+async fn cli_status_json_output_parses_into_expected_keys() {
+    let db = require_test_db!();
+    let binary = match find_pgmcp_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!("SKIPPED: pgmcp binary not found");
+            return;
+        }
+    };
+    let home = TempDir::new().expect("home");
+    write_home_config(home.path(), &db.connection_url());
+    let output = pgmcp(&binary)
+        .env("HOME", home.path())
+        .args(["status", "--json"])
+        .output()
+        .expect("run");
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("--json output not valid JSON: {e}\n{stdout}"));
+    for key in ["daemon", "database", "model_state", "counters"] {
+        assert!(
+            v.get(key).is_some(),
+            "--json output missing top-level key `{key}`: {stdout}"
+        );
+    }
+    // Database URL must be redacted regardless of fallback vs daemon.
+    let url = v["database"]["url"].as_str().expect("database.url");
+    assert!(
+        url.contains(":****@"),
+        "database.url must be redacted (contain `:****@`); got {url}"
+    );
+}
+
+#[tokio::test]
+async fn cli_status_unknown_section_is_rejected_with_message() {
+    let db = require_test_db!();
+    let binary = match find_pgmcp_binary() {
+        Some(b) => b,
+        None => {
+            eprintln!("SKIPPED: pgmcp binary not found");
+            return;
+        }
+    };
+    let home = TempDir::new().expect("home");
+    write_home_config(home.path(), &db.connection_url());
+    let output = pgmcp(&binary)
+        .env("HOME", home.path())
+        .args(["status", "no_such_model"])
+        .output()
+        .expect("run");
+    // Process exits cleanly (the unknown-section message goes to stderr
+    // and the function returns Ok). Verify the warning is present.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("unknown model `no_such_model`"),
+        "expected unknown-model error on stderr, got:\n{stderr}"
+    );
 }

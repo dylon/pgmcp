@@ -15,5 +15,6 @@ pub mod context;
 pub mod daemon;
 pub mod reindex;
 pub mod results;
-pub mod stats;
+pub mod statistics;
+pub mod status;
 pub mod tool;

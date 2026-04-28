@@ -56,6 +56,12 @@ fn spawn_embed_drain(
                 EmbedIndexRequest::Commit(_) => {
                     // Not exercised by these tests.
                 }
+                EmbedIndexRequest::IndexFile(_) => {
+                    // The daemon's primary path (introduced in Step 2a of
+                    // the candle migration). Not exercised here — these
+                    // tests submit `process_file` directly, which uses
+                    // the legacy `File(EmbedRequest)` variant.
+                }
             }
         }
     })

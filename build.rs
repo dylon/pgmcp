@@ -35,6 +35,10 @@ fn main() {
         }
     }
 
+    // candle uses cudarc directly; no ONNX Runtime to RUNPATH-embed.
+    // Re-run when Cargo.lock changes (e.g. on candle version bump).
+    println!("cargo:rerun-if-changed=Cargo.lock");
+
     // Compile src/fcm/cuda/kernels.cu → $OUT_DIR/fcm_kernels.ptx via nvcc.
     //
     // Target is compute_89 (RTX 4060 Ti — Ada Lovelace). The resulting PTX

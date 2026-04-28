@@ -33,9 +33,15 @@ schemars = "1.0"
 sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono"] }
 pgvector = { version = "0.4", features = ["sqlx"] }
 
-# Embeddings
-fastembed = "4"
-ort = { version = "=2.0.0-rc.9", default-features = false, features = ["cuda"] }
+# Embeddings — direct candle stack. Pure Rust BERT inference; uses cudarc
+# (already a direct dep) for CUDA. No ONNX Runtime, no fastembed, no
+# pyke-distributed CUDA-12 native bundle.
+candle-core = { version = "=0.10.2", default-features = false, features = ["cuda"] }
+candle-nn = { version = "=0.10.2", default-features = false, features = ["cuda"] }
+candle-transformers = { version = "=0.10.2", default-features = false, features = ["cuda"] }
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
+safetensors = "0.7"
+hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
 
 # Filesystem
 notify = "7"

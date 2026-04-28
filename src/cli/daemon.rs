@@ -13,17 +13,102 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rmcp::ServiceExt;
+use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
+use rmcp::transport::streamable_http_server::session::{
+    ServerSseMessage, SessionId, SessionManager,
+};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
+use std::sync::atomic::Ordering;
 use tracing::info;
 
 use crate::config::{self, Config};
 use crate::context::SystemContext;
 use crate::shutdown::ShutdownCoordinator;
+use crate::stats::tracker::StatsTracker;
 use crate::{
     api, cron, daemon, daemon_state, db, embed, indexer, logging, mcp, shutdown, stats, work_pool,
 };
+
+/// Wrap any [`SessionManager`] so that successful `create_session` /
+/// `close_session` calls maintain a live count in
+/// `StatsTracker::http_mcp_sessions`. Every other trait method
+/// transparently delegates to the wrapped manager — the wrapper does
+/// not buffer, cache, or alter messages.
+struct CountingSessionManager<M: SessionManager> {
+    inner: M,
+    stats: Arc<StatsTracker>,
+}
+
+impl<M: SessionManager> SessionManager for CountingSessionManager<M> {
+    type Error = M::Error;
+    type Transport = M::Transport;
+
+    async fn create_session(&self) -> Result<(SessionId, Self::Transport), Self::Error> {
+        let pair = self.inner.create_session().await?;
+        // Increment only on success — a failed create must not leak count.
+        self.stats.http_mcp_sessions.fetch_add(1, Ordering::AcqRel);
+        Ok(pair)
+    }
+
+    async fn initialize_session(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<ServerJsonRpcMessage, Self::Error> {
+        self.inner.initialize_session(id, message).await
+    }
+
+    async fn has_session(&self, id: &SessionId) -> Result<bool, Self::Error> {
+        self.inner.has_session(id).await
+    }
+
+    async fn close_session(&self, id: &SessionId) -> Result<(), Self::Error> {
+        let result = self.inner.close_session(id).await;
+        if result.is_ok() {
+            // saturating-sub to make the counter monotone-bounded if the
+            // server somehow over-counts close events.
+            let _ = self.stats.http_mcp_sessions.fetch_update(
+                Ordering::AcqRel,
+                Ordering::Acquire,
+                |v| Some(v.saturating_sub(1)),
+            );
+        }
+        result
+    }
+
+    async fn create_stream(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<impl futures::Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
+        self.inner.create_stream(id, message).await
+    }
+
+    async fn create_standalone_stream(
+        &self,
+        id: &SessionId,
+    ) -> Result<impl futures::Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
+        self.inner.create_standalone_stream(id).await
+    }
+
+    async fn resume(
+        &self,
+        id: &SessionId,
+        last_event_id: String,
+    ) -> Result<impl futures::Stream<Item = ServerSseMessage> + Send + 'static, Self::Error> {
+        self.inner.resume(id, last_event_id).await
+    }
+
+    async fn accept_message(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> Result<(), Self::Error> {
+        self.inner.accept_message(id, message).await
+    }
+}
 
 pub async fn serve(config_override: Option<&Path>) -> anyhow::Result<()> {
     let config_path = Config::resolve_path(config_override);
@@ -91,16 +176,54 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     // 2. Initialize stats tracker
     let stats_tracker = Arc::new(stats::tracker::StatsTracker::new());
 
-    // 3. Initialize work pool (embedding model creation moved to embed pool)
-    let work_pool = Arc::new(work_pool::pool::WorkPool::new(
+    // 3. Initialize the three role-specialized work pools.
+    //
+    // - GeneralPool — unbounded CPU-bound work that's neither GPU nor
+    //   cron (parallel betweenness centrality, ad-hoc CPU bursts).
+    //   Sized from `[work_pool]` config (defaults: num_cpus).
+    // - CronPool — small dedicated pool for cron task bodies. Cron
+    //   scheduler dispatches each due closure to this pool so a heavy
+    //   `block_on` job doesn't stall light cleanup jobs that fire on the
+    //   same scheduler tick. 2 workers is plenty given the existing
+    //   shared `heavy_cron_lock` already serializes the heavy quartet.
+    //
+    // The InferencePool (GPU-bound, file-indexing + query-embed +
+    // GPU-FCM) is a different type — `embed::pool::EmbeddingPool` —
+    // constructed in step 4 below.
+    let general_pool = Arc::new(work_pool::pool::WorkPool::new(
         config_snapshot.work_pool.min_threads,
         config_snapshot.work_pool.resolved_max_threads(),
         config_snapshot.work_pool.resolved_initial_threads(),
         shutdown.terminating_flag(),
     ));
+    let cron_pool = Arc::new(work_pool::pool::WorkPool::new(
+        1,
+        2,
+        2,
+        shutdown.terminating_flag(),
+    ));
 
-    // 5. Start scaling monitor
-    let monitor_pool = Arc::clone(&work_pool);
+    // 5. Start scaling monitor for the general pool with a per-pool RSS
+    //    budget. `system.rss_limit_mib = 0` (default) resolves to 80% of
+    //    MemAvailable at boot; we split it 50/25/25 across InferencePool /
+    //    CronPool / GeneralPool, so GeneralPool gets 25%. Inference and
+    //    Cron pools don't run their own monitors today (their concurrency
+    //    is fixed at construction); the GeneralPool monitor is the one
+    //    that actually adapts to RSS pressure.
+    let total_rss_budget = config_snapshot.system.resolved_rss_limit_bytes();
+    let general_rss_budget = total_rss_budget / 4; // 25% share
+    if total_rss_budget > 0 {
+        info!(
+            total_rss_budget_mib = total_rss_budget >> 20,
+            general_pool_share_mib = general_rss_budget >> 20,
+            "Per-pool RSS scaling armed"
+        );
+    } else {
+        info!(
+            "RSS-aware scaling disabled (system.rss_limit_mib unset and MemAvailable unreadable)"
+        );
+    }
+    let monitor_pool = Arc::clone(&general_pool);
     let monitor_shutdown = shutdown.terminating_flag();
     let monitor_stats = Arc::clone(&stats_tracker);
     let monitor_handle = std::thread::Builder::new()
@@ -110,6 +233,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
                 &monitor_pool,
                 monitor_shutdown,
                 &monitor_stats,
+                general_rss_budget,
             );
         })
         .expect("Failed to spawn scaling monitor thread");
@@ -152,7 +276,8 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         tokio::runtime::Handle::current(),
         embed_sender.clone(),
         lifecycle.clone(),
-        Some(Arc::clone(&work_pool)),
+        Arc::clone(&cron_pool),
+        Some(Arc::clone(&general_pool)),
     );
 
     // 8. MCP logging broadcaster + task store (constructed early so the
@@ -179,7 +304,6 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
 
     let indexer_handle = indexer::event_processor::start_indexing(
         system_ctx.clone(),
-        Arc::clone(&work_pool),
         embed_sender,
         shutdown.clone(),
         Arc::clone(&project_overrides),
@@ -222,9 +346,16 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             bind_addr
         );
 
+        // Wrap LocalSessionManager so create/close maintain the
+        // http_mcp_sessions counter — surfaced by `pgmcp status` and
+        // `/api/status`.
+        let counting_manager = CountingSessionManager {
+            inner: LocalSessionManager::default(),
+            stats: Arc::clone(&stats_tracker),
+        };
         let mcp_service = StreamableHttpService::new(
             move || Ok(mcp_server.clone()),
-            Arc::new(LocalSessionManager::default()),
+            Arc::new(counting_manager),
             StreamableHttpServerConfig {
                 stateful_mode: true,
                 cancellation_token: cancel_token.clone(),
@@ -232,17 +363,19 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             },
         );
 
-        // REST API state (shares query_embedder and db with MCP server)
+        // REST API state (shares query_embedder, db, and stats with MCP server)
         let api_state = api::ApiState {
             db: Arc::clone(&cron_db),
             query_embedder: query_embedder.clone(),
             config: Arc::clone(&config),
+            stats: Arc::clone(&stats_tracker),
         };
 
         let router = axum::Router::new()
             .nest_service("/mcp", mcp_service)
             .route("/api/search", axum::routing::post(api::handlers::search))
             .route("/api/context", axum::routing::get(api::handlers::context))
+            .route("/api/status", axum::routing::get(api::handlers::status))
             .with_state(api_state);
         let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)
             .await
@@ -310,8 +443,9 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     // Stop file watcher
     drop(indexer_handle);
 
-    // Drain work pool (5s timeout per worker)
-    let wp_handles = work_pool.shutdown_and_take_handles();
+    // Drain general pool + cron pool (5s timeout per worker)
+    let mut wp_handles = general_pool.shutdown_and_take_handles();
+    wp_handles.extend(cron_pool.shutdown_and_take_handles());
     let wp_count = wp_handles.len();
     let mut wp_timed_out = 0;
     for handle in wp_handles {

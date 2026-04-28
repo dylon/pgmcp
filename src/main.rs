@@ -55,10 +55,18 @@ enum Commands {
     Serve,
     /// Run as systemd daemon (sd-notify, file logging)
     Daemon,
-    /// Print statistics from running instance
-    Stats,
-    /// Trigger full re-index of all workspaces
-    Reindex,
+    /// Print statistics from running instance (alias: `stats`)
+    #[command(alias = "stats")]
+    Statistics,
+    /// Trigger full re-index of all workspaces. Refuses to run if the
+    /// daemon is currently listening on `mcp.host:port` — stop the daemon
+    /// first or pass `--force` to bypass.
+    Reindex {
+        /// Bypass the running-daemon check. Use only when you're certain
+        /// the daemon is stopped (e.g. socket is lingering after kill).
+        #[arg(long)]
+        force: bool,
+    },
     /// Generate default config at ~/.config/pgmcp/config.toml
     Init,
     /// Upgrade all configs: global config.toml + .pgmcp.toml in all indexed projects
@@ -130,10 +138,46 @@ enum Commands {
         #[arg(long)]
         schema: bool,
     },
+    /// Print daemon and model state. With no MODEL argument, every section
+    /// renders. MODEL filters to one of: daemon, database, embeddings,
+    /// topics, similarity, graph, git.
+    Status {
+        /// Section name to show (omit for everything).
+        model: Option<String>,
+        /// Emit the full snapshot as pretty JSON instead of text.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+/// Cap the number of glibc malloc thread arenas BEFORE the tokio runtime
+/// or any worker threads are spawned. Default is 8 × num_cpus (= 512 on a
+/// 64-CPU host); each arena retains its high-water mark for the life of
+/// the process, so a transient burst of allocations across many threads
+/// inflates RSS by tens of GB that never returns to the kernel. Capping
+/// at 2 keeps RSS close to the live working set with no measurable
+/// throughput cost — every thread still contends rarely enough on the
+/// arena lock that lock contention is invisible compared to the embed
+/// inference and DB latency that dominate this binary's wall time.
+///
+/// No-op on non-glibc targets.
+fn cap_malloc_arenas() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    cap_malloc_arenas();
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cfg = cli.config.as_deref();
 
@@ -146,8 +190,8 @@ async fn main() -> anyhow::Result<()> {
         Commands::UpgradeProject { cwd } => cli::admin::upgrade_project(cwd),
         Commands::Serve => cli::daemon::serve(cfg).await,
         Commands::Daemon => cli::daemon::daemon(cfg).await,
-        Commands::Stats => cli::stats::run(cfg).await,
-        Commands::Reindex => cli::reindex::run(cfg).await,
+        Commands::Statistics => cli::statistics::run(cfg).await,
+        Commands::Reindex { force } => cli::reindex::run(cfg, force).await,
         Commands::Context { cwd, depth } => cli::context::run(cfg, cwd, depth).await,
         Commands::Analyze {
             job,
@@ -175,5 +219,6 @@ async fn main() -> anyhow::Result<()> {
             schema,
         } => cli::tool::run(cfg, name, args, json, schema).await,
         Commands::Results { kind, limit } => cli::results::run(cfg, kind, limit).await,
+        Commands::Status { model, json } => cli::status::run(cfg, model, json).await,
     }
 }

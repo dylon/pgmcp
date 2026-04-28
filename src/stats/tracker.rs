@@ -8,6 +8,13 @@ pub struct StatsTracker {
     // Indexing counters
     pub files_indexed: AtomicU64,
     pub files_failed: AtomicU64,
+    /// Files where the inference worker observed a foreign-key violation
+    /// during chunk insert — i.e. the parent `indexed_files` row was
+    /// deleted while the worker was mid-pipeline (typical cause:
+    /// `pgmcp reindex --force` while daemon alive, or external
+    /// `TRUNCATE indexed_files`). One increment per affected file, not
+    /// per chunk.
+    pub files_aborted_fk: AtomicU64,
     pub chunks_embedded: AtomicU64,
     pub bytes_processed: AtomicU64,
 
@@ -110,6 +117,13 @@ pub struct StatsTracker {
     // Scorecard counters
     pub scorecard_scans: AtomicU64,
 
+    /// Currently-connected Streamable HTTP MCP sessions. Incremented when
+    /// a peer issues an `initialize` and a session is created in the
+    /// `LocalSessionManager` wrapper; decremented on session close /
+    /// expiration. The stdio transport is always 1 peer per process and
+    /// is reported separately by the `pgmcp status` CLI.
+    pub http_mcp_sessions: AtomicU64,
+
     // Memory observability (Phase 4 of OOM fix)
     /// Peak RSS in bytes observed since daemon start. Updated every 500 ms
     /// by the peak-RSS sampler thread (`src/stats/rss.rs::spawn_peak_sampler`).
@@ -131,6 +145,7 @@ impl StatsTracker {
         Self {
             files_indexed: AtomicU64::new(0),
             files_failed: AtomicU64::new(0),
+            files_aborted_fk: AtomicU64::new(0),
             chunks_embedded: AtomicU64::new(0),
             bytes_processed: AtomicU64::new(0),
             mcp_requests: AtomicU64::new(0),
@@ -194,6 +209,7 @@ impl StatsTracker {
             hybrid_searches: AtomicU64::new(0),
             summarize_scans: AtomicU64::new(0),
             scorecard_scans: AtomicU64::new(0),
+            http_mcp_sessions: AtomicU64::new(0),
             peak_rss_bytes: AtomicU64::new(0),
             current_rss_bytes: AtomicU64::new(0),
             heavy_cron_running: AtomicBool::new(false),
@@ -206,6 +222,7 @@ impl StatsTracker {
         serde_json::json!({
             "files_indexed": self.files_indexed.load(Ordering::Acquire),
             "files_failed": self.files_failed.load(Ordering::Acquire),
+            "files_aborted_fk": self.files_aborted_fk.load(Ordering::Acquire),
             "chunks_embedded": self.chunks_embedded.load(Ordering::Acquire),
             "bytes_processed": self.bytes_processed.load(Ordering::Acquire),
             "mcp_requests": self.mcp_requests.load(Ordering::Acquire),
@@ -268,6 +285,7 @@ impl StatsTracker {
             "hybrid_searches": self.hybrid_searches.load(Ordering::Acquire),
             "summarize_scans": self.summarize_scans.load(Ordering::Acquire),
             "scorecard_scans": self.scorecard_scans.load(Ordering::Acquire),
+            "http_mcp_sessions": self.http_mcp_sessions.load(Ordering::Acquire),
             "uptime_secs": self.uptime_start.elapsed().as_secs(),
         })
     }

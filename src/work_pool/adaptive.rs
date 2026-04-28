@@ -328,6 +328,31 @@ impl WorkerPark {
 }
 
 // ============================================================================
+// RSS-pressure helper
+// ============================================================================
+
+/// RSS pressure score in `[0.0, 3.0]`, used as a hill-climber input term
+/// so each pool can self-throttle as it approaches its memory budget.
+///
+/// Linear ramp from 0.0 at 50% of the limit to 3.0 at 125% of the limit,
+/// then clamped. Mirrors MeTTaTron's `rss_pressure` shape — the early
+/// onset (50%) gives the climber room to react before peak; the
+/// extra-budget tail (>100%) keeps the signal monotonic and saturating.
+///
+/// Returns 0.0 when `rss_limit_bytes == 0` (RSS sensing disabled) or when
+/// `/proc/self/statm` is unreadable.
+pub fn rss_pressure_score(rss_limit_bytes: u64) -> f64 {
+    if rss_limit_bytes == 0 {
+        return 0.0;
+    }
+    let Some(rss) = crate::stats::rss::current_rss_bytes() else {
+        return 0.0;
+    };
+    let ratio = rss as f64 / rss_limit_bytes as f64;
+    ((ratio - 0.5) * 4.0).clamp(0.0, 3.0)
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -336,6 +361,32 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
+
+    #[test]
+    fn rss_pressure_score_returns_zero_when_limit_disabled() {
+        // 0 = sensing disabled; result must be 0 regardless of RSS.
+        assert_eq!(rss_pressure_score(0), 0.0);
+    }
+
+    #[test]
+    fn rss_pressure_score_clamps_above_3_0() {
+        // Use a deliberately tiny limit so the daemon's actual RSS is
+        // far above it, forcing the upper clamp.
+        let v = rss_pressure_score(1);
+        assert!(
+            (v - 3.0).abs() < 1e-9,
+            "expected upper clamp at 3.0, got {v}"
+        );
+    }
+
+    #[test]
+    fn rss_pressure_score_clamps_below_zero() {
+        // A limit so large that current RSS can't possibly be near 50% of
+        // it — the score must clamp to 0, not go negative.
+        let v = rss_pressure_score(u64::MAX / 2);
+        assert!(v >= 0.0, "score must be non-negative; got {v}");
+        assert!(v <= 3.0, "score must clamp at 3.0; got {v}");
+    }
 
     #[test]
     fn test_ema_converges_to_steady_state() {

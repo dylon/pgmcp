@@ -16,6 +16,12 @@ pub async fn print_stats(config: &Config) -> anyhow::Result<()> {
         Ok(body) => {
             println!("\npgmcp Statistics");
             println!("{}", "=".repeat(50));
+            println!(
+                "Three-pool architecture: InferencePool (GPU embed),\n\
+                 CronPool (cron tasks), GeneralPool (CPU misc).\n\
+                 The work-pool counters below reflect the GeneralPool —\n\
+                 the InferencePool's activity is in the Embedding Pool group."
+            );
 
             // Parse Prometheus text format into (key, value) pairs
             let metrics: Vec<(&str, &str)> = body
@@ -31,6 +37,7 @@ pub async fn print_stats(config: &Config) -> anyhow::Result<()> {
                     &[
                         "pgmcp_files_indexed",
                         "pgmcp_files_failed",
+                        "pgmcp_files_aborted_fk",
                         "pgmcp_chunks_embedded",
                         "pgmcp_bytes_processed",
                         "pgmcp_index_duration",
@@ -56,14 +63,14 @@ pub async fn print_stats(config: &Config) -> anyhow::Result<()> {
                     ],
                 ),
                 (
-                    "Work Pool",
+                    "GeneralPool (CPU misc)",
                     &[
                         "pgmcp_active_threads",
                         "pgmcp_queue_depth",
                         "pgmcp_work_pool_",
                     ],
                 ),
-                ("Embedding Pool", &["pgmcp_embed_"]),
+                ("InferencePool (GPU embed)", &["pgmcp_embed_"]),
                 ("Cron", &["pgmcp_cron_"]),
                 ("Git History", &["pgmcp_git_"]),
                 ("Config Watcher", &["pgmcp_config_"]),

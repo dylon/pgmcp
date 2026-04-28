@@ -7,6 +7,7 @@ use arc_swap::ArcSwap;
 use crate::config::Config;
 use crate::db::DbClient;
 use crate::embed::pool::QueryEmbedder;
+use crate::stats::tracker::StatsTracker;
 
 /// Shared state for REST API handlers.
 #[derive(Clone)]
@@ -14,4 +15,7 @@ pub struct ApiState {
     pub db: Arc<dyn DbClient>,
     pub query_embedder: QueryEmbedder,
     pub config: Arc<ArcSwap<Config>>,
+    /// Live in-process counters. The `/api/status` endpoint reads
+    /// `http_mcp_sessions` and the model-scan counters from this.
+    pub stats: Arc<StatsTracker>,
 }

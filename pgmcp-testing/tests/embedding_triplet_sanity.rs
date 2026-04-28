@@ -1,4 +1,4 @@
-//! Semantic sanity tests for the real `FastembedBackend`.
+//! Semantic sanity tests for the real `CandleBackend`.
 //!
 //! Each triplet (anchor, positive, negative) asserts the model
 //! ranks the positive closer than the negative by at least `MARGIN`
@@ -19,7 +19,7 @@
 //! triplets pass on `all-MiniLM-L6-v2` (the default model) but
 //! tight enough to fail if the model is replaced with a degenerate
 //! one (random-init or wrong dimension). If a model upgrade in
-//! fastembed legitimately changes any pair, drop that triplet
+//! candle legitimately changes any pair, drop that triplet
 //! rather than the margin — losing one triplet is cheaper than
 //! masking real semantic regressions.
 
@@ -141,14 +141,14 @@ async fn semantic_triplets_rank_positives_above_negatives() {
 }
 
 /// Cosine similarity assuming inputs are L2-normalized (which
-/// FastembedBackend guarantees). Reduces to a dot product in that
+/// CandleBackend guarantees). Reduces to a dot product in that
 /// case — one fused-multiply-add per dim.
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
     debug_assert_eq!(a.len(), b.len());
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
-/// Returns `Some(backend)` if the fastembed model is cached and
+/// Returns `Some(backend)` if the candle model is cached and
 /// loadable; prints `SKIPPED:` and returns `None` otherwise.
 async fn load_real_backend() -> Option<Arc<dyn EmbeddingBackend>> {
     let home = match std::env::var("HOME") {
@@ -166,17 +166,17 @@ async fn load_real_backend() -> Option<Arc<dyn EmbeddingBackend>> {
 
     let config = EmbeddingsConfig::default();
     let backend = match tokio::task::spawn_blocking(move || {
-        pgmcp::embed::backend::FastembedBackend::new(&config)
+        pgmcp::embed::backend::CandleBackend::new(&config)
     })
     .await
     {
         Ok(Ok(b)) => b,
         Ok(Err(e)) => {
-            eprintln!("SKIPPED: FastembedBackend unavailable: {}", e);
+            eprintln!("SKIPPED: CandleBackend unavailable: {}", e);
             return None;
         }
         Err(e) => {
-            eprintln!("SKIPPED: FastembedBackend spawn panic: {}", e);
+            eprintln!("SKIPPED: CandleBackend spawn panic: {}", e);
             return None;
         }
     };

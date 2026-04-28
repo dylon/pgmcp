@@ -1097,7 +1097,7 @@ fn cluster_embeddings(
                 chunks_in_topic: weighted_count.round() as i32,
             })
             .collect();
-        top_files.sort_by(|a, b| b.chunks_in_topic.cmp(&a.chunks_in_topic));
+        top_files.sort_by_key(|b| std::cmp::Reverse(b.chunks_in_topic));
 
         // Get keywords for this topic
         let empty_kw = Vec::new();
@@ -1133,7 +1133,7 @@ fn cluster_embeddings(
     }
 
     // Sort by chunk count descending
-    topics.sort_by(|a, b| b.chunk_ids.len().cmp(&a.chunk_ids.len()));
+    topics.sort_by_key(|b| std::cmp::Reverse(b.chunk_ids.len()));
 
     ClusteringSummary {
         scope: scope.to_string(),
@@ -1928,7 +1928,7 @@ async fn build_topics_from_members(
                 chunks_in_topic: weighted.round() as i32,
             })
             .collect();
-        top_files.sort_by(|a, b| b.chunks_in_topic.cmp(&a.chunks_in_topic));
+        top_files.sort_by_key(|b| std::cmp::Reverse(b.chunks_in_topic));
 
         let empty_kw = Vec::new();
         let kw = keyword_sets.get(topic_idx).unwrap_or(&empty_kw);
@@ -1957,7 +1957,7 @@ async fn build_topics_from_members(
 
         let _ = fcm_result; // Suppress unused if fcm_result fields not touched above.
     }
-    topics.sort_by(|a, b| b.chunk_ids.len().cmp(&a.chunk_ids.len()));
+    topics.sort_by_key(|b| std::cmp::Reverse(b.chunk_ids.len()));
     topics
 }
 

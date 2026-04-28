@@ -1,14 +1,14 @@
 pub mod backend;
-#[allow(dead_code)]
 pub mod model;
 pub mod pool;
 
 pub use backend::EmbeddingBackend;
-// FastembedBackend re-exported for callers (incl. tests) wanting to plug
+// CandleBackend re-exported for callers (incl. tests) wanting to plug
 // the real model into EmbedSource::Backend(...). Not yet used by the
-// daemon's primary embed path.
+// daemon's primary embed path (which goes through EmbedSource::Pool).
 #[allow(unused_imports)]
-pub use backend::FastembedBackend;
+pub use backend::CandleBackend;
+pub use model::Embedder;
 
 use std::sync::Arc;
 
@@ -23,10 +23,10 @@ pub enum EmbedSource {
     Pool(pool::QueryEmbedder),
     /// CLI mode: lazily create a local model on first use (no pool running).
     Lazy {
-        cell: Arc<tokio::sync::OnceCell<Arc<tokio::sync::Mutex<fastembed::TextEmbedding>>>>,
+        cell: Arc<tokio::sync::OnceCell<Arc<tokio::sync::Mutex<Embedder>>>>,
         config: EmbeddingsConfig,
     },
-    /// Direct trait dispatch — production wraps `FastembedBackend`; tests
+    /// Direct trait dispatch — production wraps `CandleBackend`; tests
     /// wrap `DeterministicEmbeddingBackend` from `pgmcp-testing`. Not yet
     /// constructed by daemon-mode `main.rs`, but consumed end-to-end by
     /// `pgmcp-testing/tests/mcp_tool_smoke.rs`.
@@ -45,7 +45,7 @@ impl EmbedSource {
 
     /// Wrap a trait-object embedding backend. Tests pass
     /// `DeterministicEmbeddingBackend`; production code that wants to
-    /// bypass the pool can pass `FastembedBackend`. Currently used only by
+    /// bypass the pool can pass `CandleBackend`. Currently used only by
     /// the `pgmcp-testing` cross-crate tests.
     #[allow(dead_code)]
     pub fn backend(backend: Arc<dyn EmbeddingBackend>) -> Self {
@@ -59,14 +59,12 @@ impl EmbedSource {
             Self::Lazy { cell, config } => {
                 let model_arc = cell
                     .get_or_try_init(|| async {
-                        let m = model::create_embedding_model(config)?;
+                        let m = Embedder::new(config)?;
                         Ok::<_, PgmcpError>(Arc::new(tokio::sync::Mutex::new(m)))
                     })
                     .await?;
                 let guard = model_arc.lock().await;
-                let mut vecs = guard
-                    .embed(vec![text], None)
-                    .map_err(|e| PgmcpError::Embedding(format!("Embedding failed: {}", e)))?;
+                let mut vecs = guard.embed(&[text])?;
                 vecs.pop()
                     .ok_or_else(|| PgmcpError::Embedding("No embedding returned".into()))
             }

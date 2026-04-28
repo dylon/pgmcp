@@ -1,4 +1,8 @@
-//! `stats` subcommand: print live counters from the running daemon.
+//! `statistics` subcommand (alias `stats`): print live counters from the
+//! running daemon.
+//!
+//! Renamed from `stats` to avoid confusion with `status`. The shorter
+//! alias is preserved for backward compatibility.
 
 use std::path::Path;
 

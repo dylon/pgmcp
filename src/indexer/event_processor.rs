@@ -26,8 +26,6 @@ use crate::embed::pool::EmbedIndexRequest;
 use crate::indexer::{config_watcher::WatcherCommand, scanner, watcher};
 use crate::reactive::operators;
 use crate::shutdown::ShutdownCoordinator;
-use crate::stats::tracker::StatsTracker;
-use crate::work_pool::pool::{Priority, WorkPool};
 
 /// Handle returned from start_indexing. Dropping it stops the file watcher.
 #[allow(dead_code)]
@@ -55,7 +53,6 @@ impl IndexerHandle {
 #[allow(clippy::too_many_arguments)]
 pub fn start_indexing(
     ctx: SystemContext,
-    work_pool: Arc<WorkPool>,
     embed_tx: Sender<EmbedIndexRequest>,
     shutdown: ShutdownCoordinator,
     project_overrides: Arc<DashMap<PathBuf, config::ProjectOverride>>,
@@ -197,56 +194,38 @@ pub fn start_indexing(
         |event: &watcher::FileEvent| event.path.clone(),
     );
 
-    // 4. Subscribe to debounced events and dispatch to work pool
-    let work_pool_for_events = Arc::clone(&work_pool);
+    // 4. Subscribe to debounced events and submit IndexFile tasks to the
+    //    inference pool (which now owns the entire file-indexing pipeline).
     let config_for_events = Arc::clone(&config);
     let db_for_events = Arc::clone(&db);
     let embed_tx_for_events = embed_tx.clone();
-    let stats_for_events = Arc::clone(&stats);
     let stats_for_debounce = Arc::clone(&stats);
     let project_roots_for_events = Arc::clone(&project_roots);
     let project_overrides_for_events = Arc::clone(&project_overrides);
 
-    let rt_for_events = rt_handle.clone();
     let event_sub = crate::reactive::observable::Observable::from_receiver(debounced_rx).subscribe(
         move |event: watcher::FileEvent| {
             stats_for_debounce
                 .watcher_events_debounced
                 .fetch_add(1, Ordering::Relaxed);
 
-            let path = event.path.clone();
-            let config = Arc::clone(&config_for_events);
-            let db = db_for_events.clone();
-            let embed_tx = embed_tx_for_events.clone();
-            let stats = Arc::clone(&stats_for_events);
-            let roots = Arc::clone(&project_roots_for_events);
-            let overrides = Arc::clone(&project_overrides_for_events);
-            let rt = rt_for_events.clone();
-
-            work_pool_for_events.submit(
-                move || {
-                    rt.block_on(async {
-                        handle_file_event(
-                            &path,
-                            &event.kind,
-                            &config.load(),
-                            &db,
-                            &embed_tx,
-                            &stats,
-                            &roots,
-                            &overrides,
-                        )
-                        .await;
-                    });
-                },
-                Priority::High,
-            );
+            let task = crate::embed::pool::IndexFileTask {
+                path: event.path.clone(),
+                kind: event.kind,
+                config: Arc::clone(&config_for_events),
+                db: Arc::clone(&db_for_events),
+                project_roots: Arc::clone(&project_roots_for_events),
+                project_overrides: Arc::clone(&project_overrides_for_events),
+            };
+            if let Err(e) = embed_tx_for_events.send(EmbedIndexRequest::IndexFile(task)) {
+                error!(path = %event.path.display(), error = %e,
+                       "Failed to submit IndexFile task");
+            }
         },
     );
 
     // 5. Start initial scan in background
     let config_for_scan = Arc::clone(&config);
-    let work_pool_for_scan = Arc::clone(&work_pool);
     let db_for_scan = Arc::clone(&db);
     let embed_tx_for_scan = embed_tx.clone();
     let stats_for_scan = Arc::clone(&stats);
@@ -327,32 +306,18 @@ pub fn start_indexing(
 
                 submitted += 1;
 
-                let config = Arc::clone(&config_for_scan);
-                let db = db_for_scan.clone();
-                let embed_tx = embed_tx_for_scan.clone();
-                let stats = Arc::clone(&stats_for_scan);
-                let roots = Arc::clone(&project_roots_for_scan);
-                let overrides = Arc::clone(&project_overrides_for_scan);
-                let rt = rt_for_scan.clone();
-
-                work_pool_for_scan.submit(
-                    move || {
-                        rt.block_on(async {
-                            handle_file_event(
-                                &path,
-                                &watcher::FileEventKind::Create,
-                                &config.load(),
-                                &db,
-                                &embed_tx,
-                                &stats,
-                                &roots,
-                                &overrides,
-                            )
-                            .await;
-                        });
-                    },
-                    Priority::Low,
-                );
+                let task = crate::embed::pool::IndexFileTask {
+                    path,
+                    kind: watcher::FileEventKind::Create,
+                    config: Arc::clone(&config_for_scan),
+                    db: Arc::clone(&db_for_scan),
+                    project_roots: Arc::clone(&project_roots_for_scan),
+                    project_overrides: Arc::clone(&project_overrides_for_scan),
+                };
+                if let Err(e) = embed_tx_for_scan.send(EmbedIndexRequest::IndexFile(task)) {
+                    error!(error = %e, "Failed to submit IndexFile task during initial scan");
+                    break;
+                }
             }
 
             let _ = scan_handle.join();
@@ -418,10 +383,8 @@ pub fn start_indexing(
     // 6. Spawn watcher command handler thread
     let watcher_for_cmd = Arc::clone(&watcher_handle);
     let config_for_cmd = Arc::clone(&config);
-    let work_pool_for_cmd = Arc::clone(&work_pool);
     let db_for_cmd = db;
     let embed_tx_for_cmd = embed_tx;
-    let stats_for_cmd = Arc::clone(&stats);
     let roots_for_cmd = Arc::clone(&project_roots);
     let overrides_for_cmd = Arc::clone(&project_overrides);
     let rt_for_cmd = rt_handle;
@@ -495,10 +458,8 @@ pub fn start_indexing(
                         rescan_workspace(
                             &path,
                             &config_for_cmd,
-                            &work_pool_for_cmd,
                             &db_for_cmd,
                             &embed_tx_for_cmd,
-                            &stats_for_cmd,
                             &roots_for_cmd,
                             &overrides_for_cmd,
                             &rt_for_cmd,
@@ -528,13 +489,12 @@ fn check_pattern(pattern: &str, path_str: &str) -> bool {
 
 /// Re-scan a single workspace path and submit discovered files for indexing.
 /// Called when config.toml gains a new workspace path.
+#[allow(clippy::too_many_arguments)]
 fn rescan_workspace(
     workspace_path: &Path,
     config: &Arc<ArcSwap<Config>>,
-    work_pool: &Arc<WorkPool>,
     db: &Arc<dyn crate::db::DbClient>,
     embed_tx: &Sender<EmbedIndexRequest>,
-    stats: &Arc<StatsTracker>,
     project_roots: &Arc<DashMap<PathBuf, scanner::ProjectRoot>>,
     project_overrides: &Arc<DashMap<PathBuf, config::ProjectOverride>>,
     rt_handle: &tokio::runtime::Handle,
@@ -563,123 +523,77 @@ fn rescan_workspace(
         })
         .expect("Failed to spawn rescan walk thread");
 
-    // Process discovered files — no Level-1 metadata skip for new workspaces;
-    // process_file does Level-2 content hash skip.
-    let mut count = 0u64;
-    for path in file_rx {
-        count += 1;
-        let config = Arc::clone(config);
-        let db = Arc::clone(db);
-        let embed_tx = embed_tx.clone();
-        let stats = Arc::clone(stats);
-        let roots = Arc::clone(project_roots);
-        let overrides = Arc::clone(project_overrides);
-        let rt = rt_handle.clone();
+    // Load indexed file metadata for Level-1 (size+mtime) skip. Mirrors the
+    // initial-scan path. Without this, every path discovered by the walker is
+    // unconditionally read end-to-end via process_file just to compute a
+    // content hash that almost always matches what's already in the DB —
+    // burning I/O, malloc churn, and embed-channel backpressure on tens of
+    // thousands of files that haven't changed.
+    let metadata_map: std::collections::HashMap<String, crate::db::queries::IndexedFileMeta> =
+        match rt_handle.block_on(db.get_all_file_metadata()) {
+            Ok(metas) => {
+                let mut map = std::collections::HashMap::with_capacity(metas.len());
+                for meta in metas {
+                    map.insert(meta.path.clone(), meta);
+                }
+                map
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to load file metadata for rescan, falling back to full re-read"
+                );
+                std::collections::HashMap::new()
+            }
+        };
 
-        work_pool.submit(
-            move || {
-                rt.block_on(async {
-                    handle_file_event(
-                        &path,
-                        &watcher::FileEventKind::Create,
-                        &config.load(),
-                        &db,
-                        &embed_tx,
-                        &stats,
-                        &roots,
-                        &overrides,
-                    )
-                    .await;
-                });
-            },
-            Priority::Low,
-        );
+    let mut total_scanned: u64 = 0;
+    let mut skipped: u64 = 0;
+    let mut submitted: u64 = 0;
+    for path in file_rx {
+        total_scanned += 1;
+
+        if let Some(db_meta) = metadata_map.get(&*path.to_string_lossy())
+            && let Ok(fs_meta) = std::fs::metadata(&path)
+        {
+            let fs_size = fs_meta.len() as i64;
+            let fs_mtime: chrono::DateTime<chrono::Utc> = fs_meta
+                .modified()
+                .map(Into::into)
+                .unwrap_or_else(|_| chrono::Utc::now());
+
+            if fs_size == db_meta.size_bytes && fs_mtime <= db_meta.modified_at {
+                skipped += 1;
+                continue;
+            }
+        }
+
+        submitted += 1;
+
+        let task = crate::embed::pool::IndexFileTask {
+            path,
+            kind: watcher::FileEventKind::Create,
+            config: Arc::clone(config),
+            db: Arc::clone(db),
+            project_roots: Arc::clone(project_roots),
+            project_overrides: Arc::clone(project_overrides),
+        };
+        if let Err(e) = embed_tx.send(EmbedIndexRequest::IndexFile(task)) {
+            error!(error = %e, "Failed to submit IndexFile task during rescan");
+            break;
+        }
     }
 
     let _ = walk_handle.join();
-    info!(path = %workspace_path_str, files = count, "Re-scan complete");
+    info!(
+        path = %workspace_path_str,
+        total = total_scanned,
+        unchanged = skipped,
+        submitted,
+        "Re-scan complete"
+    );
 }
 
-pub(crate) async fn handle_file_event(
-    path: &Path,
-    kind: &watcher::FileEventKind,
-    config: &Config,
-    db: &Arc<dyn crate::db::DbClient>,
-    embed_tx: &Sender<EmbedIndexRequest>,
-    stats: &StatsTracker,
-    project_roots: &DashMap<PathBuf, scanner::ProjectRoot>,
-    project_overrides: &DashMap<PathBuf, config::ProjectOverride>,
-) {
-    match kind {
-        watcher::FileEventKind::Remove => {
-            let path_str = path.to_string_lossy();
-            if let Err(e) = db.delete_file(&path_str).await {
-                error!(path = %path_str, error = %e, "Failed to delete file from index");
-            }
-        }
-        watcher::FileEventKind::Create | watcher::FileEventKind::Modify => {
-            // Find project root
-            let (project_id, workspace_path, project_root_path) =
-                match scanner::find_project_root(path, project_roots) {
-                    Some((root_path, root_info)) => {
-                        let root = root_info.clone();
-                        drop(root_info); // Release DashMap ref
-
-                        match db
-                            .upsert_project(
-                                &root.workspace_path,
-                                &root_path.to_string_lossy(),
-                                &root.name,
-                            )
-                            .await
-                        {
-                            Ok(id) => (
-                                id,
-                                root_path.to_string_lossy().into_owned(),
-                                Some(root_path),
-                            ),
-                            Err(e) => {
-                                error!(error = %e, "Failed to upsert project");
-                                return;
-                            }
-                        }
-                    }
-                    None => {
-                        // No project root found, use the workspace path
-                        let workspace = config.workspace.paths.first().cloned().unwrap_or_default();
-                        match db.upsert_project(&workspace, &workspace, "default").await {
-                            Ok(id) => (id, workspace, None),
-                            Err(e) => {
-                                error!(error = %e, "Failed to upsert default project");
-                                return;
-                            }
-                        }
-                    }
-                };
-
-            // Look up per-project max_file_size_bytes override
-            let max_file_size_override = project_root_path.as_ref().and_then(|root| {
-                project_overrides
-                    .get(root)
-                    .and_then(|ovr| ovr.indexer.as_ref().and_then(|idx| idx.max_file_size_bytes))
-            });
-
-            if let Err(e) = super::processor::process_file(
-                path,
-                project_id,
-                &workspace_path,
-                config,
-                db,
-                embed_tx,
-                stats,
-                max_file_size_override,
-            )
-            .await
-            {
-                let path_str = path.to_string_lossy();
-                error!(path = %path_str, error = %e, "Failed to process file");
-                stats.files_failed.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-    }
-}
+// `handle_file_event` and `processor::process_file` are no longer needed:
+// the inference-pool worker now owns the entire pipeline. See
+// `src/embed/pool.rs::process_index_file_task`.

@@ -15,7 +15,14 @@ use crate::indexer::{chunker, claude_chunker};
 use crate::stats::tracker::StatsTracker;
 
 /// Process a single file: read, hash, check if changed, chunk, embed, upsert.
-#[allow(clippy::too_many_arguments)]
+///
+/// **Legacy.** The daemon's file-indexing path no longer routes through
+/// here as of Step 2a (candle migration). The inference-pool worker now
+/// owns the full pipeline — see
+/// `src/embed/pool.rs::process_index_file_task`. This function is
+/// retained because `pgmcp-testing/tests/indexer_pipeline_e2e.rs` uses
+/// it to exercise the legacy `EmbedIndexRequest::File` channel path.
+#[allow(clippy::too_many_arguments, dead_code)]
 pub async fn process_file(
     path: &Path,
     project_id: i32,

@@ -29,6 +29,39 @@ pub struct Config {
     pub work_pool: WorkPoolConfig,
     #[serde(default)]
     pub cron: CronConfig,
+    #[serde(default)]
+    pub system: SystemConfig,
+}
+
+/// Process-level resource budgets.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct SystemConfig {
+    /// Aggregate RSS budget in MiB. The pool monitors use this as the
+    /// `rss_pressure_score` denominator; when the daemon's RSS climbs
+    /// past 50% of the budget, the hill-climber's RSS term starts
+    /// discouraging unparking, and past 100% it actively parks workers.
+    ///
+    /// `0` (the default) disables RSS sensing — the climber falls back
+    /// to the original two-term throughput-vs-queue-depth behavior.
+    /// In daemon startup we resolve `0` to 80% of `MemAvailable` at
+    /// boot time.
+    #[serde(default)]
+    pub rss_limit_mib: u64,
+}
+
+impl SystemConfig {
+    /// Resolve `rss_limit_mib` to bytes. `0` (auto) returns 80% of
+    /// `MemAvailable` at the time of the call, or `0` if /proc/meminfo
+    /// is unreadable (in which case RSS sensing stays off — safe
+    /// default rather than a wrong limit).
+    pub fn resolved_rss_limit_bytes(&self) -> u64 {
+        if self.rss_limit_mib > 0 {
+            return self.rss_limit_mib * 1024 * 1024;
+        }
+        crate::stats::rss::mem_available_bytes()
+            .map(|avail| avail * 4 / 5)
+            .unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -247,6 +280,18 @@ impl DatabaseConfig {
             )
         }
     }
+
+    /// Build the database connection URL with the password component
+    /// replaced by `****`. Safe to log and to surface via the
+    /// `pgmcp status` CLI / `/api/status` endpoint. Always returns the
+    /// `:****@` form so a redacted URL is visually distinguishable
+    /// from a passwordless one.
+    pub fn connection_url_redacted(&self) -> String {
+        format!(
+            "postgres://{}:****@{}:{}/{}",
+            self.user, self.host, self.port, self.name
+        )
+    }
 }
 
 fn default_db_host() -> String {
@@ -282,6 +327,18 @@ pub struct EmbeddingsConfig {
     /// Enable GPU acceleration for embeddings (requires `cuda` feature).
     #[serde(default)]
     pub use_gpu: bool,
+    /// Maximum input token sequence length. Inputs that tokenize to more
+    /// than this are truncated. all-MiniLM-L6-v2 was trained with
+    /// `max_position_embeddings = 512`; matching that gives full fidelity.
+    /// Lowering trades long-input accuracy for transient memory.
+    #[serde(default = "default_max_length")]
+    pub max_length: usize,
+    /// Cap on input texts per single forward pass inside `Embedder::embed`.
+    /// BERT self-attention is `O(batch * seq²)`, so unbounded batches OOM
+    /// the GPU on files with many chunks. Default 8 keeps peak VRAM well
+    /// under 1 GiB per worker at `max_length = 512`.
+    #[serde(default = "default_inference_batch_size")]
+    pub inference_batch_size: usize,
 }
 
 impl Default for EmbeddingsConfig {
@@ -294,6 +351,8 @@ impl Default for EmbeddingsConfig {
             batch_size: default_batch_size(),
             pool_size: default_embed_pool_size(),
             use_gpu: false,
+            max_length: default_max_length(),
+            inference_batch_size: default_inference_batch_size(),
         }
     }
 }
@@ -351,6 +410,12 @@ fn default_batch_size() -> usize {
 }
 fn default_embed_pool_size() -> usize {
     2
+}
+fn default_max_length() -> usize {
+    512
+}
+fn default_inference_batch_size() -> usize {
+    8
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

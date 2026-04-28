@@ -1,9 +1,9 @@
 //! Embedding backend smoke tests.
 //!
 //! DeterministicEmbeddingBackend tests always run (no infra).
-//! FastembedBackend tests require the model to be cached at
-//! `~/.cache/ort.pyke.io` — skipped otherwise. This is the `pgmcp`
-//! binary's own cache location, so a successful `./scripts/verify.sh`
+//! CandleBackend tests require the model files to be cached at
+//! `~/.cache/huggingface/hub/` — skipped otherwise. This is candle's
+//! HuggingFace-hub cache location, so a successful end-to-end embed
 //! run implies the model is there.
 
 use std::sync::Arc;
@@ -63,10 +63,10 @@ async fn deterministic_backend_embed_batch_matches_embed_one() {
     }
 }
 
-/// Only runs when the real fastembed model is cached locally. Skipped
+/// Only runs when the real candle BERT model is cached locally. Skipped
 /// otherwise with a visible message.
 #[tokio::test(flavor = "multi_thread")]
-async fn fastembed_backend_embed_one_returns_normalized_vector_if_cached() {
+async fn candle_backend_embed_one_returns_normalized_vector_if_cached() {
     // Detect whether the default model is already cached — skip if not.
     let home = match std::env::var("HOME") {
         Ok(h) => h,
@@ -75,27 +75,27 @@ async fn fastembed_backend_embed_one_returns_normalized_vector_if_cached() {
             return;
         }
     };
-    let cache_marker = std::path::Path::new(&home).join(".cache/huggingface");
+    let cache_marker = std::path::Path::new(&home).join(".cache/huggingface/hub");
     if !cache_marker.exists() {
-        eprintln!("SKIPPED: ~/.cache/huggingface not present (model not downloaded)");
+        eprintln!("SKIPPED: ~/.cache/huggingface/hub not present (model not downloaded)");
         return;
     }
 
     let config = EmbeddingsConfig::default();
-    // FastembedBackend::new downloads the model if not cached. We skip
+    // CandleBackend::new downloads the model if not cached. We skip
     // proactively on cold caches, so this should hit the fast path.
     let backend = match tokio::task::spawn_blocking(move || {
-        pgmcp::embed::backend::FastembedBackend::new(&config)
+        pgmcp::embed::backend::CandleBackend::new(&config)
     })
     .await
     {
         Ok(Ok(b)) => b,
         Ok(Err(e)) => {
-            eprintln!("SKIPPED: FastembedBackend unavailable: {}", e);
+            eprintln!("SKIPPED: CandleBackend unavailable: {}", e);
             return;
         }
         Err(e) => {
-            eprintln!("SKIPPED: FastembedBackend spawn panic: {}", e);
+            eprintln!("SKIPPED: CandleBackend spawn panic: {}", e);
             return;
         }
     };
@@ -104,7 +104,7 @@ async fn fastembed_backend_embed_one_returns_normalized_vector_if_cached() {
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 1e-3,
-        "real fastembed should L2-normalize; got ‖v‖ = {}",
+        "candle backend should L2-normalize; got ‖v‖ = {}",
         norm
     );
 }
