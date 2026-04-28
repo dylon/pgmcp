@@ -916,10 +916,24 @@ pgmcp upgrade-project --cwd DIR # Merge new defaults in DIR
 
 ### Environment Variables
 
-| Variable            | Description                                           |
-|---------------------|-------------------------------------------------------|
-| `PGMCP_DB_PASSWORD` | Database password (takes precedence over config file) |
-| `PGMCP_CONFIG`      | Path to configuration file                            |
+| Variable            | Description                                                                                                                                  |
+|---------------------|----------------------------------------------------------------------------------------------------------------------------------------------|
+| `PGMCP_DB_PASSWORD` | Database password (takes precedence over config file)                                                                                        |
+| `PGMCP_CONFIG`      | Path to configuration file                                                                                                                   |
+| `RUST_LOG`          | Tracing filter (default `info`). Applies to all CLI subcommands and `serve`/`daemon`. Output goes to stderr; stdout stays clean for piping.  |
+
+#### Diagnosing CLI failures
+
+Every CLI subcommand (`analyze`, `reindex`, `tool`, `context`, `statistics`,
+`status`, `results`) installs a tracing subscriber that writes to stderr,
+respecting `RUST_LOG`. If a CLI run finishes with surprising output (zero
+results, empty tables), re-run with `RUST_LOG=info` (or `debug`) to see the
+internal log stream. Long-running analyses (topic clustering on a large
+corpus, full reindex) emit progress + error messages along the way.
+
+```bash
+RUST_LOG=info pgmcp analyze topics 2>&1 | tee /tmp/topics.log
+```
 
 ---
 

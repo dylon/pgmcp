@@ -1491,6 +1491,23 @@ pub async fn store_topics(
     scope: &str,
     topics: &[crate::cron::topic_clustering::TopicResult],
 ) -> Result<(), sqlx::Error> {
+    // Per-topic transaction: each topic's `code_topics` row + its chunk
+    // assignments commit together, or roll back together. A failed topic
+    // does NOT abort the whole `store_topics` call — we log and continue
+    // so a single transient FK conflict doesn't lose the rest of a
+    // 200-topic clustering run.
+    //
+    // FK-resilience: between when topic clustering starts (12+ minutes
+    // ago for a 178k-chunk corpus) and when assignments are inserted
+    // here, the daemon's reindex/file watcher may have deleted some
+    // `file_chunks` rows. The `chunk_topic_assignments.chunk_id ->
+    // file_chunks.id` FK rejects those inserts. We sidestep this with a
+    // bulk `INSERT ... SELECT ... WHERE EXISTS` that silently skips
+    // orphaned chunk_ids — preserving the topics that *can* still be
+    // recorded while dropping the rows that no longer have a valid
+    // parent. (Bug 1 in
+    // ~/.claude/plans/thoroughly-examine-home-dylon-workspace-melodic-cake.md.)
+    let mut errors: Vec<(i32, sqlx::Error)> = Vec::new();
     for topic in topics {
         let top_files_json =
             serde_json::to_value(&topic.top_files).unwrap_or(serde_json::Value::Null);
@@ -1511,13 +1528,27 @@ pub async fn store_topics(
             Some(&topic.parent_topic_ids)
         };
 
-        let topic_id = sqlx::query_scalar::<_, i32>(
+        let mut tx = pool.begin().await?;
+
+        // Validate `representative_chunk_id` exists at INSERT time. The
+        // `code_topics.representative_chunk_id` FK rejects nonexistent IDs
+        // even though the column is nullable with `ON DELETE SET NULL` —
+        // the `ON DELETE` only fires when the parent is deleted *after* a
+        // valid INSERT. We use a sub-SELECT that returns NULL when the
+        // chunk doesn't exist; that NULL satisfies the FK trivially. The
+        // `FOR KEY SHARE` prevents the row from being deleted between
+        // the validation SELECT and the INSERT's FK trigger fire.
+        let topic_id_res = sqlx::query_scalar::<_, i32>(
             "INSERT INTO code_topics
                 (scope, cluster_index, label, chunk_count, file_count, project_count,
                  project_names, avg_internal_similarity, representative_chunk_id,
                  representative_snippet, top_files, keywords, keyword_scores,
                  centroid, parent_topic_ids)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+             VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8,
+                (SELECT id FROM file_chunks WHERE id = $9 FOR KEY SHARE),
+                $10, $11, $12, $13, $14, $15
+             )
              ON CONFLICT (scope, cluster_index) DO UPDATE SET
                 label = EXCLUDED.label,
                 chunk_count = EXCLUDED.chunk_count,
@@ -1550,23 +1581,85 @@ pub async fn store_topics(
         .bind(&keyword_scores_f32)
         .bind(centroid_opt)
         .bind(parent_ids_opt)
-        .fetch_one(pool)
-        .await?;
+        .fetch_one(&mut *tx)
+        .await;
 
-        // Store chunk-to-topic assignments with membership degrees
-        for (idx, &chunk_id) in topic.chunk_ids.iter().enumerate() {
-            let membership = topic.memberships.get(idx).copied().unwrap_or(1.0);
-            sqlx::query(
-                "INSERT INTO chunk_topic_assignments (chunk_id, topic_id, membership_score)
-                 VALUES ($1, $2, $3)
+        let topic_id = match topic_id_res {
+            Ok(id) => id,
+            Err(e) => {
+                let _ = tx.rollback().await;
+                errors.push((topic.cluster_index, e));
+                continue;
+            }
+        };
+
+        // Bulk-insert assignments. Use a CTE that locks the parent
+        // `file_chunks` rows with `FOR KEY SHARE` *before* the INSERT
+        // runs — this fixes the TOCTOU race the previous `WHERE EXISTS`
+        // version had, where a concurrent DELETE between the EXISTS
+        // check and the FK trigger fire would still cause the FK to
+        // fail. `FOR KEY SHARE` is the weakest lock that blocks DELETE
+        // (and key-changing UPDATEs); concurrent reads + non-key UPDATEs
+        // still proceed. The lock is released when this transaction
+        // commits or rolls back.
+        if !topic.chunk_ids.is_empty() {
+            // Pad memberships with 1.0 if the FCM result didn't supply one
+            // for every chunk (defensive — should never happen).
+            let n = topic.chunk_ids.len();
+            let mut memberships: Vec<f64> = topic
+                .memberships
+                .iter()
+                .copied()
+                .chain(std::iter::repeat(1.0))
+                .take(n)
+                .collect();
+            memberships.truncate(n);
+
+            let assign_res = sqlx::query(
+                "WITH locked AS (
+                     SELECT fc.id AS chunk_id
+                     FROM file_chunks fc
+                     WHERE fc.id = ANY($1::bigint[])
+                     FOR KEY SHARE
+                 )
+                 INSERT INTO chunk_topic_assignments (chunk_id, topic_id, membership_score)
+                 SELECT v.chunk_id, $2, v.membership
+                 FROM unnest($1::bigint[], $3::double precision[]) AS v(chunk_id, membership)
+                 JOIN locked l ON l.chunk_id = v.chunk_id
                  ON CONFLICT (chunk_id, topic_id) DO UPDATE SET
                     membership_score = EXCLUDED.membership_score",
             )
-            .bind(chunk_id)
+            .bind(&topic.chunk_ids)
             .bind(topic_id)
-            .bind(membership)
-            .execute(pool)
-            .await?;
+            .bind(&memberships)
+            .execute(&mut *tx)
+            .await;
+
+            if let Err(e) = assign_res {
+                let _ = tx.rollback().await;
+                errors.push((topic.cluster_index, e));
+                continue;
+            }
+        }
+
+        if let Err(e) = tx.commit().await {
+            errors.push((topic.cluster_index, e));
+        }
+    }
+
+    if !errors.is_empty() {
+        // Log per-topic failures via tracing; return Ok unless ALL topics
+        // failed (in which case the most-recent error is propagated).
+        for (cluster_index, err) in &errors {
+            tracing::warn!(
+                cluster_index,
+                error = %err,
+                "store_topics: per-topic transaction failed (continuing)"
+            );
+        }
+        if errors.len() == topics.len() && !topics.is_empty() {
+            // All topics failed — surface the last error.
+            return Err(errors.into_iter().last().expect("non-empty").1);
         }
     }
 

@@ -22,6 +22,7 @@ pub async fn run(
     kind: Option<ResultsKind>,
     limit: i32,
 ) -> anyhow::Result<()> {
+    crate::logging::init_cli();
     let config = Config::load(config_override)?;
     let pool = db::pool::create_pool(&config.database).await?;
     db::migrations::run_migrations(&pool, &config.vector).await?;

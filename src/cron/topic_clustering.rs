@@ -1356,17 +1356,8 @@ pub async fn run_global_topic_scan(
         "FCM clustering complete"
     );
 
-    // Store results
-    if let Err(e) = db.clear_topics_for_scope("global").await {
-        error!(error = %e, "Failed to clear old global topics");
-        return;
-    }
-
-    if let Err(e) = db.store_topics("global", &summary.topics).await {
-        error!(error = %e, "Failed to store global topics");
-        return;
-    }
-
+    // Record what FCM discovered BEFORE persistence. See the analogous
+    // comment in run_mmap_global_topic_scan for rationale.
     stats.topic_scans.fetch_add(1, Ordering::Relaxed);
     stats
         .topics_discovered
@@ -1374,6 +1365,27 @@ pub async fn run_global_topic_scan(
     stats
         .topic_noise_chunks
         .store(summary.noise_chunks as u64, Ordering::Relaxed);
+
+    // Store results
+    if let Err(e) = db.clear_topics_for_scope("global").await {
+        error!(
+            error = %e,
+            topics_found = summary.topics_found,
+            noise_chunks = summary.noise_chunks,
+            "Failed to clear old global topics — clustering completed but DB unchanged"
+        );
+        return;
+    }
+
+    if let Err(e) = db.store_topics("global", &summary.topics).await {
+        error!(
+            error = %e,
+            topics_found = summary.topics_found,
+            noise_chunks = summary.noise_chunks,
+            "Failed to store global topics (all topics) — clustering completed but no topics persisted"
+        );
+        return;
+    }
 
     info!(
         topics = summary.topics_found,
@@ -1701,15 +1713,11 @@ async fn run_mmap_global_topic_scan(
         topics,
     };
 
-    if let Err(e) = db.clear_topics_for_scope("global").await {
-        error!(error = %e, "mmap-streaming: clear_topics failed");
-        return;
-    }
-    if let Err(e) = db.store_topics("global", &summary.topics).await {
-        error!(error = %e, "mmap-streaming: store_topics failed");
-        return;
-    }
-
+    // Record what FCM discovered BEFORE attempting persistence. If storage
+    // fails (FK conflict from a chunk deleted mid-run, disk full, etc.) the
+    // user still sees an accurate "topics_found / noise_chunks" rather than
+    // silently zero. Stats reflect the in-memory computation; persistence
+    // is the side-effect.
     stats.topic_scans.fetch_add(1, Ordering::Relaxed);
     stats
         .topics_discovered
@@ -1717,6 +1725,27 @@ async fn run_mmap_global_topic_scan(
     stats
         .topic_noise_chunks
         .store(summary.noise_chunks as u64, Ordering::Relaxed);
+
+    if let Err(e) = db.clear_topics_for_scope("global").await {
+        error!(
+            error = %e,
+            chunks_analyzed = n,
+            topics_found = summary.topics_found,
+            noise_chunks = summary.noise_chunks,
+            "mmap-streaming: clear_topics failed — clustering completed but DB state unchanged"
+        );
+        return;
+    }
+    if let Err(e) = db.store_topics("global", &summary.topics).await {
+        error!(
+            error = %e,
+            chunks_analyzed = n,
+            topics_found = summary.topics_found,
+            noise_chunks = summary.noise_chunks,
+            "mmap-streaming: store_topics failed (all topics) — clustering completed but no topics persisted"
+        );
+        return;
+    }
 
     info!(
         topics = summary.topics_found,
@@ -2151,6 +2180,15 @@ async fn run_online_global_topic_scan(
     }
 
     stats.topic_scans.fetch_add(1, Ordering::Relaxed);
+    // Online FCM produces k shell-topic centroids; per-chunk membership is
+    // persisted in LMDB rather than held in RAM, so we record the cluster
+    // count as the canonical "topics discovered" number. Noise count is not
+    // tracked on this path (would require a separate LMDB scan to count
+    // chunks whose max-membership is below the threshold) — leaving
+    // `topic_noise_chunks` as zero is correct in spirit (it isn't *known*),
+    // but a follow-up could expose noise counting from
+    // `fuzzy_c_means_online`. See topic_clustering_online.rs.
+    stats.topics_discovered.store(k as u64, Ordering::Relaxed);
 
     // Phase 9: chain meta-clustering hierarchy.
     run_hierarchy_pass(db, config, stats).await;
@@ -2202,6 +2240,7 @@ async fn run_per_project_emergency_fallback(
         };
 
     let mut total_topics = 0usize;
+    let mut total_noise = 0usize;
     for (_project_id, project_name) in &projects {
         let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
         match run_project_topic_scan(
@@ -2225,10 +2264,12 @@ async fn run_per_project_emergency_fallback(
                     continue;
                 }
                 total_topics += summary.topics_found;
+                total_noise += summary.noise_chunks;
                 let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
                 info!(
                     project = %project_name,
                     topics = summary.topics_found,
+                    noise = summary.noise_chunks,
                     chunks = summary.chunks_analyzed,
                     rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
                     "emergency fallback: per-project clustering complete"
@@ -2248,9 +2289,13 @@ async fn run_per_project_emergency_fallback(
     stats
         .topics_discovered
         .store(total_topics as u64, Ordering::Relaxed);
+    stats
+        .topic_noise_chunks
+        .store(total_noise as u64, Ordering::Relaxed);
     info!(
         projects = projects.len(),
         total_topics,
+        total_noise,
         "emergency fallback: per-project clustering cycle complete (global scope NOT refreshed)"
     );
 }

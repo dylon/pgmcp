@@ -196,6 +196,37 @@ impl<'a> io::Write for AppenderGuard<'a> {
 // Public initializers
 // ---------------------------------------------------------------------------
 
+/// Initialize tracing for one-shot CLI subcommands (`analyze`, `reindex`,
+/// `tool`, `context`, `statistics`, `status`, `results`).
+///
+/// Without this, every `info!`/`warn!`/`error!` call inside the
+/// subsystems these CLIs invoke is silently dropped — the user sees only
+/// `println!` output. That has bitten debugging at least once
+/// (`pgmcp analyze topics` reporting `0 topics, 0 noise chunks` after 214 s
+/// of work, with the actual error invisible). See
+/// `~/.claude/plans/thoroughly-examine-home-dylon-workspace-melodic-cake.md`.
+///
+/// - Writes to stderr (stdout is reserved for the CLI's structured
+///   `println!` output, e.g. JSON tool results).
+/// - Default level `info`; overridable via `RUST_LOG`.
+/// - `try_init` so it's safe to call multiple times in tests / re-entrant
+///   harness paths.
+/// - ANSI colours only when stderr is a TTY.
+pub fn init_cli() {
+    use std::io::IsTerminal;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let _ = tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_ansi(std::io::stderr().is_terminal())
+                .with_target(false)
+                .with_thread_ids(false),
+        )
+        .try_init();
+}
+
 /// Initialize tracing for foreground (serve) mode.
 /// Logs to stderr so stdout remains clean for MCP stdio transport.
 pub fn init_foreground(config: &Config) {

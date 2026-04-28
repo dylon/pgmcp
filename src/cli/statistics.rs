@@ -10,6 +10,7 @@ use crate::config::Config;
 use crate::stats;
 
 pub async fn run(config_override: Option<&Path>) -> anyhow::Result<()> {
+    crate::logging::init_cli();
     let config = Config::load(config_override)?;
     stats::cli::print_stats(&config).await?;
     Ok(())

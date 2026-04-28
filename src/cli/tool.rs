@@ -24,6 +24,7 @@ pub async fn run(
     json: bool,
     schema: bool,
 ) -> anyhow::Result<()> {
+    crate::logging::init_cli();
     // Tier 1: list / --schema — no DB, no embed model
     let catalog = mcp::server::McpServer::static_tool_catalog();
     match name {
