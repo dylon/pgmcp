@@ -343,6 +343,16 @@ struct ChurnData {
 /// Previously this did N sequential `INSERT ... VALUES` queries; the new
 /// implementation is one round-trip per batch (500 edges), on the order of
 /// 100× faster for a typical project.
+///
+/// Deduplicates by conflict key before binding. PG rejects bulk INSERT
+/// with ON CONFLICT when the same conflict-key tuple appears more than
+/// once in the input ("ON CONFLICT DO UPDATE command cannot affect row
+/// a second time"). Import extraction can produce duplicates when a
+/// file has multiple imports that resolve to the same `target_file_id`
+/// AND share the same `target_raw` (e.g., the same raw `use foo;`
+/// appearing twice, or a regex extracting an overlapping pattern). The
+/// edge_type is constant per call site so we exclude it from the
+/// per-batch key to save string clones.
 async fn insert_edges_batch(
     pool: &PgPool,
     project_id: i32,
@@ -352,12 +362,25 @@ async fn insert_edges_batch(
         return Ok(());
     }
 
-    let project_ids: Vec<i32> = vec![project_id; edges.len()];
-    let source_ids: Vec<i64> = edges.iter().map(|e| e.source_file_id).collect();
-    let target_ids: Vec<Option<i64>> = edges.iter().map(|e| e.target_file_id).collect();
-    let edge_types: Vec<String> = edges.iter().map(|e| e.edge_type.clone()).collect();
-    let target_raws: Vec<String> = edges.iter().map(|e| e.target_raw.clone()).collect();
-    let weights: Vec<f64> = edges.iter().map(|e| e.weight).collect();
+    use std::collections::HashSet;
+    let mut seen: HashSet<(i64, i64, &str)> = HashSet::with_capacity(edges.len());
+    let dedup: Vec<&ImportEdge> = edges
+        .iter()
+        .filter(|e| {
+            seen.insert((
+                e.source_file_id,
+                e.target_file_id.unwrap_or(-1),
+                e.target_raw.as_str(),
+            ))
+        })
+        .collect();
+
+    let project_ids: Vec<i32> = vec![project_id; dedup.len()];
+    let source_ids: Vec<i64> = dedup.iter().map(|e| e.source_file_id).collect();
+    let target_ids: Vec<Option<i64>> = dedup.iter().map(|e| e.target_file_id).collect();
+    let edge_types: Vec<String> = dedup.iter().map(|e| e.edge_type.clone()).collect();
+    let target_raws: Vec<String> = dedup.iter().map(|e| e.target_raw.clone()).collect();
+    let weights: Vec<f64> = dedup.iter().map(|e| e.weight).collect();
 
     sqlx::query(
         "INSERT INTO code_graph_edges (project_id, source_file_id, target_file_id, edge_type, target_raw, weight)
@@ -474,6 +497,19 @@ async fn compute_and_store_cochange_edges(
 
     // Resolve file paths to IDs using the in-memory map (no per-pair SELECTs).
     // Build parallel Vecs for a single UNNEST-based batch INSERT.
+    //
+    // Deduplicate by `(source_file_id, target_file_id)` — the conflict key
+    // PG sees is `(source_file_id, COALESCE(target_file_id, -1), edge_type,
+    // COALESCE(target_raw, ''))`, but for co-change edges edge_type and
+    // target_raw are constant within this batch ("co_change", ""), so the
+    // file-id pair fully determines uniqueness. The upstream SQL
+    // (`GROUP BY a.file_path, b.file_path` with `a < b`) already produces
+    // unique path-pairs, but if `file_paths` has multiple aliases mapping
+    // to the same file_id, the same (sid, tid) pair could appear twice —
+    // which PG rejects as "ON CONFLICT DO UPDATE command cannot affect
+    // row a second time".
+    use std::collections::HashSet;
+    let mut seen: HashSet<(i64, i64)> = HashSet::with_capacity(pairs.len());
     let mut project_ids = Vec::<i32>::with_capacity(pairs.len());
     let mut source_ids = Vec::<i64>::with_capacity(pairs.len());
     let mut target_ids = Vec::<Option<i64>>::with_capacity(pairs.len());
@@ -489,6 +525,9 @@ async fn compute_and_store_cochange_edges(
             (Some(s), Some(t)) => (s, t),
             _ => continue,
         };
+        if !seen.insert((sid, tid)) {
+            continue;
+        }
         project_ids.push(project_id);
         source_ids.push(sid);
         target_ids.push(Some(tid));
