@@ -50,6 +50,7 @@ pub async fn tool_semantic_search(
             params.language.as_deref(),
             params.project.as_deref(),
             ef_search,
+            params.dedupe_worktrees.unwrap_or(false),
         )
         .await
         .map_err(|e| {

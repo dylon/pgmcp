@@ -65,6 +65,8 @@ async fn list_projects_returns_serialized_projects_from_mock_db() {
         discovered_at: None,
         last_scanned_at: None,
         file_count: Some(42),
+        git_common_dir: None,
+        git_root_commits: None,
     });
     mock.projects.push(ProjectInfo {
         id: 2,
@@ -74,6 +76,8 @@ async fn list_projects_returns_serialized_projects_from_mock_db() {
         discovered_at: None,
         last_scanned_at: None,
         file_count: Some(7),
+        git_common_dir: None,
+        git_root_commits: None,
     });
 
     let server = server_with_mock(mock);
@@ -124,6 +128,8 @@ async fn tool_list_projects_direct_call() {
         discovered_at: None,
         last_scanned_at: None,
         file_count: Some(5),
+        git_common_dir: None,
+        git_root_commits: None,
     });
 
     let db: Arc<dyn DbClient> = Arc::new(mock);
@@ -366,6 +372,8 @@ async fn project_tree_returns_file_list_from_mock_db() {
         discovered_at: None,
         last_scanned_at: None,
         file_count: Some(2),
+        git_common_dir: None,
+        git_root_commits: None,
     });
     let server = server_with_mock(mock);
     let result = server
@@ -1044,6 +1052,8 @@ async fn project_tree_depth_zero_still_returns_result() {
         discovered_at: None,
         last_scanned_at: None,
         file_count: Some(1),
+        git_common_dir: None,
+        git_root_commits: None,
     });
     let server = server_with_mock(mock);
     let result = server

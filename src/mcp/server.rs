@@ -345,6 +345,13 @@ pub struct SemanticSearchParams {
     pub language: Option<String>,
     #[schemars(description = "Filter by project name")]
     pub project: Option<String>,
+    #[schemars(
+        description = "If true, collapse cross-worktree duplicates (same file appearing \
+                       in multiple worktrees / sibling clones of the same upstream repo) \
+                       to a single canonical hit per (repo, relative_path). Default false: \
+                       all hits are returned, including the same code on different branches."
+    )]
+    pub dedupe_worktrees: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -355,6 +362,11 @@ pub struct TextSearchParams {
     pub limit: Option<i32>,
     #[schemars(description = "Filter by programming language")]
     pub language: Option<String>,
+    #[schemars(
+        description = "If true, collapse cross-worktree duplicates (see semantic_search). \
+                       Default false."
+    )]
+    pub dedupe_worktrees: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -365,6 +377,11 @@ pub struct GrepParams {
     pub glob: Option<String>,
     #[schemars(description = "Maximum number of results (default: 10)")]
     pub limit: Option<i32>,
+    #[schemars(
+        description = "If true, collapse cross-worktree duplicates (see semantic_search). \
+                       Default false."
+    )]
+    pub dedupe_worktrees: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -401,6 +418,14 @@ pub struct FindSimilarModulesParams {
     pub limit: Option<i32>,
     #[schemars(description = "Filter results to a specific target project")]
     pub target_project: Option<String>,
+    #[schemars(
+        description = "If true, also return matches in worktrees / sibling clones \
+                       of the seed file's repo (same git_common_dir or \
+                       git_root_commits). Default false — same-repo matches are \
+                       excluded so cross-repo refactor candidates aren't drowned \
+                       out by the same code on different branches."
+    )]
+    pub include_same_repo: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -413,6 +438,12 @@ pub struct FindDuplicatesParams {
     pub language: Option<String>,
     #[schemars(description = "Maximum number of clusters to return (default: 20)")]
     pub limit: Option<i32>,
+    #[schemars(description = "If true, include duplicates whose two projects are \
+                       worktrees / sibling clones of the same upstream repo \
+                       (same git_common_dir or git_root_commits). Default false. \
+                       Most operators want false: same-code-different-branch is \
+                       not a refactor candidate.")]
+    pub include_same_repo: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -425,6 +456,12 @@ pub struct RefactoringReportParams {
     pub language: Option<String>,
     #[schemars(description = "Maximum number of candidates to return (default: 20)")]
     pub limit: Option<i32>,
+    #[schemars(
+        description = "If true, include refactor candidates whose two projects \
+                       are worktrees / sibling clones of the same upstream repo. \
+                       Default false."
+    )]
+    pub include_same_repo: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -807,6 +844,12 @@ pub struct HybridSearchParams {
     /// Weight for semantic search (default: 0.5)
     #[schemars(description = "Weight for semantic search results (default: 0.5)")]
     pub semantic_weight: Option<f64>,
+    /// Collapse cross-worktree duplicates
+    #[schemars(
+        description = "If true, collapse cross-worktree duplicates (see semantic_search). \
+                       Default false."
+    )]
+    pub dedupe_worktrees: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

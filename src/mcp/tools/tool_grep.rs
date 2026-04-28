@@ -34,7 +34,12 @@ pub async fn tool_grep(
 
     let results = ctx
         .db()
-        .grep_search(&params.pattern, params.glob.as_deref(), limit)
+        .grep_search(
+            &params.pattern,
+            params.glob.as_deref(),
+            limit,
+            params.dedupe_worktrees.unwrap_or(false),
+        )
         .await
         .map_err(|e| {
             error!(tool = "grep", error = %e, "MCP tool failed");

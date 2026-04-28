@@ -34,7 +34,12 @@ pub async fn tool_text_search(
 
     let results = ctx
         .db()
-        .text_search(&params.query, limit, params.language.as_deref())
+        .text_search(
+            &params.query,
+            limit,
+            params.language.as_deref(),
+            params.dedupe_worktrees.unwrap_or(false),
+        )
         .await
         .map_err(|e| {
             error!(tool = "text_search", error = %e, "MCP tool failed");

@@ -127,7 +127,7 @@ async fn hnsw_recall_matches_brute_force_within_recall_floor() {
     const K: i32 = 10;
 
     let hnsw_results: Vec<SearchResult> =
-        semantic_search(&pool, &query, K, None, None, /*ef_search*/ 100)
+        semantic_search(&pool, &query, K, None, None, /*ef_search*/ 100, false)
             .await
             .expect("hnsw search");
     assert_eq!(hnsw_results.len(), K as usize, "HNSW returned wrong count");
@@ -226,7 +226,7 @@ async fn semantic_search_returns_correct_rank_order_on_pinned_corpus() {
     insert_chunk(&pool, file_id, 4, &neg_e0).await;
 
     let query = basis(0);
-    let results = semantic_search(&pool, &query, 5, None, None, 100)
+    let results = semantic_search(&pool, &query, 5, None, None, 100, false)
         .await
         .expect("search");
     assert_eq!(results.len(), 5);
@@ -297,7 +297,7 @@ async fn ef_search_set_local_does_not_leak_across_pooled_connections() {
     let query = basis(0);
 
     // Issue first search with a custom ef_search.
-    let _ = semantic_search(&pool, &query, 1, None, None, 13)
+    let _ = semantic_search(&pool, &query, 1, None, None, 13, false)
         .await
         .expect("search 1");
 
@@ -321,7 +321,7 @@ async fn ef_search_set_local_does_not_leak_across_pooled_connections() {
 
     // Issue a second search with a DIFFERENT custom ef_search and
     // verify the same non-leak holds.
-    let _ = semantic_search(&pool, &query, 1, None, None, 77)
+    let _ = semantic_search(&pool, &query, 1, None, None, 77, false)
         .await
         .expect("search 2");
     let leaked2: (String,) = sqlx::query_as("SHOW hnsw.ef_search")
@@ -353,7 +353,7 @@ async fn language_filter_isolates_results() {
     insert_chunk(&pool, py_file, 0, &emb).await;
 
     // Filter by rust → only the .rs chunk should appear.
-    let rust_only = semantic_search(&pool, &emb, 10, Some("rust"), None, 100)
+    let rust_only = semantic_search(&pool, &emb, 10, Some("rust"), None, 100, false)
         .await
         .expect("search rust");
     assert_eq!(rust_only.len(), 1, "rust filter should yield 1");
@@ -361,7 +361,7 @@ async fn language_filter_isolates_results() {
     assert_eq!(rust_only[0].language, "rust");
 
     // Filter by python → only the .py chunk.
-    let python_only = semantic_search(&pool, &emb, 10, Some("python"), None, 100)
+    let python_only = semantic_search(&pool, &emb, 10, Some("python"), None, 100, false)
         .await
         .expect("search python");
     assert_eq!(python_only.len(), 1);
@@ -369,7 +369,7 @@ async fn language_filter_isolates_results() {
     assert_eq!(python_only[0].language, "python");
 
     // No filter → both chunks.
-    let unfiltered = semantic_search(&pool, &emb, 10, None, None, 100)
+    let unfiltered = semantic_search(&pool, &emb, 10, None, None, 100, false)
         .await
         .expect("search unfiltered");
     assert_eq!(unfiltered.len(), 2, "unfiltered should yield both");
@@ -392,21 +392,29 @@ async fn project_filter_isolates_results() {
     insert_chunk(&pool, alpha_file, 0, &emb).await;
     insert_chunk(&pool, beta_file, 0, &emb).await;
 
-    let alpha_only = semantic_search(&pool, &emb, 10, None, Some("proj-alpha"), 100)
+    let alpha_only = semantic_search(&pool, &emb, 10, None, Some("proj-alpha"), 100, false)
         .await
         .expect("alpha");
     assert_eq!(alpha_only.len(), 1);
     assert_eq!(alpha_only[0].project_name, "proj-alpha");
 
-    let beta_only = semantic_search(&pool, &emb, 10, None, Some("proj-beta"), 100)
+    let beta_only = semantic_search(&pool, &emb, 10, None, Some("proj-beta"), 100, false)
         .await
         .expect("beta");
     assert_eq!(beta_only.len(), 1);
     assert_eq!(beta_only[0].project_name, "proj-beta");
 
-    let both_filters = semantic_search(&pool, &emb, 10, Some("rust"), Some("proj-alpha"), 100)
-        .await
-        .expect("both filters");
+    let both_filters = semantic_search(
+        &pool,
+        &emb,
+        10,
+        Some("rust"),
+        Some("proj-alpha"),
+        100,
+        false,
+    )
+    .await
+    .expect("both filters");
     assert_eq!(both_filters.len(), 1);
     assert_eq!(both_filters[0].project_name, "proj-alpha");
     assert_eq!(both_filters[0].language, "rust");

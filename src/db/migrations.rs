@@ -17,19 +17,52 @@ pub async fn run_migrations(
         .execute(pool)
         .await?;
 
-    // Create projects table
+    // Create projects table.
+    //
+    // `git_common_dir` and `git_root_commits` group worktrees / sibling
+    // clones of the same upstream repo. See
+    // `~/.claude/plans/thoroughly-examine-home-dylon-workspace-melodic-cake.md`
+    // for the rationale: cross-project analytics (find_duplicates,
+    // find_similar_modules, refactoring_report, similarity-scan cron)
+    // would otherwise count the same code as "duplicated" between
+    // worktrees on different branches. The two columns capture two
+    // distinct "same repo" signals:
+    //
+    //   git_common_dir   — canonical absolute path of the shared `.git`
+    //                      directory. All worktrees of one repo share
+    //                      this. (Output of `git rev-parse
+    //                      --git-common-dir`, canonicalized.)
+    //   git_root_commits — sorted comma-joined list of root-commit SHAs
+    //                      (`git rev-list --max-parents=0 HEAD`).
+    //                      Independent clones of the same upstream share
+    //                      this even though their `.git` directories
+    //                      are unrelated.
+    //
+    // Two projects are "same repo" if either column matches non-NULL.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS projects (
             id SERIAL PRIMARY KEY,
             workspace_path TEXT NOT NULL,
             path TEXT UNIQUE NOT NULL,
             name TEXT NOT NULL,
+            git_common_dir TEXT,
+            git_root_commits TEXT,
             discovered_at TIMESTAMPTZ DEFAULT NOW(),
             last_scanned_at TIMESTAMPTZ
         )",
     )
     .execute(pool)
     .await?;
+
+    // Migration: add worktree-grouping columns to existing installs.
+    // Idempotent — no-op when columns already present (e.g. fresh install
+    // via the CREATE TABLE above).
+    let _ = sqlx::query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS git_common_dir TEXT")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS git_root_commits TEXT")
+        .execute(pool)
+        .await;
 
     // Create indexed_files table
     sqlx::query(
@@ -91,6 +124,14 @@ pub async fn run_migrations(
         "CREATE INDEX IF NOT EXISTS idx_files_language ON indexed_files(language)",
         "CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON file_chunks(file_id)",
         "CREATE INDEX IF NOT EXISTS idx_projects_workspace_path ON projects(workspace_path, path)",
+        // Partial indexes: most projects in pgmcp deployments are git
+        // repos, but synthetic / vendored projects leave both columns
+        // NULL — those don't need to pay storage for these indexes.
+        // Same-repo lookups (e.g. NOT EXISTS … pa.git_common_dir =
+        // pb.git_common_dir) hit the partial index when the column is
+        // non-NULL, which is the only case where a match is possible.
+        "CREATE INDEX IF NOT EXISTS idx_projects_git_common_dir ON projects(git_common_dir) WHERE git_common_dir IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_projects_git_root_commits ON projects(git_root_commits) WHERE git_root_commits IS NOT NULL",
     ];
 
     for idx_sql in &indexes {

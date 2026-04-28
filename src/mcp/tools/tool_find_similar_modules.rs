@@ -55,6 +55,7 @@ pub async fn tool_find_similar_modules(
                 min_sim,
                 limit,
                 params.target_project.as_deref(),
+                params.include_same_repo.unwrap_or(false),
             )
             .await
             .map_err(|e| {

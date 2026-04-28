@@ -49,6 +49,8 @@ pub struct UpsertProjectCall {
     pub workspace_path: String,
     pub path: String,
     pub name: String,
+    pub git_common_dir: Option<String>,
+    pub git_root_commits: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,11 +186,15 @@ impl DbClient for MockDbClient {
         workspace_path: &str,
         path: &str,
         name: &str,
+        git_common_dir: Option<&str>,
+        git_root_commits: Option<&str>,
     ) -> Result<i32, sqlx::Error> {
         self.upsert_project_calls.lock().push(UpsertProjectCall {
             workspace_path: workspace_path.to_string(),
             path: path.to_string(),
             name: name.to_string(),
+            git_common_dir: git_common_dir.map(|s| s.to_string()),
+            git_root_commits: git_root_commits.map(|s| s.to_string()),
         });
         Ok(self.next_project_id.fetch_add(1, Ordering::SeqCst))
     }
@@ -340,6 +346,7 @@ impl DbClient for MockDbClient {
         _language: Option<&str>,
         _project: Option<&str>,
         _ef_search: i32,
+        _dedupe_worktrees: bool,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
         Ok(self.semantic_search_results.clone())
     }
@@ -349,6 +356,7 @@ impl DbClient for MockDbClient {
         _query: &str,
         _limit: i32,
         _language: Option<&str>,
+        _dedupe_worktrees: bool,
     ) -> Result<Vec<TextSearchResult>, sqlx::Error> {
         Ok(self.text_search_results.clone())
     }
@@ -358,6 +366,7 @@ impl DbClient for MockDbClient {
         _pattern: &str,
         _glob: Option<&str>,
         _limit: i32,
+        _dedupe_worktrees: bool,
     ) -> Result<Vec<GrepResult>, sqlx::Error> {
         Ok(self.grep_search_results.clone())
     }
@@ -558,6 +567,7 @@ impl DbClient for MockDbClient {
         _min_similarity: f64,
         _limit: i32,
         _target_project: Option<&str>,
+        _include_same_repo: bool,
     ) -> Result<Vec<FileSimilarityPair>, sqlx::Error> {
         Ok(self.similar_files_result.clone())
     }
@@ -567,6 +577,7 @@ impl DbClient for MockDbClient {
         _min_similarity: f64,
         _language: Option<&str>,
         _limit: i32,
+        _include_same_repo: bool,
     ) -> Result<Vec<DuplicateFilePair>, sqlx::Error> {
         Ok(self.duplicate_file_pairs_result.clone())
     }
@@ -709,6 +720,8 @@ mod tests {
             discovered_at: None,
             last_scanned_at: None,
             file_count: Some(123),
+            git_common_dir: None,
+            git_root_commits: None,
         });
 
         let arc: Arc<dyn DbClient> = Arc::new(mock);
@@ -722,14 +735,14 @@ mod tests {
     async fn write_methods_record_calls() {
         let mock = MockDbClient::new();
         let id = mock
-            .upsert_project("/ws", "/ws/x", "x")
+            .upsert_project("/ws", "/ws/x", "x", None, None)
             .await
             .expect("upsert_project");
         assert_eq!(id, 1, "first id");
         assert_eq!(mock.upsert_project_calls.lock().len(), 1);
 
         let id2 = mock
-            .upsert_project("/ws", "/ws/y", "y")
+            .upsert_project("/ws", "/ws/y", "y", None, None)
             .await
             .expect("second upsert");
         assert_eq!(id2, 2);

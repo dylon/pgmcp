@@ -8,23 +8,36 @@ use sqlx::PgPool;
 // ============================================================================
 
 /// Upsert a project (create or update).
+///
+/// `git_common_dir` and `git_root_commits` are the worktree-grouping
+/// signals (see `src/indexer/git_indexer.rs::detect_git_common_dir` /
+/// `detect_git_root_commits`). Both are optional and pass `None` for
+/// non-git projects. Re-scans update the values via the ON CONFLICT
+/// branch so adding/removing/cloning a worktree is reflected on the
+/// next scan.
 pub async fn upsert_project(
     pool: &PgPool,
     workspace_path: &str,
     path: &str,
     name: &str,
+    git_common_dir: Option<&str>,
+    git_root_commits: Option<&str>,
 ) -> Result<i32, sqlx::Error> {
     let row = sqlx::query_scalar::<_, i32>(
-        "INSERT INTO projects (workspace_path, path, name)
-         VALUES ($1, $2, $3)
+        "INSERT INTO projects (workspace_path, path, name, git_common_dir, git_root_commits)
+         VALUES ($1, $2, $3, $4, $5)
          ON CONFLICT (path) DO UPDATE SET
             workspace_path = EXCLUDED.workspace_path,
-            name = EXCLUDED.name
+            name = EXCLUDED.name,
+            git_common_dir = EXCLUDED.git_common_dir,
+            git_root_commits = EXCLUDED.git_root_commits
          RETURNING id",
     )
     .bind(workspace_path)
     .bind(path)
     .bind(name)
+    .bind(git_common_dir)
+    .bind(git_root_commits)
     .fetch_one(pool)
     .await?;
 
@@ -34,7 +47,9 @@ pub async fn upsert_project(
 /// List all projects with file counts.
 pub async fn list_projects(pool: &PgPool) -> Result<Vec<ProjectInfo>, sqlx::Error> {
     let rows = sqlx::query_as::<_, ProjectInfo>(
-        "SELECT p.id, p.workspace_path, p.path, p.name, p.discovered_at, p.last_scanned_at,
+        "SELECT p.id, p.workspace_path, p.path, p.name,
+                p.git_common_dir, p.git_root_commits,
+                p.discovered_at, p.last_scanned_at,
                 COUNT(f.id) as file_count
          FROM projects p
          LEFT JOIN indexed_files f ON f.project_id = p.id
@@ -53,6 +68,15 @@ pub struct ProjectInfo {
     pub workspace_path: String,
     pub path: String,
     pub name: String,
+    /// Canonical absolute path of the shared `.git` directory. Two
+    /// projects with the same value are worktrees of the same repo.
+    /// `None` for non-git projects.
+    pub git_common_dir: Option<String>,
+    /// Sorted comma-joined list of root-commit SHAs. Two projects with
+    /// the same value are sibling clones (or worktrees) of the same
+    /// upstream repo. `None` when the project isn't a git repo or has
+    /// no commits.
+    pub git_root_commits: Option<String>,
     pub discovered_at: Option<DateTime<Utc>>,
     pub last_scanned_at: Option<DateTime<Utc>>,
     pub file_count: Option<i64>,
@@ -65,7 +89,9 @@ pub async fn find_project_by_cwd(
     cwd: &str,
 ) -> Result<Option<ProjectInfo>, sqlx::Error> {
     sqlx::query_as::<_, ProjectInfo>(
-        "SELECT p.id, p.workspace_path, p.path, p.name, p.discovered_at, p.last_scanned_at,
+        "SELECT p.id, p.workspace_path, p.path, p.name,
+                p.git_common_dir, p.git_root_commits,
+                p.discovered_at, p.last_scanned_at,
                 (SELECT COUNT(*) FROM indexed_files f WHERE f.project_id = p.id) AS file_count
          FROM projects p
          WHERE $1 LIKE p.path || '%'
@@ -291,10 +317,81 @@ pub struct SearchResult {
     pub project_name: String,
 }
 
+/// SQL fragment that filters cross-worktree duplicates of the same
+/// relative path. When `$N::bool` is false (the default), `NOT $N` is
+/// true and the OR short-circuits — no behavioural change. When true,
+/// the NOT EXISTS sub-query removes any row whose project has a
+/// lower-id sibling worktree (same `git_common_dir` or
+/// `git_root_commits`) that also holds a file with the same
+/// relative_path. Used by all four search tools (semantic, text, grep,
+/// hybrid via text+semantic).
+///
+/// Aliases used by the embedding query: `f` for `indexed_files`,
+/// `$N` for the bound `dedupe_worktrees::bool`. Caller must supply the
+/// actual `$N` index in the SQL string substitution.
+const fn worktree_dedup_clause(idx: u8) -> &'static str {
+    // Keep the aliases minimal — `p_dup`/`f_dup`/`p_self` are local to
+    // the sub-query and don't conflict with anything in the surrounding
+    // SELECT (which uses `p`, `f`, `c`).
+    match idx {
+        3 => DEDUP_3,
+        4 => DEDUP_4,
+        5 => DEDUP_5,
+        _ => panic!("worktree_dedup_clause: only $3..$5 supported"),
+    }
+}
+
+const DEDUP_3: &str = "(NOT $3 OR NOT EXISTS (
+    SELECT 1 FROM projects p_dup
+    JOIN indexed_files f_dup ON f_dup.project_id = p_dup.id
+    JOIN projects p_self ON p_self.id = f.project_id
+    WHERE p_dup.id < p_self.id
+      AND f_dup.relative_path = f.relative_path
+      AND (
+          (p_dup.git_common_dir IS NOT NULL AND p_self.git_common_dir IS NOT NULL
+           AND p_dup.git_common_dir = p_self.git_common_dir)
+          OR
+          (p_dup.git_root_commits IS NOT NULL AND p_self.git_root_commits IS NOT NULL
+           AND p_dup.git_root_commits = p_self.git_root_commits)
+      )
+))";
+const DEDUP_4: &str = "(NOT $4 OR NOT EXISTS (
+    SELECT 1 FROM projects p_dup
+    JOIN indexed_files f_dup ON f_dup.project_id = p_dup.id
+    JOIN projects p_self ON p_self.id = f.project_id
+    WHERE p_dup.id < p_self.id
+      AND f_dup.relative_path = f.relative_path
+      AND (
+          (p_dup.git_common_dir IS NOT NULL AND p_self.git_common_dir IS NOT NULL
+           AND p_dup.git_common_dir = p_self.git_common_dir)
+          OR
+          (p_dup.git_root_commits IS NOT NULL AND p_self.git_root_commits IS NOT NULL
+           AND p_dup.git_root_commits = p_self.git_root_commits)
+      )
+))";
+const DEDUP_5: &str = "(NOT $5 OR NOT EXISTS (
+    SELECT 1 FROM projects p_dup
+    JOIN indexed_files f_dup ON f_dup.project_id = p_dup.id
+    JOIN projects p_self ON p_self.id = f.project_id
+    WHERE p_dup.id < p_self.id
+      AND f_dup.relative_path = f.relative_path
+      AND (
+          (p_dup.git_common_dir IS NOT NULL AND p_self.git_common_dir IS NOT NULL
+           AND p_dup.git_common_dir = p_self.git_common_dir)
+          OR
+          (p_dup.git_root_commits IS NOT NULL AND p_self.git_root_commits IS NOT NULL
+           AND p_dup.git_root_commits = p_self.git_root_commits)
+      )
+))";
+
 /// Semantic search using vector similarity.
 ///
 /// Sets `hnsw.ef_search` on the connection for improved recall before executing
 /// the k-NN query. Supports optional filtering by language and/or project name.
+///
+/// `dedupe_worktrees=true` collapses cross-worktree duplicates of the
+/// same `(repo, relative_path)` to a single canonical (lowest-id-project)
+/// hit. `dedupe_worktrees=false` (the default) preserves every hit.
 pub async fn semantic_search(
     pool: &PgPool,
     embedding: &[f32],
@@ -302,6 +399,7 @@ pub async fn semantic_search(
     language: Option<&str>,
     project: Option<&str>,
     ef_search: i32,
+    dedupe_worktrees: bool,
 ) -> Result<Vec<SearchResult>, sqlx::Error> {
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
 
@@ -313,10 +411,13 @@ pub async fn semantic_search(
         .execute(&mut *tx)
         .await?;
 
-    // Build the query dynamically based on which filters are present
+    // Build the query dynamically based on which filters are present.
+    // The dedup clause's `$N` index is determined by how many other
+    // params come before it in the bind order.
     let results = match (language, project) {
         (Some(lang), Some(proj)) => {
-            sqlx::query_as::<_, SearchResult>(
+            // $1=embedding, $2=limit, $3=lang, $4=proj, $5=dedupe
+            sqlx::query_as::<_, SearchResult>(&format!(
                 "SELECT f.path, f.relative_path, f.language,
                         c.content as chunk_content, c.start_line, c.end_line,
                         1 - (c.embedding <=> $1) as score,
@@ -325,18 +426,22 @@ pub async fn semantic_search(
                  JOIN indexed_files f ON f.id = c.file_id
                  JOIN projects p ON p.id = f.project_id
                  WHERE f.language = $3 AND p.name = $4
+                   AND {}
                  ORDER BY c.embedding <=> $1
                  LIMIT $2",
-            )
+                worktree_dedup_clause(5)
+            ))
             .bind(&embedding_vec)
             .bind(limit)
             .bind(lang)
             .bind(proj)
+            .bind(dedupe_worktrees)
             .fetch_all(&mut *tx)
             .await?
         }
         (Some(lang), None) => {
-            sqlx::query_as::<_, SearchResult>(
+            // $1=embedding, $2=limit, $3=lang, $4=dedupe
+            sqlx::query_as::<_, SearchResult>(&format!(
                 "SELECT f.path, f.relative_path, f.language,
                         c.content as chunk_content, c.start_line, c.end_line,
                         1 - (c.embedding <=> $1) as score,
@@ -345,17 +450,21 @@ pub async fn semantic_search(
                  JOIN indexed_files f ON f.id = c.file_id
                  JOIN projects p ON p.id = f.project_id
                  WHERE f.language = $3
+                   AND {}
                  ORDER BY c.embedding <=> $1
                  LIMIT $2",
-            )
+                worktree_dedup_clause(4)
+            ))
             .bind(&embedding_vec)
             .bind(limit)
             .bind(lang)
+            .bind(dedupe_worktrees)
             .fetch_all(&mut *tx)
             .await?
         }
         (None, Some(proj)) => {
-            sqlx::query_as::<_, SearchResult>(
+            // $1=embedding, $2=limit, $3=proj, $4=dedupe
+            sqlx::query_as::<_, SearchResult>(&format!(
                 "SELECT f.path, f.relative_path, f.language,
                         c.content as chunk_content, c.start_line, c.end_line,
                         1 - (c.embedding <=> $1) as score,
@@ -364,17 +473,21 @@ pub async fn semantic_search(
                  JOIN indexed_files f ON f.id = c.file_id
                  JOIN projects p ON p.id = f.project_id
                  WHERE p.name = $3
+                   AND {}
                  ORDER BY c.embedding <=> $1
                  LIMIT $2",
-            )
+                worktree_dedup_clause(4)
+            ))
             .bind(&embedding_vec)
             .bind(limit)
             .bind(proj)
+            .bind(dedupe_worktrees)
             .fetch_all(&mut *tx)
             .await?
         }
         (None, None) => {
-            sqlx::query_as::<_, SearchResult>(
+            // $1=embedding, $2=limit, $3=dedupe
+            sqlx::query_as::<_, SearchResult>(&format!(
                 "SELECT f.path, f.relative_path, f.language,
                         c.content as chunk_content, c.start_line, c.end_line,
                         1 - (c.embedding <=> $1) as score,
@@ -382,11 +495,14 @@ pub async fn semantic_search(
                  FROM file_chunks c
                  JOIN indexed_files f ON f.id = c.file_id
                  JOIN projects p ON p.id = f.project_id
+                 WHERE {}
                  ORDER BY c.embedding <=> $1
                  LIMIT $2",
-            )
+                worktree_dedup_clause(3)
+            ))
             .bind(&embedding_vec)
             .bind(limit)
+            .bind(dedupe_worktrees)
             .fetch_all(&mut *tx)
             .await?
         }
@@ -398,38 +514,51 @@ pub async fn semantic_search(
 }
 
 /// Full-text search using PostgreSQL tsvector/tsquery.
+///
+/// `dedupe_worktrees=true` collapses cross-worktree duplicates of the
+/// same `(repo, relative_path)` to a single canonical hit. See the
+/// `worktree_dedup_clause` helper for the filter shape.
 pub async fn text_search(
     pool: &PgPool,
     query: &str,
     limit: i32,
     language: Option<&str>,
+    dedupe_worktrees: bool,
 ) -> Result<Vec<TextSearchResult>, sqlx::Error> {
     let results = if let Some(lang) = language {
-        sqlx::query_as::<_, TextSearchResult>(
-            "SELECT path, relative_path, language, content,
-                    ts_rank(to_tsvector('english', content), plainto_tsquery('english', $1)) as rank
-             FROM indexed_files
-             WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1)
-               AND language = $3
+        // $1=query, $2=limit, $3=lang, $4=dedupe
+        sqlx::query_as::<_, TextSearchResult>(&format!(
+            "SELECT f.path, f.relative_path, f.language, f.content,
+                    ts_rank(to_tsvector('english', f.content), plainto_tsquery('english', $1)) as rank
+             FROM indexed_files f
+             WHERE to_tsvector('english', f.content) @@ plainto_tsquery('english', $1)
+               AND f.language = $3
+               AND {}
              ORDER BY rank DESC
              LIMIT $2",
-        )
+            worktree_dedup_clause(4)
+        ))
         .bind(query)
         .bind(limit)
         .bind(lang)
+        .bind(dedupe_worktrees)
         .fetch_all(pool)
         .await?
     } else {
-        sqlx::query_as::<_, TextSearchResult>(
-            "SELECT path, relative_path, language, content,
-                    ts_rank(to_tsvector('english', content), plainto_tsquery('english', $1)) as rank
-             FROM indexed_files
-             WHERE to_tsvector('english', content) @@ plainto_tsquery('english', $1)
+        // $1=query, $2=limit, $3=dedupe
+        sqlx::query_as::<_, TextSearchResult>(&format!(
+            "SELECT f.path, f.relative_path, f.language, f.content,
+                    ts_rank(to_tsvector('english', f.content), plainto_tsquery('english', $1)) as rank
+             FROM indexed_files f
+             WHERE to_tsvector('english', f.content) @@ plainto_tsquery('english', $1)
+               AND {}
              ORDER BY rank DESC
              LIMIT $2",
-        )
+            worktree_dedup_clause(3)
+        ))
         .bind(query)
         .bind(limit)
+        .bind(dedupe_worktrees)
         .fetch_all(pool)
         .await?
     };
@@ -447,36 +576,49 @@ pub struct TextSearchResult {
 }
 
 /// Regex grep search across file contents.
+///
+/// `dedupe_worktrees=true` collapses cross-worktree duplicates of the
+/// same `(repo, relative_path)` to a single canonical hit. See the
+/// `worktree_dedup_clause` helper for the filter shape.
 pub async fn grep_search(
     pool: &PgPool,
     pattern: &str,
     glob: Option<&str>,
     limit: i32,
+    dedupe_worktrees: bool,
 ) -> Result<Vec<GrepResult>, sqlx::Error> {
     let results = if let Some(glob_pattern) = glob {
-        // Convert glob to SQL LIKE pattern
+        // Convert glob to SQL LIKE pattern.
+        // $1=pattern, $2=limit, $3=like, $4=dedupe
         let like_pattern = glob_pattern.replace('*', "%").replace('?', "_");
-        sqlx::query_as::<_, GrepResult>(
-            "SELECT path, relative_path, language, content
-             FROM indexed_files
-             WHERE content ~ $1
-               AND relative_path LIKE $3
+        sqlx::query_as::<_, GrepResult>(&format!(
+            "SELECT f.path, f.relative_path, f.language, f.content
+             FROM indexed_files f
+             WHERE f.content ~ $1
+               AND f.relative_path LIKE $3
+               AND {}
              LIMIT $2",
-        )
+            worktree_dedup_clause(4)
+        ))
         .bind(pattern)
         .bind(limit)
         .bind(&like_pattern)
+        .bind(dedupe_worktrees)
         .fetch_all(pool)
         .await?
     } else {
-        sqlx::query_as::<_, GrepResult>(
-            "SELECT path, relative_path, language, content
-             FROM indexed_files
-             WHERE content ~ $1
+        // $1=pattern, $2=limit, $3=dedupe
+        sqlx::query_as::<_, GrepResult>(&format!(
+            "SELECT f.path, f.relative_path, f.language, f.content
+             FROM indexed_files f
+             WHERE f.content ~ $1
+               AND {}
              LIMIT $2",
-        )
+            worktree_dedup_clause(3)
+        ))
         .bind(pattern)
         .bind(limit)
+        .bind(dedupe_worktrees)
         .fetch_all(pool)
         .await?
     };
@@ -1008,9 +1150,18 @@ pub async fn batch_find_cross_project_neighbors(
         .execute(&mut *tx)
         .await?;
 
+    // Worktree-awareness: skip pairs whose two projects are different
+    // worktrees / sibling clones of the same upstream repo (same
+    // git_common_dir OR same git_root_commits). Otherwise the
+    // materialized similarity table fills with same-code-different-branch
+    // false positives that drown out genuine cross-repo refactor candidates.
+    // See plan: ~/.claude/plans/thoroughly-examine-home-dylon-workspace-melodic-cake.md
     let results = sqlx::query_as::<_, SimilarityNeighborRow>(
         "WITH batch AS (
-            SELECT c.id, c.file_id, c.embedding, f.project_id, f.path, f.language, p.name as project_name
+            SELECT c.id, c.file_id, c.embedding, f.project_id, f.path, f.language,
+                   p.name as project_name,
+                   p.git_common_dir as git_common_dir_b,
+                   p.git_root_commits as git_root_commits_b
             FROM file_chunks c
             JOIN indexed_files f ON f.id = c.file_id
             JOIN projects p ON p.id = f.project_id
@@ -1031,10 +1182,18 @@ pub async fn batch_find_cross_project_neighbors(
             JOIN indexed_files f2 ON f2.id = c2.file_id
             JOIN projects p2 ON p2.id = f2.project_id
             WHERE f2.project_id != b.project_id
+              AND NOT (
+                  p2.git_common_dir IS NOT NULL
+                  AND p2.git_common_dir = b.git_common_dir_b
+              )
+              AND NOT (
+                  p2.git_root_commits IS NOT NULL
+                  AND p2.git_root_commits = b.git_root_commits_b
+              )
             ORDER BY c2.embedding <=> b.embedding
             LIMIT $3
         ) nn
-        WHERE nn.similarity >= $4"
+        WHERE nn.similarity >= $4",
     )
     .bind(last_chunk_id)
     .bind(batch_size)
@@ -1189,9 +1348,31 @@ pub async fn find_similar_files(
     min_similarity: f64,
     limit: i32,
     target_project: Option<&str>,
+    include_same_repo: bool,
 ) -> Result<Vec<FileSimilarityPair>, sqlx::Error> {
+    // Same-repo filter: exclude rows where the *other* side's project is
+    // a worktree / sibling clone of the seed file's project. The seed's
+    // project is `seed.project_id` (looked up via indexed_files); the
+    // other side is whichever of project_id_a/project_id_b isn't seed's.
+    // The leading `$N OR …` short-circuits the filter when the operator
+    // explicitly opts in via `include_same_repo=true`.
+    let same_repo_filter_idx = if target_project.is_some() { "$5" } else { "$4" };
+    let same_repo_filter = format!(
+        "({} OR NOT EXISTS (
+            SELECT 1 FROM projects pa, projects pb, indexed_files seed
+            WHERE seed.id = $1
+              AND pa.id = seed.project_id
+              AND pb.id = (CASE WHEN s.file_id_a = $1 THEN s.project_id_b ELSE s.project_id_a END)
+              AND (
+                  (pa.git_common_dir IS NOT NULL AND pa.git_common_dir = pb.git_common_dir)
+                  OR
+                  (pa.git_root_commits IS NOT NULL AND pa.git_root_commits = pb.git_root_commits)
+              )
+         ))",
+        same_repo_filter_idx
+    );
     if let Some(proj) = target_project {
-        sqlx::query_as::<_, FileSimilarityPair>(
+        sqlx::query_as::<_, FileSimilarityPair>(&format!(
             "SELECT
                 CASE WHEN s.file_id_a = $1 THEN s.file_id_a ELSE s.file_id_b END as file_id_a,
                 CASE WHEN s.file_id_a = $1 THEN s.path_a ELSE s.path_b END as path_a,
@@ -1207,18 +1388,20 @@ pub async fn find_similar_files(
              WHERE (s.file_id_a = $1 OR s.file_id_b = $1)
                AND s.chunk_similarity >= $2
                AND (CASE WHEN s.file_id_a = $1 THEN s.project_name_b ELSE s.project_name_a END) = $4
+               AND {same_repo_filter}
              GROUP BY file_id_a, path_a, project_name_a, file_id_b, path_b, project_name_b, s.language
              ORDER BY avg_similarity DESC
              LIMIT $3"
-        )
+        ))
         .bind(file_id)
         .bind(min_similarity)
         .bind(limit)
         .bind(proj)
+        .bind(include_same_repo)
         .fetch_all(pool)
         .await
     } else {
-        sqlx::query_as::<_, FileSimilarityPair>(
+        sqlx::query_as::<_, FileSimilarityPair>(&format!(
             "SELECT
                 CASE WHEN s.file_id_a = $1 THEN s.file_id_a ELSE s.file_id_b END as file_id_a,
                 CASE WHEN s.file_id_a = $1 THEN s.path_a ELSE s.path_b END as path_a,
@@ -1233,13 +1416,15 @@ pub async fn find_similar_files(
              FROM cross_project_similarities s
              WHERE (s.file_id_a = $1 OR s.file_id_b = $1)
                AND s.chunk_similarity >= $2
+               AND {same_repo_filter}
              GROUP BY file_id_a, path_a, project_name_a, file_id_b, path_b, project_name_b, s.language
              ORDER BY avg_similarity DESC
              LIMIT $3"
-        )
+        ))
         .bind(file_id)
         .bind(min_similarity)
         .bind(limit)
+        .bind(include_same_repo)
         .fetch_all(pool)
         .await
     }
@@ -1263,14 +1448,53 @@ pub struct DuplicateFilePair {
 }
 
 /// Find duplicate file pairs across projects from the materialized table.
+///
+/// `include_same_repo` (default `false`) controls the worktree-aware
+/// filter. When false (the common case for "find me cross-project
+/// refactoring candidates"), pairs whose two projects are worktrees /
+/// sibling clones of the same upstream repo are excluded. When true,
+/// every cross-project pair is returned regardless of repo membership —
+/// useful when an operator explicitly wants to compare branches.
+///
+/// Note: `cross_project_similarities` is itself populated with the
+/// strict same-repo filter (see `batch_find_cross_project_neighbors`),
+/// so `include_same_repo=true` here only loosens any *additional*
+/// per-query filtering. Same-repo pairs that were skipped at scan time
+/// won't reappear from this flag alone.
 pub async fn find_duplicate_file_pairs(
     pool: &PgPool,
     min_similarity: f64,
     language: Option<&str>,
     limit: i32,
+    include_same_repo: bool,
 ) -> Result<Vec<DuplicateFilePair>, sqlx::Error> {
+    // Defense-in-depth: even though Stage 3 Q1 filters at scan time,
+    // an old materialized table populated before that landed could
+    // still contain same-repo pairs. The NOT EXISTS scrubs them at
+    // query time. The leading `$N OR …` short-circuits when the
+    // operator opts back in via `include_same_repo=true`.
+    let same_repo_filter_lang = "($4 OR NOT EXISTS (
+        SELECT 1 FROM projects pa, projects pb
+        WHERE pa.id = s.project_id_a
+          AND pb.id = s.project_id_b
+          AND (
+              (pa.git_common_dir IS NOT NULL AND pa.git_common_dir = pb.git_common_dir)
+              OR
+              (pa.git_root_commits IS NOT NULL AND pa.git_root_commits = pb.git_root_commits)
+          )
+    ))";
+    let same_repo_filter_nolang = "($3 OR NOT EXISTS (
+        SELECT 1 FROM projects pa, projects pb
+        WHERE pa.id = s.project_id_a
+          AND pb.id = s.project_id_b
+          AND (
+              (pa.git_common_dir IS NOT NULL AND pa.git_common_dir = pb.git_common_dir)
+              OR
+              (pa.git_root_commits IS NOT NULL AND pa.git_root_commits = pb.git_root_commits)
+          )
+    ))";
     if let Some(lang) = language {
-        sqlx::query_as::<_, DuplicateFilePair>(
+        sqlx::query_as::<_, DuplicateFilePair>(&format!(
             "SELECT s.file_id_a, s.path_a, s.project_name_a, s.project_id_a,
                     s.file_id_b, s.path_b, s.project_name_b, s.project_id_b,
                     s.language,
@@ -1281,20 +1505,22 @@ pub async fn find_duplicate_file_pairs(
              WHERE s.chunk_similarity >= $1
                AND s.language = $3
                AND s.project_id_a != s.project_id_b
+               AND {same_repo_filter_lang}
              GROUP BY s.file_id_a, s.path_a, s.project_name_a, s.project_id_a,
                       s.file_id_b, s.path_b, s.project_name_b, s.project_id_b,
                       s.language
              HAVING AVG(s.chunk_similarity) >= $1
              ORDER BY avg_similarity DESC
              LIMIT $2",
-        )
+        ))
         .bind(min_similarity)
         .bind(limit)
         .bind(lang)
+        .bind(include_same_repo)
         .fetch_all(pool)
         .await
     } else {
-        sqlx::query_as::<_, DuplicateFilePair>(
+        sqlx::query_as::<_, DuplicateFilePair>(&format!(
             "SELECT s.file_id_a, s.path_a, s.project_name_a, s.project_id_a,
                     s.file_id_b, s.path_b, s.project_name_b, s.project_id_b,
                     s.language,
@@ -1304,15 +1530,17 @@ pub async fn find_duplicate_file_pairs(
              FROM cross_project_similarities s
              WHERE s.chunk_similarity >= $1
                AND s.project_id_a != s.project_id_b
+               AND {same_repo_filter_nolang}
              GROUP BY s.file_id_a, s.path_a, s.project_name_a, s.project_id_a,
                       s.file_id_b, s.path_b, s.project_name_b, s.project_id_b,
                       s.language
              HAVING AVG(s.chunk_similarity) >= $1
              ORDER BY avg_similarity DESC
              LIMIT $2",
-        )
+        ))
         .bind(min_similarity)
         .bind(limit)
+        .bind(include_same_repo)
         .fetch_all(pool)
         .await
     }
@@ -1365,33 +1593,56 @@ pub struct ChunkEmbeddingRow {
 }
 
 /// Extract all chunk embeddings, optionally filtered by language.
+///
+/// Worktree-aware: when multiple projects share a `git_common_dir` (or
+/// `git_root_commits`), only the canonical project (smallest
+/// `projects.id`) contributes chunks. Otherwise the global topic scan
+/// would double- or triple-count the same code per worktree, inflating
+/// `code_topics.project_count` / `project_names` / chunk counts. The
+/// per-project topic scan (`bulk_extract_project_embeddings`) doesn't
+/// need this filter — already scoped to one project by name.
 pub async fn bulk_extract_embeddings(
     pool: &PgPool,
     language: Option<&str>,
 ) -> Result<Vec<ChunkEmbeddingRow>, sqlx::Error> {
+    let canonical_filter = "NOT EXISTS (
+        SELECT 1 FROM projects p_dup
+        WHERE p_dup.id < p.id
+          AND (
+              (p_dup.git_common_dir IS NOT NULL
+               AND p.git_common_dir IS NOT NULL
+               AND p_dup.git_common_dir = p.git_common_dir)
+              OR
+              (p_dup.git_root_commits IS NOT NULL
+               AND p.git_root_commits IS NOT NULL
+               AND p_dup.git_root_commits = p.git_root_commits)
+          )
+    )";
     if let Some(lang) = language {
-        let rows = sqlx::query_as::<_, BulkChunkRow>(
+        let rows = sqlx::query_as::<_, BulkChunkRow>(&format!(
             "SELECT c.id as chunk_id, c.file_id, f.project_id, p.name as project_name,
                     f.path, f.language, c.content, c.embedding::real[] as embedding
              FROM file_chunks c
              JOIN indexed_files f ON f.id = c.file_id
              JOIN projects p ON p.id = f.project_id
              WHERE f.language = $1
+               AND {canonical_filter}
              ORDER BY c.id",
-        )
+        ))
         .bind(lang)
         .fetch_all(pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     } else {
-        let rows = sqlx::query_as::<_, BulkChunkRow>(
+        let rows = sqlx::query_as::<_, BulkChunkRow>(&format!(
             "SELECT c.id as chunk_id, c.file_id, f.project_id, p.name as project_name,
                     f.path, f.language, c.content, c.embedding::real[] as embedding
              FROM file_chunks c
              JOIN indexed_files f ON f.id = c.file_id
              JOIN projects p ON p.id = f.project_id
+             WHERE {canonical_filter}
              ORDER BY c.id",
-        )
+        ))
         .fetch_all(pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())

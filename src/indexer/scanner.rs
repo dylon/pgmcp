@@ -135,9 +135,16 @@ pub(crate) fn scan_single_workspace(
 
         let path = entry.path();
 
-        // Detect project roots (directories with .git/)
+        // Detect project roots (directories whose `.git` is either a
+        // directory — the main checkout — or a regular file — a
+        // `git worktree`'s pointer to the shared `.git/worktrees/<name>/`
+        // directory). Both kinds are valid project roots; without the
+        // file-check, sibling worktrees of a repo are never discovered
+        // and the worktree-aware analytics filter has nothing to scope
+        // (only the main checkout would be indexed).
         if path.is_dir() {
-            if path.join(".git").is_dir() {
+            let dot_git = path.join(".git");
+            if dot_git.is_dir() || dot_git.is_file() {
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())

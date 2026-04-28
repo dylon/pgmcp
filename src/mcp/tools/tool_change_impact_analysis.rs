@@ -186,7 +186,10 @@ pub async fn tool_change_impact_analysis(
     if include_semantic {
         let similar_files = ctx
             .db()
-            .find_similar_files(target_file_id, 0.80, 10, Some(&params.project))
+            // Within-project change-impact: target_project is the same
+            // project as the seed file, so the same-repo filter is a
+            // no-op. Pass `false` to keep behavior identical.
+            .find_similar_files(target_file_id, 0.80, 10, Some(&params.project), false)
             .await
             .unwrap_or_default();
 

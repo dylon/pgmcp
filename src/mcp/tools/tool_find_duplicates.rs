@@ -35,7 +35,12 @@ pub async fn tool_find_duplicates(
 
     let pairs = ctx
         .db()
-        .find_duplicate_file_pairs(min_sim, params.language.as_deref(), limit * 5)
+        .find_duplicate_file_pairs(
+            min_sim,
+            params.language.as_deref(),
+            limit * 5,
+            params.include_same_repo.unwrap_or(false),
+        )
         .await
         .map_err(|e| McpError::internal_error(format!("Duplicate query failed: {}", e), None))?;
 

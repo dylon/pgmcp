@@ -1558,6 +1558,10 @@ async fn run_mmap_global_topic_scan(
     }
 
     while offset < n_total {
+        // Worktree-aware: filter to canonical project per repo so we
+        // don't re-index the same chunks across worktrees / sibling
+        // clones. See `bulk_extract_embeddings` in src/db/queries.rs
+        // for rationale; the SQL is the same shape.
         let rows = sqlx::query_as::<_, EmbRow>(
             "SELECT c.id AS id, c.file_id AS file_id, p.name AS project_name,
                     f.path AS path, f.language AS language,
@@ -1566,6 +1570,19 @@ async fn run_mmap_global_topic_scan(
              JOIN indexed_files f ON c.file_id = f.id
              JOIN projects p ON f.project_id = p.id
              WHERE c.embedding IS NOT NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM projects p_dup
+                   WHERE p_dup.id < p.id
+                     AND (
+                         (p_dup.git_common_dir IS NOT NULL
+                          AND p.git_common_dir IS NOT NULL
+                          AND p_dup.git_common_dir = p.git_common_dir)
+                         OR
+                         (p_dup.git_root_commits IS NOT NULL
+                          AND p.git_root_commits IS NOT NULL
+                          AND p_dup.git_root_commits = p.git_root_commits)
+                     )
+               )
              ORDER BY c.id
              LIMIT $1 OFFSET $2",
         )
@@ -2087,10 +2104,27 @@ async fn run_online_global_topic_scan(
                     id: i64,
                     embedding: Vec<f32>,
                 }
+                // Worktree-aware: filter to canonical project per
+                // repo. See bulk_extract_embeddings rationale.
                 let rows = sqlx::query_as::<_, Row>(
                     "SELECT c.id AS id, c.embedding::real[] AS embedding
                      FROM file_chunks c
+                     JOIN indexed_files f ON c.file_id = f.id
+                     JOIN projects p ON f.project_id = p.id
                      WHERE c.embedding IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM projects p_dup
+                           WHERE p_dup.id < p.id
+                             AND (
+                                 (p_dup.git_common_dir IS NOT NULL
+                                  AND p.git_common_dir IS NOT NULL
+                                  AND p_dup.git_common_dir = p.git_common_dir)
+                                 OR
+                                 (p_dup.git_root_commits IS NOT NULL
+                                  AND p.git_root_commits IS NOT NULL
+                                  AND p_dup.git_root_commits = p.git_root_commits)
+                             )
+                       )
                      ORDER BY c.id
                      LIMIT $1 OFFSET $2",
                 )
@@ -2194,13 +2228,35 @@ async fn run_online_global_topic_scan(
     run_hierarchy_pass(db, config, stats).await;
 }
 
-/// Query the total chunk count with an embedding — used by memory pre-flight.
+/// Query the total chunk count with an embedding — used by memory pre-flight
+/// AND to size the mmap allocation in `run_mmap_global_topic_scan`. The
+/// count must match the filter used by the streaming query (canonical
+/// project per `git_common_dir` / `git_root_commits` group), otherwise the
+/// mmap is over-allocated and downstream `mmap.view()` includes garbage
+/// rows for un-populated indices.
 async fn count_chunks(db: &dyn DbClient) -> Option<usize> {
     let pool = db
         .pool()
         .expect("count_chunks requires a real &PgPool from DbClient::pool()");
     match sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM file_chunks WHERE embedding IS NOT NULL",
+        "SELECT COUNT(*)
+         FROM file_chunks c
+         JOIN indexed_files f ON c.file_id = f.id
+         JOIN projects p ON f.project_id = p.id
+         WHERE c.embedding IS NOT NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM projects p_dup
+               WHERE p_dup.id < p.id
+                 AND (
+                     (p_dup.git_common_dir IS NOT NULL
+                      AND p.git_common_dir IS NOT NULL
+                      AND p_dup.git_common_dir = p.git_common_dir)
+                     OR
+                     (p_dup.git_root_commits IS NOT NULL
+                      AND p.git_root_commits IS NOT NULL
+                      AND p_dup.git_root_commits = p.git_root_commits)
+                 )
+           )",
     )
     .fetch_one(pool)
     .await

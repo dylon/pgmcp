@@ -65,9 +65,12 @@ pub async fn grep(
     // give a small buffer for direct callers.
     let limit = req.limit.unwrap_or(10).clamp(1, 50);
 
+    // The /api/grep endpoint is consumed by ~/.claude/hooks/pgmcp-grep-companion.sh
+    // which doesn't currently expose dedupe; default false preserves
+    // existing behavior. The hook can opt in later via a query param.
     let results = state
         .db
-        .grep_search(&req.pattern, req.glob.as_deref(), limit)
+        .grep_search(&req.pattern, req.glob.as_deref(), limit, false)
         .await
         .map_err(|e| {
             (
@@ -161,6 +164,10 @@ pub async fn search(
         })?;
 
     let ef_search = state.config.load().vector.ef_search;
+    // The /api/search endpoint is consumed by ~/.claude/hooks/pgmcp-rag.sh
+    // (UserPromptSubmit). Default dedupe=false preserves existing
+    // behavior — the hook can pass a query param later if it wants
+    // worktree-collapsed results.
     let results = state
         .db
         .semantic_search(
@@ -169,6 +176,7 @@ pub async fn search(
             req.language.as_deref(),
             req.project.as_deref(),
             ef_search,
+            false,
         )
         .await
         .map_err(|e| {

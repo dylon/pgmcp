@@ -59,6 +59,8 @@ pub async fn tool_hybrid_search(
         "MCP tool invoked",
     );
 
+    let dedupe_worktrees = params.dedupe_worktrees.unwrap_or(false);
+
     // Run text search
     let text_results = ctx
         .db()
@@ -66,6 +68,7 @@ pub async fn tool_hybrid_search(
             &params.query,
             limit * 2, // fetch more for fusion
             params.language.as_deref(),
+            dedupe_worktrees,
         )
         .await
         .map_err(|e| McpError::internal_error(format!("Text search failed: {}", e), None))?;
@@ -86,6 +89,7 @@ pub async fn tool_hybrid_search(
             params.language.as_deref(),
             params.project.as_deref(),
             ef_search,
+            dedupe_worktrees,
         )
         .await
         .map_err(|e| McpError::internal_error(format!("Semantic search failed: {}", e), None))?;

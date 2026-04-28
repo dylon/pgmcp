@@ -452,11 +452,16 @@ fn process_index_file_task(
             Some((root_path, root_info)) => {
                 let info = root_info.clone();
                 drop(root_info); // release dashmap ref
+                let git_common_dir = crate::indexer::git_indexer::detect_git_common_dir(&root_path);
+                let git_root_commits =
+                    crate::indexer::git_indexer::detect_git_root_commits(&root_path);
                 let id = db
                     .upsert_project(
                         &info.workspace_path,
                         &root_path.to_string_lossy(),
                         &info.name,
+                        git_common_dir.as_deref(),
+                        git_root_commits.as_deref(),
                     )
                     .await?;
                 Ok::<_, sqlx::Error>((
@@ -467,7 +472,11 @@ fn process_index_file_task(
             }
             None => {
                 let workspace = cfg.workspace.paths.first().cloned().unwrap_or_default();
-                let id = db.upsert_project(&workspace, &workspace, "default").await?;
+                // The synthetic "default" project has no project_root, so
+                // can't run `git rev-parse` — pass NULL for both signals.
+                let id = db
+                    .upsert_project(&workspace, &workspace, "default", None, None)
+                    .await?;
                 Ok((id, workspace, None))
             }
         }

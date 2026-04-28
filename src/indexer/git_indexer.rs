@@ -25,6 +25,82 @@ const FIELD_SEP: &str = "\x1f"; // ASCII Unit Separator
 /// Separator between commits in git log output.
 const COMMIT_SEP: &str = "\x1e"; // ASCII Record Separator
 
+/// Returns the canonical absolute path of the shared `.git` directory for
+/// a project, or `None` if the project isn't a git repo (or `git` is missing
+/// from PATH).
+///
+/// All worktrees of one upstream repo return the same path; the main
+/// checkout returns its own `.git`. This is the *primary* worktree-grouping
+/// key persisted on `projects.git_common_dir` and used by cross-project
+/// analysis queries to skip same-repo pairs (literal worktrees of the same
+/// upstream).
+///
+/// Canonicalization is critical: `git rev-parse --git-common-dir` returns
+/// `".git"` (relative) for the main checkout but absolute paths for
+/// worktrees. Without canonicalization the main checkout wouldn't match
+/// its own worktrees on text equality.
+pub fn detect_git_common_dir(project_root: &Path) -> Option<String> {
+    if !project_root.join(".git").exists() {
+        return None;
+    }
+    let output = Command::new("git")
+        .current_dir(project_root)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let raw_path = Path::new(&raw);
+    let abs = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        project_root.join(raw_path)
+    };
+    abs.canonicalize()
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Returns the project's root commit SHA(s), sorted and joined with
+/// commas — a stable single-column key for "same upstream history".
+///
+/// Independent clones of the same repo share the same set of root
+/// commits even though their `.git` directories are unrelated. Used as
+/// a *secondary* same-repo signal alongside [`detect_git_common_dir`]:
+/// two projects are considered the same repo when *either* signal
+/// matches non-NULL.
+///
+/// Returns `None` for non-git projects, when `git` is missing, or when
+/// the repo has no commits yet.
+pub fn detect_git_root_commits(project_root: &Path) -> Option<String> {
+    if !project_root.join(".git").exists() {
+        return None;
+    }
+    let output = Command::new("git")
+        .current_dir(project_root)
+        .args(["rev-list", "--max-parents=0", "HEAD"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut roots: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if roots.is_empty() {
+        return None;
+    }
+    roots.sort();
+    Some(roots.join(","))
+}
+
 /// Index git history for a project. Only processes commits newer than the last indexed SHA.
 pub async fn index_git_history(
     project_root: &Path,

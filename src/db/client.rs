@@ -71,6 +71,8 @@ pub trait DbClient: Send + Sync {
         workspace_path: &str,
         path: &str,
         name: &str,
+        git_common_dir: Option<&str>,
+        git_root_commits: Option<&str>,
     ) -> Result<i32, sqlx::Error>;
     async fn list_projects(&self) -> Result<Vec<ProjectInfo>, sqlx::Error>;
     async fn find_project_by_cwd(&self, cwd: &str) -> Result<Option<ProjectInfo>, sqlx::Error>;
@@ -123,18 +125,21 @@ pub trait DbClient: Send + Sync {
         language: Option<&str>,
         project: Option<&str>,
         ef_search: i32,
+        dedupe_worktrees: bool,
     ) -> Result<Vec<SearchResult>, sqlx::Error>;
     async fn text_search(
         &self,
         query: &str,
         limit: i32,
         language: Option<&str>,
+        dedupe_worktrees: bool,
     ) -> Result<Vec<TextSearchResult>, sqlx::Error>;
     async fn grep_search(
         &self,
         pattern: &str,
         glob: Option<&str>,
         limit: i32,
+        dedupe_worktrees: bool,
     ) -> Result<Vec<GrepResult>, sqlx::Error>;
     async fn read_file(&self, path: &str) -> Result<Option<FileContent>, sqlx::Error>;
     async fn read_file_by_relative_path(
@@ -246,12 +251,14 @@ pub trait DbClient: Send + Sync {
         min_similarity: f64,
         limit: i32,
         target_project: Option<&str>,
+        include_same_repo: bool,
     ) -> Result<Vec<FileSimilarityPair>, sqlx::Error>;
     async fn find_duplicate_file_pairs(
         &self,
         min_similarity: f64,
         language: Option<&str>,
         limit: i32,
+        include_same_repo: bool,
     ) -> Result<Vec<DuplicateFilePair>, sqlx::Error>;
 
     // -- topic clustering ----------------------------------------------------
@@ -335,8 +342,18 @@ impl DbClient for PgPool {
         workspace_path: &str,
         path: &str,
         name: &str,
+        git_common_dir: Option<&str>,
+        git_root_commits: Option<&str>,
     ) -> Result<i32, sqlx::Error> {
-        queries::upsert_project(self, workspace_path, path, name).await
+        queries::upsert_project(
+            self,
+            workspace_path,
+            path,
+            name,
+            git_common_dir,
+            git_root_commits,
+        )
+        .await
     }
 
     async fn list_projects(&self) -> Result<Vec<ProjectInfo>, sqlx::Error> {
@@ -463,8 +480,18 @@ impl DbClient for PgPool {
         language: Option<&str>,
         project: Option<&str>,
         ef_search: i32,
+        dedupe_worktrees: bool,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
-        queries::semantic_search(self, embedding, limit, language, project, ef_search).await
+        queries::semantic_search(
+            self,
+            embedding,
+            limit,
+            language,
+            project,
+            ef_search,
+            dedupe_worktrees,
+        )
+        .await
     }
 
     async fn text_search(
@@ -472,8 +499,9 @@ impl DbClient for PgPool {
         query: &str,
         limit: i32,
         language: Option<&str>,
+        dedupe_worktrees: bool,
     ) -> Result<Vec<TextSearchResult>, sqlx::Error> {
-        queries::text_search(self, query, limit, language).await
+        queries::text_search(self, query, limit, language, dedupe_worktrees).await
     }
 
     async fn grep_search(
@@ -481,8 +509,9 @@ impl DbClient for PgPool {
         pattern: &str,
         glob: Option<&str>,
         limit: i32,
+        dedupe_worktrees: bool,
     ) -> Result<Vec<GrepResult>, sqlx::Error> {
-        queries::grep_search(self, pattern, glob, limit).await
+        queries::grep_search(self, pattern, glob, limit, dedupe_worktrees).await
     }
 
     async fn read_file(&self, path: &str) -> Result<Option<FileContent>, sqlx::Error> {
@@ -705,8 +734,17 @@ impl DbClient for PgPool {
         min_similarity: f64,
         limit: i32,
         target_project: Option<&str>,
+        include_same_repo: bool,
     ) -> Result<Vec<FileSimilarityPair>, sqlx::Error> {
-        queries::find_similar_files(self, file_id, min_similarity, limit, target_project).await
+        queries::find_similar_files(
+            self,
+            file_id,
+            min_similarity,
+            limit,
+            target_project,
+            include_same_repo,
+        )
+        .await
     }
 
     async fn find_duplicate_file_pairs(
@@ -714,8 +752,10 @@ impl DbClient for PgPool {
         min_similarity: f64,
         language: Option<&str>,
         limit: i32,
+        include_same_repo: bool,
     ) -> Result<Vec<DuplicateFilePair>, sqlx::Error> {
-        queries::find_duplicate_file_pairs(self, min_similarity, language, limit).await
+        queries::find_duplicate_file_pairs(self, min_similarity, language, limit, include_same_repo)
+            .await
     }
 
     async fn bulk_extract_embeddings(
