@@ -3,6 +3,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+use dashmap::DashMap;
+
 /// All statistics counters — fully lock-free.
 pub struct StatsTracker {
     // Indexing counters
@@ -136,6 +138,14 @@ pub struct StatsTracker {
     /// Read by observability tooling to correlate RSS spikes with cron phase.
     pub heavy_cron_running: AtomicBool,
 
+    /// Per-tool invocation counter, keyed by MCP tool name (e.g.
+    /// `"semantic_search"`, `"grep"`, `"orient"`). Populated by
+    /// `record_tool_call()` at the top of each `#[tool]` body in
+    /// `src/mcp/server.rs`. Surfaced in `/api/status`'s `counters` block as
+    /// the `tool_invocations` map. Used to A/B-test pgmcp utilization across
+    /// rollouts of the description rewrites, hooks, and agent-override work.
+    pub tool_invocations: DashMap<String, AtomicU64>,
+
     // Uptime
     pub uptime_start: Instant,
 }
@@ -213,8 +223,20 @@ impl StatsTracker {
             peak_rss_bytes: AtomicU64::new(0),
             current_rss_bytes: AtomicU64::new(0),
             heavy_cron_running: AtomicBool::new(false),
+            tool_invocations: DashMap::new(),
             uptime_start: Instant::now(),
         }
+    }
+
+    /// Increment the per-tool invocation counter for the named MCP tool.
+    /// Called once at the top of each `#[tool]` body in `src/mcp/server.rs`.
+    /// `Relaxed` ordering: the counter is observability-only, no
+    /// happens-before relation needed with anything else.
+    pub fn record_tool_call(&self, name: &str) {
+        self.tool_invocations
+            .entry(name.to_string())
+            .or_insert_with(|| AtomicU64::new(0))
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Get a JSON snapshot of all counters.
@@ -286,6 +308,11 @@ impl StatsTracker {
             "summarize_scans": self.summarize_scans.load(Ordering::Acquire),
             "scorecard_scans": self.scorecard_scans.load(Ordering::Acquire),
             "http_mcp_sessions": self.http_mcp_sessions.load(Ordering::Acquire),
+            "tool_invocations": serde_json::Value::Object(
+                self.tool_invocations.iter()
+                    .map(|e| (e.key().clone(), serde_json::Value::from(e.value().load(Ordering::Relaxed))))
+                    .collect()
+            ),
             "uptime_secs": self.uptime_start.elapsed().as_secs(),
         })
     }

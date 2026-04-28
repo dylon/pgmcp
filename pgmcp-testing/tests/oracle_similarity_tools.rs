@@ -65,6 +65,11 @@ fn server_with_pool_and_deterministic_embed(pool: PgPool) -> McpServer {
         config,
         log_broadcaster,
         task_store,
+        {
+            let __l = pgmcp::daemon_state::DaemonLifecycle::new();
+            __l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+            __l
+        },
     );
     McpServer::new(ctx)
 }

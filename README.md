@@ -18,7 +18,7 @@ that lets AI assistants query any of it on demand.
 
 ## Capability Overview
 
-pgmcp's 40 MCP tools are organized into eight capability tiers:
+pgmcp's 41 MCP tools are organized into eight capability tiers:
 
 ### Search & Retrieval (6 tools)
 
@@ -33,17 +33,24 @@ Find code by meaning, keywords, regex, or fused ranking across all indexed proje
 | `read_file`       | Read the content of an indexed file by path                                                         |
 | `search_commits`  | Semantic search over git commit history (messages + diffs)                                          |
 
-### Project Intelligence (5 tools)
+### Project Intelligence (6 tools)
 
 Discover, navigate, and manage indexed projects.
 
-| Tool            | Description                                                            |
-|-----------------|------------------------------------------------------------------------|
-| `list_projects` | List all discovered projects with file counts                          |
-| `project_tree`  | Show the file tree for a project at configurable depth                 |
-| `file_info`     | Get metadata (size, language, line count, timestamps) for a file       |
-| `index_stats`   | Overall indexing statistics, pool state, and analysis counters         |
-| `reindex`       | Clear the index and re-index all workspaces (async task with progress) |
+| Tool            | Description                                                                                                                                                                              |
+|-----------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `orient`        | Composite first-step snapshot: project metadata + language breakdown + depth-2 tree + key entry points by PageRank + recently-changed files + top topics + health envelope, in one call |
+| `list_projects` | List all discovered projects with file counts                                                                                                                                            |
+| `project_tree`  | Show the file tree for a project at configurable depth                                                                                                                                   |
+| `file_info`     | Get metadata (size, language, line count, timestamps) for a file                                                                                                                         |
+| `index_stats`   | Overall indexing statistics, pool state, and analysis counters                                                                                                                           |
+| `reindex`       | Clear the index and re-index all workspaces (async task with progress)                                                                                                                   |
+
+`orient` is the recommended first call when entering an unfamiliar codebase or
+starting a non-trivial task. It bundles what the model would otherwise spread
+across `list_projects` + `project_tree` + `centrality_analysis` + recently-changed
+queries, with a `health` envelope flagging stale graph metrics or missing topic
+data so callers can interpret partial results correctly.
 
 ### Cross-Project Similarity (4 tools)
 
@@ -131,7 +138,11 @@ High-level project understanding and engineering quality assessment.
 - **Per-project overrides** -- `.pgmcp.toml` in project roots for custom exclusions and file types
 - **CUDA acceleration** -- optional GPU-accelerated embeddings via ONNX Runtime
 - **Auto-RAG context injection** -- Claude Code hooks inject project context and relevant code on every prompt
-- **REST API** -- `POST /api/search` and `GET /api/context` alongside the MCP server
+- **PreToolUse tool-call proxy** -- five hook scripts at `~/.claude/hooks/pgmcp-*.sh` augment (Layer A) or selectively deny (Layer B, opt-in via `PGMCP_HOOK_MODE=enforce`) `Read`/`Grep`/`Glob` to bias Claude toward pgmcp's richer tools
+- **Subagent containment** -- `~/.claude/agents/Explore.md` and `general-purpose.md` overrides drop `Grep`/`Glob` from spawned-subagent tool catalogs (harness-enforced; subagents do not inherit parent `PreToolUse` hooks)
+- **REST API** -- `/health`, `/api/search`, `/api/context`, `/api/status`, `/api/grep`, `/api/file_envelope` alongside the MCP server
+- **Per-tool timeout wrapping** -- every non-reindex `#[tool]` body wrapped in `tokio::time::timeout(30s, ...)`; clients see structured `McpError` instead of hanging connections on stuck tools
+- **Per-tool invocation counters** -- `StatsTracker::tool_invocations` `DashMap` for utilization A/B-testing
 - **Prometheus metrics** -- `/metrics` endpoint + `pgmcp stats` CLI
 
 ---
@@ -143,7 +154,7 @@ High-level project understanding and engineering quality assessment.
                        │                      pgmcp daemon                    │
                        │                                                      │
                        │  ┌── Interface Layer ───────┬───────────┬─────────┐  │
-                       │  │  MCP Server (40 tools)   │  REST API │   CLI   │  │
+                       │  │  MCP Server (41 tools)   │  REST API │   CLI   │  │
                        │  └───────────┬──────────────┴───────────┴─────────┘  │
                        │              │                                       │
                        │  ┌── Analysis Layer ──────────┬──────┬────────────┐  │
@@ -191,7 +202,7 @@ High-level project understanding and engineering quality assessment.
    processing and only finalized after all chunks succeed -- crash-safe by design
 7. **Analysis cron jobs** (graph, topics, similarity) run in the background after the
    initial scan completes, populating derived tables that the analysis tools query
-8. **MCP clients** query the index via any of 40 tools over stdio or Streamable HTTP
+8. **MCP clients** query the index via any of 41 tools over stdio or Streamable HTTP
 
 ---
 
@@ -393,7 +404,7 @@ language breakdown, and file tree.
 **UserPromptSubmit Hook** -- runs `~/.claude/hooks/pgmcp-rag.sh` on every user
 prompt. Queries the daemon's `POST /api/search` endpoint with the prompt text and
 injects up to 5 semantically relevant code snippets. Short prompts (< 30 chars)
-are skipped. 3-second timeout with graceful fallback.
+are skipped. 2-second timeout with graceful fallback.
 
 **Configuration** -- add to `~/.claude/settings.json`:
 
@@ -464,6 +475,164 @@ exit 0
 ```
 
 Requires `jq` and `curl` on the system PATH.
+
+---
+
+## pgmcp Utilization (Claude Code Integration)
+
+The auto-RAG hook above enriches *every* prompt, but Claude Code still defaults
+to built-in `Read`/`Grep`/`Glob` for many exploration steps where pgmcp tools
+would produce better results (cross-project semantic queries, graph-aware
+analysis, topic clustering). To bias Claude toward pgmcp's tools, pgmcp ships
+three complementary mechanisms:
+
+1. **Tool-call proxy via `PreToolUse` hooks** — augment or selectively deny
+   `Read`/`Grep`/`Glob` calls at the harness level.
+2. **Subagent containment via `~/.claude/agents/` overrides** — drop `Grep`/`Glob`
+   from spawned-subagent tool catalogs entirely.
+3. **Per-tool invocation counters** in `/api/status` — measure utilization to
+   A/B-test whether the above are working.
+
+The full design rationale (including why an HTTP-level proxy was rejected) lives
+at `~/.claude/plans/thoroughly-examine-home-dylon-workspace-melodic-cake.md`.
+The user-side reference implementation lives in `~/.claude/hooks/` and
+`~/.claude/agents/`.
+
+### `PreToolUse` Hooks (Layer A: Augment + Layer B: Enforce)
+
+Six hook scripts ship at `~/.claude/hooks/`, plus a shared library at
+`~/.claude/hooks/lib/pgmcp-common.sh`. All are non-blocking: they exit 0
+silently when the daemon is down (verified via 300 ms `GET /health`) so a
+pgmcp outage never blocks the user.
+
+**Layer A — augmenting hooks (always on, model-discretionary):**
+
+| Hook                              | Matcher  | Behavior                                                                                                                                                               |
+|-----------------------------------|----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `pgmcp-read-context.sh`           | `Read`   | Calls `POST /api/file_envelope` and injects a 5-line context block (language, size, indexed_at, etc.) alongside the file content.                                      |
+| `pgmcp-grep-companion.sh`         | `Grep`   | When the path is broad (whole repo or no specific path), calls `POST /api/grep` and injects up to 10 cross-project hits alongside the native Grep result.             |
+| `pgmcp-glob-suggestion.sh`        | `Glob`   | When the pattern is broad (`**/*.rs` from project root), emits a one-line suggestion to use `mcp__pgmcp__orient`/`semantic_search`/`project_tree` instead.            |
+
+Augmenting hooks emit `additionalContext` and never block tool execution. They
+are model-discretionary — the model decides whether to act on the injected
+context.
+
+**Layer B — enforce hooks (opt-in, harness-enforced):**
+
+| Hook                              | Matcher  | Behavior                                                                                                                                                                     |
+|-----------------------------------|----------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `pgmcp-grep-enforce.sh`           | `Grep`   | When `PGMCP_HOOK_MODE=enforce` AND path is broad AND pattern length ≥ 3 chars, returns `permissionDecision: "deny"` and tells the model to use `mcp__pgmcp__grep` instead.   |
+| `pgmcp-glob-enforce.sh`           | `Glob`   | When `PGMCP_HOOK_MODE=enforce` AND pattern is broad, returns `permissionDecision: "deny"` and tells the model to use `mcp__pgmcp__project_tree` or `mcp__pgmcp__orient`.    |
+
+Enforce hooks use the same `permissionDecision: "deny"` primitive as
+`~/.claude/git-guard.sh` — the harness refuses the tool call regardless of
+model intent. There is **no** enforce hook for `Read` (too disruptive for
+read-after-write and `.gitignore`'d files).
+
+**Mode summary:**
+
+| Mode (`PGMCP_HOOK_MODE`)  | Activation                  | What happens                                                                                                              |
+|---------------------------|-----------------------------|---------------------------------------------------------------------------------------------------------------------------|
+| `augment-only` (default)  | Always on                   | Layer A injects context; Layer B short-circuits. Soft nudging.                                                            |
+| `enforce`                 | `PGMCP_HOOK_MODE=enforce …` | Layer B returns `permissionDecision: "deny"` for broad `Grep`/`Glob`. Native tool still allowed for narrow patterns.       |
+| `permissive`              | `PGMCP_HOOK_MODE=permissive`| Same as `augment-only`; explicit override for sessions where enforce is configured per-project but the user wants out.    |
+
+**Configuration** -- add to `~/.claude/settings.json` `PreToolUse` array
+(alongside any existing `Bash`/etc. entries):
+
+```json
+{ "matcher": "Read",  "hooks": [
+  { "type": "command", "command": "~/.claude/hooks/pgmcp-read-context.sh",   "timeout": 2000 }
+]},
+{ "matcher": "Grep",  "hooks": [
+  { "type": "command", "command": "~/.claude/hooks/pgmcp-grep-companion.sh", "timeout": 3000 },
+  { "type": "command", "command": "~/.claude/hooks/pgmcp-grep-enforce.sh",   "timeout": 1500 }
+]},
+{ "matcher": "Glob",  "hooks": [
+  { "type": "command", "command": "~/.claude/hooks/pgmcp-glob-suggestion.sh","timeout": 1000 },
+  { "type": "command", "command": "~/.claude/hooks/pgmcp-glob-enforce.sh",   "timeout": 1000 }
+]}
+```
+
+The two `Grep` and two `Glob` matchers chain — both run for each tool call.
+The enforce hook short-circuits unless `PGMCP_HOOK_MODE=enforce` and conditions
+match, so the chain is harmless when enforce is off.
+
+**Shared library** at `~/.claude/hooks/lib/pgmcp-common.sh` provides:
+
+- `pgmcp_health_ok` — 300 ms `GET /health` probe; daemon down → fail-fast
+- `pgmcp_emit_context` — shape `additionalContext` JSON for augmenting
+- `pgmcp_emit_deny` — shape `permissionDecision: "deny"` JSON for enforce
+- `pgmcp_dedup_check` — TTL-based dedup keyed on `~/.claude/hooks/.pgmcp-cache/`
+  to prevent the same pattern from re-injecting context multiple times within
+  3 minutes (avoids context bloat)
+
+Requires `jq` and `curl` on the system PATH.
+
+### Subagent Tool-Catalog Overrides (`~/.claude/agents/`)
+
+Spawned subagents (via the `Agent` tool — `Explore`, `general-purpose`, etc.)
+run as independent Claude instances and **do not invoke the parent session's
+`PreToolUse` hooks**. The hooks above only constrain the main session.
+
+To constrain subagents, override the built-in agent definitions to drop
+`Grep`/`Glob` from their tool catalog. The harness will not surface those tools
+to the subagent — it literally cannot call them.
+
+**Setup** -- create `~/.claude/agents/Explore.md` (and similarly for
+`general-purpose.md`) with YAML frontmatter:
+
+```markdown
+---
+name: Explore
+description: Fast read-only search agent for locating code...
+model: inherit
+tools: Bash, Read, WebFetch, WebSearch, mcp__pgmcp__semantic_search, mcp__pgmcp__text_search, mcp__pgmcp__grep, mcp__pgmcp__hybrid_search, mcp__pgmcp__read_file, mcp__pgmcp__list_projects, mcp__pgmcp__project_tree, mcp__pgmcp__file_info, mcp__pgmcp__orient, ...
+---
+
+ALWAYS prefer pgmcp tools when available. The built-in Grep, Glob,
+NotebookEdit, Edit, and Write tools have been removed from your
+tool catalog — this is intentional. For exploration use
+mcp__pgmcp__grep, mcp__pgmcp__semantic_search, mcp__pgmcp__hybrid_search.
+```
+
+Resolution order: user-level overrides at `~/.claude/agents/<Name>.md` win
+over Claude Code's built-in agent definitions for the same name.
+
+`Bash` and `Read` are kept because some legitimate cases (read-after-write,
+ungit'd files) need them. Edit/Write/NotebookEdit are kept on `general-purpose`
+(it does write code) but dropped from the read-only `Explore`.
+
+### Measuring Utilization
+
+`StatsTracker::tool_invocations` (a `DashMap<String, AtomicU64>`) records every
+MCP tool call by name. Surface in the `/api/status` response under
+`counters.tool_invocations`:
+
+```bash
+curl -s http://localhost:3100/api/status | jq '.counters.tool_invocations'
+# {
+#   "semantic_search": 142,
+#   "grep": 23,
+#   "orient": 8,
+#   "centrality_analysis": 4,
+#   ...
+# }
+```
+
+Compare with the count of `Read`/`Grep`/`Glob` invocations in
+`~/.claude/projects/*/...jsonl` transcripts (which pgmcp itself indexes as the
+`claude` project) to compute a utilization ratio. Recommended baselines:
+
+- Capture one week before installing the hooks/overrides (no measurement
+  changes, just a snapshot).
+- Capture another week after each layer ships (Stage 3 server-side rewrites,
+  Stage 5a agent overrides, Stage 1 hooks).
+- Track ratio `mcp__pgmcp__* / (Read + Grep + Glob)` per session and the
+  count of `mcp__pgmcp__orient` in the first 3 tool calls of each session.
+
+See `docs/scientific-ledger/recovery-times-2026-04-28.md` for related
+empirical-baseline methodology.
 
 ---
 
@@ -776,7 +945,7 @@ pgmcp analyze graph              # Run only graph analysis
 pgmcp results                   # Print cached analysis results (similarity + topics)
 pgmcp results similarity        # Print similarity results only
 pgmcp results topics             # Print topic results only
-pgmcp tool                      # List all 40 MCP tools
+pgmcp tool                      # List all 41 MCP tools
 pgmcp tool <name> [KEY=VALUE]   # Run any MCP tool from the command line
 pgmcp tool <name> --schema      # Show tool's JSON Schema
 pgmcp tool <name> --json [args] # Output compact JSON (for piping to jq)
@@ -838,7 +1007,48 @@ HTTP at `/mcp`.
 
 ## REST API
 
-In daemon mode, pgmcp exposes two REST API endpoints alongside the MCP server.
+In daemon mode, pgmcp exposes a small REST surface alongside the MCP server.
+Endpoints (registered at `src/cli/daemon.rs`):
+
+| Endpoint                  | Method | Purpose                                                                                                          |
+|---------------------------|--------|------------------------------------------------------------------------------------------------------------------|
+| `/health`                 | GET    | Cheap liveness probe (no DB queries). 200 when daemon is `Ready`, 503 otherwise.                                 |
+| `/api/search`             | POST   | Semantic search; embeds query, runs vector ranking. Used by `~/.claude/hooks/pgmcp-rag.sh`.                      |
+| `/api/context`            | GET    | Project context for a working directory; used by `pgmcp context` CLI and the SessionStart hook.                  |
+| `/api/status`             | GET    | Rich status snapshot — daemon phase, pool state, embeddings config, indexing counters, MCP session counts, etc.  |
+| `/api/grep`               | POST   | Cross-project regex grep. Used by `~/.claude/hooks/pgmcp-grep-companion.sh`.                                     |
+| `/api/file_envelope`      | POST   | File metadata envelope (language, line count, last_indexed_at). Used by `~/.claude/hooks/pgmcp-read-context.sh`. |
+
+The MCP server is also mounted at `/mcp` (Streamable HTTP transport). All
+endpoints share a single Axum router and an `ApiState` that includes the
+`DbClient`, query embedder, config, stats tracker, and `DaemonLifecycle`.
+
+### `GET /health` -- Cheap Liveness Probe
+
+Sub-millisecond probe that reads only the atomic `DaemonPhase` — no DB queries,
+no model touch. Designed to be polled at high frequency by k8s probes, systemd
+watchdogs, uptime monitors, and the `~/.claude/hooks/pgmcp-*.sh` PreToolUse
+hooks (which check it with a 300 ms timeout to fail-fast on daemon outage).
+
+| Phase          | HTTP Status         | Body                              |
+|----------------|---------------------|-----------------------------------|
+| `Ready`        | 200 OK              | `{"phase": "ready"}`              |
+| `Initializing` | 503 SERVICE_UNAVAIL | `{"phase": "initializing"}`       |
+| `Scanning`     | 503 SERVICE_UNAVAIL | `{"phase": "scanning"}`           |
+| `Terminating`  | 503 SERVICE_UNAVAIL | `{"phase": "terminating"}`        |
+| `Defunct`      | 503 SERVICE_UNAVAIL | `{"phase": "defunct"}`            |
+
+**Example:**
+
+```bash
+curl -i -m 0.3 http://localhost:3100/health
+# HTTP/1.1 200 OK
+# {"phase":"ready"}
+```
+
+Distinct from `/api/status`, which returns rich state but issues ~10 SQL
+`COUNT(*)` queries — appropriate for occasional inspection, not high-frequency
+liveness polling.
 
 ### `POST /api/search` -- Semantic Search
 
@@ -922,6 +1132,118 @@ Retrieve project context for a given working directory.
 }
 ```
 
+### `GET /api/status` -- Daemon Status Snapshot
+
+Comprehensive snapshot of daemon state, indexing progress, pool capacity,
+embeddings configuration, and live counters. Issues ~10 cheap SQL `COUNT(*)`
+queries plus an atomic snapshot of `StatsTracker`.
+
+**Response (abridged):**
+
+```json
+{
+  "daemon": {
+    "version": "0.1.0",
+    "uptime_secs": 3600,
+    "current_rss_bytes": 524288000,
+    "peak_rss_bytes": 1073741824,
+    "heavy_cron_running": false,
+    "http_mcp_sessions": 1,
+    "bind_addr": "127.0.0.1:3100"
+  },
+  "database": { "host": "localhost", "port": 5432, "pool_size": 10, "pool_active": 2, ... },
+  "embeddings": { "model": "all-MiniLM-L6-v2", "dimensions": 384, "backend": "candle", "device": "cuda:0", ... },
+  "pools": { "inference": {...}, "cron": {...}, "general": {...} },
+  "model_state": { "project_count": 14, "indexed_file_count": 21847, "chunk_count": 92418, ... },
+  "counters": {
+    "files_indexed": 21847,
+    "semantic_searches": 142,
+    "tool_invocations": {
+      "semantic_search": 142,
+      "grep": 23,
+      "orient": 8,
+      "...": "..."
+    }
+  }
+}
+```
+
+The `counters.tool_invocations` map is populated by `StatsTracker::record_tool_call()`
+at the top of each `#[tool]` body — useful for A/B-testing utilization
+(see [pgmcp Utilization](#pgmcp-utilization-claude-code-integration) below).
+
+### `POST /api/grep` -- Cross-Project Regex Grep
+
+Server-side regex search across all indexed files. Used by the
+`~/.claude/hooks/pgmcp-grep-companion.sh` PreToolUse hook to inject cross-project
+hits alongside the native `Grep` tool's output.
+
+**Request body:**
+
+```json
+{
+  "pattern": "FcmBackend",
+  "glob": "*.rs",
+  "limit": 10
+}
+```
+
+`glob` and `limit` are optional. `limit` clamped to `[1, 50]`, default 10.
+
+**Response:**
+
+```json
+{
+  "results": [
+    {
+      "path": "/home/dylon/Workspace/f1r3fly.io/pgmcp/src/fcm/cpu.rs",
+      "relative_path": "src/fcm/cpu.rs",
+      "language": "rust",
+      "content": "impl FcmBackend for CpuFcmBackend { ... }"
+    }
+  ],
+  "truncated": false
+}
+```
+
+`truncated` is true when `results.len() == limit` (more matches available).
+
+### `POST /api/file_envelope` -- File Metadata Envelope
+
+Compact metadata for a specific path: language, line count, indexed_at, etc.
+Used by `~/.claude/hooks/pgmcp-read-context.sh` to inject a one-line context
+block alongside any `Read` tool call.
+
+**Request body:**
+
+```json
+{ "path": "/home/dylon/Workspace/f1r3fly.io/pgmcp/src/lib.rs" }
+```
+
+**Response (file in index):**
+
+```json
+{
+  "found": true,
+  "info": {
+    "path": "/home/dylon/Workspace/f1r3fly.io/pgmcp/src/lib.rs",
+    "relative_path": "src/lib.rs",
+    "language": "rust",
+    "size_bytes": 1234,
+    "line_count": 42,
+    "truncated": false,
+    "indexed_at": "2026-04-28T12:34:56Z",
+    "modified_at": "2026-04-28T12:30:00Z"
+  }
+}
+```
+
+**Response (file not in index — e.g., just written or `.gitignore`'d):**
+
+```json
+{ "found": false, "info": null }
+```
+
 ---
 
 ## MCP Capabilities
@@ -930,7 +1252,7 @@ pgmcp advertises 5 of 8 MCP capabilities:
 
 | Capability      | Description                                                                   |
 |-----------------|-------------------------------------------------------------------------------|
-| **Tools**       | 40 tools across 8 capability tiers                                            |
+| **Tools**       | 41 tools across 8 capability tiers                                            |
 | **Resources**   | 2 static resources + 3 resource templates with URI parameters                 |
 | **Completions** | Auto-completion for resource template parameters (`{name}`, `{path}`)         |
 | **Logging**     | Server-to-client log push with dynamic verbosity control via `set_level()`    |
@@ -990,6 +1312,13 @@ endpoint at `http://127.0.0.1:9464/metrics`.
 
 Over 60 additional counters track analysis jobs, embedding operations, git indexing,
 config reloads, and tool invocations. See `pgmcp tool index_stats` for the full set.
+
+**Per-tool invocation map** -- `StatsTracker::tool_invocations` (a
+`DashMap<String, AtomicU64>`) records every MCP tool call by name (e.g.
+`semantic_search`, `grep`, `orient`). Surfaced under
+`/api/status` → `counters.tool_invocations` rather than as individual
+Prometheus metrics, since the key set is dynamic (new tools auto-register).
+Used to A/B-test pgmcp utilization (see [pgmcp Utilization](#pgmcp-utilization-claude-code-integration) above).
 
 ### CLI Stats
 

@@ -65,6 +65,11 @@ async fn discover_topics_realtime_partitions_synthetic_corpus_into_three_cluster
         config,
         log_broadcaster,
         task_store,
+        {
+            let __l = pgmcp::daemon_state::DaemonLifecycle::new();
+            __l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+            __l
+        },
     );
     let server = McpServer::new(ctx);
 
@@ -149,6 +154,11 @@ async fn discover_topics_global_cached_path_returns_persisted_topics() {
         config,
         log_broadcaster,
         task_store,
+        {
+            let __l = pgmcp::daemon_state::DaemonLifecycle::new();
+            __l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+            __l
+        },
     );
     let server = McpServer::new(ctx);
 

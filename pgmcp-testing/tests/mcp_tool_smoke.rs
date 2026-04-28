@@ -34,8 +34,19 @@ fn server_with_mock(mock: MockDbClient) -> McpServer {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_source = EmbedSource::lazy(Config::default().embeddings);
-    let ctx =
-        SystemContext::production(db, embed_source, stats, config, log_broadcaster, task_store);
+    let ctx = SystemContext::production(
+        db,
+        embed_source,
+        stats,
+        config,
+        log_broadcaster,
+        task_store,
+        {
+            let __l = pgmcp::daemon_state::DaemonLifecycle::new();
+            __l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+            __l
+        },
+    );
     McpServer::new(ctx)
 }
 
@@ -121,8 +132,19 @@ async fn tool_list_projects_direct_call() {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_source = EmbedSource::lazy(Config::default().embeddings);
-    let ctx =
-        SystemContext::production(db, embed_source, stats, config, log_broadcaster, task_store);
+    let ctx = SystemContext::production(
+        db,
+        embed_source,
+        stats,
+        config,
+        log_broadcaster,
+        task_store,
+        {
+            let __l = pgmcp::daemon_state::DaemonLifecycle::new();
+            __l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+            __l
+        },
+    );
 
     let result = pgmcp::mcp::tools::tool_list_projects(&ctx)
         .await
@@ -191,8 +213,19 @@ async fn semantic_search_pipeline_with_mock_embedder_and_db() {
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
         Arc::new(DeterministicEmbeddingBackend::new(384));
     let embed_source = EmbedSource::backend(embed_backend);
-    let ctx =
-        SystemContext::production(db, embed_source, stats, config, log_broadcaster, task_store);
+    let ctx = SystemContext::production(
+        db,
+        embed_source,
+        stats,
+        config,
+        log_broadcaster,
+        task_store,
+        {
+            let __l = pgmcp::daemon_state::DaemonLifecycle::new();
+            __l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+            __l
+        },
+    );
     let server = McpServer::new(ctx);
 
     let result = server
@@ -502,8 +535,19 @@ async fn hybrid_search_merges_semantic_and_text_results() {
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
         Arc::new(DeterministicEmbeddingBackend::new(384));
     let embed_source = EmbedSource::backend(embed_backend);
-    let ctx =
-        SystemContext::production(db, embed_source, stats, config, log_broadcaster, task_store);
+    let ctx = SystemContext::production(
+        db,
+        embed_source,
+        stats,
+        config,
+        log_broadcaster,
+        task_store,
+        {
+            let __l = pgmcp::daemon_state::DaemonLifecycle::new();
+            __l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+            __l
+        },
+    );
     let server = McpServer::new(ctx);
 
     let result = server
@@ -1047,6 +1091,11 @@ async fn semantic_search_empty_mock_returns_empty_results() {
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn EmbeddingBackend> =
         Arc::new(DeterministicEmbeddingBackend::new(384));
+    let lifecycle = {
+        let l = pgmcp::daemon_state::DaemonLifecycle::new();
+        l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+        l
+    };
     let ctx = SystemContext::production(
         db,
         EmbedSource::backend(embed_backend),
@@ -1054,6 +1103,7 @@ async fn semantic_search_empty_mock_returns_empty_results() {
         config,
         log_broadcaster,
         task_store,
+        lifecycle,
     );
     let server = McpServer::new(ctx);
     let result = server
@@ -1085,6 +1135,11 @@ async fn semantic_search_with_project_filter_forwards_param() {
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn EmbeddingBackend> =
         Arc::new(DeterministicEmbeddingBackend::new(384));
+    let lifecycle = {
+        let l = pgmcp::daemon_state::DaemonLifecycle::new();
+        l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+        l
+    };
     let ctx = SystemContext::production(
         db,
         EmbedSource::backend(embed_backend),
@@ -1092,6 +1147,7 @@ async fn semantic_search_with_project_filter_forwards_param() {
         config,
         log_broadcaster,
         task_store,
+        lifecycle,
     );
     let server = McpServer::new(ctx);
     let result = server
@@ -1331,6 +1387,11 @@ async fn search_commits_empty_returns_empty_list() {
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn EmbeddingBackend> =
         Arc::new(DeterministicEmbeddingBackend::new(384));
+    let lifecycle = {
+        let l = pgmcp::daemon_state::DaemonLifecycle::new();
+        l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+        l
+    };
     let ctx = SystemContext::production(
         db,
         EmbedSource::backend(embed_backend),
@@ -1338,6 +1399,7 @@ async fn search_commits_empty_returns_empty_list() {
         config,
         log_broadcaster,
         task_store,
+        lifecycle,
     );
     let server = McpServer::new(ctx);
     let result = server
@@ -1358,6 +1420,11 @@ async fn hybrid_search_empty_sides_return_empty_merge() {
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn EmbeddingBackend> =
         Arc::new(DeterministicEmbeddingBackend::new(384));
+    let lifecycle = {
+        let l = pgmcp::daemon_state::DaemonLifecycle::new();
+        l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+        l
+    };
     let ctx = SystemContext::production(
         db,
         EmbedSource::backend(embed_backend),
@@ -1365,6 +1432,7 @@ async fn hybrid_search_empty_sides_return_empty_merge() {
         config,
         log_broadcaster,
         task_store,
+        lifecycle,
     );
     let server = McpServer::new(ctx);
     let result = server

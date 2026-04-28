@@ -295,6 +295,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         Arc::clone(&config),
         Arc::clone(&log_broadcaster),
         Arc::clone(&task_store),
+        lifecycle.clone(),
     );
 
     // 10. Start file watcher + scanner
@@ -369,13 +370,20 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             query_embedder: query_embedder.clone(),
             config: Arc::clone(&config),
             stats: Arc::clone(&stats_tracker),
+            lifecycle: lifecycle.clone(),
         };
 
         let router = axum::Router::new()
             .nest_service("/mcp", mcp_service)
+            .route("/health", axum::routing::get(api::handlers::health))
             .route("/api/search", axum::routing::post(api::handlers::search))
             .route("/api/context", axum::routing::get(api::handlers::context))
             .route("/api/status", axum::routing::get(api::handlers::status))
+            .route("/api/grep", axum::routing::post(api::handlers::grep))
+            .route(
+                "/api/file_envelope",
+                axum::routing::post(api::handlers::file_envelope),
+            )
             .with_state(api_state);
         let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)
             .await

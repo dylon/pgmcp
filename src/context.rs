@@ -26,6 +26,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 use crate::config::Config;
+use crate::daemon_state::DaemonLifecycle;
 use crate::db::DbClient;
 use crate::embed::EmbedSource;
 use crate::mcp::logging::LogBroadcaster;
@@ -41,6 +42,14 @@ pub struct SystemContext {
     config: Arc<ArcSwap<Config>>,
     log_broadcaster: Arc<LogBroadcaster>,
     task_store: Arc<TaskStore>,
+    /// Daemon lifecycle phase. In daemon mode this is the same handle the
+    /// scanner/cron/MCP all read; CLI tool invocations construct a fresh
+    /// `DaemonLifecycle` and immediately advance it to `Ready` so trait
+    /// callers get a sensible answer when the CLI binary calls a tool
+    /// directly without a running daemon. `DaemonLifecycle` is already
+    /// internally `Arc<AtomicU8>` + `Arc<Subject>`, so we hold by value
+    /// and rely on its derived `Clone` for cheap propagation.
+    lifecycle: DaemonLifecycle,
 }
 
 impl SystemContext {
@@ -56,6 +65,7 @@ impl SystemContext {
         config: Arc<ArcSwap<Config>>,
         log_broadcaster: Arc<LogBroadcaster>,
         task_store: Arc<TaskStore>,
+        lifecycle: DaemonLifecycle,
     ) -> Self {
         Self {
             db,
@@ -64,6 +74,7 @@ impl SystemContext {
             config,
             log_broadcaster,
             task_store,
+            lifecycle,
         }
     }
 
@@ -89,6 +100,10 @@ impl SystemContext {
 
     pub fn task_store(&self) -> &Arc<TaskStore> {
         &self.task_store
+    }
+
+    pub fn lifecycle(&self) -> &DaemonLifecycle {
+        &self.lifecycle
     }
 }
 

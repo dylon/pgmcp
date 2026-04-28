@@ -32,6 +32,8 @@ pub fn server_with_pool(pool: sqlx::PgPool) -> McpServer {
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn EmbeddingBackend> =
         Arc::new(DeterministicEmbeddingBackend::new(384));
+    let lifecycle = pgmcp::daemon_state::DaemonLifecycle::new();
+    lifecycle.transition(pgmcp::daemon_state::DaemonPhase::Ready);
     let ctx = SystemContext::production(
         db,
         EmbedSource::backend(embed_backend),
@@ -39,6 +41,7 @@ pub fn server_with_pool(pool: sqlx::PgPool) -> McpServer {
         config,
         log_broadcaster,
         task_store,
+        lifecycle,
     );
     McpServer::new(ctx)
 }

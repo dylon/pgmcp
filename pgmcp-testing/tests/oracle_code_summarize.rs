@@ -53,6 +53,11 @@ async fn code_summarize_reports_correct_file_lang_topic_counts_for_synthetic_cor
         config,
         log_broadcaster,
         task_store,
+        {
+            let __l = pgmcp::daemon_state::DaemonLifecycle::new();
+            __l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+            __l
+        },
     );
     let server = McpServer::new(ctx);
 
@@ -137,6 +142,11 @@ async fn code_summarize_brief_detail_omits_topics_field() {
         config,
         log_broadcaster,
         task_store,
+        {
+            let __l = pgmcp::daemon_state::DaemonLifecycle::new();
+            __l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+            __l
+        },
     );
     let server = McpServer::new(ctx);
 

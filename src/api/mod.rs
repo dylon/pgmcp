@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 use crate::config::Config;
+use crate::daemon_state::DaemonLifecycle;
 use crate::db::DbClient;
 use crate::embed::pool::QueryEmbedder;
 use crate::stats::tracker::StatsTracker;
@@ -18,4 +19,8 @@ pub struct ApiState {
     /// Live in-process counters. The `/api/status` endpoint reads
     /// `http_mcp_sessions` and the model-scan counters from this.
     pub stats: Arc<StatsTracker>,
+    /// Daemon lifecycle phase. The `/health` endpoint reads this for
+    /// cheap 200/503 liveness without touching the database.
+    /// `DaemonLifecycle` is `Clone` (internally Arc) so this is cheap.
+    pub lifecycle: DaemonLifecycle,
 }

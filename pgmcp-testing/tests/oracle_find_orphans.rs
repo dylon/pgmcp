@@ -35,8 +35,19 @@ fn server_with_mock(mock: MockDbClient) -> McpServer {
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
         Arc::new(DeterministicEmbeddingBackend::new(384));
     let embed_source = EmbedSource::backend(embed_backend);
-    let ctx =
-        SystemContext::production(db, embed_source, stats, config, log_broadcaster, task_store);
+    let ctx = SystemContext::production(
+        db,
+        embed_source,
+        stats,
+        config,
+        log_broadcaster,
+        task_store,
+        {
+            let __l = pgmcp::daemon_state::DaemonLifecycle::new();
+            __l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
+            __l
+        },
+    );
     McpServer::new(ctx)
 }
 

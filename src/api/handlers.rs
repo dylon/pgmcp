@@ -3,10 +3,119 @@
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
+use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use super::ApiState;
+use crate::daemon_state::DaemonPhase;
 use crate::db::queries::{StatusSnapshot, status_snapshot};
+
+// ============================================================================
+// GET /health — Cheap liveness probe (no DB queries, no model touch)
+// ============================================================================
+
+/// Lightweight liveness probe for k8s probes, systemd watchdogs, uptime
+/// monitors, and the `~/.claude/hooks/pgmcp-*.sh` PreToolUse hooks
+/// (which check this with a 300 ms timeout before deciding whether to
+/// inject pgmcp context). Reads only an atomic phase from the
+/// `DaemonLifecycle` — does not touch the DB or any worker pool.
+///
+/// 200 OK with `{"phase": "ready"}` when the daemon is in the `Ready`
+/// phase. 503 SERVICE_UNAVAILABLE with `{"phase": "<label>"}` for any
+/// other phase (Initializing/Scanning/Terminating/Defunct).
+///
+/// Intended to be polled at high frequency. Distinct from `/api/status`,
+/// which returns a rich snapshot but issues ~10 SQL `COUNT(*)` queries.
+pub async fn health(State(state): State<ApiState>) -> impl IntoResponse {
+    let phase = state.lifecycle.current();
+    let body = Json(serde_json::json!({ "phase": phase.label() }));
+    if phase == DaemonPhase::Ready {
+        (StatusCode::OK, body)
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, body)
+    }
+}
+
+// ============================================================================
+// POST /api/grep — Cross-project regex grep (REST mirror of mcp__pgmcp__grep)
+// ============================================================================
+
+/// Used by the `~/.claude/hooks/pgmcp-grep-companion.sh` PreToolUse hook
+/// when the model issues a broad-path `Grep`. Hook calls this and injects
+/// pgmcp's cross-project hits into the model's context alongside the
+/// native `Grep` result.
+#[derive(Debug, Deserialize)]
+pub struct GrepRequest {
+    pub pattern: String,
+    pub glob: Option<String>,
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct GrepResponse {
+    pub results: Vec<crate::db::queries::GrepResult>,
+    pub truncated: bool,
+}
+
+pub async fn grep(
+    State(state): State<ApiState>,
+    Json(req): Json<GrepRequest>,
+) -> Result<Json<GrepResponse>, (StatusCode, String)> {
+    // Clamp limit to [1, 50] — the hook caps its own injection at 10, but
+    // give a small buffer for direct callers.
+    let limit = req.limit.unwrap_or(10).clamp(1, 50);
+
+    let results = state
+        .db
+        .grep_search(&req.pattern, req.glob.as_deref(), limit)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("grep_search failed: {}", e),
+            )
+        })?;
+
+    let truncated = results.len() == limit as usize;
+    Ok(Json(GrepResponse { results, truncated }))
+}
+
+// ============================================================================
+// POST /api/file_envelope — File metadata for the read-context hook
+// ============================================================================
+
+/// Compact envelope returned to `~/.claude/hooks/pgmcp-read-context.sh`
+/// when the model is about to `Read` a file: language, line count,
+/// last_indexed_at. Future expansion will include centrality_rank,
+/// top_topics, top_coupled_files, and recent_commits — for now it returns
+/// what the trait already exposes via `file_info`.
+#[derive(Debug, Deserialize)]
+pub struct FileEnvelopeRequest {
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct FileEnvelopeResponse {
+    pub found: bool,
+    pub info: Option<crate::db::queries::FileInfo>,
+}
+
+pub async fn file_envelope(
+    State(state): State<ApiState>,
+    Json(req): Json<FileEnvelopeRequest>,
+) -> Result<Json<FileEnvelopeResponse>, (StatusCode, String)> {
+    let info = state.db.file_info(&req.path).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("file_info failed: {}", e),
+        )
+    })?;
+
+    Ok(Json(FileEnvelopeResponse {
+        found: info.is_some(),
+        info,
+    }))
+}
 
 // ============================================================================
 // POST /api/search — Semantic search

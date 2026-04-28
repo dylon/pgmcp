@@ -22,6 +22,32 @@ use crate::stats::tracker::StatsTracker;
 use super::logging::LogBroadcaster;
 use super::tasks::TaskStore;
 
+/// Wrap a tool's delegated future in a `tokio::time::timeout`. Tools
+/// that exceed their budget surface a structured `McpError` instead of
+/// hanging the harness; clients see a recognizable error rather than
+/// dropping the connection. Stage 4b of the pgmcp-utilization plan
+/// (`~/.claude/plans/thoroughly-examine-home-dylon-workspace-melodic-cake.md`).
+///
+/// Default budget is 30 s. `reindex` is the only tool exempt — it can
+/// run for minutes when re-indexing a large workspace, and its progress
+/// is reported via the MCP task store, not the immediate response.
+pub(crate) async fn timeout_wrap<F>(
+    name: &str,
+    secs: u64,
+    fut: F,
+) -> Result<CallToolResult, McpError>
+where
+    F: std::future::Future<Output = Result<CallToolResult, McpError>>,
+{
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+        Ok(r) => r,
+        Err(_) => Err(McpError::internal_error(
+            format!("{} timed out after {}s", name, secs),
+            None,
+        )),
+    }
+}
+
 /// Truncate a string to at most `max_len` bytes on a valid char boundary.
 pub(crate) fn truncate(s: &str, max_len: usize) -> &str {
     if s.len() <= max_len {
@@ -834,6 +860,12 @@ pub struct ProjectTreeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OrientParams {
+    #[schemars(description = "Project name (as shown by list_projects)")]
+    pub project: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FileInfoParams {
     #[schemars(description = "Absolute path of the file")]
     pub path: String,
@@ -871,107 +903,244 @@ impl McpServer {
         )
     }
 
-    #[tool(
-        description = "Search indexed code using semantic similarity (vector embeddings). Best for conceptual queries like 'error handling' or 'database connection setup'. Filter by project name to scope results. Use project: \"claude\" to search Claude Code session transcripts, memory files, and plans from ~/.claude/."
-    )]
+    #[tool(description = "Vector-similarity search across all indexed files. \
+USE WHEN: query is conceptual ('error handling patterns', 'auth flow', 'how does X work'), \
+cross-project, or you don't know the exact tokens to search for. \
+DO NOT USE WHEN: you have an exact symbol/string and just need its locations — `grep` or \
+the built-in `Grep` is faster. \
+Filter by project name to scope results. Use project: \"claude\" to search past Claude \
+Code session transcripts, memory files, and plans from ~/.claude/.")]
     async fn semantic_search(
         &self,
         Parameters(params): Parameters<SemanticSearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_semantic_search::tool_semantic_search(self.ctx(), params).await
+        self.stats().record_tool_call("semantic_search");
+        timeout_wrap(
+            "semantic_search",
+            30,
+            super::tools::tool_semantic_search::tool_semantic_search(self.ctx(), params),
+        )
+        .await
     }
 
-    #[tool(
-        description = "Search indexed code using PostgreSQL full-text search. Best for exact keyword matches. Searches all indexed projects including Claude Code session transcripts (use the \"claude\" project)."
-    )]
+    #[tool(description = "PostgreSQL full-text search across all indexed files. \
+USE WHEN: searching for exact keywords or phrases across multiple projects, with \
+ranking by relevance. \
+DO NOT USE WHEN: you only need to search the current cwd (built-in `Grep` is faster), \
+or when the query is conceptual rather than lexical (use `semantic_search` instead). \
+Filter by project; use project: \"claude\" to search Claude Code session transcripts.")]
     async fn text_search(
         &self,
         Parameters(params): Parameters<TextSearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_text_search::tool_text_search(self.ctx(), params).await
+        self.stats().record_tool_call("text_search");
+        timeout_wrap(
+            "text_search",
+            30,
+            super::tools::tool_text_search::tool_text_search(self.ctx(), params),
+        )
+        .await
     }
 
-    #[tool(description = "Search indexed files using a regex pattern across file contents.")]
+    #[tool(
+        description = "Regex pattern search across all indexed files (PostgreSQL ~ operator). \
+USE WHEN: searching for a regex across the full indexed codebase or across multiple \
+projects, especially when the model has no idea which project the match is in. \
+DO NOT USE WHEN: you only need to search within the current cwd or a specific small \
+directory tree — the built-in `Grep` tool is faster and respects .gitignore. \
+Returns file paths, line numbers, and matching snippets across all indexed projects."
+    )]
     async fn grep(
         &self,
         Parameters(params): Parameters<GrepParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_grep::tool_grep(self.ctx(), params).await
+        self.stats().record_tool_call("grep");
+        timeout_wrap(
+            "grep",
+            30,
+            super::tools::tool_grep::tool_grep(self.ctx(), params),
+        )
+        .await
     }
 
-    #[tool(description = "Read the content of an indexed file by its absolute path.")]
+    #[tool(
+        description = "Read an indexed file by absolute path, returning its content along with \
+indexing metadata. \
+USE WHEN: reading a file that is part of an indexed project AND you want the metadata \
+envelope (last_indexed_at, language, chunk count). \
+DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), reading a \
+.gitignore'd file, or reading a file outside the indexed workspaces — use the built-in \
+`Read` tool for those."
+    )]
     async fn read_file(
         &self,
         Parameters(params): Parameters<ReadFileParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_read_file::tool_read_file(self.ctx(), params).await
+        self.stats().record_tool_call("read_file");
+        timeout_wrap(
+            "read_file",
+            30,
+            super::tools::tool_read_file::tool_read_file(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(description = "List all discovered projects with file counts.")]
     async fn list_projects(&self) -> Result<CallToolResult, McpError> {
-        super::tools::tool_list_projects::tool_list_projects(self.ctx()).await
+        self.stats().record_tool_call("list_projects");
+        timeout_wrap(
+            "list_projects",
+            30,
+            super::tools::tool_list_projects::tool_list_projects(self.ctx()),
+        )
+        .await
     }
 
-    #[tool(description = "Show the file tree for a project, limited by depth.")]
+    #[tool(
+        description = "Composite first-step orientation snapshot for a project. Bundles project metadata, language breakdown, depth-2 directory tree, key entry points (top files by PageRank), recently-changed files, and top topics into one call. USE WHEN: entering an unfamiliar codebase or starting a non-trivial task — call this before scattering across list_projects/project_tree/centrality_analysis. Returns a `health` envelope flagging stale graph metrics or missing topic data so you can interpret partial results correctly."
+    )]
+    async fn orient(
+        &self,
+        Parameters(params): Parameters<OrientParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("orient");
+        timeout_wrap(
+            "orient",
+            30,
+            super::tools::tool_orient::tool_orient(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Project file tree limited by depth (depth=2 typical). \
+USE WHEN: you want the structural overview of a project without enumerating every file \
+yourself via `Glob`. \
+DO NOT USE WHEN: you only need to glob within a specific subdirectory — the built-in \
+`Glob` tool gives you exact pattern matching against the live filesystem. \
+For unfamiliar projects, prefer `orient` which bundles project_tree, top topics, and key \
+entry points.")]
     async fn project_tree(
         &self,
         Parameters(params): Parameters<ProjectTreeParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_project_tree::tool_project_tree(self.ctx(), params).await
+        self.stats().record_tool_call("project_tree");
+        timeout_wrap(
+            "project_tree",
+            30,
+            super::tools::tool_project_tree::tool_project_tree(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Get metadata about an indexed file (size, language, line count, last indexed)."
+        description = "Indexed-file metadata envelope (size, language, line count, \
+last_indexed_at, project name, chunk count). \
+USE WHEN: you want a quick fingerprint of a file before deciding whether to read it, \
+or before semantic_search/grep on it specifically. \
+DO NOT USE WHEN: the file is not in the index (e.g., just written, .gitignore'd) — \
+use the built-in `Bash: stat` or `Read` instead."
     )]
     async fn file_info(
         &self,
         Parameters(params): Parameters<FileInfoParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_file_info::tool_file_info(self.ctx(), params).await
+        self.stats().record_tool_call("file_info");
+        timeout_wrap(
+            "file_info",
+            30,
+            super::tools::tool_file_info::tool_file_info(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
         description = "Get overall indexing statistics including file counts, search counts, and pool state."
     )]
     async fn index_stats(&self) -> Result<CallToolResult, McpError> {
-        super::tools::tool_index_stats::tool_index_stats(self.ctx()).await
+        self.stats().record_tool_call("index_stats");
+        timeout_wrap(
+            "index_stats",
+            30,
+            super::tools::tool_index_stats::tool_index_stats(self.ctx()),
+        )
+        .await
     }
 
     #[tool(
         description = "Trigger a full re-index of all workspaces. Clears the existing index and restarts indexing. Can be invoked as a long-running task."
     )]
     async fn reindex(&self) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("reindex");
+        // No timeout: reindex can run for minutes on a large workspace.
+        // Progress is reported via the MCP task store, not the immediate
+        // response — wrapping in 30s would falsely fail every full reindex.
         super::tools::tool_reindex::tool_reindex(self.ctx()).await
     }
 
     #[tool(
-        description = "Compare two specific files by computing chunk-level vector similarity. Always real-time (no dependency on batch scan). Supports project:relative_path syntax (e.g. 'pgmcp:src/work_pool/adaptive.rs') or absolute paths. Returns overall similarity, chunk-by-chunk alignment, and a human-readable verdict."
+        description = "Pairwise file comparison via chunk-level vector similarity. \
+USE WHEN: confirming whether two files implement the same concept, deciding if a candidate \
+refactor target is similar enough to merge, or auditing apparent duplicates. \
+DO NOT USE WHEN: looking for unknown duplicates — use `find_similar_modules` or \
+`find_duplicates` to discover them first. \
+Always real-time (no batch dependency). Path syntax: project:relative or absolute. Returns \
+overall similarity, chunk alignment, and a human-readable verdict."
     )]
     async fn compare_files(
         &self,
         Parameters(params): Parameters<CompareFilesParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_compare_files::tool_compare_files(self.ctx(), params).await
+        self.stats().record_tool_call("compare_files");
+        timeout_wrap(
+            "compare_files",
+            30,
+            super::tools::tool_compare_files::tool_compare_files(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Find modules/files similar to a given one across all indexed projects. Queries the materialized similarity table (populated by periodic batch scan), falling back to listing matching files if no results found. Aggregates chunk-level similarity to file-level (avg, max, matching chunk count)."
+        description = "Find files similar to a given one across all indexed projects. \
+USE WHEN: looking for cross-project copies of a utility, identifying refactor candidates \
+(modules that could share a library), or asking 'has someone else solved this?'. \
+DO NOT USE WHEN: comparing two specific files — use `compare_files`. \
+Queries the materialized similarity table (populated by periodic batch scan); aggregates \
+chunk similarity to file-level avg/max/matching count."
     )]
     async fn find_similar_modules(
         &self,
         Parameters(params): Parameters<FindSimilarModulesParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_find_similar_modules::tool_find_similar_modules(self.ctx(), params).await
+        self.stats().record_tool_call("find_similar_modules");
+        timeout_wrap(
+            "find_similar_modules",
+            30,
+            super::tools::tool_find_similar_modules::tool_find_similar_modules(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Find clusters of duplicated code across projects. Uses union-find clustering on the materialized similarity table to group highly similar files. Filters to clusters spanning min_projects+ distinct projects. Requires the similarity batch scan to have run at least once."
+        description = "Cross-project duplicate-code cluster discovery (union-find on similarity \
+pairs). \
+USE WHEN: looking for refactor opportunities across the user's whole indexed workspace, \
+finding redundant utilities to consolidate, or auditing copy-paste violations. \
+DO NOT USE WHEN: you already know what you're looking for — use `find_similar_modules` \
+with a seed file. \
+Filters to clusters spanning min_projects+ distinct projects. Requires the similarity \
+batch scan to have run at least once."
     )]
     async fn find_duplicates(
         &self,
         Parameters(params): Parameters<FindDuplicatesParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_find_duplicates::tool_find_duplicates(self.ctx(), params).await
+        self.stats().record_tool_call("find_duplicates");
+        timeout_wrap(
+            "find_duplicates",
+            30,
+            super::tools::tool_find_duplicates::tool_find_duplicates(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
@@ -981,27 +1150,55 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<RefactoringReportParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_refactoring_report::tool_refactoring_report(self.ctx(), params).await
+        self.stats().record_tool_call("refactoring_report");
+        timeout_wrap(
+            "refactoring_report",
+            30,
+            super::tools::tool_refactoring_report::tool_refactoring_report(self.ctx(), params),
+        )
+        .await
     }
 
-    #[tool(
-        description = "Search git commit history using semantic similarity. Finds commits by meaning — query with concepts like 'fix database timeout' or 'add authentication'. Returns commit hash, author, date, subject, and matching diff/message content. Requires per-project opt-in via [git] index_history = true in .pgmcp.toml."
-    )]
+    #[tool(description = "Semantic search over git commit messages and diffs. \
+USE WHEN: investigating when a feature was added, when a bug was fixed, how a piece of \
+code evolved, or who last touched a concept ('fix database timeout', 'add authentication'). \
+DO NOT USE WHEN: you have an exact commit hash (`git show <hash>` is faster) or you only \
+need recent commits in the current cwd (`git log` is faster). \
+Requires per-project opt-in via [git] index_history = true in .pgmcp.toml.")]
     async fn search_commits(
         &self,
         Parameters(params): Parameters<SearchCommitsParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_search_commits::tool_search_commits(self.ctx(), params).await
+        self.stats().record_tool_call("search_commits");
+        timeout_wrap(
+            "search_commits",
+            30,
+            super::tools::tool_search_commits::tool_search_commits(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Discover semantic code patterns using Fuzzy C-Means clustering over chunk embeddings (Fuzzy BERTopic with c-TF-IDF labeling). With 'project' param: real-time intra-project analysis showing code patterns and DRY violation candidates. Without 'project': returns cached inter-project pattern discovery results (shared library candidates). Returns topic clusters with keyword labels, membership degrees, representative code snippets, file lists, and internal similarity scores."
+        description = "Discover semantic code patterns via Fuzzy C-Means clustering on chunk \
+embeddings (Fuzzy BERTopic + c-TF-IDF labels). \
+USE WHEN: you want to understand the dominant patterns/concerns in a project (intra-project \
+DRY violations) or shared patterns across projects (cross-project library candidates). \
+DO NOT USE WHEN: you already know the concept and want to find specific instances — use \
+`semantic_search` instead. \
+With `project`: real-time intra-project. Without: cached cross-project results. Returns \
+topic clusters with keyword labels, membership scores, and representative chunks/files."
     )]
     async fn discover_topics(
         &self,
         Parameters(params): Parameters<DiscoverTopicsParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_discover_topics::tool_discover_topics(self.ctx(), params).await
+        self.stats().record_tool_call("discover_topics");
+        timeout_wrap(
+            "discover_topics",
+            30,
+            super::tools::tool_discover_topics::tool_discover_topics(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
@@ -1011,57 +1208,123 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<TopicHierarchyFcmParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_topic_hierarchy_fcm::tool_topic_hierarchy_fcm(self.ctx(), params).await
+        self.stats().record_tool_call("topic_hierarchy_fcm");
+        timeout_wrap(
+            "topic_hierarchy_fcm",
+            30,
+            super::tools::tool_topic_hierarchy_fcm::tool_topic_hierarchy_fcm(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Identify code chunks/files with low topic membership (below threshold). Orphan code may be utility functions, dead code, or candidates for refactoring. Requires discover_topics to have been run first."
+        description = "Find chunks/files with low topic membership (below threshold). \
+USE WHEN: looking for dead code, abandoned utilities, or candidates for deletion. Orphan \
+code is content the topic model couldn't fit anywhere with confidence. \
+DO NOT USE WHEN: looking for files whose semantic doesn't match their directory — use \
+`find_misplaced_code` for that. \
+Requires discover_topics first."
     )]
     async fn find_orphans(
         &self,
         Parameters(params): Parameters<FindOrphansParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_find_orphans::tool_find_orphans(self.ctx(), params).await
+        self.stats().record_tool_call("find_orphans");
+        timeout_wrap(
+            "find_orphans",
+            30,
+            super::tools::tool_find_orphans::tool_find_orphans(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Detect files whose semantic content doesn't match their directory context (architecture recovery). Compares each file's dominant topic against the majority topic of its directory neighbors. High membership entropy also signals misplacement. Requires discover_topics to have been run first."
+        description = "Architecture-recovery: files whose semantic topic doesn't match their \
+directory context. \
+USE WHEN: looking for files in the wrong module, suggesting reorganization, or auditing \
+'why is this in this folder?'. \
+DO NOT USE WHEN: looking for orphans (no topic) — use `find_orphans`. \
+Compares each file's dominant topic vs its directory neighbors' majority. Requires \
+discover_topics first."
     )]
     async fn find_misplaced_code(
         &self,
         Parameters(params): Parameters<FindMisplacedCodeParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_find_misplaced_code::tool_find_misplaced_code(self.ctx(), params).await
+        self.stats().record_tool_call("find_misplaced_code");
+        timeout_wrap(
+            "find_misplaced_code",
+            30,
+            super::tools::tool_find_misplaced_code::tool_find_misplaced_code(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Find files that frequently change together in git commits (co-change coupling via Jaccard similarity). High coupling (>0.7) suggests files that should be in the same module. Requires git history indexing enabled via [git] index_history = true in .pgmcp.toml."
+        description = "Find files that frequently change together in git commits (Jaccard \
+co-change coupling). \
+USE WHEN: planning a refactor and want to know which files will likely need to change \
+together, or assessing whether two files belong in the same module. High coupling >0.7 \
+suggests strong implicit dependency. \
+DO NOT USE WHEN: looking for static dependencies (use `dependency_graph` instead) or \
+semantic similarity (use `find_similar_modules`). \
+Requires [git] index_history = true."
     )]
     async fn find_coupled_files(
         &self,
         Parameters(params): Parameters<FindCoupledFilesParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_find_coupled_files::tool_find_coupled_files(self.ctx(), params).await
+        self.stats().record_tool_call("find_coupled_files");
+        timeout_wrap(
+            "find_coupled_files",
+            30,
+            super::tools::tool_find_coupled_files::tool_find_coupled_files(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Compare topic distribution of test files vs implementation files to find untested areas. Identifies topics with implementation code but no corresponding test coverage. Requires discover_topics to have been run first."
+        description = "Find topics with implementation code but no test coverage. \
+USE WHEN: building a test plan, identifying which subsystems have weak tests, or arguing \
+for resourcing test work in specific areas. \
+DO NOT USE WHEN: you want line-coverage data — pgmcp doesn't run the tests, only \
+classifies files as test/impl based on path heuristics. Use a coverage tool (tarpaulin, \
+llvm-cov) for true coverage. \
+Requires discover_topics first."
     )]
     async fn test_coverage_gaps(
         &self,
         Parameters(params): Parameters<TestCoverageGapsParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_test_coverage_gaps::tool_test_coverage_gaps(self.ctx(), params).await
+        self.stats().record_tool_call("test_coverage_gaps");
+        timeout_wrap(
+            "test_coverage_gaps",
+            30,
+            super::tools::tool_test_coverage_gaps::tool_test_coverage_gaps(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Rank files by composite complexity (size, chunk count, topic diversity, coupling). Identifies refactoring candidates — files with high composite scores handle too many concerns (SRP violation)."
+        description = "Rank files by composite complexity (size + chunk count + topic diversity \
++ coupling). \
+USE WHEN: identifying SRP violations, finding files that 'do too much', or prioritizing \
+refactor targets by raw size/diversity. \
+DO NOT USE WHEN: you want bug-likelihood (use `bug_prediction`) or formal complexity \
+metrics (use `design_metrics` for cyclomatic + WMC + maintainability index). \
+Sortable by: composite (default), size, chunks, topics, coupling."
     )]
     async fn complexity_hotspots(
         &self,
         Parameters(params): Parameters<ComplexityHotspotsParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_complexity_hotspots::tool_complexity_hotspots(self.ctx(), params).await
+        self.stats().record_tool_call("complexity_hotspots");
+        timeout_wrap(
+            "complexity_hotspots",
+            30,
+            super::tools::tool_complexity_hotspots::tool_complexity_hotspots(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
@@ -1071,37 +1334,78 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<TopicHierarchyParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_topic_hierarchy::tool_topic_hierarchy(self.ctx(), params).await
+        self.stats().record_tool_call("topic_hierarchy");
+        timeout_wrap(
+            "topic_hierarchy",
+            30,
+            super::tools::tool_topic_hierarchy::tool_topic_hierarchy(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Find files within a project that cover overlapping topics and should be consolidated. Uses weighted Jaccard similarity on per-file topic distributions, clustered with union-find. Defaults to markdown files but works on any language. Requires discover_topics to have been run first."
+        description = "Find files (default: markdown) covering overlapping topics that should \
+be consolidated. \
+USE WHEN: cleaning up a docs/ directory with redundant pages, or finding code modules \
+that duplicate concerns. \
+DO NOT USE WHEN: looking for line-level duplicates — use `find_duplicates`. This is \
+topic-level, not text-level. \
+Weighted Jaccard on per-file topic distributions, union-find clustered. Set language=\"*\" \
+for all languages."
     )]
     async fn suggest_merges(
         &self,
         Parameters(params): Parameters<SuggestMergesParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_suggest_merges::tool_suggest_merges(self.ctx(), params).await
+        self.stats().record_tool_call("suggest_merges");
+        timeout_wrap(
+            "suggest_merges",
+            30,
+            super::tools::tool_suggest_merges::tool_suggest_merges(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Find files spanning too many distinct topics and suggest where to split them. Uses Shannon entropy of per-file topic distribution to identify candidates, then detects topic transitions aligned to heading boundaries (for markdown) or chunk boundaries. Requires discover_topics to have been run first."
+        description = "Find files spanning too many distinct topics and suggest split points. \
+USE WHEN: a markdown file or source module has grown sprawling, or you suspect an SRP \
+violation that you want broken up cleanly. \
+DO NOT USE WHEN: looking for general complexity hotspots — use `complexity_hotspots`. \
+Splits align to heading boundaries (markdown) or chunk boundaries (code). Shannon-entropy \
+scored. Requires discover_topics first."
     )]
     async fn suggest_splits(
         &self,
         Parameters(params): Parameters<SuggestSplitsParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_suggest_splits::tool_suggest_splits(self.ctx(), params).await
+        self.stats().record_tool_call("suggest_splits");
+        timeout_wrap(
+            "suggest_splits",
+            30,
+            super::tools::tool_suggest_splits::tool_suggest_splits(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Identify code topics that lack corresponding documentation. Compares documentation chunks (markdown files) vs code chunks per topic. Topics with no doc coverage represent code areas with missing documentation. Requires discover_topics to have been run first."
+        description = "Find code topics with no corresponding markdown documentation. \
+USE WHEN: building a docs-debt list, finding sub-systems that exist only in code, or \
+prioritizing where to write documentation. \
+DO NOT USE WHEN: you want to assess docstring quality (comments inside code) — this only \
+considers separate markdown files. \
+Requires discover_topics first."
     )]
     async fn doc_coverage_gaps(
         &self,
         Parameters(params): Parameters<DocCoverageGapsParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_doc_coverage_gaps::tool_doc_coverage_gaps(self.ctx(), params).await
+        self.stats().record_tool_call("doc_coverage_gaps");
+        timeout_wrap(
+            "doc_coverage_gaps",
+            30,
+            super::tools::tool_doc_coverage_gaps::tool_doc_coverage_gaps(self.ctx(), params),
+        )
+        .await
     }
 
     // ========================================================================
@@ -1109,23 +1413,48 @@ impl McpServer {
     // ========================================================================
 
     #[tool(
-        description = "Visualize the dependency graph for a project. Shows import relationships between files, optionally focused on a specific file's neighborhood. Supports summary (counts), edges (full edge list), and DOT (Graphviz) output formats. Requires the graph-analysis cron job to have populated code_graph_edges."
+        description = "Project dependency graph: import relationships, optionally focused on a \
+file's neighborhood. \
+USE WHEN: you need to know what depends on a file, what a file depends on, or want a \
+Graphviz diagram of an architecture. \
+DO NOT USE WHEN: you need co-change behavior (use `find_coupled_files`) or static call \
+graphs (this is import-level only). \
+Output formats: summary (counts), edges (list), DOT (Graphviz). Requires graph-analysis cron."
     )]
     async fn dependency_graph(
         &self,
         Parameters(params): Parameters<DependencyGraphParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_dependency_graph::tool_dependency_graph(self.ctx(), params).await
+        self.stats().record_tool_call("dependency_graph");
+        timeout_wrap(
+            "dependency_graph",
+            30,
+            super::tools::tool_dependency_graph::tool_dependency_graph(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Rank files by centrality in the dependency graph (PageRank, betweenness, degree). High-centrality files are critical paths that affect many other files. Requires the graph-analysis cron job to have run."
+        description = "Rank files by graph centrality (PageRank, betweenness, degree). \
+USE WHEN: identifying load-bearing files in an unfamiliar codebase ('what should I read \
+first?'), or finding which files a refactor would impact most. High-centrality = touches \
+many other files. \
+DO NOT USE WHEN: you want change-frequency or bug-proneness — use `bug_prediction` or \
+`complexity_hotspots`. \
+Requires graph-analysis cron. The composite `orient` tool returns the top entry points by \
+PageRank as part of its envelope."
     )]
     async fn centrality_analysis(
         &self,
         Parameters(params): Parameters<CentralityAnalysisParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_centrality_analysis::tool_centrality_analysis(self.ctx(), params).await
+        self.stats().record_tool_call("centrality_analysis");
+        timeout_wrap(
+            "centrality_analysis",
+            30,
+            super::tools::tool_centrality_analysis::tool_centrality_analysis(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
@@ -1135,29 +1464,60 @@ impl McpServer {
         &self,
         Parameters(params): Parameters<CommunityDetectionParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_community_detection::tool_community_detection(self.ctx(), params).await
+        self.stats().record_tool_call("community_detection");
+        timeout_wrap(
+            "community_detection",
+            30,
+            super::tools::tool_community_detection::tool_community_detection(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Find circular dependency cycles in the import graph. Cycles make code harder to test, build, and understand. Uses Tarjan's SCC algorithm followed by DFS cycle extraction. Requires the graph-analysis cron job to have run."
+        description = "Find circular import dependency cycles (Tarjan SCC + DFS). \
+USE WHEN: investigating build/link errors, code that's hard to test in isolation, or \
+auditing layering violations. Cycles make code harder to test, build, and understand. \
+DO NOT USE WHEN: looking for runtime call cycles (this is import-level static graph only). \
+Requires graph-analysis cron."
     )]
     async fn circular_dependencies(
         &self,
         Parameters(params): Parameters<CircularDependenciesParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_circular_dependencies::tool_circular_dependencies(self.ctx(), params)
-            .await
+        self.stats().record_tool_call("circular_dependencies");
+        timeout_wrap(
+            "circular_dependencies",
+            30,
+            super::tools::tool_circular_dependencies::tool_circular_dependencies(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
     }
 
     #[tool(
-        description = "Analyze what files would be affected by changing a specific file. Combines import graph (reverse dependents), co-change history (files that often change together), and semantic similarity (functionally related code). Requires the graph-analysis cron job to have run."
+        description = "Predict which files would be affected by changing a specific file. \
+USE WHEN: scoping a refactor or assessing the blast radius of a change before making it. \
+Combines reverse-imports + git co-change + semantic similarity for richer impact than any \
+single signal. \
+DO NOT USE WHEN: you only need static reverse-imports (use `dependency_graph` with focus). \
+Requires graph-analysis cron + git history for full coverage."
     )]
     async fn change_impact_analysis(
         &self,
         Parameters(params): Parameters<ChangeImpactAnalysisParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_change_impact_analysis::tool_change_impact_analysis(self.ctx(), params)
-            .await
+        self.stats().record_tool_call("change_impact_analysis");
+        timeout_wrap(
+            "change_impact_analysis",
+            30,
+            super::tools::tool_change_impact_analysis::tool_change_impact_analysis(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
     }
 
     // ========================================================================
@@ -1165,59 +1525,123 @@ impl McpServer {
     // ========================================================================
 
     #[tool(
-        description = "Compute Robert C. Martin's package metrics per module: Afferent Coupling (Ca), Efferent Coupling (Ce), Instability (I), Abstractness (A), Distance from Main Sequence (D*). Modules in the Zone of Pain (low A, low I) or Zone of Uselessness (high A, high I) need attention. Requires the graph-analysis cron job."
+        description = "Robert C. Martin package metrics per module: Ca, Ce, Instability (I), \
+Abstractness (A), Distance from Main Sequence (D*). \
+USE WHEN: doing a formal architecture review, identifying Zone of Pain (low A, low I) or \
+Zone of Uselessness (high A, high I) modules. \
+DO NOT USE WHEN: looking at single-file complexity — use `design_metrics`. This is \
+module/package level. \
+Requires graph-analysis cron."
     )]
     async fn coupling_cohesion_report(
         &self,
         Parameters(params): Parameters<CouplingCohesionReportParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_coupling_cohesion_report::tool_coupling_cohesion_report(
-            self.ctx(),
-            params,
+        self.stats().record_tool_call("coupling_cohesion_report");
+        timeout_wrap(
+            "coupling_cohesion_report",
+            30,
+            super::tools::tool_coupling_cohesion_report::tool_coupling_cohesion_report(
+                self.ctx(),
+                params,
+            ),
         )
         .await
     }
 
     #[tool(
-        description = "Detect architecture violations: dependency cycles, god modules, bidirectional dependencies, Stable Dependencies Principle (SDP) violations, and modules in Zone of Pain/Uselessness. Returns violations grouped by severity. Requires the graph-analysis cron job."
+        description = "Detect architecture violations: cycles, god modules, bidirectional deps, \
+SDP violations, Zone of Pain/Uselessness modules. \
+USE WHEN: producing an architecture review, gating a PR on architectural-debt regressions, \
+or building an ORR (Operational Readiness Review). \
+DO NOT USE WHEN: looking at design-level smells in a single file — use \
+`design_smell_detection` for god class / SRP violations / shotgun surgery / etc. \
+Grouped by severity. Requires graph-analysis cron."
     )]
     async fn architecture_violations(
         &self,
         Parameters(params): Parameters<ArchitectureViolationsParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_architecture_violations::tool_architecture_violations(self.ctx(), params)
-            .await
+        self.stats().record_tool_call("architecture_violations");
+        timeout_wrap(
+            "architecture_violations",
+            30,
+            super::tools::tool_architecture_violations::tool_architecture_violations(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
     }
 
     #[tool(
-        description = "Detect design smells: god class (high complexity + many topics), SRP violation (high topic diversity), shotgun surgery (many co-change partners), stale module (old + no changes), unstable dependency (high churn + many dependents). Uses file_metrics and topic data. Requires the graph-analysis cron job and discover_topics."
+        description = "File-level design smells: god class, SRP violation, shotgun surgery, \
+stale module, unstable dependency. \
+USE WHEN: doing a code review for design quality, finding refactor targets at the file \
+level. Each smell has a clear remediation pattern. \
+DO NOT USE WHEN: looking for module/package-level violations — use `architecture_violations` \
+for those. \
+Filter to specific smell types via `smells` param. Requires graph-analysis + discover_topics."
     )]
     async fn design_smell_detection(
         &self,
         Parameters(params): Parameters<DesignSmellDetectionParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_design_smell_detection::tool_design_smell_detection(self.ctx(), params)
-            .await
+        self.stats().record_tool_call("design_smell_detection");
+        timeout_wrap(
+            "design_smell_detection",
+            30,
+            super::tools::tool_design_smell_detection::tool_design_smell_detection(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
     }
 
     #[tool(
-        description = "Measure positive architecture quality across 10 dimensions: separation of concerns, loose coupling, SDP compliance, acyclicity, test coverage, doc coverage, code organization, module balance, API stability, and dependency health. Each scored 0-100%. Requires graph-analysis cron job and discover_topics."
+        description = "10-dimension architecture-quality scorecard (separation of concerns, \
+loose coupling, SDP compliance, acyclicity, test coverage, doc coverage, code organization, \
+module balance, API stability, dependency health). \
+USE WHEN: producing an architecture review or maturity assessment, comparing two projects \
+on aggregate quality. \
+DO NOT USE WHEN: you want the full A-F engineering scorecard with ORR checklist — use \
+`engineering_scorecard` (this tool is one of its inputs). \
+Each dim 0-100%. Requires graph-analysis + discover_topics."
     )]
     async fn architecture_quality(
         &self,
         Parameters(params): Parameters<ArchitectureQualityParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_architecture_quality::tool_architecture_quality(self.ctx(), params).await
+        self.stats().record_tool_call("architecture_quality");
+        timeout_wrap(
+            "architecture_quality",
+            30,
+            super::tools::tool_architecture_quality::tool_architecture_quality(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Compute detailed design metrics per file: cyclomatic complexity (from branching keywords), weighted methods per class (WMC), Card & Glass system complexity, and maintainability index. Useful for identifying over-complex files that need refactoring."
+        description = "Per-file design metrics: cyclomatic complexity, WMC, Card & Glass S/D/Sy, \
+maintainability index. \
+USE WHEN: ranking refactor targets by formal numeric metrics, or comparing complexity \
+between two files objectively. \
+DO NOT USE WHEN: you want a composite ranking (use `complexity_hotspots`) or bug \
+prediction (use `bug_prediction`). \
+Pure metrics, no interpretation. Useful in scorecards and CI gates."
     )]
     async fn design_metrics(
         &self,
         Parameters(params): Parameters<DesignMetricsParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_design_metrics::tool_design_metrics(self.ctx(), params).await
+        self.stats().record_tool_call("design_metrics");
+        timeout_wrap(
+            "design_metrics",
+            30,
+            super::tools::tool_design_metrics::tool_design_metrics(self.ctx(), params),
+        )
+        .await
     }
 
     // ========================================================================
@@ -1225,34 +1649,72 @@ impl McpServer {
     // ========================================================================
 
     #[tool(
-        description = "Predict which files are most likely to contain bugs using a heuristic composite score: churn rate * cyclomatic complexity * fix commit ratio * coupling. No ML dependencies — uses precomputed file_metrics. Requires the graph-analysis cron job."
+        description = "Heuristic bug-proneness ranking per file (churn × complexity × fix-commit \
+ratio × coupling). \
+USE WHEN: prioritizing review/test-coverage effort, or identifying risky files to refactor \
+first. \
+DO NOT USE WHEN: looking at a single file (use `complexity_hotspots` and \
+`technical_debt_analysis` for richer per-file detail). \
+Heuristic, not ML. Requires graph-analysis cron + git history."
     )]
     async fn bug_prediction(
         &self,
         Parameters(params): Parameters<BugPredictionParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_bug_prediction::tool_bug_prediction(self.ctx(), params).await
+        self.stats().record_tool_call("bug_prediction");
+        timeout_wrap(
+            "bug_prediction",
+            30,
+            super::tools::tool_bug_prediction::tool_bug_prediction(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Analyze technical debt across a project by combining TODO/FIXME/HACK density, cyclomatic complexity, test coverage gaps, module distance from Main Sequence (D*), and churn rate into a composite debt score per file. Optionally scans file content for debt markers."
+        description = "Composite technical-debt score per file (TODO density + cyclomatic \
+complexity + test gaps + D* + churn). \
+USE WHEN: building a refactor backlog, identifying highest-leverage cleanup targets, or \
+estimating debt for an architecture review. \
+DO NOT USE WHEN: looking at a specific file's complexity in isolation — `design_metrics` \
+gives per-file numbers without the composite weighting. \
+Optionally scans content for TODO/FIXME/HACK markers."
     )]
     async fn technical_debt_analysis(
         &self,
         Parameters(params): Parameters<TechnicalDebtAnalysisParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_technical_debt_analysis::tool_technical_debt_analysis(self.ctx(), params)
-            .await
+        self.stats().record_tool_call("technical_debt_analysis");
+        timeout_wrap(
+            "technical_debt_analysis",
+            30,
+            super::tools::tool_technical_debt_analysis::tool_technical_debt_analysis(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
     }
 
     #[tool(
-        description = "Detect anomalous files using embedding distance from project centroid and metric z-scores. Outlier files may indicate abandoned experiments, copied code from other projects, or architectural inconsistencies. No ML dependencies — uses statistical distance measures."
+        description = "Statistical outlier detection: files whose embedding distance from \
+project centroid + metric z-scores deviate from the project norm. \
+USE WHEN: hunting for abandoned experiments, copy-pasted code from other projects, or \
+architectural inconsistencies the model can't see by reading any single file. \
+DO NOT USE WHEN: looking for misplaced files relative to directory context — use \
+`find_misplaced_code` (semantic-based, more targeted). \
+No ML deps — pure statistical distance."
     )]
     async fn anomaly_detection(
         &self,
         Parameters(params): Parameters<AnomalyDetectionParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_anomaly_detection::tool_anomaly_detection(self.ctx(), params).await
+        self.stats().record_tool_call("anomaly_detection");
+        timeout_wrap(
+            "anomaly_detection",
+            30,
+            super::tools::tool_anomaly_detection::tool_anomaly_detection(self.ctx(), params),
+        )
+        .await
     }
 
     // ========================================================================
@@ -1260,23 +1722,48 @@ impl McpServer {
     // ========================================================================
 
     #[tool(
-        description = "Combined text + semantic search using Reciprocal Rank Fusion (RRF). Runs both BM25 full-text search and vector similarity search in parallel, then merges results with configurable weights. Best for queries that benefit from both exact keyword matching and conceptual understanding."
+        description = "Combined keyword + semantic search using Reciprocal Rank Fusion (RRF). \
+Runs BM25 full-text and vector similarity in parallel, merges with configurable weights. \
+USE WHEN: query is partially lexical and partially conceptual ('async error handling'), \
+or you want robust ranking when neither pure keyword nor pure semantic alone gets the \
+right top result. \
+DO NOT USE WHEN: query is purely lexical (text_search is sufficient) or purely \
+conceptual (semantic_search is sufficient). \
+RRF gives more stable ordering than either branch alone for mixed queries."
     )]
     async fn hybrid_search(
         &self,
         Parameters(params): Parameters<HybridSearchParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_hybrid_search::tool_hybrid_search(self.ctx(), params).await
+        self.stats().record_tool_call("hybrid_search");
+        timeout_wrap(
+            "hybrid_search",
+            30,
+            super::tools::tool_hybrid_search::tool_hybrid_search(self.ctx(), params),
+        )
+        .await
     }
 
     #[tool(
-        description = "Generate a structural summary of a project, directory, or file. Identifies key modules by PageRank, describes each directory's role based on topic assignments and file composition, and highlights dominant patterns. Requires the graph-analysis cron job and discover_topics."
+        description = "Structural summary of a project, directory, or specific file. \
+USE WHEN: writing a module's README, explaining unfamiliar code to someone, or generating \
+a design-doc starting point. Combines PageRank-ranked key modules + topic assignments + \
+language breakdown into prose. \
+DO NOT USE WHEN: you only need a directory listing — use `project_tree`. \
+Requires graph-analysis cron and discover_topics. The `orient` tool gives a faster \
+project-wide overview without prose."
     )]
     async fn code_summarize(
         &self,
         Parameters(params): Parameters<CodeSummarizeParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_code_summarize::tool_code_summarize(self.ctx(), params).await
+        self.stats().record_tool_call("code_summarize");
+        timeout_wrap(
+            "code_summarize",
+            30,
+            super::tools::tool_code_summarize::tool_code_summarize(self.ctx(), params),
+        )
+        .await
     }
 
     // ========================================================================
@@ -1284,14 +1771,28 @@ impl McpServer {
     // ========================================================================
 
     #[tool(
-        description = "Comprehensive engineering quality scorecard grading 10 dimensions A-F with GPA. Aggregates results from dependency analysis, architecture quality, design smells, test coverage, documentation, and code health metrics into a single actionable report with Operational Readiness Review (ORR) checklist. Requires the graph-analysis cron job and discover_topics."
+        description = "Engineering-quality scorecard: 10 dimensions A-F + GPA + ORR checklist. \
+USE WHEN: producing a quarterly health report for a service, evaluating whether a project \
+is ready for production handoff, or comparing the maturity of two projects. \
+DO NOT USE WHEN: you only need a single dimension — call the underlying tool directly \
+(`architecture_quality`, `bug_prediction`, `test_coverage_gaps`, etc.). \
+Aggregates dependency analysis + architecture quality + design smells + test/doc coverage \
++ health metrics. Requires graph-analysis cron + discover_topics."
     )]
     async fn engineering_scorecard(
         &self,
         Parameters(params): Parameters<EngineeringScorecardParams>,
     ) -> Result<CallToolResult, McpError> {
-        super::tools::tool_engineering_scorecard::tool_engineering_scorecard(self.ctx(), params)
-            .await
+        self.stats().record_tool_call("engineering_scorecard");
+        timeout_wrap(
+            "engineering_scorecard",
+            30,
+            super::tools::tool_engineering_scorecard::tool_engineering_scorecard(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
     }
 }
 
@@ -1620,101 +2121,53 @@ impl ServerHandler for McpServer {
                 .enable_tasks()
                 .build(),
         )
-        .with_server_info(
-            Implementation::new("pgmcp", env!("CARGO_PKG_VERSION")),
-        )
+        .with_server_info(Implementation::new("pgmcp", env!("CARGO_PKG_VERSION")))
         .with_instructions(
-            "pgmcp indexes source code from the user's development workspaces into PostgreSQL \
-             with pgvector embeddings. It maintains a continuously-updated index of all projects.\n\n\
-             WHEN TO USE pgmcp (prefer over built-in Grep/Glob/Read for these cases):\n\
-             - Cross-project searches: find patterns, functions, or concepts across ALL indexed projects at once\n\
-             - Semantic/conceptual queries: \"error handling patterns\", \"database connection setup\", \
-               \"authentication flow\" — use semantic_search (vector similarity)\n\
-             - Keyword searches across the full indexed codebase: use text_search (PostgreSQL full-text)\n\
-             - Regex searches across all indexed files: use grep\n\
-             - Discovering what projects exist and their structure: use list_projects, project_tree\n\
-             - Reading indexed files without filesystem access: use read_file\n\
-             - Checking indexing health: use index_stats\n\n\
-             Built-in tools (Grep/Glob/Read) are better for single-file or single-directory operations \
-             in the current working directory. pgmcp is better for broad, cross-project exploration \
-             and semantic understanding of the codebase.\n\n\
-             GIT HISTORY:\n\
-             - search_commits: semantic search over git commit messages and diffs — find when \
-               a feature was added, a bug was fixed, or how code evolved. Requires per-project \
-               opt-in via [git] index_history = true in .pgmcp.toml.\n\n\
-             CLAUDE SESSION HISTORY:\n\
-             - The \"claude\" project indexes ~/.claude/ (session transcripts, memory files, \
-               plans). Use semantic_search or text_search with project: \"claude\" to search \
-               past conversations, decisions, and context from previous Claude Code sessions.\n\n\
-             CROSS-PROJECT SIMILARITY ANALYSIS:\n\
-             - compare_files: Compare two specific files (always real-time, no batch dependency). \
-               Supports project:relative_path syntax (e.g. 'pgmcp:src/work_pool/adaptive.rs').\n\
-             - find_similar_modules: Find modules similar to a given one across projects. \
-               Uses the materialized similarity table (populated by periodic batch scan).\n\
-             - find_duplicates: Find clusters of duplicated code across projects using \
-               union-find clustering.\n\
-             - refactoring_report: Actionable refactoring candidates with suggested crate names \
-               and shared line estimates.\n\n\
-             CODE TOPIC DISCOVERY (Fuzzy BERTopic):\n\
-             - discover_topics: Discovers semantic code patterns using Fuzzy C-Means clustering \
-               with c-TF-IDF keyword labeling (Fuzzy BERTopic). With project param: real-time \
-               intra-project analysis (DRY violation detection). Without project: inter-project \
-               pattern discovery from cached results (shared library candidates). Returns topic \
-               clusters with keyword labels, membership degrees, representative code, and files.\n\n\
-             CODE ANALYSIS TOOLS:\n\
-             - find_orphans: Identifies code chunks/files with low topic membership. \
-               Orphan code may be utility functions, dead code, or candidates for refactoring.\n\
-             - find_misplaced_code: Detects files whose semantic content doesn't match their \
-               directory context. Suggests architectural reorganization.\n\
-             - find_coupled_files: Finds files that frequently change together in git commits \
-               (co-change coupling via Jaccard similarity). Requires git history indexing.\n\
-             - test_coverage_gaps: Compares topic distribution of test files vs implementation \
-               files. Finds topics with no corresponding test coverage.\n\
-             - complexity_hotspots: Ranks files by composite complexity (size, chunks, topic \
-               diversity, coupling). Identifies refactoring candidates.\n\
-             - topic_hierarchy: Shows how discovered topics relate hierarchically using \
-               agglomerative clustering on topic centroids. Reveals module boundaries.\n\n\
-             DOCUMENT ANALYSIS TOOLS:\n\
-             - suggest_merges: Find files (default: markdown) covering overlapping topics that \
-               should be consolidated. Uses weighted Jaccard on per-file topic distributions.\n\
-             - suggest_splits: Find files spanning too many distinct topics and suggest split \
-               points aligned to heading boundaries. Uses Shannon entropy scoring.\n\
-             - doc_coverage_gaps: Identify code topics that lack corresponding markdown \
-               documentation. Compares doc chunks vs code chunks per topic.\n\n\
-             GRAPH ANALYSIS TOOLS:\n\
-             - dependency_graph: Visualize import/co-change/semantic dependency graph with \
-               focus file neighborhood, DOT output, and connected component analysis.\n\
-             - centrality_analysis: Rank files by PageRank, betweenness, or degree centrality.\n\
-             - community_detection: Louvain community detection on dependency graph, compared \
-               against directory structure to reveal architectural misalignment.\n\
-             - circular_dependencies: Find import cycles using Tarjan's SCC + DFS extraction.\n\
-             - change_impact_analysis: Predict which files are affected by changing a given file \
-               (import graph + co-change + semantic similarity).\n\n\
-             ARCHITECTURE & DESIGN QUALITY TOOLS:\n\
-             - coupling_cohesion_report: Robert C. Martin's package metrics (Ca, Ce, I, A, D*) \
-               per module. Identifies Zone of Pain and Zone of Uselessness.\n\
-             - architecture_violations: Checks for cycles, god modules, bidirectional deps, \
-               SDP violations, and zone problems. Grouped by severity.\n\
-             - design_smell_detection: Detects god class, SRP violation, shotgun surgery, \
-               stale module, and unstable dependency patterns.\n\
-             - architecture_quality: Scores 10 quality dimensions 0-100% with letter grades.\n\
-             - design_metrics: Per-file cyclomatic complexity, WMC, Card & Glass S/D/Sy, and \
-               maintainability index.\n\n\
-             PREDICTIVE ANALYSIS TOOLS (heuristic-based):\n\
-             - bug_prediction: Ranks files by bug-proneness score (churn * complexity * fix ratio).\n\
-             - technical_debt_analysis: Composite debt score from TODO density, complexity, \
-               test gaps, churn. Scans content for TODO/FIXME/HACK markers.\n\
-             - anomaly_detection: Identifies outlier files using embedding distance from project \
-               centroid and metric z-scores.\n\n\
-             HYBRID SEARCH & SUMMARIZATION:\n\
-             - hybrid_search: Combined text + semantic search using Reciprocal Rank Fusion (RRF).\n\
-             - code_summarize: Structural summary of project/directory/file with key files by \
-               PageRank, topic overview, and language breakdown.\n\n\
-             ENGINEERING SCORECARD:\n\
-             - engineering_scorecard: Comprehensive quality report grading 10 dimensions A-F \
-               with GPA and Operational Readiness Review (ORR) checklist.\n\n\
-             Clustering uses Fuzzy C-Means (FCM) with soft membership — chunks can belong \
-             to multiple topics with different membership degrees, enabling richer analysis.",
+            "pgmcp indexes the user's development workspaces into PostgreSQL+pgvector and \
+             exposes ~40 tools for cross-project search, semantic queries, graph analysis, \
+             and code-health metrics.\n\n\
+             USE THESE TOOLS BEFORE built-in Read/Grep/Glob when the question is conceptual \
+             ('how does X work?'), cross-project ('does this pattern exist elsewhere?'), \
+             graph-shaped ('what depends on this?'), or about code health ('where is the \
+             technical debt?'). Built-in tools remain right for narrow within-cwd operations \
+             and for files just written this turn (not yet in the index).\n\n\
+             FIRST STEP for unfamiliar codebases or non-trivial tasks: call `orient` — it \
+             bundles project_tree, key entry points by PageRank, recently-changed files, \
+             top topics, and a `health` envelope into one call so you don't have to scatter \
+             across half a dozen tools to get oriented.\n\n\
+             The 'claude' project indexes ~/.claude/ — past Claude Code sessions, memory \
+             files, plans. Use semantic_search or text_search with project: \"claude\" to \
+             retrieve prior context, decisions, and plans.\n\n\
+             ### Tool catalog\n\n\
+             SEARCH: orient (composite first-step), semantic_search (vector similarity, \
+             conceptual queries), text_search (Postgres full-text, exact keywords), \
+             grep (regex across all indexed files), hybrid_search (BM25+vector RRF — best \
+             for queries that benefit from both keyword and concept), search_commits (git \
+             history semantic search; requires [git] index_history = true).\n\n\
+             READ/INVENTORY: read_file, file_info, list_projects, project_tree, index_stats.\n\n\
+             CROSS-PROJECT SIMILARITY: compare_files (real-time chunk-level), \
+             find_similar_modules (materialized table), find_duplicates (union-find \
+             clusters), refactoring_report (actionable extraction candidates).\n\n\
+             TOPIC DISCOVERY (Fuzzy BERTopic = FCM + c-TF-IDF): discover_topics, \
+             topic_hierarchy, topic_hierarchy_fcm — soft-clustering chunks into \
+             keyword-labeled topics. With project param = real-time intra-project; \
+             without = cached cross-project.\n\n\
+             CODE ANALYSIS: find_orphans (low topic membership), find_misplaced_code \
+             (semantic vs directory mismatch), find_coupled_files (git co-change Jaccard), \
+             test_coverage_gaps, complexity_hotspots, doc_coverage_gaps, suggest_merges, \
+             suggest_splits.\n\n\
+             GRAPH: dependency_graph (DOT/edges/summary), centrality_analysis (PageRank, \
+             betweenness, degree), community_detection (Louvain), circular_dependencies \
+             (Tarjan SCC), change_impact_analysis (graph + co-change + semantic).\n\n\
+             ARCHITECTURE & DESIGN: coupling_cohesion_report (Robert C. Martin Ca/Ce/I/A/D*), \
+             architecture_violations, design_smell_detection (god class, SRP violation, \
+             shotgun surgery, stale module, unstable dependency), architecture_quality \
+             (10-dim 0-100% scorecard), design_metrics (cyclomatic, WMC, maintainability).\n\n\
+             PREDICTION: bug_prediction (churn × complexity × fix ratio), \
+             technical_debt_analysis (TODO density + complexity + test gaps + churn), \
+             anomaly_detection (embedding distance from project centroid).\n\n\
+             SUMMARIZATION & SCORECARD: code_summarize (structural roll-up), \
+             engineering_scorecard (10-dim A-F + GPA + ORR checklist).",
         )
     }
 

@@ -46,6 +46,11 @@ pub async fn run(
             let task_store = Arc::new(mcp::tasks::TaskStore::new());
             // Lazy embed: no pool running, model created on first embedding tool call
             let db: Arc<dyn db::DbClient> = Arc::new(pool);
+            // CLI-mode lifecycle: pre-Ready since the CLI doesn't run a
+            // scanner. Tools that need lifecycle info (orient's `health`
+            // envelope) get a sensible answer instead of None.
+            let lifecycle = crate::daemon_state::DaemonLifecycle::new();
+            lifecycle.transition(crate::daemon_state::DaemonPhase::Ready);
             let cli_ctx = SystemContext::production(
                 db,
                 embed::EmbedSource::lazy(config_arc.load().embeddings.clone()),
@@ -53,6 +58,7 @@ pub async fn run(
                 config_arc,
                 log_broadcaster,
                 task_store,
+                lifecycle,
             );
             let server = mcp::server::McpServer::new(cli_ctx);
 
