@@ -94,8 +94,6 @@ cudarc = { version = "0.19.4", features = ["cublas", "cublaslt", "cuda-version-f
 half = "2"
 heed = "0.20"
 bincode = "1"
-blas-src = { version = "0.10", features = ["intel-mkl"] }
-intel-mkl-src = { version = "0.8", features = ["mkl-dynamic-lp64-seq"] }
 # Already a transitive dep via sqlx; promoted to direct so the DbClient trait
 # can use #[async_trait] on its method signatures.
 async-trait = "0.1"

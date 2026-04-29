@@ -11,7 +11,6 @@ Restart=on-failure
 RestartSec=5
 User=%i
 Environment=PGMCP_CONFIG=%h/.config/pgmcp/config.toml
-Environment=LD_LIBRARY_PATH=/opt/intel/oneapi/mkl/latest/lib/intel64
 # Bound glibc thread arenas. Default is 8 × num_cpus (= 512 on a 64-CPU host).
 # Each arena retains its high-water mark forever, so a transient burst of
 # allocations across many threads bloats RSS by tens of GB that never get

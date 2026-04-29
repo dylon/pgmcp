@@ -423,9 +423,9 @@ fn print_text(snap: &StatusResponse, model: Option<&str>) {
             "connected MCP clients (HTTP)",
             &snap.daemon.http_mcp_sessions.to_string(),
         );
-        // RUNPATHs (MKL/CUDA/ort) are embedded by build.rs and inspectable
-        // via `readelf -d $(which pgmcp) | grep RUNPATH` — too noisy to
-        // surface inline.
+        // RUNPATHs (CUDA/ort) and BLAS link (AOCL-BLIS) are wired by build.rs
+        // and inspectable via `readelf -d $(which pgmcp) | grep -E 'NEEDED|RUNPATH'`
+        // — too noisy to surface inline.
     }
 
     if want("database") {

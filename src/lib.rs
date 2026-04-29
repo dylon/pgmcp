@@ -11,11 +11,10 @@
 
 #![recursion_limit = "256"]
 
-// Force linkage to BLAS (Intel MKL) for ndarray's blas feature. Mirrors
-// the same `extern crate` pair in `src/main.rs` — the linker needs these
-// on both the lib target and the bin target.
-extern crate blas_src;
-extern crate intel_mkl_src;
+// BLAS provider for ndarray's `blas` feature (cblas-sys FFI) is wired by
+// `build.rs`, which emits `cargo:rustc-link-lib=dylib=blis-mt` so the
+// linker pulls AOCL-BLIS (libblis-mt.so.5) into the lib and bin targets.
+// No `extern crate blas_src;` — there is no stub-provider crate involved.
 
 pub mod api;
 pub mod cli;

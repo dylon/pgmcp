@@ -4,7 +4,7 @@
 
 - Rust 1.85+ (edition 2024)
 - PostgreSQL 15+ with `pgvector` and `pg_trgm` extensions
-- Intel MKL (for ndarray BLAS on the CPU fallback)
+- AOCL-BLIS (for ndarray BLAS on the CPU fallback; Arch: `pacman -S aocl-blis`)
 - **CUDA toolkit 12+ with `nvcc` on PATH, plus an NVIDIA GPU.** CUDA is
   mandatory. There is no CPU-only build mode; `Cargo.toml` has no
   `[features]` table. The daemon's `src/fcm/` module provides a CPU

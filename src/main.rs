@@ -1,8 +1,5 @@
 #![recursion_limit = "256"]
 
-extern crate blas_src;
-extern crate intel_mkl_src;
-
 mod api;
 mod cli;
 mod config;

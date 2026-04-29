@@ -1,19 +1,33 @@
-/// Build script: ensure MKL's layered libraries (core, sequential) are linked
-/// and findable at runtime. Intel MKL uses a layered model where
-/// libmkl_intel_lp64.so does NOT declare DT_NEEDED for libmkl_core.so —
-/// all three layers must be explicitly linked by the application with
-/// --no-as-needed so the linker doesn't strip them as "unused".
+/// Build script: link AOCL-BLIS (BLAS) for ndarray's CPU fallback, emit
+/// RUNPATH for the CUDA toolkit so the binary can resolve libcudart.so /
+/// libcublasLt.so at runtime, and compile the fused-reduction PTX kernels
+/// (src/fcm/cuda/kernels.cu) with nvcc.
 fn main() {
-    if let Some(dir) = find_mkl_lib_dir() {
-        println!("cargo:rustc-link-search=native={dir}");
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
-
-        // --no-as-needed forces these into DT_NEEDED even though our code
-        // doesn't reference their symbols directly (libmkl_intel_lp64 does).
-        println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
-        println!("cargo:rustc-link-arg=-lmkl_core");
-        println!("cargo:rustc-link-arg=-lmkl_sequential");
-        println!("cargo:rustc-link-arg=-Wl,--as-needed");
+    // AOCL-BLIS (libblis-mt.so.5) provides cblas_sgemm/dgemm/sdot/ddot for
+    // ndarray's `blas` feature. The lib lives in /usr/lib (default loader
+    // path), so no rpath/RUNPATH is needed — just the link directive.
+    // Probe via pkg-config to fail loudly if aocl-blis isn't installed.
+    let blis_pc = std::process::Command::new("pkg-config")
+        .args(["--exists", "blis-mt"])
+        .status();
+    match blis_pc {
+        Ok(s) if s.success() => {
+            // We use `rustc-link-arg` (not `rustc-link-lib`) so the `-l`
+            // flag is appended at the end of the rust-lld command line,
+            // after every rlib that might reference cblas_sgemm. Wrapping
+            // with `--no-as-needed` forces DT_NEEDED for libblis-mt even
+            // though no symbols from it are referenced ahead of the lib
+            // in scan order — without it, rust-lld silently drops the
+            // library and emits "undefined symbol: cblas_sgemm".
+            println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
+            println!("cargo:rustc-link-arg=-lblis-mt");
+            println!("cargo:rustc-link-arg=-Wl,--as-needed");
+            println!("cargo:warning=pgmcp: linking AOCL-BLIS (blis-mt)");
+        }
+        _ => panic!(
+            "pgmcp: AOCL-BLIS not found via pkg-config('blis-mt'). \
+             Install aocl-blis (Arch: pacman -S aocl-blis)."
+        ),
     }
 
     // CUDA toolkit is mandatory. Cudarc's build.rs emits link-search +
@@ -66,36 +80,6 @@ fn main() {
         panic!("nvcc failed to compile {cu_src} (exit {:?})", status.code());
     }
     println!("cargo:warning=pgmcp: compiled fcm_kernels.ptx → {ptx_out}");
-}
-
-fn find_mkl_lib_dir() -> Option<String> {
-    // Try pkg-config first
-    if let Ok(output) = std::process::Command::new("pkg-config")
-        .args(["--libs-only-L", "mkl-dynamic-lp64-seq"])
-        .output()
-        && output.status.success()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for token in stdout.split_whitespace() {
-            if let Some(path) = token.strip_prefix("-L") {
-                return Some(path.to_string());
-            }
-        }
-    }
-
-    // Fallback: well-known Intel oneAPI paths
-    let candidates = [
-        "/opt/intel/oneapi/mkl/latest/lib",
-        "/opt/intel/oneapi/mkl/latest/lib/intel64",
-    ];
-    for dir in &candidates {
-        let path = std::path::Path::new(dir);
-        if path.join("libmkl_core.so.2").exists() || path.join("libmkl_core.so").exists() {
-            return Some(dir.to_string());
-        }
-    }
-
-    None
 }
 
 /// Find a directory that contains BOTH `libcudart.so` and `libcublasLt.so`.

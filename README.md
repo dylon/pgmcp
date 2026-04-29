@@ -213,7 +213,7 @@ High-level project understanding and engineering quality assessment.
 - **Rust** (2024 edition, nightly or stable 1.85+)
 - **PostgreSQL 15+** with [pgvector](https://github.com/pgvector/pgvector) and `pg_trgm` extensions
 - **CUDA toolkit 12+** with `nvcc` on PATH, plus an NVIDIA GPU
-- **Intel MKL** (for ndarray BLAS on the CPU fallback)
+- **AOCL-BLIS** (for ndarray BLAS on the CPU fallback; on Arch: `pacman -S aocl-blis`)
 - ~500 MB disk for the all-MiniLM-L6-v2 ONNX model (downloaded on first run)
 
 ### Build & Install

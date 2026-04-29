@@ -1,6 +1,6 @@
-//! Mirror pgmcp's rpath setup so cross-crate test binaries
-//! (`pgmcp-testing/tests/*.rs`) can find libonnxruntime.so, libcudart.so,
-//! libcublasLt.so, libmkl_*.so at runtime.
+//! Mirror pgmcp's BLAS link + rpath setup so cross-crate test binaries
+//! (`pgmcp-testing/tests/*.rs`) link AOCL-BLIS (libblis-mt) and find
+//! libonnxruntime.so, libcudart.so, libcublasLt.so at runtime.
 //!
 //! Cargo's `cargo:rustc-link-arg=-Wl,-rpath,...` directive applies only to
 //! the package's own targets — it does not propagate transitively to crates
@@ -16,17 +16,23 @@ fn main() {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
     }
 
-    // Intel MKL libs. MKL uses a layered model where libmkl_intel_lp64.so
-    // does NOT declare DT_NEEDED for libmkl_core.so / libmkl_sequential.so;
-    // we must explicitly link them with --no-as-needed so the linker keeps
-    // them in DT_NEEDED. Mirrors the parent crate's build.rs MKL block.
-    if let Some(dir) = find_mkl_lib_dir() {
-        println!("cargo:rustc-link-search=native={dir}");
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+    // AOCL-BLIS (libblis-mt.so.5). System lib in /usr/lib (default loader
+    // path). Mirrors the parent crate's build.rs link directive so test
+    // binaries built here resolve cblas_* symbols. See build.rs in the
+    // parent crate for why we use rustc-link-arg + --no-as-needed instead
+    // of cargo:rustc-link-lib.
+    let blis_pc = std::process::Command::new("pkg-config")
+        .args(["--exists", "blis-mt"])
+        .status();
+    if matches!(blis_pc, Ok(s) if s.success()) {
         println!("cargo:rustc-link-arg=-Wl,--no-as-needed");
-        println!("cargo:rustc-link-arg=-lmkl_core");
-        println!("cargo:rustc-link-arg=-lmkl_sequential");
+        println!("cargo:rustc-link-arg=-lblis-mt");
         println!("cargo:rustc-link-arg=-Wl,--as-needed");
+    } else {
+        panic!(
+            "pgmcp-testing: AOCL-BLIS not found via pkg-config('blis-mt'). \
+             Install aocl-blis."
+        );
     }
 
     // ONNX Runtime, downloaded by the `ort` crate into ~/.cache/ort.pyke.io.
@@ -74,31 +80,6 @@ fn has_cuda_libs(dir: &str) -> bool {
     ["libcublasLt.so", "libcublasLt.so.13", "libcublasLt.so.12"]
         .iter()
         .any(|name| std::path::Path::new(&format!("{dir}/{name}")).exists())
-}
-
-fn find_mkl_lib_dir() -> Option<String> {
-    if let Ok(output) = std::process::Command::new("pkg-config")
-        .args(["--libs-only-L", "mkl-dynamic-lp64-seq"])
-        .output()
-        && output.status.success()
-    {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        for token in stdout.split_whitespace() {
-            if let Some(path) = token.strip_prefix("-L") {
-                return Some(path.to_string());
-            }
-        }
-    }
-    for dir in [
-        "/opt/intel/oneapi/mkl/latest/lib",
-        "/opt/intel/oneapi/mkl/latest/lib/intel64",
-    ] {
-        let path = std::path::Path::new(dir);
-        if path.join("libmkl_core.so.2").exists() || path.join("libmkl_core.so").exists() {
-            return Some(dir.to_string());
-        }
-    }
-    None
 }
 
 fn find_ort_lib_dir() -> Option<String> {
