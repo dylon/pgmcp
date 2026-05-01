@@ -397,6 +397,75 @@ pub async fn run_migrations(
         sqlx::query(idx_sql).execute(pool).await?;
     }
 
+    // Tier 0e — Tree-sitter symbol tables.
+    //
+    // `file_symbols` stores per-file symbol definitions extracted by the
+    // tree-sitter pass: function/struct/enum/trait/interface/class/const/module
+    // declarations with their byte range mapped to start_line / end_line.
+    // Used by `naming_consistency`, `boilerplate_clusters` (for tree-sitter
+    // identifier normalization), `extraction_candidates` (for exact call-site
+    // counts), and the future symbol-aware import resolution.
+    //
+    // `symbol_references` stores per-call/per-type-use edges: source_line +
+    // resolved target (when known) or raw target form (when unresolved).
+    // The `target_symbol_id IS NULL OR target_file_id IS NULL` rows are the
+    // unresolved-target equivalent of `code_graph_edges` for fine-grained
+    // dep-health analysis.
+    //
+    // Both tables CASCADE off `indexed_files.id` — if a file is reindexed
+    // (file_chunks rebuilt), its symbols and references are rebuilt too.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS file_symbols (
+            id BIGSERIAL PRIMARY KEY,
+            file_id BIGINT NOT NULL REFERENCES indexed_files(id) ON DELETE CASCADE,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            parent_id BIGINT REFERENCES file_symbols(id) ON DELETE CASCADE,
+            visibility TEXT,
+            signature TEXT,
+            UNIQUE (file_id, kind, name, start_line)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    let file_symbols_indexes = vec![
+        "CREATE INDEX IF NOT EXISTS idx_file_symbols_file ON file_symbols(file_id)",
+        "CREATE INDEX IF NOT EXISTS idx_file_symbols_name ON file_symbols(name)",
+        "CREATE INDEX IF NOT EXISTS idx_file_symbols_kind_name ON file_symbols(kind, name)",
+        "CREATE INDEX IF NOT EXISTS idx_file_symbols_name_trgm ON file_symbols USING gin (name gin_trgm_ops)",
+    ];
+    for idx_sql in &file_symbols_indexes {
+        sqlx::query(idx_sql).execute(pool).await?;
+    }
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS symbol_references (
+            id BIGSERIAL PRIMARY KEY,
+            source_file_id BIGINT NOT NULL REFERENCES indexed_files(id) ON DELETE CASCADE,
+            source_symbol_id BIGINT REFERENCES file_symbols(id) ON DELETE SET NULL,
+            target_file_id BIGINT REFERENCES indexed_files(id) ON DELETE SET NULL,
+            target_symbol_id BIGINT REFERENCES file_symbols(id) ON DELETE SET NULL,
+            target_raw TEXT NOT NULL,
+            ref_kind TEXT NOT NULL,
+            source_line INTEGER NOT NULL,
+            UNIQUE (source_file_id, source_line, target_raw, ref_kind)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    let symbol_refs_indexes = vec![
+        "CREATE INDEX IF NOT EXISTS idx_symbol_refs_source_file ON symbol_references(source_file_id)",
+        "CREATE INDEX IF NOT EXISTS idx_symbol_refs_target_symbol ON symbol_references(target_symbol_id)",
+        "CREATE INDEX IF NOT EXISTS idx_symbol_refs_target_raw ON symbol_references(target_raw)",
+    ];
+    for idx_sql in &symbol_refs_indexes {
+        sqlx::query(idx_sql).execute(pool).await?;
+    }
+
     Ok(())
 }
 

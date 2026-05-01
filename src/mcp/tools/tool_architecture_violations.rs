@@ -24,11 +24,13 @@ pub async fn tool_architecture_violations(
     ctx.stats().violation_scans.fetch_add(1, Ordering::Relaxed);
 
     let severity_threshold = params.severity_threshold.as_deref().unwrap_or("medium");
+    let include_fixes = params.include_fixes.unwrap_or(true);
 
     info!(
         tool = "architecture_violations",
         project = %params.project,
         severity_threshold,
+        include_fixes,
         "MCP tool invoked",
     );
 
@@ -290,6 +292,50 @@ pub async fn tool_architecture_violations(
         let sb = severity_order(b["severity"].as_str().unwrap_or("low"));
         sb.cmp(&sa)
     });
+
+    // Phase 1 backfill: attach a typed `recommended_fix` to each violation.
+    // Off when include_fixes=false, which reproduces today's diagnostic-only shape.
+    if include_fixes {
+        use crate::mcp::tools::fix_helpers::default_fix_for_violation;
+        for v in &mut violations {
+            let vtype = match v["type"].as_str() {
+                Some(t) => t.to_string(),
+                None => continue,
+            };
+            // Collect file references from whichever fields the violation type populates.
+            let files: Vec<String> = match vtype.as_str() {
+                "dependency_cycle" => v["files"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                "bidirectional_dependency" => {
+                    let mut out = Vec::new();
+                    if let Some(a) = v["file_a"].as_str() {
+                        out.push(a.to_string());
+                    }
+                    if let Some(b) = v["file_b"].as_str() {
+                        out.push(b.to_string());
+                    }
+                    out
+                }
+                _ => Vec::new(),
+            };
+            let module = v["module"]
+                .as_str()
+                .or_else(|| v["source_module"].as_str())
+                .or_else(|| v["target_module"].as_str());
+            if let Some(fix) = default_fix_for_violation(&vtype, &params.project, &files, module)
+                && let Ok(fix_json) = serde_json::to_value(&fix)
+                && let Some(obj) = v.as_object_mut()
+            {
+                obj.insert("recommended_fix".to_string(), fix_json);
+            }
+        }
+    }
 
     let result = serde_json::json!({
         "project": params.project,

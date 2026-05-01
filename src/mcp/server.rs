@@ -464,6 +464,429 @@ pub struct RefactoringReportParams {
     pub include_same_repo: Option<bool>,
 }
 
+/// Tier 2 — `chunk_clusters` (chunk-level cross-project DRY).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ChunkClustersParams {
+    #[schemars(
+        description = "Minimum chunk-pair similarity. Threshold for clustering decisions (default: 0.88)."
+    )]
+    pub min_similarity: Option<f64>,
+    #[schemars(description = "Minimum chunks per cluster (default: 3)")]
+    pub min_cluster_size: Option<usize>,
+    #[schemars(
+        description = "Minimum distinct projects a cluster must span (default: 2). Set 1 for intra-project."
+    )]
+    pub min_projects: Option<usize>,
+    #[schemars(description = "Filter by programming language")]
+    pub language: Option<String>,
+    #[schemars(
+        description = "Filter pairs to those touching this project. Use to focus the audit on a single project's DRY violations."
+    )]
+    pub project: Option<String>,
+    #[schemars(description = "Maximum clusters to return (default: 20)")]
+    pub limit: Option<i32>,
+    #[schemars(
+        description = "Worktree filter: \"main\" (default) restricts both endpoints to canonical \
+                       main projects (e.g. f1r3node/, not f1r3node-reified-rspaces/). \"all\" \
+                       allows feature-branch worktrees."
+    )]
+    pub worktree_filter: Option<String>,
+    #[schemars(
+        description = "If true, include pairs whose two projects are worktrees / sibling clones \
+                       of the same upstream repo. Default false (cross-repo refactor candidates only)."
+    )]
+    pub include_same_repo: Option<bool>,
+}
+
+// ============================================================================
+// Tier 5 — Audit & trend params
+// ============================================================================
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DependencyHealthParams {
+    #[schemars(description = "Filter to a single project (optional)")]
+    pub project: Option<String>,
+    #[schemars(
+        description = "Worktree filter: \"main\" (default) restricts to canonical main projects."
+    )]
+    pub worktree_filter: Option<String>,
+    #[schemars(description = "Maximum dependency entries to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PatternSearchParams {
+    #[schemars(description = "Code snippet to find similar implementations for")]
+    pub snippet: String,
+    #[schemars(description = "Filter by programming language")]
+    pub language: Option<String>,
+    #[schemars(description = "Minimum cosine similarity (default: 0.78)")]
+    pub min_similarity: Option<f64>,
+    #[schemars(description = "Maximum matches to return (default: 15)")]
+    pub limit: Option<i32>,
+    #[schemars(
+        description = "Exclude this project from results (typically the caller's own project)"
+    )]
+    pub exclude_project: Option<String>,
+    #[schemars(description = "Worktree filter: \"main\" (default) or \"all\"")]
+    pub worktree_filter: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MergeConflictRiskParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Files in the in-flight branch (relative paths, required)")]
+    pub branch_files: Vec<String>,
+    #[schemars(description = "Lookback window in days (default: 14)")]
+    pub window_days: Option<i32>,
+    #[schemars(
+        description = "Exclude this author email from the risk count (typically the PR author)"
+    )]
+    pub exclude_email: Option<String>,
+    #[schemars(description = "Maximum files to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NamingConsistencyParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Filter by programming language (e.g. \"rust\", \"python\"). Omit to scan every language with a registered backend."
+    )]
+    pub language: Option<String>,
+    #[schemars(
+        description = "Minimum dominance for the per-(directory, kind) convention (default: 0.7). Below this threshold the directory is considered too mixed to flag divergences."
+    )]
+    pub min_dominance: Option<f64>,
+    #[schemars(description = "Maximum divergences to return (default: 50)")]
+    pub limit: Option<i32>,
+    #[schemars(
+        description = "Whether to embed `recommended_fix` per divergence (default: true). Set false to reproduce the diagnostic-only shape."
+    )]
+    pub include_fixes: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ModuleGrowthParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Single-file path (optional). When omitted, project-scope.")]
+    pub file: Option<String>,
+    #[schemars(description = "Time bucket: \"week\", \"month\" (default), or \"quarter\".")]
+    pub bucket: Option<String>,
+    #[schemars(description = "How many buckets back to look at (default: 12)")]
+    pub lookback_buckets: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AdoptionLagParams {
+    #[schemars(description = "Reference file (the modern implementation)")]
+    pub new_file: String,
+    #[schemars(description = "Project filter (optional)")]
+    pub project: Option<String>,
+    #[schemars(description = "Worktree filter: \"main\" (default) or \"all\"")]
+    pub worktree_filter: Option<String>,
+    #[schemars(description = "Minimum similarity for legacy candidates (default: 0.70)")]
+    pub min_similarity: Option<f64>,
+    #[schemars(
+        description = "Minimum age in days for a file to be considered legacy (default: 180)"
+    )]
+    pub legacy_min_age_days: Option<i32>,
+    #[schemars(description = "Maximum legacy usages to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TechDebtBurnDownParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Time horizon: \"week\", \"month\" (default), or \"quarter\".")]
+    pub time_horizon: Option<String>,
+    #[schemars(description = "Number of engineers available (default: 1)")]
+    pub engineer_count: Option<i32>,
+    #[schemars(description = "Maximum items to consider (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+/// Tier 4 — `pr_scope_recommender` (min/recommended/max PR scope from a starter file).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PrScopeRecommenderParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Starter file (relative path, required)")]
+    pub file: String,
+    #[schemars(
+        description = "Minimum co-change Jaccard for the recommended scope (default: 0.4)."
+    )]
+    pub co_change_min: Option<f64>,
+    #[schemars(description = "Reverse-BFS depth for the maximum scope (default: 2).")]
+    pub impact_depth: Option<i32>,
+    #[schemars(
+        description = "If true (default), include topic-neighbor files (chunks sharing the seed's \
+                       dominant topic) in the maximum scope."
+    )]
+    pub include_topic_neighbors: Option<bool>,
+}
+
+/// Tier 4 — `hot_path_audit` (central + churning + bug-prone intersection).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HotPathAuditParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Percentile threshold (default: 0.9 = top 10%). A file qualifies only if \
+                       it sits in the top P% of pagerank, churn, AND fix_commit_ratio."
+    )]
+    pub percentile_threshold: Option<f64>,
+    #[schemars(description = "Maximum hot paths to return (default: 20)")]
+    pub limit: Option<i32>,
+}
+
+/// Tier 4 — `bus_factor_map` (knowledge-concentration risk per file).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BusFactorMapParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Filter to files in the top (1 - min_pagerank_percentile) of pagerank \
+                       (default: 0.5 — top half). Less central files are filtered out."
+    )]
+    pub min_pagerank_percentile: Option<f64>,
+    #[schemars(description = "Maximum files to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+
+/// Tier 4 — `reviewer_recommender` (rank reviewers by recent file ownership).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReviewerRecommenderParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Changed files (relative paths, required)")]
+    pub files: Vec<String>,
+    #[schemars(description = "Authors to exclude (e.g. the PR author's email). Optional.")]
+    pub exclude_authors: Option<Vec<String>>,
+    #[schemars(
+        description = "Recency window in days for blame data (default: 365). Older blame is \
+                       ignored — long-stale ownership isn't reviewer authority."
+    )]
+    pub recency_window_days: Option<i32>,
+}
+
+/// Tier 3 — `recommend_layering` (infer layered architecture, list violation edges).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecommendLayeringParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Number of layers to bucket the project into (default: 4)")]
+    pub num_layers: Option<usize>,
+    #[schemars(
+        description = "Minimum severity to report: \"low\", \"medium\", \"high\", \"critical\" \
+                       (default: \"medium\"). Severity = number of layers an edge crosses."
+    )]
+    pub severity_threshold: Option<String>,
+    #[schemars(description = "Maximum violations to return (default: 50)")]
+    pub limit: Option<i32>,
+    #[schemars(
+        description = "Optional layer-name override (top to bottom). The default heuristic \
+                       infers names from instability — unreliable for non-web codebases. Pass \
+                       N names matching `num_layers`."
+    )]
+    pub layer_names: Option<Vec<String>>,
+}
+
+/// Tier 3 — `shotgun_surgery_fix` (consolidation recommender for shotgun-surgery smells).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ShotgunSurgeryFixParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Minimum co-change partners for a hub to qualify (default: 6). Mirrors \
+                       the threshold used by design_smell_detection."
+    )]
+    pub min_partners: Option<i32>,
+    #[schemars(description = "Minimum Jaccard co-change similarity (default: 0.2).")]
+    pub min_coupling: Option<f64>,
+    #[schemars(description = "Maximum hubs to return (default: 15)")]
+    pub limit: Option<i32>,
+}
+
+/// Tier 3 — `fix_circular_dependency` (cycle-breaking edge selection).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FixCircularDependencyParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Maximum cycle length to enumerate per SCC (default: 10). Longer cycles \
+                       are reported as the SCC summary only."
+    )]
+    pub max_cycle_length: Option<i32>,
+    #[schemars(description = "Maximum fix candidates to return (default: 20)")]
+    pub limit: Option<i32>,
+    #[schemars(
+        description = "Strategy preference: \"interface\", \"inversion\", or \"auto\" (default). \
+                       Auto picks based on Ce/Ca/instability of the cycle nodes."
+    )]
+    pub prefer_strategy: Option<String>,
+}
+
+/// Tier 3 — `recommend_module_split` (split god files using chunk → topic mapping).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecommendModuleSplitParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Minimum file line_count to consider for splitting (default: 500). \
+                       Mirrors the god_class threshold used by design_smell_detection."
+    )]
+    pub min_lines: Option<i32>,
+    #[schemars(description = "Maximum split candidates to return (default: 10)")]
+    pub limit: Option<i32>,
+    #[schemars(
+        description = "Minimum number of distinct topic-groups required to recommend a split \
+                       (default: 2). Files whose chunks all belong to one dominant topic get an \
+                       `add_test` recommendation instead — they're cohesive."
+    )]
+    pub min_communities: Option<usize>,
+    #[schemars(
+        description = "If true, include per-chunk membership detail in the output. Default false."
+    )]
+    pub include_chunks: Option<bool>,
+}
+
+/// Tier 3 — `stale_zombie_detector` (graph + history-based dead-code identification).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StaleZombieParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Minimum days since last commit (default: 540 — ~18 months)")]
+    pub min_days_idle: Option<i32>,
+    #[schemars(
+        description = "Maximum PageRank percentile (default: 0.25 — bottom 25%). Files above this \
+                       are too central to be zombies."
+    )]
+    pub max_pagerank_pct: Option<f64>,
+    #[schemars(description = "Maximum candidates to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+
+/// Tier 2 — `boilerplate_clusters` (codegen-worthy near-identical chunks).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BoilerplateClustersParams {
+    #[schemars(
+        description = "Minimum chunk-pair similarity (default: 0.96). Aggressive — boilerplate \
+                       must be near-identical."
+    )]
+    pub min_similarity: Option<f64>,
+    #[schemars(description = "Minimum chunks per cluster (default: 3)")]
+    pub min_cluster_size: Option<usize>,
+    #[schemars(
+        description = "Minimum normalized Jaccard match ratio after identifier substitution \
+                       (default: 0.99). Below this, the cluster is real-similarity rather than \
+                       boilerplate."
+    )]
+    pub min_normalized_match: Option<f64>,
+    #[schemars(description = "Filter by programming language")]
+    pub language: Option<String>,
+    #[schemars(description = "Filter pairs touching this project")]
+    pub project: Option<String>,
+    #[schemars(description = "Maximum clusters to return (default: 20)")]
+    pub limit: Option<i32>,
+    #[schemars(description = "Worktree filter: \"main\" (default) or \"all\".")]
+    pub worktree_filter: Option<String>,
+    #[schemars(
+        description = "If true, include pairs whose two projects are worktrees of the same \
+                       upstream repo. Default false."
+    )]
+    pub include_same_repo: Option<bool>,
+}
+
+/// Tier 2 — `pattern_abstraction_candidates` (trait/interface extraction at medium similarity).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PatternAbstractionParams {
+    #[schemars(description = "Minimum chunk-pair similarity (default: 0.70)")]
+    pub min_similarity: Option<f64>,
+    #[schemars(
+        description = "Maximum chunk-pair similarity, exclusive (default: 0.85). Above this is \
+                       duplicate code, not pattern."
+    )]
+    pub max_similarity: Option<f64>,
+    #[schemars(
+        description = "Minimum FCM topic-membership score on both endpoints (default: 0.55). \
+                       Above this means the chunks are confidently in the same topic."
+    )]
+    pub min_topic_membership: Option<f64>,
+    #[schemars(description = "Minimum implementations per pattern candidate (default: 4)")]
+    pub min_cluster_size: Option<usize>,
+    #[schemars(description = "Filter by programming language")]
+    pub language: Option<String>,
+    #[schemars(description = "Restrict to pairs touching this project")]
+    pub project: Option<String>,
+    #[schemars(description = "Maximum candidates to return (default: 20)")]
+    pub limit: Option<i32>,
+    #[schemars(description = "Worktree filter: \"main\" (default) or \"all\".")]
+    pub worktree_filter: Option<String>,
+    #[schemars(
+        description = "If true, include candidates whose two projects are worktrees of the same \
+                       upstream repo. Default false."
+    )]
+    pub include_same_repo: Option<bool>,
+}
+
+/// Tier 2 — `extraction_candidates` (ranked extract-to-shared-crate; superset of refactoring_report).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExtractionCandidatesParams {
+    #[schemars(description = "Minimum file-pair similarity (default: 0.85)")]
+    pub min_similarity: Option<f64>,
+    #[schemars(description = "Minimum projects spanned by a candidate (default: 2)")]
+    pub min_projects: Option<usize>,
+    #[schemars(description = "Filter by programming language")]
+    pub language: Option<String>,
+    #[schemars(description = "Maximum candidates to return (default: 20)")]
+    pub limit: Option<i32>,
+    #[schemars(
+        description = "Worktree filter: \"main\" (default) restricts to canonical main projects; \
+                       \"all\" includes feature-branch worktrees."
+    )]
+    pub worktree_filter: Option<String>,
+    #[schemars(
+        description = "If true, include refactor candidates whose two projects are worktrees / \
+                       sibling clones of the same upstream repo. Default false."
+    )]
+    pub include_same_repo: Option<bool>,
+    #[schemars(
+        description = "If true (default), count the call sites that would have to update with the \
+                       extraction. Set false to skip the extra graph query."
+    )]
+    pub include_call_sites: Option<bool>,
+    #[schemars(
+        description = "Risk tier filter: \"any\" (default), \"low\", \"low-med\". Drops candidates \
+                       whose risk_tier exceeds the threshold."
+    )]
+    pub risk_threshold: Option<String>,
+}
+
+/// Tier 2 — `internal_dry` (DRY within one file, real-time).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InternalDryParams {
+    #[schemars(
+        description = "File reference: either `project:relative_path` (e.g. \"f1r3node:src/cli/mod.rs\") or absolute path"
+    )]
+    pub file: String,
+    #[schemars(
+        description = "Minimum intra-file chunk-pair similarity (default: 0.80). Lower than \
+                       cross-project DRY because semantically related code in the same file \
+                       has more shared context."
+    )]
+    pub min_similarity: Option<f64>,
+    #[schemars(
+        description = "Minimum chunks per proposed helper (default: 2). Single chunks are \
+                       skipped — a helper extracted from one chunk isn't a DRY win."
+    )]
+    pub min_pairs_per_helper: Option<usize>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TopicHierarchyFcmParams {
     /// Maximum meta-groups to return (default: 50).
@@ -730,6 +1153,13 @@ pub struct ArchitectureViolationsParams {
         description = "Minimum severity to report: \"low\", \"medium\", \"high\", \"critical\" (default: \"medium\")"
     )]
     pub severity_threshold: Option<String>,
+    /// Whether to embed a typed `recommended_fix` action on each violation. Default true.
+    /// Set false to reproduce the pre-2026-04-30 diagnostic-only output shape.
+    #[schemars(
+        description = "Whether to embed a typed recommended_fix action on each violation (default: true). \
+                       Set false to reproduce the pre-2026-04-30 diagnostic-only shape."
+    )]
+    pub include_fixes: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -745,6 +1175,12 @@ pub struct DesignSmellDetectionParams {
     /// Max results (default: 30)
     #[schemars(description = "Max results (default: 30)")]
     pub limit: Option<i32>,
+    /// Whether to embed a typed `recommended_fix` action on each smell. Default true.
+    #[schemars(
+        description = "Whether to embed a typed recommended_fix action on each smell (default: true). \
+                       Set false to reproduce the pre-2026-04-30 diagnostic-only shape."
+    )]
+    pub include_fixes: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1198,6 +1634,484 @@ batch scan to have run at least once."
             "refactoring_report",
             30,
             super::tools::tool_refactoring_report::tool_refactoring_report(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Cluster near-duplicate code chunks (not files) across projects and propose a \
+shared function name per cluster. \
+USE WHEN: looking for fine-grained DRY opportunities — two files might be 90% different but share \
+a small embedded utility worth extracting. Distinct from `find_duplicates` (file-level) and \
+`refactoring_report` (whole-crate extraction). \
+DO NOT USE WHEN: you want library-extraction candidates (use `refactoring_report`) or you have \
+a specific seed file (use `find_similar_modules`). \
+Each cluster includes a typed `recommended_fix` (extract_function or extract_module) with \
+proposed function name, module name, and priority_score = loc_avg × project_count × (chunk_count - 1). \
+Reads the materialized similarity table; requires the 6-hour similarity-scan cron to have run."
+    )]
+    async fn chunk_clusters(
+        &self,
+        Parameters(params): Parameters<ChunkClustersParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("chunk_clusters");
+        timeout_wrap(
+            "chunk_clusters",
+            30,
+            super::tools::tool_chunk_clusters::tool_chunk_clusters(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "DRY within a single file: find intra-file chunk pairs above a similarity \
+threshold and propose private-helper extractions. \
+USE WHEN: you've opened a file and want to know whether parts of it are repeating themselves — \
+e.g. multiple HTTP handlers building the same request envelope. Real-time over the indexed \
+chunks; no cron dependency. \
+DO NOT USE WHEN: looking for cross-file or cross-project DRY (use `chunk_clusters`). \
+Returns clusters of similar chunks, each with a proposed `extract_function` recommended_fix \
+(action=extract_function, suggested_name, line ranges). Pass `file` as `project:relative_path` \
+or absolute path."
+    )]
+    async fn internal_dry(
+        &self,
+        Parameters(params): Parameters<InternalDryParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("internal_dry");
+        timeout_wrap(
+            "internal_dry",
+            30,
+            super::tools::tool_internal_dry::tool_internal_dry(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Extraction-to-shared-crate candidates with effort + risk + proposed API surface. \
+Strict superset of `refactoring_report`. \
+USE WHEN: planning a `extract_module` PR — you want to know not just *which* code to extract, but \
+*how big* the migration is (loc_to_extract, call_sites_to_update) and *how risky* (high churn? many \
+unresolved imports?). Each candidate carries a typed `recommended_fix(action=extract_module)`. \
+DO NOT USE WHEN: doing a quick \"what duplicates exist?\" survey — `find_duplicates` or \
+`refactoring_report` is faster. \
+Reads materialized similarity table; requires the 6-hour similarity-scan cron."
+    )]
+    async fn extraction_candidates(
+        &self,
+        Parameters(params): Parameters<ExtractionCandidatesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("extraction_candidates");
+        timeout_wrap(
+            "extraction_candidates",
+            30,
+            super::tools::tool_extraction_candidates::tool_extraction_candidates(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Trait / interface / Protocol extraction candidates: chunks at *medium* \
+similarity (0.70-0.85) sharing the same topic — different implementations of the same idea. \
+USE WHEN: looking for OOP / Rust-trait abstraction opportunities. Distinct from `chunk_clusters` \
+(near-duplicates → extract function) and `extraction_candidates` (whole-file → extract crate). \
+DO NOT USE WHEN: chunks are nearly identical (use `chunk_clusters`) or you have no topic data \
+yet (run `discover_topics` first). \
+Each candidate includes a typed `recommended_fix(action=extract_trait|extract_interface)` with \
+proposed method name, abstraction kind by language, and a diversity-rewarded priority score \
+(higher reward for less-similar implementations of the same topic)."
+    )]
+    async fn pattern_abstraction_candidates(
+        &self,
+        Parameters(params): Parameters<PatternAbstractionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats()
+            .record_tool_call("pattern_abstraction_candidates");
+        timeout_wrap(
+            "pattern_abstraction_candidates",
+            30,
+            super::tools::tool_pattern_abstraction::tool_pattern_abstraction(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Codegen-worthy near-identical chunks: clusters where chunks differ only by \
+renamed identifiers — strong macro / generic / template candidates. \
+USE WHEN: auditing for boilerplate that should be a `macro_rules!` (Rust), generic (TS/Java), \
+or parametric template. Aggressive default threshold (0.96) so only near-identical code surfaces. \
+DO NOT USE WHEN: looking for general DRY (use `chunk_clusters`); a 0.88 cluster of \"similar idea\" \
+code is not a boilerplate cluster. \
+For each cluster, identifiers are normalized to positional placeholders; the differing values are \
+reported (so you know which identifiers vary across instances). Recommended fix is always \
+`extract_macro`. Reads materialized similarity table; requires the 6-hour similarity-scan cron."
+    )]
+    async fn boilerplate_clusters(
+        &self,
+        Parameters(params): Parameters<BoilerplateClustersParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("boilerplate_clusters");
+        timeout_wrap(
+            "boilerplate_clusters",
+            30,
+            super::tools::tool_boilerplate_clusters::tool_boilerplate_clusters(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Likely-dead files based on graph + history evidence: low PageRank percentile \
+(bottom 25%), in_degree <= 1, and idle for >= 540 days by default. \
+USE WHEN: cleaning up legacy modules during a quarterly audit. Distinct from `find_orphans` \
+(which uses topic membership) — this combines graph centrality, importer count, and authorial \
+abandonment. \
+DO NOT USE WHEN: file_metrics is empty (graph cron hasn't run) — the tool soft-fails with a \
+guidance message. \
+For files with `in_degree=0`, the recommended_fix is `delete_file`. For `in_degree=1`, the fix \
+is `move_function` (relocate the single referenced symbol into its sole importer, then delete)."
+    )]
+    async fn stale_zombie_detector(
+        &self,
+        Parameters(params): Parameters<StaleZombieParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("stale_zombie_detector");
+        timeout_wrap(
+            "stale_zombie_detector",
+            30,
+            super::tools::tool_stale_zombie::tool_stale_zombie(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "For each god file (line_count >= 500 by default), propose an explicit split \
+along FCM topic boundaries with line ranges and a typed `recommended_fix(action=split_file)`. \
+USE WHEN: an `architecture_violations` god_module finding or a `design_smell_detection` god_class \
+finding has surfaced — this tool turns the diagnosis into a concrete sub-file proposal with chunk \
+ranges and per-piece suggested filenames. \
+DO NOT USE WHEN: no FCM topics have been computed yet (run `discover_topics` first; otherwise \
+this tool soft-fails with `health.topics_present:false`). \
+Single-topic god files get an `add_test` recommendation instead — they're cohesive and shouldn't \
+be split."
+    )]
+    async fn recommend_module_split(
+        &self,
+        Parameters(params): Parameters<RecommendModuleSplitParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("recommend_module_split");
+        timeout_wrap(
+            "recommend_module_split",
+            30,
+            super::tools::tool_recommend_module_split::tool_recommend_module_split(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "For each Tarjan SCC (cycle group) in a project's import graph, recommend a \
+specific edge to break and the strategy: `extract_interface` or `invert_dependency`. \
+USE WHEN: `circular_dependencies` has surfaced cycles and you want explicit, agent-executable fix \
+guidance — which edge to flip, which side gets the new abstraction, which imports must update. \
+DO NOT USE WHEN: the import graph is empty (graph cron hasn't run); soft-fails with \
+`health.graph_stale:true`. \
+Strategy heuristic: when one cycle endpoint is more abstract / stable, the edge from the \
+less-abstract side becomes a trait/interface dependency on the abstract side (`invert_dependency`); \
+otherwise, propose extracting a new shared interface for the lower-coupling endpoint."
+    )]
+    async fn fix_circular_dependency(
+        &self,
+        Parameters(params): Parameters<FixCircularDependencyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("fix_circular_dependency");
+        timeout_wrap(
+            "fix_circular_dependency",
+            30,
+            super::tools::tool_fix_circular_dependency::tool_fix_circular_dependency(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "For each shotgun-surgery smell hub (file co-changing with many partners), \
+pick the absorbing centroid file and recommend consolidation. \
+USE WHEN: a `design_smell_detection` shotgun_surgery finding has surfaced — turn the \"this hub \
+ripples to N partners\" signal into a typed `recommended_fix(action=consolidate_logic)` with the \
+target file and per-partner moves enumerated. \
+DO NOT USE WHEN: git history is disabled for the project (no co-change data); soft-fails with \
+`health.git_history_present:false`. \
+Centroid heuristic: among the hub plus its co-change partners, pick the file with the highest \
+PageRank — the most architecturally central place to consolidate the scattered logic."
+    )]
+    async fn shotgun_surgery_fix(
+        &self,
+        Parameters(params): Parameters<ShotgunSurgeryFixParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("shotgun_surgery_fix");
+        timeout_wrap(
+            "shotgun_surgery_fix",
+            30,
+            super::tools::tool_shotgun_surgery_fix::tool_shotgun_surgery_fix(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Infer a layered architecture for a project (Louvain on imports + SDP-based \
+layer assignment) and list every cross-layer import as a violation, each with a typed \
+`recommended_fix`. \
+USE WHEN: doing an architecture audit and you want a layered view *plus* the violations that \
+break it — UI files reaching directly into data layer, deep upward dependencies, etc. \
+DO NOT USE WHEN: the project's import graph is small (< num_layers communities) — the heuristic \
+collapses and confidence drops sharply. The default web-biased layer-naming is unreliable for \
+non-web codebases; override via `layer_names`. \
+Per-violation fix dispatch: skip-N-layer downward → add_anti_corruption_layer; small leaf → \
+move_function; upward → invert_dependency."
+    )]
+    async fn recommend_layering(
+        &self,
+        Parameters(params): Parameters<RecommendLayeringParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("recommend_layering");
+        timeout_wrap(
+            "recommend_layering",
+            30,
+            super::tools::tool_recommend_layering::tool_recommend_layering(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Given a starter file, recommend the right PR scope: minimum (direct \
+importers), recommended (+ co-change Jaccard ≥ threshold), maximum (+ depth-N reverse BFS + \
+topic neighbors). Emits a `verdict`: focused / normal / sprawling. \
+USE WHEN: about to open a PR and want to know whether other files should travel with it. \
+DO NOT USE WHEN: git history is disabled — co-change leg drops out and the recommendation \
+quality declines (still works on imports + topics)."
+    )]
+    async fn pr_scope_recommender(
+        &self,
+        Parameters(params): Parameters<PrScopeRecommenderParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("pr_scope_recommender");
+        timeout_wrap(
+            "pr_scope_recommender",
+            30,
+            super::tools::tool_pr_scope::tool_pr_scope(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Files in the intersection of top-P% PageRank, top-P% churn, and top-P% \
+fix_commit_ratio — the most fragile critical paths. \
+USE WHEN: deciding where to invest test/docs effort, or as a release-readiness audit (\"what's \
+the most expensive risk we're shipping?\"). \
+DO NOT USE WHEN: file_metrics or git history is empty — the percentile gates collapse to zero \
+and the result is empty. Each row carries a `priority` (P0/P1/P2) and an action recommendation \
+(add integration test, freeze API, refactor)."
+    )]
+    async fn hot_path_audit(
+        &self,
+        Parameters(params): Parameters<HotPathAuditParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("hot_path_audit");
+        timeout_wrap(
+            "hot_path_audit",
+            30,
+            super::tools::tool_hot_path_audit::tool_hot_path_audit(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Per-file knowledge-concentration risk: top author's share of blamed lines × \
+PageRank ÷ distinct authors. Surfaces files where a single contributor's departure causes \
+maximum harm. \
+USE WHEN: planning team coverage / PTO, or auditing a release candidate for fragility. \
+DO NOT USE WHEN: file_chunks blame columns are empty (project hasn't run the git-blame cron). \
+Returns critical / warning / healthy buckets and a `bus_factor_estimate` (greedy set-cover ≥50% of total blamed lines)."
+    )]
+    async fn bus_factor_map(
+        &self,
+        Parameters(params): Parameters<BusFactorMapParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("bus_factor_map");
+        timeout_wrap(
+            "bus_factor_map",
+            30,
+            super::tools::tool_bus_factor_map::tool_bus_factor_map(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Given a list of changed files, rank reviewers by recent ownership and \
+suggest a minimum cover-set (≥80% of files with the fewest reviewers). \
+USE WHEN: about to open a PR and need to pick reviewers — pastes the file list, gets a \
+ranked author list with per-file breakdowns. \
+DO NOT USE WHEN: blame columns are empty — files with no blame data appear in `unowned_files`. \
+Pass the PR author's email in `exclude_authors` to skip self-review."
+    )]
+    async fn reviewer_recommender(
+        &self,
+        Parameters(params): Parameters<ReviewerRecommenderParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("reviewer_recommender");
+        timeout_wrap(
+            "reviewer_recommender",
+            30,
+            super::tools::tool_reviewer_recommender::tool_reviewer_recommender(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Audit external/unresolved import targets across one or all projects. \
+USE WHEN: doing a quarterly dep audit — surface third-party deps, rank by usage centrality + \
+staleness, recommend prune / upgrade / consolidate / keep. \
+DO NOT USE WHEN: code_graph_edges has no unresolved-target rows."
+    )]
+    async fn dependency_health(
+        &self,
+        Parameters(params): Parameters<DependencyHealthParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("dependency_health");
+        timeout_wrap(
+            "dependency_health",
+            30,
+            super::tools::tool_dependency_health::tool_dependency_health(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Snippet-as-query: embed a code snippet and find the closest implementations \
+across all indexed projects, plus a `verdict` (reuse / adapt / new). \
+USE WHEN: mid-implementation, you want to know whether anyone in the workspace is already \
+solving this. Distinct from `semantic_search` (which targets natural-language queries). \
+DO NOT USE WHEN: you have a known seed file — use `find_similar_modules`."
+    )]
+    async fn pattern_search(
+        &self,
+        Parameters(params): Parameters<PatternSearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("pattern_search");
+        timeout_wrap(
+            "pattern_search",
+            30,
+            super::tools::tool_pattern_search::tool_pattern_search(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Score files by likelihood of conflicting with peer in-flight work, using \
+overlapping recent commits as a proxy. \
+USE WHEN: about to land a long-lived feature branch and want to know which files are also \
+being edited concurrently. \
+DO NOT USE WHEN: git history is disabled — soft-fails with `health.git_history_present:false`."
+    )]
+    async fn merge_conflict_risk(
+        &self,
+        Parameters(params): Parameters<MergeConflictRiskParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("merge_conflict_risk");
+        timeout_wrap(
+            "merge_conflict_risk",
+            30,
+            super::tools::tool_merge_conflict_risk::tool_merge_conflict_risk(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Surface symbols whose naming convention diverges from the dominant \
+convention within their directory. \
+USE WHEN: enforcing or auditing per-module naming consistency. \
+DO NOT USE WHEN: file_symbols data is absent — this tool requires the Tier-0e tree-sitter pass. \
+Today, soft-fails with `health.symbols_present:false` and a guidance message; once Phase 0b \
+ships, returns `divergences[]` with `recommended_fix(action=move_function)`."
+    )]
+    async fn naming_consistency(
+        &self,
+        Parameters(params): Parameters<NamingConsistencyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("naming_consistency");
+        timeout_wrap(
+            "naming_consistency",
+            30,
+            super::tools::tool_naming_consistency::tool_naming_consistency(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Project- or file-level growth trajectory over time: commits, authors, and \
+optionally LOC per bucket (week/month/quarter). \
+USE WHEN: investigating whether a module is growing fast enough to need a preemptive split, or \
+auditing release-velocity trends. \
+DO NOT USE WHEN: git history is disabled or the lookback window has < 4 buckets — trend math \
+falls back to raw bucket data with no projection."
+    )]
+    async fn module_growth_trajectory(
+        &self,
+        Parameters(params): Parameters<ModuleGrowthParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("module_growth_trajectory");
+        timeout_wrap(
+            "module_growth_trajectory",
+            30,
+            super::tools::tool_module_growth::tool_module_growth(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Given a 'modern' reference file, find legacy/older usages of similar \
+patterns across the corpus. \
+USE WHEN: you've just rewritten a feature and want to know where the old version is still in \
+use, so you can plan migrations. \
+DO NOT USE WHEN: no chunks found for the reference."
+    )]
+    async fn adoption_lag(
+        &self,
+        Parameters(params): Parameters<AdoptionLagParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("adoption_lag");
+        timeout_wrap(
+            "adoption_lag",
+            30,
+            super::tools::tool_adoption_lag::tool_adoption_lag(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Compose a phased remediation plan: aggregate `recommended_fix` items from \
+bug_prediction, technical_debt_analysis, architecture_violations, design_smell_detection, \
+stale_zombie_detector, and fix_circular_dependency. Rank by cost-benefit and bin-pack into \
+'now' / 'next' / 'later' for the requested time_horizon. \
+USE WHEN: planning a remediation sprint — one ranked, time-budgeted list across every quality \
+dimension instead of running 6 tools separately."
+    )]
+    async fn tech_debt_burn_down(
+        &self,
+        Parameters(params): Parameters<TechDebtBurnDownParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("tech_debt_burn_down");
+        timeout_wrap(
+            "tech_debt_burn_down",
+            45,
+            super::tools::tool_tech_debt_burn_down::tool_tech_debt_burn_down(self.ctx(), params),
         )
         .await
     }
@@ -2167,8 +3081,8 @@ impl ServerHandler for McpServer {
         .with_server_info(Implementation::new("pgmcp", env!("CARGO_PKG_VERSION")))
         .with_instructions(
             "pgmcp indexes the user's development workspaces into PostgreSQL+pgvector and \
-             exposes ~40 tools for cross-project search, semantic queries, graph analysis, \
-             and code-health metrics.\n\n\
+             exposes ~63 tools for cross-project search, semantic queries, graph analysis, \
+             code-health metrics, and recommendation-shaped refactoring actions.\n\n\
              USE THESE TOOLS BEFORE built-in Read/Grep/Glob when the question is conceptual \
              ('how does X work?'), cross-project ('does this pattern exist elsewhere?'), \
              graph-shaped ('what depends on this?'), or about code health ('where is the \
@@ -2210,7 +3124,34 @@ impl ServerHandler for McpServer {
              technical_debt_analysis (TODO density + complexity + test gaps + churn), \
              anomaly_detection (embedding distance from project centroid).\n\n\
              SUMMARIZATION & SCORECARD: code_summarize (structural roll-up), \
-             engineering_scorecard (10-dim A-F + GPA + ORR checklist).",
+             engineering_scorecard (10-dim A-F + GPA + ORR checklist).\n\n\
+             REFACTORING & RECOMMENDATIONS (every finding embeds a typed `recommended_fix` \
+             with action + steps + confidence + estimated_effort): chunk_clusters \
+             (chunk-level cross-project DRY), internal_dry (within-file DRY), \
+             extraction_candidates (ranked extract-to-shared-crate; superset of \
+             refactoring_report), pattern_abstraction_candidates (medium-similarity → \
+             trait/interface/protocol), boilerplate_clusters (codegen-worthy near-identical \
+             chunks → macros/generics), recommend_module_split (god-file → multiple files \
+             via FCM topic grouping), recommend_layering (Louvain + SDP layered \
+             architecture proposal), shotgun_surgery_fix (consolidate scattered \
+             hub-and-spoke logic), fix_circular_dependency (per-cycle edge-break \
+             recommendation via PageRank-delta), stale_zombie_detector (low PageRank + low \
+             in-degree + author abandonment → delete or move), naming_consistency \
+             (per-(directory, kind) convention divergence; requires file_symbols), \
+             tech_debt_burn_down (capstone — phased remediation plan from all findings, \
+             cost-benefit ranked, packed into now/next/later phases).\n\n\
+             PR & TEAM WORKFLOW: pr_scope_recommender (min/recommended/max PR scope from a \
+             starter file), hot_path_audit (PageRank ∩ churn ∩ fix-ratio intersection with \
+             P0/P1/P2 priority), bus_factor_map (knowledge-concentration risk per file via \
+             blame), reviewer_recommender (rank reviewers by recent file ownership), \
+             merge_conflict_risk (peer-overlap on a branch's files; window-based), \
+             dependency_health (external/unresolved-import audit; \
+             prune/upgrade/consolidate/keep), pattern_search (embed snippet, find matches \
+             across projects, verdict reuse|adapt|new with recommended_fix).\n\n\
+             TRAJECTORY & ADOPTION: module_growth_trajectory (LOC + chunks + churn over \
+             time, predicts god_module emergence via linear regression), adoption_lag (find \
+             legacy usages of a modern reference file via kNN + age filter, recommends \
+             merge_files / move_function).",
         )
     }
 

@@ -119,6 +119,42 @@ pub struct StatsTracker {
     // Scorecard counters
     pub scorecard_scans: AtomicU64,
 
+    // DRY tier (Tier 2) counters — recommendation-shaped tools producing
+    // typed `RecommendedFix` actions; see `src/mcp/tools/fix_actions.rs`.
+    pub chunk_cluster_scans: AtomicU64,
+    pub extraction_candidate_reports: AtomicU64,
+    pub boilerplate_scans: AtomicU64,
+    pub internal_dry_scans: AtomicU64,
+    pub pattern_abstraction_scans: AtomicU64,
+
+    // Antipattern-fix tier (Tier 3) counters — typed `RecommendedFix`
+    // actions for architecture violations and design smells.
+    pub cycle_fix_scans: AtomicU64,
+    pub split_recommendations: AtomicU64,
+    pub consolidation_scans: AtomicU64,
+    pub zombie_scans: AtomicU64,
+    pub layering_scans: AtomicU64,
+
+    // Engineer/architect workflow tier (Tier 4) counters.
+    pub pr_scope_recommendations: AtomicU64,
+    pub hot_path_audits: AtomicU64,
+    pub bus_factor_scans: AtomicU64,
+    pub reviewer_recommendations: AtomicU64,
+
+    // Audit & trend tier (Tier 5) counters.
+    pub dependency_health_scans: AtomicU64,
+    pub pattern_searches: AtomicU64,
+    pub merge_risk_scans: AtomicU64,
+    pub naming_consistency_scans: AtomicU64,
+    pub growth_trajectory_scans: AtomicU64,
+    pub adoption_lag_scans: AtomicU64,
+    pub burn_down_plans: AtomicU64,
+
+    // Tree-sitter symbol extraction (Tier 0e infrastructure).
+    pub symbol_extraction_runs: AtomicU64,
+    pub symbols_extracted: AtomicU64,
+    pub symbol_references_inserted: AtomicU64,
+
     /// Currently-connected Streamable HTTP MCP sessions. Incremented when
     /// a peer issues an `initialize` and a session is created in the
     /// `LocalSessionManager` wrapper; decremented on session close /
@@ -219,6 +255,30 @@ impl StatsTracker {
             hybrid_searches: AtomicU64::new(0),
             summarize_scans: AtomicU64::new(0),
             scorecard_scans: AtomicU64::new(0),
+            chunk_cluster_scans: AtomicU64::new(0),
+            extraction_candidate_reports: AtomicU64::new(0),
+            boilerplate_scans: AtomicU64::new(0),
+            internal_dry_scans: AtomicU64::new(0),
+            pattern_abstraction_scans: AtomicU64::new(0),
+            cycle_fix_scans: AtomicU64::new(0),
+            split_recommendations: AtomicU64::new(0),
+            consolidation_scans: AtomicU64::new(0),
+            zombie_scans: AtomicU64::new(0),
+            layering_scans: AtomicU64::new(0),
+            pr_scope_recommendations: AtomicU64::new(0),
+            hot_path_audits: AtomicU64::new(0),
+            bus_factor_scans: AtomicU64::new(0),
+            reviewer_recommendations: AtomicU64::new(0),
+            dependency_health_scans: AtomicU64::new(0),
+            pattern_searches: AtomicU64::new(0),
+            merge_risk_scans: AtomicU64::new(0),
+            naming_consistency_scans: AtomicU64::new(0),
+            growth_trajectory_scans: AtomicU64::new(0),
+            adoption_lag_scans: AtomicU64::new(0),
+            burn_down_plans: AtomicU64::new(0),
+            symbol_extraction_runs: AtomicU64::new(0),
+            symbols_extracted: AtomicU64::new(0),
+            symbol_references_inserted: AtomicU64::new(0),
             http_mcp_sessions: AtomicU64::new(0),
             peak_rss_bytes: AtomicU64::new(0),
             current_rss_bytes: AtomicU64::new(0),
@@ -307,6 +367,30 @@ impl StatsTracker {
             "hybrid_searches": self.hybrid_searches.load(Ordering::Acquire),
             "summarize_scans": self.summarize_scans.load(Ordering::Acquire),
             "scorecard_scans": self.scorecard_scans.load(Ordering::Acquire),
+            "chunk_cluster_scans": self.chunk_cluster_scans.load(Ordering::Acquire),
+            "extraction_candidate_reports": self.extraction_candidate_reports.load(Ordering::Acquire),
+            "boilerplate_scans": self.boilerplate_scans.load(Ordering::Acquire),
+            "internal_dry_scans": self.internal_dry_scans.load(Ordering::Acquire),
+            "pattern_abstraction_scans": self.pattern_abstraction_scans.load(Ordering::Acquire),
+            "cycle_fix_scans": self.cycle_fix_scans.load(Ordering::Acquire),
+            "split_recommendations": self.split_recommendations.load(Ordering::Acquire),
+            "consolidation_scans": self.consolidation_scans.load(Ordering::Acquire),
+            "zombie_scans": self.zombie_scans.load(Ordering::Acquire),
+            "layering_scans": self.layering_scans.load(Ordering::Acquire),
+            "pr_scope_recommendations": self.pr_scope_recommendations.load(Ordering::Acquire),
+            "hot_path_audits": self.hot_path_audits.load(Ordering::Acquire),
+            "bus_factor_scans": self.bus_factor_scans.load(Ordering::Acquire),
+            "reviewer_recommendations": self.reviewer_recommendations.load(Ordering::Acquire),
+            "dependency_health_scans": self.dependency_health_scans.load(Ordering::Acquire),
+            "pattern_searches": self.pattern_searches.load(Ordering::Acquire),
+            "merge_risk_scans": self.merge_risk_scans.load(Ordering::Acquire),
+            "naming_consistency_scans": self.naming_consistency_scans.load(Ordering::Acquire),
+            "growth_trajectory_scans": self.growth_trajectory_scans.load(Ordering::Acquire),
+            "adoption_lag_scans": self.adoption_lag_scans.load(Ordering::Acquire),
+            "burn_down_plans": self.burn_down_plans.load(Ordering::Acquire),
+            "symbol_extraction_runs": self.symbol_extraction_runs.load(Ordering::Acquire),
+            "symbols_extracted": self.symbols_extracted.load(Ordering::Acquire),
+            "symbol_references_inserted": self.symbol_references_inserted.load(Ordering::Acquire),
             "http_mcp_sessions": self.http_mcp_sessions.load(Ordering::Acquire),
             "tool_invocations": serde_json::Value::Object(
                 self.tool_invocations.iter()
@@ -383,6 +467,36 @@ mod tests {
         stats.hybrid_searches.store(45, Ordering::Relaxed);
         stats.summarize_scans.store(46, Ordering::Relaxed);
         stats.scorecard_scans.store(47, Ordering::Relaxed);
+        stats.chunk_cluster_scans.store(101, Ordering::Relaxed);
+        stats
+            .extraction_candidate_reports
+            .store(102, Ordering::Relaxed);
+        stats.boilerplate_scans.store(103, Ordering::Relaxed);
+        stats.internal_dry_scans.store(104, Ordering::Relaxed);
+        stats
+            .pattern_abstraction_scans
+            .store(105, Ordering::Relaxed);
+        stats.cycle_fix_scans.store(106, Ordering::Relaxed);
+        stats.split_recommendations.store(107, Ordering::Relaxed);
+        stats.consolidation_scans.store(108, Ordering::Relaxed);
+        stats.zombie_scans.store(109, Ordering::Relaxed);
+        stats.layering_scans.store(110, Ordering::Relaxed);
+        stats.pr_scope_recommendations.store(111, Ordering::Relaxed);
+        stats.hot_path_audits.store(112, Ordering::Relaxed);
+        stats.bus_factor_scans.store(113, Ordering::Relaxed);
+        stats.reviewer_recommendations.store(114, Ordering::Relaxed);
+        stats.dependency_health_scans.store(115, Ordering::Relaxed);
+        stats.pattern_searches.store(116, Ordering::Relaxed);
+        stats.merge_risk_scans.store(117, Ordering::Relaxed);
+        stats.naming_consistency_scans.store(118, Ordering::Relaxed);
+        stats.growth_trajectory_scans.store(119, Ordering::Relaxed);
+        stats.adoption_lag_scans.store(120, Ordering::Relaxed);
+        stats.burn_down_plans.store(121, Ordering::Relaxed);
+        stats.symbol_extraction_runs.store(122, Ordering::Relaxed);
+        stats.symbols_extracted.store(123, Ordering::Relaxed);
+        stats
+            .symbol_references_inserted
+            .store(124, Ordering::Relaxed);
 
         let snap = stats.snapshot();
 
@@ -434,6 +548,30 @@ mod tests {
         assert_eq!(snap["hybrid_searches"], 45);
         assert_eq!(snap["summarize_scans"], 46);
         assert_eq!(snap["scorecard_scans"], 47);
+        assert_eq!(snap["chunk_cluster_scans"], 101);
+        assert_eq!(snap["extraction_candidate_reports"], 102);
+        assert_eq!(snap["boilerplate_scans"], 103);
+        assert_eq!(snap["internal_dry_scans"], 104);
+        assert_eq!(snap["pattern_abstraction_scans"], 105);
+        assert_eq!(snap["cycle_fix_scans"], 106);
+        assert_eq!(snap["split_recommendations"], 107);
+        assert_eq!(snap["consolidation_scans"], 108);
+        assert_eq!(snap["zombie_scans"], 109);
+        assert_eq!(snap["layering_scans"], 110);
+        assert_eq!(snap["pr_scope_recommendations"], 111);
+        assert_eq!(snap["hot_path_audits"], 112);
+        assert_eq!(snap["bus_factor_scans"], 113);
+        assert_eq!(snap["reviewer_recommendations"], 114);
+        assert_eq!(snap["dependency_health_scans"], 115);
+        assert_eq!(snap["pattern_searches"], 116);
+        assert_eq!(snap["merge_risk_scans"], 117);
+        assert_eq!(snap["naming_consistency_scans"], 118);
+        assert_eq!(snap["growth_trajectory_scans"], 119);
+        assert_eq!(snap["adoption_lag_scans"], 120);
+        assert_eq!(snap["burn_down_plans"], 121);
+        assert_eq!(snap["symbol_extraction_runs"], 122);
+        assert_eq!(snap["symbols_extracted"], 123);
+        assert_eq!(snap["symbol_references_inserted"], 124);
 
         // Verify existing fields still present
         assert_eq!(snap["files_indexed"], 0);

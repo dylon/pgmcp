@@ -9,6 +9,8 @@ pub mod scheduler;
 #[allow(dead_code)]
 pub mod similarity;
 #[allow(dead_code)]
+pub mod symbol_extraction;
+#[allow(dead_code)]
 pub mod topic_clustering;
 #[allow(dead_code)]
 pub mod topic_clustering_online;

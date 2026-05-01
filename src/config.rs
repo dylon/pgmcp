@@ -182,9 +182,13 @@ fn default_file_types() -> Vec<FileTypeMapping> {
             extension: "ts".into(),
             language: "typescript".into(),
         },
+        // `.tsx` routes to the dedicated TSX backend
+        // (`LanguageRegistry::for_language("tsx")` → `TSX_BACKEND`), not the
+        // plain TS backend. Existing `.tsx` rows whose `indexed_files.language`
+        // is `"typescript"` will keep that value until the next reindex.
         FileTypeMapping {
             extension: "tsx".into(),
-            language: "typescript".into(),
+            language: "tsx".into(),
         },
         FileTypeMapping {
             extension: "toml".into(),
@@ -209,6 +213,53 @@ fn default_file_types() -> Vec<FileTypeMapping> {
         FileTypeMapping {
             extension: "jsonl".into(),
             language: "jsonl".into(),
+        },
+        // Tier-0e tree-sitter backends — extensions added 2026-05-01 alongside
+        // the symbol-extraction cron. Every language string here must
+        // correspond to a `Some(...)` from `LanguageRegistry::for_language`.
+        FileTypeMapping {
+            extension: "java".into(),
+            language: "java".into(),
+        },
+        FileTypeMapping {
+            extension: "scala".into(),
+            language: "scala".into(),
+        },
+        FileTypeMapping {
+            extension: "c".into(),
+            language: "c".into(),
+        },
+        FileTypeMapping {
+            extension: "h".into(),
+            language: "c".into(),
+        },
+        FileTypeMapping {
+            extension: "cpp".into(),
+            language: "cpp".into(),
+        },
+        FileTypeMapping {
+            extension: "cc".into(),
+            language: "cpp".into(),
+        },
+        FileTypeMapping {
+            extension: "cxx".into(),
+            language: "cpp".into(),
+        },
+        FileTypeMapping {
+            extension: "hpp".into(),
+            language: "cpp".into(),
+        },
+        FileTypeMapping {
+            extension: "hxx".into(),
+            language: "cpp".into(),
+        },
+        FileTypeMapping {
+            extension: "clj".into(),
+            language: "clojure".into(),
+        },
+        FileTypeMapping {
+            extension: "cljs".into(),
+            language: "clojurescript".into(),
         },
     ]
 }
@@ -605,6 +656,14 @@ pub struct CronConfig {
     #[serde(default = "default_graph_analysis_interval")]
     pub graph_analysis_interval_secs: u64,
 
+    /// Interval between symbol-extraction (Tier-0e) runs in seconds (default: 7200 = 2 hours).
+    /// The cron runs the per-language `LanguageBackend` impls across the indexed corpus and
+    /// persists into `file_symbols` + `symbol_references`. Steady-state cost is bounded by the
+    /// per-project `symbol_extraction_last_run:<id>` watermark — only files modified since the
+    /// last run are re-extracted.
+    #[serde(default = "default_symbol_extraction_interval")]
+    pub symbol_extraction_interval_secs: u64,
+
     // -----------------------------------------------------------------------
     // OOM-fix additions (Phase 1)
     // -----------------------------------------------------------------------
@@ -639,6 +698,11 @@ pub struct CronConfig {
     /// Default 3600 = 60 minutes.
     #[serde(default = "default_ready_delay_topic_secs")]
     pub ready_delay_topic_secs: u64,
+
+    /// Ready-relative initial delay for symbol-extraction cron (seconds).
+    /// Default 1800 = 30 minutes (matches `ready_delay_graph_secs`).
+    #[serde(default = "default_ready_delay_symbol_extraction_secs")]
+    pub ready_delay_symbol_extraction_secs: u64,
 
     /// GPU FCM precision selector (cuda feature only). Valid values: "fp32",
     /// "fp16", "bf16". Default: "fp16" — mixed precision with fp32 accumulator,
@@ -715,12 +779,14 @@ impl Default for CronConfig {
             topic_membership_threshold: default_topic_membership_threshold(),
             topic_label_top_k: default_topic_label_top_k(),
             graph_analysis_interval_secs: default_graph_analysis_interval(),
+            symbol_extraction_interval_secs: default_symbol_extraction_interval(),
             topic_max_mem_fraction: default_topic_max_mem_fraction(),
             topic_scratch_dir: None,
             ready_delay_git_secs: default_ready_delay_git_secs(),
             ready_delay_similarity_secs: default_ready_delay_similarity_secs(),
             ready_delay_graph_secs: default_ready_delay_graph_secs(),
             ready_delay_topic_secs: default_ready_delay_topic_secs(),
+            ready_delay_symbol_extraction_secs: default_ready_delay_symbol_extraction_secs(),
             gpu_fcm_precision: default_gpu_fcm_precision(),
             topic_k_selector: default_topic_k_selector(),
             topic_k_candidates: Vec::new(),
@@ -749,6 +815,9 @@ fn default_ready_delay_graph_secs() -> u64 {
 }
 fn default_ready_delay_topic_secs() -> u64 {
     3600
+}
+fn default_ready_delay_symbol_extraction_secs() -> u64 {
+    1800
 }
 fn default_gpu_fcm_precision() -> String {
     "fp16".into()
@@ -823,6 +892,9 @@ fn default_topic_label_top_k() -> usize {
 fn default_graph_analysis_interval() -> u64 {
     7200
 } // 2 hours
+fn default_symbol_extraction_interval() -> u64 {
+    7200
+} // 2 hours — matches graph-analysis cadence
 
 impl Config {
     /// Load configuration from the default path or the specified path.
@@ -1084,6 +1156,51 @@ mod tests {
         );
     }
 
+    /// Regression test for the Tier-0e extensions added 2026-05-01. Every
+    /// extension here must round-trip to a language whose `LanguageRegistry`
+    /// returns `Some` — otherwise the symbol-extraction cron would skip files
+    /// of that type.
+    #[test]
+    fn test_default_file_types_includes_tier_0e_languages() {
+        let config = IndexerConfig::default();
+        for (ext, expected_lang) in [
+            ("java", "java"),
+            ("scala", "scala"),
+            ("c", "c"),
+            ("h", "c"),
+            ("cpp", "cpp"),
+            ("cc", "cpp"),
+            ("cxx", "cpp"),
+            ("hpp", "cpp"),
+            ("hxx", "cpp"),
+            ("clj", "clojure"),
+            ("cljs", "clojurescript"),
+            ("tsx", "tsx"),
+        ] {
+            let path_str = format!("file.{}", ext);
+            let path = Path::new(&path_str);
+            assert!(
+                config.is_configured_extension(path),
+                "missing default mapping for .{}",
+                ext
+            );
+            assert_eq!(
+                config.language_for_path(path),
+                Some(expected_lang.to_string()),
+                "wrong language for .{}",
+                ext
+            );
+            // Cross-check: the language must be one that `LanguageRegistry`
+            // routes to a backend.
+            assert!(
+                crate::parsing::LanguageRegistry::for_language(expected_lang).is_some(),
+                "no backend registered for language `{}` (mapped from .{})",
+                expected_lang,
+                ext
+            );
+        }
+    }
+
     #[test]
     fn test_merge_toml_scalars_user_wins() {
         let defaults: TomlValue = toml::from_str(r#"key = "default""#).expect("parse");
@@ -1198,6 +1315,13 @@ mod tests {
         assert!((config.topic_fcm_tolerance - 1e-5).abs() < 1e-12);
         assert!((config.topic_membership_threshold - 0.05).abs() < f64::EPSILON);
         assert_eq!(config.topic_label_top_k, 5);
+    }
+
+    #[test]
+    fn test_symbol_extraction_cron_defaults() {
+        let config = CronConfig::default();
+        assert_eq!(config.symbol_extraction_interval_secs, 7200);
+        assert_eq!(config.ready_delay_symbol_extraction_secs, 1800);
     }
 
     // ========================================================================

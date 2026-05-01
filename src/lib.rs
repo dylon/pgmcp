@@ -9,7 +9,7 @@
 //! Module layout mirrors `src/main.rs`; if you add a new top-level module
 //! there, add it here too so external test/example surface stays aligned.
 
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 // BLAS provider for ndarray's `blas` feature (cblas-sys FFI) is wired by
 // `build.rs`, which emits `cargo:rustc-link-lib=dylib=blis-mt` so the
@@ -33,6 +33,7 @@ pub mod logging;
 pub mod mcp;
 #[allow(dead_code)]
 pub mod mmap_array;
+pub mod parsing;
 pub mod reactive;
 pub mod shutdown;
 pub mod stats;

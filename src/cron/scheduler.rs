@@ -919,6 +919,71 @@ pub fn schedule_maintenance_jobs(
         true
     });
 
+    // Symbol extraction (Tier-0e tree-sitter pass — populates file_symbols + symbol_references)
+    let db_clone_symbol = Arc::clone(&db);
+    let rt_clone_symbol = rt.clone();
+    let stats_for_symbol = Arc::clone(&stats);
+    let symbol_extraction_interval = config.symbol_extraction_interval_secs;
+    let lc = lifecycle.clone();
+    let lock = Arc::clone(&heavy_cron_lock);
+    let ready_symbol_extraction: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+    let symbol_extraction_ready_delay =
+        Duration::from_secs(config.ready_delay_symbol_extraction_secs);
+    let cron_pool_symbol = Arc::clone(&cron_pool);
+    handle.schedule_recurring(
+        1_000,
+        symbol_extraction_interval * 1000,
+        "symbol-extraction",
+        move || {
+            if lc.is_stopping() {
+                return false;
+            }
+            let lc = lc.clone();
+            let lock = Arc::clone(&lock);
+            let ready_symbol_extraction = Arc::clone(&ready_symbol_extraction);
+            let stats_for_symbol = Arc::clone(&stats_for_symbol);
+            let db = db_clone_symbol.clone();
+            let rt = rt_clone_symbol.clone();
+            cron_pool_symbol.submit(
+                move || {
+                    if !lc.is_at_least(crate::daemon_state::DaemonPhase::Ready) {
+                        return;
+                    }
+                    let first_seen = ready_symbol_extraction.get_or_init(Instant::now);
+                    if first_seen.elapsed() < symbol_extraction_ready_delay {
+                        return;
+                    }
+                    let _guard = match lock.try_lock() {
+                        Some(g) => g,
+                        None => {
+                            tracing::info!("heavy cron busy, deferring symbol-extraction");
+                            return;
+                        }
+                    };
+                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_symbol));
+                    let stats = Arc::clone(&stats_for_symbol);
+                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    let t0 = Instant::now();
+                    rt.block_on(async {
+                        crate::cron::symbol_extraction::run_symbol_extraction(db.as_ref(), &stats)
+                            .await;
+                    });
+                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    tracing::info!(
+                        job = "symbol-extraction",
+                        rss_mb_start = rss_start >> 20,
+                        rss_mb_end = rss_end >> 20,
+                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
+                        elapsed_s = t0.elapsed().as_secs_f64(),
+                        "heavy cron complete"
+                    );
+                },
+                crate::work_pool::pool::Priority::Low,
+            );
+            true
+        },
+    );
+
     // Topic clustering (global full-chunk — always produces scope = "global")
     let db_clone_topic = db; // final move // final move
     let rt_clone_topic = rt; // final move

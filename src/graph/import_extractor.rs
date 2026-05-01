@@ -1,5 +1,15 @@
 //! Regex-based import extraction for multiple programming languages.
 //! Extracts import/dependency relationships from source code content.
+//!
+//! As of Tier-0e (tree-sitter parsing layer, see `src/parsing/`), this module
+//! is the **fallback path** for `src/cron/graph_analysis.rs::analyze_project`.
+//! Files with rows in `symbol_references` (populated by the
+//! `symbol-extraction` cron) are sourced from the `import_use` rows directly;
+//! files without such rows fall back to the regex extractors here. The
+//! resolver helpers (`resolve_import_candidates`, etc.) are still consumed
+//! by the symbol-aware path for `target_file_id` lookup, since the
+//! symbol-extraction cron resolves only by name match — not by per-language
+//! file-path conventions.
 
 use regex::Regex;
 use std::sync::LazyLock;

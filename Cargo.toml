@@ -87,6 +87,32 @@ uuid = { version = "1", features = ["v4"] }
 rand = "0.9"
 ndarray = { version = "0.16", features = ["blas", "serde"] }
 petgraph = "0.7"
+# Tree-sitter (Tier 0e). Per-language grammar crates are added incrementally
+# as `src/parsing/<lang>.rs` backends land — see plan
+# `~/.claude/plans/help-me-design-software-ancient-flurry.md`. The bare
+# `tree-sitter` core ships first so the trait + types compile before any
+# concrete backend.
+tree-sitter = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-typescript = "0.23"
+tree-sitter-java = "0.23"
+tree-sitter-scala = "0.24"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+# Rholang grammar lives in the user's local rholang-rs workspace; depend by
+# path. The published package name is `rholang-tree-sitter` (not the canonical
+# `tree-sitter-rholang` style); aliased here so usage matches the convention.
+# Migration path: switch to a published crate once available.
+tree-sitter-rholang = { package = "rholang-tree-sitter", path = "/home/dylon/Workspace/f1r3fly.io/rholang-rs/rholang-tree-sitter" }
+tree-sitter-clojure = "0.1"
+# Rust backend uses the native `syn` parser instead of tree-sitter — replicates
+# the proven pattern from MeTTa-Compiler's `tools/gc-root-audit/` static
+# analysis. `proc-macro2 = { version = "1", features = ["span-locations"] }`
+# is required for `Span::start().line` on stable Rust.
+syn = { version = "2", features = ["full", "visit", "extra-traits"] }
+quote = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
 memmap2 = "0.9"
 futures = "0.3"
 tempfile = "3"

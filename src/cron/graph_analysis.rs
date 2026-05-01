@@ -131,17 +131,69 @@ async fn analyze_project(
     // batch before loading the next. `all_edges` stays live but is bounded by
     // the actual number of import statements in the project (typically
     // 5-15× file_count).
+    //
+    // Tier-0e dispatch: files with rows in `symbol_references` skip the regex
+    // path and pull import_use rows directly. Files NOT in `symbol_set` (no
+    // backend or symbol-extraction cron hasn't run yet) take the regex path.
     let mut all_edges: Vec<ImportEdge> = Vec::new();
     let file_ids: Vec<i64> = metas.iter().map(|m| m.file_id).collect();
 
+    let symbol_set =
+        crate::db::queries::file_ids_with_symbol_refs(pool, project_id, &file_ids).await?;
+
+    // Build a per-file language map so the symbol-dispatch path can call
+    // `resolve_import_candidates` without re-fetching content.
+    let file_languages: HashMap<i64, String> = metas
+        .iter()
+        .map(|m| (m.file_id, m.language.clone()))
+        .collect();
+    let file_paths_by_id: HashMap<i64, String> = metas
+        .iter()
+        .map(|m| (m.file_id, m.relative_path.clone()))
+        .collect();
+
+    if !symbol_set.is_empty() {
+        let symbol_imports =
+            crate::db::queries::get_imports_from_symbols(pool, project_id, &file_ids).await?;
+        for imp in &symbol_imports {
+            let target_file_id = imp.target_file_id.or_else(|| {
+                let language = file_languages.get(&imp.source_file_id)?;
+                let source_path = file_paths_by_id.get(&imp.source_file_id)?;
+                let raw = synthesize_raw_import(&imp.target_raw, language);
+                let candidates =
+                    import_extractor::resolve_import_candidates(&raw, source_path, language);
+                candidates
+                    .iter()
+                    .find_map(|c| file_paths.get(c.as_str()))
+                    .copied()
+            });
+            all_edges.push(ImportEdge {
+                source_file_id: imp.source_file_id,
+                target_file_id,
+                target_raw: imp.target_raw.clone(),
+                edge_type: "import".to_string(),
+                weight: 1.0,
+            });
+        }
+    }
+
     for batch_ids in file_ids.chunks(CONTENT_BATCH_SIZE) {
+        // Skip files that took the symbol-aware path above.
+        let regex_batch_ids: Vec<i64> = batch_ids
+            .iter()
+            .copied()
+            .filter(|id| !symbol_set.contains(id))
+            .collect();
+        if regex_batch_ids.is_empty() {
+            continue;
+        }
         let batch: Vec<FileContentLite> = sqlx::query_as::<_, FileContentLite>(
             "SELECT id as file_id, relative_path, language, content
              FROM indexed_files
              WHERE project_id = $1 AND id = ANY($2::bigint[]) AND content IS NOT NULL",
         )
         .bind(project_id)
-        .bind(batch_ids)
+        .bind(&regex_batch_ids)
         .fetch_all(pool)
         .await?;
 
@@ -312,6 +364,28 @@ struct ImportEdge {
     target_raw: String,
     edge_type: String,
     weight: f64,
+}
+
+/// Synthesize a `RawImport` from a `symbol_references.target_raw` string so
+/// the existing per-language `resolve_import_candidates` resolver can be
+/// reused without re-parsing source content. `kind` is heuristically derived
+/// because the parsing layer collapses Rust's `use`/`mod`/`extern_crate` to
+/// a single `Import` shape.
+fn synthesize_raw_import(target_raw: &str, language: &str) -> import_extractor::RawImport {
+    let kind = match language {
+        "rust" => {
+            if target_raw.contains("::") {
+                "use"
+            } else {
+                "mod"
+            }
+        }
+        _ => "import",
+    };
+    import_extractor::RawImport {
+        raw_path: target_raw.to_string(),
+        kind: kind.to_string(),
+    }
 }
 
 struct FileMetricsRow {
@@ -715,4 +789,42 @@ async fn upsert_file_metrics_batch(
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synthesize_rust_use_kind() {
+        let r = synthesize_raw_import("crate::foo::bar", "rust");
+        assert_eq!(r.raw_path, "crate::foo::bar");
+        assert_eq!(r.kind, "use");
+    }
+
+    #[test]
+    fn synthesize_rust_mod_kind_for_bare_name() {
+        // `mod foo;` and `extern crate foo;` both produce bare names.
+        // We pick "mod" so resolve_rust_import returns sibling-file candidates.
+        let r = synthesize_raw_import("foo", "rust");
+        assert_eq!(r.kind, "mod");
+    }
+
+    #[test]
+    fn synthesize_python_kind() {
+        let r = synthesize_raw_import("django.http", "python");
+        assert_eq!(r.kind, "import");
+    }
+
+    #[test]
+    fn synthesize_javascript_kind() {
+        let r = synthesize_raw_import("./helpers", "javascript");
+        assert_eq!(r.kind, "import");
+    }
+
+    #[test]
+    fn synthesize_unknown_language_falls_back_to_import() {
+        let r = synthesize_raw_import("anything", "unknown_lang");
+        assert_eq!(r.kind, "import");
+    }
 }

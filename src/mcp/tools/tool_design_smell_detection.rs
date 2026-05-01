@@ -28,11 +28,13 @@ pub async fn tool_design_smell_detection(
     let limit = params.limit.unwrap_or(30);
     let detect_all = params.smells.is_none();
     let smells = params.smells.unwrap_or_default();
+    let include_fixes = params.include_fixes.unwrap_or(true);
 
     info!(
         tool = "design_smell_detection",
         project = %params.project,
         limit,
+        include_fixes,
         "MCP tool invoked",
     );
 
@@ -210,6 +212,33 @@ pub async fn tool_design_smell_detection(
         sb.cmp(&sa)
     });
     detected_smells.truncate(limit as usize);
+
+    // Phase 1 backfill: attach a typed `recommended_fix` to each smell.
+    if include_fixes {
+        use crate::mcp::tools::fix_helpers::default_fix_for_smell;
+        for s in &mut detected_smells {
+            let smell_type = match s["smell"].as_str() {
+                Some(t) => t.to_string(),
+                None => continue,
+            };
+            let path = s["path"].as_str().unwrap_or("?").to_string();
+            // Pull the line_count if present; otherwise default to 0 (the
+            // builder clamps to 1 to keep PathRange.end_line valid).
+            let line_count = s["line_count"].as_i64().unwrap_or(0).min(i32::MAX as i64) as i32;
+            let metric_summary = s["reason"].as_str().unwrap_or("").to_string();
+            if let Some(fix) = default_fix_for_smell(
+                &smell_type,
+                &params.project,
+                &path,
+                line_count,
+                &metric_summary,
+            ) && let Ok(fix_json) = serde_json::to_value(&fix)
+                && let Some(obj) = s.as_object_mut()
+            {
+                obj.insert("recommended_fix".to_string(), fix_json);
+            }
+        }
+    }
 
     let result = serde_json::json!({
         "project": params.project,

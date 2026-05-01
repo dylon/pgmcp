@@ -103,6 +103,217 @@ pub async fn find_project_by_cwd(
     .await
 }
 
+/// Resolve which projects are the **main** of their worktree group.
+///
+/// pgmcp indexes ~50 projects, many of which are git worktrees of the same
+/// upstream (e.g. `f1r3node/`, `f1r3node-cost-accounted-rho-calc/`,
+/// `f1r3node-reified-rspaces/` all share `git_common_dir`). For cross-project
+/// analyses (similarity, refactoring, dependency-health) we want one canonical
+/// row per worktree group; otherwise feature-branch worktrees double-count.
+///
+/// Grouping rule: two projects are siblings if they share `git_common_dir`
+/// (canonical) or — when that's NULL — `git_root_commits` (works for non-git
+/// or detached worktrees). Projects with both NULL are singletons.
+///
+/// Within each group of size > 1, the **main** project is the one whose
+/// directory basename is shortest (with lexicographic-shortest as a
+/// tiebreaker). The user's convention is that feature-branch worktrees use
+/// the form `<canonical>-<feature>`, so the canonical name is always a
+/// strict prefix of every sibling — and therefore the shortest basename.
+///
+/// Returns the list of `project_id`s that are main, sorted ascending for
+/// stable downstream pagination.
+pub async fn select_main_worktree_projects(pool: &PgPool) -> Result<Vec<i32>, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: i32,
+        path: String,
+        git_common_dir: Option<String>,
+        git_root_commits: Option<String>,
+    }
+
+    let rows: Vec<Row> =
+        sqlx::query_as::<_, Row>("SELECT id, path, git_common_dir, git_root_commits FROM projects")
+            .fetch_all(pool)
+            .await?;
+
+    let tuples: Vec<(i32, String, Option<String>, Option<String>)> = rows
+        .into_iter()
+        .map(|r| (r.id, r.path, r.git_common_dir, r.git_root_commits))
+        .collect();
+
+    Ok(pick_main_worktree_ids(&tuples))
+}
+
+/// Pure grouping logic — given `(id, path, git_common_dir, git_root_commits)`
+/// rows, return the main project id of each worktree group. Extracted from
+/// `select_main_worktree_projects` so the algorithm can be unit-tested without
+/// a Postgres instance.
+pub(crate) fn pick_main_worktree_ids(
+    rows: &[(i32, String, Option<String>, Option<String>)],
+) -> Vec<i32> {
+    use std::collections::HashMap;
+
+    let mut groups: HashMap<(String, String), Vec<(i32, String)>> = HashMap::new();
+    let mut singletons: Vec<i32> = Vec::new();
+
+    for (id, path, git_common_dir, git_root_commits) in rows {
+        let basename = path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or(path)
+            .to_string();
+        match (git_common_dir.as_deref(), git_root_commits.as_deref()) {
+            (None, None) => singletons.push(*id),
+            (cd, rc) => {
+                let key = (cd.unwrap_or("").to_string(), rc.unwrap_or("").to_string());
+                groups.entry(key).or_default().push((*id, basename));
+            }
+        }
+    }
+
+    let mut main_ids = singletons;
+    for (_, mut members) in groups {
+        // Shortest basename wins; tie-break lexicographically; final tie-break by id.
+        members.sort_by(|a, b| {
+            a.1.len()
+                .cmp(&b.1.len())
+                .then_with(|| a.1.cmp(&b.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        if let Some((id, _)) = members.into_iter().next() {
+            main_ids.push(id);
+        }
+    }
+
+    main_ids.sort();
+    main_ids
+}
+
+#[cfg(test)]
+mod worktree_tests {
+    use super::pick_main_worktree_ids;
+
+    /// Helper to build the (id, path, common_dir, root_commits) tuple used by
+    /// the resolver.
+    fn row(
+        id: i32,
+        path: &str,
+        common_dir: Option<&str>,
+        root_commits: Option<&str>,
+    ) -> (i32, String, Option<String>, Option<String>) {
+        (
+            id,
+            path.to_string(),
+            common_dir.map(str::to_string),
+            root_commits.map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn singleton_project_is_always_main() {
+        let rows = vec![row(1, "/ws/foo", None, None)];
+        assert_eq!(pick_main_worktree_ids(&rows), vec![1]);
+    }
+
+    #[test]
+    fn worktree_group_sharing_git_common_dir_picks_shortest_basename() {
+        // `f1r3node` < `f1r3node-cost-accounted-rho-calc` < `f1r3node-reified-rspaces`
+        let rows = vec![
+            row(
+                10,
+                "/ws/f1r3node-reified-rspaces",
+                Some("/ws/f1r3node/.git"),
+                None,
+            ),
+            row(11, "/ws/f1r3node", Some("/ws/f1r3node/.git"), None),
+            row(
+                12,
+                "/ws/f1r3node-cost-accounted-rho-calc",
+                Some("/ws/f1r3node/.git"),
+                None,
+            ),
+        ];
+        assert_eq!(pick_main_worktree_ids(&rows), vec![11]);
+    }
+
+    #[test]
+    fn worktree_group_sharing_root_commits_when_common_dir_is_null() {
+        // `MeTTa-Compiler/.git` is null for the worktree clones in the
+        // user's setup; they're still grouped via `git_root_commits`.
+        let rows = vec![
+            row(20, "/ws/MeTTa-Compiler-JIT", None, Some("abc123")),
+            row(21, "/ws/MeTTa-Compiler", None, Some("abc123")),
+            row(22, "/ws/MeTTa-Compiler-PR-63", None, Some("abc123")),
+        ];
+        assert_eq!(pick_main_worktree_ids(&rows), vec![21]);
+    }
+
+    #[test]
+    fn projects_with_both_keys_null_each_become_their_own_group() {
+        // Two unrelated non-git projects must NOT collapse into one group;
+        // each stays a singleton.
+        let rows = vec![
+            row(30, "/ws/alpha", None, None),
+            row(31, "/ws/beta", None, None),
+        ];
+        let mut got = pick_main_worktree_ids(&rows);
+        got.sort();
+        assert_eq!(got, vec![30, 31]);
+    }
+
+    #[test]
+    fn lexicographic_tiebreak_when_basenames_equal_length() {
+        // Equal-length basenames (5 chars each): pick the lexicographically smallest.
+        let rows = vec![
+            row(40, "/ws/delta", Some("/shared/.git"), None),
+            row(41, "/ws/alpha", Some("/shared/.git"), None),
+        ];
+        // Both "delta" and "alpha" are 5 chars; "alpha" < "delta" lexicographically.
+        assert_eq!(pick_main_worktree_ids(&rows), vec![41]);
+    }
+
+    #[test]
+    fn id_tiebreak_when_basename_identical() {
+        // Two rows with identical basenames (path collision is degenerate
+        // but possible from a stale rescan) — fall through to id ascending.
+        let rows = vec![
+            row(50, "/ws-a/dup", Some("/shared/.git"), None),
+            row(49, "/ws-b/dup", Some("/shared/.git"), None),
+        ];
+        assert_eq!(pick_main_worktree_ids(&rows), vec![49]);
+    }
+
+    #[test]
+    fn singletons_and_groups_combine_in_one_call() {
+        let rows = vec![
+            // Worktree group A: main is 100 ("rust")
+            row(100, "/ws/rust", Some("/a/.git"), None),
+            row(101, "/ws/rust-feature-x", Some("/a/.git"), None),
+            // Singleton project
+            row(200, "/ws/lonely", None, None),
+            // Worktree group B keyed on root_commits: main is 301 ("py")
+            row(300, "/ws/py-experimental", None, Some("xyz")),
+            row(301, "/ws/py", None, Some("xyz")),
+        ];
+        assert_eq!(pick_main_worktree_ids(&rows), vec![100, 200, 301]);
+    }
+
+    #[test]
+    fn trailing_slash_in_path_does_not_break_basename() {
+        let rows = vec![row(60, "/ws/foo/", Some("/a/.git"), None)];
+        // Basename of "/ws/foo/" is "foo".
+        assert_eq!(pick_main_worktree_ids(&rows), vec![60]);
+    }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        let rows: Vec<(i32, String, Option<String>, Option<String>)> = Vec::new();
+        assert!(pick_main_worktree_ids(&rows).is_empty());
+    }
+}
+
 /// Returns language breakdown (language, count) for a project, ordered by count descending.
 pub async fn language_summary(
     pool: &PgPool,
@@ -1117,6 +1328,44 @@ pub async fn compare_two_files(
     Ok(results)
 }
 
+/// Real-time intra-file chunk-pair similarity. Used by `internal_dry`.
+///
+/// Cross-joins `file_chunks` against itself with `c.id < c'.id` to avoid
+/// the symmetric duplicate, returning rows where the cosine similarity
+/// is at least `min_similarity`. Single-file variant of `compare_two_files`.
+pub async fn compare_chunks_within_file(
+    pool: &PgPool,
+    file_id: i64,
+    min_similarity: f64,
+    ef_search: i32,
+) -> Result<Vec<ChunkPairSimilarity>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+
+    let results = sqlx::query_as::<_, ChunkPairSimilarity>(
+        "SELECT ca.id AS chunk_id_a, ca.content AS content_a,
+                ca.start_line AS start_line_a, ca.end_line AS end_line_a,
+                cb.id AS chunk_id_b, cb.content AS content_b,
+                cb.start_line AS start_line_b, cb.end_line AS end_line_b,
+                1 - (ca.embedding <=> cb.embedding) AS similarity
+         FROM file_chunks ca
+         JOIN file_chunks cb
+              ON ca.file_id = cb.file_id AND ca.id < cb.id
+         WHERE ca.file_id = $1
+           AND 1 - (ca.embedding <=> cb.embedding) >= $2
+         ORDER BY similarity DESC",
+    )
+    .bind(file_id)
+    .bind(min_similarity)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(results)
+}
+
 /// Row returned by the batch similarity scanner.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct SimilarityNeighborRow {
@@ -1544,6 +1793,802 @@ pub async fn find_duplicate_file_pairs(
         .fetch_all(pool)
         .await
     }
+}
+
+// ============================================================================
+// Chunk-level similarity (Tier 2 — DRY tools)
+// ============================================================================
+
+/// One chunk-pair from `cross_project_similarities`. Lighter-weight than
+/// `DuplicateFilePair` because chunk_clusters / boilerplate_clusters /
+/// pattern_abstraction_candidates aggregate at the chunk level, not file level.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ChunkSimilarityPair {
+    pub chunk_id_a: i64,
+    pub chunk_id_b: i64,
+    pub file_id_a: i64,
+    pub file_id_b: i64,
+    pub path_a: String,
+    pub path_b: String,
+    pub project_id_a: i32,
+    pub project_id_b: i32,
+    pub project_name_a: String,
+    pub project_name_b: String,
+    pub language: String,
+    pub similarity: f64,
+}
+
+/// Read chunk-pair rows from `cross_project_similarities` with the
+/// usual cross-project + main-worktree + same-repo filters applied.
+///
+/// `main_only`: when `true`, both endpoints must belong to a project in
+/// `select_main_worktree_projects` (caller passes `main_ids`). Pass an
+/// empty slice to disable the main-only filter.
+///
+/// `project`: when `Some(name)`, at least one endpoint must belong to
+/// the named project.
+pub async fn find_chunk_similarity_pairs(
+    pool: &PgPool,
+    min_similarity: f64,
+    language: Option<&str>,
+    main_ids: &[i32],
+    project: Option<&str>,
+    include_same_repo: bool,
+    limit: i32,
+) -> Result<Vec<ChunkSimilarityPair>, sqlx::Error> {
+    sqlx::query_as::<_, ChunkSimilarityPair>(
+        "SELECT s.chunk_id_a, s.chunk_id_b,
+                s.file_id_a, s.file_id_b,
+                s.path_a, s.path_b,
+                s.project_id_a, s.project_id_b,
+                s.project_name_a, s.project_name_b,
+                s.language,
+                s.chunk_similarity AS similarity
+         FROM cross_project_similarities s
+         WHERE s.chunk_similarity >= $1
+           AND s.project_id_a != s.project_id_b
+           AND ($2::text IS NULL OR s.language = $2)
+           AND (cardinality($3::int[]) = 0
+                OR (s.project_id_a = ANY($3) AND s.project_id_b = ANY($3)))
+           AND ($4::text IS NULL OR s.project_name_a = $4 OR s.project_name_b = $4)
+           AND ($5 OR NOT EXISTS (
+                   SELECT 1 FROM projects pa, projects pb
+                   WHERE pa.id = s.project_id_a
+                     AND pb.id = s.project_id_b
+                     AND ((pa.git_common_dir IS NOT NULL AND pa.git_common_dir = pb.git_common_dir)
+                          OR (pa.git_root_commits IS NOT NULL AND pa.git_root_commits = pb.git_root_commits))
+                ))
+         ORDER BY s.chunk_similarity DESC, s.chunk_id_a ASC, s.chunk_id_b ASC
+         LIMIT $6",
+    )
+    .bind(min_similarity)
+    .bind(language)
+    .bind(main_ids)
+    .bind(project)
+    .bind(include_same_repo)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// One pair plus the topic both endpoints belong to, used by
+/// `pattern_abstraction_candidates`. The endpoints sit at *medium*
+/// similarity (e.g. 0.70-0.85): different implementations of the same
+/// abstraction.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PatternAbstractionPair {
+    pub chunk_id_a: i64,
+    pub chunk_id_b: i64,
+    pub file_id_a: i64,
+    pub file_id_b: i64,
+    pub path_a: String,
+    pub path_b: String,
+    pub project_id_a: i32,
+    pub project_id_b: i32,
+    pub project_name_a: String,
+    pub project_name_b: String,
+    pub language: String,
+    pub similarity: f64,
+    pub topic_id: i64,
+    pub topic_label: String,
+    pub topic_keywords: Option<Vec<String>>,
+    pub membership_a: f64,
+    pub membership_b: f64,
+}
+
+/// Find chunk-pairs at medium similarity (between min_sim and max_sim,
+/// exclusive on the upper bound) that share the same topic. Used by
+/// `pattern_abstraction_candidates` to surface candidates for trait /
+/// interface extraction.
+pub async fn find_pattern_abstraction_pairs(
+    pool: &PgPool,
+    min_similarity: f64,
+    max_similarity: f64,
+    min_membership: f64,
+    language: Option<&str>,
+    main_ids: &[i32],
+    project: Option<&str>,
+    include_same_repo: bool,
+    limit: i32,
+) -> Result<Vec<PatternAbstractionPair>, sqlx::Error> {
+    sqlx::query_as::<_, PatternAbstractionPair>(
+        "SELECT s.chunk_id_a, s.chunk_id_b,
+                s.file_id_a, s.file_id_b,
+                s.path_a, s.path_b,
+                s.project_id_a, s.project_id_b,
+                s.project_name_a, s.project_name_b,
+                s.language,
+                s.chunk_similarity AS similarity,
+                cta_a.topic_id,
+                ct.label AS topic_label,
+                ct.keywords AS topic_keywords,
+                cta_a.membership_score AS membership_a,
+                cta_b.membership_score AS membership_b
+         FROM cross_project_similarities s
+         JOIN chunk_topic_assignments cta_a ON cta_a.chunk_id = s.chunk_id_a
+         JOIN chunk_topic_assignments cta_b ON cta_b.chunk_id = s.chunk_id_b
+                                            AND cta_b.topic_id = cta_a.topic_id
+         JOIN code_topics ct ON ct.id = cta_a.topic_id
+         WHERE s.chunk_similarity >= $1 AND s.chunk_similarity < $2
+           AND s.project_id_a != s.project_id_b
+           AND cta_a.membership_score >= $3
+           AND cta_b.membership_score >= $3
+           AND ($4::text IS NULL OR s.language = $4)
+           AND (cardinality($5::int[]) = 0
+                OR (s.project_id_a = ANY($5) AND s.project_id_b = ANY($5)))
+           AND ($6::text IS NULL OR s.project_name_a = $6 OR s.project_name_b = $6)
+           AND ($7 OR NOT EXISTS (
+                   SELECT 1 FROM projects pa, projects pb
+                   WHERE pa.id = s.project_id_a
+                     AND pb.id = s.project_id_b
+                     AND ((pa.git_common_dir IS NOT NULL AND pa.git_common_dir = pb.git_common_dir)
+                          OR (pa.git_root_commits IS NOT NULL AND pa.git_root_commits = pb.git_root_commits))
+                ))
+         ORDER BY cta_a.topic_id, s.chunk_similarity DESC, s.chunk_id_a ASC, s.chunk_id_b ASC
+         LIMIT $8",
+    )
+    .bind(min_similarity)
+    .bind(max_similarity)
+    .bind(min_membership)
+    .bind(language)
+    .bind(main_ids)
+    .bind(project)
+    .bind(include_same_repo)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// One chunk's content + line range, used for centroid selection and
+/// snippet display in chunk_clusters / boilerplate_clusters.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ChunkContentRow {
+    pub chunk_id: i64,
+    pub file_id: i64,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub content: String,
+}
+
+/// Fetch chunk content + line ranges for a set of chunk_ids. Used by
+/// chunk-cluster tools after clustering, to emit per-member snippets and
+/// estimate `loc_per_chunk_avg`.
+///
+/// Tolerates FK drift (chunk deleted mid-run): rows that no longer exist
+/// are simply absent from the result. The caller skips clusters with
+/// fewer-than-expected returned rows.
+pub async fn get_chunk_content_rows(
+    pool: &PgPool,
+    chunk_ids: &[i64],
+) -> Result<Vec<ChunkContentRow>, sqlx::Error> {
+    if chunk_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, ChunkContentRow>(
+        "SELECT id AS chunk_id, file_id, start_line, end_line, content
+         FROM file_chunks
+         WHERE id = ANY($1)",
+    )
+    .bind(chunk_ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// Per-chunk topic summary used to derive cluster keywords.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ChunkTopicSummaryRow {
+    pub chunk_id: i64,
+    pub topic_id: i64,
+    pub label: String,
+    pub keywords: Option<Vec<String>>,
+    pub membership_score: f64,
+}
+
+/// Fetch topic summaries (label + keyword list) for the chunks in a cluster,
+/// joining `chunk_topic_assignments` to `code_topics`. Returns one row per
+/// (chunk, topic) pairing — chunks may be members of multiple topics under FCM.
+///
+/// If topics haven't been computed (`code_topics` empty), returns empty;
+/// callers fall back to identifier-token heuristics.
+pub async fn get_chunk_topic_summaries(
+    pool: &PgPool,
+    chunk_ids: &[i64],
+) -> Result<Vec<ChunkTopicSummaryRow>, sqlx::Error> {
+    if chunk_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, ChunkTopicSummaryRow>(
+        "SELECT cta.chunk_id, ct.id AS topic_id, ct.label, ct.keywords, cta.membership_score
+         FROM chunk_topic_assignments cta
+         JOIN code_topics ct ON ct.id = cta.topic_id
+         WHERE cta.chunk_id = ANY($1)
+           AND cta.membership_score >= 0.05
+         ORDER BY cta.chunk_id, cta.membership_score DESC",
+    )
+    .bind(chunk_ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// One row per file with the count of distinct source files importing it.
+/// Used by `extraction_candidates` to estimate `effort.call_sites_to_update`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CallSiteCount {
+    pub file_id: i64,
+    pub importer_count: i64,
+    /// Approximate count of unresolved imports (target_raw match by basename).
+    /// Filled when the symbol_references table is empty AND the language has
+    /// no resolved-import support (Go/Java/C/C++ pre-Tier-0e).
+    pub unresolved_count: i64,
+}
+
+/// For each input file_id, count the distinct files that import it.
+/// Resolved-only path: joins `code_graph_edges` where `target_file_id`
+/// already resolved at graph-analysis time. Unresolved-target imports
+/// (Go/Java/C/C++) are reported as `unresolved_count` via fuzzy basename
+/// match — it's an upper bound, hence the dedicated field.
+pub async fn count_call_sites_to_files(
+    pool: &PgPool,
+    file_ids: &[i64],
+) -> Result<Vec<CallSiteCount>, sqlx::Error> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, CallSiteCount>(
+        "WITH targets AS (
+            SELECT id, regexp_replace(relative_path, '^.*/', '') AS basename
+            FROM indexed_files
+            WHERE id = ANY($1)
+         ),
+         resolved AS (
+            SELECT t.id AS file_id,
+                   COUNT(DISTINCT cge.source_file_id) AS importer_count
+            FROM targets t
+            LEFT JOIN code_graph_edges cge
+                  ON cge.target_file_id = t.id AND cge.edge_type = 'import'
+            GROUP BY t.id
+         ),
+         unresolved AS (
+            SELECT t.id AS file_id,
+                   COUNT(DISTINCT cge.source_file_id) AS unresolved_count
+            FROM targets t
+            LEFT JOIN code_graph_edges cge
+                  ON cge.target_file_id IS NULL
+                 AND cge.edge_type = 'import'
+                 AND cge.target_raw ILIKE '%' || regexp_replace(t.basename, '\\.[^.]+$', '') || '%'
+            GROUP BY t.id
+         )
+         SELECT r.file_id,
+                COALESCE(r.importer_count, 0) AS importer_count,
+                COALESCE(u.unresolved_count, 0) AS unresolved_count
+         FROM resolved r
+         LEFT JOIN unresolved u ON u.file_id = r.file_id",
+    )
+    .bind(file_ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// Subset of `file_metrics` columns used for risk-tier classification in
+/// `extraction_candidates`. Returns one row per requested file_id; files
+/// without a `file_metrics` row are simply absent.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FileRiskMetrics {
+    pub file_id: i64,
+    pub pagerank: Option<f64>,
+    pub churn_rate: Option<f64>,
+    pub fix_commit_ratio: Option<f64>,
+    pub days_since_last_change: Option<i32>,
+}
+
+/// Pull churn / pagerank / fix-ratio for a set of file_ids in one query.
+pub async fn get_file_risk_metrics(
+    pool: &PgPool,
+    file_ids: &[i64],
+) -> Result<Vec<FileRiskMetrics>, sqlx::Error> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, FileRiskMetrics>(
+        "SELECT file_id, pagerank, churn_rate, fix_commit_ratio, days_since_last_change
+         FROM file_metrics
+         WHERE file_id = ANY($1)",
+    )
+    .bind(file_ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// One row per zombie-candidate file: low PageRank percentile, low in-degree,
+/// long-idle. Used by `stale_zombie_detector`.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct ZombieCandidate {
+    pub file_id: i64,
+    pub relative_path: String,
+    pub line_count: i32,
+    pub pagerank: Option<f64>,
+    pub pagerank_pct: f64,
+    pub in_degree: Option<i32>,
+    pub author_count: Option<i32>,
+    pub commit_count: Option<i32>,
+    pub days_since_last_change: Option<i32>,
+}
+
+/// Find files that are graph + history "zombies": low PageRank, low in-degree,
+/// long-idle. Distinct from `find_orphans` (topic-based) — this combines
+/// graph centrality, import topology, and authorial abandonment.
+pub async fn find_zombie_candidates(
+    pool: &PgPool,
+    project_name: &str,
+    min_days_idle: i32,
+    max_pagerank_pct: f64,
+    limit: i32,
+) -> Result<Vec<ZombieCandidate>, sqlx::Error> {
+    sqlx::query_as::<_, ZombieCandidate>(
+        "WITH ranked AS (
+            SELECT f.id AS file_id,
+                   f.relative_path,
+                   f.line_count,
+                   fm.pagerank,
+                   fm.in_degree,
+                   fm.author_count,
+                   fm.commit_count,
+                   fm.days_since_last_change,
+                   PERCENT_RANK() OVER (ORDER BY COALESCE(fm.pagerank, 0)) AS pagerank_pct
+            FROM indexed_files f
+            JOIN projects p ON p.id = f.project_id
+            LEFT JOIN file_metrics fm ON fm.file_id = f.id
+            WHERE p.name = $1
+         )
+         SELECT file_id, relative_path, line_count, pagerank, pagerank_pct,
+                in_degree, author_count, commit_count, days_since_last_change
+         FROM ranked
+         WHERE COALESCE(in_degree, 0) <= 1
+           AND COALESCE(days_since_last_change, 0) > $2
+           AND pagerank_pct <= $3
+         ORDER BY pagerank_pct ASC,
+                  COALESCE(days_since_last_change, 0) DESC,
+                  file_id ASC
+         LIMIT $4",
+    )
+    .bind(project_name)
+    .bind(min_days_idle)
+    .bind(max_pagerank_pct)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// One row per chunk in a god-candidate file, with its dominant FCM topic
+/// (highest membership_score) when one is known. Used by
+/// `recommend_module_split` to group chunks into proposed sub-files.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct GodFileChunkRow {
+    pub file_id: i64,
+    pub relative_path: String,
+    pub language: String,
+    pub line_count: i32,
+    pub chunk_id: i64,
+    pub chunk_index: i32,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub topic_id: Option<i64>,
+    pub topic_label: Option<String>,
+    pub topic_keywords: Option<Vec<String>>,
+    pub membership_score: Option<f64>,
+}
+
+/// For a project, return all chunks of files whose `line_count >= min_lines`,
+/// each annotated with the chunk's dominant FCM topic (the assignment row
+/// with the highest `membership_score`). Topics may be NULL when no FCM run
+/// has reached that chunk yet.
+///
+/// Drives `recommend_module_split` — chunks of a god file get grouped by
+/// `topic_id` to produce per-topic sub-file recommendations.
+pub async fn get_god_file_chunks_with_topics(
+    pool: &PgPool,
+    project_name: &str,
+    min_lines: i32,
+) -> Result<Vec<GodFileChunkRow>, sqlx::Error> {
+    sqlx::query_as::<_, GodFileChunkRow>(
+        "WITH god_files AS (
+            SELECT f.id, f.relative_path, f.language, f.line_count
+            FROM indexed_files f
+            JOIN projects p ON p.id = f.project_id
+            WHERE p.name = $1 AND f.line_count >= $2
+         ),
+         dominant_topic AS (
+            SELECT DISTINCT ON (cta.chunk_id)
+                   cta.chunk_id,
+                   cta.topic_id,
+                   cta.membership_score,
+                   ct.label,
+                   ct.keywords
+            FROM chunk_topic_assignments cta
+            JOIN code_topics ct ON ct.id = cta.topic_id
+            ORDER BY cta.chunk_id, cta.membership_score DESC, cta.topic_id ASC
+         )
+         SELECT g.id AS file_id,
+                g.relative_path,
+                g.language,
+                g.line_count,
+                fc.id AS chunk_id,
+                fc.chunk_index,
+                fc.start_line,
+                fc.end_line,
+                dt.topic_id,
+                dt.label AS topic_label,
+                dt.keywords AS topic_keywords,
+                dt.membership_score
+         FROM god_files g
+         JOIN file_chunks fc ON fc.file_id = g.id
+         LEFT JOIN dominant_topic dt ON dt.chunk_id = fc.id
+         ORDER BY g.id, fc.chunk_index",
+    )
+    .bind(project_name)
+    .bind(min_lines)
+    .fetch_all(pool)
+    .await
+}
+
+// ============================================================================
+// Tier 4 — engineer/architect workflow queries
+// ============================================================================
+
+/// One row per "hot path" file: high PageRank, high churn, high fix-commit ratio.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct HotPathRow {
+    pub file_id: i64,
+    pub relative_path: String,
+    pub pagerank: Option<f64>,
+    pub churn_rate: Option<f64>,
+    pub fix_commit_ratio: Option<f64>,
+    pub bug_proneness: Option<f64>,
+    pub instability: Option<f64>,
+    pub in_degree: Option<i32>,
+    pub author_count: Option<i32>,
+    pub commit_count: Option<i32>,
+    pub pagerank_pct: f64,
+    pub churn_pct: f64,
+    pub fix_ratio_pct: f64,
+}
+
+/// Files in the intersection of top-P% PageRank, top-P% churn, and top-P%
+/// fix_commit_ratio for a project. Used by `hot_path_audit`.
+pub async fn find_hot_paths(
+    pool: &PgPool,
+    project_name: &str,
+    percentile_threshold: f64,
+    limit: i32,
+) -> Result<Vec<HotPathRow>, sqlx::Error> {
+    sqlx::query_as::<_, HotPathRow>(
+        "WITH stats AS (
+            SELECT f.id AS file_id,
+                   f.relative_path,
+                   fm.pagerank,
+                   fm.churn_rate,
+                   fm.fix_commit_ratio,
+                   fm.bug_proneness,
+                   fm.instability,
+                   fm.in_degree,
+                   fm.author_count,
+                   fm.commit_count,
+                   PERCENT_RANK() OVER (ORDER BY COALESCE(fm.pagerank, 0)) AS pagerank_pct,
+                   PERCENT_RANK() OVER (ORDER BY COALESCE(fm.churn_rate, 0)) AS churn_pct,
+                   PERCENT_RANK() OVER (ORDER BY COALESCE(fm.fix_commit_ratio, 0)) AS fix_ratio_pct
+            FROM indexed_files f
+            JOIN projects p ON p.id = f.project_id
+            LEFT JOIN file_metrics fm ON fm.file_id = f.id
+            WHERE p.name = $1
+         )
+         SELECT file_id, relative_path,
+                pagerank, churn_rate, fix_commit_ratio,
+                bug_proneness, instability,
+                in_degree, author_count, commit_count,
+                pagerank_pct, churn_pct, fix_ratio_pct
+         FROM stats
+         WHERE pagerank_pct >= $2
+           AND churn_pct >= $2
+           AND fix_ratio_pct >= $2
+         ORDER BY (pagerank_pct + churn_pct + fix_ratio_pct) DESC,
+                  file_id ASC
+         LIMIT $3",
+    )
+    .bind(project_name)
+    .bind(percentile_threshold)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// One row per file with its top author (by lines blamed) and risk score.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct BusFactorRow {
+    pub file_id: i64,
+    pub relative_path: String,
+    pub top_author: String,
+    pub top_share: f64,
+    pub distinct_authors: i64,
+    pub last_touch: Option<DateTime<Utc>>,
+    pub pagerank: Option<f64>,
+    pub risk_score: Option<f64>,
+}
+
+/// Per-file bus-factor risk for a project: top author's share of blamed lines
+/// × pagerank ÷ author count. Used by `bus_factor_map`.
+pub async fn find_bus_factor_files(
+    pool: &PgPool,
+    project_name: &str,
+    min_pagerank_pct: f64,
+    limit: i32,
+) -> Result<Vec<BusFactorRow>, sqlx::Error> {
+    sqlx::query_as::<_, BusFactorRow>(
+        "WITH per_file AS (
+            SELECT f.id,
+                   f.relative_path,
+                   fc.blame_author,
+                   COUNT(*) AS lines_blamed,
+                   MAX(fc.blame_date) AS last_touch
+            FROM file_chunks fc
+            JOIN indexed_files f ON f.id = fc.file_id
+            JOIN projects p ON p.id = f.project_id
+            WHERE p.name = $1 AND fc.blame_author IS NOT NULL
+            GROUP BY f.id, f.relative_path, fc.blame_author
+         ),
+         top AS (
+            SELECT id,
+                   relative_path,
+                   (array_agg(blame_author ORDER BY lines_blamed DESC))[1] AS top_author,
+                   (MAX(lines_blamed)::float8) /
+                       NULLIF(SUM(lines_blamed)::float8, 0) AS top_share,
+                   COUNT(*)::bigint AS distinct_authors,
+                   MAX(last_touch) AS last_touch
+            FROM per_file
+            GROUP BY id, relative_path
+         ),
+         ranked AS (
+            SELECT t.*,
+                   fm.pagerank,
+                   PERCENT_RANK() OVER (ORDER BY COALESCE(fm.pagerank, 0)) AS pr_pct
+            FROM top t
+            LEFT JOIN file_metrics fm ON fm.file_id = t.id
+         )
+         SELECT id AS file_id,
+                relative_path,
+                top_author,
+                top_share,
+                distinct_authors,
+                last_touch,
+                pagerank,
+                (COALESCE(pagerank, 0.0) * top_share /
+                    GREATEST(1.0, distinct_authors::float8)) AS risk_score
+         FROM ranked
+         WHERE pr_pct >= $2
+         ORDER BY risk_score DESC NULLS LAST, file_id ASC
+         LIMIT $3",
+    )
+    .bind(project_name)
+    .bind(min_pagerank_pct)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// One row per (file, top_author) pair within the recency window. Used by
+/// `reviewer_recommender` to aggregate per-author file ownership.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FileAuthorRow {
+    pub relative_path: String,
+    pub top_author: Option<String>,
+    pub last_touch_days: Option<i32>,
+}
+
+/// For each requested file, return the dominant blame_author within the
+/// recency window. Files without blame coverage return `top_author = NULL`.
+pub async fn find_dominant_authors_for_files(
+    pool: &PgPool,
+    project_name: &str,
+    file_paths: &[String],
+    recency_window_days: i32,
+) -> Result<Vec<FileAuthorRow>, sqlx::Error> {
+    if file_paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, FileAuthorRow>(
+        "WITH per_file AS (
+            SELECT f.relative_path,
+                   fc.blame_author,
+                   COUNT(*) AS lines_blamed,
+                   MAX(fc.blame_date) AS last_touch
+            FROM file_chunks fc
+            JOIN indexed_files f ON f.id = fc.file_id
+            JOIN projects p ON p.id = f.project_id
+            WHERE p.name = $1
+              AND f.relative_path = ANY($2)
+              AND fc.blame_author IS NOT NULL
+              AND fc.blame_date >= NOW() - ($3 || ' days')::interval
+            GROUP BY f.relative_path, fc.blame_author
+         )
+         SELECT relative_path,
+                (array_agg(blame_author ORDER BY lines_blamed DESC))[1] AS top_author,
+                EXTRACT(DAY FROM (NOW() - MAX(last_touch)))::int AS last_touch_days
+         FROM per_file
+         GROUP BY relative_path",
+    )
+    .bind(project_name)
+    .bind(file_paths)
+    .bind(recency_window_days)
+    .fetch_all(pool)
+    .await
+}
+
+// ============================================================================
+// Tier 5 — audit & trend queries
+// ============================================================================
+
+/// One row per unresolved external dep target. Used by `dependency_health`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UnresolvedDepRow {
+    pub target_raw: String,
+    pub importer_count: i64,
+    pub usage_centrality: f64,
+    pub latest_change_days: Option<f64>,
+    pub sample_importers: Vec<String>,
+}
+
+/// External dependency-target audit. Groups `code_graph_edges` rows where
+/// `target_file_id IS NULL` (unresolved imports — typically external crates,
+/// system libraries, or Go/Java/C/C++ targets pre-Tier-0e) by `target_raw`.
+pub async fn find_unresolved_dependencies(
+    pool: &PgPool,
+    project_id: Option<i32>,
+    limit: i32,
+) -> Result<Vec<UnresolvedDepRow>, sqlx::Error> {
+    sqlx::query_as::<_, UnresolvedDepRow>(
+        "SELECT cge.target_raw,
+                COUNT(DISTINCT cge.source_file_id) AS importer_count,
+                COALESCE(SUM(COALESCE(fm.pagerank, 0.0)), 0.0) AS usage_centrality,
+                EXTRACT(EPOCH FROM (NOW() - MAX(f.indexed_at)))/86400.0 AS latest_change_days,
+                (array_agg(DISTINCT f.relative_path))[1:5] AS sample_importers
+         FROM code_graph_edges cge
+         JOIN indexed_files f ON f.id = cge.source_file_id
+         LEFT JOIN file_metrics fm ON fm.file_id = cge.source_file_id
+         WHERE cge.target_file_id IS NULL
+           AND cge.target_raw IS NOT NULL
+           AND cge.edge_type = 'import'
+           AND ($1::int IS NULL OR cge.project_id = $1)
+         GROUP BY cge.target_raw
+         ORDER BY usage_centrality DESC NULLS LAST, importer_count DESC, target_raw ASC
+         LIMIT $2",
+    )
+    .bind(project_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// One row per file in the merge-conflict scan. Used by `merge_conflict_risk`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct MergeRiskRow {
+    pub file_path: String,
+    pub recent_commits: i64,
+    pub distinct_recent_authors: i64,
+    pub top_other_authors: Vec<String>,
+}
+
+/// Find files in `branch_files` with overlapping recent commits from other
+/// authors. Used by `merge_conflict_risk`. The `exclude_email` is omitted
+/// from the per-file partner counts.
+pub async fn find_merge_conflict_risks(
+    pool: &PgPool,
+    project_name: &str,
+    branch_files: &[String],
+    window_days: i32,
+    exclude_email: Option<&str>,
+) -> Result<Vec<MergeRiskRow>, sqlx::Error> {
+    if branch_files.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, MergeRiskRow>(
+        "WITH commits_in_window AS (
+            SELECT gc.author, gcf.file_path
+            FROM git_commits gc
+            JOIN git_commit_files gcf ON gcf.commit_id = gc.id
+            JOIN projects p ON p.id = gc.project_id
+            WHERE p.name = $1
+              AND gc.author_date >= NOW() - ($3 || ' days')::interval
+              AND gcf.file_path = ANY($2)
+              AND ($4::text IS NULL OR gc.author <> $4)
+         )
+         SELECT file_path,
+                COUNT(*)::bigint AS recent_commits,
+                COUNT(DISTINCT author)::bigint AS distinct_recent_authors,
+                (array_agg(DISTINCT author))[1:5] AS top_other_authors
+         FROM commits_in_window
+         GROUP BY file_path
+         ORDER BY distinct_recent_authors DESC, recent_commits DESC, file_path ASC",
+    )
+    .bind(project_name)
+    .bind(branch_files)
+    .bind(window_days)
+    .bind(exclude_email)
+    .fetch_all(pool)
+    .await
+}
+
+/// One time-bucket row for a project (or single file). Used by `module_growth_trajectory`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct GrowthBucketRow {
+    pub period_start: DateTime<Utc>,
+    pub commits: i64,
+    pub authors: i64,
+    pub additions: Option<i64>,
+    pub deletions: Option<i64>,
+}
+
+/// Bucket commits into time periods (week/month/quarter) and aggregate.
+/// `interval_unit` is one of "week", "month", "quarter" — caller validates.
+pub async fn get_growth_buckets(
+    pool: &PgPool,
+    project_name: &str,
+    file_path: Option<&str>,
+    interval_unit: &str,
+    lookback_buckets: i32,
+) -> Result<Vec<GrowthBucketRow>, sqlx::Error> {
+    sqlx::query_as::<_, GrowthBucketRow>(
+        // We can't bind interval keywords directly; concat-and-cast is the
+        // typical workaround. interval_unit is hard-coded to one of three
+        // strings by the caller, so injection isn't a concern.
+        &format!(
+            "WITH per_commit AS (
+                SELECT gc.author_date,
+                       gc.author,
+                       gc.id,
+                       date_trunc('{unit}', gc.author_date) AS bucket
+                FROM git_commits gc
+                JOIN projects p ON p.id = gc.project_id
+                LEFT JOIN git_commit_files gcf ON gcf.commit_id = gc.id
+                WHERE p.name = $1
+                  AND gc.author_date >= NOW() - ($3 * INTERVAL '1 {unit}')
+                  AND ($2::text IS NULL OR gcf.file_path = $2)
+                GROUP BY gc.id, gc.author_date, gc.author
+             )
+             SELECT bucket AS period_start,
+                    COUNT(*)::bigint AS commits,
+                    COUNT(DISTINCT author)::bigint AS authors,
+                    NULL::bigint AS additions,
+                    NULL::bigint AS deletions
+             FROM per_commit
+             GROUP BY bucket
+             ORDER BY bucket ASC",
+            unit = interval_unit
+        ),
+    )
+    .bind(project_name)
+    .bind(file_path)
+    .bind(lookback_buckets)
+    .fetch_all(pool)
+    .await
 }
 
 /// Resolve file_id to its line_count (for estimating shared lines).
@@ -2950,4 +3995,395 @@ pub async fn status_snapshot(pool: &PgPool) -> Result<StatusSnapshot, sqlx::Erro
         server_version,
         vector_extension_version,
     })
+}
+
+// ============================================================================
+// Tier-0e — Symbol extraction (file_symbols + symbol_references)
+// ============================================================================
+
+/// One row backing the symbol-extraction Phase A scan.
+#[derive(Debug, sqlx::FromRow)]
+pub struct SymbolExtractionFileMeta {
+    pub file_id: i64,
+    pub relative_path: String,
+    pub language: String,
+}
+
+/// Phase-A metadata fetch — per-project list of files routed to a backend that exists,
+/// optionally filtered by `since` watermark.
+pub async fn list_files_for_symbol_extraction(
+    pool: &PgPool,
+    project_id: i32,
+    backend_languages: &[&str],
+    since: Option<DateTime<Utc>>,
+) -> Result<Vec<SymbolExtractionFileMeta>, sqlx::Error> {
+    let langs: Vec<String> = backend_languages.iter().map(|s| s.to_string()).collect();
+    sqlx::query_as::<_, SymbolExtractionFileMeta>(
+        "SELECT id as file_id, relative_path, language
+         FROM indexed_files
+         WHERE project_id = $1
+           AND content IS NOT NULL
+           AND language = ANY($2::text[])
+           AND ($3::timestamptz IS NULL OR modified_at > $3)
+         ORDER BY id",
+    )
+    .bind(project_id)
+    .bind(&langs)
+    .bind(since)
+    .fetch_all(pool)
+    .await
+}
+
+/// Per-batch content fetch for the symbol-extraction cron's Phase B.
+#[derive(Debug, sqlx::FromRow)]
+pub struct SymbolExtractionFileContent {
+    pub file_id: i64,
+    pub relative_path: String,
+    pub language: String,
+    pub content: Option<String>,
+}
+
+/// Fetch content for a batch of file IDs.
+pub async fn fetch_file_content_batch(
+    pool: &PgPool,
+    project_id: i32,
+    file_ids: &[i64],
+) -> Result<Vec<SymbolExtractionFileContent>, sqlx::Error> {
+    sqlx::query_as::<_, SymbolExtractionFileContent>(
+        "SELECT id as file_id, relative_path, language, content
+         FROM indexed_files
+         WHERE project_id = $1 AND id = ANY($2::bigint[]) AND content IS NOT NULL",
+    )
+    .bind(project_id)
+    .bind(file_ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// Delete all `file_symbols` rows for a file (CASCADE wipes children + dependent
+/// `symbol_references` via the FK on `source_symbol_id`/`target_symbol_id`).
+pub async fn delete_symbols_for_file(pool: &PgPool, file_id: i64) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM file_symbols WHERE file_id = $1")
+        .bind(file_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Delete all `symbol_references` rows whose source is the given file.
+pub async fn delete_symbol_references_for_file(
+    pool: &PgPool,
+    source_file_id: i64,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM symbol_references WHERE source_file_id = $1")
+        .bind(source_file_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected())
+}
+
+/// Bulk-insert symbols for a file via UNNEST. Caller must dedupe by
+/// `(file_id, kind, name, start_line)` before invoking. Returns the inserted
+/// row IDs **in input order**, so the cron can resolve `parent_id` (impl-method
+/// → struct) by joining names within the same file.
+///
+/// On UNIQUE conflict (which should not happen if the caller deletes existing
+/// rows first), `DO UPDATE` updates the metadata fields and returns the existing
+/// id — preserving the input-order invariant.
+pub async fn bulk_insert_file_symbols(
+    pool: &PgPool,
+    file_id: i64,
+    symbols: &[crate::parsing::symbols::Symbol],
+) -> Result<Vec<i64>, sqlx::Error> {
+    if symbols.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let names: Vec<String> = symbols.iter().map(|s| s.name.clone()).collect();
+    let kinds: Vec<String> = symbols
+        .iter()
+        .map(|s| s.kind.as_db_str().to_string())
+        .collect();
+    let start_lines: Vec<i32> = symbols.iter().map(|s| s.start_line as i32).collect();
+    let end_lines: Vec<i32> = symbols.iter().map(|s| s.end_line as i32).collect();
+    let visibilities: Vec<Option<String>> = symbols.iter().map(|s| s.visibility.clone()).collect();
+    let signatures: Vec<Option<String>> = symbols.iter().map(|s| s.signature.clone()).collect();
+
+    // Generate a per-batch ordinal so RETURNING comes back in input order
+    // even when ON CONFLICT DO UPDATE fires.
+    let ordinals: Vec<i32> = (0..symbols.len() as i32).collect();
+
+    let rows: Vec<(i32, i64)> = sqlx::query_as::<_, (i32, i64)>(
+        "WITH input AS (
+             SELECT * FROM UNNEST(
+                 $1::int4[], $2::int8[], $3::text[], $4::text[],
+                 $5::int4[], $6::int4[], $7::text[], $8::text[]
+             ) AS u(ord, file_id, name, kind, start_line, end_line, visibility, signature)
+         ),
+         inserted AS (
+             INSERT INTO file_symbols (file_id, name, kind, start_line, end_line, visibility, signature)
+             SELECT file_id, name, kind, start_line, end_line, visibility, signature
+             FROM input
+             ON CONFLICT (file_id, kind, name, start_line) DO UPDATE SET
+                 end_line = EXCLUDED.end_line,
+                 visibility = EXCLUDED.visibility,
+                 signature = EXCLUDED.signature
+             RETURNING id, file_id, kind, name, start_line
+         )
+         SELECT input.ord, inserted.id
+         FROM input
+         JOIN inserted USING (file_id, kind, name, start_line)
+         ORDER BY input.ord",
+    )
+    .bind(&ordinals)
+    .bind(vec![file_id; symbols.len()])
+    .bind(&names)
+    .bind(&kinds)
+    .bind(&start_lines)
+    .bind(&end_lines)
+    .bind(&visibilities)
+    .bind(&signatures)
+    .fetch_all(pool)
+    .await?;
+
+    let mut ids: Vec<i64> = vec![0i64; symbols.len()];
+    for (ord, id) in rows {
+        if let Some(slot) = ids.get_mut(ord as usize) {
+            *slot = id;
+        }
+    }
+    Ok(ids)
+}
+
+/// Apply resolved `parent_id` values for a file's symbols. The cron computes
+/// `parent_id` by name+line-range matching in Rust; this helper writes them
+/// back in one round-trip.
+pub async fn update_symbol_parent_ids(
+    pool: &PgPool,
+    pairs: &[(i64, i64)], // (child_id, parent_id)
+) -> Result<u64, sqlx::Error> {
+    if pairs.is_empty() {
+        return Ok(0);
+    }
+    let child_ids: Vec<i64> = pairs.iter().map(|(c, _)| *c).collect();
+    let parent_ids: Vec<i64> = pairs.iter().map(|(_, p)| *p).collect();
+    let res = sqlx::query(
+        "UPDATE file_symbols
+         SET parent_id = u.parent_id
+         FROM UNNEST($1::int8[], $2::int8[]) AS u(child_id, parent_id)
+         WHERE file_symbols.id = u.child_id",
+    )
+    .bind(&child_ids)
+    .bind(&parent_ids)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Bulk-insert symbol references for a file via UNNEST. Caller must dedupe by
+/// `(source_line, target_raw, ref_kind)` before invoking. ON CONFLICT DO NOTHING
+/// — duplicate rows from re-runs are silently dropped.
+pub async fn bulk_insert_symbol_references(
+    pool: &PgPool,
+    source_file_id: i64,
+    refs: &[crate::parsing::symbols::SymbolReference],
+) -> Result<u64, sqlx::Error> {
+    if refs.is_empty() {
+        return Ok(0);
+    }
+
+    let source_files: Vec<i64> = vec![source_file_id; refs.len()];
+    let source_symbols: Vec<Option<i64>> = refs.iter().map(|r| r.source_symbol_id).collect();
+    let target_files: Vec<Option<i64>> = refs.iter().map(|r| r.target_file_id).collect();
+    let target_symbols: Vec<Option<i64>> = refs.iter().map(|r| r.target_symbol_id).collect();
+    let target_raws: Vec<String> = refs.iter().map(|r| r.target_raw.clone()).collect();
+    let ref_kinds: Vec<String> = refs
+        .iter()
+        .map(|r| r.ref_kind.as_db_str().to_string())
+        .collect();
+    let source_lines: Vec<i32> = refs.iter().map(|r| r.source_line as i32).collect();
+
+    let res = sqlx::query(
+        "INSERT INTO symbol_references (
+             source_file_id, source_symbol_id, target_file_id, target_symbol_id,
+             target_raw, ref_kind, source_line
+         )
+         SELECT * FROM UNNEST(
+             $1::int8[], $2::int8[], $3::int8[], $4::int8[],
+             $5::text[], $6::text[], $7::int4[]
+         )
+         ON CONFLICT (source_file_id, source_line, target_raw, ref_kind) DO NOTHING",
+    )
+    .bind(&source_files)
+    .bind(&source_symbols)
+    .bind(&target_files)
+    .bind(&target_symbols)
+    .bind(&target_raws)
+    .bind(&ref_kinds)
+    .bind(&source_lines)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Per-project second pass — resolve `target_symbol_id` and `target_file_id`
+/// for any unresolved `symbol_references` rows by joining `target_raw` against
+/// `file_symbols.name` within the project. Multi-match by name picks one
+/// arbitrarily; the confidence score in downstream tools accounts for this.
+pub async fn resolve_symbol_reference_targets(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        "UPDATE symbol_references sr
+         SET target_symbol_id = fs.id, target_file_id = fs.file_id
+         FROM file_symbols fs
+         JOIN indexed_files src_f ON src_f.id = sr.source_file_id
+         JOIN indexed_files tgt_f ON tgt_f.id = fs.file_id
+         WHERE src_f.project_id = $1
+           AND tgt_f.project_id = $1
+           AND sr.target_symbol_id IS NULL
+           AND sr.target_raw = fs.name",
+    )
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Read the symbol-extraction watermark for a project.
+pub async fn get_symbol_extraction_watermark(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    let key = format!("symbol_extraction_last_run:{}", project_id);
+    let val: Option<String> = sqlx::query_scalar("SELECT value FROM pgmcp_metadata WHERE key = $1")
+        .bind(&key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(val.and_then(|s| {
+        DateTime::parse_from_rfc3339(&s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    }))
+}
+
+/// Set the symbol-extraction watermark for a project.
+pub async fn set_symbol_extraction_watermark(
+    pool: &PgPool,
+    project_id: i32,
+    ts: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let key = format!("symbol_extraction_last_run:{}", project_id);
+    sqlx::query(
+        "INSERT INTO pgmcp_metadata (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(&key)
+    .bind(ts.to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// One symbol-derived import edge for the graph-analysis migration.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ImportFromSymbols {
+    pub source_file_id: i64,
+    pub target_raw: String,
+    pub target_file_id: Option<i64>,
+    pub source_line: i32,
+}
+
+/// Fetch all `import_use` symbol-references for a project's files. Used by
+/// `graph_analysis::analyze_project` to materialize import edges without
+/// re-parsing file content (the symbol-extraction cron has already run).
+pub async fn get_imports_from_symbols(
+    pool: &PgPool,
+    project_id: i32,
+    file_ids: &[i64],
+) -> Result<Vec<ImportFromSymbols>, sqlx::Error> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, ImportFromSymbols>(
+        "SELECT sr.source_file_id,
+                sr.target_raw,
+                sr.target_file_id,
+                sr.source_line
+         FROM symbol_references sr
+         JOIN indexed_files f ON f.id = sr.source_file_id
+         WHERE f.project_id = $1
+           AND sr.source_file_id = ANY($2::bigint[])
+           AND sr.ref_kind = 'import_use'",
+    )
+    .bind(project_id)
+    .bind(file_ids)
+    .fetch_all(pool)
+    .await
+}
+
+/// Return the subset of `file_ids` that have at least one row in
+/// `symbol_references`. Used by graph_analysis to decide which files take
+/// the symbol-aware path vs the regex fallback.
+pub async fn file_ids_with_symbol_refs(
+    pool: &PgPool,
+    project_id: i32,
+    file_ids: &[i64],
+) -> Result<std::collections::HashSet<i64>, sqlx::Error> {
+    if file_ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let rows: Vec<(i64,)> = sqlx::query_as::<_, (i64,)>(
+        "SELECT DISTINCT sr.source_file_id
+         FROM symbol_references sr
+         JOIN indexed_files f ON f.id = sr.source_file_id
+         WHERE f.project_id = $1
+           AND sr.source_file_id = ANY($2::bigint[])",
+    )
+    .bind(project_id)
+    .bind(file_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// One row of the per-project naming distribution: a symbol's name + kind +
+/// containing file path. Consumed by `tool_naming_consistency` for in-Rust
+/// per-(directory, kind) convention dominance analysis.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct NamingDistributionRow {
+    pub symbol_name: String,
+    pub kind: String,
+    pub file_id: i64,
+    pub relative_path: String,
+    pub start_line: i32,
+    pub language: String,
+}
+
+/// Fetch all symbol names + kinds for a project (optionally filtered by language).
+/// Sorted by `(relative_path, start_line)` so the consumer's directory-grouping
+/// stays stable across runs.
+pub async fn get_naming_distribution(
+    pool: &PgPool,
+    project_id: i32,
+    language: Option<&str>,
+) -> Result<Vec<NamingDistributionRow>, sqlx::Error> {
+    sqlx::query_as::<_, NamingDistributionRow>(
+        "SELECT fs.name as symbol_name,
+                fs.kind,
+                fs.file_id,
+                f.relative_path,
+                fs.start_line,
+                f.language
+         FROM file_symbols fs
+         JOIN indexed_files f ON fs.file_id = f.id
+         WHERE f.project_id = $1
+           AND ($2::text IS NULL OR f.language = $2)
+         ORDER BY f.relative_path, fs.start_line",
+    )
+    .bind(project_id)
+    .bind(language)
+    .fetch_all(pool)
+    .await
 }

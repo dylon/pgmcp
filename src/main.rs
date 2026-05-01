@@ -1,4 +1,4 @@
-#![recursion_limit = "256"]
+#![recursion_limit = "512"]
 
 mod api;
 mod cli;
@@ -17,6 +17,7 @@ mod logging;
 mod mcp;
 #[allow(dead_code)]
 mod mmap_array;
+mod parsing;
 mod reactive;
 mod shutdown;
 mod stats;
