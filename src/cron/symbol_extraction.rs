@@ -474,4 +474,358 @@ mod tests {
         resolve_source_symbol_ids(&symbols, &ids, &mut refs);
         assert_eq!(refs[0].source_symbol_id, Some(11));
     }
+
+    // ========================================================================
+    // Additional edge-case examples — patterns the resolution must handle
+    // ========================================================================
+
+    #[test]
+    fn parent_resolution_skips_zero_ids() {
+        // bulk_insert_file_symbols leaves a 0 in the ids slot when ON CONFLICT
+        // doesn't match — the resolver must not propagate zeros as parents.
+        let symbols = vec![
+            Symbol {
+                file_id: 0,
+                name: "Container".into(),
+                kind: SymbolKind::Struct,
+                start_line: 1,
+                end_line: 50,
+                parent_id: None,
+                visibility: None,
+                signature: None,
+            },
+            Symbol {
+                file_id: 0,
+                name: "method".into(),
+                kind: SymbolKind::Function,
+                start_line: 10,
+                end_line: 20,
+                parent_id: None,
+                visibility: None,
+                signature: None,
+            },
+        ];
+        let ids = vec![0i64, 11]; // container's id is 0 — bad slot
+        let pairs = compute_parent_pairs(&symbols, &ids);
+        assert!(pairs.is_empty(), "should not emit pair when parent id is 0");
+    }
+
+    #[test]
+    fn parent_resolution_handles_overlapping_containers() {
+        // Two containers covering the same range — picks the first one
+        // matched (smallest span; if span ties, first in input order wins).
+        let symbols = vec![
+            Symbol {
+                file_id: 0,
+                name: "TraitA".into(),
+                kind: SymbolKind::Trait,
+                start_line: 1,
+                end_line: 50,
+                parent_id: None,
+                visibility: None,
+                signature: None,
+            },
+            Symbol {
+                file_id: 0,
+                name: "ClassB".into(),
+                kind: SymbolKind::Class,
+                start_line: 1,
+                end_line: 50, // identical span
+                parent_id: None,
+                visibility: None,
+                signature: None,
+            },
+            Symbol {
+                file_id: 0,
+                name: "method".into(),
+                kind: SymbolKind::Function,
+                start_line: 10,
+                end_line: 20,
+                parent_id: None,
+                visibility: None,
+                signature: None,
+            },
+        ];
+        let ids = vec![10, 11, 12];
+        let pairs = compute_parent_pairs(&symbols, &ids);
+        assert_eq!(pairs.len(), 1);
+        // First-in-input-order wins on tie, since `if best.map(...).unwrap_or(true)`
+        // only updates when STRICTLY smaller.
+        assert_eq!(pairs[0].0, 12); // method
+        assert_eq!(pairs[0].1, 10); // TraitA (first in input)
+    }
+
+    #[test]
+    fn source_symbol_resolution_unowned_ref_stays_none() {
+        // Reference at a line not enclosed by any symbol → source_symbol_id stays None.
+        let symbols = vec![Symbol {
+            file_id: 0,
+            name: "fn1".into(),
+            kind: SymbolKind::Function,
+            start_line: 10,
+            end_line: 20,
+            parent_id: None,
+            visibility: None,
+            signature: None,
+        }];
+        let ids = vec![1i64];
+        let mut refs = vec![SymbolReference {
+            source_file_id: 0,
+            source_symbol_id: None,
+            target_file_id: None,
+            target_symbol_id: None,
+            target_raw: "thing".into(),
+            ref_kind: SymbolRefKind::Call,
+            source_line: 5, // before fn1
+        }];
+        resolve_source_symbol_ids(&symbols, &ids, &mut refs);
+        assert_eq!(refs[0].source_symbol_id, None);
+    }
+
+    #[test]
+    fn source_symbol_resolution_preserves_existing_assignments() {
+        // Refs that already have source_symbol_id set must NOT be overwritten.
+        let symbols = vec![Symbol {
+            file_id: 0,
+            name: "outer".into(),
+            kind: SymbolKind::Function,
+            start_line: 1,
+            end_line: 100,
+            parent_id: None,
+            visibility: None,
+            signature: None,
+        }];
+        let ids = vec![42i64];
+        let mut refs = vec![SymbolReference {
+            source_file_id: 0,
+            source_symbol_id: Some(99), // already set
+            target_file_id: None,
+            target_symbol_id: None,
+            target_raw: "x".into(),
+            ref_kind: SymbolRefKind::Call,
+            source_line: 50,
+        }];
+        resolve_source_symbol_ids(&symbols, &ids, &mut refs);
+        assert_eq!(refs[0].source_symbol_id, Some(99));
+    }
+
+    #[test]
+    fn parent_resolution_only_promotes_function_kind() {
+        // Containers contain other containers but those don't get parent_id —
+        // only Functions do.
+        let symbols = vec![
+            Symbol {
+                file_id: 0,
+                name: "Outer".into(),
+                kind: SymbolKind::Struct,
+                start_line: 1,
+                end_line: 100,
+                parent_id: None,
+                visibility: None,
+                signature: None,
+            },
+            Symbol {
+                file_id: 0,
+                name: "Inner".into(),
+                kind: SymbolKind::Struct,
+                start_line: 10,
+                end_line: 50,
+                parent_id: None,
+                visibility: None,
+                signature: None,
+            },
+        ];
+        let ids = vec![1i64, 2];
+        let pairs = compute_parent_pairs(&symbols, &ids);
+        // Inner is contained by Outer but Inner is a Struct, not a Function.
+        // Current logic only promotes Functions; Inner gets no parent_pair.
+        assert!(
+            pairs.is_empty(),
+            "compute_parent_pairs should only emit Function children, got {:?}",
+            pairs
+        );
+    }
+
+    #[test]
+    fn dedupe_symbols_by_unique_key_works_in_place() {
+        // The cron's defensive dedupe before bulk insert: same (kind, name, start_line)
+        // collapsed to a single entry. Replicates the in-place HashSet retain pattern
+        // used in extract_and_persist_file.
+        use std::collections::HashSet;
+        let mut symbols = vec![
+            Symbol {
+                file_id: 0,
+                name: "foo".into(),
+                kind: SymbolKind::Function,
+                start_line: 1,
+                end_line: 5,
+                parent_id: None,
+                visibility: None,
+                signature: None,
+            },
+            Symbol {
+                file_id: 0,
+                name: "foo".into(), // duplicate
+                kind: SymbolKind::Function,
+                start_line: 1,
+                end_line: 5,
+                parent_id: None,
+                visibility: None,
+                signature: None,
+            },
+            Symbol {
+                file_id: 0,
+                name: "bar".into(),
+                kind: SymbolKind::Function,
+                start_line: 10,
+                end_line: 15,
+                parent_id: None,
+                visibility: None,
+                signature: None,
+            },
+        ];
+        let mut seen: HashSet<(SymbolKind, String, u32)> = HashSet::new();
+        symbols.retain(|s| seen.insert((s.kind, s.name.clone(), s.start_line)));
+        assert_eq!(symbols.len(), 2);
+        assert_eq!(symbols[0].name, "foo");
+        assert_eq!(symbols[1].name, "bar");
+    }
+
+    #[test]
+    fn dedupe_references_by_unique_key_works_in_place() {
+        use std::collections::HashSet;
+        let mut refs = vec![
+            SymbolReference {
+                source_file_id: 0,
+                source_symbol_id: None,
+                target_file_id: None,
+                target_symbol_id: None,
+                target_raw: "do_thing".into(),
+                ref_kind: SymbolRefKind::Call,
+                source_line: 10,
+            },
+            SymbolReference {
+                source_file_id: 0,
+                source_symbol_id: None,
+                target_file_id: None,
+                target_symbol_id: None,
+                target_raw: "do_thing".into(), // duplicate
+                ref_kind: SymbolRefKind::Call,
+                source_line: 10,
+            },
+            SymbolReference {
+                source_file_id: 0,
+                source_symbol_id: None,
+                target_file_id: None,
+                target_symbol_id: None,
+                target_raw: "do_thing".into(),
+                ref_kind: SymbolRefKind::Call,
+                source_line: 11, // different line — kept
+            },
+        ];
+        let mut seen: HashSet<(u32, String, String)> = HashSet::new();
+        refs.retain(|r| {
+            seen.insert((
+                r.source_line,
+                r.target_raw.clone(),
+                r.ref_kind.as_db_str().to_string(),
+            ))
+        });
+        assert_eq!(refs.len(), 2);
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// A function symbol whose start_line is within a single Struct's
+        /// [start, end] range always gets that Struct as parent (when both
+        /// have valid non-zero ids).
+        #[test]
+        fn prop_function_inside_struct_gets_parent(
+            container_start in 1u32..50,
+            container_span in 50u32..100,
+            offset_in_container in 1u32..40,
+            container_id in 1i64..1000,
+            child_id in 1001i64..2000,
+        ) {
+            let container_end = container_start + container_span;
+            let fn_start = container_start + offset_in_container.min(container_span - 1);
+            let symbols = vec![
+                Symbol {
+                    file_id: 0,
+                    name: "Container".into(),
+                    kind: SymbolKind::Struct,
+                    start_line: container_start,
+                    end_line: container_end,
+                    parent_id: None,
+                    visibility: None,
+                    signature: None,
+                },
+                Symbol {
+                    file_id: 0,
+                    name: "method".into(),
+                    kind: SymbolKind::Function,
+                    start_line: fn_start,
+                    end_line: fn_start + 1,
+                    parent_id: None,
+                    visibility: None,
+                    signature: None,
+                },
+            ];
+            let ids = vec![container_id, child_id];
+            let pairs = compute_parent_pairs(&symbols, &ids);
+            prop_assert_eq!(pairs.len(), 1);
+            prop_assert_eq!(pairs[0], (child_id, container_id));
+        }
+
+        /// A reference at line L gets resolved to whichever symbol's
+        /// [start, end] range contains L. If multiple match, the smallest
+        /// span wins. Test with two non-nested ranges where only one
+        /// contains L.
+        #[test]
+        fn prop_reference_gets_unique_enclosing_symbol(
+            target_id in 1i64..1000,
+            other_id in 1001i64..2000,
+            target_start in 100u32..200,
+            target_span in 5u32..30,
+            other_start in 1u32..50,
+        ) {
+            let target_end = target_start + target_span;
+            let ref_line = target_start + (target_span / 2); // squarely inside target
+            let symbols = vec![
+                Symbol {
+                    file_id: 0,
+                    name: "other".into(),
+                    kind: SymbolKind::Function,
+                    start_line: other_start,
+                    end_line: other_start + 5,
+                    parent_id: None,
+                    visibility: None,
+                    signature: None,
+                },
+                Symbol {
+                    file_id: 0,
+                    name: "target".into(),
+                    kind: SymbolKind::Function,
+                    start_line: target_start,
+                    end_line: target_end,
+                    parent_id: None,
+                    visibility: None,
+                    signature: None,
+                },
+            ];
+            let ids = vec![other_id, target_id];
+            let mut refs = vec![SymbolReference {
+                source_file_id: 0,
+                source_symbol_id: None,
+                target_file_id: None,
+                target_symbol_id: None,
+                target_raw: "x".into(),
+                ref_kind: SymbolRefKind::Call,
+                source_line: ref_line,
+            }];
+            resolve_source_symbol_ids(&symbols, &ids, &mut refs);
+            prop_assert_eq!(refs[0].source_symbol_id, Some(target_id));
+        }
+    }
 }

@@ -827,4 +827,72 @@ mod tests {
         let r = synthesize_raw_import("anything", "unknown_lang");
         assert_eq!(r.kind, "import");
     }
+
+    #[test]
+    fn synthesize_preserves_raw_path_verbatim() {
+        // The raw_path must be byte-identical to the input target_raw — the
+        // resolver depends on the exact form for path-prefix matching
+        // ("crate::foo::bar" must not become "foo::bar" or similar).
+        let input = "std::collections::HashMap::new";
+        let r = synthesize_raw_import(input, "rust");
+        assert_eq!(r.raw_path, input);
+    }
+
+    #[test]
+    fn synthesize_handles_empty_target_raw() {
+        // Edge case: an empty target_raw shouldn't panic; falls to the
+        // bare-name (kind=mod) path for rust, kind=import for others.
+        let r = synthesize_raw_import("", "rust");
+        assert_eq!(r.raw_path, "");
+        assert_eq!(r.kind, "mod");
+        let r = synthesize_raw_import("", "python");
+        assert_eq!(r.kind, "import");
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Any rust path containing `::` produces kind=use (so the resolver
+        /// hits the use-arm and walks crate/super/self prefixes correctly).
+        #[test]
+        fn prop_rust_path_with_double_colon_is_use(
+            head in "[a-z][a-z0-9_]{0,8}",
+            tail in prop::collection::vec("[a-z][a-z0-9_]{0,8}", 1..4usize),
+        ) {
+            let path = format!("{}::{}", head, tail.join("::"));
+            let r = synthesize_raw_import(&path, "rust");
+            prop_assert_eq!(r.kind, "use");
+            prop_assert_eq!(r.raw_path, path);
+        }
+
+        /// Any bare rust name (no `::`) produces kind=mod (so the resolver
+        /// hits the mod-arm and looks for sibling-file candidates).
+        #[test]
+        fn prop_rust_bare_name_is_mod(
+            name in "[a-z][a-z0-9_]{0,15}",
+        ) {
+            let r = synthesize_raw_import(&name, "rust");
+            prop_assert_eq!(r.kind, "mod");
+        }
+
+        /// Non-rust languages always produce kind=import regardless of
+        /// target_raw shape.
+        #[test]
+        fn prop_non_rust_always_import(
+            target in "[a-zA-Z][a-zA-Z0-9_./:-]*",
+            language in prop_oneof![
+                Just("python"),
+                Just("javascript"),
+                Just("typescript"),
+                Just("java"),
+                Just("clojure"),
+                Just("scala"),
+                Just("go"),
+                Just("unknown"),
+            ],
+        ) {
+            let r = synthesize_raw_import(&target, language);
+            prop_assert_eq!(r.kind, "import");
+        }
+    }
 }

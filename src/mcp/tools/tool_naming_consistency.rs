@@ -574,4 +574,280 @@ mod tests {
         assert_eq!(directory_of("foo.rs"), "");
         assert_eq!(directory_of("a/b/c/d.rs"), "a/b/c");
     }
+
+    // ========================================================================
+    // Edge-case examples — additional patterns the heuristic must handle
+    // ========================================================================
+
+    #[test]
+    fn classify_handles_trailing_underscore_screaming() {
+        // Trailing underscore on screaming snake stays screaming.
+        assert_eq!(
+            classify_convention("MAX_SIZE_"),
+            NamingConvention::ScreamingSnake
+        );
+    }
+
+    #[test]
+    fn classify_treats_alpha_only_uppercase_no_separator_as_other() {
+        // No separator + no lowercase + no underscore → can't disambiguate
+        // between "single PascalCase letter" and "ScreamingSnake without sep".
+        // Conservative: classify as Other so it's never flagged as divergent.
+        assert_eq!(classify_convention("MAX"), NamingConvention::Other);
+        assert_eq!(classify_convention("EOF"), NamingConvention::Other);
+        assert_eq!(classify_convention("X"), NamingConvention::Other);
+    }
+
+    #[test]
+    fn classify_skips_pure_numeric() {
+        assert_eq!(classify_convention("123"), NamingConvention::Other);
+        assert_eq!(classify_convention("0_1"), NamingConvention::Other);
+    }
+
+    #[test]
+    fn classify_handles_mixed_separators() {
+        // Underscore wins over dash since both can't coexist in any single
+        // canonical convention; the heuristic prefers snake-style.
+        assert_eq!(
+            classify_convention("foo_bar-baz"),
+            NamingConvention::SnakeCase
+        );
+    }
+
+    #[test]
+    fn classify_alphanumeric_camel() {
+        assert_eq!(
+            classify_convention("fooBar123"),
+            NamingConvention::CamelCase
+        );
+        assert_eq!(
+            classify_convention("Build4Things"),
+            NamingConvention::PascalCase
+        );
+    }
+
+    #[test]
+    fn convert_preserves_acronyms_naively() {
+        // "HTTPClient" — the splitter sees H,T,T,P,C as runs of uppercase.
+        // The naive splitter produces ["HTTPClient"] (one word, no
+        // lowercase→uppercase boundary), so snake_case becomes "httpclient".
+        // This is acceptable because the user can override; the goal is
+        // never to mangle, only to normalize.
+        let snake = convert_to_convention("HTTPClient", NamingConvention::SnakeCase);
+        // Documented behavior: acronym runs are not split; the result is
+        // valid even if not idiomatic.
+        assert!(!snake.is_empty());
+        assert!(!snake.contains(' '));
+    }
+
+    #[test]
+    fn convert_round_trip_for_simple_words() {
+        // For multi-word identifiers that classify cleanly, converting to
+        // a target convention and back should recover the same target form.
+        for name in ["foo_bar", "build_http_client", "MAX_SIZE"] {
+            let snake = convert_to_convention(name, NamingConvention::SnakeCase);
+            let pascal = convert_to_convention(&snake, NamingConvention::PascalCase);
+            let snake_again = convert_to_convention(&pascal, NamingConvention::SnakeCase);
+            assert_eq!(
+                snake, snake_again,
+                "non-idempotent round-trip for `{}`",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn convert_idempotent_to_same_target() {
+        // Converting twice to the same target should equal converting once.
+        let conventions = [
+            NamingConvention::SnakeCase,
+            NamingConvention::CamelCase,
+            NamingConvention::PascalCase,
+            NamingConvention::ScreamingSnake,
+            NamingConvention::KebabCase,
+        ];
+        for name in ["foo_bar", "buildClient", "FooBar", "API_KEY"] {
+            for target in conventions {
+                let once = convert_to_convention(name, target);
+                let twice = convert_to_convention(&once, target);
+                assert_eq!(
+                    once,
+                    twice,
+                    "convert_to_convention({:?}, {:?}) is not idempotent: {:?} → {:?}",
+                    name,
+                    target.as_str(),
+                    once,
+                    twice
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn convert_other_target_returns_input_unchanged() {
+        assert_eq!(
+            convert_to_convention("fooBar", NamingConvention::Other),
+            "fooBar"
+        );
+    }
+
+    #[test]
+    fn split_into_words_handles_camel_humps() {
+        assert_eq!(
+            split_into_words("fooBarBaz"),
+            vec!["foo".to_string(), "Bar".to_string(), "Baz".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_into_words_handles_underscore() {
+        assert_eq!(
+            split_into_words("foo_bar"),
+            vec!["foo".to_string(), "bar".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_into_words_empty_string() {
+        let result = split_into_words("");
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn capitalize_handles_empty_and_single_char() {
+        assert_eq!(capitalize(""), "");
+        assert_eq!(capitalize("a"), "A");
+        assert_eq!(capitalize("A"), "A");
+        // Subsequent chars lowercase.
+        assert_eq!(capitalize("FOO"), "Foo");
+    }
+
+    // ========================================================================
+    // Property-based tests — random identifiers must classify consistently
+    // ========================================================================
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// Any well-formed `lowercase_with_underscore` name (≥2 segments)
+        /// classifies as SnakeCase.
+        #[test]
+        fn prop_snake_case_round_trips_through_classifier(
+            segments in prop::collection::vec("[a-z][a-z0-9]{0,8}", 2..5usize),
+        ) {
+            let name = segments.join("_");
+            prop_assert_eq!(classify_convention(&name), NamingConvention::SnakeCase);
+        }
+
+        /// Any well-formed PascalCase name (capital followed by mixed-case)
+        /// classifies as PascalCase.
+        #[test]
+        fn prop_pascal_case_round_trips_through_classifier(
+            head_letter in "[A-Z]",
+            tail in "[a-z][a-z0-9]{0,5}",
+            second_word_letter in "[A-Z]",
+            second_tail in "[a-z][a-z0-9]{0,5}",
+        ) {
+            let name = format!("{}{}{}{}", head_letter, tail, second_word_letter, second_tail);
+            prop_assert_eq!(classify_convention(&name), NamingConvention::PascalCase);
+        }
+
+        /// Any well-formed camelCase name classifies as CamelCase.
+        #[test]
+        fn prop_camel_case_round_trips_through_classifier(
+            head in "[a-z][a-z0-9]{0,5}",
+            second_letter in "[A-Z]",
+            second_tail in "[a-z][a-z0-9]{0,5}",
+        ) {
+            let name = format!("{}{}{}", head, second_letter, second_tail);
+            prop_assert_eq!(classify_convention(&name), NamingConvention::CamelCase);
+        }
+
+        /// Any well-formed `UPPER_WITH_UNDERSCORE` (≥2 segments) classifies
+        /// as ScreamingSnake.
+        #[test]
+        fn prop_screaming_snake_round_trips_through_classifier(
+            segments in prop::collection::vec("[A-Z][A-Z0-9]{0,5}", 2..5usize),
+        ) {
+            let name = segments.join("_");
+            prop_assert_eq!(classify_convention(&name), NamingConvention::ScreamingSnake);
+        }
+
+        /// Any well-formed `lower-with-dash` name classifies as KebabCase.
+        #[test]
+        fn prop_kebab_case_round_trips_through_classifier(
+            segments in prop::collection::vec("[a-z][a-z0-9]{0,5}", 2..5usize),
+        ) {
+            let name = segments.join("-");
+            prop_assert_eq!(classify_convention(&name), NamingConvention::KebabCase);
+        }
+
+        /// `convert_to_convention(_, target)` is idempotent for all targets
+        /// other than `Other`. Random lowercase-only names — they always
+        /// have a clean conversion path.
+        #[test]
+        fn prop_convert_idempotent_for_lowercase_names(
+            words in prop::collection::vec("[a-z]{2,5}", 2..4usize),
+            target_idx in 0..5usize,
+        ) {
+            let conventions = [
+                NamingConvention::SnakeCase,
+                NamingConvention::CamelCase,
+                NamingConvention::PascalCase,
+                NamingConvention::ScreamingSnake,
+                NamingConvention::KebabCase,
+            ];
+            let target = conventions[target_idx];
+            let name = words.join("_");
+            let once = convert_to_convention(&name, target);
+            let twice = convert_to_convention(&once, target);
+            prop_assert_eq!(once, twice);
+        }
+
+        /// Round-trip through snake_case is stable: snake → X → snake should
+        /// equal snake → snake (= snake itself for already-snake input).
+        #[test]
+        fn prop_snake_through_target_back_to_snake_is_stable(
+            words in prop::collection::vec("[a-z]{2,5}", 2..4usize),
+            target_idx in 0..5usize,
+        ) {
+            let conventions = [
+                NamingConvention::SnakeCase,
+                NamingConvention::CamelCase,
+                NamingConvention::PascalCase,
+                NamingConvention::ScreamingSnake,
+                NamingConvention::KebabCase,
+            ];
+            let target = conventions[target_idx];
+            let snake = words.join("_");
+            // snake → target → snake should give us back `snake` (lowercase
+            // words separated by underscore).
+            let target_form = convert_to_convention(&snake, target);
+            let back_to_snake = convert_to_convention(&target_form, NamingConvention::SnakeCase);
+            prop_assert_eq!(&snake, &back_to_snake);
+        }
+
+        /// `directory_of` is the prefix-up-to-last-slash. Property: the
+        /// returned slice is always a prefix of the input, and the input
+        /// minus the directory is a non-empty filename.
+        #[test]
+        fn prop_directory_of_is_prefix(
+            dirs in prop::collection::vec("[a-z]{1,8}", 0..4usize),
+            file in "[a-z]{1,10}\\.rs",
+        ) {
+            let path = if dirs.is_empty() {
+                file.clone()
+            } else {
+                format!("{}/{}", dirs.join("/"), file)
+            };
+            let dir = directory_of(&path);
+            // The directory is either empty (no slash) or a strict prefix.
+            if dir.is_empty() {
+                prop_assert!(!path.contains('/'));
+            } else {
+                prop_assert!(path.starts_with(dir));
+                prop_assert!(path.len() > dir.len() + 1); // dir + '/' + filename
+            }
+        }
+    }
 }
