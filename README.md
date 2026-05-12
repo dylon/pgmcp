@@ -6,7 +6,7 @@ pgmcp continuously indexes source code into PostgreSQL with vector embeddings,
 then applies dependency graph analysis, topic clustering, architecture metrics,
 and heuristic risk prediction to surface actionable engineering intelligence --
 all exposed through 40 [Model Context Protocol](https://modelcontextprotocol.io/)
-tools that Claude Code (or any MCP client) can call.
+tools that Claude Code, Codex CLI, or any MCP client can call.
 
 Think of it as three layers working together: a **real-time indexing engine** that
 watches your file system and maintains a searchable mirror in PostgreSQL, an
@@ -18,7 +18,7 @@ that lets AI assistants query any of it on demand.
 
 ## Capability Overview
 
-pgmcp's 41 MCP tools are organized into eight capability tiers:
+pgmcp's 71 MCP tools are organized into nine capability tiers:
 
 ### Search & Retrieval (6 tools)
 
@@ -26,12 +26,28 @@ Find code by meaning, keywords, regex, or fused ranking across all indexed proje
 
 | Tool              | Description                                                                                         |
 |-------------------|-----------------------------------------------------------------------------------------------------|
-| `semantic_search` | Vector similarity search (cosine over HNSW). Use `project: "claude"` to search session transcripts. |
+| `semantic_search` | Vector similarity search (cosine over HNSW). Use `project: "claude"` or `project: "codex"` to search agent session transcripts. |
 | `text_search`     | PostgreSQL full-text search with BM25/TF-IDF ranking                                                |
 | `grep`            | Server-side regex across file contents with optional glob filtering                                 |
 | `hybrid_search`   | Reciprocal Rank Fusion of BM25 + vector search with configurable weights                            |
 | `read_file`       | Read the content of an indexed file by path                                                         |
 | `search_commits`  | Semantic search over git commit history (messages + diffs)                                          |
+
+### Software Pattern Knowledge (8 tools)
+
+Design with a separate, local full-text pattern/anti-pattern index. These tools
+use the same embedding model as file search, but never query `file_chunks`.
+
+| Tool                         | Description                                                                 |
+|------------------------------|-----------------------------------------------------------------------------|
+| `software_pattern_search`    | Semantic search over software patterns, anti-patterns, paradigms, and sources |
+| `recommend_design_patterns`  | Recommend patterns and anti-patterns to avoid for a feature/refactor task    |
+| `review_design_patterns`     | Review a proposed design for anti-pattern risks and better alternatives      |
+| `get_software_pattern`       | Fetch one pattern card with source links and optional bounded excerpts       |
+| `list_software_patterns`     | Browse/filter the pattern catalog by paradigm, kind, category, or source     |
+| `pattern_catalog_stats`      | Pattern/source/chunk/import status for the dedicated knowledge index         |
+| `refresh_pattern_catalog`    | Seed, import, or incrementally refresh local full-text pattern sources       |
+| `upsert_pattern_source`      | Attach local full-text docs/snippets to an existing pattern                  |
 
 ### Project Intelligence (6 tools)
 
@@ -137,6 +153,8 @@ High-level project understanding and engineering quality assessment.
 - **17 file types** -- Rust, Python, TypeScript, JavaScript, Go, Rholang, MeTTa, Prolog, Shell, JSONL, Markdown, and more
 - **Per-project overrides** -- `.pgmcp.toml` in project roots for custom exclusions and file types
 - **CUDA acceleration** -- optional GPU-accelerated embeddings via ONNX Runtime
+- **Cross-agent memory search** -- synthetic `claude` and `codex` projects make both clients' config, prompt history, and sessions queryable through the same MCP tools
+- **Software pattern knowledge index** -- separate pgvector tables for local full-text design pattern/anti-pattern sources; file search tools never return pattern docs
 - **Auto-RAG context injection** -- Claude Code hooks inject project context and relevant code on every prompt
 - **PreToolUse tool-call proxy** -- five hook scripts at `~/.claude/hooks/pgmcp-*.sh` augment (Layer A) or selectively deny (Layer B, opt-in via `PGMCP_HOOK_MODE=enforce`) `Read`/`Grep`/`Glob` to bias Claude toward pgmcp's richer tools
 - **Subagent containment** -- `~/.claude/agents/Explore.md` and `general-purpose.md` overrides drop `Grep`/`Glob` from spawned-subagent tool catalogs (harness-enforced; subagents do not inherit parent `PreToolUse` hooks)
@@ -154,7 +172,7 @@ High-level project understanding and engineering quality assessment.
                        │                      pgmcp daemon                    │
                        │                                                      │
                        │  ┌── Interface Layer ───────┬───────────┬─────────┐  │
-                       │  │  MCP Server (41 tools)   │  REST API │   CLI   │  │
+                       │  │  MCP Server (71 tools)   │  REST API │   CLI   │  │
                        │  └───────────┬──────────────┴───────────┴─────────┘  │
                        │              │                                       │
                        │  ┌── Analysis Layer ──────────┬──────┬────────────┐  │
@@ -202,7 +220,7 @@ High-level project understanding and engineering quality assessment.
    processing and only finalized after all chunks succeed -- crash-safe by design
 7. **Analysis cron jobs** (graph, topics, similarity) run in the background after the
    initial scan completes, populating derived tables that the analysis tools query
-8. **MCP clients** query the index via any of 41 tools over stdio or Streamable HTTP
+8. **MCP clients** query the index via any of 71 tools over stdio or Streamable HTTP
 
 ---
 
@@ -255,11 +273,14 @@ pgmcp init                    # Generate config at ~/.config/pgmcp/config.toml
 PGMCP_DB_PASSWORD=secret pgmcp serve   # Foreground mode (stdout logging)
 ```
 
-### Connect Claude Code
+### Connect Claude Code or Codex
 
 ```bash
 claude mcp add --transport http pgmcp http://localhost:3100/mcp
 claude mcp list   # Should show: pgmcp (connected)
+
+codex mcp add pgmcp --url http://localhost:3100/mcp
+codex mcp list    # Should show: pgmcp
 ```
 
 Or add to `.mcp.json` in your project root:
@@ -279,6 +300,7 @@ For stdio transport (foreground debugging):
 
 ```bash
 claude mcp add --transport stdio pgmcp /usr/local/bin/pgmcp serve
+codex mcp add pgmcp -- /usr/local/bin/pgmcp serve
 ```
 
 ---
@@ -356,9 +378,9 @@ All intervals are configurable in the `[cron]` section of the config file.
 
 ---
 
-## Claude Integration
+## Agent Client Integration
 
-### Auto-Discovery of `~/.claude/`
+### Auto-Discovery of Agent Homes
 
 On startup, pgmcp checks whether `~/.claude/` exists and, if so, registers it as
 a synthetic **"claude"** project. All indexable files within are scanned and indexed
@@ -371,6 +393,11 @@ just like any workspace project. This includes:
 
 A hardcoded `CLAUDE_DIR_EXCLUDES` list filters out noise directories (telemetry,
 debug logs, cache, binary snapshots).
+
+pgmcp also checks whether `~/.codex/` exists and registers it as a synthetic
+**"codex"** project. Codex stores credentials, sqlite state, shell snapshots,
+plugin checkouts, and caches in the same directory, so pgmcp uses an allow-list:
+`config.toml`, `history.jsonl`, `memories/**`, and `sessions/**/*.jsonl`.
 
 ### Project-Level `.claude/` Scanning
 
@@ -392,10 +419,26 @@ Each extracted message becomes a separate chunk with its own embedding, making
 session history semantically searchable. Generic (non-Claude) JSONL files are
 chunked one line per chunk.
 
+### Codex JSONL Session and History Parsing
+
+Codex session rollouts live under `~/.codex/sessions/YYYY/MM/DD/*.jsonl`, and
+prompt history lives at `~/.codex/history.jsonl`. pgmcp extracts user messages,
+assistant responses, tool calls, and bounded tool outputs while skipping
+developer/system instructions, reasoning records, encrypted payloads, token
+counts, invalid JSON lines, and oversized tool output.
+
+Both synthetic projects live in the same PostgreSQL index. Claude can search
+Codex history with `project: "codex"`, and Codex can search Claude history with
+`project: "claude"`.
+
 ### Auto-RAG Hooks
 
 pgmcp can automatically inject relevant context into every Claude Code session
 and prompt via two hooks. No manual tool calls needed.
+
+Codex CLI supports MCP server registration, so it can query pgmcp tools directly.
+It does not currently expose Claude-style prompt hooks in the local CLI surface,
+so automatic prompt-time injection is Claude-specific.
 
 **SessionStart Hook** -- runs `pgmcp context` when a Claude Code session begins.
 Injects a markdown summary containing the project name, root path, file count,
@@ -1266,7 +1309,7 @@ pgmcp advertises 5 of 8 MCP capabilities:
 
 | Capability      | Description                                                                   |
 |-----------------|-------------------------------------------------------------------------------|
-| **Tools**       | 41 tools across 8 capability tiers                                            |
+| **Tools**       | 71 tools across 9 capability tiers                                            |
 | **Resources**   | 2 static resources + 3 resource templates with URI parameters                 |
 | **Completions** | Auto-completion for resource template parameters (`{name}`, `{path}`)         |
 | **Logging**     | Server-to-client log push with dynamic verbosity control via `set_level()`    |

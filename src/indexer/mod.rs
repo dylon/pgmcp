@@ -1,5 +1,6 @@
 pub mod chunker;
 pub mod claude_chunker;
+pub mod codex_chunker;
 pub mod config_watcher;
 pub mod event_processor;
 pub mod git_indexer;

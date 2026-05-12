@@ -378,6 +378,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             .route("/health", axum::routing::get(api::handlers::health))
             .route("/api/search", axum::routing::post(api::handlers::search))
             .route("/api/context", axum::routing::get(api::handlers::context))
+            .route("/api/mandates", axum::routing::get(api::handlers::mandates))
             .route("/api/status", axum::routing::get(api::handlers::status))
             .route("/api/grep", axum::routing::post(api::handlers::grep))
             .route(

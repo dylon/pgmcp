@@ -14,11 +14,12 @@ pub async fn run(
     crate::logging::init_cli();
     let config = Config::load(config_override)?;
     let pool = db::pool::create_pool(&config.database).await?;
-    run_context_command(&pool, cwd, depth).await
+    run_context_command(&pool, &config, cwd, depth).await
 }
 
 async fn run_context_command(
     pool: &sqlx::PgPool,
+    config: &Config,
     cwd: Option<PathBuf>,
     depth: i32,
 ) -> anyhow::Result<()> {
@@ -69,14 +70,18 @@ async fn run_context_command(
                 }
             }
 
+            let mandates = crate::mandates::resolve_effective_mandates(config, Some(&project));
+            println!();
+            print!("{}", crate::mandates::render_mandates_markdown(&mandates));
+
             println!();
             println!("### Available pgmcp tools");
             println!(
-                "Use ToolSearch to load: semantic_search, text_search, grep, read_file, list_projects, project_tree, file_info, index_stats, reindex, search_commits"
+                "Use ToolSearch to load: semantic_search, text_search, grep, read_file, list_projects, project_tree, mandate_context, file_info, index_stats, reindex, search_commits, software_pattern_search, recommend_design_patterns, review_design_patterns"
             );
             println!();
             println!(
-                "**Tip:** Use search_commits for git history. Use semantic_search with project: \"claude\" for past Claude Code sessions/memory."
+                "**Tip:** Use mandate_context to reload effective AGENTS.md/CLAUDE.md/.pgmcp.toml context. Use search_commits for git history. Use semantic_search with project: \"claude\" or project: \"codex\" for past agent sessions/memory."
             );
         }
         None => {
@@ -96,14 +101,17 @@ async fn run_context_command(
                     );
                 }
             }
+            let mandates = crate::mandates::resolve_effective_mandates(config, None);
+            println!();
+            print!("{}", crate::mandates::render_mandates_markdown(&mandates));
             println!();
             println!("### Available pgmcp tools");
             println!(
-                "Use ToolSearch to load: semantic_search, text_search, grep, read_file, list_projects, project_tree, file_info, index_stats, reindex, search_commits"
+                "Use ToolSearch to load: semantic_search, text_search, grep, read_file, list_projects, project_tree, mandate_context, file_info, index_stats, reindex, search_commits, software_pattern_search, recommend_design_patterns, review_design_patterns"
             );
             println!();
             println!(
-                "**Tip:** Use search_commits for git history. Use semantic_search with project: \"claude\" for past Claude Code sessions/memory."
+                "**Tip:** Use mandate_context to reload effective AGENTS.md/CLAUDE.md/.pgmcp.toml context. Use search_commits for git history. Use semantic_search with project: \"claude\" or project: \"codex\" for past agent sessions/memory."
             );
         }
     }

@@ -28,9 +28,13 @@ use pgmcp_testing::mocks::{DeterministicEmbeddingBackend, MockDbClient};
 
 /// Build an `McpServer` wired to a populated `MockDbClient`.
 fn server_with_mock(mock: MockDbClient) -> McpServer {
+    server_with_mock_and_config(mock, test_config())
+}
+
+fn server_with_mock_and_config(mock: MockDbClient, config_value: Config) -> McpServer {
     let db: Arc<dyn DbClient> = Arc::new(mock);
     let stats = Arc::new(StatsTracker::new());
-    let config = Arc::new(ArcSwap::from_pointee(test_config()));
+    let config = Arc::new(ArcSwap::from_pointee(config_value));
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_source = EmbedSource::lazy(Config::default().embeddings);
@@ -111,6 +115,65 @@ async fn list_projects_returns_serialized_projects_from_mock_db() {
     assert!(
         payload.contains("\"file_count\""),
         "file_count not in payload:\n{payload}"
+    );
+}
+
+#[tokio::test]
+async fn mandate_context_returns_sources_and_project_override_from_mock_db() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    let project = workspace.join("alpha");
+    std::fs::create_dir_all(&project).expect("create project");
+    std::fs::write(workspace.join("AGENTS.md"), "workspace mandate").expect("write AGENTS");
+    std::fs::write(project.join("CLAUDE.md"), "project info").expect("write CLAUDE");
+    std::fs::write(
+        project.join(".pgmcp.toml"),
+        "[git]\nindex_history = true\n\n[indexer]\nmax_file_size_bytes = 1234\n",
+    )
+    .expect("write .pgmcp.toml");
+
+    let mut config = test_config();
+    config.workspace.paths = vec![workspace.to_string_lossy().into_owned()];
+
+    let mut mock = MockDbClient::new();
+    mock.projects.push(ProjectInfo {
+        id: 1,
+        workspace_path: workspace.to_string_lossy().into_owned(),
+        path: project.to_string_lossy().into_owned(),
+        name: "alpha".into(),
+        discovered_at: None,
+        last_scanned_at: None,
+        file_count: Some(3),
+        git_common_dir: None,
+        git_root_commits: None,
+    });
+
+    let server = server_with_mock_and_config(mock, config);
+    let result = server
+        .call_tool_cli("mandate_context", serde_json::json!({"project": "alpha"}))
+        .await
+        .expect("tool call");
+    let payload = result
+        .content
+        .iter()
+        .filter_map(|c| match &c.raw {
+            rmcp::model::RawContent::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .next()
+        .expect("text content present");
+    let json: serde_json::Value = serde_json::from_str(&payload).expect("json payload");
+
+    assert_eq!(json["found_project"], true);
+    assert!(payload.contains("workspace mandate"));
+    assert!(payload.contains("project info"));
+    assert_eq!(
+        json["mandates"]["project_override"]["git_index_history"],
+        true
+    );
+    assert_eq!(
+        json["mandates"]["project_override"]["max_file_size_bytes"],
+        1234
     );
 }
 

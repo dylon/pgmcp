@@ -1,3 +1,7 @@
+[env]
+NVCC_CCBIN = "g++-14"
+CUDA_COMPUTE_CAP = "89"
+
 [alias]
 # Convenience wrappers for individual verification gates. The full verify
 # sequence (including formatting, CPU-only build, and GPU smokes) lives in

@@ -2714,6 +2714,7 @@ dependencies = [
  "sd-notify",
  "serde",
  "serde_json",
+ "sha2",
  "sqlx",
  "syn",
  "tempfile",
@@ -2734,6 +2735,7 @@ dependencies = [
  "tree-sitter-python",
  "tree-sitter-scala",
  "tree-sitter-typescript",
+ "ureq",
  "uuid",
  "xxhash-rust",
 ]

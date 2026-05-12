@@ -326,6 +326,52 @@ pub async fn context(
 }
 
 // ============================================================================
+// GET /api/mandates?project=name&cwd=/path — Effective mandates
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct MandatesQuery {
+    pub project: Option<String>,
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MandatesResponse {
+    pub requested_project: Option<String>,
+    pub requested_cwd: Option<String>,
+    pub found_project: bool,
+    pub mandates: crate::mandates::MandateBundle,
+}
+
+pub async fn mandates(
+    State(state): State<ApiState>,
+    Query(params): Query<MandatesQuery>,
+) -> Result<Json<MandatesResponse>, (StatusCode, String)> {
+    let project = crate::mandates::resolve_project_for_mandates(
+        state.db.as_ref(),
+        params.project.as_deref(),
+        params.cwd.as_deref(),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Project lookup failed: {}", e),
+        )
+    })?;
+
+    let config = state.config.load();
+    let bundle = crate::mandates::resolve_effective_mandates(&config, project.as_ref());
+
+    Ok(Json(MandatesResponse {
+        requested_project: params.project,
+        requested_cwd: params.cwd,
+        found_project: project.is_some(),
+        mandates: bundle,
+    }))
+}
+
+// ============================================================================
 // GET /api/status — Daemon health & model-state snapshot
 // ============================================================================
 

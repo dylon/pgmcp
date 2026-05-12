@@ -30,10 +30,12 @@ pub mod fcm;
 pub mod graph;
 pub mod indexer;
 pub mod logging;
+pub mod mandates;
 pub mod mcp;
 #[allow(dead_code)]
 pub mod mmap_array;
 pub mod parsing;
+pub mod patterns;
 pub mod reactive;
 pub mod shutdown;
 pub mod stats;

@@ -266,7 +266,7 @@ mod tests {
             drop(tx);
 
             let mut all = Vec::new();
-            while let Ok(batch) = buffered.recv_timeout(Duration::from_millis(200)) {
+            for batch in buffered {
                 all.extend(batch);
             }
 
@@ -286,10 +286,7 @@ mod tests {
             }
             drop(tx);
 
-            let mut batches = Vec::new();
-            while let Ok(batch) = buffered.recv_timeout(Duration::from_millis(200)) {
-                batches.push(batch);
-            }
+            let batches: Vec<Vec<i32>> = buffered.iter().collect();
 
             // All batches except possibly the last must have exactly `count` items
             for (i, batch) in batches.iter().enumerate() {
@@ -320,10 +317,7 @@ mod tests {
             }
             drop(tx);
 
-            let mut results = Vec::new();
-            while let Ok(v) = distinct.recv_timeout(Duration::from_millis(200)) {
-                results.push(v);
-            }
+            let results: Vec<i32> = distinct.iter().collect();
 
             // Property 1: output count <= input count
             prop_assert!(results.len() <= items.len());
@@ -359,10 +353,7 @@ mod tests {
             }
             drop(tx);
 
-            let mut results = Vec::new();
-            while let Ok(v) = throttled.recv_timeout(Duration::from_millis(200)) {
-                results.push(v);
-            }
+            let results: Vec<i32> = throttled.iter().collect();
 
             // Output count must be <= input count
             prop_assert!(results.len() <= items.len());
@@ -439,10 +430,7 @@ mod tests {
                 tx.send(item).expect("send");
             }
             drop(tx);
-            let mut out: Vec<i32> = Vec::new();
-            while let Ok(v) = throttled.recv_timeout(Duration::from_millis(200)) {
-                out.push(v);
-            }
+            let out: Vec<i32> = throttled.iter().collect();
             // With a 500ms window and instant sends, exactly 1 item emits
             // before the window closes (the first one).
             prop_assert_eq!(out.len(), 1);

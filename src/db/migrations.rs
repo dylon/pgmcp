@@ -466,6 +466,155 @@ pub async fn run_migrations(
         sqlx::query(idx_sql).execute(pool).await?;
     }
 
+    // ================================================================
+    // Software pattern / anti-pattern knowledge index
+    // ================================================================
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS programming_paradigms (
+            id SERIAL PRIMARY KEY,
+            slug TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL,
+            wikipedia_url TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS software_patterns (
+            id BIGSERIAL PRIMARY KEY,
+            slug TEXT UNIQUE NOT NULL,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('pattern', 'anti_pattern')),
+            category TEXT NOT NULL,
+            summary TEXT NOT NULL,
+            intent TEXT NOT NULL,
+            problem TEXT NOT NULL,
+            solution TEXT NOT NULL,
+            consequences TEXT NOT NULL,
+            tags TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+            canonical_url TEXT,
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS software_pattern_paradigms (
+            pattern_id BIGINT REFERENCES software_patterns(id) ON DELETE CASCADE,
+            paradigm_id INTEGER REFERENCES programming_paradigms(id) ON DELETE CASCADE,
+            relevance DOUBLE PRECISION NOT NULL DEFAULT 1.0,
+            PRIMARY KEY (pattern_id, paradigm_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS software_pattern_sources (
+            id BIGSERIAL PRIMARY KEY,
+            source_family TEXT NOT NULL,
+            title TEXT NOT NULL,
+            url TEXT,
+            license_label TEXT,
+            source_type TEXT NOT NULL,
+            ingest_policy TEXT NOT NULL,
+            content TEXT,
+            content_hash BIGINT,
+            fetched_at TIMESTAMPTZ,
+            imported_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            status TEXT NOT NULL DEFAULT 'pending',
+            error TEXT,
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS software_pattern_source_patterns (
+            source_id BIGINT REFERENCES software_pattern_sources(id) ON DELETE CASCADE,
+            pattern_id BIGINT REFERENCES software_patterns(id) ON DELETE CASCADE,
+            relation TEXT NOT NULL DEFAULT 'documents',
+            PRIMARY KEY (source_id, pattern_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS software_pattern_chunks (
+            id BIGSERIAL PRIMARY KEY,
+            source_id BIGINT REFERENCES software_pattern_sources(id) ON DELETE CASCADE,
+            chunk_index INTEGER NOT NULL,
+            content TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            embedding vector(384) NOT NULL,
+            UNIQUE (source_id, chunk_index)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS software_pattern_import_runs (
+            id BIGSERIAL PRIMARY KEY,
+            mode TEXT NOT NULL,
+            source_family TEXT,
+            started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at TIMESTAMPTZ,
+            status TEXT NOT NULL,
+            sources_seen INTEGER NOT NULL DEFAULT 0,
+            sources_imported INTEGER NOT NULL DEFAULT 0,
+            chunks_embedded INTEGER NOT NULL DEFAULT 0,
+            error TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    let pattern_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_programming_paradigms_slug ON programming_paradigms(slug)",
+        "CREATE INDEX IF NOT EXISTS idx_software_patterns_kind ON software_patterns(kind)",
+        "CREATE INDEX IF NOT EXISTS idx_software_patterns_category ON software_patterns(category)",
+        "CREATE INDEX IF NOT EXISTS idx_software_patterns_tags ON software_patterns USING gin(tags)",
+        "CREATE INDEX IF NOT EXISTS idx_spp_paradigm ON software_pattern_paradigms(paradigm_id)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_sps_identity ON software_pattern_sources(source_family, title, (COALESCE(url, '')))",
+        "CREATE INDEX IF NOT EXISTS idx_sps_family ON software_pattern_sources(source_family)",
+        "CREATE INDEX IF NOT EXISTS idx_sps_status ON software_pattern_sources(status)",
+        "CREATE INDEX IF NOT EXISTS idx_spsp_pattern ON software_pattern_source_patterns(pattern_id)",
+        "CREATE INDEX IF NOT EXISTS idx_spc_source ON software_pattern_chunks(source_id)",
+        "CREATE INDEX IF NOT EXISTS idx_spir_started ON software_pattern_import_runs(started_at DESC)",
+    ];
+
+    for idx_sql in &pattern_indexes {
+        sqlx::query(idx_sql).execute(pool).await?;
+    }
+
+    // The original oneTBB registry entry pointed at an Intel-hosted page that
+    // returned 403 to simple HTTP clients. Drop only the failed empty legacy row;
+    // successful/manual imports are left intact.
+    sqlx::query(
+        "DELETE FROM software_pattern_sources s
+         WHERE s.source_family = 'intel_onetbb'
+           AND s.url = 'https://www.intel.com/content/www/us/en/docs/onetbb/developer-guide-api-reference/2022-0/design-patterns.html'
+           AND s.status = 'failed'
+           AND s.content IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM software_pattern_chunks c WHERE c.source_id = s.id
+           )",
+    )
+    .execute(pool)
+    .await?;
+
+    ensure_software_pattern_hnsw_index(pool, vector_config).await?;
+
     Ok(())
 }
 
@@ -570,6 +719,51 @@ async fn ensure_git_commit_hnsw_index(
         .await?;
 
         tracing::info!("Git commit chunks HNSW index created/rebuilt");
+    }
+
+    Ok(())
+}
+
+/// Ensure HNSW index on software-pattern knowledge chunk embeddings.
+async fn ensure_software_pattern_hnsw_index(
+    pool: &PgPool,
+    config: &VectorConfig,
+) -> Result<(), sqlx::Error> {
+    let current_params = format!(
+        "m={},ef_construction={}",
+        config.hnsw_m, config.hnsw_ef_construction
+    );
+
+    let stored: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'software_pattern_hnsw_params'",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    let needs_rebuild = stored.as_deref() != Some(&current_params);
+
+    if needs_rebuild {
+        let _ = sqlx::query("DROP INDEX IF EXISTS idx_software_pattern_chunks_embedding")
+            .execute(pool)
+            .await;
+
+        let create_sql = format!(
+            "CREATE INDEX idx_software_pattern_chunks_embedding ON software_pattern_chunks \
+             USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
+            config.hnsw_m, config.hnsw_ef_construction
+        );
+        let _ = sqlx::query(&create_sql).execute(pool).await;
+
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value)
+             VALUES ('software_pattern_hnsw_params', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+
+        tracing::info!("Software pattern chunks HNSW index created/rebuilt");
     }
 
     Ok(())

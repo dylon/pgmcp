@@ -397,6 +397,128 @@ pub struct SearchCommitsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SoftwarePatternSearchParams {
+    #[schemars(description = "Design/problem query to match against the software pattern index")]
+    pub query: String,
+    #[schemars(description = "Maximum number of pattern matches to return (default: 10)")]
+    pub limit: Option<i32>,
+    #[schemars(description = "Filter to pattern or anti_pattern")]
+    pub kind: Option<String>,
+    #[schemars(
+        description = "Programming paradigms to target, e.g. object_oriented_programming, functional_programming, logic_programming, event_driven_programming, concurrent_programming, parallel_programming, aspect_oriented_programming"
+    )]
+    pub paradigms: Option<Vec<String>>,
+    #[schemars(
+        description = "Filter by pattern category, e.g. creational, behavioral, resilience"
+    )]
+    pub category: Option<String>,
+    #[schemars(description = "Filter by source family, e.g. wikipedia, oodesign, aws, aspectj")]
+    pub source_family: Option<String>,
+    #[schemars(
+        description = "Filter by source type, e.g. curated_card, article, manual, repository"
+    )]
+    pub source_type: Option<String>,
+    #[schemars(description = "Include source metadata and bounded excerpts (default: true)")]
+    pub include_sources: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecommendDesignPatternsParams {
+    #[schemars(description = "Feature or refactor task to design")]
+    pub task: String,
+    #[schemars(
+        description = "Target programming paradigms. If omitted, inferred from language/project."
+    )]
+    pub paradigms: Option<Vec<String>>,
+    #[schemars(description = "Implementation language, used for paradigm inference")]
+    pub language: Option<String>,
+    #[schemars(description = "Project name, used for dominant-language inference")]
+    pub project: Option<String>,
+    #[schemars(description = "Design constraints, risks, or preferences")]
+    pub constraints: Option<Vec<String>>,
+    #[schemars(description = "Maximum number of recommended patterns (default: 8)")]
+    pub limit: Option<i32>,
+    #[schemars(description = "Include anti-patterns to avoid (default: true)")]
+    pub include_antipatterns: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReviewDesignPatternsParams {
+    #[schemars(description = "Proposed design to review")]
+    pub design: String,
+    #[schemars(
+        description = "Target programming paradigms. If omitted, inferred from language/project."
+    )]
+    pub paradigms: Option<Vec<String>>,
+    #[schemars(description = "Implementation language, used for paradigm inference")]
+    pub language: Option<String>,
+    #[schemars(description = "Project name, used for dominant-language inference")]
+    pub project: Option<String>,
+    #[schemars(description = "Maximum number of findings/matches (default: 8)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetSoftwarePatternParams {
+    #[schemars(description = "Pattern slug or numeric id")]
+    pub slug_or_id: String,
+    #[schemars(description = "Include source metadata (default: true)")]
+    pub include_sources: Option<bool>,
+    #[schemars(description = "Include bounded source excerpts (default: false)")]
+    pub include_excerpts: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListSoftwarePatternsParams {
+    #[schemars(description = "Filter to pattern or anti_pattern")]
+    pub kind: Option<String>,
+    #[schemars(description = "Filter by paradigm slug or name")]
+    pub paradigm: Option<String>,
+    #[schemars(description = "Filter by category")]
+    pub category: Option<String>,
+    #[schemars(description = "Filter by source family")]
+    pub source_family: Option<String>,
+    #[schemars(description = "Maximum number of rows (default: 50)")]
+    pub limit: Option<i32>,
+    #[schemars(description = "Offset for pagination (default: 0)")]
+    pub offset: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RefreshPatternCatalogParams {
+    #[schemars(
+        description = "Refresh mode: seed_only, source_family, or all. seed_only embeds bundled cards; source_family/all fetch opted-in source URLs."
+    )]
+    pub mode: Option<String>,
+    #[schemars(description = "Source family to import when mode=source_family, e.g. oodesign")]
+    pub source_family: Option<String>,
+    #[schemars(description = "If true, report what would be imported without changing the DB")]
+    pub dry_run: Option<bool>,
+    #[schemars(description = "Maximum sources to import for this run")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UpsertPatternSourceParams {
+    #[schemars(description = "Existing pattern slug to attach this source to")]
+    pub pattern_slug: String,
+    #[schemars(description = "Source family label, e.g. local, team_wiki, oodesign")]
+    pub source_family: String,
+    #[schemars(description = "Source type, e.g. article, manual, snippet, repository")]
+    pub source_type: String,
+    #[schemars(description = "Source title")]
+    pub title: String,
+    #[schemars(description = "Optional source URL")]
+    pub url: Option<String>,
+    #[schemars(description = "Optional license/provenance label")]
+    pub license_label: Option<String>,
+    #[schemars(description = "Full text content to chunk and embed")]
+    pub content: String,
+    #[schemars(description = "Rebuild chunks/embeddings for this source (default: true)")]
+    pub reembed: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CompareFilesParams {
     #[schemars(description = "First file reference (project:relative_path or absolute path)")]
     pub file_a: String,
@@ -1345,6 +1467,16 @@ pub struct OrientParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MandateContextParams {
+    #[schemars(
+        description = "Project name (as shown by list_projects). Takes precedence over cwd."
+    )]
+    pub project: Option<String>,
+    #[schemars(description = "Working directory used to resolve the nearest indexed project.")]
+    pub cwd: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FileInfoParams {
     #[schemars(description = "Absolute path of the file")]
     pub path: String,
@@ -1487,6 +1619,22 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
             "orient",
             30,
             super::tools::tool_orient::tool_orient(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Return the effective workspace/project mandate bundle from existing AGENTS.md, CLAUDE.md, and project .pgmcp.toml sources. USE WHEN: starting non-trivial work, checking project rules, or wiring client hooks. MCP surfaces this context advisory-only; hard enforcement still belongs in client hooks, pre-push hooks, CI, or verification scripts."
+    )]
+    async fn mandate_context(
+        &self,
+        Parameters(params): Parameters<MandateContextParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("mandate_context");
+        timeout_wrap(
+            "mandate_context",
+            30,
+            super::tools::tool_mandate_context::tool_mandate_context(self.ctx(), params),
         )
         .await
     }
@@ -2131,6 +2279,141 @@ Requires per-project opt-in via [git] index_history = true in .pgmcp.toml.")]
             "search_commits",
             30,
             super::tools::tool_search_commits::tool_search_commits(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Semantic search over the dedicated software pattern and anti-pattern knowledge index. \
+USE WHEN: designing a feature/refactor and you want pattern candidates, anti-pattern warnings, or paradigm-specific design guidance. \
+DO NOT USE WHEN: searching indexed source files — use semantic_search/hybrid_search for code. \
+The pattern index is separate from file_chunks and includes locally imported full-text pattern documentation plus curated cards."
+    )]
+    async fn software_pattern_search(
+        &self,
+        Parameters(params): Parameters<SoftwarePatternSearchParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("software_pattern_search");
+        timeout_wrap(
+            "software_pattern_search",
+            30,
+            super::tools::tool_software_patterns::tool_software_pattern_search(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Recommend software design patterns and anti-patterns to avoid for a feature or refactor task. \
+USE WHEN: drafting an implementation plan and selecting an approach for a target paradigm. \
+Returns structured recommendations with source citations from the separate pattern knowledge index."
+    )]
+    async fn recommend_design_patterns(
+        &self,
+        Parameters(params): Parameters<RecommendDesignPatternsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("recommend_design_patterns");
+        timeout_wrap(
+            "recommend_design_patterns",
+            30,
+            super::tools::tool_software_patterns::tool_recommend_design_patterns(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Review a proposed design against the software pattern knowledge index. \
+USE WHEN: checking a plan for anti-pattern risks and better paradigm-specific alternatives before implementation."
+    )]
+    async fn review_design_patterns(
+        &self,
+        Parameters(params): Parameters<ReviewDesignPatternsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("review_design_patterns");
+        timeout_wrap(
+            "review_design_patterns",
+            30,
+            super::tools::tool_software_patterns::tool_review_design_patterns(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Fetch a full software pattern or anti-pattern card by slug or id, with source links and optional excerpts."
+    )]
+    async fn get_software_pattern(
+        &self,
+        Parameters(params): Parameters<GetSoftwarePatternParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("get_software_pattern");
+        timeout_wrap(
+            "get_software_pattern",
+            30,
+            super::tools::tool_software_patterns::tool_get_software_pattern(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List software patterns and anti-patterns by paradigm, kind, category, or source family."
+    )]
+    async fn list_software_patterns(
+        &self,
+        Parameters(params): Parameters<ListSoftwarePatternsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("list_software_patterns");
+        timeout_wrap(
+            "list_software_patterns",
+            30,
+            super::tools::tool_software_patterns::tool_list_software_patterns(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Pattern catalog statistics: paradigms, patterns, source families, chunks, and embedding status."
+    )]
+    async fn pattern_catalog_stats(&self) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("pattern_catalog_stats");
+        timeout_wrap(
+            "pattern_catalog_stats",
+            30,
+            super::tools::tool_software_patterns::tool_pattern_catalog_stats(self.ctx()),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Admin tool to seed, import, or re-embed the local full-text software pattern catalog. \
+mode=seed_only embeds bundled cards; mode=source_family imports one source family; mode=all imports all registered source URLs."
+    )]
+    async fn refresh_pattern_catalog(
+        &self,
+        Parameters(params): Parameters<RefreshPatternCatalogParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("refresh_pattern_catalog");
+        timeout_wrap(
+            "refresh_pattern_catalog",
+            120,
+            super::tools::tool_software_patterns::tool_refresh_pattern_catalog(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Admin tool to attach full-text local documentation or snippets to an existing software pattern and embed them."
+    )]
+    async fn upsert_pattern_source(
+        &self,
+        Parameters(params): Parameters<UpsertPatternSourceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("upsert_pattern_source");
+        timeout_wrap(
+            "upsert_pattern_source",
+            120,
+            super::tools::tool_software_patterns::tool_upsert_pattern_source(self.ctx(), params),
         )
         .await
     }
@@ -3019,8 +3302,17 @@ impl McpServer {
             "grep"                   => grep(GrepParams),
             "hybrid_search"          => hybrid_search(HybridSearchParams),
             "search_commits"         => search_commits(SearchCommitsParams),
+            // Pattern knowledge
+            "software_pattern_search"    => software_pattern_search(SoftwarePatternSearchParams),
+            "recommend_design_patterns"  => recommend_design_patterns(RecommendDesignPatternsParams),
+            "review_design_patterns"     => review_design_patterns(ReviewDesignPatternsParams),
+            "get_software_pattern"       => get_software_pattern(GetSoftwarePatternParams),
+            "list_software_patterns"     => list_software_patterns(ListSoftwarePatternsParams),
+            "refresh_pattern_catalog"    => refresh_pattern_catalog(RefreshPatternCatalogParams),
+            "upsert_pattern_source"      => upsert_pattern_source(UpsertPatternSourceParams),
             // File info
             "read_file"              => read_file(ReadFileParams),
+            "mandate_context"        => mandate_context(MandateContextParams),
             "project_tree"           => project_tree(ProjectTreeParams),
             "file_info"              => file_info(FileInfoParams),
             // Similarity
@@ -3062,6 +3354,7 @@ impl McpServer {
             "list_projects" => list_projects,
             "index_stats"   => index_stats,
             "reindex"       => reindex,
+            "pattern_catalog_stats" => pattern_catalog_stats,
         })
     }
 }
@@ -3081,7 +3374,7 @@ impl ServerHandler for McpServer {
         .with_server_info(Implementation::new("pgmcp", env!("CARGO_PKG_VERSION")))
         .with_instructions(
             "pgmcp indexes the user's development workspaces into PostgreSQL+pgvector and \
-             exposes ~63 tools for cross-project search, semantic queries, graph analysis, \
+             exposes ~72 tools for cross-project search, semantic queries, graph analysis, \
              code-health metrics, and recommendation-shaped refactoring actions.\n\n\
              USE THESE TOOLS BEFORE built-in Read/Grep/Glob when the question is conceptual \
              ('how does X work?'), cross-project ('does this pattern exist elsewhere?'), \
@@ -3090,8 +3383,10 @@ impl ServerHandler for McpServer {
              and for files just written this turn (not yet in the index).\n\n\
              FIRST STEP for unfamiliar codebases or non-trivial tasks: call `orient` — it \
              bundles project_tree, key entry points by PageRank, recently-changed files, \
-             top topics, and a `health` envelope into one call so you don't have to scatter \
-             across half a dozen tools to get oriented.\n\n\
+             top topics, mandate sources, and a `health` envelope into one call so you don't \
+             have to scatter across half a dozen tools to get oriented. Use `mandate_context` \
+             when you specifically need the effective AGENTS.md/CLAUDE.md/.pgmcp.toml bundle \
+             for a project or cwd.\n\n\
              The 'claude' project indexes ~/.claude/ — past Claude Code sessions, memory \
              files, plans. Use semantic_search or text_search with project: \"claude\" to \
              retrieve prior context, decisions, and plans.\n\n\
@@ -3101,7 +3396,8 @@ impl ServerHandler for McpServer {
              grep (regex across all indexed files), hybrid_search (BM25+vector RRF — best \
              for queries that benefit from both keyword and concept), search_commits (git \
              history semantic search; requires [git] index_history = true).\n\n\
-             READ/INVENTORY: read_file, file_info, list_projects, project_tree, index_stats.\n\n\
+             READ/INVENTORY: read_file, file_info, list_projects, project_tree, \
+             mandate_context, index_stats.\n\n\
              CROSS-PROJECT SIMILARITY: compare_files (real-time chunk-level), \
              find_similar_modules (materialized table), find_duplicates (union-find \
              clusters), refactoring_report (actionable extraction candidates).\n\n\
@@ -3199,6 +3495,11 @@ impl ServerHandler for McpServer {
                 RawResource::new("pgmcp://projects", "Indexed Projects")
                     .with_description("List of indexed projects (JSON)")
                     .no_annotation(),
+                RawResource::new("pgmcp://workspace/mandates", "Workspace Mandates")
+                    .with_description(
+                        "Effective workspace-level AGENTS.md/CLAUDE.md mandate sources (JSON)",
+                    )
+                    .no_annotation(),
             ],
             next_cursor: None,
             meta: None,
@@ -3217,6 +3518,9 @@ impl ServerHandler for McpServer {
                     .no_annotation(),
                 RawResourceTemplate::new("pgmcp://project/{name}/tree", "Project Tree")
                     .with_description("File tree for a project")
+                    .no_annotation(),
+                RawResourceTemplate::new("pgmcp://project/{name}/mandates", "Project Mandates")
+                    .with_description("Effective mandate bundle for a project")
                     .no_annotation(),
                 RawResourceTemplate::new("pgmcp://file/{path}", "File Content")
                     .with_description("Read an indexed file by relative path")
@@ -3258,11 +3562,48 @@ impl ServerHandler for McpServer {
                     request.uri.clone(),
                 )]));
             }
+            "pgmcp://workspace/mandates" => {
+                let config = self.config().load();
+                let bundle = crate::mandates::resolve_effective_mandates(&config, None);
+                let json = serde_json::to_string_pretty(&bundle)
+                    .map_err(|e| McpError::internal_error(format!("{}", e), None))?;
+                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    json,
+                    request.uri.clone(),
+                )]));
+            }
             _ => {}
         }
 
         // Templated resources
         if let Some(rest) = uri.strip_prefix("pgmcp://project/") {
+            if let Some(name) = rest.strip_suffix("/mandates") {
+                // pgmcp://project/{name}/mandates
+                let projects = self
+                    .db()
+                    .list_projects()
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("{}", e), None))?;
+                let project = projects.into_iter().find(|p| p.name == name);
+                match project {
+                    Some(p) => {
+                        let config = self.config().load();
+                        let bundle = crate::mandates::resolve_effective_mandates(&config, Some(&p));
+                        let json = serde_json::to_string_pretty(&bundle)
+                            .map_err(|e| McpError::internal_error(format!("{}", e), None))?;
+                        return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                            json,
+                            request.uri.clone(),
+                        )]));
+                    }
+                    None => {
+                        return Err(McpError::resource_not_found(
+                            format!("Project not found: {}", name),
+                            None,
+                        ));
+                    }
+                }
+            }
             if let Some(name) = rest.strip_suffix("/tree") {
                 // pgmcp://project/{name}/tree
                 let paths = self

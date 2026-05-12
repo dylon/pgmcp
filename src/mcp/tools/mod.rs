@@ -59,6 +59,7 @@ pub mod tool_hybrid_search;
 pub mod tool_index_stats;
 pub mod tool_internal_dry;
 pub mod tool_list_projects;
+pub mod tool_mandate_context;
 pub mod tool_merge_conflict_risk;
 pub mod tool_module_growth;
 pub mod tool_naming_consistency;
@@ -76,6 +77,7 @@ pub mod tool_reviewer_recommender;
 pub mod tool_search_commits;
 pub mod tool_semantic_search;
 pub mod tool_shotgun_surgery_fix;
+pub mod tool_software_patterns;
 pub mod tool_stale_zombie;
 pub mod tool_suggest_merges;
 pub mod tool_suggest_splits;
@@ -123,6 +125,7 @@ pub use tool_hybrid_search::tool_hybrid_search;
 pub use tool_index_stats::tool_index_stats;
 pub use tool_internal_dry::tool_internal_dry;
 pub use tool_list_projects::tool_list_projects;
+pub use tool_mandate_context::tool_mandate_context;
 pub use tool_merge_conflict_risk::tool_merge_conflict_risk;
 pub use tool_module_growth::tool_module_growth;
 pub use tool_naming_consistency::tool_naming_consistency;
@@ -140,6 +143,11 @@ pub use tool_reviewer_recommender::tool_reviewer_recommender;
 pub use tool_search_commits::tool_search_commits;
 pub use tool_semantic_search::tool_semantic_search;
 pub use tool_shotgun_surgery_fix::tool_shotgun_surgery_fix;
+pub use tool_software_patterns::{
+    tool_get_software_pattern, tool_list_software_patterns, tool_pattern_catalog_stats,
+    tool_recommend_design_patterns, tool_refresh_pattern_catalog, tool_review_design_patterns,
+    tool_software_pattern_search, tool_upsert_pattern_source,
+};
 pub use tool_stale_zombie::tool_stale_zombie;
 pub use tool_suggest_merges::tool_suggest_merges;
 pub use tool_suggest_splits::tool_suggest_splits;

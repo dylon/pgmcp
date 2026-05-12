@@ -14,10 +14,12 @@ mod fcm;
 mod graph;
 mod indexer;
 mod logging;
+mod mandates;
 mod mcp;
 #[allow(dead_code)]
 mod mmap_array;
 mod parsing;
+mod patterns;
 mod reactive;
 mod shutdown;
 mod stats;

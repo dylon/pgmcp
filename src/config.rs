@@ -953,6 +953,13 @@ impl Config {
             .filter(|p| p.is_dir())
     }
 
+    /// Return the `~/.codex/` directory if it exists.
+    pub fn codex_dir() -> Option<PathBuf> {
+        dirs::home_dir()
+            .map(|h| h.join(".codex"))
+            .filter(|p| p.is_dir())
+    }
+
     /// Upgrade an existing config file by merging new defaults while preserving
     /// user customizations. Returns the path that was written.
     pub fn upgrade(path: Option<&Path>) -> Result<PathBuf> {

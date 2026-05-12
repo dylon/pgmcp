@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 pub mod client;
 pub mod migrations;
+pub mod patterns;
 #[allow(dead_code)]
 pub mod pool;
 #[allow(dead_code)]

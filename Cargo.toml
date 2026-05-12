@@ -8,7 +8,7 @@ members = [".", "pgmcp-testing"]
 name = "pgmcp"
 version = "0.1.0"
 edition = "2024"
-description = "PostgreSQL + pgvector MCP File Indexer for Claude Code"
+description = "PostgreSQL + pgvector MCP File Indexer for Claude Code and Codex"
 license = "Apache-2.0"
 
 # CUDA is a mandatory dependency. The daemon is split into a CUDA backend
@@ -42,6 +42,8 @@ candle-transformers = { version = "=0.10.2", default-features = false, features 
 tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 safetensors = "0.7"
 hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
+ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }
+sha2 = "0.10"
 
 # Filesystem
 notify = "7"

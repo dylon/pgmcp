@@ -157,6 +157,8 @@ pub async fn tool_orient(
     let phase_label = ctx.lifecycle().current().label();
     let graph_stale = entry_points.is_empty() && project.file_count.unwrap_or(0) > 0;
     let topics_stale = topics.is_empty();
+    let config = ctx.config().load();
+    let mandates = crate::mandates::resolve_effective_mandates(&config, Some(&project));
 
     let body = json!({
         "found": true,
@@ -186,6 +188,7 @@ pub async fn tool_orient(
             "keywords": t.keywords.as_ref().map(|k| &k.0),
             "member_count": t.member_count,
         })).collect::<Vec<_>>(),
+        "mandates": crate::mandates::compact_sources(&mandates),
         "health": {
             "phase": phase_label,
             "graph_stale": graph_stale,

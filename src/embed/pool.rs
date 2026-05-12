@@ -408,7 +408,7 @@ fn process_index_file_task(
     use chrono::{DateTime, Utc};
     use xxhash_rust::xxh3::xxh3_64;
 
-    use crate::indexer::{chunker, claude_chunker};
+    use crate::indexer::{chunker, claude_chunker, codex_chunker};
 
     let path = task.path;
     let path_str = path.to_string_lossy().into_owned();
@@ -604,6 +604,8 @@ fn process_index_file_task(
     // Chunk content with the language-appropriate chunker.
     let chunks = if &*language == "jsonl" && claude_chunker::is_claude_session_transcript(&path) {
         claude_chunker::chunk_claude_jsonl(&content)
+    } else if &*language == "jsonl" && codex_chunker::is_codex_jsonl(&path) {
+        codex_chunker::chunk_codex_jsonl(&content)
     } else if &*language == "jsonl" {
         chunker::chunk_jsonl_content(&content)
     } else {

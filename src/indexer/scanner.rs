@@ -2,7 +2,8 @@
 //!
 //! Discovers project roots via .git/ directory heuristic.
 //! Respects .gitignore files.
-//! Auto-discovers `~/.claude/` as a synthetic "claude" project.
+//! Auto-discovers agent homes such as `~/.claude/` and `~/.codex/` as
+//! synthetic projects.
 
 use std::path::{Path, PathBuf};
 
@@ -33,7 +34,7 @@ const CLAUDE_DIR_EXCLUDES: &[&str] = &[
 ];
 
 /// Scan all configured workspace paths and submit files for indexing.
-/// Also auto-discovers `~/.claude/` if it exists.
+/// Also auto-discovers `~/.claude/` and `~/.codex/` if they exist.
 pub fn scan_workspaces(
     config: &Config,
     file_tx: Sender<PathBuf>,
@@ -92,6 +93,24 @@ pub fn scan_workspaces(
         );
 
         scan_claude_dir(&claude_dir, &claude_path_str, config, &file_tx);
+    }
+
+    // Auto-discover ~/.codex/ if it exists. Codex contains credentials,
+    // sqlite state, caches, and shell snapshots, so this path is allow-listed
+    // instead of broadly indexing every configured extension.
+    if let Some(codex_dir) = Config::codex_dir() {
+        let codex_path_str = codex_dir.to_string_lossy().into_owned();
+        info!(path = %codex_path_str, "Auto-discovered ~/.codex/ directory");
+
+        project_roots.insert(
+            codex_dir.clone(),
+            ProjectRoot {
+                workspace_path: codex_path_str.clone(),
+                name: "codex".into(),
+            },
+        );
+
+        scan_codex_dir(&codex_dir, &codex_path_str, config, &file_tx);
     }
 }
 
@@ -280,6 +299,87 @@ fn scan_claude_dir(
     info!(files = count, path = %workspace_path, "Scanned ~/.claude/ directory");
 }
 
+/// Scan `~/.codex/` with an allow-list. Unlike `~/.claude/`, Codex keeps
+/// auth material, sqlite state, logs, shell snapshots, and plugin checkouts
+/// directly under its home directory.
+fn scan_codex_dir(
+    codex_dir: &Path,
+    workspace_path: &str,
+    config: &Config,
+    file_tx: &Sender<PathBuf>,
+) {
+    let mut builder = WalkBuilder::new(codex_dir);
+    builder.hidden(false);
+    builder.git_ignore(false);
+    builder.git_global(false);
+    builder.git_exclude(false);
+
+    let mut count: u64 = 0;
+
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "Error walking ~/.codex/");
+                continue;
+            }
+        };
+
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        if !should_index_codex_file(codex_dir, path, config) {
+            continue;
+        }
+
+        if file_tx.send(path.to_path_buf()).is_err() {
+            break;
+        }
+        count += 1;
+    }
+
+    info!(files = count, path = %workspace_path, "Scanned ~/.codex/ directory");
+}
+
+fn should_index_codex_file(codex_dir: &Path, path: &Path, config: &Config) -> bool {
+    let relative = path.strip_prefix(codex_dir).unwrap_or(path);
+
+    if !codex_relative_path_allowed(relative) {
+        return false;
+    }
+
+    if !config.indexer.is_configured_extension(path) {
+        return false;
+    }
+
+    let path_str = path.to_string_lossy();
+    !config.indexer.exclude_patterns.iter().any(|pattern| {
+        if let Some(suffix) = pattern.strip_prefix('*') {
+            path_str.ends_with(suffix)
+        } else {
+            path_str.contains(pattern)
+        }
+    })
+}
+
+fn codex_relative_path_allowed(relative: &Path) -> bool {
+    if relative == Path::new("config.toml") || relative == Path::new("history.jsonl") {
+        return true;
+    }
+
+    match relative.components().next() {
+        Some(std::path::Component::Normal(component)) if component.to_str() == Some("sessions") => {
+            relative.extension().and_then(|e| e.to_str()) == Some("jsonl")
+        }
+        Some(std::path::Component::Normal(component)) if component.to_str() == Some("memories") => {
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Find the project root for a given file path.
 pub fn find_project_root<'a>(
     path: &Path,
@@ -300,4 +400,48 @@ pub fn find_project_root<'a>(
 pub struct ProjectRoot {
     pub workspace_path: String,
     pub name: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_allowlist_includes_config_history_sessions_and_memories() {
+        let config = Config::default();
+        let codex_dir = Path::new("/home/user/.codex");
+
+        for path in [
+            "/home/user/.codex/config.toml",
+            "/home/user/.codex/history.jsonl",
+            "/home/user/.codex/sessions/2026/05/12/rollout.jsonl",
+            "/home/user/.codex/memories/project.md",
+        ] {
+            assert!(
+                should_index_codex_file(codex_dir, Path::new(path), &config),
+                "expected Codex scanner to include {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_allowlist_excludes_secrets_state_cache_and_snapshots() {
+        let config = Config::default();
+        let codex_dir = Path::new("/home/user/.codex");
+
+        for path in [
+            "/home/user/.codex/auth.json",
+            "/home/user/.codex/state_5.sqlite",
+            "/home/user/.codex/log/codex-tui.log",
+            "/home/user/.codex/cache/tool.json",
+            "/home/user/.codex/tmp/plugins/README.md",
+            "/home/user/.codex/shell_snapshots/snapshot.sh",
+            "/home/user/.codex/sessions/2026/05/12/notes.md",
+        ] {
+            assert!(
+                !should_index_codex_file(codex_dir, Path::new(path), &config),
+                "expected Codex scanner to exclude {path}"
+            );
+        }
+    }
 }

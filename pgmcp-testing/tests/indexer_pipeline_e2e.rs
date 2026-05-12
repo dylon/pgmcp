@@ -539,6 +539,79 @@ async fn process_file_claude_jsonl_routes_through_claude_chunker() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn process_file_codex_jsonl_routes_through_codex_chunker() {
+    let testdb = require_test_db!();
+    let workdir = TempDir::new().expect("tempdir");
+    let codex_dir = workdir.path().join(".codex/sessions/2026/05/12");
+    std::fs::create_dir_all(&codex_dir).expect("mkdir");
+    let file_path = codex_dir.join("rollout.jsonl");
+    std::fs::write(
+        &file_path,
+        "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"hello codex\"}]}}\n\
+         {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hi codex\"}]}}\n",
+    )
+    .expect("write");
+
+    let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
+    let project_id = seed_project(testdb.pool(), workdir.path().to_str().unwrap()).await;
+    let (embed_tx, embed_rx): (Sender<EmbedIndexRequest>, _) = crossbeam_channel::unbounded();
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let drain = spawn_embed_drain(embed_rx, backend);
+    let stats = StatsTracker::new();
+    let config = default_config();
+
+    process_file(
+        &file_path,
+        project_id,
+        workdir.path().to_str().unwrap(),
+        &config,
+        &db,
+        &embed_tx,
+        &stats,
+        None,
+    )
+    .await
+    .expect("process_file");
+
+    let pool = testdb.pool().clone();
+    let path_str = file_path.to_string_lossy().into_owned();
+    wait_for(
+        || {
+            let pool = pool.clone();
+            let path = path_str.clone();
+            async move {
+                let row: Option<(i64,)> = sqlx::query_as(
+                    "SELECT id FROM indexed_files WHERE path = $1 AND content_hash IS NOT NULL",
+                )
+                .bind(&path)
+                .fetch_optional(&pool)
+                .await
+                .expect("q");
+                row.is_some()
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let chunks: Vec<(String,)> = sqlx::query_as(
+        "SELECT c.content FROM file_chunks c \
+         JOIN indexed_files f ON f.id = c.file_id WHERE f.path = $1 \
+         ORDER BY c.chunk_index",
+    )
+    .bind(&path_str)
+    .fetch_all(testdb.pool())
+    .await
+    .expect("chunks");
+    assert_eq!(chunks.len(), 2);
+    assert!(chunks[0].0.starts_with("[user]"));
+    assert!(chunks[1].0.starts_with("[assistant]"));
+
+    drop(embed_tx);
+    let _ = drain.await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn process_file_concurrent_on_distinct_paths_no_deadlock() {
     let testdb = require_test_db!();
     let workdir = TempDir::new().expect("tempdir");

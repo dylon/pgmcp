@@ -147,9 +147,23 @@ fn list_tools(tools: &[rmcp::model::Tool]) {
             ],
         ),
         (
+            "Pattern Knowledge",
+            &[
+                "software_pattern_search",
+                "recommend_design_patterns",
+                "review_design_patterns",
+                "get_software_pattern",
+                "list_software_patterns",
+                "pattern_catalog_stats",
+                "refresh_pattern_catalog",
+                "upsert_pattern_source",
+            ],
+        ),
+        (
             "File Info",
             &[
                 "read_file",
+                "mandate_context",
                 "project_tree",
                 "file_info",
                 "list_projects",

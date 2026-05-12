@@ -67,6 +67,7 @@ fn main() {
     let status = std::process::Command::new("nvcc")
         .args([
             "-ptx",
+            "-std=c++20",
             "--gpu-architecture=compute_89",
             "-O3",
             "--use_fast_math",

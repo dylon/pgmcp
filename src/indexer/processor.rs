@@ -11,7 +11,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::config::Config;
 use crate::db::DbClient;
 use crate::embed::pool::{ChunkData, EmbedIndexRequest, EmbedRequest};
-use crate::indexer::{chunker, claude_chunker};
+use crate::indexer::{chunker, claude_chunker, codex_chunker};
 use crate::stats::tracker::StatsTracker;
 
 /// Process a single file: read, hash, check if changed, chunk, embed, upsert.
@@ -159,6 +159,8 @@ pub async fn process_file(
     // Chunk the content, routing to the appropriate chunker
     let chunks = if &*language == "jsonl" && claude_chunker::is_claude_session_transcript(path) {
         claude_chunker::chunk_claude_jsonl(&content)
+    } else if &*language == "jsonl" && codex_chunker::is_codex_jsonl(path) {
+        codex_chunker::chunk_codex_jsonl(&content)
     } else if &*language == "jsonl" {
         chunker::chunk_jsonl_content(&content)
     } else {
