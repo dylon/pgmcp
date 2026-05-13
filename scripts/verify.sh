@@ -30,6 +30,23 @@ if ! command -v nvcc >/dev/null 2>&1; then
     exit 2
 fi
 
+# Host-compiler preflight. cudaforge passes NVCC_CCBIN to nvcc -ccbin; the
+# .cargo/config.toml force-pins it to g++-14. Verify the binary actually
+# exists and is GCC 14.x — a missing or wrong-version ccbin would otherwise
+# explode inside Gate 2 with a wall of unrelated <functional> template errors.
+if ! command -v g++-14 >/dev/null 2>&1; then
+    echo "verify.sh: g++-14 not found on PATH. CUDA 12.x nvcc cannot use" >&2
+    echo "  the system g++ (>= 15 ships C++23 headers nvcc can't parse)." >&2
+    echo "  Arch:   pacman -S gcc14" >&2
+    echo "  Debian: apt install g++-14" >&2
+    exit 2
+fi
+ccbin_major=$(g++-14 -dumpversion | cut -d. -f1)
+if [ "${ccbin_major}" != "14" ]; then
+    echo "verify.sh: g++-14 reports version ${ccbin_major}.x, expected 14.x" >&2
+    exit 2
+fi
+
 run_gate() {
     local name="$1"; shift
     local start

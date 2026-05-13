@@ -88,6 +88,8 @@ pub struct PatternCatalogStats {
     pub paradigms: i64,
     pub patterns: i64,
     pub anti_patterns: i64,
+    pub principles: i64,
+    pub code_smells: i64,
     pub sources: i64,
     pub chunks: i64,
     pub chunks_missing_embeddings: i64,
@@ -571,6 +573,14 @@ pub async fn catalog_stats(pool: &PgPool) -> Result<PatternCatalogStats, sqlx::E
         sqlx::query_scalar("SELECT COUNT(*) FROM software_patterns WHERE kind = 'anti_pattern'")
             .fetch_one(pool)
             .await?;
+    let principles =
+        sqlx::query_scalar("SELECT COUNT(*) FROM software_patterns WHERE kind = 'principle'")
+            .fetch_one(pool)
+            .await?;
+    let code_smells =
+        sqlx::query_scalar("SELECT COUNT(*) FROM software_patterns WHERE kind = 'code_smell'")
+            .fetch_one(pool)
+            .await?;
     let sources = sqlx::query_scalar("SELECT COUNT(*) FROM software_pattern_sources")
         .fetch_one(pool)
         .await?;
@@ -597,6 +607,8 @@ pub async fn catalog_stats(pool: &PgPool) -> Result<PatternCatalogStats, sqlx::E
         paradigms,
         patterns,
         anti_patterns,
+        principles,
+        code_smells,
         sources,
         chunks,
         chunks_missing_embeddings,

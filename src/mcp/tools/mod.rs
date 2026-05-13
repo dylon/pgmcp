@@ -76,6 +76,7 @@ pub mod tool_reindex;
 pub mod tool_reviewer_recommender;
 pub mod tool_search_commits;
 pub mod tool_semantic_search;
+pub mod tool_session_mandates;
 pub mod tool_shotgun_surgery_fix;
 pub mod tool_software_patterns;
 pub mod tool_stale_zombie;

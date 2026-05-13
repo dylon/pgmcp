@@ -1474,6 +1474,46 @@ pub struct MandateContextParams {
     pub project: Option<String>,
     #[schemars(description = "Working directory used to resolve the nearest indexed project.")]
     pub cwd: Option<String>,
+    #[schemars(
+        description = "Session UUID. If supplied, response includes active session mandates and any promoted durable mandates for the resolved project."
+    )]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionMandatesParams {
+    #[schemars(description = "Session UUID. Either session_id or cwd must be supplied.")]
+    pub session_id: Option<String>,
+    #[schemars(
+        description = "Working directory; returns mandates from any session matching this cwd."
+    )]
+    pub cwd: Option<String>,
+    #[schemars(description = "Status filter: 'active' (default), 'all', 'promoted', 'retired'.")]
+    pub status: Option<String>,
+    #[schemars(description = "Max rows (1..=100, default 20).")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PromoteSessionMandateParams {
+    #[schemars(description = "session_mandates.id of the row to promote.")]
+    pub mandate_id: i64,
+    #[schemars(
+        description = "Target scope: 'project' (per-project rule) or 'workspace' (cross-project)."
+    )]
+    pub scope: String,
+    #[schemars(
+        description = "Project id to attach the promoted mandate to. Required when scope='project'."
+    )]
+    pub project_id: Option<i32>,
+    #[schemars(
+        description = "If true, also append the imperative under a marker section in the appropriate CLAUDE.md / AGENTS.md / .pgmcp.toml. Default false (DB-only)."
+    )]
+    pub write_to_file: Option<bool>,
+    #[schemars(
+        description = "Optional explicit file path to write to. If omitted, the handler picks CLAUDE.md / AGENTS.md per scope."
+    )]
+    pub target_file: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1624,7 +1664,7 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
     }
 
     #[tool(
-        description = "Return the effective workspace/project mandate bundle from existing AGENTS.md, CLAUDE.md, and project .pgmcp.toml sources. USE WHEN: starting non-trivial work, checking project rules, or wiring client hooks. MCP surfaces this context advisory-only; hard enforcement still belongs in client hooks, pre-push hooks, CI, or verification scripts."
+        description = "Return the effective workspace/project mandate bundle from existing AGENTS.md, CLAUDE.md, and project .pgmcp.toml sources. USE WHEN: starting non-trivial work, checking project rules, or wiring client hooks. MCP surfaces this context advisory-only; hard enforcement still belongs in client hooks, pre-push hooks, CI, or verification scripts. If `session_id` is supplied, the response also includes any active session-scoped mandates and durable mandates promoted for the resolved project."
     )]
     async fn mandate_context(
         &self,
@@ -1635,6 +1675,38 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
             "mandate_context",
             30,
             super::tools::tool_mandate_context::tool_mandate_context(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List session-scoped mandates extracted from prompts via the UserPromptSubmit hook. Provide either session_id (preferred) or cwd. Returns active mandates by default; pass status='all' for history."
+    )]
+    async fn session_mandates(
+        &self,
+        Parameters(params): Parameters<SessionMandatesParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("session_mandates");
+        timeout_wrap(
+            "session_mandates",
+            30,
+            super::tools::tool_session_mandates::tool_session_mandates(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Promote a session_mandates row to durable scope. scope='project' requires project_id. Inserts into durable_mandates; if write_to_file=true and target_file is supplied, appends the imperative under a marker section in that file (idempotent)."
+    )]
+    async fn promote_session_mandate(
+        &self,
+        Parameters(params): Parameters<PromoteSessionMandateParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.stats().record_tool_call("promote_session_mandate");
+        timeout_wrap(
+            "promote_session_mandate",
+            30,
+            super::tools::tool_session_mandates::tool_promote_session_mandate(self.ctx(), params),
         )
         .await
     }
@@ -2394,9 +2466,14 @@ mode=seed_only embeds bundled cards; mode=source_family imports one source famil
         Parameters(params): Parameters<RefreshPatternCatalogParams>,
     ) -> Result<CallToolResult, McpError> {
         self.stats().record_tool_call("refresh_pattern_catalog");
+        // mode=all touches ~50 registered source families; each fetches an
+        // article body over HTTP and re-embeds 10-30 chunks. A 10-minute
+        // ceiling accommodates that without leaving the call open forever.
+        // Per-source progress is committed independently, so a timeout still
+        // preserves what landed before the deadline.
         timeout_wrap(
             "refresh_pattern_catalog",
-            120,
+            600,
             super::tools::tool_software_patterns::tool_refresh_pattern_catalog(self.ctx(), params),
         )
         .await
@@ -2410,9 +2487,11 @@ mode=seed_only embeds bundled cards; mode=source_family imports one source famil
         Parameters(params): Parameters<UpsertPatternSourceParams>,
     ) -> Result<CallToolResult, McpError> {
         self.stats().record_tool_call("upsert_pattern_source");
+        // Single-source manual ingestion: 5 minutes covers very large pasted
+        // bodies (entire books, RFCs) and the per-chunk embedding loop.
         timeout_wrap(
             "upsert_pattern_source",
-            120,
+            300,
             super::tools::tool_software_patterns::tool_upsert_pattern_source(self.ctx(), params),
         )
         .await
@@ -3310,6 +3389,9 @@ impl McpServer {
             "list_software_patterns"     => list_software_patterns(ListSoftwarePatternsParams),
             "refresh_pattern_catalog"    => refresh_pattern_catalog(RefreshPatternCatalogParams),
             "upsert_pattern_source"      => upsert_pattern_source(UpsertPatternSourceParams),
+            // Session-level mandates
+            "session_mandates"           => session_mandates(SessionMandatesParams),
+            "promote_session_mandate"    => promote_session_mandate(PromoteSessionMandateParams),
             // File info
             "read_file"              => read_file(ReadFileParams),
             "mandate_context"        => mandate_context(MandateContextParams),

@@ -1,6 +1,20 @@
+# CUDA host compiler pin. GCC 16+ <functional> uses C++23 explicit-object-
+# parameter ("this Self&& self") syntax that nvcc 12.x cannot parse, so the
+# candle-kernels build (via cudaforge -> nvcc moe_wmma*.cu) fails against
+# the system g++. We pin to g++-14, the highest CUDA-12-supported host
+# compiler. `force = true` is REQUIRED: Cargo's [env] is non-forcing by
+# default, and a developer-exported NVCC_CCBIN (e.g. /usr/bin/g++ from a
+# different repo's tooling) would otherwise silently shadow this value and
+# resurrect the build break. Do not remove without first verifying that
+# every transitive .cu compile succeeds against the default host g++.
+#
+# CUDA_COMPUTE_CAP is also forced for symmetry: pgmcp's own build.rs
+# hardcodes compute_89 (RTX 4060 Ti Ada Lovelace); a stale value in a
+# developer shell would silently mis-target candle's kernels while pgmcp's
+# own PTX stays at 89.
 [env]
-NVCC_CCBIN = "g++-14"
-CUDA_COMPUTE_CAP = "89"
+NVCC_CCBIN = { value = "g++-14", force = true }
+CUDA_COMPUTE_CAP = { value = "89", force = true }
 
 [alias]
 # Convenience wrappers for individual verification gates. The full verify

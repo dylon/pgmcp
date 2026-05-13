@@ -30,7 +30,7 @@ rmcp = { version = "1.1", features = ["server", "transport-io", "transport-strea
 schemars = "1.0"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid"] }
 pgvector = { version = "0.4", features = ["sqlx"] }
 
 # Embeddings — direct candle stack. Pure Rust BERT inference; uses cudarc
@@ -43,6 +43,10 @@ tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 safetensors = "0.7"
 hf-hub = { version = "0.4", default-features = false, features = ["rustls-tls", "ureq"] }
 ureq = { version = "2.12", default-features = false, features = ["tls", "json"] }
+# Used by refresh_pattern_catalog's source-fetch path. ureq 2.x is HTTP/1.1
+# only, but many indexed sources (Wikipedia, AWS, Microsoft Learn, arXiv)
+# serve HTTP/2 exclusively and truncate responses to non-HTTP/2 clients.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "gzip", "brotli", "blocking", "json"] }
 sha2 = "0.10"
 
 # Filesystem
@@ -85,7 +89,7 @@ thiserror = "2"
 anyhow = "1"
 regex = "1"
 libc = "0.2"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.9"
 ndarray = { version = "0.16", features = ["blas", "serde"] }
 petgraph = "0.7"

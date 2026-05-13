@@ -41,6 +41,58 @@ could be plugged in without feature gates.
 
 There is no `cuda` cargo feature. `Cargo.toml` has no `[features]` table.
 
+## Session-level mandates (`src/sessions.rs`)
+
+pgmcp observes user prompts via the UserPromptSubmit hook
+(`~/.claude/hooks/pgmcp-rag.sh` POSTs `{session_id, cwd, prompt}` to
+`POST /api/session/observe`) and extracts imperative directives with a
+tiered heuristic regex pipeline calibrated against the user's actual
+prompt history. Extracted mandates are persisted by session_id with 12
+polarities (always/never/prefer/avoid/remember/from_now_on/correction/
+permission/constraint/mandate/process_rule/project_rule) and re-injected
+on every subsequent prompt as `additionalContext` to alleviate the LLM's
+short-term-memory problem.
+
+The agent can introspect via the `session_mandates` MCP tool and promote
+a session mandate to durable scope via `promote_session_mandate`
+(inserts into `durable_mandates`; with `write_to_file=true`, appends to
+the named target file under a `## Promoted session mandates (pgmcp)`
+marker section, idempotent on re-run).
+
+Prompts are persisted locally in `session_prompts` (sha256-deduped,
+embedded for cross-session retrieval); same privacy posture as
+`file_chunks` — purely local, no remote shipping.
+
+## Software pattern catalog (`src/patterns/`)
+
+The curated catalog ships ~810 entries across 14 paradigms in 21 per-family
+files: `gof`, `solid_grasp`, `principles`, `functional`, `concurrency`,
+`architecture`, `declarative`, `anti_patterns`, `code_smells`, `security`,
+`testing`, `idioms`, `aop`, `observability`, `deployment`,
+`data_engineering`, `api_design`, `ml_ai`, `distributed_data`,
+`kubernetes`, and `sources` (registry). `kind` is constrained to
+`pattern | anti_pattern | principle | code_smell`. `mod.rs` exposes the
+`pat(...)` helper and assembles `pattern_seeds()`. To add a new pattern,
+append a `pat(...)` call to the appropriate per-family file; referential
+integrity tests in `mod.rs` automatically check slug/paradigm/source/kind
+consistency. The current embedding signature is
+`pgmcp-pattern-embedding-v3`; bump it whenever seed prose changes so
+existing installs re-embed cleanly.
+
+## CUDA host compiler pin (`.cargo/config.toml`)
+
+The CUDA host compiler is force-pinned to `g++-14` via `.cargo/config.toml`
+(`NVCC_CCBIN = { value = "g++-14", force = true }`) because GCC 15+ ships
+C++23 `<functional>` (explicit object parameters / "deducing this") that
+`nvcc` 12.x cannot parse. Without the pin, the `candle-kernels` transitive
+build (via `cudaforge` → `nvcc moe_wmma*.cu`) explodes against the system
+g++. `force = true` is required because Cargo's `[env]` is non-forcing by
+default — a developer-exported `NVCC_CCBIN` would otherwise silently
+shadow the project setting and resurrect the build break. Do not remove
+the pin or `force = true` without verifying every transitive `.cu` compile
+against your system g++. `scripts/verify.sh` preflights for `g++-14` so
+misconfigured hosts fail fast with a clear message instead of in Gate 2.
+
 ## Architecture: the FCM backend trait
 
 Swappable compute paths live behind `src/fcm::FcmBackend`. Closed

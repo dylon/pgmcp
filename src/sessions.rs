@@ -1,0 +1,1321 @@
+//! Session-level mandate observation, extraction, and persistence.
+//!
+//! This module mirrors `src/mandates.rs` (file-backed workspace/project
+//! mandates) but for *session* scope — short-term, mid-conversation
+//! standing directives extracted from user prompts and re-injected as
+//! `additionalContext` to combat the LLM's short-term-memory problem.
+//!
+//! The extractor is a tiered heuristic regex pipeline calibrated against
+//! the user's actual Claude+Codex history (see plan file for the
+//! empirical mining methodology). It is intentionally LLM-free so it can
+//! run in-hook on every prompt without external dependencies.
+
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
+use chrono::{DateTime, Utc};
+use pgvector::Vector;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use sqlx::PgPool;
+use uuid::Uuid;
+
+// ============================================================================
+// Public types
+// ============================================================================
+
+/// 12 polarities derived from corpus mining of the user's prompt history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MandatePolarity {
+    /// Universal positive directive (`regardless`, `every time`).
+    Always,
+    /// Universal negation with standing-scope gate (`never X again`).
+    Never,
+    /// Preference between alternatives (`prefer X over Y`, `instead of`).
+    Prefer,
+    /// Specific thing to dodge (`avoid`, `try not to`, `no need`).
+    Avoid,
+    /// Habitual reminder (`remember to`, `make sure`, `be sure`).
+    Remember,
+    /// Temporal scope (`anytime you`, `in the future`, `next time`).
+    FromNowOn,
+    /// Negative reprimand surfacing an existing rule (`I told you`, `again?!`).
+    Correction,
+    /// Approval-gated rule (`without my approval`, `unless I explicitly`).
+    Permission,
+    /// Structural impossibility (`cannot`, `not allowed`, `forbidden`).
+    Constraint,
+    /// Explicit rule flag (`must`, `non-negotiable`, `golden rule`).
+    Mandate,
+    /// Step-order rule (`always X before Y`).
+    ProcessRule,
+    /// Project-scoped rule (`in this project`, `for this repo`).
+    ProjectRule,
+}
+
+impl MandatePolarity {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Never => "never",
+            Self::Prefer => "prefer",
+            Self::Avoid => "avoid",
+            Self::Remember => "remember",
+            Self::FromNowOn => "from_now_on",
+            Self::Correction => "correction",
+            Self::Permission => "permission",
+            Self::Constraint => "constraint",
+            Self::Mandate => "mandate",
+            Self::ProcessRule => "process_rule",
+            Self::ProjectRule => "project_rule",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "always" => Some(Self::Always),
+            "never" => Some(Self::Never),
+            "prefer" => Some(Self::Prefer),
+            "avoid" => Some(Self::Avoid),
+            "remember" => Some(Self::Remember),
+            "from_now_on" => Some(Self::FromNowOn),
+            "correction" => Some(Self::Correction),
+            "permission" => Some(Self::Permission),
+            "constraint" => Some(Self::Constraint),
+            "mandate" => Some(Self::Mandate),
+            "process_rule" => Some(Self::ProcessRule),
+            "project_rule" => Some(Self::ProjectRule),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum CueTier {
+    F,
+    E,
+    D,
+    C,
+    B,
+    A,
+}
+
+impl CueTier {
+    pub fn as_char(self) -> char {
+        match self {
+            Self::A => 'A',
+            Self::B => 'B',
+            Self::C => 'C',
+            Self::D => 'D',
+            Self::E => 'E',
+            Self::F => 'F',
+        }
+    }
+    /// Used by SessionMandate consumers that need to compare row tiers
+    /// (e.g. the cron refinement pass). Not yet called from the bin path.
+    #[allow(dead_code)]
+    pub fn from_char(c: char) -> Self {
+        match c {
+            'A' => Self::A,
+            'B' => Self::B,
+            'C' => Self::C,
+            'E' => Self::E,
+            'F' => Self::F,
+            _ => Self::D,
+        }
+    }
+}
+
+/// Status taxonomy persisted in `session_mandates.status`. The MCP / REST
+/// surface treats the column as a string today; this enum is exposed for
+/// callers that want strongly-typed status handling (cron refinement,
+/// integration tests).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MandateStatus {
+    Active,
+    Superseded,
+    Retired,
+    Promoted,
+}
+
+impl MandateStatus {
+    #[allow(dead_code)]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Superseded => "superseded",
+            Self::Retired => "retired",
+            Self::Promoted => "promoted",
+        }
+    }
+}
+
+/// One mandate as extracted from a prompt (no DB id; pre-persistence).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ExtractedMandate {
+    pub polarity: MandatePolarity,
+    pub imperative: String,
+    pub target: Option<String>,
+    pub cwd_prefix: Option<String>,
+    pub cue_tier: CueTier,
+    pub salience: f32,
+}
+
+/// One persisted session mandate.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct SessionMandate {
+    pub id: i64,
+    pub session_id: Uuid,
+    pub source_prompt_id: i64,
+    pub polarity: String,
+    pub imperative: String,
+    pub target: Option<String>,
+    pub cwd_prefix: Option<String>,
+    pub cue_tier: String,
+    pub salience: f32,
+    pub status: String,
+    pub created_at: DateTime<Utc>,
+    pub last_reinforced_at: DateTime<Utc>,
+    pub reinforcement_count: i32,
+}
+
+/// One promoted (durable) mandate.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct DurableMandate {
+    pub id: i64,
+    pub scope: String,
+    pub project_id: Option<i32>,
+    pub polarity: String,
+    pub imperative: String,
+    pub target: Option<String>,
+    pub source_mandate_id: Option<i64>,
+    pub promoted_at: DateTime<Utc>,
+    pub file_path: Option<String>,
+}
+
+// ============================================================================
+// Tiered cue table (empirically calibrated)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy)]
+struct Cue {
+    pattern: &'static str,
+    polarity: MandatePolarity,
+    tier: CueTier,
+    prior_weight: f32,
+    requires_gate: bool,
+}
+
+const CUES: &[Cue] = &[
+    // ---------- Tier A: strong, self-standing ----------
+    Cue {
+        pattern: r"(?i)\bnever\s+(?:do|make|change|modify|revert|destroy|clobber|reset|stash|amend|force.?push|skip|hide|discard|gloss|hand.?wave|fudge|hack|second.?guess|disable|delete|push|commit|merge|use|run|include|admit|forget|accept|leave|stop|panic|hardcode|hard.?code|assume|guess|fabricate|hallucinate|ad.?hoc)\b",
+        polarity: MandatePolarity::Never,
+        tier: CueTier::A,
+        prior_weight: 10.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\bnon[- ]negotiable\b",
+        polarity: MandatePolarity::Mandate,
+        tier: CueTier::A,
+        prior_weight: 10.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\bmandator(?:y|ily)\b",
+        polarity: MandatePolarity::Mandate,
+        tier: CueTier::A,
+        prior_weight: 10.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\bgolden rule\b",
+        polarity: MandatePolarity::Mandate,
+        tier: CueTier::A,
+        prior_weight: 10.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\b(?:do not|don'?t)\b[^.\n!?]{1,80}\b(?:again|ever|unless|without my (?:explicit )?(?:approval|permission))\b",
+        polarity: MandatePolarity::Never,
+        tier: CueTier::A,
+        prior_weight: 10.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\bnever\b[^.\n!?]{1,80}\b(?:again|ever|without)\b",
+        polarity: MandatePolarity::Never,
+        tier: CueTier::A,
+        prior_weight: 10.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\bwithout my (?:explicit )?(?:approval|permission)\b",
+        polarity: MandatePolarity::Permission,
+        tier: CueTier::A,
+        prior_weight: 10.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\bunless (?:I (?:explicitly|specifically|first) (?:approve|ask|tell)|you (?:are|get) (?:explicitly )?asked)\b",
+        polarity: MandatePolarity::Permission,
+        tier: CueTier::A,
+        prior_weight: 10.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\bnot allowed\b|\bforbidden\b|\bprohibited\b",
+        polarity: MandatePolarity::Constraint,
+        tier: CueTier::A,
+        prior_weight: 9.0,
+        requires_gate: false,
+    },
+    // ---------- Tier B: standing scope by qualifier; gate required ----------
+    Cue {
+        pattern: r"(?i)\b(?:do not|don'?t)\b",
+        polarity: MandatePolarity::Never,
+        tier: CueTier::B,
+        prior_weight: 7.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bnever\b",
+        polarity: MandatePolarity::Never,
+        tier: CueTier::B,
+        prior_weight: 7.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\balways\b",
+        polarity: MandatePolarity::Always,
+        tier: CueTier::B,
+        prior_weight: 8.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bregardless\b",
+        polarity: MandatePolarity::Always,
+        tier: CueTier::B,
+        prior_weight: 8.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bevery time\b|\beach time\b|\banytime you\b|\bany time you\b",
+        polarity: MandatePolarity::FromNowOn,
+        tier: CueTier::B,
+        prior_weight: 8.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bin (?:every|each|this) (?:case|step|round|run|session|project|repo|codebase)\b",
+        polarity: MandatePolarity::FromNowOn,
+        tier: CueTier::B,
+        prior_weight: 8.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bfor this (?:project|repo|repository|codebase)\b",
+        polarity: MandatePolarity::ProjectRule,
+        tier: CueTier::B,
+        prior_weight: 8.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\b(?:prefer|favou?r) (?:to |using )?[a-z`]",
+        polarity: MandatePolarity::Prefer,
+        tier: CueTier::B,
+        prior_weight: 7.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bin favou?r of\b|\binstead of\b|\brather than\b",
+        polarity: MandatePolarity::Prefer,
+        tier: CueTier::B,
+        prior_weight: 7.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bavoid\b|\btry not to\b|\brefrain from\b|\b(?:stay|steer) away from\b",
+        polarity: MandatePolarity::Avoid,
+        tier: CueTier::B,
+        prior_weight: 7.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\b(?:no need|need not)\b",
+        polarity: MandatePolarity::Avoid,
+        tier: CueTier::B,
+        prior_weight: 6.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bdo not include\b",
+        polarity: MandatePolarity::Avoid,
+        tier: CueTier::B,
+        prior_weight: 7.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bremember (?:to|that|,)\b",
+        polarity: MandatePolarity::Remember,
+        tier: CueTier::B,
+        prior_weight: 7.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bmake sure (?:to|that|you)\b",
+        polarity: MandatePolarity::Remember,
+        tier: CueTier::B,
+        prior_weight: 7.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bbe sure (?:to|that|you)\b",
+        polarity: MandatePolarity::Remember,
+        tier: CueTier::B,
+        prior_weight: 7.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bkeep in mind\b",
+        polarity: MandatePolarity::Remember,
+        tier: CueTier::B,
+        prior_weight: 7.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bdo not forget\b|\b(?:don'?t) forget\b",
+        polarity: MandatePolarity::Remember,
+        tier: CueTier::B,
+        prior_weight: 8.0,
+        requires_gate: true,
+    },
+    // ---------- Tier C: correction signals ----------
+    Cue {
+        pattern: r"(?i)\bI (?:have |already |just )?(?:told|asked|said|warned) you\b",
+        polarity: MandatePolarity::Correction,
+        tier: CueTier::C,
+        prior_weight: 10.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\bI explicitly (?:told|said|asked|stated)\b",
+        polarity: MandatePolarity::Correction,
+        tier: CueTier::C,
+        prior_weight: 10.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\byou keep\b|\bwhy do you keep\b",
+        polarity: MandatePolarity::Correction,
+        tier: CueTier::C,
+        prior_weight: 9.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\bwhat the (?:hell|fuck|f\b)\b",
+        polarity: MandatePolarity::Correction,
+        tier: CueTier::C,
+        prior_weight: 9.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\bI'?m not happy\b|\bdid I (?:say|ask|tell)\b",
+        polarity: MandatePolarity::Correction,
+        tier: CueTier::C,
+        prior_weight: 9.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\b(?:stop|quit) (?:it|that|doing|using)\b",
+        polarity: MandatePolarity::Correction,
+        tier: CueTier::C,
+        prior_weight: 9.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\bagain[!?]+",
+        polarity: MandatePolarity::Correction,
+        tier: CueTier::C,
+        prior_weight: 8.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\bagain\?!\?",
+        polarity: MandatePolarity::Correction,
+        tier: CueTier::C,
+        prior_weight: 9.0,
+        requires_gate: false,
+    },
+    // ---------- Tier D: weak / companion-only (require Tier A/B/C cue in same sentence) ----------
+    Cue {
+        pattern: r"(?i)\byou must\b|\byou (?:will|shall|need to) (?:always|never)\b",
+        polarity: MandatePolarity::Mandate,
+        tier: CueTier::D,
+        prior_weight: 7.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bmust\b",
+        polarity: MandatePolarity::Mandate,
+        tier: CueTier::D,
+        prior_weight: 5.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\brequire(?:d|s|ment)?\b",
+        polarity: MandatePolarity::Mandate,
+        tier: CueTier::D,
+        prior_weight: 5.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bcritical(?:ly)?\b",
+        polarity: MandatePolarity::Mandate,
+        tier: CueTier::D,
+        prior_weight: 4.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bimportant(?:ly)?\b",
+        polarity: MandatePolarity::Mandate,
+        tier: CueTier::D,
+        prior_weight: 3.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\brules?:",
+        polarity: MandatePolarity::Mandate,
+        tier: CueTier::D,
+        prior_weight: 6.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\b(?:can'?t|cannot)\b",
+        polarity: MandatePolarity::Constraint,
+        tier: CueTier::D,
+        prior_weight: 4.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bensure\b",
+        polarity: MandatePolarity::Remember,
+        tier: CueTier::D,
+        prior_weight: 3.0,
+        requires_gate: true,
+    },
+    Cue {
+        pattern: r"(?i)\bno longer\b",
+        polarity: MandatePolarity::Never,
+        tier: CueTier::D,
+        prior_weight: 5.0,
+        requires_gate: true,
+    },
+    // ---------- Tier E: temporal cues (rare but high precision) ----------
+    Cue {
+        pattern: r"(?i)\bfrom now on\b|\bgoing forward\b|\bhenceforth\b|\bfrom this point( on)?\b|\b(?:starting|beginning) (?:now|today)\b|\bin the future\b|\bnext time\b",
+        polarity: MandatePolarity::FromNowOn,
+        tier: CueTier::E,
+        prior_weight: 9.0,
+        requires_gate: false,
+    },
+    // ---------- Tier F: process patterns ----------
+    // Stem-based verb matches (commit/committed/committing, etc.) so the pattern handles tenses.
+    Cue {
+        pattern: r"(?i)\b(?:always|never|do not|don'?t)\b[^.!?\n]{0,80}\b(?:before|after|when)\s+(?:you )?(?:commit|push|merg|run|build|test|deploy|edit|writ|delet|optimi|benchmark)\w*\b",
+        polarity: MandatePolarity::ProcessRule,
+        tier: CueTier::F,
+        prior_weight: 8.0,
+        requires_gate: false,
+    },
+    Cue {
+        pattern: r"(?i)\bbefore (?:commit|push|mak|run|build|test|deploy|edit|writ|finaliz|merg|optimi|benchmark)\w*\b",
+        polarity: MandatePolarity::ProcessRule,
+        tier: CueTier::F,
+        prior_weight: 6.0,
+        requires_gate: true,
+    },
+];
+
+// ----- Disambiguation gates (Tier-B / Tier-D) -----
+const STANDING_QUALIFIER_PATTERN: &str = r"(?i)\b(?:again|ever|unless|without|regardless|from now on|going forward|every time|each time|in (?:this|every) (?:project|repo|case|session|run)|next time|anytime|in the future)\b";
+const EMPHATIC_PUNCTUATION_PATTERN: &str = r"!{1,}|\?!\?|\?!";
+const EXPLICIT_MANDATE_MARKER_PATTERN: &str =
+    r"(?i)\b(?:mandatory|non.?negotiable|golden rule|rules?:|required|critical|must)\b";
+const CORRECTION_PRESENT_PATTERN: &str = r"(?i)\b(?:I (?:told|asked|said|warned) you|you keep|what the (?:hell|fuck|f\b)|again[!?]|did I (?:say|ask|tell))\b";
+const ALL_CAPS_SPAN_PATTERN: &str = r"\b[A-Z][A-Z0-9_]{2,}(?:\s+[A-Z][A-Z0-9_]{2,}){3,}\b";
+
+// ----- Exclusion filters (drop before any gate evaluation) -----
+const EXCLUSION_PATTERNS: &[&str] = &[
+    r"(?i)\bstop\s+(?:the\s+)?(?:daemon|server|process|service|build|run|task|job|profiling|recording|optimization)\b",
+    r"(?i)\bnever\s+(?:calls?|fires?|gets?|reaches?|happens?|emits?|writes?|reads?|sets?|returns?|matches?)\b",
+    r"(?i)\balways\s+(?:fires?|runs?|matches?|returns?|emits?|gets?|calls?)\b",
+    r"(?i)\brequired\s+(?:by|for|to be|fields?|argument|parameter)\b",
+    r"(?i)\bcritical\s+(?:path|section|risk|files?|context|race|state)\b",
+    r"(?i)\bimportant\s+(?:context|note|finding|aspect|factor)\b",
+];
+
+// Scope hint
+const SCOPE_HINT_PATTERN: &str = r"(?i)\bin (?:this|the) (?:project|repo|repository|codebase)\b|\bfor (?:this|the) (?:project|repo|repository|codebase)\b";
+
+// Back-tick / quoted target
+const BACKTICK_TARGET_PATTERN: &str = r"`([^`\n]{1,80})`";
+
+// Bullet/list lead
+const BULLET_LEAD_PATTERN: &str = r"^\s*(?:[-*•]\s+|\d+[.)]\s+)";
+
+// ============================================================================
+// Compiled-regex caches
+// ============================================================================
+
+struct CompiledCue {
+    re: Regex,
+    polarity: MandatePolarity,
+    tier: CueTier,
+    prior_weight: f32,
+    requires_gate: bool,
+}
+
+fn compiled_cues() -> &'static [CompiledCue] {
+    static CELL: OnceLock<Vec<CompiledCue>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        CUES.iter()
+            .map(|c| CompiledCue {
+                re: Regex::new(c.pattern).expect("cue regex compiles"),
+                polarity: c.polarity,
+                tier: c.tier,
+                prior_weight: c.prior_weight,
+                requires_gate: c.requires_gate,
+            })
+            .collect()
+    })
+}
+
+fn compiled_exclusions() -> &'static [Regex] {
+    static CELL: OnceLock<Vec<Regex>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        EXCLUSION_PATTERNS
+            .iter()
+            .map(|p| Regex::new(p).expect("exclusion regex compiles"))
+            .collect()
+    })
+}
+
+macro_rules! lazy_regex {
+    ($fn_name:ident, $pat:expr) => {
+        fn $fn_name() -> &'static Regex {
+            static CELL: OnceLock<Regex> = OnceLock::new();
+            CELL.get_or_init(|| Regex::new($pat).expect("regex compiles"))
+        }
+    };
+}
+lazy_regex!(standing_qualifier_re, STANDING_QUALIFIER_PATTERN);
+lazy_regex!(emphatic_punct_re, EMPHATIC_PUNCTUATION_PATTERN);
+lazy_regex!(explicit_marker_re, EXPLICIT_MANDATE_MARKER_PATTERN);
+lazy_regex!(correction_present_re, CORRECTION_PRESENT_PATTERN);
+lazy_regex!(all_caps_span_re, ALL_CAPS_SPAN_PATTERN);
+lazy_regex!(scope_hint_re, SCOPE_HINT_PATTERN);
+lazy_regex!(backtick_target_re, BACKTICK_TARGET_PATTERN);
+lazy_regex!(bullet_lead_re, BULLET_LEAD_PATTERN);
+
+// ============================================================================
+// Pure extraction logic
+// ============================================================================
+
+const MAX_IMPERATIVE_CHARS: usize = 200;
+const NEARBY_WINDOW_CHARS: usize = 150;
+const PUNCT_WINDOW_CHARS: usize = 60;
+
+/// Split a prompt into sentences. Splits ONLY on `.!?\n` and never on `,`
+/// (the user's corpus has many multi-clause comma-continuations). Tracks
+/// back-tick parity so we don't break inside `` `.expect(...)` ``-style spans.
+fn split_sentences(prompt: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    let mut in_backtick = false;
+    let bytes = prompt.as_bytes();
+    for (i, b) in bytes.iter().enumerate() {
+        let c = *b as char;
+        if c == '`' {
+            in_backtick = !in_backtick;
+            continue;
+        }
+        if !in_backtick && matches!(c, '.' | '!' | '?' | '\n') {
+            let segment = &prompt[start..=i];
+            if !segment.trim().is_empty() {
+                out.push(segment);
+            }
+            start = i + 1;
+        }
+    }
+    if start < prompt.len() {
+        let tail = &prompt[start..];
+        if !tail.trim().is_empty() {
+            out.push(tail);
+        }
+    }
+    out
+}
+
+/// Slice a window of ±`window_chars` around `byte_pos` on char boundaries.
+fn window_around(prompt: &str, byte_pos: usize, window_chars: usize) -> &str {
+    let lo = prompt[..byte_pos.min(prompt.len())]
+        .char_indices()
+        .rev()
+        .take(window_chars)
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let hi = prompt
+        .get(byte_pos..)
+        .map(|s| {
+            s.char_indices()
+                .take(window_chars)
+                .last()
+                .map(|(i, c)| byte_pos + i + c.len_utf8())
+                .unwrap_or(prompt.len())
+        })
+        .unwrap_or(prompt.len());
+    &prompt[lo..hi.min(prompt.len())]
+}
+
+/// Check the disambiguation gates around a cue match. Returns true if at least
+/// one of the 6 gates fires within the relevant window.
+fn gates_fire(prompt: &str, sentence: &str, cue_pos_in_prompt: usize) -> bool {
+    let near_150 = window_around(prompt, cue_pos_in_prompt, NEARBY_WINDOW_CHARS);
+    let near_60 = window_around(prompt, cue_pos_in_prompt, PUNCT_WINDOW_CHARS);
+    let near_100 = window_around(prompt, cue_pos_in_prompt, 100);
+
+    // (1) standing-scope qualifier
+    if standing_qualifier_re().is_match(near_150) {
+        return true;
+    }
+    // (2) emphatic punctuation
+    if emphatic_punct_re().is_match(near_60) {
+        return true;
+    }
+    // (3) explicit-mandate marker
+    if explicit_marker_re().is_match(near_150) {
+        return true;
+    }
+    // (4) correction polarity anywhere in same prompt
+    if correction_present_re().is_match(prompt) {
+        return true;
+    }
+    // (6) ALL-CAPS span
+    if all_caps_span_re().is_match(near_100) {
+        return true;
+    }
+    // (7) bullet-list lead in the sentence — CLAUDE.md / AGENTS.md style.
+    if bullet_lead_re().is_match(sentence.trim_start()) {
+        return true;
+    }
+    // (8) back-ticked technical specifics in the sentence — the user uses
+    // back-ticks to anchor mandates to precise targets (`unwrap()`, etc.).
+    if backtick_target_re().is_match(sentence) {
+        return true;
+    }
+    // (5) CLAUDE.md re-statement deferred to caller (requires fs access).
+    false
+}
+
+/// Truncate at a word boundary, ≤ MAX_IMPERATIVE_CHARS.
+fn truncate_imperative(s: &str) -> String {
+    let trimmed = s.trim();
+    if trimmed.chars().count() <= MAX_IMPERATIVE_CHARS {
+        return trimmed.to_string();
+    }
+    // Cap at MAX_IMPERATIVE_CHARS chars on a word boundary.
+    let mut end = 0;
+    for (i, c) in trimmed.char_indices() {
+        if trimmed[..i].chars().count() > MAX_IMPERATIVE_CHARS && c.is_whitespace() {
+            end = i;
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    let mut out = trimmed[..end].trim_end().to_string();
+    out.push('…');
+    out
+}
+
+/// Compute companion-feature salience boost.
+fn companion_boost(prompt: &str, sentence: &str, cue_pos: usize, polarity: MandatePolarity) -> f32 {
+    let mut mult = 1.0_f32;
+    let near_60 = window_around(prompt, cue_pos, PUNCT_WINDOW_CHARS);
+    let near_100 = window_around(prompt, cue_pos, 100);
+
+    if emphatic_punct_re().is_match(near_60) {
+        mult *= 1.25;
+    }
+    if all_caps_span_re().is_match(near_100) {
+        mult *= 1.3;
+    }
+    if backtick_target_re().is_match(sentence) {
+        mult *= 1.15;
+    }
+    if bullet_lead_re().is_match(sentence) {
+        mult *= 1.1;
+    }
+    // Tier-A / Tier-C cue also present in same sentence → ×1.5
+    // Quick check: any Tier-A or Tier-C cue regex matches the sentence.
+    let same_sentence_strong = compiled_cues().iter().any(|c| {
+        matches!(c.tier, CueTier::A | CueTier::C)
+            && c.polarity != polarity
+            && c.re.is_match(sentence)
+    });
+    if same_sentence_strong {
+        mult *= 1.5;
+    }
+    mult
+}
+
+fn capture_target(sentence: &str) -> Option<String> {
+    backtick_target_re()
+        .captures(sentence)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str().to_string())
+}
+
+fn detect_scope_hint(prompt: &str, cwd: Option<&str>) -> Option<String> {
+    if scope_hint_re().is_match(prompt) {
+        cwd.map(|c| c.to_string())
+    } else {
+        None
+    }
+}
+
+/// Tiered heuristic extractor. Pure function. Optionally takes the session
+/// cwd for `cwd_prefix` scope-hint detection.
+pub fn extract_mandates(prompt: &str, cwd: Option<&str>) -> Vec<ExtractedMandate> {
+    if prompt.trim().is_empty() {
+        return Vec::new();
+    }
+
+    // Apply exclusion filters first (drop the matched span). We approximate
+    // by masking matched spans with spaces so positions stay aligned.
+    let mut masked = prompt.to_string();
+    for re in compiled_exclusions() {
+        // Collect ranges first to avoid borrow issues.
+        let ranges: Vec<(usize, usize)> =
+            re.find_iter(prompt).map(|m| (m.start(), m.end())).collect();
+        for (s, e) in ranges {
+            // Replace with spaces of the same length (byte-wise) to preserve byte positions
+            // for downstream regex offsets that reference `prompt`.
+            if let Some(slice) = masked.get_mut(s..e) {
+                for b in unsafe { slice.as_bytes_mut() } {
+                    if *b != b'\n' {
+                        *b = b' ';
+                    }
+                }
+            }
+        }
+    }
+
+    let scope_hint = detect_scope_hint(prompt, cwd);
+    let mut out: Vec<ExtractedMandate> = Vec::new();
+    let mut seen: HashSet<(MandatePolarity, String)> = HashSet::new();
+
+    for sentence in split_sentences(&masked) {
+        let sentence_offset = unsafe {
+            // SAFETY: sentence is a sub-slice of masked which has identical bytes/layout to prompt.
+            sentence.as_ptr().offset_from(masked.as_ptr()) as usize
+        };
+        for cue in compiled_cues() {
+            for m in cue.re.find_iter(sentence) {
+                let cue_pos_in_prompt = sentence_offset + m.start();
+
+                if cue.requires_gate && !gates_fire(prompt, sentence, cue_pos_in_prompt) {
+                    continue;
+                }
+
+                let target = capture_target(sentence);
+                let salience = (cue.prior_weight
+                    * companion_boost(prompt, sentence, cue_pos_in_prompt, cue.polarity))
+                .min(10.0);
+
+                let imperative = truncate_imperative(sentence);
+                let key = (cue.polarity, imperative.to_lowercase());
+                if !seen.insert(key) {
+                    continue;
+                }
+
+                out.push(ExtractedMandate {
+                    polarity: cue.polarity,
+                    imperative,
+                    target: target.clone(),
+                    cwd_prefix: scope_hint.clone(),
+                    cue_tier: cue.tier,
+                    salience,
+                });
+            }
+        }
+    }
+
+    out
+}
+
+// ============================================================================
+// Markdown rendering
+// ============================================================================
+
+/// Render an active-mandate set as a compact Markdown block. Ranks by
+/// `(cue_tier DESC, last_reinforced_at DESC, salience DESC)`, capped at
+/// `cap_bytes`. Truncates oldest/lowest-tier first.
+pub fn render_session_mandates_md(mandates: &[SessionMandate], cap_bytes: usize) -> String {
+    if mandates.is_empty() {
+        return String::new();
+    }
+    let mut ranked: Vec<&SessionMandate> = mandates.iter().collect();
+    ranked.sort_by(|a, b| {
+        b.cue_tier
+            .cmp(&a.cue_tier)
+            .then(b.last_reinforced_at.cmp(&a.last_reinforced_at))
+            .then(
+                b.salience
+                    .partial_cmp(&a.salience)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+    });
+
+    let mut out = String::from("## Active session mandates (pgmcp)\n\n");
+    for m in ranked {
+        let polarity_label = match MandatePolarity::parse(&m.polarity) {
+            Some(p) => format!("{:?}", p),
+            None => m.polarity.clone(),
+        };
+        let target = m
+            .target
+            .as_deref()
+            .map(|t| format!(" (`{}`)", t))
+            .unwrap_or_default();
+        let line = format!(
+            "- **{}**{}: {} _(reinforced ×{})_\n",
+            polarity_label, target, m.imperative, m.reinforcement_count
+        );
+        if out.len() + line.len() > cap_bytes {
+            break;
+        }
+        out.push_str(&line);
+    }
+    out
+}
+
+// ============================================================================
+// Utility helpers
+// ============================================================================
+
+pub fn prompt_sha256(prompt: &str) -> String {
+    let digest = Sha256::digest(prompt.as_bytes());
+    format!("{:x}", digest)
+}
+
+// ============================================================================
+// DB helpers
+// ============================================================================
+
+pub async fn upsert_session(
+    pool: &PgPool,
+    id: Uuid,
+    cwd: &str,
+    project_id: Option<i32>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO sessions (id, cwd, project_id, first_seen, last_seen)
+         VALUES ($1, $2, $3, NOW(), NOW())
+         ON CONFLICT (id) DO UPDATE SET
+            cwd = EXCLUDED.cwd,
+            project_id = EXCLUDED.project_id,
+            last_seen = NOW()",
+    )
+    .bind(id)
+    .bind(cwd)
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn insert_prompt(
+    pool: &PgPool,
+    session_id: Uuid,
+    text: &str,
+    sha256: &str,
+    embedding: Option<&[f32]>,
+) -> Result<i64, sqlx::Error> {
+    let vector = embedding.map(|v| Vector::from(v.to_vec()));
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO session_prompts (session_id, prompt_text, prompt_sha256, embedding)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (session_id, prompt_sha256) DO UPDATE SET ts = NOW()
+         RETURNING id",
+    )
+    .bind(session_id)
+    .bind(text)
+    .bind(sha256)
+    .bind(vector)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+pub async fn upsert_mandate(
+    pool: &PgPool,
+    session_id: Uuid,
+    source_prompt_id: i64,
+    m: &ExtractedMandate,
+) -> Result<i64, sqlx::Error> {
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO session_mandates
+            (session_id, source_prompt_id, polarity, imperative, target, cwd_prefix,
+             cue_tier, salience, status, created_at, last_reinforced_at, reinforcement_count)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'active', NOW(), NOW(), 1)
+         ON CONFLICT (session_id, polarity, lower(imperative)) DO UPDATE SET
+            last_reinforced_at = NOW(),
+            reinforcement_count = session_mandates.reinforcement_count + 1,
+            salience = GREATEST(session_mandates.salience, EXCLUDED.salience),
+            source_prompt_id = EXCLUDED.source_prompt_id,
+            target = COALESCE(EXCLUDED.target, session_mandates.target),
+            cwd_prefix = COALESCE(EXCLUDED.cwd_prefix, session_mandates.cwd_prefix),
+            cue_tier = CASE WHEN EXCLUDED.cue_tier < session_mandates.cue_tier
+                            THEN EXCLUDED.cue_tier ELSE session_mandates.cue_tier END
+         RETURNING id",
+    )
+    .bind(session_id)
+    .bind(source_prompt_id)
+    .bind(m.polarity.as_str())
+    .bind(&m.imperative)
+    .bind(m.target.as_deref())
+    .bind(m.cwd_prefix.as_deref())
+    .bind(m.cue_tier.as_char().to_string())
+    .bind(m.salience)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+pub async fn list_active_mandates(
+    pool: &PgPool,
+    session_id: Option<Uuid>,
+    cwd: Option<&str>,
+    limit: i32,
+) -> Result<Vec<SessionMandate>, sqlx::Error> {
+    let limit = limit.clamp(1, 100);
+    match (session_id, cwd) {
+        (Some(sid), _) => {
+            sqlx::query_as::<_, SessionMandate>(
+                "SELECT * FROM session_mandates
+             WHERE session_id = $1 AND status = 'active'
+             ORDER BY cue_tier DESC, last_reinforced_at DESC, salience DESC
+             LIMIT $2",
+            )
+            .bind(sid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+        (None, Some(cwd)) => {
+            sqlx::query_as::<_, SessionMandate>(
+                "SELECT m.* FROM session_mandates m
+             JOIN sessions s ON s.id = m.session_id
+             WHERE s.cwd = $1 AND m.status = 'active'
+             ORDER BY m.cue_tier DESC, m.last_reinforced_at DESC, m.salience DESC
+             LIMIT $2",
+            )
+            .bind(cwd)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+        (None, None) => Ok(Vec::new()),
+    }
+}
+
+/// Manually retire a session mandate. Exposed for the future
+/// `session-mandate-refinement` cron and for integration tests; the
+/// production hook path does not call it yet.
+#[allow(dead_code)]
+pub async fn retire_mandate(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE session_mandates SET status = 'retired' WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn get_mandate(pool: &PgPool, id: i64) -> Result<Option<SessionMandate>, sqlx::Error> {
+    sqlx::query_as::<_, SessionMandate>("SELECT * FROM session_mandates WHERE id = $1")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn promote_mandate(
+    pool: &PgPool,
+    id: i64,
+    scope: &str,
+    project_id: Option<i32>,
+    file_path: Option<&str>,
+) -> Result<i64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let mandate = sqlx::query_as::<_, SessionMandate>(
+        "SELECT * FROM session_mandates WHERE id = $1 FOR UPDATE",
+    )
+    .bind(id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    let durable_id: i64 = sqlx::query_scalar(
+        "INSERT INTO durable_mandates
+            (scope, project_id, polarity, imperative, target, source_mandate_id, file_path)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id",
+    )
+    .bind(scope)
+    .bind(project_id)
+    .bind(&mandate.polarity)
+    .bind(&mandate.imperative)
+    .bind(mandate.target.as_deref())
+    .bind(mandate.id)
+    .bind(file_path)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query("UPDATE session_mandates SET status = 'promoted' WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(durable_id)
+}
+
+pub async fn list_durable_mandates_for_project(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Vec<DurableMandate>, sqlx::Error> {
+    sqlx::query_as::<_, DurableMandate>(
+        "SELECT * FROM durable_mandates
+         WHERE project_id = $1 OR scope = 'workspace'
+         ORDER BY promoted_at DESC",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
+// ============================================================================
+// Tests (pure-function extractor)
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn polarities(ms: &[ExtractedMandate]) -> Vec<MandatePolarity> {
+        ms.iter().map(|m| m.polarity).collect()
+    }
+
+    #[test]
+    fn tier_a_no_gate_never_again() {
+        let p = "Never make destructive changes without my explicit approval again!";
+        let ms = extract_mandates(p, None);
+        assert!(!ms.is_empty(), "expected at least one mandate: {:?}", ms);
+        assert!(polarities(&ms).contains(&MandatePolarity::Never));
+    }
+
+    #[test]
+    fn tier_a_no_gate_non_negotiable() {
+        let p = "This is non-negotiable.";
+        let ms = extract_mandates(p, None);
+        assert!(polarities(&ms).contains(&MandatePolarity::Mandate));
+    }
+
+    #[test]
+    fn tier_b_without_gate_is_dropped_do_not_replan() {
+        let p = "Do not re-plan; just resume.";
+        let ms = extract_mandates(p, None);
+        // No standing-scope qualifier => task-local => dropped
+        assert!(
+            ms.is_empty() || ms.iter().all(|m| m.polarity == MandatePolarity::Correction),
+            "expected drop, got {:?}",
+            ms
+        );
+    }
+
+    #[test]
+    fn tier_b_without_gate_ensure_is_dropped() {
+        let p = "Ensure the close ) is consumed.";
+        let ms = extract_mandates(p, None);
+        assert!(
+            ms.is_empty(),
+            "ensure without gate should drop, got {:?}",
+            ms
+        );
+    }
+
+    #[test]
+    fn tier_b_with_punct_gate_dont_gaslight() {
+        let p = "don't fucking gaslight me!!";
+        let ms = extract_mandates(p, None);
+        assert!(
+            !ms.is_empty(),
+            "expected mandate via punctuation gate: {:?}",
+            ms
+        );
+    }
+
+    #[test]
+    fn tier_c_correction_i_asked_you() {
+        let p = "I asked you to review your proposal before implementing.";
+        let ms = extract_mandates(p, None);
+        assert!(polarities(&ms).contains(&MandatePolarity::Correction));
+    }
+
+    #[test]
+    fn tier_c_correction_you_keep() {
+        let p = "Why do you keep discarding work?";
+        let ms = extract_mandates(p, None);
+        assert!(polarities(&ms).contains(&MandatePolarity::Correction));
+    }
+
+    #[test]
+    fn exclusion_filter_stop_the_daemon() {
+        let p = "Please stop the daemon.";
+        let ms = extract_mandates(p, None);
+        assert!(
+            ms.is_empty(),
+            "task-local stop request should drop, got {:?}",
+            ms
+        );
+    }
+
+    #[test]
+    fn exclusion_filter_never_returns_null() {
+        let p = "This function never returns null.";
+        let ms = extract_mandates(p, None);
+        // Code-behavior description; the "never" cue must be masked out.
+        assert!(
+            !ms.iter().any(|m| m.polarity == MandatePolarity::Never),
+            "code-behavior never should be filtered: {:?}",
+            ms
+        );
+    }
+
+    #[test]
+    fn exclusion_filter_required_parameter() {
+        let p = "required parameter foo";
+        let ms = extract_mandates(p, None);
+        assert!(ms.is_empty(), "required-parameter should drop: {:?}", ms);
+    }
+
+    #[test]
+    fn companion_backtick_capture() {
+        // Use raw string so the back-ticks are real (not escape-eaten).
+        let p = r#"always prefer `.expect(...)` over `unwrap()`."#;
+        let ms = extract_mandates(p, None);
+        let prefer = ms
+            .iter()
+            .find(|m| m.polarity == MandatePolarity::Prefer)
+            .or_else(|| ms.iter().find(|m| m.polarity == MandatePolarity::Always));
+        assert!(prefer.is_some(), "expected prefer/always mandate: {:?}", ms);
+        if let Some(m) = prefer {
+            assert!(m.target.is_some(), "expected back-tick target: {:?}", m);
+        }
+    }
+
+    #[test]
+    fn companion_all_caps_boost() {
+        let p = "MUST FIX ALL FAILURES REGARDLESS";
+        let ms = extract_mandates(p, None);
+        assert!(!ms.is_empty());
+        // Mandate cue is Tier D requires gate; ALL-CAPS span fires gate.
+        // Salience should be > base prior (5.0 for "must"); boosted ×1.3 caps min at 6.5.
+        assert!(
+            ms.iter().any(|m| m.salience >= 5.0),
+            "expected boosted salience, got {:?}",
+            ms
+        );
+    }
+
+    #[test]
+    fn companion_bullet_lead_boost() {
+        let p = "- Always prefer pattern matching to conditionals.";
+        let ms = extract_mandates(p, None);
+        assert!(!ms.is_empty(), "expected bullet-prefixed always: {:?}", ms);
+    }
+
+    #[test]
+    fn sentence_split_not_on_comma() {
+        // The corpus has many comma-continuations carrying standing rules.
+        // Tier-F covers "always X before benchmarking" (benchmark is in verb list).
+        let p = "Use the profiler, always benchmark before optimizing.";
+        let ms = extract_mandates(p, None);
+        assert!(!ms.is_empty(), "comma-continuation lost: {:?}", ms);
+        assert!(
+            ms.iter().any(|m| matches!(
+                m.polarity,
+                MandatePolarity::ProcessRule | MandatePolarity::Always
+            )),
+            "expected ProcessRule/Always from second clause: {:?}",
+            ms
+        );
+    }
+
+    #[test]
+    fn cwd_prefix_scope_hint() {
+        let p = "In this project, never use unsafe.";
+        let ms = extract_mandates(p, Some("/home/me/proj"));
+        // The "never use" matches Tier A explicitly, but check scope hint propagates.
+        assert!(
+            ms.iter()
+                .any(|m| m.cwd_prefix.as_deref() == Some("/home/me/proj")),
+            "expected cwd_prefix populated: {:?}",
+            ms
+        );
+    }
+
+    #[test]
+    fn empty_prompt_yields_nothing() {
+        assert!(extract_mandates("", None).is_empty());
+        assert!(extract_mandates("   \n  ", None).is_empty());
+    }
+
+    #[test]
+    fn polarity_round_trip() {
+        for p in [
+            MandatePolarity::Always,
+            MandatePolarity::Never,
+            MandatePolarity::Prefer,
+            MandatePolarity::Avoid,
+            MandatePolarity::Remember,
+            MandatePolarity::FromNowOn,
+            MandatePolarity::Correction,
+            MandatePolarity::Permission,
+            MandatePolarity::Constraint,
+            MandatePolarity::Mandate,
+            MandatePolarity::ProcessRule,
+            MandatePolarity::ProjectRule,
+        ] {
+            assert_eq!(MandatePolarity::parse(p.as_str()), Some(p));
+        }
+    }
+
+    #[test]
+    fn sha256_stable() {
+        let h1 = prompt_sha256("hello");
+        let h2 = prompt_sha256("hello");
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64);
+    }
+
+    #[test]
+    fn render_empty_is_empty_string() {
+        assert!(render_session_mandates_md(&[], 2048).is_empty());
+    }
+}

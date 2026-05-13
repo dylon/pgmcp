@@ -35,17 +35,28 @@ Find code by meaning, keywords, regex, or fused ranking across all indexed proje
 
 ### Software Pattern Knowledge (8 tools)
 
-Design with a separate, local full-text pattern/anti-pattern index. These tools
-use the same embedding model as file search, but never query `file_chunks`.
+Design with a separate, local full-text pattern/anti-pattern index. The catalog
+holds **~810 entries spanning 14 paradigms** — patterns, anti-patterns,
+principles (SOLID, GRASP, DRY/KISS/YAGNI, package principles, …), and code
+smells (Long Method, Feature Envy, Shotgun Surgery, …) — across object-oriented,
+functional, logic, event-driven, concurrent, parallel, aspect-oriented,
+distributed, reactive, dataflow, declarative, actor-model, procedural, and
+machine-learning engineering. Round 2 added dense coverage of observability /
+SRE, deployment & release, data engineering, API design, ML/AI engineering
+(RAG, vector search, chain-of-thought, ReAct, function calling), CRDTs and
+distributed-data primitives (G-Counter, Vector Clock, Bloom filter, HLL),
+Kubernetes patterns (Operator, CRD, HPA, NetworkPolicy), plus more Fowler
+refactorings and security primitives (AEAD, forward secrecy, PKCE, HSTS). These tools use the same embedding model as file search, but never
+query `file_chunks`.
 
 | Tool                         | Description                                                                 |
 |------------------------------|-----------------------------------------------------------------------------|
-| `software_pattern_search`    | Semantic search over software patterns, anti-patterns, paradigms, and sources |
-| `recommend_design_patterns`  | Recommend patterns and anti-patterns to avoid for a feature/refactor task    |
-| `review_design_patterns`     | Review a proposed design for anti-pattern risks and better alternatives      |
+| `software_pattern_search`    | Semantic search over software patterns, anti-patterns, principles, code smells, paradigms, and sources |
+| `recommend_design_patterns`  | Recommend patterns, principles, anti-patterns, and code smells for a feature/refactor task |
+| `review_design_patterns`     | Review a proposed design for anti-pattern risks, code-smell hits, principle reminders, and better alternatives |
 | `get_software_pattern`       | Fetch one pattern card with source links and optional bounded excerpts       |
-| `list_software_patterns`     | Browse/filter the pattern catalog by paradigm, kind, category, or source     |
-| `pattern_catalog_stats`      | Pattern/source/chunk/import status for the dedicated knowledge index         |
+| `list_software_patterns`     | Browse/filter the catalog by paradigm, kind (`pattern`/`anti_pattern`/`principle`/`code_smell`), category, or source |
+| `pattern_catalog_stats`      | Per-kind counts (patterns / anti-patterns / principles / code-smells), source/chunk/import status |
 | `refresh_pattern_catalog`    | Seed, import, or incrementally refresh local full-text pattern sources       |
 | `upsert_pattern_source`      | Attach local full-text docs/snippets to an existing pattern                  |
 

@@ -337,6 +337,19 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     // 12. Construct the MCP server from the same SystemContext.
     let mcp_server = mcp::server::McpServer::new(system_ctx.clone());
 
+    // 12a. Background-seed the software-pattern catalog so the first MCP
+    // pattern-tool call doesn't block on ~1400 chunk embeddings. Lazy
+    // seeding remains as a safety net for non-daemon invocations.
+    {
+        let warm_ctx = system_ctx.clone();
+        tokio::spawn(async move {
+            match mcp::tools::tool_software_patterns::warm_pattern_catalog(&warm_ctx).await {
+                Ok(()) => tracing::info!("Software pattern catalog warm-up complete"),
+                Err(e) => tracing::warn!(error = %e, "Software pattern catalog warm-up failed"),
+            }
+        });
+    }
+
     let cancel_token = shutdown.cancellation_token();
 
     if is_daemon {
@@ -384,6 +397,10 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             .route(
                 "/api/file_envelope",
                 axum::routing::post(api::handlers::file_envelope),
+            )
+            .route(
+                "/api/session/observe",
+                axum::routing::post(api::handlers::session_observe),
             )
             .with_state(api_state);
         let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)

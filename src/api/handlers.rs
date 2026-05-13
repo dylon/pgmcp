@@ -200,6 +200,155 @@ pub async fn search(
 }
 
 // ============================================================================
+// POST /api/session/observe — Session-mandate observation + re-injection
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ObserveRequest {
+    pub session_id: uuid::Uuid,
+    pub cwd: String,
+    pub prompt: String,
+    #[serde(default = "default_true")]
+    pub include_rag: bool,
+    pub rag_limit: Option<i32>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Serialize)]
+pub struct ObserveResponse {
+    pub session_id: uuid::Uuid,
+    pub prompt_id: i64,
+    pub extracted: Vec<crate::sessions::ExtractedMandate>,
+    pub active_mandates: Vec<crate::sessions::SessionMandate>,
+    pub rag_hits: Vec<SearchResultItem>,
+    pub additional_context: String,
+}
+
+pub async fn session_observe(
+    State(state): State<ApiState>,
+    Json(req): Json<ObserveRequest>,
+) -> Result<Json<ObserveResponse>, (StatusCode, String)> {
+    let pool = state.db.pool().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "raw pool unavailable".to_string(),
+    ))?;
+
+    // Resolve project_id from cwd (longest-prefix match).
+    let project = state.db.find_project_by_cwd(&req.cwd).await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("project lookup failed: {}", e),
+        )
+    })?;
+    let project_id = project.as_ref().map(|p| p.id);
+
+    crate::sessions::upsert_session(pool, req.session_id, &req.cwd, project_id)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("upsert_session failed: {}", e),
+            )
+        })?;
+
+    let sha256 = crate::sessions::prompt_sha256(&req.prompt);
+
+    // Embed the prompt for cross-session retrieval (and to populate the
+    // vector column on the row we're about to insert).
+    let embedding = state
+        .query_embedder
+        .embed_query(req.prompt.clone())
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Embedding failed: {}", e),
+            )
+        })?;
+
+    let prompt_id = crate::sessions::insert_prompt(
+        pool,
+        req.session_id,
+        &req.prompt,
+        &sha256,
+        Some(&embedding),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("insert_prompt failed: {}", e),
+        )
+    })?;
+
+    let extracted = crate::sessions::extract_mandates(&req.prompt, Some(&req.cwd));
+    for m in &extracted {
+        let _ = crate::sessions::upsert_mandate(pool, req.session_id, prompt_id, m)
+            .await
+            .map_err(|e| tracing::warn!(error = %e, "upsert_mandate failed"));
+    }
+
+    let active = crate::sessions::list_active_mandates(pool, Some(req.session_id), None, 20)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("list_active_mandates failed: {}", e),
+            )
+        })?;
+
+    // Optional RAG hits using the existing semantic_search path.
+    let mut rag_hits: Vec<SearchResultItem> = Vec::new();
+    if req.include_rag {
+        let limit = req.rag_limit.unwrap_or(5).clamp(1, 20);
+        let ef_search = state.config.load().vector.ef_search;
+        if let Ok(hits) = state
+            .db
+            .semantic_search(&embedding, limit, None, None, ef_search, false)
+            .await
+        {
+            rag_hits = hits
+                .into_iter()
+                .map(|r| SearchResultItem {
+                    file_path: r.path,
+                    chunk: r.chunk_content,
+                    similarity: r.score.unwrap_or(0.0),
+                    language: r.language,
+                })
+                .collect();
+        }
+    }
+
+    // Render the combined `additional_context` Markdown block (≤ 2 KB).
+    let mut additional_context = crate::sessions::render_session_mandates_md(&active, 2048);
+    if !rag_hits.is_empty() {
+        additional_context.push_str("\n## Relevant indexed code (pgmcp RAG)\n\n");
+        let budget_remaining = 2048usize.saturating_sub(additional_context.len());
+        let mut used = 0;
+        for hit in &rag_hits {
+            let line = format!("- `{}` (similarity {:.2})\n", hit.file_path, hit.similarity);
+            if used + line.len() > budget_remaining {
+                break;
+            }
+            additional_context.push_str(&line);
+            used += line.len();
+        }
+    }
+
+    Ok(Json(ObserveResponse {
+        session_id: req.session_id,
+        prompt_id,
+        extracted,
+        active_mandates: active,
+        rag_hits,
+        additional_context,
+    }))
+}
+
+// ============================================================================
 // GET /api/context?cwd=/path — Project context
 // ============================================================================
 

@@ -21,6 +21,7 @@ mod mmap_array;
 mod parsing;
 mod patterns;
 mod reactive;
+mod sessions;
 mod shutdown;
 mod stats;
 #[allow(dead_code)]

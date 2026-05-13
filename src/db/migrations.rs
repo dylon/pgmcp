@@ -613,7 +613,141 @@ pub async fn run_migrations(
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "ALTER TABLE software_patterns DROP CONSTRAINT IF EXISTS software_patterns_kind_check",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE software_patterns
+            ADD CONSTRAINT software_patterns_kind_check
+            CHECK (kind IN ('pattern', 'anti_pattern', 'principle', 'code_smell'))",
+    )
+    .execute(pool)
+    .await?;
+
     ensure_software_pattern_hnsw_index(pool, vector_config).await?;
+
+    // ================================================================
+    // Session-level mandate observation (session_id keyed)
+    // ================================================================
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sessions (
+            id          UUID PRIMARY KEY,
+            cwd         TEXT NOT NULL,
+            project_id  INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+            first_seen  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS session_prompts (
+            id            BIGSERIAL PRIMARY KEY,
+            session_id    UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            ts            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            prompt_text   TEXT NOT NULL,
+            prompt_sha256 CHAR(64) NOT NULL,
+            embedding     vector(384),
+            UNIQUE (session_id, prompt_sha256)
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS session_mandates (
+            id                   BIGSERIAL PRIMARY KEY,
+            session_id           UUID NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+            source_prompt_id     BIGINT NOT NULL REFERENCES session_prompts(id) ON DELETE CASCADE,
+            polarity             TEXT NOT NULL,
+            imperative           TEXT NOT NULL,
+            target               TEXT,
+            cwd_prefix           TEXT,
+            cue_tier             CHAR(1) NOT NULL DEFAULT 'D',
+            salience             REAL NOT NULL DEFAULT 1.0,
+            status               TEXT NOT NULL DEFAULT 'active',
+            created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_reinforced_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            reinforcement_count  INTEGER NOT NULL DEFAULT 1
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS durable_mandates (
+            id                  BIGSERIAL PRIMARY KEY,
+            scope               TEXT NOT NULL,
+            project_id          INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            polarity            TEXT NOT NULL,
+            imperative          TEXT NOT NULL,
+            target              TEXT,
+            source_mandate_id   BIGINT REFERENCES session_mandates(id) ON DELETE SET NULL,
+            promoted_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            file_path           TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    let session_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_sessions_last_seen ON sessions(last_seen DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_sessions_cwd       ON sessions(cwd)",
+        "CREATE INDEX IF NOT EXISTS idx_session_prompts_session_ts ON session_prompts(session_id, ts DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_session_mandates_session_status ON session_mandates(session_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_session_mandates_cwd ON session_mandates(cwd_prefix)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_session_mandates_unique ON session_mandates(session_id, polarity, lower(imperative))",
+        "CREATE INDEX IF NOT EXISTS idx_durable_mandates_scope_project ON durable_mandates(scope, project_id)",
+    ];
+    for idx_sql in &session_indexes {
+        sqlx::query(idx_sql).execute(pool).await?;
+    }
+
+    // Idempotent CHECK-constraint installs (DROP IF EXISTS + ADD).
+    sqlx::query(
+        "ALTER TABLE session_mandates DROP CONSTRAINT IF EXISTS session_mandates_polarity_check",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE session_mandates
+            ADD CONSTRAINT session_mandates_polarity_check
+            CHECK (polarity IN ('always','never','prefer','avoid','remember','from_now_on',
+                                'correction','permission','constraint','mandate',
+                                'process_rule','project_rule'))",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE session_mandates DROP CONSTRAINT IF EXISTS session_mandates_status_check",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE session_mandates
+            ADD CONSTRAINT session_mandates_status_check
+            CHECK (status IN ('active','superseded','retired','promoted'))",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE durable_mandates DROP CONSTRAINT IF EXISTS durable_mandates_scope_check",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE durable_mandates
+            ADD CONSTRAINT durable_mandates_scope_check
+            CHECK (scope IN ('project','workspace'))",
+    )
+    .execute(pool)
+    .await?;
+
+    ensure_session_prompts_hnsw_index(pool, vector_config).await?;
 
     Ok(())
 }
@@ -764,6 +898,50 @@ async fn ensure_software_pattern_hnsw_index(
         .await?;
 
         tracing::info!("Software pattern chunks HNSW index created/rebuilt");
+    }
+
+    Ok(())
+}
+
+/// HNSW index for `session_prompts.embedding`. Mirrors the software-pattern
+/// helper above. Rebuilt only when `[vector]` params change.
+async fn ensure_session_prompts_hnsw_index(
+    pool: &PgPool,
+    config: &VectorConfig,
+) -> Result<(), sqlx::Error> {
+    let current_params = format!(
+        "m={},ef_construction={}",
+        config.hnsw_m, config.hnsw_ef_construction
+    );
+
+    let stored: Option<String> = sqlx::query_scalar::<_, String>(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'session_prompts_hnsw_params'",
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    if stored.as_deref() != Some(&current_params) {
+        let _ = sqlx::query("DROP INDEX IF EXISTS idx_session_prompts_embedding")
+            .execute(pool)
+            .await;
+
+        let create_sql = format!(
+            "CREATE INDEX idx_session_prompts_embedding ON session_prompts \
+             USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
+            config.hnsw_m, config.hnsw_ef_construction
+        );
+        let _ = sqlx::query(&create_sql).execute(pool).await;
+
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value)
+             VALUES ('session_prompts_hnsw_params', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+
+        tracing::info!("Session prompts HNSW index created/rebuilt");
     }
 
     Ok(())

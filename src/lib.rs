@@ -37,6 +37,7 @@ pub mod mmap_array;
 pub mod parsing;
 pub mod patterns;
 pub mod reactive;
+pub mod sessions;
 pub mod shutdown;
 pub mod stats;
 #[allow(dead_code)]

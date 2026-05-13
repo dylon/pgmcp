@@ -22,7 +22,7 @@ use crate::patterns::{self as pattern_catalog, SourceDescriptor};
 const DEFAULT_SEARCH_LIMIT: i32 = 10;
 const DEFAULT_LIST_LIMIT: i32 = 50;
 const DEFAULT_EXCERPT_CHARS: usize = 700;
-const PATTERN_EMBEDDING_SCHEMA_VERSION: &str = "pgmcp-pattern-embedding-v1";
+const PATTERN_EMBEDDING_SCHEMA_VERSION: &str = "pgmcp-pattern-embedding-v3";
 
 #[derive(Debug, Default)]
 struct ImportSummary {
@@ -107,6 +107,7 @@ pub async fn tool_recommend_design_patterns(
     .await?;
 
     let include_antipatterns = params.include_antipatterns.unwrap_or(true);
+    let secondary_limit = (limit / 2).max(3);
     let anti_patterns = if include_antipatterns {
         let rows = search_rows(
             ctx,
@@ -122,10 +123,44 @@ pub async fn tool_recommend_design_patterns(
             },
         )
         .await?;
-        aggregate_matches(rows, true, (limit / 2).max(3))
+        aggregate_matches(rows, true, secondary_limit)
     } else {
         Vec::new()
     };
+    let code_smells = if include_antipatterns {
+        let rows = search_rows(
+            ctx,
+            pool,
+            &query,
+            limit * 3,
+            PatternSearchOptions {
+                kind: Some("code_smell".to_string()),
+                paradigms: Some(paradigms.clone()),
+                category: None,
+                source_family: None,
+                source_type: None,
+            },
+        )
+        .await?;
+        aggregate_matches(rows, true, secondary_limit)
+    } else {
+        Vec::new()
+    };
+    let principle_rows = search_rows(
+        ctx,
+        pool,
+        &query,
+        limit * 3,
+        PatternSearchOptions {
+            kind: Some("principle".to_string()),
+            paradigms: Some(paradigms.clone()),
+            category: None,
+            source_family: None,
+            source_type: None,
+        },
+    )
+    .await?;
+    let recommended_principles = aggregate_matches(principle_rows, true, secondary_limit);
 
     let recommended = aggregate_matches(pattern_rows, true, limit);
     json_result(json!({
@@ -135,10 +170,14 @@ pub async fn tool_recommend_design_patterns(
         "paradigms": paradigms,
         "constraints": params.constraints.unwrap_or_default(),
         "recommended_patterns": recommended,
+        "recommended_principles": recommended_principles,
         "anti_patterns_to_avoid": anti_patterns,
+        "code_smells_to_avoid": code_smells,
         "planning_guidance": [
             "Prefer the smallest pattern that directly addresses the task forces.",
             "Treat anti-pattern matches as review prompts, not automatic rejections.",
+            "Apply principles (SOLID, GRASP, DRY/KISS/YAGNI) as standing review checks.",
+            "Use code-smell hits to spot specific design quality risks the task could amplify.",
             "Use source citations to inspect the rationale before committing to a design."
         ],
     }))
@@ -189,14 +228,44 @@ pub async fn tool_review_design_patterns(
         },
     )
     .await?;
+    let smell_rows = search_rows(
+        ctx,
+        pool,
+        &params.design,
+        limit * 4,
+        PatternSearchOptions {
+            kind: Some("code_smell".to_string()),
+            paradigms: Some(paradigms.clone()),
+            category: None,
+            source_family: None,
+            source_type: None,
+        },
+    )
+    .await?;
+    let principle_rows = search_rows(
+        ctx,
+        pool,
+        &params.design,
+        limit * 4,
+        PatternSearchOptions {
+            kind: Some("principle".to_string()),
+            paradigms: Some(paradigms.clone()),
+            category: None,
+            source_family: None,
+            source_type: None,
+        },
+    )
+    .await?;
 
     json_result(json!({
         "project": params.project,
         "language": params.language,
         "paradigms": paradigms,
         "anti_pattern_risks": aggregate_matches(risk_rows, true, limit),
+        "code_smells_to_avoid": aggregate_matches(smell_rows, true, limit),
         "pattern_alternatives": aggregate_matches(alternative_rows, true, limit),
-        "review_guidance": "Use high-scoring anti-patterns as targeted questions for the design review; confirm with code/context before changing the plan.",
+        "principles_to_consider": aggregate_matches(principle_rows, true, limit),
+        "review_guidance": "Use high-scoring anti-patterns and code smells as targeted questions for the design review; cross-check against the suggested principles; confirm with code/context before changing the plan.",
     }))
 }
 
@@ -417,6 +486,7 @@ pub async fn tool_upsert_pattern_source(
             )
         })?;
 
+    let sanitized_content = sanitize_text_for_postgres(&params.content);
     let source_id = patterns::upsert_source(
         pool,
         SourceUpsert {
@@ -426,7 +496,7 @@ pub async fn tool_upsert_pattern_source(
             license_label: params.license_label.as_deref(),
             source_type: &params.source_type,
             ingest_policy: "manual_local",
-            content: Some(&params.content),
+            content: Some(&sanitized_content),
             status: "imported",
             error: None,
             metadata: json!({"manual": true}),
@@ -441,7 +511,7 @@ pub async fn tool_upsert_pattern_source(
         .map_err(sql_error("upsert_pattern_source"))?;
 
     let chunks_embedded = if params.reembed.unwrap_or(true) {
-        embed_source_content(ctx, pool, source_id, &params.content).await?
+        embed_source_content(ctx, pool, source_id, &sanitized_content).await?
     } else {
         0
     };
@@ -479,6 +549,15 @@ async fn ensure_seeded_if_empty(ctx: &SystemContext, pool: &PgPool) -> Result<()
         seed_catalog(ctx, pool).await?;
     }
     Ok(())
+}
+
+/// Background seed entry-point invoked from the daemon at startup so the
+/// first MCP pattern-tool call doesn't block on ~1400 chunk embeddings.
+/// Lazy seeding via `ensure_seeded_if_empty` remains as a safety net for
+/// non-daemon invocations (CLI `pgmcp tool`).
+pub async fn warm_pattern_catalog(ctx: &SystemContext) -> Result<(), McpError> {
+    let pool = raw_pool(ctx)?;
+    ensure_seeded_if_empty(ctx, pool).await
 }
 
 async fn seed_catalog(ctx: &SystemContext, pool: &PgPool) -> Result<ImportSummary, McpError> {
@@ -866,14 +945,17 @@ async fn embed_source_content(
 
     let mut embedded = 0;
     for (idx, (start_line, end_line, chunk)) in chunks.iter().enumerate() {
-        let embedding = ctx.embed().embed_query(chunk).await.map_err(|e| {
+        // Defensive: even if callers forgot to sanitize, NUL bytes must
+        // never reach a Postgres TEXT column. See sanitize_text_for_postgres.
+        let safe_chunk = sanitize_text_for_postgres(chunk);
+        let embedding = ctx.embed().embed_query(&safe_chunk).await.map_err(|e| {
             McpError::internal_error(format!("Pattern source embedding failed: {}", e), None)
         })?;
         patterns::insert_source_chunk(
             pool,
             source_id,
             idx as i32,
-            chunk,
+            &safe_chunk,
             *start_line,
             *end_line,
             &embedding,
@@ -886,6 +968,11 @@ async fn embed_source_content(
     Ok(embedded)
 }
 
+/// Minimum text characters required for a fetched source to be considered
+/// usable. Set low enough to admit short reference pages but high enough to
+/// reject SPA shells where `html_to_text` only stripped script tags.
+const MIN_FETCHED_TEXT_CHARS: usize = 40;
+
 async fn fetch_source_text(
     source: &SourceDescriptor,
     validators: &HttpValidators,
@@ -893,35 +980,72 @@ async fn fetch_source_text(
     let url = source.url.to_string();
     let title = source.title.to_string();
     let validators = validators.clone();
-    tokio::task::spawn_blocking(move || {
-        let mut request = ureq::get(&url).set("User-Agent", "pgmcp-pattern-indexer/0.1");
+    tokio::task::spawn_blocking(move || -> Result<FetchedSource, String> {
+        // reqwest::blocking client. HTTP/2 + gzip/brotli are required because
+        // many indexed sources (Wikipedia, AWS, Microsoft Learn, arXiv) serve
+        // HTTP/2 exclusively and compress responses by default; ureq 2.x
+        // could not consume them and reported "unexpected end of file".
+        let client = reqwest::blocking::Client::builder()
+            .user_agent("pgmcp-pattern-indexer/0.1")
+            .timeout(std::time::Duration::from_secs(30))
+            .gzip(true)
+            .brotli(true)
+            .build()
+            .map_err(|e| format!("build http client failed: {}", e))?;
+
+        let mut request = client
+            .get(&url)
+            .header("Accept", "text/html,application/xhtml+xml,application/pdf,*/*;q=0.8");
         if let Some(etag) = validators.etag.as_deref() {
-            request = request.set("If-None-Match", etag);
+            request = request.header("If-None-Match", etag);
         }
         if let Some(last_modified) = validators.last_modified.as_deref() {
-            request = request.set("If-Modified-Since", last_modified);
+            request = request.header("If-Modified-Since", last_modified);
         }
 
-        let response = match request.call() {
-            Ok(response) => response,
-            Err(ureq::Error::Status(304, response)) => {
-                return Ok(FetchedSource::NotModified {
-                    etag: response.header("ETag").map(str::to_string),
-                    last_modified: response.header("Last-Modified").map(str::to_string),
-                });
-            }
-            Err(e) => return Err(format!("fetch failed for {}: {}", url, e)),
-        };
-        let etag = response.header("ETag").map(str::to_string);
-        let last_modified = response.header("Last-Modified").map(str::to_string);
+        let response = request
+            .send()
+            .map_err(|e| format!("fetch failed for {}: {}", url, e))?;
+
+        let status = response.status();
+        if status == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(FetchedSource::NotModified {
+                etag: response
+                    .headers()
+                    .get("ETag")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string),
+                last_modified: response
+                    .headers()
+                    .get("Last-Modified")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string),
+            });
+        }
+        if !status.is_success() {
+            return Err(format!("fetch failed for {}: status {}", url, status));
+        }
+
+        let etag = response
+            .headers()
+            .get("ETag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let last_modified = response
+            .headers()
+            .get("Last-Modified")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
         let body = response
-            .into_string()
+            .text()
             .map_err(|e| format!("read failed for {}: {}", url, e))?;
-        let text = html_to_text(&body);
-        if text.trim().len() < 80 {
+        let text = sanitize_text_for_postgres(&html_to_text(&body));
+        if text.trim().len() < MIN_FETCHED_TEXT_CHARS {
             Err(format!(
-                "fetched source '{}' but extracted too little text",
-                title
+                "fetched source '{}' but extracted too little text ({} chars after html_to_text; URL may be a JS-rendered SPA or landing page)",
+                title,
+                text.trim().len(),
             ))
         } else {
             Ok(FetchedSource::Modified {
@@ -933,6 +1057,19 @@ async fn fetch_source_text(
     })
     .await
     .map_err(|e| format!("fetch task failed: {}", e))?
+}
+
+/// PostgreSQL TEXT columns reject `\0` even though it's a valid UTF-8 code
+/// point. Some upstream sources (corrupt HTML, content sniffed binary,
+/// editor artefacts) ship NUL bytes inside otherwise-text bodies. Strip
+/// them at every ingress so downstream `INSERT … (TEXT)` never fails with
+/// `invalid byte sequence for encoding "UTF8": 0x00`.
+fn sanitize_text_for_postgres(input: &str) -> String {
+    if input.contains('\0') {
+        input.replace('\0', "")
+    } else {
+        input.to_string()
+    }
 }
 
 fn html_to_text(input: &str) -> String {
@@ -1088,17 +1225,49 @@ fn paradigms_for_language(language: &str) -> Vec<String> {
             vec!["functional_programming"]
         }
         "clojure" | "lisp" | "scheme" => vec!["functional_programming"],
-        "prolog" | "datalog" => vec!["logic_programming"],
+        "prolog" | "datalog" => {
+            vec!["logic_programming", "declarative_programming"]
+        }
         "javascript" | "typescript" | "tsx" | "jsx" => vec![
             "event_driven_programming",
             "functional_programming",
             "object_oriented_programming",
+            "reactive_programming",
         ],
         "aspectj" => vec!["aspect_oriented_programming", "object_oriented_programming"],
+        "erlang" | "elixir" | "pony" | "gleam" => vec![
+            "actor_model",
+            "concurrent_programming",
+            "functional_programming",
+        ],
+        "sql" | "plsql" | "tsql" => vec!["declarative_programming"],
+        "html" | "css" | "scss" | "sass" => vec!["declarative_programming"],
+        "yaml" | "json" | "toml" | "hcl" | "terraform" => vec!["declarative_programming"],
+        "rxjava" | "rxjs" | "rxswift" | "rxkotlin" | "rxscala" => vec![
+            "reactive_programming",
+            "event_driven_programming",
+            "functional_programming",
+        ],
+        "flink" | "beam" | "spark" | "kafka_streams" => vec![
+            "dataflow_programming",
+            "parallel_programming",
+            "distributed_systems",
+        ],
+        "python" => vec![
+            "object_oriented_programming",
+            "functional_programming",
+            "machine_learning_engineering",
+        ],
+        "pytorch" | "tensorflow" | "jax" | "langchain" | "transformers" | "huggingface" => vec![
+            "machine_learning_engineering",
+            "functional_programming",
+            "dataflow_programming",
+        ],
         _ => vec![
             "object_oriented_programming",
             "functional_programming",
             "event_driven_programming",
+            "reactive_programming",
         ],
     }
     .into_iter()
