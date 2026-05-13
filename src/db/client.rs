@@ -147,6 +147,55 @@ pub trait DbClient: Send + Sync {
         relative_path: &str,
     ) -> Result<Option<FileContent>, sqlx::Error>;
     async fn file_info(&self, path: &str) -> Result<Option<FileInfo>, sqlx::Error>;
+    async fn file_chunk_summary(
+        &self,
+        path: &str,
+    ) -> Result<crate::db::queries::FileChunkSummary, sqlx::Error>;
+    async fn get_file_region_by_lines(
+        &self,
+        path: &str,
+        start_line: i32,
+        end_line: i32,
+    ) -> Result<Vec<crate::db::queries::FileChunkRow>, sqlx::Error>;
+    async fn get_chunks_in_index_range(
+        &self,
+        path: &str,
+        idx_start: i32,
+        idx_end: i32,
+    ) -> Result<Vec<crate::db::queries::FileChunkRow>, sqlx::Error>;
+    async fn grep_search_chunks(
+        &self,
+        pattern: &str,
+        project: Option<&str>,
+        language: Option<&str>,
+        glob: Option<&str>,
+        case_insensitive: bool,
+        limit: i32,
+        dedupe_worktrees: bool,
+    ) -> Result<Vec<crate::db::queries::GrepChunkResult>, sqlx::Error>;
+    async fn find_canonical_by_content_hash(
+        &self,
+        project_id: i32,
+        content_hash: i64,
+    ) -> Result<Option<crate::db::queries::CanonicalFileMatch>, sqlx::Error>;
+    async fn update_file_path_in_place(
+        &self,
+        file_id: i64,
+        new_path: &str,
+        new_relative_path: &str,
+        modified_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error>;
+    async fn insert_duplicate_file(
+        &self,
+        project_id: i32,
+        path: &str,
+        relative_path: &str,
+        language: &str,
+        size_bytes: i64,
+        content_hash: i64,
+        canonical_file_id: i64,
+        modified_at: DateTime<Utc>,
+    ) -> Result<i64, sqlx::Error>;
     async fn project_tree(
         &self,
         project_name: &str,
@@ -527,6 +576,98 @@ impl DbClient for PgPool {
 
     async fn file_info(&self, path: &str) -> Result<Option<FileInfo>, sqlx::Error> {
         queries::file_info(self, path).await
+    }
+
+    async fn file_chunk_summary(
+        &self,
+        path: &str,
+    ) -> Result<queries::FileChunkSummary, sqlx::Error> {
+        queries::file_chunk_summary(self, path).await
+    }
+
+    async fn get_file_region_by_lines(
+        &self,
+        path: &str,
+        start_line: i32,
+        end_line: i32,
+    ) -> Result<Vec<queries::FileChunkRow>, sqlx::Error> {
+        queries::get_file_region_by_lines(self, path, start_line, end_line).await
+    }
+
+    async fn get_chunks_in_index_range(
+        &self,
+        path: &str,
+        idx_start: i32,
+        idx_end: i32,
+    ) -> Result<Vec<queries::FileChunkRow>, sqlx::Error> {
+        queries::get_chunks_in_index_range(self, path, idx_start, idx_end).await
+    }
+
+    async fn grep_search_chunks(
+        &self,
+        pattern: &str,
+        project: Option<&str>,
+        language: Option<&str>,
+        glob: Option<&str>,
+        case_insensitive: bool,
+        limit: i32,
+        dedupe_worktrees: bool,
+    ) -> Result<Vec<queries::GrepChunkResult>, sqlx::Error> {
+        queries::grep_search_chunks(
+            self,
+            pattern,
+            project,
+            language,
+            glob,
+            case_insensitive,
+            limit,
+            dedupe_worktrees,
+        )
+        .await
+    }
+
+    async fn find_canonical_by_content_hash(
+        &self,
+        project_id: i32,
+        content_hash: i64,
+    ) -> Result<Option<queries::CanonicalFileMatch>, sqlx::Error> {
+        queries::find_canonical_by_content_hash(self, project_id, content_hash).await
+    }
+
+    async fn update_file_path_in_place(
+        &self,
+        file_id: i64,
+        new_path: &str,
+        new_relative_path: &str,
+        modified_at: DateTime<Utc>,
+    ) -> Result<(), sqlx::Error> {
+        queries::update_file_path_in_place(self, file_id, new_path, new_relative_path, modified_at)
+            .await
+    }
+
+    async fn insert_duplicate_file(
+        &self,
+        project_id: i32,
+        path: &str,
+        relative_path: &str,
+        language: &str,
+        size_bytes: i64,
+        content_hash: i64,
+        canonical_file_id: i64,
+        modified_at: DateTime<Utc>,
+    ) -> Result<i64, sqlx::Error> {
+        queries::insert_duplicate_file(
+            self,
+            project_id,
+            path,
+            relative_path,
+            language,
+            size_bytes,
+            content_hash,
+            canonical_file_id,
+            modified_at,
+        )
+        .await
     }
 
     async fn project_tree(

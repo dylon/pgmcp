@@ -382,6 +382,24 @@ pub struct GrepParams {
                        Default false."
     )]
     pub dedupe_worktrees: Option<bool>,
+    #[schemars(description = "Filter matches to a specific project (by name)")]
+    pub project: Option<String>,
+    #[schemars(description = "Filter matches to a specific language string \
+                       (e.g. \"rust\", \"pdf\", \"latex\")")]
+    pub language: Option<String>,
+    #[schemars(
+        description = "Lines of context to show BEFORE each match (default: 0). Returns at most \
+                       this many extra lines from the matching chunk to anchor the hit; \
+                       cross-chunk context-line stitching is not performed."
+    )]
+    pub before_context: Option<i32>,
+    #[schemars(
+        description = "Lines of context to show AFTER each match (default: 0). See \
+                       `before_context` for caveats."
+    )]
+    pub after_context: Option<i32>,
+    #[schemars(description = "If true, ignore case (`~*` regex op). Default false.")]
+    pub case_insensitive: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1450,6 +1468,21 @@ pub struct EngineeringScorecardParams {
 pub struct ReadFileParams {
     #[schemars(description = "Absolute path of the file to read")]
     pub path: String,
+    #[schemars(description = "1-based inclusive start line for a region read. \
+                       Combine with `end_line` to fetch only a slice of the \
+                       file (stitched from indexed chunks). Use this for long \
+                       documents to avoid pulling 20–50k tokens for a paragraph.")]
+    pub start_line: Option<i32>,
+    #[schemars(
+        description = "1-based inclusive end line for a region read. Pair with \
+                       `start_line`."
+    )]
+    pub end_line: Option<i32>,
+    #[schemars(description = "Inclusive chunk_index lower bound for a chunk-indexed \
+                       region read. Useful when paging large documents.")]
+    pub chunk_index_start: Option<i32>,
+    #[schemars(description = "Inclusive chunk_index upper bound.")]
+    pub chunk_index_end: Option<i32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

@@ -107,6 +107,10 @@ pub struct MockDbClient {
     pub semantic_search_results: Vec<SearchResult>,
     pub text_search_results: Vec<TextSearchResult>,
     pub grep_search_results: Vec<GrepResult>,
+    /// Override for the chunk-aware grep tool. When non-empty, the
+    /// `grep_search_chunks` mock returns these verbatim instead of
+    /// synthesizing from `grep_search_results`.
+    pub grep_chunk_results_override: Vec<pgmcp::db::queries::GrepChunkResult>,
     pub read_file_result: Option<FileContent>,
     pub file_info_result: Option<FileInfo>,
     pub project_tree_result: Vec<String>,
@@ -384,6 +388,103 @@ impl DbClient for MockDbClient {
 
     async fn file_info(&self, _path: &str) -> Result<Option<FileInfo>, sqlx::Error> {
         Ok(self.file_info_result.clone())
+    }
+
+    async fn file_chunk_summary(
+        &self,
+        _path: &str,
+    ) -> Result<pgmcp::db::queries::FileChunkSummary, sqlx::Error> {
+        Ok(pgmcp::db::queries::FileChunkSummary {
+            chunk_count: 0,
+            first_chunk_line: None,
+            last_chunk_line: None,
+        })
+    }
+
+    async fn get_file_region_by_lines(
+        &self,
+        _path: &str,
+        _start_line: i32,
+        _end_line: i32,
+    ) -> Result<Vec<pgmcp::db::queries::FileChunkRow>, sqlx::Error> {
+        Ok(Vec::new())
+    }
+
+    async fn get_chunks_in_index_range(
+        &self,
+        _path: &str,
+        _idx_start: i32,
+        _idx_end: i32,
+    ) -> Result<Vec<pgmcp::db::queries::FileChunkRow>, sqlx::Error> {
+        Ok(Vec::new())
+    }
+
+    async fn grep_search_chunks(
+        &self,
+        _pattern: &str,
+        _project: Option<&str>,
+        _language: Option<&str>,
+        _glob: Option<&str>,
+        _case_insensitive: bool,
+        _limit: i32,
+        _dedupe_worktrees: bool,
+    ) -> Result<Vec<pgmcp::db::queries::GrepChunkResult>, sqlx::Error> {
+        // Synthesize one `GrepChunkResult` per `grep_search_results`
+        // entry so existing tests that stub `grep_search_results` (the
+        // legacy whole-file API) keep working under the new chunk-aware
+        // tool body. Tests that need precise chunk metadata can stub
+        // `grep_chunk_results_override` instead.
+        if !self.grep_chunk_results_override.is_empty() {
+            return Ok(self.grep_chunk_results_override.clone());
+        }
+        let synthesized: Vec<pgmcp::db::queries::GrepChunkResult> = self
+            .grep_search_results
+            .iter()
+            .enumerate()
+            .map(|(i, r)| pgmcp::db::queries::GrepChunkResult {
+                project_name: "mock".into(),
+                path: r.path.clone(),
+                relative_path: r.relative_path.clone(),
+                language: r.language.clone(),
+                chunk_index: 0,
+                start_line: 1,
+                end_line: 1,
+                content: r.content.clone().unwrap_or_default() + if i > 0 { "" } else { "" },
+            })
+            .collect();
+        Ok(synthesized)
+    }
+
+    async fn find_canonical_by_content_hash(
+        &self,
+        _project_id: i32,
+        _content_hash: i64,
+    ) -> Result<Option<pgmcp::db::queries::CanonicalFileMatch>, sqlx::Error> {
+        Ok(None)
+    }
+
+    async fn update_file_path_in_place(
+        &self,
+        _file_id: i64,
+        _new_path: &str,
+        _new_relative_path: &str,
+        _modified_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), sqlx::Error> {
+        Ok(())
+    }
+
+    async fn insert_duplicate_file(
+        &self,
+        _project_id: i32,
+        _path: &str,
+        _relative_path: &str,
+        _language: &str,
+        _size_bytes: i64,
+        _content_hash: i64,
+        _canonical_file_id: i64,
+        _modified_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<i64, sqlx::Error> {
+        Ok(0)
     }
 
     async fn project_tree(

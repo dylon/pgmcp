@@ -1994,6 +1994,282 @@ pub async fn get_chunk_content_rows(
     .await
 }
 
+/// One chunk's content + line + chunk-index info. Returned by the new
+/// region-read helpers used by `read_file`'s `start_line`/`end_line` and
+/// `chunk_index_start`/`chunk_index_end` parameters.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct FileChunkRow {
+    pub chunk_index: i32,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub content: String,
+}
+
+/// Fetch all chunks of a file (by path) whose `(start_line, end_line)`
+/// range overlaps the requested `[start, end]` line window. Returns
+/// chunks ordered by `chunk_index`. Used by `read_file` when the caller
+/// supplies a line range — avoids loading the entire file content for a
+/// targeted slice and works even when `indexed_files.content` is NULL
+/// (Level-1 oversized files).
+///
+/// Follows `duplicate_of_file_id` so duplicate-pointer rows return their
+/// canonical's chunks transparently.
+pub async fn get_file_region_by_lines(
+    pool: &PgPool,
+    path: &str,
+    start_line: i32,
+    end_line: i32,
+) -> Result<Vec<FileChunkRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, FileChunkRow>(
+        "SELECT c.chunk_index, c.start_line, c.end_line, c.content
+         FROM file_chunks c
+         JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+         WHERE f.path = $1
+           AND c.start_line <= $3
+           AND c.end_line   >= $2
+         ORDER BY c.chunk_index",
+    )
+    .bind(path)
+    .bind(start_line)
+    .bind(end_line)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Fetch chunks of a file by `chunk_index` range, inclusive. Returns
+/// chunks ordered by `chunk_index`. Follows `duplicate_of_file_id`.
+pub async fn get_chunks_in_index_range(
+    pool: &PgPool,
+    path: &str,
+    idx_start: i32,
+    idx_end: i32,
+) -> Result<Vec<FileChunkRow>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, FileChunkRow>(
+        "SELECT c.chunk_index, c.start_line, c.end_line, c.content
+         FROM file_chunks c
+         JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+         WHERE f.path = $1
+           AND c.chunk_index >= $2
+           AND c.chunk_index <= $3
+         ORDER BY c.chunk_index",
+    )
+    .bind(path)
+    .bind(idx_start)
+    .bind(idx_end)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Chunk-anchored grep match. Returned by the per-chunk variant of
+/// `grep_search`. The chunk metadata lets the tool body (or the agent)
+/// expand context lines on demand without re-querying the full file.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct GrepChunkResult {
+    pub project_name: String,
+    pub path: String,
+    pub relative_path: String,
+    pub language: String,
+    pub chunk_index: i32,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub content: String,
+}
+
+/// Per-chunk grep: returns the matching `file_chunks` rows for `pattern`,
+/// optionally filtered by project name / language / glob and with case
+/// insensitivity. Unlike `grep_search` (which returns whole files), this
+/// helper anchors each match to a specific `(chunk_index, start_line,
+/// end_line)` so the caller can return a small slice — typically ~500
+/// tokens per hit instead of an entire file's worth.
+pub async fn grep_search_chunks(
+    pool: &PgPool,
+    pattern: &str,
+    project: Option<&str>,
+    language: Option<&str>,
+    glob: Option<&str>,
+    case_insensitive: bool,
+    limit: i32,
+    dedupe_worktrees: bool,
+) -> Result<Vec<GrepChunkResult>, sqlx::Error> {
+    let regex_op = if case_insensitive { "~*" } else { "~" };
+    let like_pattern = glob.map(|g| g.replace('*', "%").replace('?', "_"));
+    // Param layout: $1=pattern, $2=project, $3=language, $4=like (or NULL),
+    // $5=dedupe, $6=limit.
+    let sql = format!(
+        "SELECT
+            p.name AS project_name,
+            f.path,
+            f.relative_path,
+            f.language,
+            c.chunk_index,
+            c.start_line,
+            c.end_line,
+            c.content
+         FROM file_chunks c
+         JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+         JOIN projects p ON p.id = f.project_id
+         WHERE c.content {regex_op} $1
+           AND ($2::text IS NULL OR p.name = $2)
+           AND ($3::text IS NULL OR f.language = $3)
+           AND ($4::text IS NULL OR f.relative_path LIKE $4)
+           AND {dedup}
+         ORDER BY f.path, c.chunk_index
+         LIMIT $6",
+        regex_op = regex_op,
+        dedup = worktree_dedup_clause(5),
+    );
+
+    let rows = sqlx::query_as::<_, GrepChunkResult>(&sql)
+        .bind(pattern)
+        .bind(project)
+        .bind(language)
+        .bind(like_pattern)
+        .bind(dedupe_worktrees)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}
+
+/// Aggregate metadata about a file's chunks. Used by `file_info` to
+/// report `chunk_count`, `first_chunk_line`, and `last_chunk_line` so
+/// clients can size region reads without an extra round-trip.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct FileChunkSummary {
+    pub chunk_count: i32,
+    pub first_chunk_line: Option<i32>,
+    pub last_chunk_line: Option<i32>,
+}
+
+/// Fetch chunk count + line span for a file. Returns zeros for files
+/// without any chunks (oversized Level-1 placeholders, empty files).
+/// Follows `duplicate_of_file_id` so a duplicate reports its canonical's
+/// chunk metadata.
+pub async fn file_chunk_summary(
+    pool: &PgPool,
+    path: &str,
+) -> Result<FileChunkSummary, sqlx::Error> {
+    let row = sqlx::query_as::<_, FileChunkSummary>(
+        "SELECT
+            COUNT(*)::int AS chunk_count,
+            MIN(c.start_line) AS first_chunk_line,
+            MAX(c.end_line) AS last_chunk_line
+         FROM file_chunks c
+         JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+         WHERE f.path = $1",
+    )
+    .bind(path)
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
+}
+
+/// Information about a canonical file row used to drive cross-path
+/// dedup decisions in `embed::pool`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CanonicalFileMatch {
+    pub id: i64,
+    pub path: String,
+    pub content_hash: Option<i64>,
+}
+
+/// Look up the canonical row (i.e. `duplicate_of_file_id IS NULL`) for
+/// a given `(project_id, content_hash)` pair. Used by the index-time
+/// dedup decision: if a row already exists with this content elsewhere
+/// in the project, the new path becomes either a rename (old path gone)
+/// or a duplicate (old path still on disk).
+pub async fn find_canonical_by_content_hash(
+    pool: &PgPool,
+    project_id: i32,
+    content_hash: i64,
+) -> Result<Option<CanonicalFileMatch>, sqlx::Error> {
+    sqlx::query_as::<_, CanonicalFileMatch>(
+        "SELECT id, path, content_hash
+         FROM indexed_files
+         WHERE project_id = $1
+           AND content_hash = $2
+           AND duplicate_of_file_id IS NULL
+         ORDER BY id ASC
+         LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(content_hash)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Update a canonical row's path in place. Used when the rename
+/// detection sees the previous path is gone on disk. Chunks are NOT
+/// touched.
+pub async fn update_file_path_in_place(
+    pool: &PgPool,
+    file_id: i64,
+    new_path: &str,
+    new_relative_path: &str,
+    modified_at: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE indexed_files
+         SET path = $2, relative_path = $3, modified_at = $4, indexed_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(file_id)
+    .bind(new_path)
+    .bind(new_relative_path)
+    .bind(modified_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Insert a duplicate-pointer row referencing an existing canonical.
+/// The new row carries metadata (path/relative_path/size/language/etc.)
+/// but no chunks of its own — queries follow `duplicate_of_file_id` to
+/// the canonical via `COALESCE`. Returns the new row's id.
+pub async fn insert_duplicate_file(
+    pool: &PgPool,
+    project_id: i32,
+    path: &str,
+    relative_path: &str,
+    language: &str,
+    size_bytes: i64,
+    content_hash: i64,
+    canonical_file_id: i64,
+    modified_at: DateTime<Utc>,
+) -> Result<i64, sqlx::Error> {
+    let id: (i64,) = sqlx::query_as(
+        "INSERT INTO indexed_files (
+            project_id, path, relative_path, language, size_bytes,
+            content, content_hash, line_count, truncated, modified_at,
+            duplicate_of_file_id
+         )
+         VALUES ($1, $2, $3, $4, $5, NULL, $6, 0, false, $7, $8)
+         ON CONFLICT (path) DO UPDATE SET
+            project_id = EXCLUDED.project_id,
+            relative_path = EXCLUDED.relative_path,
+            language = EXCLUDED.language,
+            size_bytes = EXCLUDED.size_bytes,
+            content_hash = EXCLUDED.content_hash,
+            modified_at = EXCLUDED.modified_at,
+            duplicate_of_file_id = EXCLUDED.duplicate_of_file_id,
+            indexed_at = NOW()
+         RETURNING id",
+    )
+    .bind(project_id)
+    .bind(path)
+    .bind(relative_path)
+    .bind(language)
+    .bind(size_bytes)
+    .bind(content_hash)
+    .bind(modified_at)
+    .bind(canonical_file_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(id.0)
+}
+
 /// Per-chunk topic summary used to derive cluster keywords.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ChunkTopicSummaryRow {

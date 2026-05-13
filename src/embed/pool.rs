@@ -27,6 +27,27 @@ use crate::error::{PgmcpError, Result};
 use crate::indexer::{scanner, watcher};
 use crate::stats::tracker::StatsTracker;
 
+/// Decision branch for cross-path content-hash dedup. Computed in the
+/// embed worker after content extraction & hashing.
+enum DedupAction {
+    /// Same content already indexed at this path — Level-2 skip.
+    Level2Skip,
+    /// Content already indexed at a different path that is now gone
+    /// from disk. Update the canonical's path in place; reuse chunks
+    /// and embeddings.
+    Rename { canonical_id: i64, old_path: String },
+    /// Content already indexed at a different path that is still
+    /// present. Insert a metadata-only duplicate row pointing at the
+    /// canonical; chunk queries dereference via `COALESCE`.
+    Duplicate {
+        canonical_id: i64,
+        canonical_path: String,
+    },
+    /// No matching content elsewhere — proceed with the normal
+    /// extract/chunk/embed/upsert path.
+    ProceedNormal,
+}
+
 /// Indexing-side request handled by an inference pool worker.
 pub enum EmbedIndexRequest {
     /// Full file-indexing pipeline (read → hash → skip-check → chunk →
@@ -408,7 +429,7 @@ fn process_index_file_task(
     use chrono::{DateTime, Utc};
     use xxhash_rust::xxh3::xxh3_64;
 
-    use crate::indexer::{chunker, claude_chunker, codex_chunker};
+    use crate::indexer::{chunker, claude_chunker, codex_chunker, document_chunker, extract};
 
     let path = task.path;
     let path_str = path.to_string_lossy().into_owned();
@@ -490,13 +511,52 @@ fn process_index_file_task(
         }
     };
 
-    // Per-project max_file_size_bytes override.
+    let is_document_language = extract::is_document_language(&language);
+
+    // Per-project size and extraction overrides.
+    let project_override_get = |root: &PathBuf| task.project_overrides.get(root);
     let max_file_size_override = project_root_path.as_ref().and_then(|root| {
-        task.project_overrides
-            .get(root)
+        project_override_get(root)
             .and_then(|ovr| ovr.indexer.as_ref().and_then(|i| i.max_file_size_bytes))
     });
-    let max_size = max_file_size_override.unwrap_or(cfg.indexer.max_file_size_bytes);
+    let max_doc_source_override = project_root_path.as_ref().and_then(|root| {
+        project_override_get(root).and_then(|ovr| {
+            ovr.indexer
+                .as_ref()
+                .and_then(|i| i.max_document_source_bytes)
+        })
+    });
+    let max_extracted_text_override = project_root_path.as_ref().and_then(|root| {
+        project_override_get(root).and_then(|ovr| {
+            ovr.indexer
+                .as_ref()
+                .and_then(|i| i.max_extracted_text_bytes)
+        })
+    });
+    let extraction_timeout_override = project_root_path.as_ref().and_then(|root| {
+        project_override_get(root).and_then(|ovr| {
+            ovr.indexer
+                .as_ref()
+                .and_then(|i| i.document_extraction_timeout_secs)
+        })
+    });
+
+    // Document languages get a separate (larger) size cap; code keeps the
+    // 1 MiB default. Both still go through the source-byte Level-1 skip
+    // below, so unchanged files rescan in O(stat) regardless of size.
+    let max_size = if is_document_language {
+        max_doc_source_override.unwrap_or(cfg.indexer.max_document_source_bytes)
+    } else {
+        max_file_size_override.unwrap_or(cfg.indexer.max_file_size_bytes)
+    };
+
+    let extract_opts = extract::ExtractOptions {
+        timeout: std::time::Duration::from_secs(
+            extraction_timeout_override.unwrap_or(cfg.indexer.document_extraction_timeout_secs),
+        ),
+        max_extracted_bytes: max_extracted_text_override
+            .unwrap_or(cfg.indexer.max_extracted_text_bytes),
+    };
 
     // Pre-read size gate for oversized files: register placeholder, no content.
     if size_bytes > max_size as i64 {
@@ -550,16 +610,201 @@ fn process_index_file_task(
         return;
     }
 
-    // Read file content (sync).
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
-        Err(e) => {
-            error!(path = %path_str, worker_id, error = %e, "fs::read_to_string failed");
-            stats.files_failed.fetch_add(1, Ordering::Relaxed);
-            return;
+    // Read file content (sync). Document languages route through the
+    // extraction subprocess pipeline (`pdftotext`, `ps2ascii`, `pandoc`)
+    // and end up normalized for token-efficient delivery; code languages
+    // are read verbatim as UTF-8.
+    let content = if is_document_language {
+        match extract::extract_for_language(&language, &path, &extract_opts) {
+            Ok(Some(extracted)) => {
+                if extracted.truncated {
+                    stats.documents_truncated.fetch_add(1, Ordering::Relaxed);
+                }
+                extracted.text
+            }
+            Ok(None) => {
+                error!(
+                    path = %path_str,
+                    worker_id,
+                    lang = %language,
+                    "Document extractor returned None for known document language"
+                );
+                stats.files_failed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Err(extract::ExtractError::ToolMissing { tool }) => {
+                debug!(
+                    path = %path_str,
+                    worker_id,
+                    lang = %language,
+                    tool,
+                    "Skipping document — required tool missing"
+                );
+                stats
+                    .documents_skipped_no_tool
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Err(extract::ExtractError::Timeout) => {
+                error!(
+                    path = %path_str,
+                    worker_id,
+                    lang = %language,
+                    "Document extraction timed out"
+                );
+                stats
+                    .documents_extraction_timeout
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            Err(e) => {
+                error!(
+                    path = %path_str,
+                    worker_id,
+                    lang = %language,
+                    error = %e,
+                    "Document extraction failed"
+                );
+                stats.files_failed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+        }
+    } else {
+        match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                error!(path = %path_str, worker_id, error = %e, "fs::read_to_string failed");
+                stats.files_failed.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         }
     };
     let content_hash = xxh3_64(content.as_bytes()) as i64;
+
+    // Cross-path dedup + rename detection:
+    //
+    // - Same path + same content_hash → Level-2 skip (caught below).
+    // - Different path, same content_hash, old path GONE → rename: update
+    //   the canonical's path in place; chunks/embeddings reused.
+    // - Different path, same content_hash, old path PRESENT → duplicate:
+    //   insert a metadata-only row pointing at the canonical via
+    //   `duplicate_of_file_id`; chunk-bearing MCP queries follow the
+    //   pointer transparently.
+    //
+    // For source-code projects this is rare. For document corpora it's
+    // the difference between embedding a moved 50-page PDF once or
+    // re-embedding it every time the user reorganizes their library.
+    let relative_path = path
+        .strip_prefix(&workspace_path)
+        .unwrap_or(&path)
+        .to_string_lossy()
+        .into_owned();
+    let dedup_action = rt.block_on(async {
+        // First — is this row already at this path with this content?
+        if let Ok(Some(existing_hash)) = db.get_content_hash(&path_str).await
+            && existing_hash == content_hash
+        {
+            return Ok::<DedupAction, sqlx::Error>(DedupAction::Level2Skip);
+        }
+        // Otherwise, look for a canonical in the same project with this hash.
+        let canonical = db
+            .find_canonical_by_content_hash(project_id, content_hash)
+            .await?;
+        let Some(canonical) = canonical else {
+            return Ok(DedupAction::ProceedNormal);
+        };
+        if canonical.path == path_str {
+            // Same row; the Level-2 skip should have caught it. Fall
+            // through to the normal upsert (which is idempotent).
+            return Ok(DedupAction::ProceedNormal);
+        }
+        let old_exists = std::path::Path::new(&canonical.path).exists();
+        if !old_exists {
+            return Ok(DedupAction::Rename {
+                canonical_id: canonical.id,
+                old_path: canonical.path,
+            });
+        }
+        Ok(DedupAction::Duplicate {
+            canonical_id: canonical.id,
+            canonical_path: canonical.path,
+        })
+    });
+
+    match dedup_action {
+        Ok(DedupAction::Level2Skip) => return,
+        Ok(DedupAction::Rename {
+            canonical_id,
+            old_path,
+        }) => {
+            // RENAME — update the existing canonical's path in place.
+            let res = rt.block_on(async {
+                db.update_file_path_in_place(canonical_id, &path_str, &relative_path, modified_at)
+                    .await
+            });
+            match res {
+                Ok(()) => {
+                    stats.documents_renamed.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        old = %old_path,
+                        new = %path_str,
+                        canonical_id,
+                        "Rename detected — path updated, chunks reused"
+                    );
+                }
+                Err(e) => {
+                    error!(path = %path_str, error = %e, "rename update failed");
+                    stats.files_failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+        Ok(DedupAction::Duplicate {
+            canonical_id,
+            canonical_path,
+        }) => {
+            // DUPLICATE — insert a metadata-only row pointing at the
+            // canonical; chunk-bearing queries dereference via COALESCE.
+            let res = rt.block_on(async {
+                db.insert_duplicate_file(
+                    project_id,
+                    &path_str,
+                    &relative_path,
+                    &language,
+                    size_bytes,
+                    content_hash,
+                    canonical_id,
+                    modified_at,
+                )
+                .await
+            });
+            match res {
+                Ok(_) => {
+                    stats.documents_deduplicated.fetch_add(1, Ordering::Relaxed);
+                    info!(
+                        canonical = %canonical_path,
+                        duplicate = %path_str,
+                        canonical_id,
+                        "Duplicate detected — pointer stored, extraction skipped"
+                    );
+                }
+                Err(e) => {
+                    error!(path = %path_str, error = %e, "duplicate-pointer insert failed");
+                    stats.files_failed.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            return;
+        }
+        Ok(DedupAction::ProceedNormal) => {}
+        Err(e) => {
+            error!(
+                path = %path_str,
+                error = %e,
+                "dedup decision failed; falling through to normal upsert"
+            );
+            // Fall through — better to over-index than to drop the file.
+        }
+    }
 
     // Level-2 content-hash skip + upsert if changed.
     let upsert_res = rt.block_on(async {
@@ -568,17 +813,12 @@ fn process_index_file_task(
         {
             return Ok::<Option<i64>, sqlx::Error>(None); // skipped
         }
-        let relative = path
-            .strip_prefix(&workspace_path)
-            .unwrap_or(&path)
-            .to_string_lossy()
-            .into_owned();
         let line_count = content.lines().count() as i32;
         let file_id = db
             .upsert_file(
                 project_id,
                 &path_str,
-                &relative,
+                &relative_path,
                 &language,
                 size_bytes,
                 Some(content.as_str()),
@@ -601,13 +841,24 @@ fn process_index_file_task(
         }
     };
 
-    // Chunk content with the language-appropriate chunker.
+    // Chunk content with the language-appropriate chunker. JSONL gets
+    // record-aware variants for Claude/Codex session transcripts; latex
+    // and org get heading-aware chunking (post-pandoc plain text mostly
+    // falls back to paragraph mode internally); pdf/postscript/docx/etc.
+    // use paragraph-aware chunking; everything else uses the line chunker.
     let chunks = if &*language == "jsonl" && claude_chunker::is_claude_session_transcript(&path) {
         claude_chunker::chunk_claude_jsonl(&content)
     } else if &*language == "jsonl" && codex_chunker::is_codex_jsonl(&path) {
         codex_chunker::chunk_codex_jsonl(&content)
     } else if &*language == "jsonl" {
         chunker::chunk_jsonl_content(&content)
+    } else if matches!(&*language, "latex" | "org" | "rst") {
+        document_chunker::chunk_by_heading(&content, &language)
+    } else if matches!(
+        &*language,
+        "pdf" | "postscript" | "docx" | "doc" | "rtf" | "odt" | "epub" | "bibtex"
+    ) {
+        document_chunker::chunk_paragraphs(&content, document_chunker::DEFAULT_PARAGRAPH_OPTS)
     } else {
         chunker::chunk_content(
             &content,

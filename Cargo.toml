@@ -63,6 +63,17 @@ num_cpus = "1"
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+# Document indexing: subprocess + Unicode normalization for the extraction
+# pipeline (PDF/PostScript/DOCX/EPUB → normalized plain text). `which` is
+# used at daemon startup to preflight CLI tools (`pdftotext`, `ps2ascii`,
+# `pandoc`); `wait-timeout` enforces per-extraction subprocess timeouts so
+# malformed inputs cannot wedge a worker; `unicode-normalization` provides
+# the NFKC pass that collapses ligatures and fancy punctuation before
+# storage so MCP tool results are token-efficient.
+which = "6"
+wait-timeout = "0.2"
+unicode-normalization = "0.1"
+
 # Configuration
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }

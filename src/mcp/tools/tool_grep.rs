@@ -9,11 +9,32 @@ use std::time::Instant;
 use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, LoggingLevel};
+use serde::Serialize;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 
 use crate::context::SystemContext;
+use crate::db::queries::GrepChunkResult;
 use crate::mcp::server::*;
+
+/// Per-match response envelope. Slimmer than `GrepChunkResult` for the
+/// JSON wire — drops the raw chunk content when context lines are
+/// requested so the agent only sees the narrow window around each match.
+#[derive(Debug, Serialize)]
+struct GrepHit {
+    project_name: String,
+    path: String,
+    relative_path: String,
+    language: String,
+    chunk_index: i32,
+    /// Matching window's first 1-based line number.
+    window_start: i32,
+    /// Matching window's last 1-based line number (inclusive).
+    window_end: i32,
+    /// Matching window's content (one or more lines from the chunk,
+    /// bounded by `before_context` + match + `after_context`).
+    content: String,
+}
 
 pub async fn tool_grep(
     ctx: &SystemContext,
@@ -24,19 +45,31 @@ pub async fn tool_grep(
     ctx.stats().grep_searches.fetch_add(1, Ordering::Relaxed);
 
     let limit = params.limit.unwrap_or(10);
+    let before = params.before_context.unwrap_or(0).max(0);
+    let after = params.after_context.unwrap_or(0).max(0);
+    let case_insensitive = params.case_insensitive.unwrap_or(false);
+
     info!(
         tool = "grep",
         pattern = %truncate(&params.pattern, 200),
         glob = params.glob.as_deref().unwrap_or("*"),
+        project = params.project.as_deref().unwrap_or("*"),
+        language = params.language.as_deref().unwrap_or("*"),
+        before_context = before,
+        after_context = after,
+        case_insensitive,
         limit,
         "MCP tool invoked",
     );
 
-    let results = ctx
+    let chunks = ctx
         .db()
-        .grep_search(
+        .grep_search_chunks(
             &params.pattern,
+            params.project.as_deref(),
+            params.language.as_deref(),
             params.glob.as_deref(),
+            case_insensitive,
             limit,
             params.dedupe_worktrees.unwrap_or(false),
         )
@@ -46,8 +79,13 @@ pub async fn tool_grep(
             McpError::internal_error(format!("Grep failed: {}", e), None)
         })?;
 
-    let count = results.len();
-    let json = serde_json::to_string_pretty(&results)
+    let hits: Vec<GrepHit> = chunks
+        .into_iter()
+        .map(|m| build_hit(m, &params.pattern, before, after, case_insensitive))
+        .collect();
+
+    let count = hits.len();
+    let json = serde_json::to_string_pretty(&hits)
         .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
 
     debug!(
@@ -58,4 +96,87 @@ pub async fn tool_grep(
     );
 
     Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+/// Given a matching chunk and the pattern, find the first match line
+/// within the chunk and return the requested context window. When
+/// `before == 0 && after == 0`, the entire chunk is returned (the
+/// previous behavior was whole-file; this is still a ~10-100x token
+/// reduction for typical document matches).
+fn build_hit(
+    chunk: GrepChunkResult,
+    pattern: &str,
+    before: i32,
+    after: i32,
+    case_insensitive: bool,
+) -> GrepHit {
+    if before == 0 && after == 0 {
+        return GrepHit {
+            project_name: chunk.project_name,
+            path: chunk.path,
+            relative_path: chunk.relative_path,
+            language: chunk.language,
+            chunk_index: chunk.chunk_index,
+            window_start: chunk.start_line,
+            window_end: chunk.end_line,
+            content: chunk.content,
+        };
+    }
+
+    // Find the first matching line within the chunk to anchor the
+    // context window. We compile the regex defensively; if it fails to
+    // compile we just return the full chunk content.
+    let re = if case_insensitive {
+        regex::RegexBuilder::new(pattern)
+            .case_insensitive(true)
+            .build()
+    } else {
+        regex::Regex::new(pattern)
+    };
+    let Ok(re) = re else {
+        return GrepHit {
+            project_name: chunk.project_name,
+            path: chunk.path,
+            relative_path: chunk.relative_path,
+            language: chunk.language,
+            chunk_index: chunk.chunk_index,
+            window_start: chunk.start_line,
+            window_end: chunk.end_line,
+            content: chunk.content,
+        };
+    };
+
+    let lines: Vec<&str> = chunk.content.split('\n').collect();
+    let match_line_local = lines
+        .iter()
+        .position(|l| re.is_match(l))
+        .map(|i| i as i32)
+        .unwrap_or(0);
+
+    let window_local_start = (match_line_local - before).max(0);
+    let window_local_end = (match_line_local + after).min(lines.len() as i32 - 1);
+    let window_slice: Vec<&&str> = lines
+        .iter()
+        .skip(window_local_start as usize)
+        .take((window_local_end - window_local_start + 1) as usize)
+        .collect();
+
+    let window_start = chunk.start_line + window_local_start;
+    let window_end = chunk.start_line + window_local_end;
+    let content = window_slice
+        .iter()
+        .map(|s| **s)
+        .collect::<Vec<&str>>()
+        .join("\n");
+
+    GrepHit {
+        project_name: chunk.project_name,
+        path: chunk.path,
+        relative_path: chunk.relative_path,
+        language: chunk.language,
+        chunk_index: chunk.chunk_index,
+        window_start,
+        window_end,
+        content,
+    }
 }

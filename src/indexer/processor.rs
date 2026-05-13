@@ -11,7 +11,7 @@ use xxhash_rust::xxh3::xxh3_64;
 use crate::config::Config;
 use crate::db::DbClient;
 use crate::embed::pool::{ChunkData, EmbedIndexRequest, EmbedRequest};
-use crate::indexer::{chunker, claude_chunker, codex_chunker};
+use crate::indexer::{chunker, claude_chunker, codex_chunker, extract};
 use crate::stats::tracker::StatsTracker;
 
 /// Process a single file: read, hash, check if changed, chunk, embed, upsert.
@@ -43,6 +43,15 @@ pub async fn process_file(
             return Ok(());
         }
     };
+
+    // Document languages route through the live pool (which carries the
+    // extraction pipeline). The legacy `process_file` path doesn't run
+    // the subprocess extractors; skip cleanly so document files don't
+    // hit `read_to_string` on binary input.
+    if extract::is_document_language(&language) {
+        trace!(path = %path_str, lang = %language, "Skipping document in legacy processor");
+        return Ok(());
+    }
 
     // Read file metadata
     let metadata =

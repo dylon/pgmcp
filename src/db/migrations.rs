@@ -106,6 +106,24 @@ pub async fn run_migrations(
         .execute(pool)
         .await;
 
+    // Migration: content-based dedup + rename detection.
+    //
+    // `duplicate_of_file_id` (NULL = canonical row; non-NULL = duplicate
+    // pointer). Duplicate rows have `content_hash` set but no
+    // `file_chunks` rows of their own — chunk-bearing queries follow the
+    // pointer via `COALESCE(duplicate_of_file_id, id)`.
+    //
+    // `ON DELETE SET NULL` so deleting a canonical leaves orphan
+    // duplicates that can be promoted on the next scan (see
+    // `delete_file_with_promotion` in queries.rs).
+    let _ = sqlx::query(
+        "ALTER TABLE indexed_files
+         ADD COLUMN IF NOT EXISTS duplicate_of_file_id BIGINT
+         REFERENCES indexed_files(id) ON DELETE SET NULL",
+    )
+    .execute(pool)
+    .await;
+
     // Migration: drop the old UNIQUE composite index on projects(workspace_path, path)
     // if it exists. The path column is already UNIQUE on its own, so the composite
     // index only needs to be a regular (non-unique) index for query performance.
@@ -123,6 +141,8 @@ pub async fn run_migrations(
         "CREATE INDEX IF NOT EXISTS idx_files_project ON indexed_files(project_id)",
         "CREATE INDEX IF NOT EXISTS idx_files_language ON indexed_files(language)",
         "CREATE INDEX IF NOT EXISTS idx_chunks_file_id ON file_chunks(file_id)",
+        "CREATE INDEX IF NOT EXISTS idx_files_duplicate_of ON indexed_files(duplicate_of_file_id) WHERE duplicate_of_file_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_files_canonical_hash ON indexed_files(project_id, content_hash) WHERE duplicate_of_file_id IS NULL AND content_hash IS NOT NULL",
         "CREATE INDEX IF NOT EXISTS idx_projects_workspace_path ON projects(workspace_path, path)",
         // Partial indexes: most projects in pgmcp deployments are git
         // repos, but synthetic / vendored projects leave both columns

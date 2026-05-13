@@ -98,6 +98,29 @@ pub struct IndexerConfig {
     pub max_file_size_bytes: u64,
     #[serde(default = "default_exclude_patterns")]
     pub exclude_patterns: Vec<String>,
+    /// Source-form preference for the per-directory dedup pass. When a
+    /// directory contains multiple files sharing the same stem (e.g.
+    /// `invoice.org` + `invoice.tex` + `invoice.pdf`), the scanner enqueues
+    /// only the entry whose extension appears earliest in this list.
+    /// Extensions not listed are kept unconditionally.
+    #[serde(default = "default_source_priority")]
+    pub source_priority: Vec<String>,
+    /// Per-file source-byte cap for binary document formats (PDF, DOCX,
+    /// EPUB, etc.). The default 1 MiB `max_file_size_bytes` is too small
+    /// for typical academic PDFs and would Level-1-skip them; document
+    /// languages use this separate cap instead.
+    #[serde(default = "default_max_document_source_bytes")]
+    pub max_document_source_bytes: u64,
+    /// Cap on the extracted-text size held in memory per document. The
+    /// subprocess extractors stop reading child stdout at this byte count
+    /// and set `truncated = true` rather than fail outright.
+    #[serde(default = "default_max_extracted_text_bytes")]
+    pub max_extracted_text_bytes: usize,
+    /// Per-file timeout for the document extraction subprocess
+    /// (`pdftotext`, `ps2ascii`, `pandoc`). Past this, the child is
+    /// killed and the file is counted as `documents_extraction_timeout`.
+    #[serde(default = "default_document_extraction_timeout_secs")]
+    pub document_extraction_timeout_secs: u64,
 }
 
 impl Default for IndexerConfig {
@@ -107,6 +130,10 @@ impl Default for IndexerConfig {
             debounce_ms: default_debounce_ms(),
             max_file_size_bytes: default_max_file_size(),
             exclude_patterns: default_exclude_patterns(),
+            source_priority: default_source_priority(),
+            max_document_source_bytes: default_max_document_source_bytes(),
+            max_extracted_text_bytes: default_max_extracted_text_bytes(),
+            document_extraction_timeout_secs: default_document_extraction_timeout_secs(),
         }
     }
 }
@@ -261,6 +288,69 @@ fn default_file_types() -> Vec<FileTypeMapping> {
             extension: "cljs".into(),
             language: "clojurescript".into(),
         },
+        // Document indexing extensions — extraction is routed through
+        // `src/indexer/extract/` to system tools (`pdftotext`,
+        // `ps2ascii`, `pandoc`). The `language` strings here are
+        // deliberately unique from tree-sitter backend names so that
+        // `parsing::LanguageRegistry::for_language` returns `None` for
+        // them and the symbol-extraction / graph / import crons skip
+        // these languages automatically.
+        FileTypeMapping {
+            extension: "pdf".into(),
+            language: "pdf".into(),
+        },
+        FileTypeMapping {
+            extension: "ps".into(),
+            language: "postscript".into(),
+        },
+        FileTypeMapping {
+            extension: "eps".into(),
+            language: "postscript".into(),
+        },
+        FileTypeMapping {
+            extension: "tex".into(),
+            language: "latex".into(),
+        },
+        FileTypeMapping {
+            extension: "latex".into(),
+            language: "latex".into(),
+        },
+        FileTypeMapping {
+            extension: "bib".into(),
+            language: "bibtex".into(),
+        },
+        FileTypeMapping {
+            extension: "org".into(),
+            language: "org".into(),
+        },
+        FileTypeMapping {
+            extension: "rst".into(),
+            language: "rst".into(),
+        },
+        FileTypeMapping {
+            extension: "docx".into(),
+            language: "docx".into(),
+        },
+        FileTypeMapping {
+            extension: "doc".into(),
+            language: "doc".into(),
+        },
+        FileTypeMapping {
+            extension: "rtf".into(),
+            language: "rtf".into(),
+        },
+        FileTypeMapping {
+            extension: "odt".into(),
+            language: "odt".into(),
+        },
+        FileTypeMapping {
+            extension: "epub".into(),
+            language: "epub".into(),
+        },
+        FileTypeMapping {
+            extension: "txt".into(),
+            language: "text".into(),
+        },
     ]
 }
 
@@ -280,6 +370,34 @@ fn default_exclude_patterns() -> Vec<String> {
         "__pycache__".into(),
         "*.lock".into(),
     ]
+}
+
+/// Hardcoded fallback priority for choosing one form when multiple sibling
+/// files share the same `(parent_dir, file_stem)`. Earlier entries are
+/// preferred. Overridable via `[indexer] source_priority = [...]` in the
+/// global config and via `[indexer] source_priority = [...]` in a
+/// per-project `.pgmcp.toml`.
+pub const DEFAULT_SOURCE_PRIORITY: &[&str] = &[
+    "org", "rst", "md", "tex", "latex", "docx", "epub", "odt", "rtf", "pdf", "ps", "eps", "doc",
+];
+
+fn default_source_priority() -> Vec<String> {
+    DEFAULT_SOURCE_PRIORITY
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
+fn default_max_document_source_bytes() -> u64 {
+    100 * 1024 * 1024 // 100 MiB — covers virtually all academic PDFs and ebooks
+}
+
+fn default_max_extracted_text_bytes() -> usize {
+    50 * 1024 * 1024 // 50 MiB of post-extraction text
+}
+
+fn default_document_extraction_timeout_secs() -> u64 {
+    30
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -960,6 +1078,26 @@ impl Config {
             .filter(|p| p.is_dir())
     }
 
+    /// Return the `~/Papers/` directory if it exists. When present, the
+    /// scanner auto-discovers it as a synthetic project named `Papers`
+    /// (mirroring the `~/.claude/` and `~/.codex/` precedent — no `.git/`
+    /// required). Returns `None` if the directory is absent so users
+    /// without an academic-papers folder pay no cost.
+    pub fn papers_dir() -> Option<PathBuf> {
+        dirs::home_dir()
+            .map(|h| h.join("Papers"))
+            .filter(|p| p.is_dir())
+    }
+
+    /// Return the `~/Documents/` directory if it exists. Auto-discovered
+    /// as a synthetic project named `Documents`. See `papers_dir` for the
+    /// design rationale; same `is_dir()` guard pattern.
+    pub fn documents_dir() -> Option<PathBuf> {
+        dirs::home_dir()
+            .map(|h| h.join("Documents"))
+            .filter(|p| p.is_dir())
+    }
+
     /// Upgrade an existing config file by merging new defaults while preserving
     /// user customizations. Returns the path that was written.
     pub fn upgrade(path: Option<&Path>) -> Result<PathBuf> {
@@ -1037,6 +1175,17 @@ pub struct ProjectIndexerOverride {
     pub exclude_patterns: Option<Vec<String>>,
     pub file_types: Option<Vec<FileTypeMapping>>,
     pub max_file_size_bytes: Option<u64>,
+    /// Per-project source-form priority (replaces the global list rather
+    /// than merging — for an ordered list, replace semantics are clearer
+    /// than OR).
+    pub source_priority: Option<Vec<String>>,
+    /// Per-project cap on binary document source bytes; overrides the
+    /// global `[indexer] max_document_source_bytes`.
+    pub max_document_source_bytes: Option<u64>,
+    /// Per-project cap on extracted text size.
+    pub max_extracted_text_bytes: Option<usize>,
+    /// Per-project extraction subprocess timeout in seconds.
+    pub document_extraction_timeout_secs: Option<u64>,
 }
 
 /// Git history indexing configuration for a project.
@@ -1273,6 +1422,100 @@ mod tests {
         let merged = merge_toml_values(defaults, user);
         assert_eq!(merged["a"].as_integer(), Some(2));
         assert_eq!(merged["user_only"].as_integer(), Some(42));
+    }
+
+    /// Regression: every document extension added in Phase 5 must be
+    /// configured and map to its expected language. The language strings
+    /// MUST NOT collide with any tree-sitter backend name in
+    /// `LanguageRegistry`, since that's how the symbol-extraction cron
+    /// decides to skip these files (return `None` from `for_language`).
+    #[test]
+    fn test_default_file_types_includes_document_languages() {
+        let config = IndexerConfig::default();
+        for (ext, expected_lang) in [
+            ("pdf", "pdf"),
+            ("ps", "postscript"),
+            ("eps", "postscript"),
+            ("tex", "latex"),
+            ("latex", "latex"),
+            ("bib", "bibtex"),
+            ("org", "org"),
+            ("rst", "rst"),
+            ("docx", "docx"),
+            ("doc", "doc"),
+            ("rtf", "rtf"),
+            ("odt", "odt"),
+            ("epub", "epub"),
+            ("txt", "text"),
+        ] {
+            let path_str = format!("file.{}", ext);
+            let path = Path::new(&path_str);
+            assert!(
+                config.is_configured_extension(path),
+                "missing document mapping for .{}",
+                ext
+            );
+            assert_eq!(
+                config.language_for_path(path),
+                Some(expected_lang.to_string()),
+                "wrong language for .{}",
+                ext
+            );
+            // None of these languages should resolve to a tree-sitter backend.
+            assert!(
+                crate::parsing::LanguageRegistry::for_language(expected_lang).is_none(),
+                "document language `{}` (.{}) collides with tree-sitter backend",
+                expected_lang,
+                ext
+            );
+        }
+    }
+
+    #[test]
+    fn test_indexer_config_document_defaults() {
+        let cfg = IndexerConfig::default();
+        assert_eq!(cfg.max_document_source_bytes, 100 * 1024 * 1024);
+        assert_eq!(cfg.max_extracted_text_bytes, 50 * 1024 * 1024);
+        assert_eq!(cfg.document_extraction_timeout_secs, 30);
+        // Priority list contains source forms first, output forms last.
+        let prio = &cfg.source_priority;
+        let pos_org = prio.iter().position(|e| e == "org").expect("org present");
+        let pos_tex = prio.iter().position(|e| e == "tex").expect("tex present");
+        let pos_pdf = prio.iter().position(|e| e == "pdf").expect("pdf present");
+        assert!(
+            pos_org < pos_tex && pos_tex < pos_pdf,
+            "expected org < tex < pdf in source priority"
+        );
+    }
+
+    #[test]
+    fn test_project_override_with_document_fields() {
+        let toml_str = r#"
+            [indexer]
+            source_priority = ["org", "pdf"]
+            max_document_source_bytes = 209715200
+            max_extracted_text_bytes = 104857600
+            document_extraction_timeout_secs = 60
+        "#;
+        let parsed: ProjectOverride = toml::from_str(toml_str).expect("parse");
+        let idx = parsed.indexer.expect("indexer section present");
+        assert_eq!(
+            idx.source_priority.as_deref(),
+            Some(&["org".to_string(), "pdf".to_string()][..])
+        );
+        assert_eq!(idx.max_document_source_bytes, Some(209715200));
+        assert_eq!(idx.max_extracted_text_bytes, Some(104857600));
+        assert_eq!(idx.document_extraction_timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn test_synthetic_dir_helpers_optional() {
+        // These helpers return Option<PathBuf>; the contract is "Some when
+        // the directory exists, None otherwise" — we only assert the type
+        // contract here since the directories' existence depends on the
+        // host filesystem.
+        let _: Option<PathBuf> = Config::papers_dir();
+        let _: Option<PathBuf> = Config::documents_dir();
     }
 
     #[test]

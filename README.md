@@ -245,6 +245,23 @@ High-level project understanding and engineering quality assessment.
 - **AOCL-BLIS** (for ndarray BLAS on the CPU fallback; on Arch: `pacman -S aocl-blis`)
 - ~500 MB disk for the all-MiniLM-L6-v2 ONNX model (downloaded on first run)
 
+#### Optional — document indexing
+
+To index `~/Papers/` (academic papers in PDF/LaTeX/EPUB) and `~/Documents/`
+(notes, invoices, mixed formats), install the document-extraction CLI tools.
+Without them, files of the affected types are skipped at index time and the
+count is surfaced via `index_stats.documents_skipped_no_tool`.
+
+| Tool        | Used for                              | Arch              | Debian/Ubuntu          | macOS                   |
+|-------------|---------------------------------------|-------------------|------------------------|-------------------------|
+| `pdftotext` | PDF text extraction                   | `poppler`         | `poppler-utils`        | `brew install poppler`  |
+| `ps2ascii`  | PostScript / `.ps` / `.eps`           | `ghostscript`     | `ghostscript`          | `brew install ghostscript` |
+| `pandoc`    | DOCX, DOC, RTF, ODT, EPUB, LaTeX, ORG | `pandoc-cli`      | `pandoc`               | `brew install pandoc`   |
+
+These are looked up once at daemon startup; missing tools produce a single
+`warn!` line per tool naming the install hint. Plain text and structured-text
+formats (`.md`, `.txt`, `.rst`, `.bib`) need no extra tools.
+
 ### Build & Install
 
 CUDA is mandatory. `Cargo.toml` has no `[features]` table; there is no
@@ -409,6 +426,124 @@ pgmcp also checks whether `~/.codex/` exists and registers it as a synthetic
 **"codex"** project. Codex stores credentials, sqlite state, shell snapshots,
 plugin checkouts, and caches in the same directory, so pgmcp uses an allow-list:
 `config.toml`, `history.jsonl`, `memories/**`, and `sessions/**/*.jsonl`.
+
+### Document Indexing — `~/Papers/` and `~/Documents/`
+
+Beyond source code, pgmcp can index **personal document corpora**: academic
+papers, notes, invoices, manuals — the kinds of things you'd want to grep or
+semantic-search even though they aren't in a git repo.
+
+On startup, pgmcp checks for two well-known document directories and registers
+them as synthetic projects when they exist:
+
+| Directory       | Project name | Typical contents                              |
+|-----------------|--------------|-----------------------------------------------|
+| `~/Papers/`     | `Papers`     | Academic PDFs, LaTeX source, EPUB textbooks   |
+| `~/Documents/` | `Documents`  | Notes (ORG/MD/RST), invoices, DOCX, ODT, RTF  |
+
+No `.git/` is required; the directory's mere existence enables it. Users
+without these directories pay no cost (the daemon `is_dir()`-guards both).
+
+#### Supported formats
+
+| Extension      | Language       | Storage form                                 |
+|----------------|----------------|----------------------------------------------|
+| `pdf`          | `pdf`          | `pdftotext -layout`, NFKC + dehyphenated     |
+| `ps` / `eps`   | `postscript`   | `ps2ascii`, NFKC                             |
+| `docx`         | `docx`         | `pandoc --to plain`                          |
+| `doc`          | `doc`          | `pandoc --to plain` (needs antiword/catdoc)  |
+| `rtf`          | `rtf`          | `pandoc --to plain`                          |
+| `odt`          | `odt`          | `pandoc --to plain`                          |
+| `epub`         | `epub`         | `pandoc --to plain`                          |
+| `tex`/`latex`  | `latex`        | `pandoc --to plain` (strips markup)          |
+| `org`          | `org`          | `pandoc --to plain` (strips markup)          |
+| `rst`          | `rst`          | UTF-8 passthrough + normalization            |
+| `bib`          | `bibtex`       | UTF-8 passthrough + normalization            |
+| `txt`          | `text`         | UTF-8 passthrough + normalization            |
+
+The extraction layer routes binary formats through system tools (see
+Prerequisites) and applies a single **normalization pass** to all outputs:
+NFKC Unicode, dehyphenation of line-break-split words, page-number-line
+stripping, control-character removal, whitespace collapse. The result is
+stored verbatim in `file_chunks.content` so MCP tool responses are
+already token-efficient — no separate wire format needed.
+
+#### Source-form preference
+
+When several forms of the same document coexist in one directory — e.g.
+`invoice.org`, `invoice.tex`, `invoice.pdf` — pgmcp indexes **only the source
+form**, not the build output. The default priority (configurable per project
+in `.pgmcp.toml`) is:
+
+```
+org > rst > md > tex > latex > docx > epub > odt > rtf > pdf > ps > eps > doc
+```
+
+Files whose extension isn't in the priority list (e.g. `.csv`) are kept
+unconditionally — they can't be deduplicated against anything.
+
+#### Content-based dedup and rename detection
+
+For document corpora, the same PDF often ends up in two places (download
+folder + organized archive) or gets moved as the library is reorganized.
+pgmcp detects both cases via content hashing **before** extraction:
+
+- **Rename** — same content, different path, old path is gone on disk:
+  the existing canonical row's path is updated in place; chunks and
+  embeddings are reused.
+- **Cross-path duplicate** — same content, different path, old path still
+  present: insert a metadata-only row pointing at the canonical via
+  `duplicate_of_file_id`. Chunk-bearing queries follow the pointer
+  transparently via `COALESCE(duplicate_of_file_id, id)`.
+
+The savings are large: moving or duplicating a 50-page PDF is now O(stat)
+instead of triggering subprocess extraction + GPU embedding. Counters
+`documents_renamed` and `documents_deduplicated` in `index_stats` surface
+the impact.
+
+#### Recommended agent workflow (token-efficient)
+
+For documents projects, prefer chunk-level retrieval over file-level:
+
+- `semantic_search project=Papers query="attention mechanism" limit=5` —
+  ~5 chunks (~2-3k tokens) targeted at the question.
+- `grep pattern="error budget" project=Documents before_context=2 after_context=2`
+  — chunk-anchored regex matches with surrounding lines, ~500 tokens per
+  hit instead of whole-file (~20-50k tokens).
+- `read_file path=~/Papers/<sample>.pdf start_line=100 end_line=150` —
+  pulls only the requested line range from indexed chunks, stitched and
+  trimmed. Works even when `indexed_files.content` is NULL (Level-1
+  oversized files): chunks are stitched on demand.
+- `read_file path=~/Papers/<sample>.pdf chunk_index_start=5 chunk_index_end=6`
+  — alternate chunk-indexed addressing for paging through long documents.
+
+`file_info` reports `chunk_count`, `first/last_chunk_line`, and
+`extracted_kind` (e.g. `pdf_text`, `docx_text`, `latex_plain`) so the agent
+can plan further reads in one round-trip.
+
+#### Per-project `.pgmcp.toml`
+
+Drop a `.pgmcp.toml` into `~/Papers/` or `~/Documents/` to override defaults:
+
+```toml
+[indexer]
+# Override the 1 MiB default for binary docs (default 100 MiB):
+max_document_source_bytes = 209715200   # 200 MiB
+
+# Per-project priority replacement (note: replace semantics, not merge):
+source_priority = ["org", "tex", "latex", "rst", "md", "epub", "pdf", "ps", "eps"]
+
+# Exclude LaTeX build artifacts in addition to the hardcoded defaults:
+exclude_patterns = [
+    "*.aux", "*.log", "*.out", "*.toc",
+    "*.synctex.gz", "*.fls", "*.fdb_latexmk",
+    "supplementary/", "submissions-archive/",
+]
+
+# Documents typically aren't in git; turn history indexing off explicitly.
+[git]
+index_history = false
+```
 
 ### Project-Level `.claude/` Scanning
 

@@ -33,6 +33,47 @@ const CLAUDE_DIR_EXCLUDES: &[&str] = &[
     "mcp-needs-auth-cache.json",
 ];
 
+/// LaTeX build artifacts and OS noise to exclude under `~/Papers/`. The
+/// patterns follow the same suffix/prefix matching convention used by
+/// the global `exclude_patterns`: a leading `*` matches a suffix; anything
+/// else is treated as a path-component substring.
+const PAPERS_DIR_EXCLUDES: &[&str] = &[
+    "*.aux",
+    "*.log",
+    "*.out",
+    "*.toc",
+    "*.lof",
+    "*.lot",
+    "*.synctex.gz",
+    "*.fls",
+    "*.fdb_latexmk",
+    "*.bbl",
+    "*.blg",
+    "*.nav",
+    "*.snm",
+    "*.vrb",
+    "*.idx",
+    "*.ind",
+    "*.ilg",
+    "*.bak",
+    ".~lock.", // LibreOffice lockfiles: ".~lock.<name>#"
+    "Trash/",
+    ".cache/",
+    "tmp/",
+];
+
+/// Office-app temp files, downloads, and trash to exclude under
+/// `~/Documents/`.
+const DOCUMENTS_DIR_EXCLUDES: &[&str] = &[
+    "*.bak",
+    ".~lock.", // LibreOffice lockfiles
+    "Trash/",
+    ".cache/",
+    "tmp/",
+    ".DS_Store",
+    "*.lnk",
+];
+
 /// Scan all configured workspace paths and submit files for indexing.
 /// Also auto-discovers `~/.claude/` and `~/.codex/` if they exist.
 pub fn scan_workspaces(
@@ -111,6 +152,72 @@ pub fn scan_workspaces(
         );
 
         scan_codex_dir(&codex_dir, &codex_path_str, config, &file_tx);
+    }
+
+    // Auto-discover ~/Papers/ as a synthetic project. The directory has
+    // no `.git/` and is `is_dir()`-guarded so users without it pay no
+    // cost. Honors a `.pgmcp.toml` placed directly in the directory.
+    if let Some(papers_dir) = Config::papers_dir() {
+        let path_str = papers_dir.to_string_lossy().into_owned();
+        info!(path = %path_str, "Auto-discovered ~/Papers/ directory");
+
+        let name = papers_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Papers".into());
+        project_roots.insert(
+            papers_dir.clone(),
+            ProjectRoot {
+                workspace_path: path_str.clone(),
+                name,
+            },
+        );
+        if let Some(ovr) = config::ProjectOverride::load(&papers_dir) {
+            project_overrides.insert(papers_dir.clone(), ovr);
+        }
+
+        let override_snapshot = project_overrides
+            .get(&papers_dir)
+            .map(|r| r.value().clone());
+        scan_papers_dir(
+            &papers_dir,
+            &path_str,
+            config,
+            &file_tx,
+            override_snapshot.as_ref(),
+        );
+    }
+
+    // Auto-discover ~/Documents/ symmetric with ~/Papers/.
+    if let Some(documents_dir) = Config::documents_dir() {
+        let path_str = documents_dir.to_string_lossy().into_owned();
+        info!(path = %path_str, "Auto-discovered ~/Documents/ directory");
+
+        let name = documents_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Documents".into());
+        project_roots.insert(
+            documents_dir.clone(),
+            ProjectRoot {
+                workspace_path: path_str.clone(),
+                name,
+            },
+        );
+        if let Some(ovr) = config::ProjectOverride::load(&documents_dir) {
+            project_overrides.insert(documents_dir.clone(), ovr);
+        }
+
+        let override_snapshot = project_overrides
+            .get(&documents_dir)
+            .map(|r| r.value().clone());
+        scan_documents_dir(
+            &documents_dir,
+            &path_str,
+            config,
+            &file_tx,
+            override_snapshot.as_ref(),
+        );
     }
 }
 
@@ -364,6 +471,230 @@ fn should_index_codex_file(codex_dir: &Path, path: &Path, config: &Config) -> bo
     })
 }
 
+/// Scan `~/Papers/` as a synthetic project named "Papers", applying
+/// source-form deduplication so that an `invoice.org` + `invoice.tex` +
+/// `invoice.pdf` triplet only indexes the highest-priority form.
+fn scan_papers_dir(
+    papers_dir: &Path,
+    workspace_path: &str,
+    config: &Config,
+    file_tx: &Sender<PathBuf>,
+    project_override: Option<&config::ProjectOverride>,
+) {
+    scan_synthetic_doc_dir(
+        papers_dir,
+        workspace_path,
+        config,
+        file_tx,
+        PAPERS_DIR_EXCLUDES,
+        project_override,
+        "~/Papers/",
+    );
+}
+
+/// Scan `~/Documents/` as a synthetic project named "Documents". Same
+/// behavior as `scan_papers_dir` with the Documents-specific excludes.
+fn scan_documents_dir(
+    documents_dir: &Path,
+    workspace_path: &str,
+    config: &Config,
+    file_tx: &Sender<PathBuf>,
+    project_override: Option<&config::ProjectOverride>,
+) {
+    scan_synthetic_doc_dir(
+        documents_dir,
+        workspace_path,
+        config,
+        file_tx,
+        DOCUMENTS_DIR_EXCLUDES,
+        project_override,
+        "~/Documents/",
+    );
+}
+
+/// Shared synthetic-document-directory walker. Mirrors `scan_claude_dir`
+/// but layers source-form deduplication on top of the candidate list
+/// (group by `(parent_dir, file_stem)`; keep one entry per group per the
+/// priority list) so that build outputs don't shadow their sources.
+fn scan_synthetic_doc_dir(
+    dir: &Path,
+    workspace_path: &str,
+    config: &Config,
+    file_tx: &Sender<PathBuf>,
+    extra_excludes: &[&str],
+    project_override: Option<&config::ProjectOverride>,
+    log_label: &str,
+) {
+    let mut builder = WalkBuilder::new(dir);
+    builder.hidden(false);
+    builder.git_ignore(false);
+    builder.git_global(false);
+    builder.git_exclude(false);
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    for entry in builder.build() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(error = %e, "Error walking {}", log_label);
+                continue;
+            }
+        };
+
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+
+        // Synthetic-dir-specific excludes (LaTeX build artifacts, etc.).
+        if matches_any_pattern(path, dir, extra_excludes) {
+            continue;
+        }
+
+        if !config.indexer.is_configured_extension(path) {
+            continue;
+        }
+
+        // Global exclude_patterns.
+        let path_str = path.to_string_lossy();
+        let globally_excluded = config.indexer.exclude_patterns.iter().any(|pattern| {
+            if let Some(suffix) = pattern.strip_prefix('*') {
+                path_str.ends_with(suffix)
+            } else {
+                path_str.contains(pattern)
+            }
+        });
+        if globally_excluded {
+            continue;
+        }
+
+        candidates.push(path.to_path_buf());
+    }
+
+    // Resolve effective source priority: per-project override replaces
+    // the global list (replace semantics, not OR — order matters).
+    let effective_priority: Vec<String> = project_override
+        .and_then(|o| o.indexer.as_ref())
+        .and_then(|i| i.source_priority.clone())
+        .unwrap_or_else(|| config.indexer.source_priority.clone());
+
+    let pre_count = candidates.len();
+    let keepers = dedup_source_forms(candidates, &effective_priority);
+    let post_count = keepers.len();
+    if pre_count != post_count {
+        debug!(
+            label = log_label,
+            before = pre_count,
+            after = post_count,
+            removed = pre_count - post_count,
+            "Source-form dedup collapsed sibling duplicates"
+        );
+    }
+
+    let mut sent: u64 = 0;
+    for path in keepers {
+        if file_tx.send(path).is_err() {
+            break;
+        }
+        sent += 1;
+    }
+    info!(files = sent, path = %workspace_path, label = %log_label, "Scanned synthetic doc directory");
+}
+
+/// True when any pattern in `patterns` matches `path`. Patterns starting
+/// with `*` are suffix matches; otherwise treated as path-component
+/// substring matches against the relative path under `root`.
+fn matches_any_pattern(path: &Path, root: &Path, patterns: &[&str]) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let rel_str = relative.to_string_lossy();
+    patterns.iter().any(|pat| {
+        if let Some(suffix) = pat.strip_prefix('*') {
+            rel_str.ends_with(suffix)
+        } else {
+            rel_str.contains(pat)
+                || relative
+                    .file_name()
+                    .map(|f| f.to_string_lossy().starts_with(pat))
+                    .unwrap_or(false)
+        }
+    })
+}
+
+/// Group input paths by `(parent_dir, file_stem)`. For each group whose
+/// members have priority-listed extensions, keep only the entry whose
+/// extension appears earliest in `priority`. Files whose extensions are
+/// not in `priority` are kept unconditionally (they aren't competing with
+/// anything to be deduplicated against).
+///
+/// Properties:
+/// - Idempotent: `dedup(dedup(xs)) == dedup(xs)`.
+/// - Subset: every output appears in input.
+/// - Order-preserving: keepers are emitted in their original input order.
+/// - Cross-directory paths never merge.
+pub(crate) fn dedup_source_forms(files: Vec<PathBuf>, priority: &[String]) -> Vec<PathBuf> {
+    use std::collections::HashMap;
+
+    if files.is_empty() {
+        return files;
+    }
+    let prio_idx: HashMap<&str, usize> = priority
+        .iter()
+        .enumerate()
+        .map(|(i, ext)| (ext.as_str(), i))
+        .collect();
+
+    // For each (parent, stem) group with priority members, remember the
+    // input index of the winner. Non-priority files index into `keep` as
+    // `true` unconditionally; priority files start `false` and the winner
+    // gets flipped to `true`.
+    let mut keep: Vec<bool> = vec![false; files.len()];
+    let mut groups: HashMap<(PathBuf, String), (usize, usize)> = HashMap::new(); // (winner_idx, winner_prio)
+
+    for (i, path) in files.iter().enumerate() {
+        let parent = path.parent().map(Path::to_path_buf);
+        let stem = path.file_stem().and_then(|s| s.to_str()).map(String::from);
+        let ext = path.extension().and_then(|e| e.to_str());
+        let (Some(parent), Some(stem)) = (parent, stem) else {
+            keep[i] = true;
+            continue;
+        };
+        let Some(ext) = ext else {
+            keep[i] = true;
+            continue;
+        };
+        match prio_idx.get(ext) {
+            None => {
+                // Extension not in priority list — not in any dedup
+                // group; kept unconditionally.
+                keep[i] = true;
+            }
+            Some(&prio) => {
+                let key = (parent, stem);
+                groups
+                    .entry(key)
+                    .and_modify(|(winner_idx, winner_prio)| {
+                        if prio < *winner_prio {
+                            *winner_idx = i;
+                            *winner_prio = prio;
+                        }
+                    })
+                    .or_insert((i, prio));
+            }
+        }
+    }
+
+    for (_, (winner_idx, _)) in groups {
+        keep[winner_idx] = true;
+    }
+
+    files
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(p, k)| if k { Some(p) } else { None })
+        .collect()
+}
+
 fn codex_relative_path_allowed(relative: &Path) -> bool {
     if relative == Path::new("config.toml") || relative == Path::new("history.jsonl") {
         return true;
@@ -421,6 +752,128 @@ mod tests {
                 should_index_codex_file(codex_dir, Path::new(path), &config),
                 "expected Codex scanner to include {path}"
             );
+        }
+    }
+
+    fn priority_default() -> Vec<String> {
+        crate::config::DEFAULT_SOURCE_PRIORITY
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+
+    #[test]
+    fn dedup_prefers_org_over_tex_over_pdf() {
+        let inputs = vec![
+            PathBuf::from("/p/invoice.pdf"),
+            PathBuf::from("/p/invoice.tex"),
+            PathBuf::from("/p/invoice.org"),
+        ];
+        let out = dedup_source_forms(inputs, &priority_default());
+        assert_eq!(out, vec![PathBuf::from("/p/invoice.org")]);
+    }
+
+    #[test]
+    fn dedup_prefers_tex_over_pdf_when_no_org() {
+        let inputs = vec![PathBuf::from("/p/paper.pdf"), PathBuf::from("/p/paper.tex")];
+        let out = dedup_source_forms(inputs, &priority_default());
+        assert_eq!(out, vec![PathBuf::from("/p/paper.tex")]);
+    }
+
+    #[test]
+    fn dedup_keeps_files_with_unknown_extensions() {
+        // `.csv` isn't in the priority list, so it should be kept
+        // unconditionally even when an `.org` sibling exists.
+        let inputs = vec![PathBuf::from("/p/data.csv"), PathBuf::from("/p/data.org")];
+        let mut out = dedup_source_forms(inputs, &priority_default());
+        out.sort();
+        assert_eq!(
+            out,
+            vec![PathBuf::from("/p/data.csv"), PathBuf::from("/p/data.org")]
+        );
+    }
+
+    #[test]
+    fn dedup_does_not_dedup_across_parent_dirs() {
+        let inputs = vec![PathBuf::from("/a/paper.pdf"), PathBuf::from("/b/paper.pdf")];
+        let out = dedup_source_forms(inputs.clone(), &priority_default());
+        assert_eq!(out, inputs);
+    }
+
+    #[test]
+    fn dedup_singleton_passes_through() {
+        let inputs = vec![PathBuf::from("/p/only.pdf")];
+        let out = dedup_source_forms(inputs.clone(), &priority_default());
+        assert_eq!(out, inputs);
+    }
+
+    #[test]
+    fn dedup_idempotent() {
+        let inputs = vec![
+            PathBuf::from("/p/invoice.pdf"),
+            PathBuf::from("/p/invoice.tex"),
+            PathBuf::from("/p/invoice.org"),
+            PathBuf::from("/q/notes.md"),
+            PathBuf::from("/q/notes.pdf"),
+        ];
+        let prio = priority_default();
+        let once = dedup_source_forms(inputs, &prio);
+        let twice = dedup_source_forms(once.clone(), &prio);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn dedup_per_project_priority_replaces_global() {
+        // Custom priority puts `pdf` before `org` — caller can prefer PDFs.
+        let custom = vec!["pdf".to_string(), "org".to_string()];
+        let inputs = vec![
+            PathBuf::from("/p/invoice.pdf"),
+            PathBuf::from("/p/invoice.org"),
+        ];
+        let out = dedup_source_forms(inputs, &custom);
+        assert_eq!(out, vec![PathBuf::from("/p/invoice.pdf")]);
+    }
+
+    #[test]
+    fn dedup_empty_priority_no_dedup() {
+        let inputs = vec![
+            PathBuf::from("/p/invoice.pdf"),
+            PathBuf::from("/p/invoice.org"),
+        ];
+        let out = dedup_source_forms(inputs.clone(), &Vec::new());
+        // Every extension is "unknown" in the empty priority — both kept.
+        assert_eq!(out, inputs);
+    }
+
+    use proptest::prelude::*;
+    proptest! {
+        #[test]
+        fn prop_dedup_subset(
+            paths in prop::collection::vec(
+                "[a-z]{1,4}/[a-z]{1,4}\\.(pdf|tex|org|md)",
+                0..30,
+            )
+        ) {
+            let inputs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+            let out = dedup_source_forms(inputs.clone(), &priority_default());
+            for p in &out {
+                prop_assert!(inputs.contains(p));
+            }
+            prop_assert!(out.len() <= inputs.len());
+        }
+
+        #[test]
+        fn prop_dedup_idempotent(
+            paths in prop::collection::vec(
+                "[a-z]{1,4}/[a-z]{1,4}\\.(pdf|tex|org|md|csv)",
+                0..30,
+            )
+        ) {
+            let inputs: Vec<PathBuf> = paths.iter().map(PathBuf::from).collect();
+            let prio = priority_default();
+            let once = dedup_source_forms(inputs, &prio);
+            let twice = dedup_source_forms(once.clone(), &prio);
+            prop_assert_eq!(once, twice);
         }
     }
 

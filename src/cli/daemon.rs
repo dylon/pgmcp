@@ -21,7 +21,7 @@ use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
 use std::sync::atomic::Ordering;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::{self, Config};
 use crate::context::SystemContext;
@@ -175,6 +175,15 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
 
     // 2. Initialize stats tracker
     let stats_tracker = Arc::new(stats::tracker::StatsTracker::new());
+
+    // 2b. Document-extraction tool preflight. Logs once at startup which
+    // CLI tools (poppler/ghostscript/pandoc) are available for the
+    // document indexing pipeline. Missing tools don't abort the daemon —
+    // files of the affected types are skipped at index time and counted
+    // via `documents_skipped_no_tool` so missing tools surface in
+    // `index_stats`. Per-tool `OnceLock` resolution then avoids
+    // re-running `which::which` on the hot path.
+    preflight_document_tools();
 
     // 3. Initialize the three role-specialized work pools.
     //
@@ -551,4 +560,28 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
 
     info!("pgmcp shutdown complete");
     Ok(())
+}
+
+/// Probe `$PATH` for each CLI tool the document extraction pipeline can
+/// use, logging availability once at startup. Missing tools are non-fatal
+/// — affected file types are simply skipped at index time and counted via
+/// `StatsTracker::documents_skipped_no_tool`. The hint string included
+/// with each missing tool tells the operator which package to install.
+fn preflight_document_tools() {
+    for (tool, langs, hint) in indexer::extract::REQUIRED_TOOLS {
+        match which::which(tool) {
+            Ok(path) => info!(
+                tool = %tool,
+                path = %path.display(),
+                langs = ?langs,
+                "Document extraction tool available"
+            ),
+            Err(_) => warn!(
+                tool = %tool,
+                langs = ?langs,
+                hint = %hint,
+                "Document extraction tool MISSING — files of these types will be skipped"
+            ),
+        }
+    }
 }

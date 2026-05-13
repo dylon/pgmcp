@@ -92,6 +92,25 @@ pub struct StatsTracker {
     pub split_scans: AtomicU64,
     pub doc_coverage_scans: AtomicU64,
 
+    // Document indexing counters — populated by `embed::pool` when
+    // processing PDF/DOCX/EPUB/etc. files. `_skipped_no_tool` indicates a
+    // missing CLI tool (poppler/ghostscript/pandoc) was needed; the
+    // daemon's startup preflight names which tool to install.
+    pub documents_skipped_no_tool: AtomicU64,
+    pub documents_extraction_timeout: AtomicU64,
+    pub documents_truncated: AtomicU64,
+    /// Cross-path duplicate detected at index time — second copy of the
+    /// same content stored as a metadata-only `duplicate_of_file_id`
+    /// pointer to the canonical row.
+    pub documents_deduplicated: AtomicU64,
+    /// Rename/relocation detected — content found at a previously
+    /// known path that no longer exists on disk; the canonical row's
+    /// path was updated in place without re-extracting or re-embedding.
+    pub documents_renamed: AtomicU64,
+    /// Canonical deleted while duplicates pointed at it — one duplicate
+    /// was promoted to canonical and chunks were re-parented to it.
+    pub documents_canonical_promoted: AtomicU64,
+
     // Graph analysis counters
     pub graph_build_runs: AtomicU64,
     pub dependency_graph_scans: AtomicU64,
@@ -238,6 +257,12 @@ impl StatsTracker {
             merge_scans: AtomicU64::new(0),
             split_scans: AtomicU64::new(0),
             doc_coverage_scans: AtomicU64::new(0),
+            documents_skipped_no_tool: AtomicU64::new(0),
+            documents_extraction_timeout: AtomicU64::new(0),
+            documents_truncated: AtomicU64::new(0),
+            documents_deduplicated: AtomicU64::new(0),
+            documents_renamed: AtomicU64::new(0),
+            documents_canonical_promoted: AtomicU64::new(0),
             graph_build_runs: AtomicU64::new(0),
             dependency_graph_scans: AtomicU64::new(0),
             centrality_scans: AtomicU64::new(0),
@@ -350,6 +375,12 @@ impl StatsTracker {
             "merge_scans": self.merge_scans.load(Ordering::Acquire),
             "split_scans": self.split_scans.load(Ordering::Acquire),
             "doc_coverage_scans": self.doc_coverage_scans.load(Ordering::Acquire),
+            "documents_skipped_no_tool": self.documents_skipped_no_tool.load(Ordering::Acquire),
+            "documents_extraction_timeout": self.documents_extraction_timeout.load(Ordering::Acquire),
+            "documents_truncated": self.documents_truncated.load(Ordering::Acquire),
+            "documents_deduplicated": self.documents_deduplicated.load(Ordering::Acquire),
+            "documents_renamed": self.documents_renamed.load(Ordering::Acquire),
+            "documents_canonical_promoted": self.documents_canonical_promoted.load(Ordering::Acquire),
             "graph_build_runs": self.graph_build_runs.load(Ordering::Acquire),
             "dependency_graph_scans": self.dependency_graph_scans.load(Ordering::Acquire),
             "centrality_scans": self.centrality_scans.load(Ordering::Acquire),

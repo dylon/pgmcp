@@ -35,6 +35,7 @@ anyhow = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 pgvector = { version = "0.4", features = ["sqlx"] }
 crossbeam-channel = "0.5"
+dashmap = "6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 libc = "0.2"
 arc-swap = "1"
