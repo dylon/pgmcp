@@ -5,6 +5,122 @@ use std::time::Instant;
 
 use dashmap::DashMap;
 
+/// Per-tool telemetry: call count, error count, cumulative duration, and
+/// bucketed duration histogram. Used both keyed by `tool_name`
+/// (the `tool_invocations` map, replacing the old plain `AtomicU64`) and
+/// keyed by `(tool_name, client_name)` (the `tool_telemetry_by_client`
+/// map). All increments are `Relaxed`: this is observability-only data
+/// with no happens-before requirement against other state.
+///
+/// Bucket spacing is exponential at 3× per step from 100 µs to 1000 s
+/// plus an overflow bucket — yielding p50/p95/p99 estimates accurate
+/// to within a 3× factor without any per-call allocation.
+pub struct PerToolStats {
+    pub count: AtomicU64,
+    pub error_count: AtomicU64,
+    pub duration_ns_sum: AtomicU64,
+    pub duration_buckets: [AtomicU64; 16],
+}
+
+impl PerToolStats {
+    /// Inclusive upper bounds (ns) for each duration bucket. Index 15
+    /// is the overflow bucket (`u64::MAX`).
+    pub const BUCKET_UPPER_NS: [u64; 16] = [
+        100_000,
+        300_000,
+        1_000_000,
+        3_000_000,
+        10_000_000,
+        30_000_000,
+        100_000_000,
+        300_000_000,
+        1_000_000_000,
+        3_000_000_000,
+        10_000_000_000,
+        30_000_000_000,
+        100_000_000_000,
+        300_000_000_000,
+        1_000_000_000_000,
+        u64::MAX,
+    ];
+
+    pub fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            error_count: AtomicU64::new(0),
+            duration_ns_sum: AtomicU64::new(0),
+            duration_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+
+    /// Record a single tool invocation. `duration_ns` is the wall-clock
+    /// time the future took (including timeout if any). `ok = false`
+    /// also increments `error_count`.
+    pub fn record(&self, duration_ns: u64, ok: bool) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        if !ok {
+            self.error_count.fetch_add(1, Ordering::Relaxed);
+        }
+        self.duration_ns_sum.fetch_add(duration_ns, Ordering::Relaxed);
+        let bucket = Self::BUCKET_UPPER_NS
+            .iter()
+            .position(|&upper| duration_ns <= upper)
+            .unwrap_or(15);
+        self.duration_buckets[bucket].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Estimate the p-th percentile (p ∈ [0.0, 1.0]) duration in ns by
+    /// finding the bucket whose cumulative count crosses `total * p`.
+    /// Returns the bucket's upper bound; precision is therefore 3× the
+    /// underlying bucket spacing.
+    pub fn percentile_ns(&self, p: f64) -> u64 {
+        let counts: [u64; 16] = std::array::from_fn(|i| {
+            self.duration_buckets[i].load(Ordering::Relaxed)
+        });
+        let total: u64 = counts.iter().sum();
+        if total == 0 {
+            return 0;
+        }
+        let target = ((total as f64) * p) as u64;
+        let mut running = 0u64;
+        for (i, &c) in counts.iter().enumerate() {
+            running = running.saturating_add(c);
+            if running >= target {
+                return Self::BUCKET_UPPER_NS[i];
+            }
+        }
+        Self::BUCKET_UPPER_NS[15]
+    }
+
+    /// JSON snapshot suitable for inclusion in `/api/status` and the
+    /// `pgmcp://stats` MCP resource.
+    pub fn snapshot(&self) -> serde_json::Value {
+        let count = self.count.load(Ordering::Relaxed);
+        let errors = self.error_count.load(Ordering::Relaxed);
+        let sum_ns = self.duration_ns_sum.load(Ordering::Relaxed);
+        let mean_ms = if count > 0 {
+            (sum_ns as f64 / count as f64) / 1_000_000.0
+        } else {
+            0.0
+        };
+        let to_ms = |ns: u64| ns as f64 / 1_000_000.0;
+        serde_json::json!({
+            "count": count,
+            "errors": errors,
+            "mean_ms": mean_ms,
+            "p50_ms": to_ms(self.percentile_ns(0.50)),
+            "p95_ms": to_ms(self.percentile_ns(0.95)),
+            "p99_ms": to_ms(self.percentile_ns(0.99)),
+        })
+    }
+}
+
+impl Default for PerToolStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// All statistics counters — fully lock-free.
 pub struct StatsTracker {
     // Indexing counters
@@ -252,13 +368,23 @@ pub struct StatsTracker {
     /// Read by observability tooling to correlate RSS spikes with cron phase.
     pub heavy_cron_running: AtomicBool,
 
-    /// Per-tool invocation counter, keyed by MCP tool name (e.g.
-    /// `"semantic_search"`, `"grep"`, `"orient"`). Populated by
-    /// `record_tool_call()` at the top of each `#[tool]` body in
-    /// `src/mcp/server.rs`. Surfaced in `/api/status`'s `counters` block as
-    /// the `tool_invocations` map. Used to A/B-test pgmcp utilization across
-    /// rollouts of the description rewrites, hooks, and agent-override work.
-    pub tool_invocations: DashMap<String, AtomicU64>,
+    /// Per-tool telemetry, keyed by MCP tool name (e.g. `"semantic_search"`,
+    /// `"grep"`, `"orient"`). Populated by `record_tool_call()` from the
+    /// `instrumented_tool_wrap` helper in `src/mcp/server.rs` once per
+    /// tool invocation, after the future has resolved. Carries call count,
+    /// error count, cumulative duration, and a 16-bucket duration
+    /// histogram so p50/p95/p99 can be derived without per-call allocation.
+    /// Surfaced in `/api/status` as the `tool_invocations` map (count
+    /// only, for back-compat) and as the new `tool_telemetry` map (full
+    /// per-tool detail).
+    pub tool_invocations: DashMap<String, PerToolStats>,
+    /// Per-(tool, client_name) telemetry, keyed by
+    /// `(tool_name, client_name_lowercased)` where client_name is sourced
+    /// from `rmcp::Peer::peer_info().client_info.name` (e.g. `"claude-code"`,
+    /// `"cursor"`). Defaults to `"unknown"` when the MCP `initialize`
+    /// handshake has not been observed yet. Surfaced in `/api/status` as
+    /// `tool_telemetry_by_client`.
+    pub tool_telemetry_by_client: DashMap<(String, String), PerToolStats>,
 
     // Uptime
     pub uptime_start: Instant,
@@ -380,19 +506,25 @@ impl StatsTracker {
             current_rss_bytes: AtomicU64::new(0),
             heavy_cron_running: AtomicBool::new(false),
             tool_invocations: DashMap::new(),
+            tool_telemetry_by_client: DashMap::new(),
             uptime_start: Instant::now(),
         }
     }
 
-    /// Increment the per-tool invocation counter for the named MCP tool.
-    /// Called once at the top of each `#[tool]` body in `src/mcp/server.rs`.
-    /// `Relaxed` ordering: the counter is observability-only, no
-    /// happens-before relation needed with anything else.
-    pub fn record_tool_call(&self, name: &str) {
+    /// Record a completed tool invocation. Called once per tool call
+    /// from `instrumented_tool_wrap` in `src/mcp/server.rs` after the
+    /// future resolves. Increments both the per-tool and the
+    /// per-(tool, client) telemetry. `Relaxed` ordering throughout:
+    /// observability-only data with no happens-before requirement.
+    pub fn record_tool_call(&self, name: &str, client: &str, duration_ns: u64, ok: bool) {
         self.tool_invocations
             .entry(name.to_string())
-            .or_insert_with(|| AtomicU64::new(0))
-            .fetch_add(1, Ordering::Relaxed);
+            .or_insert_with(PerToolStats::new)
+            .record(duration_ns, ok);
+        self.tool_telemetry_by_client
+            .entry((name.to_string(), client.to_string()))
+            .or_insert_with(PerToolStats::new)
+            .record(duration_ns, ok);
     }
 
     /// Get a JSON snapshot of all counters.
@@ -508,7 +640,25 @@ impl StatsTracker {
             "http_mcp_sessions": self.http_mcp_sessions.load(Ordering::Acquire),
             "tool_invocations": serde_json::Value::Object(
                 self.tool_invocations.iter()
-                    .map(|e| (e.key().clone(), serde_json::Value::from(e.value().load(Ordering::Relaxed))))
+                    .map(|e| (e.key().clone(), serde_json::Value::from(e.value().count.load(Ordering::Relaxed))))
+                    .collect()
+            ),
+            "tool_telemetry": serde_json::Value::Object(
+                self.tool_invocations.iter()
+                    .map(|e| (e.key().clone(), e.value().snapshot()))
+                    .collect()
+            ),
+            "tool_telemetry_by_client": serde_json::Value::Array(
+                self.tool_telemetry_by_client.iter()
+                    .map(|e| {
+                        let (tool, client) = e.key();
+                        let mut obj = e.value().snapshot();
+                        if let Some(map) = obj.as_object_mut() {
+                            map.insert("tool".to_string(), serde_json::Value::String(tool.clone()));
+                            map.insert("client".to_string(), serde_json::Value::String(client.clone()));
+                        }
+                        obj
+                    })
                     .collect()
             ),
             "uptime_secs": self.uptime_start.elapsed().as_secs(),

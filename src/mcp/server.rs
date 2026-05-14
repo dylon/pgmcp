@@ -48,6 +48,77 @@ where
     }
 }
 
+/// Identifying metadata about the MCP peer that issued the current call,
+/// derived from the rmcp `RequestContext`. `client_name` is normalized to
+/// lowercase so per-(tool, client) breakdowns are stable across capitalization
+/// variants in `clientInfo.name`.
+///
+/// `client_version` and `protocol_version` are captured for Tier 3's DB-row
+/// telemetry but unused by the Tier 1 in-memory counters. The
+/// `#[allow(dead_code)]` is removed once those fields land in the
+/// `mcp_tool_calls` row builder.
+#[derive(Clone, Debug)]
+#[allow(dead_code)]
+pub(crate) struct CallerInfo {
+    pub client_name: String,
+    pub client_version: String,
+    pub protocol_version: String,
+}
+
+impl CallerInfo {
+    pub fn unknown() -> Self {
+        Self {
+            client_name: "unknown".to_string(),
+            client_version: "unknown".to_string(),
+            protocol_version: "unknown".to_string(),
+        }
+    }
+}
+
+/// Extract caller identification from the rmcp `RequestContext`. Reads
+/// `ctx.peer.peer_info()` (which carries `client_info.{name, version}` and
+/// `protocol_version` from the MCP `initialize` handshake) and returns
+/// a `CallerInfo`. Falls back to `"unknown"` triple when the peer has not
+/// completed `initialize` yet (rare; only on the very first tool call).
+pub(crate) fn extract_caller(ctx: &RequestContext<RoleServer>) -> CallerInfo {
+    let Some(info) = ctx.peer.peer_info() else {
+        return CallerInfo::unknown();
+    };
+    CallerInfo {
+        client_name: info.client_info.name.to_lowercase(),
+        client_version: info.client_info.version.clone(),
+        protocol_version: format!("{:?}", info.protocol_version),
+    }
+}
+
+/// Time, identify, and record a tool invocation, then forward through
+/// `timeout_wrap` so the timeout behavior is preserved verbatim. Replaces
+/// the older `self.stats().record_tool_call(name)` + `timeout_wrap(...)`
+/// idiom that lived at the top of every `#[tool]` body — captures the
+/// same per-tool counter PLUS duration, error outcome, and caller identity
+/// in one place.
+pub(crate) async fn instrumented_tool_wrap<F>(
+    stats: &StatsTracker,
+    name: &str,
+    secs: u64,
+    ctx: &RequestContext<RoleServer>,
+    fut: F,
+) -> Result<CallToolResult, McpError>
+where
+    F: std::future::Future<Output = Result<CallToolResult, McpError>>,
+{
+    let caller = extract_caller(ctx);
+    let start = std::time::Instant::now();
+    let result = timeout_wrap(name, secs, fut).await;
+    let duration_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    let ok = result.is_ok();
+    stats.record_tool_call(name, &caller.client_name, duration_ns, ok);
+    if !ok {
+        stats.mcp_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    result
+}
+
 /// Truncate a string to at most `max_len` bytes on a valid char boundary.
 pub(crate) fn truncate(s: &str, max_len: usize) -> &str {
     if s.len() <= max_len {
@@ -1597,11 +1668,13 @@ Code session transcripts, memory files, and plans from ~/.claude/.")]
     async fn semantic_search(
         &self,
         Parameters(params): Parameters<SemanticSearchParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("semantic_search");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "semantic_search",
             30,
+            &_ctx,
             super::tools::tool_semantic_search::tool_semantic_search(self.ctx(), params),
         )
         .await
@@ -1616,11 +1689,13 @@ Filter by project; use project: \"claude\" to search Claude Code session transcr
     async fn text_search(
         &self,
         Parameters(params): Parameters<TextSearchParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("text_search");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "text_search",
             30,
+            &_ctx,
             super::tools::tool_text_search::tool_text_search(self.ctx(), params),
         )
         .await
@@ -1637,11 +1712,13 @@ Returns file paths, line numbers, and matching snippets across all indexed proje
     async fn grep(
         &self,
         Parameters(params): Parameters<GrepParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("grep");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "grep",
             30,
+            &_ctx,
             super::tools::tool_grep::tool_grep(self.ctx(), params),
         )
         .await
@@ -1659,22 +1736,25 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
     async fn read_file(
         &self,
         Parameters(params): Parameters<ReadFileParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("read_file");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "read_file",
             30,
+            &_ctx,
             super::tools::tool_read_file::tool_read_file(self.ctx(), params),
         )
         .await
     }
 
     #[tool(description = "List all discovered projects with file counts.")]
-    async fn list_projects(&self) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("list_projects");
-        timeout_wrap(
+    async fn list_projects(&self, _ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
             "list_projects",
             30,
+            &_ctx,
             super::tools::tool_list_projects::tool_list_projects(self.ctx()),
         )
         .await
@@ -1686,11 +1766,13 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
     async fn orient(
         &self,
         Parameters(params): Parameters<OrientParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("orient");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "orient",
             30,
+            &_ctx,
             super::tools::tool_orient::tool_orient(self.ctx(), params),
         )
         .await
@@ -1702,11 +1784,13 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
     async fn mandate_context(
         &self,
         Parameters(params): Parameters<MandateContextParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("mandate_context");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "mandate_context",
             30,
+            &_ctx,
             super::tools::tool_mandate_context::tool_mandate_context(self.ctx(), params),
         )
         .await
@@ -1718,11 +1802,13 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
     async fn session_mandates(
         &self,
         Parameters(params): Parameters<SessionMandatesParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("session_mandates");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "session_mandates",
             30,
+            &_ctx,
             super::tools::tool_session_mandates::tool_session_mandates(self.ctx(), params),
         )
         .await
@@ -1734,11 +1820,13 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
     async fn promote_session_mandate(
         &self,
         Parameters(params): Parameters<PromoteSessionMandateParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("promote_session_mandate");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "promote_session_mandate",
             30,
+            &_ctx,
             super::tools::tool_session_mandates::tool_promote_session_mandate(self.ctx(), params),
         )
         .await
@@ -1754,11 +1842,13 @@ entry points.")]
     async fn project_tree(
         &self,
         Parameters(params): Parameters<ProjectTreeParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("project_tree");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "project_tree",
             30,
+            &_ctx,
             super::tools::tool_project_tree::tool_project_tree(self.ctx(), params),
         )
         .await
@@ -1775,11 +1865,13 @@ use the built-in `Bash: stat` or `Read` instead."
     async fn file_info(
         &self,
         Parameters(params): Parameters<FileInfoParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("file_info");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "file_info",
             30,
+            &_ctx,
             super::tools::tool_file_info::tool_file_info(self.ctx(), params),
         )
         .await
@@ -1788,11 +1880,12 @@ use the built-in `Bash: stat` or `Read` instead."
     #[tool(
         description = "Get overall indexing statistics including file counts, search counts, and pool state."
     )]
-    async fn index_stats(&self) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("index_stats");
-        timeout_wrap(
+    async fn index_stats(&self, _ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
             "index_stats",
             30,
+            &_ctx,
             super::tools::tool_index_stats::tool_index_stats(self.ctx()),
         )
         .await
@@ -1801,12 +1894,18 @@ use the built-in `Bash: stat` or `Read` instead."
     #[tool(
         description = "Trigger a full re-index of all workspaces. Clears the existing index and restarts indexing. Can be invoked as a long-running task."
     )]
-    async fn reindex(&self) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("reindex");
+    async fn reindex(&self, _ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
         // No timeout: reindex can run for minutes on a large workspace.
         // Progress is reported via the MCP task store, not the immediate
         // response — wrapping in 30s would falsely fail every full reindex.
-        super::tools::tool_reindex::tool_reindex(self.ctx()).await
+        let caller = extract_caller(&_ctx);
+        let start = std::time::Instant::now();
+        let result = super::tools::tool_reindex::tool_reindex(self.ctx()).await;
+        let duration_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+        let ok = result.is_ok();
+        self.stats().record_tool_call("reindex", &caller.client_name, duration_ns, ok);
+        if !ok { self.stats().mcp_errors.fetch_add(1, Ordering::Relaxed); }
+        result
     }
 
     #[tool(
@@ -1821,11 +1920,13 @@ overall similarity, chunk alignment, and a human-readable verdict."
     async fn compare_files(
         &self,
         Parameters(params): Parameters<CompareFilesParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("compare_files");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "compare_files",
             30,
+            &_ctx,
             super::tools::tool_compare_files::tool_compare_files(self.ctx(), params),
         )
         .await
@@ -1842,11 +1943,13 @@ chunk similarity to file-level avg/max/matching count."
     async fn find_similar_modules(
         &self,
         Parameters(params): Parameters<FindSimilarModulesParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("find_similar_modules");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "find_similar_modules",
             30,
+            &_ctx,
             super::tools::tool_find_similar_modules::tool_find_similar_modules(self.ctx(), params),
         )
         .await
@@ -1865,11 +1968,13 @@ batch scan to have run at least once."
     async fn find_duplicates(
         &self,
         Parameters(params): Parameters<FindDuplicatesParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("find_duplicates");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "find_duplicates",
             30,
+            &_ctx,
             super::tools::tool_find_duplicates::tool_find_duplicates(self.ctx(), params),
         )
         .await
@@ -1881,11 +1986,13 @@ batch scan to have run at least once."
     async fn refactoring_report(
         &self,
         Parameters(params): Parameters<RefactoringReportParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("refactoring_report");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "refactoring_report",
             30,
+            &_ctx,
             super::tools::tool_refactoring_report::tool_refactoring_report(self.ctx(), params),
         )
         .await
@@ -1906,11 +2013,13 @@ Reads the materialized similarity table; requires the 6-hour similarity-scan cro
     async fn chunk_clusters(
         &self,
         Parameters(params): Parameters<ChunkClustersParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("chunk_clusters");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "chunk_clusters",
             30,
+            &_ctx,
             super::tools::tool_chunk_clusters::tool_chunk_clusters(self.ctx(), params),
         )
         .await
@@ -1930,11 +2039,13 @@ or absolute path."
     async fn internal_dry(
         &self,
         Parameters(params): Parameters<InternalDryParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("internal_dry");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "internal_dry",
             30,
+            &_ctx,
             super::tools::tool_internal_dry::tool_internal_dry(self.ctx(), params),
         )
         .await
@@ -1953,11 +2064,13 @@ Reads materialized similarity table; requires the 6-hour similarity-scan cron."
     async fn extraction_candidates(
         &self,
         Parameters(params): Parameters<ExtractionCandidatesParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("extraction_candidates");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "extraction_candidates",
             30,
+            &_ctx,
             super::tools::tool_extraction_candidates::tool_extraction_candidates(
                 self.ctx(),
                 params,
@@ -1980,12 +2093,13 @@ proposed method name, abstraction kind by language, and a diversity-rewarded pri
     async fn pattern_abstraction_candidates(
         &self,
         Parameters(params): Parameters<PatternAbstractionParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats()
-            .record_tool_call("pattern_abstraction_candidates");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "pattern_abstraction_candidates",
             30,
+            &_ctx,
             super::tools::tool_pattern_abstraction::tool_pattern_abstraction(self.ctx(), params),
         )
         .await
@@ -2005,11 +2119,13 @@ reported (so you know which identifiers vary across instances). Recommended fix 
     async fn boilerplate_clusters(
         &self,
         Parameters(params): Parameters<BoilerplateClustersParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("boilerplate_clusters");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "boilerplate_clusters",
             30,
+            &_ctx,
             super::tools::tool_boilerplate_clusters::tool_boilerplate_clusters(self.ctx(), params),
         )
         .await
@@ -2029,11 +2145,13 @@ is `move_function` (relocate the single referenced symbol into its sole importer
     async fn stale_zombie_detector(
         &self,
         Parameters(params): Parameters<StaleZombieParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("stale_zombie_detector");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "stale_zombie_detector",
             30,
+            &_ctx,
             super::tools::tool_stale_zombie::tool_stale_zombie(self.ctx(), params),
         )
         .await
@@ -2053,11 +2171,13 @@ be split."
     async fn recommend_module_split(
         &self,
         Parameters(params): Parameters<RecommendModuleSplitParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("recommend_module_split");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "recommend_module_split",
             30,
+            &_ctx,
             super::tools::tool_recommend_module_split::tool_recommend_module_split(
                 self.ctx(),
                 params,
@@ -2080,11 +2200,13 @@ otherwise, propose extracting a new shared interface for the lower-coupling endp
     async fn fix_circular_dependency(
         &self,
         Parameters(params): Parameters<FixCircularDependencyParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("fix_circular_dependency");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "fix_circular_dependency",
             30,
+            &_ctx,
             super::tools::tool_fix_circular_dependency::tool_fix_circular_dependency(
                 self.ctx(),
                 params,
@@ -2107,11 +2229,13 @@ PageRank — the most architecturally central place to consolidate the scattered
     async fn shotgun_surgery_fix(
         &self,
         Parameters(params): Parameters<ShotgunSurgeryFixParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("shotgun_surgery_fix");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "shotgun_surgery_fix",
             30,
+            &_ctx,
             super::tools::tool_shotgun_surgery_fix::tool_shotgun_surgery_fix(self.ctx(), params),
         )
         .await
@@ -2132,11 +2256,13 @@ move_function; upward → invert_dependency."
     async fn recommend_layering(
         &self,
         Parameters(params): Parameters<RecommendLayeringParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("recommend_layering");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "recommend_layering",
             30,
+            &_ctx,
             super::tools::tool_recommend_layering::tool_recommend_layering(self.ctx(), params),
         )
         .await
@@ -2153,11 +2279,13 @@ quality declines (still works on imports + topics)."
     async fn pr_scope_recommender(
         &self,
         Parameters(params): Parameters<PrScopeRecommenderParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("pr_scope_recommender");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "pr_scope_recommender",
             30,
+            &_ctx,
             super::tools::tool_pr_scope::tool_pr_scope(self.ctx(), params),
         )
         .await
@@ -2175,11 +2303,13 @@ and the result is empty. Each row carries a `priority` (P0/P1/P2) and an action 
     async fn hot_path_audit(
         &self,
         Parameters(params): Parameters<HotPathAuditParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("hot_path_audit");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "hot_path_audit",
             30,
+            &_ctx,
             super::tools::tool_hot_path_audit::tool_hot_path_audit(self.ctx(), params),
         )
         .await
@@ -2196,11 +2326,13 @@ Returns critical / warning / healthy buckets and a `bus_factor_estimate` (greedy
     async fn bus_factor_map(
         &self,
         Parameters(params): Parameters<BusFactorMapParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("bus_factor_map");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "bus_factor_map",
             30,
+            &_ctx,
             super::tools::tool_bus_factor_map::tool_bus_factor_map(self.ctx(), params),
         )
         .await
@@ -2217,11 +2349,13 @@ Pass the PR author's email in `exclude_authors` to skip self-review."
     async fn reviewer_recommender(
         &self,
         Parameters(params): Parameters<ReviewerRecommenderParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("reviewer_recommender");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "reviewer_recommender",
             30,
+            &_ctx,
             super::tools::tool_reviewer_recommender::tool_reviewer_recommender(self.ctx(), params),
         )
         .await
@@ -2236,11 +2370,13 @@ DO NOT USE WHEN: code_graph_edges has no unresolved-target rows."
     async fn dependency_health(
         &self,
         Parameters(params): Parameters<DependencyHealthParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("dependency_health");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "dependency_health",
             30,
+            &_ctx,
             super::tools::tool_dependency_health::tool_dependency_health(self.ctx(), params),
         )
         .await
@@ -2256,11 +2392,13 @@ DO NOT USE WHEN: you have a known seed file — use `find_similar_modules`."
     async fn pattern_search(
         &self,
         Parameters(params): Parameters<PatternSearchParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("pattern_search");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "pattern_search",
             30,
+            &_ctx,
             super::tools::tool_pattern_search::tool_pattern_search(self.ctx(), params),
         )
         .await
@@ -2276,11 +2414,13 @@ DO NOT USE WHEN: git history is disabled — soft-fails with `health.git_history
     async fn merge_conflict_risk(
         &self,
         Parameters(params): Parameters<MergeConflictRiskParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("merge_conflict_risk");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "merge_conflict_risk",
             30,
+            &_ctx,
             super::tools::tool_merge_conflict_risk::tool_merge_conflict_risk(self.ctx(), params),
         )
         .await
@@ -2297,11 +2437,13 @@ ships, returns `divergences[]` with `recommended_fix(action=move_function)`."
     async fn naming_consistency(
         &self,
         Parameters(params): Parameters<NamingConsistencyParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("naming_consistency");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "naming_consistency",
             30,
+            &_ctx,
             super::tools::tool_naming_consistency::tool_naming_consistency(self.ctx(), params),
         )
         .await
@@ -2318,11 +2460,13 @@ falls back to raw bucket data with no projection."
     async fn module_growth_trajectory(
         &self,
         Parameters(params): Parameters<ModuleGrowthParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("module_growth_trajectory");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "module_growth_trajectory",
             30,
+            &_ctx,
             super::tools::tool_module_growth::tool_module_growth(self.ctx(), params),
         )
         .await
@@ -2338,11 +2482,13 @@ DO NOT USE WHEN: no chunks found for the reference."
     async fn adoption_lag(
         &self,
         Parameters(params): Parameters<AdoptionLagParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("adoption_lag");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "adoption_lag",
             30,
+            &_ctx,
             super::tools::tool_adoption_lag::tool_adoption_lag(self.ctx(), params),
         )
         .await
@@ -2359,11 +2505,13 @@ dimension instead of running 6 tools separately."
     async fn tech_debt_burn_down(
         &self,
         Parameters(params): Parameters<TechDebtBurnDownParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("tech_debt_burn_down");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "tech_debt_burn_down",
             45,
+            &_ctx,
             super::tools::tool_tech_debt_burn_down::tool_tech_debt_burn_down(self.ctx(), params),
         )
         .await
@@ -2378,11 +2526,13 @@ Requires per-project opt-in via [git] index_history = true in .pgmcp.toml.")]
     async fn search_commits(
         &self,
         Parameters(params): Parameters<SearchCommitsParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("search_commits");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "search_commits",
             30,
+            &_ctx,
             super::tools::tool_search_commits::tool_search_commits(self.ctx(), params),
         )
         .await
@@ -2397,11 +2547,13 @@ The pattern index is separate from file_chunks and includes locally imported ful
     async fn software_pattern_search(
         &self,
         Parameters(params): Parameters<SoftwarePatternSearchParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("software_pattern_search");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "software_pattern_search",
             30,
+            &_ctx,
             super::tools::tool_software_patterns::tool_software_pattern_search(self.ctx(), params),
         )
         .await
@@ -2415,11 +2567,13 @@ Returns structured recommendations with source citations from the separate patte
     async fn recommend_design_patterns(
         &self,
         Parameters(params): Parameters<RecommendDesignPatternsParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("recommend_design_patterns");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "recommend_design_patterns",
             30,
+            &_ctx,
             super::tools::tool_software_patterns::tool_recommend_design_patterns(
                 self.ctx(),
                 params,
@@ -2435,11 +2589,13 @@ USE WHEN: checking a plan for anti-pattern risks and better paradigm-specific al
     async fn review_design_patterns(
         &self,
         Parameters(params): Parameters<ReviewDesignPatternsParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("review_design_patterns");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "review_design_patterns",
             30,
+            &_ctx,
             super::tools::tool_software_patterns::tool_review_design_patterns(self.ctx(), params),
         )
         .await
@@ -2451,11 +2607,13 @@ USE WHEN: checking a plan for anti-pattern risks and better paradigm-specific al
     async fn get_software_pattern(
         &self,
         Parameters(params): Parameters<GetSoftwarePatternParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("get_software_pattern");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "get_software_pattern",
             30,
+            &_ctx,
             super::tools::tool_software_patterns::tool_get_software_pattern(self.ctx(), params),
         )
         .await
@@ -2467,11 +2625,13 @@ USE WHEN: checking a plan for anti-pattern risks and better paradigm-specific al
     async fn list_software_patterns(
         &self,
         Parameters(params): Parameters<ListSoftwarePatternsParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("list_software_patterns");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "list_software_patterns",
             30,
+            &_ctx,
             super::tools::tool_software_patterns::tool_list_software_patterns(self.ctx(), params),
         )
         .await
@@ -2480,11 +2640,12 @@ USE WHEN: checking a plan for anti-pattern risks and better paradigm-specific al
     #[tool(
         description = "Pattern catalog statistics: paradigms, patterns, source families, chunks, and embedding status."
     )]
-    async fn pattern_catalog_stats(&self) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("pattern_catalog_stats");
-        timeout_wrap(
+    async fn pattern_catalog_stats(&self, _ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
             "pattern_catalog_stats",
             30,
+            &_ctx,
             super::tools::tool_software_patterns::tool_pattern_catalog_stats(self.ctx()),
         )
         .await
@@ -2497,16 +2658,18 @@ mode=seed_only embeds bundled cards; mode=source_family imports one source famil
     async fn refresh_pattern_catalog(
         &self,
         Parameters(params): Parameters<RefreshPatternCatalogParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("refresh_pattern_catalog");
         // mode=all touches ~50 registered source families; each fetches an
         // article body over HTTP and re-embeds 10-30 chunks. A 10-minute
         // ceiling accommodates that without leaving the call open forever.
         // Per-source progress is committed independently, so a timeout still
         // preserves what landed before the deadline.
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "refresh_pattern_catalog",
             600,
+            &_ctx,
             super::tools::tool_software_patterns::tool_refresh_pattern_catalog(self.ctx(), params),
         )
         .await
@@ -2518,13 +2681,15 @@ mode=seed_only embeds bundled cards; mode=source_family imports one source famil
     async fn upsert_pattern_source(
         &self,
         Parameters(params): Parameters<UpsertPatternSourceParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("upsert_pattern_source");
         // Single-source manual ingestion: 5 minutes covers very large pasted
         // bodies (entire books, RFCs) and the per-chunk embedding loop.
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "upsert_pattern_source",
             300,
+            &_ctx,
             super::tools::tool_software_patterns::tool_upsert_pattern_source(self.ctx(), params),
         )
         .await
@@ -2543,11 +2708,13 @@ topic clusters with keyword labels, membership scores, and representative chunks
     async fn discover_topics(
         &self,
         Parameters(params): Parameters<DiscoverTopicsParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("discover_topics");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "discover_topics",
             30,
+            &_ctx,
             super::tools::tool_discover_topics::tool_discover_topics(self.ctx(), params),
         )
         .await
@@ -2559,11 +2726,13 @@ topic clusters with keyword labels, membership scores, and representative chunks
     async fn topic_hierarchy_fcm(
         &self,
         Parameters(params): Parameters<TopicHierarchyFcmParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("topic_hierarchy_fcm");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "topic_hierarchy_fcm",
             30,
+            &_ctx,
             super::tools::tool_topic_hierarchy_fcm::tool_topic_hierarchy_fcm(self.ctx(), params),
         )
         .await
@@ -2580,11 +2749,13 @@ Requires discover_topics first."
     async fn find_orphans(
         &self,
         Parameters(params): Parameters<FindOrphansParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("find_orphans");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "find_orphans",
             30,
+            &_ctx,
             super::tools::tool_find_orphans::tool_find_orphans(self.ctx(), params),
         )
         .await
@@ -2602,11 +2773,13 @@ discover_topics first."
     async fn find_misplaced_code(
         &self,
         Parameters(params): Parameters<FindMisplacedCodeParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("find_misplaced_code");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "find_misplaced_code",
             30,
+            &_ctx,
             super::tools::tool_find_misplaced_code::tool_find_misplaced_code(self.ctx(), params),
         )
         .await
@@ -2625,11 +2798,13 @@ Requires [git] index_history = true."
     async fn find_coupled_files(
         &self,
         Parameters(params): Parameters<FindCoupledFilesParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("find_coupled_files");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "find_coupled_files",
             30,
+            &_ctx,
             super::tools::tool_find_coupled_files::tool_find_coupled_files(self.ctx(), params),
         )
         .await
@@ -2647,11 +2822,13 @@ Requires discover_topics first."
     async fn test_coverage_gaps(
         &self,
         Parameters(params): Parameters<TestCoverageGapsParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("test_coverage_gaps");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "test_coverage_gaps",
             30,
+            &_ctx,
             super::tools::tool_test_coverage_gaps::tool_test_coverage_gaps(self.ctx(), params),
         )
         .await
@@ -2669,11 +2846,13 @@ Sortable by: composite (default), size, chunks, topics, coupling."
     async fn complexity_hotspots(
         &self,
         Parameters(params): Parameters<ComplexityHotspotsParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("complexity_hotspots");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "complexity_hotspots",
             30,
+            &_ctx,
             super::tools::tool_complexity_hotspots::tool_complexity_hotspots(self.ctx(), params),
         )
         .await
@@ -2685,11 +2864,13 @@ Sortable by: composite (default), size, chunks, topics, coupling."
     async fn topic_hierarchy(
         &self,
         Parameters(params): Parameters<TopicHierarchyParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("topic_hierarchy");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "topic_hierarchy",
             30,
+            &_ctx,
             super::tools::tool_topic_hierarchy::tool_topic_hierarchy(self.ctx(), params),
         )
         .await
@@ -2708,11 +2889,13 @@ for all languages."
     async fn suggest_merges(
         &self,
         Parameters(params): Parameters<SuggestMergesParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("suggest_merges");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "suggest_merges",
             30,
+            &_ctx,
             super::tools::tool_suggest_merges::tool_suggest_merges(self.ctx(), params),
         )
         .await
@@ -2729,11 +2912,13 @@ scored. Requires discover_topics first."
     async fn suggest_splits(
         &self,
         Parameters(params): Parameters<SuggestSplitsParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("suggest_splits");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "suggest_splits",
             30,
+            &_ctx,
             super::tools::tool_suggest_splits::tool_suggest_splits(self.ctx(), params),
         )
         .await
@@ -2750,11 +2935,13 @@ Requires discover_topics first."
     async fn doc_coverage_gaps(
         &self,
         Parameters(params): Parameters<DocCoverageGapsParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("doc_coverage_gaps");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "doc_coverage_gaps",
             30,
+            &_ctx,
             super::tools::tool_doc_coverage_gaps::tool_doc_coverage_gaps(self.ctx(), params),
         )
         .await
@@ -2776,11 +2963,13 @@ Output formats: summary (counts), edges (list), DOT (Graphviz). Requires graph-a
     async fn dependency_graph(
         &self,
         Parameters(params): Parameters<DependencyGraphParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("dependency_graph");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "dependency_graph",
             30,
+            &_ctx,
             super::tools::tool_dependency_graph::tool_dependency_graph(self.ctx(), params),
         )
         .await
@@ -2799,11 +2988,13 @@ PageRank as part of its envelope."
     async fn centrality_analysis(
         &self,
         Parameters(params): Parameters<CentralityAnalysisParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("centrality_analysis");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "centrality_analysis",
             30,
+            &_ctx,
             super::tools::tool_centrality_analysis::tool_centrality_analysis(self.ctx(), params),
         )
         .await
@@ -2815,11 +3006,13 @@ PageRank as part of its envelope."
     async fn community_detection(
         &self,
         Parameters(params): Parameters<CommunityDetectionParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("community_detection");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "community_detection",
             30,
+            &_ctx,
             super::tools::tool_community_detection::tool_community_detection(self.ctx(), params),
         )
         .await
@@ -2835,11 +3028,13 @@ Requires graph-analysis cron."
     async fn circular_dependencies(
         &self,
         Parameters(params): Parameters<CircularDependenciesParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("circular_dependencies");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "circular_dependencies",
             30,
+            &_ctx,
             super::tools::tool_circular_dependencies::tool_circular_dependencies(
                 self.ctx(),
                 params,
@@ -2859,11 +3054,13 @@ Requires graph-analysis cron + git history for full coverage."
     async fn change_impact_analysis(
         &self,
         Parameters(params): Parameters<ChangeImpactAnalysisParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("change_impact_analysis");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "change_impact_analysis",
             30,
+            &_ctx,
             super::tools::tool_change_impact_analysis::tool_change_impact_analysis(
                 self.ctx(),
                 params,
@@ -2888,11 +3085,13 @@ Requires graph-analysis cron."
     async fn coupling_cohesion_report(
         &self,
         Parameters(params): Parameters<CouplingCohesionReportParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("coupling_cohesion_report");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "coupling_cohesion_report",
             30,
+            &_ctx,
             super::tools::tool_coupling_cohesion_report::tool_coupling_cohesion_report(
                 self.ctx(),
                 params,
@@ -2913,11 +3112,13 @@ Grouped by severity. Requires graph-analysis cron."
     async fn architecture_violations(
         &self,
         Parameters(params): Parameters<ArchitectureViolationsParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("architecture_violations");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "architecture_violations",
             30,
+            &_ctx,
             super::tools::tool_architecture_violations::tool_architecture_violations(
                 self.ctx(),
                 params,
@@ -2938,11 +3139,13 @@ Filter to specific smell types via `smells` param. Requires graph-analysis + dis
     async fn design_smell_detection(
         &self,
         Parameters(params): Parameters<DesignSmellDetectionParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("design_smell_detection");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "design_smell_detection",
             30,
+            &_ctx,
             super::tools::tool_design_smell_detection::tool_design_smell_detection(
                 self.ctx(),
                 params,
@@ -2964,11 +3167,13 @@ Each dim 0-100%. Requires graph-analysis + discover_topics."
     async fn architecture_quality(
         &self,
         Parameters(params): Parameters<ArchitectureQualityParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("architecture_quality");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "architecture_quality",
             30,
+            &_ctx,
             super::tools::tool_architecture_quality::tool_architecture_quality(self.ctx(), params),
         )
         .await
@@ -2986,11 +3191,13 @@ Pure metrics, no interpretation. Useful in scorecards and CI gates."
     async fn design_metrics(
         &self,
         Parameters(params): Parameters<DesignMetricsParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("design_metrics");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "design_metrics",
             30,
+            &_ctx,
             super::tools::tool_design_metrics::tool_design_metrics(self.ctx(), params),
         )
         .await
@@ -3012,11 +3219,13 @@ Heuristic, not ML. Requires graph-analysis cron + git history."
     async fn bug_prediction(
         &self,
         Parameters(params): Parameters<BugPredictionParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("bug_prediction");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "bug_prediction",
             30,
+            &_ctx,
             super::tools::tool_bug_prediction::tool_bug_prediction(self.ctx(), params),
         )
         .await
@@ -3034,11 +3243,13 @@ Optionally scans content for TODO/FIXME/HACK markers."
     async fn technical_debt_analysis(
         &self,
         Parameters(params): Parameters<TechnicalDebtAnalysisParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("technical_debt_analysis");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "technical_debt_analysis",
             30,
+            &_ctx,
             super::tools::tool_technical_debt_analysis::tool_technical_debt_analysis(
                 self.ctx(),
                 params,
@@ -3059,11 +3270,13 @@ No ML deps — pure statistical distance."
     async fn anomaly_detection(
         &self,
         Parameters(params): Parameters<AnomalyDetectionParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("anomaly_detection");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "anomaly_detection",
             30,
+            &_ctx,
             super::tools::tool_anomaly_detection::tool_anomaly_detection(self.ctx(), params),
         )
         .await
@@ -3086,11 +3299,13 @@ RRF gives more stable ordering than either branch alone for mixed queries."
     async fn hybrid_search(
         &self,
         Parameters(params): Parameters<HybridSearchParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("hybrid_search");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "hybrid_search",
             30,
+            &_ctx,
             super::tools::tool_hybrid_search::tool_hybrid_search(self.ctx(), params),
         )
         .await
@@ -3108,11 +3323,13 @@ project-wide overview without prose."
     async fn code_summarize(
         &self,
         Parameters(params): Parameters<CodeSummarizeParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("code_summarize");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "code_summarize",
             30,
+            &_ctx,
             super::tools::tool_code_summarize::tool_code_summarize(self.ctx(), params),
         )
         .await
@@ -3134,11 +3351,13 @@ Aggregates dependency analysis + architecture quality + design smells + test/doc
     async fn engineering_scorecard(
         &self,
         Parameters(params): Parameters<EngineeringScorecardParams>,
+        _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        self.stats().record_tool_call("engineering_scorecard");
-        timeout_wrap(
+        instrumented_tool_wrap(
+            self.stats(),
             "engineering_scorecard",
             30,
+            &_ctx,
             super::tools::tool_engineering_scorecard::tool_engineering_scorecard(
                 self.ctx(),
                 params,
@@ -3363,11 +3582,24 @@ pub(crate) fn format_clustering_summary(
 // CLI dispatch — call tool handlers without a running MCP session
 // ============================================================================
 
+/// CLI dispatch by tool name. Bypasses the rmcp `#[tool]` wrapper (which
+/// now requires a `RequestContext<RoleServer>` synthesized by the transport
+/// layer) and invokes the underlying tool body directly. The CLI test path
+/// has no MCP peer so telemetry attribution records `client = "unknown"` for
+/// these calls.
+///
+/// Most tools live in a module whose name matches the tool name (e.g.
+/// `tool_grep::tool_grep`); for those, the default branch uses `paste!` to
+/// concatenate. A second branch accepts `in $body_mod` for the handful of
+/// tools whose body lives in a different module (e.g. the seven
+/// software-pattern tools all share `tool_software_patterns`).
 macro_rules! dispatch_tool {
     ($self:expr, $name:expr, $args:expr, {
-        $($tool_name:literal => $method:ident($params_ty:ty)),* $(,)?
+        $($tool_name:literal => $method:ident($params_ty:ty)
+            $(in $body_mod:ident)?),* $(,)?
     }, no_params: {
-        $($np_name:literal => $np_method:ident),* $(,)?
+        $($np_name:literal => $np_method:ident
+            $(in $np_body_mod:ident)?),* $(,)?
     }) => {
         match $name {
             $(
@@ -3376,15 +3608,45 @@ macro_rules! dispatch_tool {
                         .map_err(|e| McpError::invalid_params(
                             format!("Invalid parameters for '{}': {}", $tool_name, e), None
                         ))?;
-                    $self.$method(Parameters(params)).await
+                    dispatch_tool_call!($self, $method, params $(, in $body_mod)?)
                 }
             )*
             $(
-                $np_name => $self.$np_method().await,
+                $np_name => dispatch_tool_call_nullary!($self, $np_method $(, in $np_body_mod)?),
             )*
             _ => Err(McpError::invalid_params(
                 format!("Unknown tool: '{}'. Run `pgmcp tool` to list available tools.", $name), None
             ))
+        }
+    };
+}
+
+/// Helper for `dispatch_tool!`: invoke a tool body that takes a params arg.
+/// Default branch infers the module name as `tool_$method`; the `in $body_mod`
+/// branch overrides it.
+macro_rules! dispatch_tool_call {
+    ($self:expr, $method:ident, $params:expr) => {
+        paste::paste! {
+            super::tools::[<tool_ $method>]::[<tool_ $method>]($self.ctx(), $params).await
+        }
+    };
+    ($self:expr, $method:ident, $params:expr, in $body_mod:ident) => {
+        paste::paste! {
+            super::tools::$body_mod::[<tool_ $method>]($self.ctx(), $params).await
+        }
+    };
+}
+
+/// Helper for `dispatch_tool!`: invoke a nullary tool body.
+macro_rules! dispatch_tool_call_nullary {
+    ($self:expr, $method:ident) => {
+        paste::paste! {
+            super::tools::[<tool_ $method>]::[<tool_ $method>]($self.ctx()).await
+        }
+    };
+    ($self:expr, $method:ident, in $body_mod:ident) => {
+        paste::paste! {
+            super::tools::$body_mod::[<tool_ $method>]($self.ctx()).await
         }
     };
 }
@@ -3414,17 +3676,17 @@ impl McpServer {
             "grep"                   => grep(GrepParams),
             "hybrid_search"          => hybrid_search(HybridSearchParams),
             "search_commits"         => search_commits(SearchCommitsParams),
-            // Pattern knowledge
-            "software_pattern_search"    => software_pattern_search(SoftwarePatternSearchParams),
-            "recommend_design_patterns"  => recommend_design_patterns(RecommendDesignPatternsParams),
-            "review_design_patterns"     => review_design_patterns(ReviewDesignPatternsParams),
-            "get_software_pattern"       => get_software_pattern(GetSoftwarePatternParams),
-            "list_software_patterns"     => list_software_patterns(ListSoftwarePatternsParams),
-            "refresh_pattern_catalog"    => refresh_pattern_catalog(RefreshPatternCatalogParams),
-            "upsert_pattern_source"      => upsert_pattern_source(UpsertPatternSourceParams),
-            // Session-level mandates
+            // Pattern knowledge — all share the `tool_software_patterns` module.
+            "software_pattern_search"    => software_pattern_search(SoftwarePatternSearchParams) in tool_software_patterns,
+            "recommend_design_patterns"  => recommend_design_patterns(RecommendDesignPatternsParams) in tool_software_patterns,
+            "review_design_patterns"     => review_design_patterns(ReviewDesignPatternsParams) in tool_software_patterns,
+            "get_software_pattern"       => get_software_pattern(GetSoftwarePatternParams) in tool_software_patterns,
+            "list_software_patterns"     => list_software_patterns(ListSoftwarePatternsParams) in tool_software_patterns,
+            "refresh_pattern_catalog"    => refresh_pattern_catalog(RefreshPatternCatalogParams) in tool_software_patterns,
+            "upsert_pattern_source"      => upsert_pattern_source(UpsertPatternSourceParams) in tool_software_patterns,
+            // Session-level mandates — `promote_session_mandate` shares the `tool_session_mandates` module.
             "session_mandates"           => session_mandates(SessionMandatesParams),
-            "promote_session_mandate"    => promote_session_mandate(PromoteSessionMandateParams),
+            "promote_session_mandate"    => promote_session_mandate(PromoteSessionMandateParams) in tool_session_mandates,
             // File info
             "read_file"              => read_file(ReadFileParams),
             "mandate_context"        => mandate_context(MandateContextParams),
@@ -3469,7 +3731,7 @@ impl McpServer {
             "list_projects" => list_projects,
             "index_stats"   => index_stats,
             "reindex"       => reindex,
-            "pattern_catalog_stats" => pattern_catalog_stats,
+            "pattern_catalog_stats" => pattern_catalog_stats in tool_software_patterns,
         })
     }
 }

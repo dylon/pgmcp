@@ -60,6 +60,13 @@ dashmap = "6"
 arc-swap = "1"
 num_cpus = "1"
 
+# Macro token concatenation — used by the `dispatch_tool!` CLI dispatcher in
+# `src/mcp/server.rs` to expand `$method` → `super::tools::tool_$method::tool_$method`
+# so the CLI test harness can invoke tool bodies directly, bypassing the rmcp
+# `#[tool]` wrapper (which now requires a `RequestContext<RoleServer>` we do
+# not synthesize in the test path).
+paste = "1"
+
 # Hashing
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 

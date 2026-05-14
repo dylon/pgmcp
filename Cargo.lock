@@ -2790,6 +2790,7 @@ dependencies = [
  "notify",
  "num_cpus",
  "parking_lot",
+ "paste",
  "petgraph",
  "pgvector",
  "predicates",
