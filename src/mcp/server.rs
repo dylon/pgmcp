@@ -96,7 +96,9 @@ pub(crate) fn extract_caller(ctx: &RequestContext<RoleServer>) -> CallerInfo {
 /// the older `self.stats().record_tool_call(name)` + `timeout_wrap(...)`
 /// idiom that lived at the top of every `#[tool]` body — captures the
 /// same per-tool counter PLUS duration, error outcome, and caller identity
-/// in one place.
+/// in one place. Additionally enqueues a durable `TelemetryRow` for the
+/// async writer task (Tier 3); the enqueue is non-blocking and drops on
+/// channel overflow.
 pub(crate) async fn instrumented_tool_wrap<F>(
     stats: &StatsTracker,
     name: &str,
@@ -110,13 +112,69 @@ where
     let caller = extract_caller(ctx);
     let start = std::time::Instant::now();
     let result = timeout_wrap(name, secs, fut).await;
-    let duration_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    let elapsed = start.elapsed();
+    let duration_ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
     let ok = result.is_ok();
     stats.record_tool_call(name, &caller.client_name, duration_ns, ok);
     if !ok {
         stats.mcp_errors.fetch_add(1, Ordering::Relaxed);
     }
+    let (outcome, error_class) = classify_result(&result, secs, elapsed);
+    let row = crate::stats::telemetry_writer::TelemetryRow {
+        tool: name.to_string(),
+        client_name: caller.client_name.clone(),
+        client_version: Some(caller.client_version.clone()),
+        protocol_version: Some(caller.protocol_version.clone()),
+        mcp_session_id: None,
+        project: None,
+        cwd: None,
+        duration_ms: (duration_ns / 1_000_000).min(i32::MAX as u64) as i32,
+        outcome,
+        error_class,
+        request_id: Some(format!("{:?}", ctx.id)),
+        params_sha256: None,
+    };
+    crate::stats::telemetry_writer::try_enqueue(stats, row);
     result
+}
+
+/// Classify a tool result into the `outcome` + `error_class` columns of
+/// `mcp_tool_calls`. The `timeout` outcome is detected when the duration
+/// is at-or-above the budget AND the error message mentions "timed out".
+fn classify_result(
+    result: &Result<CallToolResult, McpError>,
+    timeout_secs: u64,
+    elapsed: std::time::Duration,
+) -> (&'static str, Option<String>) {
+    match result {
+        Ok(_) => ("ok", None),
+        Err(e) => {
+            let msg = e.to_string();
+            let is_timeout = elapsed.as_secs() >= timeout_secs && msg.contains("timed out");
+            if is_timeout {
+                ("timeout", Some("timeout".to_string()))
+            } else {
+                ("error", Some(classify_error_kind(&msg)))
+            }
+        }
+    }
+}
+
+/// Coarse error classification for telemetry. Matches a handful of
+/// common message prefixes the rmcp `McpError` helpers produce. Anything
+/// else falls into `"internal"`.
+fn classify_error_kind(msg: &str) -> String {
+    if msg.contains("invalid_params") || msg.contains("Invalid parameters") {
+        "invalid_params".to_string()
+    } else if msg.contains("not found") {
+        "not_found".to_string()
+    } else if msg.contains("requires") || msg.contains("Requires") {
+        "precondition".to_string()
+    } else if msg.contains("database") || msg.contains("sql") {
+        "db_error".to_string()
+    } else {
+        "internal".to_string()
+    }
 }
 
 /// Truncate a string to at most `max_len` bytes on a valid char boundary.

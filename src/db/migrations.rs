@@ -829,6 +829,55 @@ pub async fn run_migrations(
 
     ensure_session_prompts_hnsw_index(pool, vector_config).await?;
 
+    // ================================================================
+    // MCP tool-call telemetry (per-call durable row)
+    //
+    // Append-only audit trail of every MCP tool invocation: tool name,
+    // caller identity (lowercased rmcp clientInfo.name + version + MCP
+    // protocol version), per-call duration, outcome (ok/error/timeout),
+    // and an optional project tag (the value of the `project` parameter
+    // when the tool accepts one). Privacy posture mirrors session_prompts:
+    // tool/client names are stored verbatim; raw params never are — only
+    // a sha256 of the canonicalized params JSON, populated when the
+    // wrapper has access to it.
+    //
+    // Retention is enforced by the `telemetry-retention` cron job
+    // (`src/cron/telemetry_retention.rs`), which deletes rows older than
+    // `MetricsConfig::telemetry_retention_days` (default 30).
+    // ================================================================
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS mcp_tool_calls (
+            id               BIGSERIAL PRIMARY KEY,
+            ts               TIMESTAMPTZ NOT NULL DEFAULT now(),
+            tool             TEXT NOT NULL,
+            client_name      TEXT NOT NULL,
+            client_version   TEXT,
+            protocol_version TEXT,
+            mcp_session_id   TEXT,
+            project          TEXT,
+            project_id       INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+            cwd              TEXT,
+            duration_ms      INTEGER NOT NULL,
+            outcome          TEXT NOT NULL,
+            error_class      TEXT,
+            request_id       TEXT,
+            params_sha256    TEXT,
+            CHECK (outcome IN ('ok', 'error', 'timeout', 'cancelled'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    let mcp_tool_calls_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_mcp_tool_calls_ts ON mcp_tool_calls(ts)",
+        "CREATE INDEX IF NOT EXISTS idx_mcp_tool_calls_tool_ts ON mcp_tool_calls(tool, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_mcp_tool_calls_client_ts ON mcp_tool_calls(client_name, ts)",
+        "CREATE INDEX IF NOT EXISTS idx_mcp_tool_calls_project ON mcp_tool_calls(project_id) WHERE project_id IS NOT NULL",
+    ];
+    for idx in mcp_tool_calls_indexes {
+        sqlx::query(idx).execute(pool).await?;
+    }
+
     Ok(())
 }
 

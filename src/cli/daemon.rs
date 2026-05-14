@@ -343,6 +343,57 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         None
     };
 
+    // 11b. Start the durable telemetry writer (if enabled). Without it, the
+    // in-memory counters in StatsTracker still tick over but no rows land in
+    // `mcp_tool_calls`. The `instrumented_tool_wrap` helper detects the
+    // missing sender and drops rows silently in that case.
+    let telemetry_writer_handle = if config_snapshot.metrics.telemetry_db_write_enabled {
+        if let Some(pool) = system_ctx.db().pool() {
+            Some(stats::telemetry_writer::start_telemetry_writer(
+                pool.clone(),
+                Arc::clone(&stats_tracker),
+                config_snapshot.metrics.clone(),
+                shutdown.cancellation_token(),
+            ))
+        } else {
+            tracing::warn!("telemetry writer disabled: DbClient has no PgPool (CLI mode?)");
+            None
+        }
+    } else {
+        None
+    };
+
+    // 11c. Schedule the daily `telemetry-retention` cron job. Runs every
+    // 24h and DELETEs `mcp_tool_calls` rows older than
+    // `metrics.telemetry_retention_days` (default 30).
+    if config_snapshot.metrics.telemetry_db_write_enabled
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let stats_for_retention = Arc::clone(&stats_tracker);
+        let retention_days = config_snapshot.metrics.telemetry_retention_days;
+        let rt_for_retention = tokio::runtime::Handle::current();
+        // 24h interval. Initial delay 30s so we don't run during the
+        // startup window when other heavy initialization is in flight.
+        cron_handle.schedule_recurring(
+            30_000,
+            24 * 60 * 60 * 1000,
+            "telemetry-retention",
+            move || {
+                let pool = pool.clone();
+                let stats = Arc::clone(&stats_for_retention);
+                rt_for_retention.spawn(async move {
+                    cron::telemetry_retention::run_or_log(
+                        Arc::new(pool),
+                        stats,
+                        retention_days,
+                    )
+                    .await;
+                });
+                true
+            },
+        );
+    }
+
     // 12. Construct the MCP server from the same SystemContext.
     let mcp_server = mcp::server::McpServer::new(system_ctx.clone());
 
@@ -550,6 +601,17 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     // Stop metrics server
     if let Some(handle) = metrics_handle {
         handle.abort();
+    }
+
+    // Stop telemetry writer (drains the channel via cancellation token; no
+    // hard abort needed, run_telemetry_writer's shutdown branch flushes
+    // pending rows before exiting).
+    if let Some(handle) = telemetry_writer_handle {
+        match tokio::time::timeout(component_timeout, handle).await {
+            Ok(Ok(())) => info!("Telemetry writer drained and exited"),
+            Ok(Err(e)) => tracing::warn!(error = %e, "Telemetry writer task panicked"),
+            Err(_) => tracing::warn!("Telemetry writer did not drain within 5s; aborting"),
+        }
     }
 
     // Close database pool (5s timeout)

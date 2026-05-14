@@ -3,7 +3,11 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
+use arc_swap::ArcSwapOption;
 use dashmap::DashMap;
+use tokio::sync::mpsc;
+
+use crate::stats::telemetry_writer::TelemetryRow;
 
 /// Per-tool telemetry: call count, error count, cumulative duration, and
 /// bucketed duration histogram. Used both keyed by `tool_name`
@@ -386,6 +390,21 @@ pub struct StatsTracker {
     /// `tool_telemetry_by_client`.
     pub tool_telemetry_by_client: DashMap<(String, String), PerToolStats>,
 
+    // ---- Telemetry writer (Tier 3 durable storage) ----
+    /// Rows successfully INSERTed into `mcp_tool_calls`.
+    pub telemetry_rows_written: AtomicU64,
+    /// Rows dropped because the writer channel was full (back-pressure).
+    pub telemetry_writes_dropped: AtomicU64,
+    /// Rows discarded because the bulk-INSERT failed (DB error / connection loss).
+    pub telemetry_writes_failed: AtomicU64,
+    /// Rows purged by the daily `telemetry-retention` cron job.
+    pub telemetry_rows_purged: AtomicU64,
+    /// Channel sender to the telemetry writer task; `None` in CLI mode
+    /// or before `start_telemetry_writer` has registered the writer.
+    /// Wrapped in `ArcSwapOption` so the hot `instrumented_tool_wrap`
+    /// path is lock-free.
+    telemetry_tx: ArcSwapOption<mpsc::Sender<TelemetryRow>>,
+
     // Uptime
     pub uptime_start: Instant,
 }
@@ -507,8 +526,26 @@ impl StatsTracker {
             heavy_cron_running: AtomicBool::new(false),
             tool_invocations: DashMap::new(),
             tool_telemetry_by_client: DashMap::new(),
+            telemetry_rows_written: AtomicU64::new(0),
+            telemetry_writes_dropped: AtomicU64::new(0),
+            telemetry_writes_failed: AtomicU64::new(0),
+            telemetry_rows_purged: AtomicU64::new(0),
+            telemetry_tx: ArcSwapOption::empty(),
             uptime_start: Instant::now(),
         }
+    }
+
+    /// Register the telemetry writer's sender on this tracker so
+    /// `instrumented_tool_wrap` can enqueue rows. Called once at daemon
+    /// startup from `start_telemetry_writer`.
+    pub fn set_telemetry_sender(&self, tx: mpsc::Sender<TelemetryRow>) {
+        self.telemetry_tx.store(Some(std::sync::Arc::new(tx)));
+    }
+
+    /// Snapshot the current sender, or `None` if no writer is registered
+    /// (CLI mode or `[metrics] telemetry_db_write_enabled = false`).
+    pub fn telemetry_sender(&self) -> Option<std::sync::Arc<mpsc::Sender<TelemetryRow>>> {
+        self.telemetry_tx.load_full()
     }
 
     /// Record a completed tool invocation. Called once per tool call
@@ -638,6 +675,10 @@ impl StatsTracker {
             "symbols_extracted": self.symbols_extracted.load(Ordering::Acquire),
             "symbol_references_inserted": self.symbol_references_inserted.load(Ordering::Acquire),
             "http_mcp_sessions": self.http_mcp_sessions.load(Ordering::Acquire),
+            "telemetry_rows_written": self.telemetry_rows_written.load(Ordering::Acquire),
+            "telemetry_writes_dropped": self.telemetry_writes_dropped.load(Ordering::Acquire),
+            "telemetry_writes_failed": self.telemetry_writes_failed.load(Ordering::Acquire),
+            "telemetry_rows_purged": self.telemetry_rows_purged.load(Ordering::Acquire),
             "tool_invocations": serde_json::Value::Object(
                 self.tool_invocations.iter()
                     .map(|e| (e.key().clone(), serde_json::Value::from(e.value().count.load(Ordering::Relaxed))))
