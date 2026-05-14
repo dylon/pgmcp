@@ -74,10 +74,54 @@ const DOCUMENTS_DIR_EXCLUDES: &[&str] = &[
     "*.lnk",
 ];
 
+/// Resolved paths for the four synthetic project directories that
+/// `scan_workspaces` auto-discovers. Computed once by the caller —
+/// production uses `SyntheticRoots::from_home()` at scan-start, tests
+/// construct fields explicitly to point at tempdirs.
+///
+/// Decoupling auto-discovery from `dirs::home_dir()` lets tests run in
+/// parallel without racing on `std::env::set_var("HOME", …)`. Before
+/// this struct existed, tests had to mutate process-global `$HOME` to
+/// redirect `Config::*_dir()`, which produced an indefinite deadlock
+/// when concurrent tests clobbered each other's overrides.
+#[derive(Debug, Default, Clone)]
+pub struct SyntheticRoots {
+    pub claude: Option<PathBuf>,
+    pub codex: Option<PathBuf>,
+    pub papers: Option<PathBuf>,
+    pub documents: Option<PathBuf>,
+}
+
+impl SyntheticRoots {
+    /// Resolve all four roots from `$HOME` (via `dirs::home_dir()`
+    /// through the existing `Config::*_dir()` helpers). Production
+    /// callers invoke this once per scan cycle.
+    pub fn from_home() -> Self {
+        Self {
+            claude: Config::claude_dir(),
+            codex: Config::codex_dir(),
+            papers: Config::papers_dir(),
+            documents: Config::documents_dir(),
+        }
+    }
+
+    /// All-`None`: no synthetic auto-discovery. Tests use this when
+    /// they only want the regular workspace walker to run.
+    // `pgmcp-testing` (a separate workspace member) is the sole caller,
+    // so the dead-code lint can't see usage when linting the main crate.
+    #[allow(dead_code)]
+    pub fn empty() -> Self {
+        Self::default()
+    }
+}
+
 /// Scan all configured workspace paths and submit files for indexing.
-/// Also auto-discovers `~/.claude/` and `~/.codex/` if they exist.
+/// Also walks each of the synthetic project directories in `roots`
+/// (typically `~/.claude/`, `~/.codex/`, `~/Papers/`, `~/Documents/`
+/// in production; explicit tempdir paths in tests).
 pub fn scan_workspaces(
     config: &Config,
+    roots: &SyntheticRoots,
     file_tx: Sender<PathBuf>,
     project_roots: &DashMap<PathBuf, ProjectRoot>,
     project_overrides: &DashMap<PathBuf, config::ProjectOverride>,
@@ -119,8 +163,8 @@ pub fn scan_workspaces(
         scan_claude_dir(&claude_subdir, &workspace_path, config, &file_tx);
     }
 
-    // Auto-discover ~/.claude/ if it exists
-    if let Some(claude_dir) = Config::claude_dir() {
+    // Auto-discover ~/.claude/ if it was supplied
+    if let Some(claude_dir) = roots.claude.as_ref() {
         let claude_path_str = claude_dir.to_string_lossy().into_owned();
         info!(path = %claude_path_str, "Auto-discovered ~/.claude/ directory");
 
@@ -133,13 +177,13 @@ pub fn scan_workspaces(
             },
         );
 
-        scan_claude_dir(&claude_dir, &claude_path_str, config, &file_tx);
+        scan_claude_dir(claude_dir, &claude_path_str, config, &file_tx);
     }
 
-    // Auto-discover ~/.codex/ if it exists. Codex contains credentials,
+    // Auto-discover ~/.codex/ if it was supplied. Codex contains credentials,
     // sqlite state, caches, and shell snapshots, so this path is allow-listed
     // instead of broadly indexing every configured extension.
-    if let Some(codex_dir) = Config::codex_dir() {
+    if let Some(codex_dir) = roots.codex.as_ref() {
         let codex_path_str = codex_dir.to_string_lossy().into_owned();
         info!(path = %codex_path_str, "Auto-discovered ~/.codex/ directory");
 
@@ -151,13 +195,12 @@ pub fn scan_workspaces(
             },
         );
 
-        scan_codex_dir(&codex_dir, &codex_path_str, config, &file_tx);
+        scan_codex_dir(codex_dir, &codex_path_str, config, &file_tx);
     }
 
-    // Auto-discover ~/Papers/ as a synthetic project. The directory has
-    // no `.git/` and is `is_dir()`-guarded so users without it pay no
-    // cost. Honors a `.pgmcp.toml` placed directly in the directory.
-    if let Some(papers_dir) = Config::papers_dir() {
+    // Auto-discover ~/Papers/ as a synthetic project. Honors a `.pgmcp.toml`
+    // placed directly in the directory.
+    if let Some(papers_dir) = roots.papers.as_ref() {
         let path_str = papers_dir.to_string_lossy().into_owned();
         info!(path = %path_str, "Auto-discovered ~/Papers/ directory");
 
@@ -172,15 +215,13 @@ pub fn scan_workspaces(
                 name,
             },
         );
-        if let Some(ovr) = config::ProjectOverride::load(&papers_dir) {
+        if let Some(ovr) = config::ProjectOverride::load(papers_dir) {
             project_overrides.insert(papers_dir.clone(), ovr);
         }
 
-        let override_snapshot = project_overrides
-            .get(&papers_dir)
-            .map(|r| r.value().clone());
+        let override_snapshot = project_overrides.get(papers_dir).map(|r| r.value().clone());
         scan_papers_dir(
-            &papers_dir,
+            papers_dir,
             &path_str,
             config,
             &file_tx,
@@ -189,7 +230,7 @@ pub fn scan_workspaces(
     }
 
     // Auto-discover ~/Documents/ symmetric with ~/Papers/.
-    if let Some(documents_dir) = Config::documents_dir() {
+    if let Some(documents_dir) = roots.documents.as_ref() {
         let path_str = documents_dir.to_string_lossy().into_owned();
         info!(path = %path_str, "Auto-discovered ~/Documents/ directory");
 
@@ -204,15 +245,15 @@ pub fn scan_workspaces(
                 name,
             },
         );
-        if let Some(ovr) = config::ProjectOverride::load(&documents_dir) {
+        if let Some(ovr) = config::ProjectOverride::load(documents_dir) {
             project_overrides.insert(documents_dir.clone(), ovr);
         }
 
         let override_snapshot = project_overrides
-            .get(&documents_dir)
+            .get(documents_dir)
             .map(|r| r.value().clone());
         scan_documents_dir(
-            &documents_dir,
+            documents_dir,
             &path_str,
             config,
             &file_tx,

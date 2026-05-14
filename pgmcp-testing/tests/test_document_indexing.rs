@@ -6,18 +6,25 @@
 //! the full DB-backed pipeline (which lives in
 //! `tests/indexer_pipeline_e2e.rs`) so this test runs reliably without
 //! Postgres or any external CLI tools.
+//!
+//! Synthetic-project paths are injected explicitly via `SyntheticRoots`
+//! — these tests do NOT mutate `$HOME`. That used to be necessary
+//! because `scan_workspaces` resolved `~/Papers/` and friends via
+//! `dirs::home_dir()`; the resulting `unsafe { set_var("HOME", …) }`
+//! race produced an indefinite deadlock when concurrent tests
+//! clobbered each other's overrides.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, bounded};
+use crossbeam_channel::{Receiver, unbounded};
 use dashmap::DashMap;
 use tempfile::TempDir;
 
 use pgmcp::config::{Config, ProjectOverride};
-use pgmcp::indexer::scanner::{self, ProjectRoot};
+use pgmcp::indexer::scanner::{self, ProjectRoot, SyntheticRoots};
 
 fn write_file(dir: &std::path::Path, rel: &str, body: &str) -> PathBuf {
     let path = dir.join(rel);
@@ -36,49 +43,31 @@ fn drain(rx: &Receiver<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
-fn run_workspace_scan(
-    workspace: &std::path::Path,
-) -> (Vec<PathBuf>, DashMap<PathBuf, ProjectRoot>) {
+/// Run a scan with explicit synthetic roots and a fresh unbounded
+/// channel. Tests pass `SyntheticRoots::empty()` when they only want
+/// the regular workspace walker, or set specific fields to point at
+/// tempdir-backed `Papers`/`Documents`/`.claude`/`.codex` paths.
+fn run_scan(
+    workspace_paths: Vec<String>,
+    roots: SyntheticRoots,
+) -> (Vec<PathBuf>, Arc<DashMap<PathBuf, ProjectRoot>>) {
     let mut config = Config::default();
-    config.workspace.paths = vec![workspace.to_string_lossy().into_owned()];
+    config.workspace.paths = workspace_paths;
 
     let project_roots: Arc<DashMap<PathBuf, ProjectRoot>> = Arc::new(DashMap::new());
     let project_overrides: Arc<DashMap<PathBuf, ProjectOverride>> = Arc::new(DashMap::new());
 
-    let (tx, rx) = bounded::<PathBuf>(1024);
-
-    // Save and restore `$HOME` so the synthetic ~/Papers and ~/Documents
-    // auto-discovery doesn't accidentally pick up the developer's real
-    // directories while running tests. We point HOME at an empty dir.
-    let prev_home = std::env::var_os("HOME");
-    let home_guard = TempDir::new().unwrap();
-    // SAFETY: tests in this binary run serially when set_var is used; the
-    // test harness here is single-threaded for this case.
-    unsafe {
-        std::env::set_var("HOME", home_guard.path());
-    }
-
-    scanner::scan_workspaces(&config, tx, &project_roots, &project_overrides);
+    let (tx, rx) = unbounded::<PathBuf>();
+    scanner::scan_workspaces(&config, &roots, tx, &project_roots, &project_overrides);
     let files = drain(&rx);
 
-    unsafe {
-        if let Some(h) = prev_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-    }
-
-    (
-        files,
-        Arc::try_unwrap(project_roots).unwrap_or_else(|a| (*a).clone()),
-    )
+    (files, project_roots)
 }
 
 #[test]
 fn synthetic_project_papers_indexes_org_pdf_tex_with_dedup() {
-    // Lay down a small "Papers" tree under a temp home so the scanner's
-    // `Config::papers_dir()` finds it deterministically.
+    // Lay down a small "Papers" tree under a tempdir and inject it as
+    // the synthetic Papers root — no `$HOME` mutation needed.
     let home = TempDir::new().unwrap();
     let papers_root = home.path().join("Papers");
     std::fs::create_dir_all(&papers_root).unwrap();
@@ -111,28 +100,11 @@ fn synthetic_project_papers_indexes_org_pdf_tex_with_dedup() {
     // in the priority list.
     write_file(&papers_root, "notes.txt", "loose notes");
 
-    // Build a Config that recognises these extensions and run a scan via
-    // a HOME-swapped synthetic discovery path.
-    let mut config = Config::default();
-    config.workspace.paths = vec![]; // no regular workspace; rely on auto-discovery
-
-    let project_roots: Arc<DashMap<PathBuf, ProjectRoot>> = Arc::new(DashMap::new());
-    let project_overrides: Arc<DashMap<PathBuf, ProjectOverride>> = Arc::new(DashMap::new());
-    let (tx, rx) = bounded::<PathBuf>(1024);
-
-    let prev_home = std::env::var_os("HOME");
-    unsafe {
-        std::env::set_var("HOME", home.path());
-    }
-    scanner::scan_workspaces(&config, tx, &project_roots, &project_overrides);
-    let mut files = drain(&rx);
-    unsafe {
-        if let Some(h) = prev_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-    }
+    let roots = SyntheticRoots {
+        papers: Some(papers_root.clone()),
+        ..SyntheticRoots::empty()
+    };
+    let (mut files, project_roots) = run_scan(Vec::new(), roots);
 
     files.sort();
     let rel: HashSet<String> = files
@@ -193,26 +165,11 @@ source_priority = ["pdf", "org"]
 "#;
     write_file(&papers_root, ".pgmcp.toml", override_toml);
 
-    let mut config = Config::default();
-    config.workspace.paths = vec![];
-
-    let project_roots: Arc<DashMap<PathBuf, ProjectRoot>> = Arc::new(DashMap::new());
-    let project_overrides: Arc<DashMap<PathBuf, ProjectOverride>> = Arc::new(DashMap::new());
-    let (tx, rx) = bounded::<PathBuf>(1024);
-
-    let prev_home = std::env::var_os("HOME");
-    unsafe {
-        std::env::set_var("HOME", home.path());
-    }
-    scanner::scan_workspaces(&config, tx, &project_roots, &project_overrides);
-    let files = drain(&rx);
-    unsafe {
-        if let Some(h) = prev_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-    }
+    let roots = SyntheticRoots {
+        papers: Some(papers_root.clone()),
+        ..SyntheticRoots::empty()
+    };
+    let (files, _project_roots) = run_scan(Vec::new(), roots);
 
     let rel: HashSet<String> = files
         .iter()
@@ -235,29 +192,12 @@ source_priority = ["pdf", "org"]
 
 #[test]
 fn empty_home_synthetic_dirs_skip_silently() {
-    let empty_home = TempDir::new().unwrap();
-    let project_roots: Arc<DashMap<PathBuf, ProjectRoot>> = Arc::new(DashMap::new());
-    let project_overrides: Arc<DashMap<PathBuf, ProjectOverride>> = Arc::new(DashMap::new());
-    let config = Config::default();
-    let (tx, rx) = bounded::<PathBuf>(64);
-
-    let prev_home = std::env::var_os("HOME");
-    unsafe {
-        std::env::set_var("HOME", empty_home.path());
-    }
-    scanner::scan_workspaces(&config, tx, &project_roots, &project_overrides);
-    let files = drain(&rx);
-    unsafe {
-        if let Some(h) = prev_home {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-    }
+    // No synthetic roots supplied + no workspace paths => nothing to scan.
+    let (files, project_roots) = run_scan(Vec::new(), SyntheticRoots::empty());
 
     assert!(
         files.is_empty(),
-        "expected no files indexed when ~/Papers and ~/Documents absent"
+        "expected no files indexed when synthetic roots are all None"
     );
     assert!(
         project_roots.is_empty(),
@@ -275,7 +215,10 @@ fn regular_workspace_scan_still_works_with_document_extensions() {
     write_file(workspace.path(), "src/main.rs", "fn main() {}\n");
     write_file(workspace.path(), "README.txt", "hello\n");
 
-    let (files, project_roots) = run_workspace_scan(workspace.path());
+    let (files, project_roots) = run_scan(
+        vec![workspace.path().to_string_lossy().into_owned()],
+        SyntheticRoots::empty(),
+    );
     let names: HashSet<String> = files
         .iter()
         .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))

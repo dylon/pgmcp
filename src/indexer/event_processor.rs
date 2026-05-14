@@ -270,10 +270,17 @@ pub fn start_indexing(
             let scan_config = config_snapshot.clone();
             let scan_roots = Arc::clone(&project_roots_for_scan);
             let scan_overrides = Arc::clone(&project_overrides_for_scan);
+            let synthetic_roots = scanner::SyntheticRoots::from_home();
             let scan_handle = std::thread::Builder::new()
                 .name("pgmcp-scan-walk".into())
                 .spawn(move || {
-                    scanner::scan_workspaces(&scan_config, file_tx, &scan_roots, &scan_overrides);
+                    scanner::scan_workspaces(
+                        &scan_config,
+                        &synthetic_roots,
+                        file_tx,
+                        &scan_roots,
+                        &scan_overrides,
+                    );
                 })
                 .expect("Failed to spawn scan walk thread");
 
