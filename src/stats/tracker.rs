@@ -128,6 +128,24 @@ pub struct StatsTracker {
     /// `documents_truncated` (size-gated). One increment per affected
     /// indexer run per file (not cumulative across runs).
     pub files_with_content_omitted: AtomicU64,
+    /// `read_file` MCP tool served content from disk after verifying
+    /// `xxh3_64(disk_bytes) == content_hash`. The expected fast-path
+    /// for plain-text files indexed under the asymmetric-storage
+    /// policy.
+    pub read_file_disk_hits: AtomicU64,
+    /// `read_file` MCP tool detected a content_hash mismatch between
+    /// the indexed row and the on-disk file. Means the file has
+    /// changed since the last indexer pass; falls back to chunk
+    /// stitching (which is also stale relative to disk).
+    pub read_file_disk_hash_mismatches: AtomicU64,
+    /// `read_file` MCP tool failed to `fs::read_to_string(path)` —
+    /// file missing, permission error, encoding error. Falls back to
+    /// chunk stitching.
+    pub read_file_disk_io_errors: AtomicU64,
+    /// `read_file` MCP tool stitched chunks because there was no
+    /// inline content and either no recoverable-from-disk flag or
+    /// the disk attempt failed/mismatched.
+    pub read_file_chunk_stitches: AtomicU64,
 
     // Graph analysis counters
     pub graph_build_runs: AtomicU64,
@@ -284,6 +302,10 @@ impl StatsTracker {
             documents_canonical_promoted: AtomicU64::new(0),
             files_with_null_bytes_stripped: AtomicU64::new(0),
             files_with_content_omitted: AtomicU64::new(0),
+            read_file_disk_hits: AtomicU64::new(0),
+            read_file_disk_hash_mismatches: AtomicU64::new(0),
+            read_file_disk_io_errors: AtomicU64::new(0),
+            read_file_chunk_stitches: AtomicU64::new(0),
             graph_build_runs: AtomicU64::new(0),
             dependency_graph_scans: AtomicU64::new(0),
             centrality_scans: AtomicU64::new(0),
@@ -405,6 +427,10 @@ impl StatsTracker {
             "documents_canonical_promoted": self.documents_canonical_promoted.load(Ordering::Acquire),
             "files_with_null_bytes_stripped": self.files_with_null_bytes_stripped.load(Ordering::Acquire),
             "files_with_content_omitted": self.files_with_content_omitted.load(Ordering::Acquire),
+            "read_file_disk_hits": self.read_file_disk_hits.load(Ordering::Acquire),
+            "read_file_disk_hash_mismatches": self.read_file_disk_hash_mismatches.load(Ordering::Acquire),
+            "read_file_disk_io_errors": self.read_file_disk_io_errors.load(Ordering::Acquire),
+            "read_file_chunk_stitches": self.read_file_chunk_stitches.load(Ordering::Acquire),
             "graph_build_runs": self.graph_build_runs.load(Ordering::Acquire),
             "dependency_graph_scans": self.dependency_graph_scans.load(Ordering::Acquire),
             "centrality_scans": self.centrality_scans.load(Ordering::Acquire),

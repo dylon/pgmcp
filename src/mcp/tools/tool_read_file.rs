@@ -25,9 +25,10 @@ use rmcp::model::{CallToolResult, Content, LoggingLevel};
 use serde::Serialize;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::context::SystemContext;
-use crate::db::queries::FileChunkRow;
+use crate::db::queries::{FileChunkRow, FileContent};
 use crate::mcp::server::*;
 
 #[derive(Debug, Serialize)]
@@ -109,32 +110,52 @@ pub async fn tool_read_file(
             ))]));
         }
         Some(mut file) if file.content.is_none() => {
-            // Level-1 oversized placeholder. Stitch chunks to recover the
-            // extracted text. Falls back to "no content" if there are no
-            // chunks either.
-            let summary = ctx
-                .db()
-                .file_chunk_summary(&params.path)
-                .await
-                .map_err(|e| {
-                    McpError::internal_error(format!("Chunk summary failed: {}", e), None)
-                })?;
-            if summary.chunk_count > 0 {
-                let chunks = ctx
-                    .db()
-                    .get_chunks_in_index_range(&params.path, 0, i32::MAX)
-                    .await
-                    .map_err(|e| {
-                        McpError::internal_error(format!("Chunk fetch failed: {}", e), None)
-                    })?;
-                let stitched = chunks
-                    .iter()
-                    .map(|c| c.content.as_str())
-                    .collect::<Vec<&str>>()
-                    .join("\n\n");
-                file.content = Some(stitched);
+            // Content is NULL: either the file is a Level-1 oversized
+            // placeholder, or the indexer set `content_recoverable_from_disk
+            // = true` for a plain-text language (asymmetric-storage policy
+            // from PR D). Try the disk fast-path first; on hash mismatch,
+            // disk-IO error, or `content_recoverable_from_disk = false`,
+            // fall back to stitching all chunks.
+            if file.content_recoverable_from_disk
+                && let Some(expected_hash) = file.content_hash
+            {
+                match std::fs::read_to_string(&params.path) {
+                    Ok(disk_bytes) => {
+                        let disk_hash = xxh3_64(disk_bytes.as_bytes()) as i64;
+                        if disk_hash == expected_hash {
+                            ctx.stats()
+                                .read_file_disk_hits
+                                .fetch_add(1, Ordering::Relaxed);
+                            file.content = Some(disk_bytes);
+                            file
+                        } else {
+                            info!(
+                                tool = "read_file",
+                                path = %params.path,
+                                "Disk file changed since indexing (hash mismatch); falling back to chunks"
+                            );
+                            ctx.stats()
+                                .read_file_disk_hash_mismatches
+                                .fetch_add(1, Ordering::Relaxed);
+                            stitch_chunks(ctx, &params.path, file).await?
+                        }
+                    }
+                    Err(e) => {
+                        info!(
+                            tool = "read_file",
+                            path = %params.path,
+                            error = %e,
+                            "Disk read failed; falling back to chunks"
+                        );
+                        ctx.stats()
+                            .read_file_disk_io_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        stitch_chunks(ctx, &params.path, file).await?
+                    }
+                }
+            } else {
+                stitch_chunks(ctx, &params.path, file).await?
             }
-            file
         }
         Some(file) => file,
     };
@@ -149,6 +170,39 @@ pub async fn tool_read_file(
         "MCP tool completed",
     );
     Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+/// Recover `content` by fetching every chunk for the file and joining
+/// them with `\n\n`. Falls back to leaving `content = None` if the file
+/// has no chunks (e.g. Level-1 oversized placeholder with no extracted
+/// text). Bumps `read_file_chunk_stitches` to record the slower path.
+async fn stitch_chunks(
+    ctx: &SystemContext,
+    path: &str,
+    mut file: FileContent,
+) -> Result<FileContent, McpError> {
+    ctx.stats()
+        .read_file_chunk_stitches
+        .fetch_add(1, Ordering::Relaxed);
+    let summary = ctx
+        .db()
+        .file_chunk_summary(path)
+        .await
+        .map_err(|e| McpError::internal_error(format!("Chunk summary failed: {}", e), None))?;
+    if summary.chunk_count > 0 {
+        let chunks = ctx
+            .db()
+            .get_chunks_in_index_range(path, 0, i32::MAX)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Chunk fetch failed: {}", e), None))?;
+        let stitched = chunks
+            .iter()
+            .map(|c| c.content.as_str())
+            .collect::<Vec<&str>>()
+            .join("\n\n");
+        file.content = Some(stitched);
+    }
+    Ok(file)
 }
 
 async fn read_line_region(

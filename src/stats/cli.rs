@@ -75,6 +75,18 @@ pub async fn print_stats(config: &Config) -> anyhow::Result<()> {
                 ("Git History", &["pgmcp_git_"]),
                 ("Config Watcher", &["pgmcp_config_"]),
                 ("File Watcher", &["pgmcp_watcher_"]),
+                (
+                    "Content storage",
+                    &[
+                        "pgmcp_files_with_null_bytes_stripped",
+                        "pgmcp_files_with_content_omitted",
+                        "pgmcp_documents_extraction_oom",
+                        "pgmcp_read_file_disk_hits",
+                        "pgmcp_read_file_disk_hash_mismatches",
+                        "pgmcp_read_file_disk_io_errors",
+                        "pgmcp_read_file_chunk_stitches",
+                    ],
+                ),
                 ("System", &["pgmcp_uptime_"]),
             ];
 

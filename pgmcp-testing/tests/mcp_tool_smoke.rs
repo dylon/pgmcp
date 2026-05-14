@@ -390,6 +390,8 @@ async fn read_file_returns_content_from_mock_db() {
         size_bytes: 9,
         line_count: 1,
         truncated: false,
+        content_recoverable_from_disk: false,
+        content_hash: None,
     });
     let server = server_with_mock(mock);
     let result = server
@@ -1045,6 +1047,8 @@ async fn read_file_accepts_relative_path_with_project() {
         size_bytes: 9,
         line_count: 1,
         truncated: false,
+        content_recoverable_from_disk: false,
+        content_hash: None,
     });
     let server = server_with_mock(mock);
     let result = server

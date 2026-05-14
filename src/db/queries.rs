@@ -903,10 +903,13 @@ pub struct GrepResult {
     pub content: Option<String>,
 }
 
-/// Read a single file's content by path.
+/// Read a single file's content by path. Includes the asymmetric-
+/// storage flags so callers can decide whether to attempt a disk
+/// fast-path before falling back to chunk stitching.
 pub async fn read_file(pool: &PgPool, path: &str) -> Result<Option<FileContent>, sqlx::Error> {
     let row = sqlx::query_as::<_, FileContent>(
-        "SELECT path, relative_path, language, content, size_bytes, line_count, truncated
+        "SELECT path, relative_path, language, content, size_bytes, line_count, truncated,
+                content_recoverable_from_disk, content_hash
          FROM indexed_files WHERE path = $1",
     )
     .bind(path)
@@ -925,6 +928,18 @@ pub struct FileContent {
     pub size_bytes: i64,
     pub line_count: i32,
     pub truncated: bool,
+    /// True when the indexer deliberately stored `content = NULL`
+    /// because the source file lives on disk and is recreate-cheap.
+    /// `read_file` consumers attempt `fs::read_to_string` (after a
+    /// `content_hash` check) before falling back to chunk-stitching.
+    #[serde(skip_serializing)]
+    pub content_recoverable_from_disk: bool,
+    /// xxHash3-64 of the file bytes at indexing time. Used to verify
+    /// that the on-disk file matches what was indexed before serving
+    /// a disk-read fast-path. `None` for in-flight / never-finalized
+    /// rows; the disk fast-path skips those.
+    #[serde(skip_serializing)]
+    pub content_hash: Option<i64>,
 }
 
 /// Read a single file's content by relative path.
@@ -933,7 +948,8 @@ pub async fn read_file_by_relative_path(
     relative_path: &str,
 ) -> Result<Option<FileContent>, sqlx::Error> {
     let row = sqlx::query_as::<_, FileContent>(
-        "SELECT path, relative_path, language, content, size_bytes, line_count, truncated
+        "SELECT path, relative_path, language, content, size_bytes, line_count, truncated,
+                content_recoverable_from_disk, content_hash
          FROM indexed_files WHERE relative_path = $1",
     )
     .bind(relative_path)
