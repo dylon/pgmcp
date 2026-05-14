@@ -1629,6 +1629,22 @@ pub struct OrientParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct McpToolTelemetryParams {
+    #[schemars(description = "Filter to a specific MCP tool name (e.g. \"grep\", \"semantic_search\").")]
+    pub tool: Option<String>,
+    #[schemars(description = "Filter to a specific MCP client name (e.g. \"claude-code\", \"cursor\"). Matched case-sensitively against the lowercased name stored in mcp_tool_calls.")]
+    pub client_name: Option<String>,
+    #[schemars(description = "Filter to calls that named this project as the `project` parameter.")]
+    pub project: Option<String>,
+    #[schemars(description = "Lookback window in minutes (default 60, max 44640 = 31 days).")]
+    pub since_minutes: Option<i32>,
+    #[schemars(description = "Result limit for `aggregation=\"raw\"` (default 100, max 1000).")]
+    pub limit: Option<i32>,
+    #[schemars(description = "Aggregation shape: one of `summary`, `top_tools`, `top_callers`, `top_projects`, `error_rate`, `histogram`, `raw`. Default `summary`.")]
+    pub aggregation: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MandateContextParams {
     #[schemars(
         description = "Project name (as shown by list_projects). Takes precedence over cwd."
@@ -1945,6 +1961,28 @@ use the built-in `Bash: stat` or `Read` instead."
             30,
             &_ctx,
             super::tools::tool_index_stats::tool_index_stats(self.ctx()),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Query per-call MCP tool telemetry from the durable `mcp_tool_calls` table. \
+USE WHEN: you want a historical view of which tools were used (over the last N minutes), how long they took (p50/p95/p99), which agents called them, and which projects they targeted. \
+DO NOT USE WHEN: you only need real-time counts — `index_stats` and the `pgmcp://stats` resource already carry the live in-memory snapshot. \
+Aggregation modes: `summary` (default; (tool × client × project) breakdown with percentiles), `top_tools`, `top_callers`, `top_projects`, `error_rate`, `histogram` (log-spaced duration bands), `raw` (most-recent rows). \
+Default lookback is 60 minutes; pass `since_minutes` up to 44640 (31 days) to widen it."
+    )]
+    async fn mcp_tool_telemetry(
+        &self,
+        Parameters(params): Parameters<McpToolTelemetryParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "mcp_tool_telemetry",
+            30,
+            &_ctx,
+            super::tools::tool_mcp_tool_telemetry::tool_mcp_tool_telemetry(self.ctx(), params),
         )
         .await
     }
@@ -3785,6 +3823,8 @@ impl McpServer {
             // Advanced
             "code_summarize"         => code_summarize(CodeSummarizeParams),
             "engineering_scorecard"  => engineering_scorecard(EngineeringScorecardParams),
+            // Telemetry
+            "mcp_tool_telemetry"     => mcp_tool_telemetry(McpToolTelemetryParams),
         }, no_params: {
             "list_projects" => list_projects,
             "index_stats"   => index_stats,
