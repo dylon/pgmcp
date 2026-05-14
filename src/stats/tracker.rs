@@ -10,6 +10,14 @@ pub struct StatsTracker {
     // Indexing counters
     pub files_indexed: AtomicU64,
     pub files_failed: AtomicU64,
+    /// Files the scanner/watcher has submitted to the embed-pool's
+    /// index channel — i.e. handed off but not yet processed. Together
+    /// with `files_indexed` and `files_failed` this gives in-flight
+    /// count: `submitted - indexed - failed`. Without it, the metrics
+    /// surface only "what's done"; this counter exposes "what's still
+    /// coming" so back-pressure on the bounded(batch*2) embed channel
+    /// is observable.
+    pub files_submitted: AtomicU64,
     /// Files where the inference worker observed a foreign-key violation
     /// during chunk insert — i.e. the parent `indexed_files` row was
     /// deleted while the worker was mid-pipeline (typical cause:
@@ -246,6 +254,7 @@ impl StatsTracker {
         Self {
             files_indexed: AtomicU64::new(0),
             files_failed: AtomicU64::new(0),
+            files_submitted: AtomicU64::new(0),
             files_aborted_fk: AtomicU64::new(0),
             chunks_embedded: AtomicU64::new(0),
             bytes_processed: AtomicU64::new(0),
@@ -372,6 +381,7 @@ impl StatsTracker {
         serde_json::json!({
             "files_indexed": self.files_indexed.load(Ordering::Acquire),
             "files_failed": self.files_failed.load(Ordering::Acquire),
+            "files_submitted": self.files_submitted.load(Ordering::Acquire),
             "files_aborted_fk": self.files_aborted_fk.load(Ordering::Acquire),
             "chunks_embedded": self.chunks_embedded.load(Ordering::Acquire),
             "bytes_processed": self.bytes_processed.load(Ordering::Acquire),

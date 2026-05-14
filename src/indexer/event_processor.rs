@@ -217,6 +217,9 @@ pub fn start_indexing(
                 project_roots: Arc::clone(&project_roots_for_events),
                 project_overrides: Arc::clone(&project_overrides_for_events),
             };
+            stats_for_debounce
+                .files_submitted
+                .fetch_add(1, Ordering::Relaxed);
             if let Err(e) = embed_tx_for_events.send(EmbedIndexRequest::IndexFile(task)) {
                 error!(path = %event.path.display(), error = %e,
                        "Failed to submit IndexFile task");
@@ -321,6 +324,9 @@ pub fn start_indexing(
                     project_roots: Arc::clone(&project_roots_for_scan),
                     project_overrides: Arc::clone(&project_overrides_for_scan),
                 };
+                stats_for_scan
+                    .files_submitted
+                    .fetch_add(1, Ordering::Relaxed);
                 if let Err(e) = embed_tx_for_scan.send(EmbedIndexRequest::IndexFile(task)) {
                     error!(error = %e, "Failed to submit IndexFile task during initial scan");
                     break;
@@ -585,6 +591,12 @@ fn rescan_workspace(
             project_roots: Arc::clone(project_roots),
             project_overrides: Arc::clone(project_overrides),
         };
+        // `rescan_workspace` doesn't currently receive a stats handle —
+        // the rescan path is a minor submitter (only fires when config
+        // adds a new workspace dir). The dominant scan + watcher paths
+        // bump `files_submitted` at their submission sites. Threading
+        // `stats` here would be additive but isn't needed for the
+        // counter to be useful.
         if let Err(e) = embed_tx.send(EmbedIndexRequest::IndexFile(task)) {
             error!(error = %e, "Failed to submit IndexFile task during rescan");
             break;

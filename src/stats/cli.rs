@@ -37,6 +37,7 @@ pub async fn print_stats(config: &Config) -> anyhow::Result<()> {
                     &[
                         "pgmcp_files_indexed",
                         "pgmcp_files_failed",
+                        "pgmcp_files_submitted",
                         "pgmcp_files_aborted_fk",
                         "pgmcp_chunks_embedded",
                         "pgmcp_bytes_processed",

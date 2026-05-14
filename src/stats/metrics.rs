@@ -25,6 +25,9 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
          # HELP pgmcp_files_failed Total files failed to index\n\
          # TYPE pgmcp_files_failed counter\n\
          pgmcp_files_failed {}\n\
+         # HELP pgmcp_files_submitted Total files handed off to the embed-pool index channel; in-flight = submitted - indexed - failed\n\
+         # TYPE pgmcp_files_submitted counter\n\
+         pgmcp_files_submitted {}\n\
          # HELP pgmcp_files_aborted_fk Files aborted mid-pipeline due to a foreign-key violation (parent row deleted underfoot — typically `pgmcp reindex --force` or external admin SQL); one increment per affected file, not per chunk\n\
          # TYPE pgmcp_files_aborted_fk counter\n\
          pgmcp_files_aborted_fk {}\n\
@@ -135,6 +138,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
          pgmcp_read_file_chunk_stitches {}\n",
         s.files_indexed.load(Ordering::Relaxed),
         s.files_failed.load(Ordering::Relaxed),
+        s.files_submitted.load(Ordering::Relaxed),
         s.files_aborted_fk.load(Ordering::Relaxed),
         s.chunks_embedded.load(Ordering::Relaxed),
         s.bytes_processed.load(Ordering::Relaxed),

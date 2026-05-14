@@ -218,6 +218,19 @@ impl EmbeddingPool {
         }
     }
 
+    /// Current depth and capacity of the index channel. Used by
+    /// observability surfaces to distinguish "stalled" from "back-
+    /// pressured" from "draining" — when `(depth, capacity)` reads
+    /// `(64, 64)` over consecutive scrapes, workers can't keep up with
+    /// scanner submissions.
+    // Used externally by future metrics/observability surfaces; not yet
+    // wired into the Prometheus exposition (deferred so this PR stays
+    // a pure additive data-layer change with no MetricsState surgery).
+    #[allow(dead_code)]
+    pub fn index_channel_depth(&self) -> (usize, usize) {
+        (self.index_tx.len(), self.index_tx.capacity().unwrap_or(0))
+    }
+
     /// Signal shutdown and return worker handles for joining with custom timeout logic.
     pub fn shutdown_take_handles(self) -> Vec<JoinHandle<()>> {
         drop(self.index_tx);
