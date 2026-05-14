@@ -86,12 +86,31 @@ fn excess_blank_lines_regex() -> &'static Regex {
 
 /// Join words split by a hard hyphen at end-of-line.
 ///
-/// Heuristic: a line ending in `-` followed by a line whose first
-/// non-whitespace character is a lowercase letter is treated as a wrapped
-/// word — the hyphen and newline are removed and the next-line indent is
-/// stripped. We deliberately do NOT join when the next line starts with
-/// an uppercase letter (likely a compound proper noun like `Foo-Bar`).
+/// Iterates `dehyphenate_pass` to a fixed point: a single pass joins
+/// each (line, next-line) pair greedily and then skips past both lines,
+/// which can leave an unprocessed hyphen on the joined line when three+
+/// consecutive lines all end in `-` and start with a lowercase letter
+/// (e.g. `"a-\na-\na"`). Looping is bounded by input size — each pass
+/// shortens the output or stabilizes — and is cheap in practice because
+/// most documents have at most one or two dehyphenation chains.
 fn dehyphenate(input: &str) -> String {
+    let mut current = dehyphenate_pass(input);
+    loop {
+        let next = dehyphenate_pass(&current);
+        if next == current {
+            return current;
+        }
+        current = next;
+    }
+}
+
+/// One left-to-right pass of dehyphenation. Heuristic: a line ending in
+/// `-` followed by a line whose first non-whitespace character is a
+/// lowercase letter is treated as a wrapped word — the hyphen and
+/// newline are removed and the next-line indent is stripped. We
+/// deliberately do NOT join when the next line starts with an uppercase
+/// letter (likely a compound proper noun like `Foo-Bar`).
+fn dehyphenate_pass(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let lines: Vec<&str> = input.split('\n').collect();
     let n = lines.len();
@@ -253,6 +272,17 @@ mod tests {
         let once = normalize_extracted_text(input);
         let twice = normalize_extracted_text(&once);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn dehyphenate_resolves_consecutive_chains() {
+        // Regression for the proptest-discovered idempotence bug: three
+        // lines all ending in a hyphen + lowercase-alpha next line. A
+        // single dehyphenation pass would have produced "aa-\na" because
+        // the index jumps by 2 after a join; the fixed-point loop catches
+        // the remaining hyphen on the next pass.
+        assert_eq!(normalize_extracted_text("a-\na-\na"), "aaa");
+        assert_eq!(normalize_extracted_text("a-\na-\na-\na"), "aaaa");
     }
 
     use proptest::prelude::*;

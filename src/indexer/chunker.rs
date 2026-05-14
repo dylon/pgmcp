@@ -1,5 +1,64 @@
 //! Line-based content chunking with configurable size and overlap.
 
+/// Maximum byte size for any single chunk before it gets sub-split at a
+/// UTF-8 boundary. Sized below PostgreSQL's 1 MiB per-row `tsvector`
+/// limit (1,048,575 bytes), with headroom for tsvector encoding
+/// overhead. Any chunk over this would fail the FTS index update on
+/// `file_chunks.content`; pre-splitting keeps every chunk insertable.
+pub const TSVECTOR_SAFE_CHUNK_BYTES: usize = 900 * 1024;
+
+/// Post-process a chunker's output: any chunk whose content exceeds
+/// `TSVECTOR_SAFE_CHUNK_BYTES` is split at the nearest UTF-8 boundary
+/// into multiple sub-chunks of bounded size. All sub-chunks inherit the
+/// parent chunk's `start_line` / `end_line` range. `chunk_index` is
+/// renumbered sequentially across the output so the result is dense and
+/// monotonic, matching the invariants downstream consumers expect.
+///
+/// Lossless: concatenating `out.iter().map(|c| &c.content)` is byte-for-
+/// byte equal to concatenating the input's contents. The triggering
+/// case is `.jsonl` tool-result transcripts with a single embedded
+/// string ≥ 1 MiB — those would otherwise fail FTS insertion with
+/// `string is too long for tsvector`.
+pub fn split_oversized_chunks(input: Vec<Chunk>) -> Vec<Chunk> {
+    let mut out: Vec<Chunk> = Vec::with_capacity(input.len());
+    let mut next_index: i32 = 0;
+    for chunk in input {
+        if chunk.content.len() <= TSVECTOR_SAFE_CHUNK_BYTES {
+            out.push(Chunk {
+                chunk_index: next_index,
+                ..chunk
+            });
+            next_index += 1;
+            continue;
+        }
+        let total = chunk.content.len();
+        let mut start = 0;
+        while start < total {
+            let mut end = (start + TSVECTOR_SAFE_CHUNK_BYTES).min(total);
+            // Walk left to the nearest UTF-8 char boundary. A char is at
+            // most 4 bytes; this loop iterates ≤ 3 times.
+            while end > start && !chunk.content.is_char_boundary(end) {
+                end -= 1;
+            }
+            if end == start {
+                // Should not happen because is_char_boundary(start) is
+                // guaranteed (start advances only to past-boundary values).
+                // Defensive: avoid an infinite loop.
+                break;
+            }
+            out.push(Chunk {
+                chunk_index: next_index,
+                content: chunk.content[start..end].to_string(),
+                start_line: chunk.start_line,
+                end_line: chunk.end_line,
+            });
+            next_index += 1;
+            start = end;
+        }
+    }
+    out
+}
+
 /// A chunk of file content.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Chunk {
@@ -454,5 +513,146 @@ mod tests {
         assert_eq!(chunks.len(), 1);
         assert!(chunks[0].content.starts_with('\u{FEFF}'));
         assert_eq!(chunks[0].start_line, 1);
+    }
+
+    // ========================================================================
+    // split_oversized_chunks (TSVECTOR_SAFE_CHUNK_BYTES enforcement)
+    // ========================================================================
+
+    #[test]
+    fn split_oversized_chunks_passes_small_chunks_through_unchanged() {
+        let input = vec![
+            Chunk {
+                chunk_index: 0,
+                content: "hello".into(),
+                start_line: 1,
+                end_line: 1,
+            },
+            Chunk {
+                chunk_index: 1,
+                content: "world".into(),
+                start_line: 2,
+                end_line: 2,
+            },
+        ];
+        let out = split_oversized_chunks(input.clone());
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn split_oversized_chunks_splits_2mib_single_chunk() {
+        let huge = "a".repeat(2 * 1024 * 1024); // 2 MiB
+        let input = vec![Chunk {
+            chunk_index: 0,
+            content: huge.clone(),
+            start_line: 42,
+            end_line: 42,
+        }];
+        let out = split_oversized_chunks(input);
+        // 2 MiB / 900 KiB → 3 sub-chunks.
+        assert_eq!(out.len(), 3);
+        for chunk in &out {
+            assert!(chunk.content.len() <= TSVECTOR_SAFE_CHUNK_BYTES);
+            assert_eq!(chunk.start_line, 42);
+            assert_eq!(chunk.end_line, 42);
+        }
+        // Indices are dense and sequential.
+        assert_eq!(out[0].chunk_index, 0);
+        assert_eq!(out[1].chunk_index, 1);
+        assert_eq!(out[2].chunk_index, 2);
+        // Lossless: concatenation matches input.
+        let rejoined: String = out.iter().map(|c| c.content.as_str()).collect();
+        assert_eq!(rejoined, huge);
+    }
+
+    #[test]
+    fn split_oversized_chunks_handles_multibyte_at_boundary() {
+        // 'é' is two bytes. Construct content where the naive split at
+        // TSVECTOR_SAFE_CHUNK_BYTES would land inside a multi-byte char.
+        let pad = "a".repeat(TSVECTOR_SAFE_CHUNK_BYTES - 1);
+        let content = format!("{pad}é{pad}");
+        let input = vec![Chunk {
+            chunk_index: 0,
+            content: content.clone(),
+            start_line: 1,
+            end_line: 1,
+        }];
+        let out = split_oversized_chunks(input);
+        for chunk in &out {
+            assert!(chunk.content.len() <= TSVECTOR_SAFE_CHUNK_BYTES);
+            // Must still be valid UTF-8 — i.e. no panic on this.
+            let _ = chunk.content.chars().count();
+        }
+        let rejoined: String = out.iter().map(|c| c.content.as_str()).collect();
+        assert_eq!(rejoined, content);
+    }
+
+    #[test]
+    fn split_oversized_chunks_renumbers_indices_after_split() {
+        // Mix of small + oversized + small. Indices on output must be 0,1,…,N-1.
+        let huge = "x".repeat(2 * 1024 * 1024);
+        let input = vec![
+            Chunk {
+                chunk_index: 0,
+                content: "small1".into(),
+                start_line: 1,
+                end_line: 1,
+            },
+            Chunk {
+                chunk_index: 1,
+                content: huge,
+                start_line: 2,
+                end_line: 2,
+            },
+            Chunk {
+                chunk_index: 2,
+                content: "small2".into(),
+                start_line: 3,
+                end_line: 3,
+            },
+        ];
+        let out = split_oversized_chunks(input);
+        // 1 + 3 (split) + 1 = 5
+        assert_eq!(out.len(), 5);
+        for (i, chunk) in out.iter().enumerate() {
+            assert_eq!(chunk.chunk_index, i as i32);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_no_chunk_exceeds_tsvector_limit(
+            unit in "[a-zA-Z0-9 \n]{1,40}",
+            repeats in 1usize..=80_000,
+        ) {
+            let oversized = unit.repeat(repeats);
+            let input = vec![Chunk {
+                chunk_index: 0,
+                content: oversized,
+                start_line: 1,
+                end_line: 1,
+            }];
+            let out = split_oversized_chunks(input);
+            for chunk in &out {
+                prop_assert!(chunk.content.len() <= TSVECTOR_SAFE_CHUNK_BYTES);
+            }
+        }
+
+        #[test]
+        fn prop_split_oversized_is_lossless(
+            unit in "[a-zA-Z0-9 \n]{1,40}",
+            repeats in 1usize..=80_000,
+        ) {
+            let original = unit.repeat(repeats);
+            let input = vec![Chunk {
+                chunk_index: 0,
+                content: original.clone(),
+                start_line: 1,
+                end_line: 1,
+            }];
+            let out = split_oversized_chunks(input);
+            let rejoined: String = out.iter().map(|c| c.content.as_str()).collect();
+            prop_assert_eq!(rejoined, original);
+        }
     }
 }

@@ -63,6 +63,16 @@ pub struct Extracted {
 pub struct ExtractOptions {
     pub timeout: Duration,
     pub max_extracted_bytes: usize,
+    /// Hard cap on the address-space size (RLIMIT_AS) of any
+    /// `pandoc` / `pdftotext` / `ps2ascii` subprocess. `None` means no
+    /// limit; `Some(n)` calls `setrlimit(RLIMIT_AS, n)` in the child
+    /// before exec via `CommandExt::pre_exec` (Unix-only).
+    ///
+    /// This guards against runaway allocators in extractors. A 2026-05-13
+    /// incident saw `pandoc` balloon to 68 GiB anon-RSS on a single
+    /// document and trigger an OOM kill that took the daemon with it;
+    /// without an rlimit, one pathological input can take down indexing.
+    pub max_subprocess_rss_bytes: Option<u64>,
 }
 
 impl Default for ExtractOptions {
@@ -70,6 +80,7 @@ impl Default for ExtractOptions {
         Self {
             timeout: Duration::from_secs(30),
             max_extracted_bytes: 50 * 1024 * 1024,
+            max_subprocess_rss_bytes: Some(4 * 1024 * 1024 * 1024), // 4 GiB
         }
     }
 }
@@ -96,6 +107,15 @@ pub enum ExtractError {
         status: i32,
         stderr: String,
     },
+    /// Subprocess died from a signal — typically because it exceeded the
+    /// `max_subprocess_rss_bytes` rlimit (SIGSEGV/SIGABRT on malloc
+    /// failure inside glibc), got OOM-killed by the kernel (SIGKILL),
+    /// or otherwise aborted. Distinct from `Process` because the exit
+    /// status is None and the signal number carries the diagnosis.
+    SubprocessKilled {
+        tool: &'static str,
+        signal: i32,
+    },
     Encoding(String),
 }
 
@@ -113,6 +133,10 @@ impl std::fmt::Display for ExtractError {
             } => {
                 write!(f, "{tool} exited with status {status}: {stderr}")
             }
+            Self::SubprocessKilled { tool, signal } => write!(
+                f,
+                "{tool} killed by signal {signal} (likely rlimit/OOM/abort)"
+            ),
             Self::Encoding(msg) => write!(f, "encoding error: {msg}"),
         }
     }

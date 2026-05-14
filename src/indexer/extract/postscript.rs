@@ -20,7 +20,13 @@ pub fn extract(path: &Path, opts: &ExtractOptions) -> Result<Option<Extracted>, 
     cmd.arg::<&OsStr>(path.as_os_str());
     cmd.env("LC_ALL", "C.UTF-8");
 
-    let captured = run_bounded(cmd, "ps2ascii", opts.timeout, opts.max_extracted_bytes)?;
+    let captured = run_bounded(
+        cmd,
+        "ps2ascii",
+        opts.timeout,
+        opts.max_extracted_bytes,
+        opts.max_subprocess_rss_bytes,
+    )?;
     let raw = String::from_utf8_lossy(&captured.stdout);
     let text = normalize_extracted_text(&raw);
     Ok(Some(Extracted {

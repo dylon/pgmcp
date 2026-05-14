@@ -40,6 +40,7 @@ pub fn extract(path: &Path, opts: &ExtractOptions) -> Result<Option<Extracted>, 
         &args,
         opts.timeout,
         opts.max_extracted_bytes,
+        opts.max_subprocess_rss_bytes,
     )?;
     let text = normalize_extracted_text(&raw);
     Ok(Some(Extracted {

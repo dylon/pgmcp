@@ -27,6 +27,19 @@ use crate::error::{PgmcpError, Result};
 use crate::indexer::{scanner, watcher};
 use crate::stats::tracker::StatsTracker;
 
+/// Remove all NUL (`\0`) bytes from `s` in-place. Returns `true` iff any
+/// bytes were removed. Postgres `TEXT` columns reject NUL bytes even
+/// though Rust `String` allows them; NUL carries no semantic information
+/// in any indexed text format, so stripping is lossless.
+fn strip_nul_bytes(s: &mut String) -> bool {
+    if s.contains('\0') {
+        s.retain(|c| c != '\0');
+        true
+    } else {
+        false
+    }
+}
+
 /// Decision branch for cross-path content-hash dedup. Computed in the
 /// embed worker after content extraction & hashing.
 enum DedupAction {
@@ -556,6 +569,10 @@ fn process_index_file_task(
         ),
         max_extracted_bytes: max_extracted_text_override
             .unwrap_or(cfg.indexer.max_extracted_text_bytes),
+        max_subprocess_rss_bytes: match cfg.indexer.max_extraction_subprocess_rss_bytes {
+            0 => None,
+            n => Some(n),
+        },
     };
 
     // Pre-read size gate for oversized files: register placeholder, no content.
@@ -614,7 +631,7 @@ fn process_index_file_task(
     // extraction subprocess pipeline (`pdftotext`, `ps2ascii`, `pandoc`)
     // and end up normalized for token-efficient delivery; code languages
     // are read verbatim as UTF-8.
-    let content = if is_document_language {
+    let mut content = if is_document_language {
         match extract::extract_for_language(&language, &path, &extract_opts) {
             Ok(Some(extracted)) => {
                 if extracted.truncated {
@@ -657,6 +674,20 @@ fn process_index_file_task(
                     .fetch_add(1, Ordering::Relaxed);
                 return;
             }
+            Err(extract::ExtractError::SubprocessKilled { tool, signal }) => {
+                error!(
+                    path = %path_str,
+                    worker_id,
+                    lang = %language,
+                    tool,
+                    signal,
+                    "Document extraction subprocess killed (likely rlimit/OOM); see [indexer] max_extraction_subprocess_rss_bytes"
+                );
+                stats
+                    .documents_extraction_oom
+                    .fetch_add(1, Ordering::Relaxed);
+                return;
+            }
             Err(e) => {
                 error!(
                     path = %path_str,
@@ -680,6 +711,15 @@ fn process_index_file_task(
         }
     };
     let content_hash = xxh3_64(content.as_bytes()) as i64;
+
+    // Strip NUL bytes before any SQL insert. Postgres `TEXT` columns
+    // reject `\0` even though Rust `String` allows them; the OOM-prone
+    // `.jsonl` tool-result transcripts have embedded NULs from binary
+    // escape sequences. Stripping is lossless because NUL bytes carry
+    // no semantic information in any indexed text format. The content
+    // hash above is over the ORIGINAL bytes so PR F's disk-fast-path
+    // can still verify against the on-disk file.
+    let mut had_nul_bytes = strip_nul_bytes(&mut content);
 
     // Cross-path dedup + rename detection:
     //
@@ -846,7 +886,8 @@ fn process_index_file_task(
     // and org get heading-aware chunking (post-pandoc plain text mostly
     // falls back to paragraph mode internally); pdf/postscript/docx/etc.
     // use paragraph-aware chunking; everything else uses the line chunker.
-    let chunks = if &*language == "jsonl" && claude_chunker::is_claude_session_transcript(&path) {
+    let mut chunks = if &*language == "jsonl" && claude_chunker::is_claude_session_transcript(&path)
+    {
         claude_chunker::chunk_claude_jsonl(&content)
     } else if &*language == "jsonl" && codex_chunker::is_codex_jsonl(&path) {
         codex_chunker::chunk_codex_jsonl(&content)
@@ -866,6 +907,28 @@ fn process_index_file_task(
             cfg.embeddings.chunk_overlap_lines,
         )
     };
+
+    // Strip NUL bytes from chunk content. Most cases are already covered
+    // by the strip on `content` above, but `claude_chunker` parses JSON
+    // strings and can introduce raw `\0` from `" "` escapes in tool
+    // results — those would otherwise reject at `insert_chunk` time.
+    for chunk in chunks.iter_mut() {
+        if strip_nul_bytes(&mut chunk.content) {
+            had_nul_bytes = true;
+        }
+    }
+    if had_nul_bytes {
+        stats
+            .files_with_null_bytes_stripped
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    // Cap chunk content at the per-row tsvector limit. JSONL transcripts
+    // occasionally have a single message > 1 MiB; without this the
+    // `INSERT INTO file_chunks` would fail with `string is too long for
+    // tsvector (X bytes, max 1048575 bytes)`. Split is byte-for-byte
+    // lossless along UTF-8 boundaries.
+    chunks = chunker::split_oversized_chunks(chunks);
 
     if chunks.is_empty() {
         if let Err(e) = rt.block_on(db.finalize_file_hash(file_id, content_hash)) {
@@ -989,4 +1052,53 @@ fn is_fk_violation(e: &sqlx::Error) -> bool {
         return db_err.code().as_deref() == Some("23503");
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strip_nul_bytes_returns_false_on_clean_input() {
+        let mut s = String::from("no nuls here");
+        assert!(!strip_nul_bytes(&mut s));
+        assert_eq!(s, "no nuls here");
+    }
+
+    #[test]
+    fn strip_nul_bytes_removes_embedded_nul() {
+        let mut s = String::from("before\0after");
+        assert!(strip_nul_bytes(&mut s));
+        assert_eq!(s, "beforeafter");
+    }
+
+    #[test]
+    fn strip_nul_bytes_removes_multiple_nuls() {
+        let mut s = String::from("\0a\0b\0c\0");
+        assert!(strip_nul_bytes(&mut s));
+        assert_eq!(s, "abc");
+    }
+
+    #[test]
+    fn strip_nul_bytes_handles_only_nuls() {
+        let mut s = String::from("\0\0\0");
+        assert!(strip_nul_bytes(&mut s));
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn strip_nul_bytes_preserves_unicode() {
+        // Mixed: NUL + multi-byte UTF-8. `retain` operates on `char`s, so
+        // the multi-byte sequences must survive untouched.
+        let mut s = String::from("héllo\0wörld\0\u{1F600}");
+        assert!(strip_nul_bytes(&mut s));
+        assert_eq!(s, "héllowörld\u{1F600}");
+    }
+
+    #[test]
+    fn strip_nul_bytes_preserves_empty_string() {
+        let mut s = String::new();
+        assert!(!strip_nul_bytes(&mut s));
+        assert_eq!(s, "");
+    }
 }

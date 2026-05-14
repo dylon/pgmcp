@@ -98,6 +98,11 @@ pub struct StatsTracker {
     // daemon's startup preflight names which tool to install.
     pub documents_skipped_no_tool: AtomicU64,
     pub documents_extraction_timeout: AtomicU64,
+    /// Document extraction subprocess (`pandoc`/`pdftotext`/`ps2ascii`)
+    /// died from a signal — typically because it exceeded the
+    /// `max_extraction_subprocess_rss_bytes` rlimit or was OOM-killed.
+    /// One increment per affected file.
+    pub documents_extraction_oom: AtomicU64,
     pub documents_truncated: AtomicU64,
     /// Cross-path duplicate detected at index time — second copy of the
     /// same content stored as a metadata-only `duplicate_of_file_id`
@@ -110,6 +115,12 @@ pub struct StatsTracker {
     /// Canonical deleted while duplicates pointed at it — one duplicate
     /// was promoted to canonical and chunks were re-parented to it.
     pub documents_canonical_promoted: AtomicU64,
+    /// Files where one or more NUL bytes (`\0`) were stripped from
+    /// content or chunk text before SQL insertion. Postgres `TEXT`
+    /// columns reject NUL bytes even though Rust `String` allows them;
+    /// stripping is lossless because NUL carries no semantic information
+    /// in any indexed text format. One increment per affected file.
+    pub files_with_null_bytes_stripped: AtomicU64,
 
     // Graph analysis counters
     pub graph_build_runs: AtomicU64,
@@ -259,10 +270,12 @@ impl StatsTracker {
             doc_coverage_scans: AtomicU64::new(0),
             documents_skipped_no_tool: AtomicU64::new(0),
             documents_extraction_timeout: AtomicU64::new(0),
+            documents_extraction_oom: AtomicU64::new(0),
             documents_truncated: AtomicU64::new(0),
             documents_deduplicated: AtomicU64::new(0),
             documents_renamed: AtomicU64::new(0),
             documents_canonical_promoted: AtomicU64::new(0),
+            files_with_null_bytes_stripped: AtomicU64::new(0),
             graph_build_runs: AtomicU64::new(0),
             dependency_graph_scans: AtomicU64::new(0),
             centrality_scans: AtomicU64::new(0),
@@ -377,10 +390,12 @@ impl StatsTracker {
             "doc_coverage_scans": self.doc_coverage_scans.load(Ordering::Acquire),
             "documents_skipped_no_tool": self.documents_skipped_no_tool.load(Ordering::Acquire),
             "documents_extraction_timeout": self.documents_extraction_timeout.load(Ordering::Acquire),
+            "documents_extraction_oom": self.documents_extraction_oom.load(Ordering::Acquire),
             "documents_truncated": self.documents_truncated.load(Ordering::Acquire),
             "documents_deduplicated": self.documents_deduplicated.load(Ordering::Acquire),
             "documents_renamed": self.documents_renamed.load(Ordering::Acquire),
             "documents_canonical_promoted": self.documents_canonical_promoted.load(Ordering::Acquire),
+            "files_with_null_bytes_stripped": self.files_with_null_bytes_stripped.load(Ordering::Acquire),
             "graph_build_runs": self.graph_build_runs.load(Ordering::Acquire),
             "dependency_graph_scans": self.dependency_graph_scans.load(Ordering::Acquire),
             "centrality_scans": self.centrality_scans.load(Ordering::Acquire),

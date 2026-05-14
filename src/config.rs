@@ -121,6 +121,14 @@ pub struct IndexerConfig {
     /// killed and the file is counted as `documents_extraction_timeout`.
     #[serde(default = "default_document_extraction_timeout_secs")]
     pub document_extraction_timeout_secs: u64,
+    /// Hard cap on the address-space size (RLIMIT_AS) of any document
+    /// extraction subprocess. Default 4 GiB. Guards against runaway
+    /// allocators in `pandoc` / `pdftotext` / `ps2ascii` — a 2026-05-13
+    /// pandoc invocation grew to 68 GiB RSS on a single input and got
+    /// OOM-killed, taking the daemon's logging task with it. Setting to
+    /// `0` disables the limit.
+    #[serde(default = "default_max_extraction_subprocess_rss_bytes")]
+    pub max_extraction_subprocess_rss_bytes: u64,
 }
 
 impl Default for IndexerConfig {
@@ -134,6 +142,7 @@ impl Default for IndexerConfig {
             max_document_source_bytes: default_max_document_source_bytes(),
             max_extracted_text_bytes: default_max_extracted_text_bytes(),
             document_extraction_timeout_secs: default_document_extraction_timeout_secs(),
+            max_extraction_subprocess_rss_bytes: default_max_extraction_subprocess_rss_bytes(),
         }
     }
 }
@@ -394,6 +403,10 @@ fn default_max_document_source_bytes() -> u64 {
 
 fn default_max_extracted_text_bytes() -> usize {
     50 * 1024 * 1024 // 50 MiB of post-extraction text
+}
+
+fn default_max_extraction_subprocess_rss_bytes() -> u64 {
+    4 * 1024 * 1024 * 1024 // 4 GiB
 }
 
 fn default_document_extraction_timeout_secs() -> u64 {

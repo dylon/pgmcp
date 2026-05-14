@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc 9b8d219ae2e0d5f433f0086ea27adbd45d5107fbb14ccdc011e6451e96c7c0c2 # shrinks to s = "\n\n\t\n"
+cc 0813fdefadfbed6a6e77424be65e753fa12632030c8a892b2d617c403706d670 # shrinks to s = "a-\na-\na"
