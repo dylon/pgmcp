@@ -38,6 +38,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 pub mod normalize;
+pub mod ocr;
+pub mod ocr_cache;
 pub mod office;
 pub mod pdf;
 pub mod postscript;
@@ -59,7 +61,7 @@ pub struct Extracted {
 
 /// Knobs for a single extraction call. Sourced from `IndexerConfig` (or
 /// a `ProjectIndexerOverride`) at the call site.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ExtractOptions {
     pub timeout: Duration,
     pub max_extracted_bytes: usize,
@@ -73,6 +75,34 @@ pub struct ExtractOptions {
     /// document and trigger an OOM kill that took the daemon with it;
     /// without an rlimit, one pathological input can take down indexing.
     pub max_subprocess_rss_bytes: Option<u64>,
+    /// OCR fallback parameters. When `enabled`, scanned PDFs whose
+    /// `pdftotext` text falls below `min_text_chars_per_page * page_count`
+    /// are rasterized with `pdftoppm` and passed through `tesseract`.
+    pub ocr: OcrOptions,
+}
+
+/// Tesseract-OCR-specific knobs. Plumbed in from `IndexerConfig` at the
+/// call site (see `embed::pool` for the canonical construction). Defaults
+/// are deliberately permissive so the OCR path is on for any binary that
+/// merely calls `ExtractOptions::default()` (e.g. the
+/// `refresh_pattern_catalog` PDF fetch path).
+#[derive(Debug, Clone)]
+pub struct OcrOptions {
+    pub enabled: bool,
+    pub min_text_chars_per_page: usize,
+    pub max_pages: usize,
+    pub dpi: u32,
+    pub languages: Vec<String>,
+    /// Per-document wall-clock budget covering pdftoppm + all tesseract
+    /// invocations. When exceeded, partial output is returned and the
+    /// caller sees `truncated = true`.
+    pub total_timeout: Duration,
+    /// Per-page tesseract stdout cap. Defaults to a generous slice of
+    /// `max_extracted_bytes / max_pages` at call-site construction.
+    pub max_per_page_bytes: usize,
+    /// Same semantics as `ExtractOptions::max_subprocess_rss_bytes` but
+    /// applied to tesseract/pdftoppm specifically.
+    pub max_subprocess_rss_bytes: Option<u64>,
 }
 
 impl Default for ExtractOptions {
@@ -81,6 +111,22 @@ impl Default for ExtractOptions {
             timeout: Duration::from_secs(30),
             max_extracted_bytes: 50 * 1024 * 1024,
             max_subprocess_rss_bytes: Some(4 * 1024 * 1024 * 1024), // 4 GiB
+            ocr: OcrOptions::default(),
+        }
+    }
+}
+
+impl Default for OcrOptions {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            min_text_chars_per_page: 200,
+            max_pages: 50,
+            dpi: 300,
+            languages: vec!["eng".to_string()],
+            total_timeout: Duration::from_secs(1800), // 30 minutes
+            max_per_page_bytes: 1024 * 1024,          // 1 MiB stdout per page
+            max_subprocess_rss_bytes: Some(4 * 1024 * 1024 * 1024),
         }
     }
 }
@@ -117,6 +163,16 @@ pub enum ExtractError {
         signal: i32,
     },
     Encoding(String),
+    /// OCR ran but produced empty/whitespace-only text. Distinct from
+    /// `OcrFailed` because the subprocesses exited successfully — the
+    /// document is genuinely unrecognizable to tesseract. Callers fall
+    /// back to whatever sparse `pdftotext` output produced.
+    OcrEmpty,
+    /// `pdftoppm` or `tesseract` failed unrecoverably. The inner variant
+    /// (typically `Process` or `Timeout`) carries the underlying error.
+    /// Counted separately so operators can distinguish OCR failures from
+    /// general extraction failures.
+    OcrFailed(Box<ExtractError>),
 }
 
 impl std::fmt::Display for ExtractError {
@@ -138,6 +194,8 @@ impl std::fmt::Display for ExtractError {
                 "{tool} killed by signal {signal} (likely rlimit/OOM/abort)"
             ),
             Self::Encoding(msg) => write!(f, "encoding error: {msg}"),
+            Self::OcrEmpty => write!(f, "OCR produced empty output"),
+            Self::OcrFailed(inner) => write!(f, "OCR failed: {inner}"),
         }
     }
 }
@@ -154,8 +212,22 @@ pub fn extract_for_language(
     path: &Path,
     opts: &ExtractOptions,
 ) -> Result<Option<Extracted>, ExtractError> {
+    extract_for_language_with_cache(language, path, opts, None, None)
+}
+
+/// Variant of [`extract_for_language`] that threads an OCR cache and the
+/// source-bytes hash through to the PDF extractor. Other languages
+/// ignore the extra parameters. The embed pool uses this entry point;
+/// ad-hoc callers (e.g. tests) can stick with [`extract_for_language`].
+pub fn extract_for_language_with_cache(
+    language: &str,
+    path: &Path,
+    opts: &ExtractOptions,
+    ocr_cache: Option<&dyn ocr_cache::OcrCache>,
+    content_hash: Option<i64>,
+) -> Result<Option<Extracted>, ExtractError> {
     match language {
-        "pdf" => pdf::extract(path, opts),
+        "pdf" => pdf::extract_with_cache(path, opts, ocr_cache, content_hash),
         "postscript" => postscript::extract(path, opts),
         "docx" | "doc" | "rtf" | "odt" | "epub" => office::extract_office(language, path, opts),
         // LaTeX and ORG ride pandoc to drop markup overhead at index time,
@@ -212,12 +284,18 @@ pub(crate) fn resolve_tool(tool: &'static str) -> Option<PathBuf> {
 
 fn tool_cache(tool: &'static str) -> &'static OnceLock<Option<PathBuf>> {
     static PDFTOTEXT: OnceLock<Option<PathBuf>> = OnceLock::new();
+    static PDFINFO: OnceLock<Option<PathBuf>> = OnceLock::new();
+    static PDFTOPPM: OnceLock<Option<PathBuf>> = OnceLock::new();
     static PS2ASCII: OnceLock<Option<PathBuf>> = OnceLock::new();
     static PANDOC: OnceLock<Option<PathBuf>> = OnceLock::new();
+    static TESSERACT: OnceLock<Option<PathBuf>> = OnceLock::new();
     match tool {
         "pdftotext" => &PDFTOTEXT,
+        "pdfinfo" => &PDFINFO,
+        "pdftoppm" => &PDFTOPPM,
         "ps2ascii" => &PS2ASCII,
         "pandoc" => &PANDOC,
+        "tesseract" => &TESSERACT,
         // Defensive: an unknown tool gets a fresh-but-immediately-leaked
         // OnceLock. This branch is never hit in production because every
         // call site uses a literal known to this match.
@@ -246,6 +324,27 @@ pub const REQUIRED_TOOLS: &[(&str, &[&str], &str)] = &[
         &["docx", "doc", "rtf", "odt", "epub", "latex", "org"],
         "install pandoc (Arch: pacman -S pandoc-cli; \
          Debian: apt install pandoc; macOS: brew install pandoc)",
+    ),
+    (
+        "pdftoppm",
+        &["pdf"],
+        "install poppler (Arch: pacman -S poppler; \
+         Debian: apt install poppler-utils; macOS: brew install poppler). \
+         Used for OCR rasterization; missing tool disables the OCR fallback.",
+    ),
+    (
+        "pdfinfo",
+        &["pdf"],
+        "install poppler (Arch: pacman -S poppler; \
+         Debian: apt install poppler-utils; macOS: brew install poppler). \
+         Used to count pages before OCR; missing tool falls back to single-page assumption.",
+    ),
+    (
+        "tesseract",
+        &["pdf"],
+        "install tesseract (Arch: pacman -S tesseract tesseract-data-eng; \
+         Debian: apt install tesseract-ocr tesseract-ocr-eng; macOS: brew install tesseract). \
+         Used as OCR fallback for image-only PDFs; missing tool disables the OCR fallback.",
     ),
 ];
 

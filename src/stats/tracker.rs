@@ -112,6 +112,21 @@ pub struct StatsTracker {
     /// One increment per affected file.
     pub documents_extraction_oom: AtomicU64,
     pub documents_truncated: AtomicU64,
+    /// Documents where `pdftotext` returned below the per-page text
+    /// threshold and OCR (pdftoppm + tesseract) was triggered. One
+    /// increment per affected file, whether OCR succeeded or fell back.
+    pub documents_ocr_triggered: AtomicU64,
+    /// OCR run was skipped because a cached result keyed on the PDF
+    /// byte-hash was already present in `ocr_extractions`. One increment
+    /// per cache hit.
+    pub documents_ocr_cache_hits: AtomicU64,
+    /// OCR run failed (pdftoppm/tesseract subprocess error, timeout, or
+    /// empty output). The caller falls back to the sparse pdftotext
+    /// output rather than raising. One increment per affected file.
+    pub documents_ocr_failed: AtomicU64,
+    /// Cumulative count of PDF pages successfully OCR'd across the
+    /// daemon's lifetime. Tracks OCR throughput at coarse granularity.
+    pub documents_ocr_pages_processed: AtomicU64,
     /// Cross-path duplicate detected at index time — second copy of the
     /// same content stored as a metadata-only `duplicate_of_file_id`
     /// pointer to the canonical row.
@@ -306,6 +321,10 @@ impl StatsTracker {
             documents_extraction_timeout: AtomicU64::new(0),
             documents_extraction_oom: AtomicU64::new(0),
             documents_truncated: AtomicU64::new(0),
+            documents_ocr_triggered: AtomicU64::new(0),
+            documents_ocr_cache_hits: AtomicU64::new(0),
+            documents_ocr_failed: AtomicU64::new(0),
+            documents_ocr_pages_processed: AtomicU64::new(0),
             documents_deduplicated: AtomicU64::new(0),
             documents_renamed: AtomicU64::new(0),
             documents_canonical_promoted: AtomicU64::new(0),
@@ -432,6 +451,10 @@ impl StatsTracker {
             "documents_extraction_timeout": self.documents_extraction_timeout.load(Ordering::Acquire),
             "documents_extraction_oom": self.documents_extraction_oom.load(Ordering::Acquire),
             "documents_truncated": self.documents_truncated.load(Ordering::Acquire),
+            "documents_ocr_triggered": self.documents_ocr_triggered.load(Ordering::Acquire),
+            "documents_ocr_cache_hits": self.documents_ocr_cache_hits.load(Ordering::Acquire),
+            "documents_ocr_failed": self.documents_ocr_failed.load(Ordering::Acquire),
+            "documents_ocr_pages_processed": self.documents_ocr_pages_processed.load(Ordering::Acquire),
             "documents_deduplicated": self.documents_deduplicated.load(Ordering::Acquire),
             "documents_renamed": self.documents_renamed.load(Ordering::Acquire),
             "documents_canonical_promoted": self.documents_canonical_promoted.load(Ordering::Acquire),

@@ -680,6 +680,35 @@ pub async fn run_migrations(
     ensure_software_pattern_hnsw_index(pool, vector_config).await?;
 
     // ================================================================
+    // OCR extraction cache (Tesseract fallback for scanned PDFs)
+    //
+    // Keyed on xxh3_64 of the SOURCE PDF BYTES (not the extracted text)
+    // so cache hits work *before* re-running pdftoppm + tesseract. The
+    // hash matches across copies of the same PDF stored under different
+    // paths (papers/ folder, workspace clones, HTTP-fetched temp files
+    // from refresh_pattern_catalog). See src/indexer/extract/ocr_cache.rs.
+    // ================================================================
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS ocr_extractions (
+            content_hash BIGINT PRIMARY KEY,
+            ocr_text     TEXT      NOT NULL,
+            pages_ocred  INTEGER   NOT NULL,
+            dpi          INTEGER   NOT NULL,
+            languages    TEXT[]    NOT NULL,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_ocr_extractions_created_at \
+         ON ocr_extractions(created_at)",
+    )
+    .execute(pool)
+    .await?;
+
+    // ================================================================
     // Session-level mandate observation (session_id keyed)
     // ================================================================
 

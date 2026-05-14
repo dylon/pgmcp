@@ -576,15 +576,32 @@ fn process_index_file_task(
         max_file_size_override.unwrap_or(cfg.indexer.max_file_size_bytes)
     };
 
+    let max_extracted_bytes_value =
+        max_extracted_text_override.unwrap_or(cfg.indexer.max_extracted_text_bytes);
+    let extraction_rss_bytes = match cfg.indexer.max_extraction_subprocess_rss_bytes {
+        0 => None,
+        n => Some(n),
+    };
     let extract_opts = extract::ExtractOptions {
         timeout: std::time::Duration::from_secs(
             extraction_timeout_override.unwrap_or(cfg.indexer.document_extraction_timeout_secs),
         ),
-        max_extracted_bytes: max_extracted_text_override
-            .unwrap_or(cfg.indexer.max_extracted_text_bytes),
-        max_subprocess_rss_bytes: match cfg.indexer.max_extraction_subprocess_rss_bytes {
-            0 => None,
-            n => Some(n),
+        max_extracted_bytes: max_extracted_bytes_value,
+        max_subprocess_rss_bytes: extraction_rss_bytes,
+        ocr: extract::OcrOptions {
+            enabled: cfg.indexer.ocr_enabled,
+            min_text_chars_per_page: cfg.indexer.ocr_min_text_chars_per_page,
+            max_pages: cfg.indexer.ocr_max_pages,
+            dpi: cfg.indexer.ocr_dpi,
+            languages: cfg.indexer.ocr_languages.clone(),
+            total_timeout: std::time::Duration::from_secs(cfg.indexer.ocr_total_timeout_secs),
+            // Apportion the extraction byte cap across OCR pages so a single
+            // doc cannot blow past the global max_extracted_text_bytes budget.
+            max_per_page_bytes: max_extracted_bytes_value
+                .checked_div(cfg.indexer.ocr_max_pages.max(1))
+                .unwrap_or(1024 * 1024)
+                .max(64 * 1024),
+            max_subprocess_rss_bytes: extraction_rss_bytes,
         },
     };
 
@@ -641,12 +658,47 @@ fn process_index_file_task(
         return;
     }
 
+    // For PDFs, compute the byte-hash up front so the OCR cache can
+    // deduplicate scanned-PDF OCR runs across re-indexes / project clones
+    // / HTTP fetches. This is one extra disk read for PDFs only; non-PDF
+    // document formats skip the hash and the cache lookup.
+    let (ocr_cache_opt, ocr_byte_hash) = if language == "pdf" && cfg.indexer.ocr_enabled {
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let hash = xxh3_64(&bytes) as i64;
+                let cache = db.pool().map(|p| {
+                    Arc::new(extract::ocr_cache::PgOcrCache::new(p.clone(), rt.clone()))
+                        as Arc<dyn extract::ocr_cache::OcrCache>
+                });
+                (cache, Some(hash))
+            }
+            Err(e) => {
+                debug!(
+                    path = %path_str,
+                    worker_id,
+                    error = %e,
+                    "fs::read failed for PDF byte-hash; OCR cache disabled for this file"
+                );
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
+
     // Read file content (sync). Document languages route through the
     // extraction subprocess pipeline (`pdftotext`, `ps2ascii`, `pandoc`)
     // and end up normalized for token-efficient delivery; code languages
     // are read verbatim as UTF-8.
     let mut content = if is_document_language {
-        match extract::extract_for_language(&language, &path, &extract_opts) {
+        let cache_ref = ocr_cache_opt.as_deref();
+        match extract::extract_for_language_with_cache(
+            &language,
+            &path,
+            &extract_opts,
+            cache_ref,
+            ocr_byte_hash,
+        ) {
             Ok(Some(extracted)) => {
                 if extracted.truncated {
                     stats.documents_truncated.fetch_add(1, Ordering::Relaxed);

@@ -129,6 +129,36 @@ pub struct IndexerConfig {
     /// `0` disables the limit.
     #[serde(default = "default_max_extraction_subprocess_rss_bytes")]
     pub max_extraction_subprocess_rss_bytes: u64,
+    /// Master switch for OCR fallback when `pdftotext` produces sparse
+    /// text. When `true` (default), scanned/image-only PDFs are rasterized
+    /// with `pdftoppm` and passed through `tesseract` per page; cached by
+    /// content_hash so re-runs reuse the OCR output.
+    #[serde(default = "default_ocr_enabled")]
+    pub ocr_enabled: bool,
+    /// Per-page character threshold below which OCR is triggered.
+    /// Trigger formula: `pdftotext_chars < ocr_min_text_chars_per_page * page_count`.
+    /// 200 chars/page admits sparse but real text (cover pages, single-paragraph
+    /// figures) while catching mostly-empty pdftotext output from scans.
+    #[serde(default = "default_ocr_min_text_chars_per_page")]
+    pub ocr_min_text_chars_per_page: usize,
+    /// Hard cap on pages OCRed per document. Protects against a 1000-page
+    /// scanned PDF burning hours of CPU. Output beyond this is omitted and
+    /// `truncated = true` is set on the result.
+    #[serde(default = "default_ocr_max_pages")]
+    pub ocr_max_pages: usize,
+    /// Rasterization DPI passed to `pdftoppm -r`. 300 is the OCR
+    /// industry-standard balance between accuracy and tempdir footprint.
+    #[serde(default = "default_ocr_dpi")]
+    pub ocr_dpi: u32,
+    /// Tesseract language traineddata identifiers. `["eng"]` is the
+    /// default; `["eng", "fra"]` joins with `+` for multi-language pages.
+    #[serde(default = "default_ocr_languages")]
+    pub ocr_languages: Vec<String>,
+    /// Per-document wall-clock budget for the full OCR run (rasterize +
+    /// all pages). When exceeded, the run is cut short, partial text is
+    /// returned, and `truncated = true` is set.
+    #[serde(default = "default_ocr_total_timeout_secs")]
+    pub ocr_total_timeout_secs: u64,
 }
 
 impl Default for IndexerConfig {
@@ -143,6 +173,12 @@ impl Default for IndexerConfig {
             max_extracted_text_bytes: default_max_extracted_text_bytes(),
             document_extraction_timeout_secs: default_document_extraction_timeout_secs(),
             max_extraction_subprocess_rss_bytes: default_max_extraction_subprocess_rss_bytes(),
+            ocr_enabled: default_ocr_enabled(),
+            ocr_min_text_chars_per_page: default_ocr_min_text_chars_per_page(),
+            ocr_max_pages: default_ocr_max_pages(),
+            ocr_dpi: default_ocr_dpi(),
+            ocr_languages: default_ocr_languages(),
+            ocr_total_timeout_secs: default_ocr_total_timeout_secs(),
         }
     }
 }
@@ -411,6 +447,30 @@ fn default_max_extraction_subprocess_rss_bytes() -> u64 {
 
 fn default_document_extraction_timeout_secs() -> u64 {
     30
+}
+
+fn default_ocr_enabled() -> bool {
+    true
+}
+
+fn default_ocr_min_text_chars_per_page() -> usize {
+    200
+}
+
+fn default_ocr_max_pages() -> usize {
+    50
+}
+
+fn default_ocr_dpi() -> u32 {
+    300
+}
+
+fn default_ocr_languages() -> Vec<String> {
+    vec!["eng".to_string()]
+}
+
+fn default_ocr_total_timeout_secs() -> u64 {
+    1800 // 30 minutes
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

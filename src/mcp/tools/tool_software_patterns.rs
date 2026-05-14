@@ -659,7 +659,7 @@ async fn import_registered_sources(
             .map(|state| http_validators_from_metadata(&state.metadata))
             .unwrap_or_default();
 
-        match fetch_source_text(source, &validators).await {
+        match fetch_source_text(source, &validators, Some(pool.clone())).await {
             Ok(FetchedSource::NotModified {
                 etag,
                 last_modified,
@@ -973,14 +973,38 @@ async fn embed_source_content(
 /// reject SPA shells where `html_to_text` only stripped script tags.
 const MIN_FETCHED_TEXT_CHARS: usize = 40;
 
+/// Try the primary URL, then each `mirrors` entry in order. Supports
+/// `https://`, `http://`, and `file://` schemes. `application/pdf`
+/// responses (HTTP) and `.pdf` files (file://) are extracted via
+/// `indexer::extract::pdf::extract`. Returns the first success; if every
+/// candidate fails, returns the last error annotated with the attempt count.
+///
+/// Only the primary URL receives the conditional-GET validators; mirrors
+/// are always fetched fresh because the cached ETag/Last-Modified came from
+/// the primary host and is meaningless against a different origin.
 async fn fetch_source_text(
     source: &SourceDescriptor,
     validators: &HttpValidators,
+    pool: Option<PgPool>,
 ) -> Result<FetchedSource, String> {
-    let url = source.url.to_string();
+    let primary = source.url.to_string();
     let title = source.title.to_string();
+    let mirrors: Vec<String> = source.mirrors.iter().map(|s| s.to_string()).collect();
     let validators = validators.clone();
+
     tokio::task::spawn_blocking(move || -> Result<FetchedSource, String> {
+        // Construct an OCR cache if we have a pool to back it. The cache
+        // lets scanned-PDF mirrors share OCR results across refresh runs
+        // and across sources that point at the same PDF bytes.
+        let ocr_cache: Option<std::sync::Arc<dyn crate::indexer::extract::ocr_cache::OcrCache>> =
+            pool.map(|p| {
+                std::sync::Arc::new(crate::indexer::extract::ocr_cache::PgOcrCache::new(
+                    p,
+                    tokio::runtime::Handle::current(),
+                ))
+                    as std::sync::Arc<dyn crate::indexer::extract::ocr_cache::OcrCache>
+            });
+        let ocr_cache_ref = ocr_cache.as_deref();
         // reqwest::blocking client. HTTP/2 + gzip/brotli are required because
         // many indexed sources (Wikipedia, AWS, Microsoft Learn, arXiv) serve
         // HTTP/2 exclusively and compress responses by default; ureq 2.x
@@ -993,70 +1017,234 @@ async fn fetch_source_text(
             .build()
             .map_err(|e| format!("build http client failed: {}", e))?;
 
-        let mut request = client
-            .get(&url)
-            .header("Accept", "text/html,application/xhtml+xml,application/pdf,*/*;q=0.8");
-        if let Some(etag) = validators.etag.as_deref() {
-            request = request.header("If-None-Match", etag);
-        }
-        if let Some(last_modified) = validators.last_modified.as_deref() {
-            request = request.header("If-Modified-Since", last_modified);
+        let mut last_err: Option<String> = None;
+        let total_candidates = 1 + mirrors.len();
+
+        for (idx, candidate) in std::iter::once(&primary).chain(mirrors.iter()).enumerate() {
+            let validators_for_this = if idx == 0 {
+                validators.clone()
+            } else {
+                HttpValidators::default()
+            };
+
+            let result = if let Some(local_path) = candidate.strip_prefix("file://") {
+                fetch_local_source_sync(local_path, &title, candidate, ocr_cache_ref)
+            } else {
+                fetch_http_source_sync(
+                    &client,
+                    candidate,
+                    &title,
+                    &validators_for_this,
+                    ocr_cache_ref,
+                )
+            };
+
+            match result {
+                Ok(fetched) => return Ok(fetched),
+                Err(e) => last_err = Some(e),
+            }
         }
 
-        let response = request
-            .send()
-            .map_err(|e| format!("fetch failed for {}: {}", url, e))?;
-
-        let status = response.status();
-        if status == reqwest::StatusCode::NOT_MODIFIED {
-            return Ok(FetchedSource::NotModified {
-                etag: response
-                    .headers()
-                    .get("ETag")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string),
-                last_modified: response
-                    .headers()
-                    .get("Last-Modified")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_string),
-            });
+        let mut err =
+            last_err.unwrap_or_else(|| format!("no urls configured for source '{}'", title));
+        if total_candidates > 1 {
+            err = format!(
+                "all {} URL(s) failed for source '{}'; last error: {}",
+                total_candidates, title, err
+            );
         }
-        if !status.is_success() {
-            return Err(format!("fetch failed for {}: status {}", url, status));
-        }
-
-        let etag = response
-            .headers()
-            .get("ETag")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        let last_modified = response
-            .headers()
-            .get("Last-Modified")
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-
-        let body = response
-            .text()
-            .map_err(|e| format!("read failed for {}: {}", url, e))?;
-        let text = sanitize_text_for_postgres(&html_to_text(&body));
-        if text.trim().len() < MIN_FETCHED_TEXT_CHARS {
-            Err(format!(
-                "fetched source '{}' but extracted too little text ({} chars after html_to_text; URL may be a JS-rendered SPA or landing page)",
-                title,
-                text.trim().len(),
-            ))
-        } else {
-            Ok(FetchedSource::Modified {
-                content: format!("Title: {}\nURL: {}\n\n{}", title, url, text),
-                etag,
-                last_modified,
-            })
-        }
+        Err(err)
     })
     .await
     .map_err(|e| format!("fetch task failed: {}", e))?
+}
+
+fn fetch_http_source_sync(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    title: &str,
+    validators: &HttpValidators,
+    ocr_cache: Option<&dyn crate::indexer::extract::ocr_cache::OcrCache>,
+) -> Result<FetchedSource, String> {
+    let mut request = client.get(url).header(
+        "Accept",
+        "text/html,application/xhtml+xml,application/pdf,*/*;q=0.8",
+    );
+    if let Some(etag) = validators.etag.as_deref() {
+        request = request.header("If-None-Match", etag);
+    }
+    if let Some(last_modified) = validators.last_modified.as_deref() {
+        request = request.header("If-Modified-Since", last_modified);
+    }
+
+    let response = request
+        .send()
+        .map_err(|e| format!("fetch failed for {}: {}", url, e))?;
+
+    let status = response.status();
+    if status == reqwest::StatusCode::NOT_MODIFIED {
+        return Ok(FetchedSource::NotModified {
+            etag: response_header(&response, "ETag"),
+            last_modified: response_header(&response, "Last-Modified"),
+        });
+    }
+    if !status.is_success() {
+        return Err(format!("fetch failed for {}: status {}", url, status));
+    }
+
+    let etag = response_header(&response, "ETag");
+    let last_modified = response_header(&response, "Last-Modified");
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_lowercase();
+
+    let url_no_query = url.split('?').next().unwrap_or(url);
+    let is_pdf = content_type.starts_with("application/pdf")
+        || url_no_query.to_lowercase().ends_with(".pdf");
+
+    let text = if is_pdf {
+        let bytes = response
+            .bytes()
+            .map_err(|e| format!("read failed for {}: {}", url, e))?;
+        extract_pdf_bytes(&bytes, url, ocr_cache)?
+    } else {
+        let body = response
+            .text()
+            .map_err(|e| format!("read failed for {}: {}", url, e))?;
+        sanitize_text_for_postgres(&html_to_text(&body))
+    };
+
+    if text.trim().chars().count() < MIN_FETCHED_TEXT_CHARS {
+        return Err(format!(
+            "fetched source '{}' but extracted too little text ({} chars after html_to_text; URL may be a JS-rendered SPA or landing page)",
+            title,
+            text.trim().chars().count(),
+        ));
+    }
+
+    Ok(FetchedSource::Modified {
+        content: format!("Title: {}\nURL: {}\n\n{}", title, url, text),
+        etag,
+        last_modified,
+    })
+}
+
+fn fetch_local_source_sync(
+    path_str: &str,
+    title: &str,
+    url: &str,
+    ocr_cache: Option<&dyn crate::indexer::extract::ocr_cache::OcrCache>,
+) -> Result<FetchedSource, String> {
+    let path = std::path::Path::new(path_str);
+    if !path.exists() {
+        return Err(format!("fetch failed for {}: file does not exist", url));
+    }
+    let metadata =
+        std::fs::metadata(path).map_err(|e| format!("fetch failed for {}: {}", url, e))?;
+    if !metadata.is_file() {
+        return Err(format!("fetch failed for {}: not a regular file", url));
+    }
+
+    // RFC 2616 Date format from mtime, so the HTTP cache validators
+    // schema stays uniform across http:// and file:// sources.
+    let last_modified = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|d| chrono::DateTime::<chrono::Utc>::from_timestamp(d.as_secs() as i64, 0))
+        .map(|dt| dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string());
+
+    let extension = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_lowercase())
+        .unwrap_or_default();
+
+    let text = match extension.as_str() {
+        "pdf" => extract_pdf_path(path, url, ocr_cache)?,
+        "html" | "htm" | "xhtml" => {
+            let body = std::fs::read_to_string(path)
+                .map_err(|e| format!("read failed for {}: {}", url, e))?;
+            sanitize_text_for_postgres(&html_to_text(&body))
+        }
+        // Plain text formats (.txt, .md, .rst, .text, etc.) read as-is.
+        _ => {
+            let body = std::fs::read_to_string(path)
+                .map_err(|e| format!("read failed for {}: {}", url, e))?;
+            sanitize_text_for_postgres(&body)
+        }
+    };
+
+    if text.trim().chars().count() < MIN_FETCHED_TEXT_CHARS {
+        return Err(format!(
+            "local source '{}' returned too little text ({} chars; file may be empty, scanned-image-only, or unreadable)",
+            title,
+            text.trim().chars().count(),
+        ));
+    }
+
+    Ok(FetchedSource::Modified {
+        content: format!("Title: {}\nURL: {}\n\n{}", title, url, text),
+        etag: None,
+        last_modified,
+    })
+}
+
+fn response_header(response: &reqwest::blocking::Response, name: &str) -> Option<String> {
+    response
+        .headers()
+        .get(name)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
+fn extract_pdf_bytes(
+    bytes: &[u8],
+    url: &str,
+    ocr_cache: Option<&dyn crate::indexer::extract::ocr_cache::OcrCache>,
+) -> Result<String, String> {
+    use std::io::Write;
+    use xxhash_rust::xxh3::xxh3_64;
+    let mut tmp = tempfile::Builder::new()
+        .prefix("pgmcp-pat-")
+        .suffix(".pdf")
+        .tempfile()
+        .map_err(|e| format!("tempfile failed for {}: {}", url, e))?;
+    tmp.write_all(bytes)
+        .map_err(|e| format!("tempfile write failed for {}: {}", url, e))?;
+    tmp.flush()
+        .map_err(|e| format!("tempfile flush failed for {}: {}", url, e))?;
+    let byte_hash = xxh3_64(bytes) as i64;
+    extract_pdf_path_with_hash(tmp.path(), url, ocr_cache, Some(byte_hash))
+}
+
+fn extract_pdf_path(
+    path: &std::path::Path,
+    url: &str,
+    ocr_cache: Option<&dyn crate::indexer::extract::ocr_cache::OcrCache>,
+) -> Result<String, String> {
+    use xxhash_rust::xxh3::xxh3_64;
+    let bytes = std::fs::read(path).map_err(|e| format!("read failed for {}: {}", url, e))?;
+    let byte_hash = xxh3_64(&bytes) as i64;
+    drop(bytes);
+    extract_pdf_path_with_hash(path, url, ocr_cache, Some(byte_hash))
+}
+
+fn extract_pdf_path_with_hash(
+    path: &std::path::Path,
+    url: &str,
+    ocr_cache: Option<&dyn crate::indexer::extract::ocr_cache::OcrCache>,
+    byte_hash: Option<i64>,
+) -> Result<String, String> {
+    let opts = crate::indexer::extract::ExtractOptions::default();
+    let extracted =
+        crate::indexer::extract::pdf::extract_with_cache(path, &opts, ocr_cache, byte_hash)
+            .map_err(|e| format!("pdf extract failed for {}: {}", url, e))?
+            .ok_or_else(|| format!("pdf extractor returned None for {}", url))?;
+    Ok(sanitize_text_for_postgres(&extracted.text))
 }
 
 /// PostgreSQL TEXT columns reject `\0` even though it's a valid UTF-8 code

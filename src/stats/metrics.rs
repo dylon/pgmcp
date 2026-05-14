@@ -124,6 +124,18 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
          # HELP pgmcp_documents_extraction_oom Document extraction subprocesses (pandoc/pdftotext/ps2ascii) killed by signal (typically rlimit hit or OOM)\n\
          # TYPE pgmcp_documents_extraction_oom counter\n\
          pgmcp_documents_extraction_oom {}\n\
+         # HELP pgmcp_documents_ocr_triggered Documents whose pdftotext output fell below the per-page text threshold and were routed through the Tesseract OCR fallback\n\
+         # TYPE pgmcp_documents_ocr_triggered counter\n\
+         pgmcp_documents_ocr_triggered {}\n\
+         # HELP pgmcp_documents_ocr_cache_hits OCR runs skipped because a cached result keyed on the PDF byte-hash was already present in ocr_extractions\n\
+         # TYPE pgmcp_documents_ocr_cache_hits counter\n\
+         pgmcp_documents_ocr_cache_hits {}\n\
+         # HELP pgmcp_documents_ocr_failed OCR runs that failed (pdftoppm/tesseract error, timeout, or empty output); caller falls back to sparse pdftotext output\n\
+         # TYPE pgmcp_documents_ocr_failed counter\n\
+         pgmcp_documents_ocr_failed {}\n\
+         # HELP pgmcp_documents_ocr_pages_processed Cumulative count of PDF pages successfully OCR'd across the daemon's lifetime\n\
+         # TYPE pgmcp_documents_ocr_pages_processed counter\n\
+         pgmcp_documents_ocr_pages_processed {}\n\
          # HELP pgmcp_read_file_disk_hits read_file MCP tool served content from disk after content_hash verification (fast path for plain-text files)\n\
          # TYPE pgmcp_read_file_disk_hits counter\n\
          pgmcp_read_file_disk_hits {}\n\
@@ -175,6 +187,10 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
         s.files_with_null_bytes_stripped.load(Ordering::Relaxed),
         s.files_with_content_omitted.load(Ordering::Relaxed),
         s.documents_extraction_oom.load(Ordering::Relaxed),
+        s.documents_ocr_triggered.load(Ordering::Relaxed),
+        s.documents_ocr_cache_hits.load(Ordering::Relaxed),
+        s.documents_ocr_failed.load(Ordering::Relaxed),
+        s.documents_ocr_pages_processed.load(Ordering::Relaxed),
         s.read_file_disk_hits.load(Ordering::Relaxed),
         s.read_file_disk_hash_mismatches.load(Ordering::Relaxed),
         s.read_file_disk_io_errors.load(Ordering::Relaxed),

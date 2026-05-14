@@ -1163,7 +1163,10 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Unweighted DFAs/NFAs return only yes/no — they lose probability, cost, count, and ambiguity information needed for statistical and quantitative reasoning.",
             "Parameterize the automaton by a semiring W; assign w∈W to every transition and final state; evaluate ⊕ over accepting paths of ⊗ along each path. Choose the semiring per query: Boolean for reachability, Tropical for shortest cost, Probability for marginal mass, Counting for ambiguity count.",
             "Subsumes the WFST-as-acceptor case (single-tape Mohri 1997); composition, determinization, ε-removal, and minimization are well-defined on the appropriate semiring subclasses (idempotent, ⊕-complete, Star).",
-            &["formal_languages_and_automata", "machine_learning_engineering"],
+            &[
+                "formal_languages_and_automata",
+                "machine_learning_engineering",
+            ],
             &["wfsa", "weighted_automaton", "semiring", "acceptor"],
             "https://en.wikipedia.org/wiki/Weighted_automaton",
         ),
@@ -1191,8 +1194,17 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Classical Büchi only answers whether an accepting run exists — too coarse for mean-payoff games, energy automata, expected response time, and quantitative LTL.",
             "Equip a Büchi automaton with semiring-weighted transitions; total accepting weight on an infinite run requires the semiring to be Star (or ω-continuous) for the ⊗-product to converge.",
             "Subsumes mean-payoff, discounted-payoff, energy automata, and probabilistic Büchi; the semiring choice determines decidability — emptiness is PTIME on tropical-Star but undecidable for arbitrary semirings.",
-            &["formal_languages_and_automata", "machine_learning_engineering"],
-            &["wba", "buchi", "omega_automaton", "weighted_automaton", "model_checking"],
+            &[
+                "formal_languages_and_automata",
+                "machine_learning_engineering",
+            ],
+            &[
+                "wba",
+                "buchi",
+                "omega_automaton",
+                "weighted_automaton",
+                "model_checking",
+            ],
             "https://link.springer.com/book/10.1007/978-3-642-01492-5",
         ),
         pat(
@@ -1220,7 +1232,12 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Transition: state × Σ → polynomial in the semiring over successor states; runs are trees; the value of a run is the polynomial evaluated bottom-up under ⊕/⊗. Kostolányi/Mišún 2018 give the canonical formulation and the polynomial reduction.",
             "Subsumes weighted NFAs (no universal) and weighted tree automata (no existential branching); decidability of emptiness and equivalence depends on the semiring's algebraic properties.",
             &["formal_languages_and_automata"],
-            &["waa", "alternating", "weighted_automaton", "polynomial_transitions"],
+            &[
+                "waa",
+                "alternating",
+                "weighted_automaton",
+                "polynomial_transitions",
+            ],
             "https://doi.org/10.1016/j.ic.2018.04.002",
         ),
         pat(
@@ -1233,7 +1250,10 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Unweighted tree automata answer membership only; statistical parsers, tree-to-tree MT, and AST-quality scoring require a numerical value per tree, not a Boolean.",
             "δ: Q^k × Σ_k → W for each k-ary node label; tree value computed bottom-up by ⊗-combining child state-values and then ⊕ over all consistent state assignments. Maletti 2010 gives the canonical algorithms.",
             "Subsumes PCFG when the semiring is probability and the WTA is regular; bottom-up determinization is decidable on commutative idempotent semirings (Borchardt 2004); foundation for weighted tree-to-tree transducers.",
-            &["formal_languages_and_automata", "machine_learning_engineering"],
+            &[
+                "formal_languages_and_automata",
+                "machine_learning_engineering",
+            ],
             &["wta", "tree_automaton", "weighted_automaton", "semiring"],
             "https://www.grammars.grlmc.com/TATA/",
         ),
@@ -1248,7 +1268,13 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Map ⟨a⟩ to existential branching and [a] to universal branching; map μ-bound variables to odd priorities and ν-bound to even; emptiness reduces to a parity-game decision over the product of the automaton and the model.",
             "Quasi-polynomial parity-game algorithms (Calude/Jain/Khoussainov/Li/Stephan 2017) yield improved μ-calculus model-checking complexity; PATA is the standard translation target.",
             &["formal_languages_and_automata"],
-            &["pata", "alternating", "tree_automaton", "parity", "mu_calculus"],
+            &[
+                "pata",
+                "alternating",
+                "tree_automaton",
+                "parity",
+                "mu_calculus",
+            ],
             "https://doi.org/10.1006/inco.1995.1149",
         ),
         pat(
@@ -1289,8 +1315,17 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Plain WFSAs compute path-values via ⊗ along the run; many quantitative streaming queries (sum, average, max-over-window) don't factor along a single path and need register-based accumulators.",
             "Δ: Q × Σ × R → Q × Expr(R, W) where Expr is a copyless arithmetic expression over the semiring; final output reads a selected register; copyless restriction gives decidable equivalence (Alur/D'Antoni 2013).",
             "Captures regular cost functions decidably; equivalent in expressiveness to MSO-definable cost functions for certain semirings; the copyless restriction is essential for decidability.",
-            &["formal_languages_and_automata", "machine_learning_engineering"],
-            &["cra", "register", "streaming", "weighted_automaton", "semiring"],
+            &[
+                "formal_languages_and_automata",
+                "machine_learning_engineering",
+            ],
+            &[
+                "cra",
+                "register",
+                "streaming",
+                "weighted_automaton",
+                "semiring",
+            ],
             "https://doi.org/10.4230/LIPIcs.FSTTCS.2013.341",
         ),
         pat(
@@ -1304,7 +1339,12 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Parameterize by a decision procedure for the Boolean algebra (⊥/¬/∧/∨ + decidable membership); transitions use predicates and term constructors instead of concrete symbols; minterm partitioning yields a deterministic equivalent.",
             "Composition, equivalence, and pre-image are decidable iff the underlying Boolean algebra is; production tooling in the Symbolic Automata library and in the mona/spot tradition.",
             &["formal_languages_and_automata"],
-            &["sft", "symbolic_transducer", "boolean_algebra", "transducer"],
+            &[
+                "sft",
+                "symbolic_transducer",
+                "boolean_algebra",
+                "transducer",
+            ],
             "https://doi.org/10.1145/3093333.3009834",
         ),
         pat(
@@ -1345,8 +1385,18 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Raw-probability multiplication along long paths underflows; ad-hoc rescaling complicates code; algorithm specialization for each query (decode vs marginal vs learner) duplicates implementations.",
             "Encode probabilities in log-space; swap the semiring per query: log for marginals, tropical for Viterbi, expectation for entropy; reuse forward-backward as the gradient skeleton for EM/Baum-Welch.",
             "Numerical stability across long sequences; one set of automaton operations covers HMM, MEMM, structured-perceptron, and CRF decoding; the semiring choice _is_ the query choice.",
-            &["formal_languages_and_automata", "machine_learning_engineering"],
-            &["pa", "hmm", "log_semiring", "viterbi", "baum_welch", "probabilistic"],
+            &[
+                "formal_languages_and_automata",
+                "machine_learning_engineering",
+            ],
+            &[
+                "pa",
+                "hmm",
+                "log_semiring",
+                "viterbi",
+                "baum_welch",
+                "probabilistic",
+            ],
             "https://doi.org/10.1109/5.18626",
         ),
         pat(
@@ -1374,7 +1424,13 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Work in the category of nominal sets; states are orbit-finite under the name-group action; transitions are equivariant; orbit-finite emptiness and minimization are decidable; orbit-finite quotient yields a canonical representative.",
             "Cleaner theory than register automata for fresh-name properties; tight links to π-calculus, nominal logic, and the Fraenkel-Mostowski model of fresh names.",
             &["formal_languages_and_automata"],
-            &["na", "nominal_automaton", "orbit_finite", "fresh_names", "pi_calculus"],
+            &[
+                "na",
+                "nominal_automaton",
+                "orbit_finite",
+                "fresh_names",
+                "pi_calculus",
+            ],
             "https://doi.org/10.1017/CBO9781139084673",
         ),
         pat(
@@ -1388,7 +1444,13 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Attach a MergeFunction<W>: W × W → W at call/return rules that combines caller and callee weights; poststar/prestar saturation algorithms generalize cleanly; reduces to WPDS when the merge is trivial ⊗.",
             "Captures SLAM/BLAST-style Boolean-program analyses with locals; required for sound caller-local semantics in pi-calculus-style scoping (PNew/PInput); slightly higher analysis cost than WPDS.",
             &["formal_languages_and_automata"],
-            &["ewpds", "wpds", "pushdown", "merge_function", "interprocedural"],
+            &[
+                "ewpds",
+                "wpds",
+                "pushdown",
+                "merge_function",
+                "interprocedural",
+            ],
             "https://doi.org/10.1007/978-3-540-77050-3_27",
         ),
         // ---------- weighted-automata algorithms + runtime substrate (Tier 2) ----------
@@ -1403,7 +1465,13 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Encode parse cost + edit cost as a lex-ordered product semiring; build a WFST whose transitions represent the {skip, delete, substitute, insert} repair operations; run Viterbi over the parse-state × input lattice.",
             "Yields one canonical minimum-cost recovery per error; cost decomposition (parse-quality vs edit-distance) allows tunable preferences; depends on a Mohri-style WFST infrastructure.",
             &["formal_languages_and_automata"],
-            &["recovery_wfst", "viterbi", "product_weight", "error_recovery", "transducer"],
+            &[
+                "recovery_wfst",
+                "viterbi",
+                "product_weight",
+                "error_recovery",
+                "transducer",
+            ],
             "https://en.wikipedia.org/wiki/Weighted_finite-state_transducer",
         ),
         pat(
@@ -1417,7 +1485,13 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Build one WFST per non-terminal category; transitions carry tropical weights derived from rule probabilities; log-push to canonical form so that beam pruning is optimal (Mohri 2002).",
             "Predictable disambiguation; composable with recovery and constrained-decoding WFSTs in a single Mohri-style pipeline; log-pushing is required to make pruning sound.",
             &["formal_languages_and_automata"],
-            &["prediction_wfst", "tropical", "log_push", "dispatch", "beam_pruning"],
+            &[
+                "prediction_wfst",
+                "tropical",
+                "log_push",
+                "dispatch",
+                "beam_pruning",
+            ],
             "https://en.wikipedia.org/wiki/Weighted_finite-state_transducer",
         ),
         pat(
@@ -1431,7 +1505,12 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Compose a sequence of OptimizationPass impls (each is a transducer of WFSTs); iterate to a fixed point; verify language-equivalence after each pass.",
             "Order-independent under confluent passes; quadratic-worst-case fixed-point cost is acceptable because dispatch WFSTs are small; pass-equivalence proofs become a maintenance asset.",
             &["formal_languages_and_automata"],
-            &["optimization_pass", "fixed_point", "wfst", "transducer_cascade"],
+            &[
+                "optimization_pass",
+                "fixed_point",
+                "wfst",
+                "transducer_cascade",
+            ],
             "https://en.wikipedia.org/wiki/Weighted_finite-state_transducer",
         ),
         pat(
@@ -1445,7 +1524,12 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "After composition, run a fixed property suite per pair (containment, spurious-action absence, weight consistency, determinism preservation) before promoting the result.",
             "Catches composition regressions at build time; cheap relative to the runtime cost it avoids; the properties are themselves declarative transducer-level invariants.",
             &["formal_languages_and_automata"],
-            &["composition_verification", "wfst", "property_check", "dispatch"],
+            &[
+                "composition_verification",
+                "wfst",
+                "property_check",
+                "dispatch",
+            ],
             "https://en.wikipedia.org/wiki/Weighted_finite-state_transducer",
         ),
         pat(
@@ -1473,7 +1557,12 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Define WpdsStepEngine: State × Event → Transition; the walker maintains a fork frontier, applies transitions across all live branches, prunes by lex-min, and commits a winner once the beam consolidates.",
             "Yields a uniform runtime for parse-with-recovery, parse-with-prediction, and parse-with-disambiguation; novel framing — the WPDS becomes the parser, not just the verifier; lexicographic tiebreaking is essential for determinism.",
             &["formal_languages_and_automata"],
-            &["wpds_walker", "reactive_parser", "fork", "lexicographic_weight"],
+            &[
+                "wpds_walker",
+                "reactive_parser",
+                "fork",
+                "lexicographic_weight",
+            ],
             "https://en.wikipedia.org/wiki/Pushdown_automaton",
         ),
         pat(
@@ -1487,7 +1576,13 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Checkpoint the WPDS configuration at every parse-boundary token; on didChange(pos), discard checkpoints ≥ pos and resume parsing from the nearest earlier checkpoint.",
             "Latency proportional to suffix length, not document length; checkpoint footprint grows with token count but caps at an LSP-tunable history; integrates with tree-sitter-style incremental semantic highlighting.",
             &["formal_languages_and_automata"],
-            &["incremental_parser", "lsp", "didchange", "wpds", "checkpoint"],
+            &[
+                "incremental_parser",
+                "lsp",
+                "didchange",
+                "wpds",
+                "checkpoint",
+            ],
             "https://en.wikipedia.org/wiki/Language_Server_Protocol",
         ),
         pat(
@@ -1515,7 +1610,13 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Compute the SCC decomposition; build a path expression PE per SCC using Tarjan's algorithm; evaluate PE under the analysis semiring; combine across SCCs via interprocedural composition.",
             "Reusable across many analyses (constant propagation, range, taint); analysis correctness reduces to semiring-axiom verification; foundation of the SeaHorn and ICRA tool families.",
             &["formal_languages_and_automata"],
-            &["algebraic_analysis", "tarjan", "path_expression", "semiring", "interprocedural"],
+            &[
+                "algebraic_analysis",
+                "tarjan",
+                "path_expression",
+                "semiring",
+                "interprocedural",
+            ],
             "https://doi.org/10.1145/3290362",
         ),
         pat(
@@ -1543,7 +1644,12 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Use HashSet<(G, G)> as the weight; ⊗ composes (∃z. (a,z) ∈ R₁ ∧ (z,b) ∈ R₂); ⊕ unions; verify that the underlying relation is closed under the semiring operations.",
             "Memory bounded by the number of reachable input-output pairs (Reps/Lal/Kidd 2007 Def 7); foundation of model-check-by-WPDS for Boolean programs.",
             &["formal_languages_and_automata"],
-            &["relational_weight", "wpds_weight", "boolean_program", "slam"],
+            &[
+                "relational_weight",
+                "wpds_weight",
+                "boolean_program",
+                "slam",
+            ],
             "https://doi.org/10.1007/978-3-540-77050-3_27",
         ),
         pat(
@@ -1557,7 +1663,13 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Annotate each source row with a fresh variable x_i ∈ X; lift query operators to polynomial operations over N[X]; the result polynomial encodes which combinations of which sources contributed how often.",
             "Most general provenance semiring (specializes to all weaker semirings by homomorphism); foundation of provenance-aware databases (Green/Karvounarakis/Tannen 2007) and probabilistic-query semantics.",
             &["formal_languages_and_automata", "declarative_programming"],
-            &["provenance", "semiring", "n_x", "polynomial", "how_provenance"],
+            &[
+                "provenance",
+                "semiring",
+                "n_x",
+                "polynomial",
+                "how_provenance",
+            ],
             "https://doi.org/10.1145/1265530.1265535",
         ),
         pat(
@@ -1570,8 +1682,17 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Per-path enumeration is exponential; per-state marginalization requires careful prefix/suffix decomposition that ad-hoc code gets wrong.",
             "Forward pass: α(q) = ⊕_p α(p) ⊗ δ(p, σ, q); backward pass symmetrically with β; per-state marginal = α(q) ⊗ β(q); generalizes to any commutative semiring.",
             "Time O(|Q|^2 · n); generalizes Viterbi (tropical), inside-outside (log), and gradient computation for EM (expectation semiring) under one skeleton.",
-            &["formal_languages_and_automata", "machine_learning_engineering"],
-            &["forward_backward", "marginalization", "baum_welch", "semiring", "dynamic_programming"],
+            &[
+                "formal_languages_and_automata",
+                "machine_learning_engineering",
+            ],
+            &[
+                "forward_backward",
+                "marginalization",
+                "baum_welch",
+                "semiring",
+                "dynamic_programming",
+            ],
             "https://doi.org/10.1109/5.18626",
         ),
         pat(
@@ -1585,7 +1706,13 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Compute the shortest-distance from each state to a final state (Bellman-Ford on the tropical semiring); push these distances forward so each transition carries the marginal cost-to-go.",
             "Beam pruning becomes optimal post-pushing; required precondition for many WFST optimizations; computation cost O(|E| + |V| log |V|) per pushing pass.",
             &["formal_languages_and_automata"],
-            &["weight_pushing", "log_push", "normalization", "beam_pruning", "mohri"],
+            &[
+                "weight_pushing",
+                "log_push",
+                "normalization",
+                "beam_pruning",
+                "mohri",
+            ],
             "https://www.aclweb.org/anthology/J02-1003",
         ),
         pat(
@@ -1599,7 +1726,13 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Lex into a token DAG whose edges represent alternative tokens spanning a substring with a per-edge weight; the parser receives the DAG; Viterbi over (parse-weight × tokenization-weight) selects the best.",
             "Cleanly defers lex/parse ambiguity to a unified weighted decision; zero-overhead for the common no-ambiguity case (single-path DAG); memory cost is O(positions × max-overlap).",
             &["formal_languages_and_automata"],
-            &["lex_dag", "token_lattice", "viterbi", "tokenization", "ambiguity"],
+            &[
+                "lex_dag",
+                "token_lattice",
+                "viterbi",
+                "tokenization",
+                "ambiguity",
+            ],
             "https://en.wikipedia.org/wiki/Lexical_analysis",
         ),
         pat(
@@ -1655,7 +1788,10 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Raw probability multiplication underflows after ~50 transitions in double precision; ad-hoc rescaling complicates downstream code.",
             "Use log-probabilities; ⊕ = log-sum-exp via the softmax-style trick (a ⊕ b = max(a,b) + log(1 + exp(-|a-b|))); ⊗ = +; final answer = exp(result) only if needed.",
             "Numerical stability across arbitrarily long paths; ⊕ is slightly more expensive than tropical; the forward algorithm on HMMs is exactly forward on the log-semiring.",
-            &["formal_languages_and_automata", "machine_learning_engineering"],
+            &[
+                "formal_languages_and_automata",
+                "machine_learning_engineering",
+            ],
             &["log_semiring", "log_sum_exp", "hmm", "probabilistic"],
             "https://en.wikipedia.org/wiki/LogSumExp",
         ),
@@ -1669,7 +1805,10 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Forward over the probability semiring computes total marginal; computing the most-likely single path requires a different ⊕ (max instead of sum).",
             "Swap ⊕ from sum to max while keeping ⊗ = ×; forward propagation now tracks the max-product along each path; back-pointers reconstruct the best path.",
             "Identical algorithm to forward up to semiring choice; back-pointer storage adds O(|Q| · n) memory; the semiring is idempotent (max is idempotent), so order of computation does not matter.",
-            &["formal_languages_and_automata", "machine_learning_engineering"],
+            &[
+                "formal_languages_and_automata",
+                "machine_learning_engineering",
+            ],
             &["viterbi", "semiring", "max_product", "decoding"],
             "https://doi.org/10.1109/PROC.1973.9030",
         ),
@@ -1697,7 +1836,10 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Computing entropy or per-parameter expectations classically requires forward + backward + per-step accumulation; encoding the expectation directly into a semiring removes the second pass.",
             "Pair (p, p·log(p)) per partial path; ⊕ adds both fields; ⊗ multiplies marginals and accumulates entropies via the chain rule (p₁·p₂, p₁·E₂ + p₂·E₁).",
             "Entropy, expected log-likelihood, and gradients computed in one forward pass; the encoding is general — works for any 'sum of expected functions over paths' (Eisner 2002).",
-            &["formal_languages_and_automata", "machine_learning_engineering"],
+            &[
+                "formal_languages_and_automata",
+                "machine_learning_engineering",
+            ],
             &["entropy_semiring", "expectation", "eisner", "gradient"],
             "https://www.aclweb.org/anthology/W02-1612",
         ),
@@ -1711,7 +1853,10 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Computing top-N paths classically requires Eppstein's algorithm or specialized heap structures; expressing it as a semiring unifies it with all forward-algorithm specializations.",
             "Weight = sorted Vec<W, len ≤ N>; ⊕ merges and truncates; ⊗ does pairwise combine and truncates; specializes to tropical at N=1, recovers Eppstein at N=k.",
             "Forward-algorithm yields N-best directly; ⊗ cost is O(N²) per edge — practical for small N (≤ 50); foundational for k-best parsing and lattice rescoring.",
-            &["formal_languages_and_automata", "machine_learning_engineering"],
+            &[
+                "formal_languages_and_automata",
+                "machine_learning_engineering",
+            ],
             &["n_best", "semiring", "top_k", "lattice_rescoring"],
             "https://doi.org/10.1145/258549.258560",
         ),
@@ -1726,7 +1871,12 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Define W = W₁ × W₂; ⊗ uses the standard product on W₁ but a left-projection product on W₂ that picks the W₂ value associated with the smaller W₁; ⊕ uses standard element-wise sum.",
             "Deterministic best-path selection under ties; semiring axioms preserved if W₁ and W₂ are; mettail-rust's LexicographicWeight = (TropicalWeight, src_idx, rule_idx) is a concrete instantiation.",
             &["formal_languages_and_automata"],
-            &["product_semiring", "lexicographic", "tiebreaker", "beam_pruning"],
+            &[
+                "product_semiring",
+                "lexicographic",
+                "tiebreaker",
+                "beam_pruning",
+            ],
             "https://en.wikipedia.org/wiki/Lexicographic_order",
         ),
         pat(
@@ -1754,7 +1904,12 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Pair each weight with a derivation (an opaque trace token) and store them in a multiset; ⊕ unions multisets without merging equal weights; ⊗ pairwise-combines each (w₁, d₁) × (w₂, d₂); a SemiringRef variant escapes the Copy bound.",
             "Ambiguity-preserving — every accepted derivation is recoverable; multiset size can grow combinatorially; downstream consumers must explicitly choose a disambiguation policy.",
             &["formal_languages_and_automata", "functional_programming"],
-            &["derivation_semiring", "multiset", "trace", "ambiguity_preserving"],
+            &[
+                "derivation_semiring",
+                "multiset",
+                "trace",
+                "ambiguity_preserving",
+            ],
             "https://en.wikipedia.org/wiki/Multiset",
         ),
         // ---------- formal-language companions (Tier 4) ----------
@@ -1811,7 +1966,12 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Weighted MSO: atomic formulas evaluate to semiring values; conjunction = ⊗, disjunction = ⊕, existential quantification = ⊕, universal = ⊗; compilation to weighted automata is constructive.",
             "Decidable specification of quantitative properties; explicit semantics for second-order quantification over weighted runs; basis of many quantitative-verification toolchains.",
             &["formal_languages_and_automata"],
-            &["weighted_mso", "droste_gastin", "buchi_elgot", "quantitative_verification"],
+            &[
+                "weighted_mso",
+                "droste_gastin",
+                "buchi_elgot",
+                "quantitative_verification",
+            ],
             "https://doi.org/10.1016/j.tcs.2007.05.001",
         ),
         pat(
@@ -1825,7 +1985,13 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Compile LTL formula φ to non-deterministic Büchi NBA_φ via tableau construction (Gerth/Peled/Vardi/Wolper 1995) or via alternating automata (Vardi 1995); model-check by emptiness of NBA_φ × Kripke-structure.",
             "LTL model-checking decidable in PSPACE; foundation of SPIN, NuSMV, and Spot; compilation can blow up exponentially in formula nesting depth.",
             &["formal_languages_and_automata"],
-            &["ltl", "buchi", "model_checking", "vardi_wolper", "temporal_logic"],
+            &[
+                "ltl",
+                "buchi",
+                "model_checking",
+                "vardi_wolper",
+                "temporal_logic",
+            ],
             "https://doi.org/10.1109/LICS.1986.4",
         ),
         pat(
@@ -1853,7 +2019,12 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Loop {build A, check A ⊨ φ, if ¬ then extract counterexample, test if spurious in concrete, if spurious refine A by adding distinguishing predicates}; terminates when A entails φ or a real counterexample is found.",
             "Practical model-checking of multi-million-state systems; convergence not guaranteed in general; foundation of SLAM, BLAST, CBMC, CPAchecker.",
             &["formal_languages_and_automata"],
-            &["cegar", "abstraction_refinement", "model_checking", "clarke"],
+            &[
+                "cegar",
+                "abstraction_refinement",
+                "model_checking",
+                "clarke",
+            ],
             "https://doi.org/10.1145/876638.876643",
         ),
         pat(
@@ -1881,7 +2052,13 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Enumerate critical pairs (overlaps between left-hand-sides of rewrite rules); check each pair joins to a common reduct; locally-confluent + terminating ⟹ globally confluent (Newman's lemma).",
             "Decides confluence for terminating TRSs; KB completion procedure can add rules to make a TRS confluent if possible; foundation of completion-based proof assistants and the dedukti/lambdapi tradition.",
             &["formal_languages_and_automata"],
-            &["confluence", "critical_pairs", "knuth_bendix", "term_rewriting", "newmans_lemma"],
+            &[
+                "confluence",
+                "critical_pairs",
+                "knuth_bendix",
+                "term_rewriting",
+                "newmans_lemma",
+            ],
             "https://en.wikipedia.org/wiki/Knuth%E2%80%93Bendix_completion_algorithm",
         ),
     ]

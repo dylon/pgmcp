@@ -63,6 +63,12 @@ pub struct SourceDescriptor {
     pub source_family: &'static str,
     pub title: &'static str,
     pub url: &'static str,
+    /// Fallback URLs tried in order if `url` fails. Supports `https://`,
+    /// `http://`, and `file://` schemes. The `file://` scheme reads from
+    /// the local filesystem and is the recommended way to point at
+    /// `~/Papers/` PDFs when a paywall/SPA/dead-domain primary URL has no
+    /// open web alternate.
+    pub mirrors: &'static [&'static str],
     pub license_label: &'static str,
     pub source_type: &'static str,
     pub ingest_policy: &'static str,
