@@ -44,7 +44,9 @@ pub async fn tool_orient(
 
     // Project metadata
     let project_meta: Option<crate::db::queries::ProjectInfo> = sqlx::query_as(
-        "SELECT p.id, p.workspace_path, p.path, p.name, p.discovered_at, p.last_scanned_at,
+        "SELECT p.id, p.workspace_path, p.path, p.name,
+                p.git_common_dir, p.git_root_commits,
+                p.discovered_at, p.last_scanned_at,
                 (SELECT COUNT(*) FROM indexed_files f WHERE f.project_id = p.id) AS file_count
          FROM projects p
          WHERE p.name = $1
