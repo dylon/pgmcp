@@ -22,7 +22,7 @@ use crate::patterns::{self as pattern_catalog, SourceDescriptor};
 const DEFAULT_SEARCH_LIMIT: i32 = 10;
 const DEFAULT_LIST_LIMIT: i32 = 50;
 const DEFAULT_EXCERPT_CHARS: usize = 700;
-const PATTERN_EMBEDDING_SCHEMA_VERSION: &str = "pgmcp-pattern-embedding-v3";
+const PATTERN_EMBEDDING_SCHEMA_VERSION: &str = "pgmcp-pattern-embedding-v4";
 
 #[derive(Debug, Default)]
 struct ImportSummary {
