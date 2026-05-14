@@ -100,6 +100,7 @@ pub async fn process_file(
                 Some(content_hash),
                 0,
                 true,
+                false, // content_recoverable_from_disk — irrelevant here (truncated)
                 modified_at,
             )
             .await?;
@@ -146,7 +147,10 @@ pub async fn process_file(
         .to_string_lossy()
         .into_owned();
 
-    // Upsert file with NULL hash (two-phase commit: hash finalized after chunks)
+    // Upsert file with NULL hash (two-phase commit: hash finalized after chunks).
+    // This legacy path always stores content inline (per the original
+    // behaviour); the asymmetric-storage decision lives in the active
+    // `src/embed/pool.rs` indexing path that production uses.
     let file_id = db
         .upsert_file(
             project_id,
@@ -158,6 +162,7 @@ pub async fn process_file(
             None,
             line_count,
             truncated,
+            false,
             modified_at,
         )
         .await?;

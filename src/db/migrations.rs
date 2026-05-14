@@ -124,6 +124,24 @@ pub async fn run_migrations(
     .execute(pool)
     .await;
 
+    // Asymmetric content storage flag. `content_recoverable_from_disk =
+    // true` means the row deliberately stores `content = NULL` because
+    // the file lives on the local filesystem and `read_to_string(path)`
+    // can recreate it byte-for-byte cheaply (after content_hash
+    // verification). Set by the indexer for plain-text languages
+    // (`.md`, `.rs`, `.py`, `.txt`, `.jsonl`, …); always `false` for
+    // document languages whose `indexed_files.content` holds the
+    // already-extracted pandoc/pdftotext output that would be expensive
+    // to recreate. The flag is independent of the `truncated` flag
+    // (which still signals size-gated oversize files).
+    let _ = sqlx::query(
+        "ALTER TABLE indexed_files
+         ADD COLUMN IF NOT EXISTS content_recoverable_from_disk BOOLEAN
+         NOT NULL DEFAULT FALSE",
+    )
+    .execute(pool)
+    .await;
+
     // Migration: drop the old UNIQUE composite index on projects(workspace_path, path)
     // if it exists. The path column is already UNIQUE on its own, so the composite
     // index only needs to be a regular (non-unique) index for query performance.
@@ -133,9 +151,22 @@ pub async fn run_migrations(
         .execute(pool)
         .await;
 
+    // Drop the legacy per-file FTS index — `text_search` now queries
+    // `file_chunks.content` exclusively. The legacy index would also
+    // overflow Postgres's 1 MiB tsvector limit on large `.jsonl`
+    // tool-result transcripts (whose content was the cause of the
+    // 2026-05-13 "string is too long for tsvector" errors before the
+    // byte-aware chunker landed).
+    let _ = sqlx::query("DROP INDEX IF EXISTS idx_files_fts")
+        .execute(pool)
+        .await;
+
     // Create indexes (IF NOT EXISTS for idempotency)
     let indexes = [
-        "CREATE INDEX IF NOT EXISTS idx_files_fts ON indexed_files USING gin(to_tsvector('english', content))",
+        // Per-chunk FTS replaces the dropped per-file index. Chunk
+        // content is bounded above by TSVECTOR_SAFE_CHUNK_BYTES (900 KiB)
+        // so every chunk fits comfortably under the 1 MiB tsvector cap.
+        "CREATE INDEX IF NOT EXISTS idx_file_chunks_fts ON file_chunks USING gin(to_tsvector('english', content))",
         "CREATE INDEX IF NOT EXISTS idx_files_path_trgm ON indexed_files USING gin(relative_path gin_trgm_ops)",
         "CREATE INDEX IF NOT EXISTS idx_files_content_hash ON indexed_files(content_hash)",
         "CREATE INDEX IF NOT EXISTS idx_files_project ON indexed_files(project_id)",

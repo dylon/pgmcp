@@ -76,6 +76,7 @@ pub struct UpsertFileCall {
     pub content_hash: Option<i64>,
     pub line_count: i32,
     pub truncated: bool,
+    pub content_recoverable_from_disk: bool,
     pub modified_at: DateTime<Utc>,
 }
 
@@ -253,6 +254,7 @@ impl DbClient for MockDbClient {
         content_hash: Option<i64>,
         line_count: i32,
         truncated: bool,
+        content_recoverable_from_disk: bool,
         modified_at: DateTime<Utc>,
     ) -> Result<i64, sqlx::Error> {
         self.upsert_file_calls.lock().push(UpsertFileCall {
@@ -265,6 +267,7 @@ impl DbClient for MockDbClient {
             content_hash,
             line_count,
             truncated,
+            content_recoverable_from_disk,
             modified_at,
         });
         Ok(self.next_file_id.fetch_add(1, Ordering::SeqCst))

@@ -374,8 +374,16 @@ pub async fn get_all_file_metadata(pool: &PgPool) -> Result<Vec<IndexedFileMeta>
 // ============================================================================
 
 /// Upsert an indexed file.
+///
 /// Pass `content_hash: None` during initial insert (deferred commit);
-/// the real hash is set via `finalize_file_hash` after all chunks are inserted.
+/// the real hash is set via `finalize_file_hash` after all chunks are
+/// inserted.
+///
+/// `content_recoverable_from_disk = true` lets the indexer skip storing
+/// `content` for plain-text languages whose source file is readable from
+/// disk (after `content_hash` verification). Document languages keep
+/// their already-extracted text in `content` because re-running pandoc /
+/// pdftotext is expensive.
 pub async fn upsert_file(
     pool: &PgPool,
     project_id: i32,
@@ -387,11 +395,12 @@ pub async fn upsert_file(
     content_hash: Option<i64>,
     line_count: i32,
     truncated: bool,
+    content_recoverable_from_disk: bool,
     modified_at: DateTime<Utc>,
 ) -> Result<i64, sqlx::Error> {
     let row = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO indexed_files (project_id, path, relative_path, language, size_bytes, content, content_hash, line_count, truncated, modified_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        "INSERT INTO indexed_files (project_id, path, relative_path, language, size_bytes, content, content_hash, line_count, truncated, content_recoverable_from_disk, modified_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
          ON CONFLICT (path) DO UPDATE SET
             project_id = EXCLUDED.project_id,
             relative_path = EXCLUDED.relative_path,
@@ -401,6 +410,7 @@ pub async fn upsert_file(
             content_hash = EXCLUDED.content_hash,
             line_count = EXCLUDED.line_count,
             truncated = EXCLUDED.truncated,
+            content_recoverable_from_disk = EXCLUDED.content_recoverable_from_disk,
             modified_at = EXCLUDED.modified_at,
             indexed_at = NOW()
          RETURNING id"
@@ -414,6 +424,7 @@ pub async fn upsert_file(
     .bind(content_hash)
     .bind(line_count)
     .bind(truncated)
+    .bind(content_recoverable_from_disk)
     .bind(modified_at)
     .fetch_one(pool)
     .await?;
@@ -724,7 +735,12 @@ pub async fn semantic_search(
     Ok(results)
 }
 
-/// Full-text search using PostgreSQL tsvector/tsquery.
+/// Full-text search using PostgreSQL tsvector/tsquery over per-chunk
+/// FTS. Returns one row per matching file with `content` set to the
+/// best-ranked chunk's body (not the whole file); this preserves the
+/// previous result shape while supporting plain-text files whose
+/// `indexed_files.content` is `NULL` (asymmetric-storage policy —
+/// see `upsert_file`).
 ///
 /// `dedupe_worktrees=true` collapses cross-worktree duplicates of the
 /// same `(repo, relative_path)` to a single canonical hit. See the
@@ -736,15 +752,29 @@ pub async fn text_search(
     language: Option<&str>,
     dedupe_worktrees: bool,
 ) -> Result<Vec<TextSearchResult>, sqlx::Error> {
+    // Strategy: rank every chunk that matches, then DISTINCT ON file_id
+    // keeping the top-ranked chunk per file. `ORDER BY file_id, rank
+    // DESC` lets DISTINCT ON pick the best chunk per file; the outer
+    // SELECT re-sorts by rank globally and applies the limit. Chunks
+    // hang off `COALESCE(duplicate_of_file_id, id)` so duplicates point
+    // at canonical chunks.
     let results = if let Some(lang) = language {
         // $1=query, $2=limit, $3=lang, $4=dedupe
         sqlx::query_as::<_, TextSearchResult>(&format!(
-            "SELECT f.path, f.relative_path, f.language, f.content,
-                    ts_rank(to_tsvector('english', f.content), plainto_tsquery('english', $1)) as rank
-             FROM indexed_files f
-             WHERE to_tsvector('english', f.content) @@ plainto_tsquery('english', $1)
-               AND f.language = $3
-               AND {}
+            "SELECT path, relative_path, language, content, rank FROM (
+                SELECT DISTINCT ON (f.id)
+                    f.path,
+                    f.relative_path,
+                    f.language,
+                    c.content,
+                    ts_rank(to_tsvector('english', c.content), plainto_tsquery('english', $1)) AS rank
+                FROM file_chunks c
+                JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+                WHERE to_tsvector('english', c.content) @@ plainto_tsquery('english', $1)
+                  AND f.language = $3
+                  AND {}
+                ORDER BY f.id, rank DESC
+             ) per_file
              ORDER BY rank DESC
              LIMIT $2",
             worktree_dedup_clause(4)
@@ -758,11 +788,19 @@ pub async fn text_search(
     } else {
         // $1=query, $2=limit, $3=dedupe
         sqlx::query_as::<_, TextSearchResult>(&format!(
-            "SELECT f.path, f.relative_path, f.language, f.content,
-                    ts_rank(to_tsvector('english', f.content), plainto_tsquery('english', $1)) as rank
-             FROM indexed_files f
-             WHERE to_tsvector('english', f.content) @@ plainto_tsquery('english', $1)
-               AND {}
+            "SELECT path, relative_path, language, content, rank FROM (
+                SELECT DISTINCT ON (f.id)
+                    f.path,
+                    f.relative_path,
+                    f.language,
+                    c.content,
+                    ts_rank(to_tsvector('english', c.content), plainto_tsquery('english', $1)) AS rank
+                FROM file_chunks c
+                JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+                WHERE to_tsvector('english', c.content) @@ plainto_tsquery('english', $1)
+                  AND {}
+                ORDER BY f.id, rank DESC
+             ) per_file
              ORDER BY rank DESC
              LIMIT $2",
             worktree_dedup_clause(3)
@@ -791,6 +829,14 @@ pub struct TextSearchResult {
 /// `dedupe_worktrees=true` collapses cross-worktree duplicates of the
 /// same `(repo, relative_path)` to a single canonical hit. See the
 /// `worktree_dedup_clause` helper for the filter shape.
+/// Regex grep across per-chunk content. Returns one row per matching
+/// file with `content` set to the first matching chunk's body (not the
+/// whole file); plain-text files whose `indexed_files.content` is NULL
+/// remain searchable because chunks always carry the text.
+///
+/// `dedupe_worktrees=true` collapses cross-worktree duplicates of the
+/// same `(repo, relative_path)` to a single canonical hit. See
+/// `worktree_dedup_clause` for the filter shape.
 pub async fn grep_search(
     pool: &PgPool,
     pattern: &str,
@@ -803,11 +849,17 @@ pub async fn grep_search(
         // $1=pattern, $2=limit, $3=like, $4=dedupe
         let like_pattern = glob_pattern.replace('*', "%").replace('?', "_");
         sqlx::query_as::<_, GrepResult>(&format!(
-            "SELECT f.path, f.relative_path, f.language, f.content
-             FROM indexed_files f
-             WHERE f.content ~ $1
+            "SELECT DISTINCT ON (f.id)
+                f.path,
+                f.relative_path,
+                f.language,
+                c.content
+             FROM file_chunks c
+             JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+             WHERE c.content ~ $1
                AND f.relative_path LIKE $3
                AND {}
+             ORDER BY f.id, c.chunk_index
              LIMIT $2",
             worktree_dedup_clause(4)
         ))
@@ -820,10 +872,16 @@ pub async fn grep_search(
     } else {
         // $1=pattern, $2=limit, $3=dedupe
         sqlx::query_as::<_, GrepResult>(&format!(
-            "SELECT f.path, f.relative_path, f.language, f.content
-             FROM indexed_files f
-             WHERE f.content ~ $1
+            "SELECT DISTINCT ON (f.id)
+                f.path,
+                f.relative_path,
+                f.language,
+                c.content
+             FROM file_chunks c
+             JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+             WHERE c.content ~ $1
                AND {}
+             ORDER BY f.id, c.chunk_index
              LIMIT $2",
             worktree_dedup_clause(3)
         ))

@@ -121,6 +121,13 @@ pub struct StatsTracker {
     /// stripping is lossless because NUL carries no semantic information
     /// in any indexed text format. One increment per affected file.
     pub files_with_null_bytes_stripped: AtomicU64,
+    /// Files where `indexed_files.content` was deliberately stored as
+    /// `NULL` because the file is a plain-text language whose source
+    /// lives on disk and `read_file` can recreate the bytes via
+    /// `read_to_string` after content_hash verification. Distinct from
+    /// `documents_truncated` (size-gated). One increment per affected
+    /// indexer run per file (not cumulative across runs).
+    pub files_with_content_omitted: AtomicU64,
 
     // Graph analysis counters
     pub graph_build_runs: AtomicU64,
@@ -276,6 +283,7 @@ impl StatsTracker {
             documents_renamed: AtomicU64::new(0),
             documents_canonical_promoted: AtomicU64::new(0),
             files_with_null_bytes_stripped: AtomicU64::new(0),
+            files_with_content_omitted: AtomicU64::new(0),
             graph_build_runs: AtomicU64::new(0),
             dependency_graph_scans: AtomicU64::new(0),
             centrality_scans: AtomicU64::new(0),
@@ -396,6 +404,7 @@ impl StatsTracker {
             "documents_renamed": self.documents_renamed.load(Ordering::Acquire),
             "documents_canonical_promoted": self.documents_canonical_promoted.load(Ordering::Acquire),
             "files_with_null_bytes_stripped": self.files_with_null_bytes_stripped.load(Ordering::Acquire),
+            "files_with_content_omitted": self.files_with_content_omitted.load(Ordering::Acquire),
             "graph_build_runs": self.graph_build_runs.load(Ordering::Acquire),
             "dependency_graph_scans": self.dependency_graph_scans.load(Ordering::Acquire),
             "centrality_scans": self.centrality_scans.load(Ordering::Acquire),

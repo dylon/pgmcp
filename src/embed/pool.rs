@@ -607,6 +607,7 @@ fn process_index_file_task(
                     Some(content_hash),
                     0,
                     true,
+                    false, // content_recoverable_from_disk — irrelevant (oversize placeholder)
                     modified_at,
                 )
                 .await?;
@@ -846,6 +847,23 @@ fn process_index_file_task(
         }
     }
 
+    // Asymmetric content-storage policy:
+    //   Plain-text languages — content is verbatim `fs::read_to_string`,
+    //     trivially re-readable from disk. Store `content = NULL` and set
+    //     `content_recoverable_from_disk = true`; read_file falls back to
+    //     a disk read after content_hash verification.
+    //   Document languages — content is normalized output from pandoc /
+    //     pdftotext / ps2ascii, expensive to recreate. Store the
+    //     extracted text inline; `content_recoverable_from_disk = false`.
+    let (stored_content, content_recoverable_from_disk) = if is_document_language {
+        (Some(content.as_str()), false)
+    } else {
+        stats
+            .files_with_content_omitted
+            .fetch_add(1, Ordering::Relaxed);
+        (None, true)
+    };
+
     // Level-2 content-hash skip + upsert if changed.
     let upsert_res = rt.block_on(async {
         if let Ok(Some(existing)) = db.get_content_hash(&path_str).await
@@ -861,10 +879,11 @@ fn process_index_file_task(
                 &relative_path,
                 &language,
                 size_bytes,
-                Some(content.as_str()),
+                stored_content,
                 None, // hash finalized after chunks land
                 line_count,
                 false,
+                content_recoverable_from_disk,
                 modified_at,
             )
             .await?;

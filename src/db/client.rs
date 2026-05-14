@@ -97,6 +97,7 @@ pub trait DbClient: Send + Sync {
         content_hash: Option<i64>,
         line_count: i32,
         truncated: bool,
+        content_recoverable_from_disk: bool,
         modified_at: DateTime<Utc>,
     ) -> Result<i64, sqlx::Error>;
     async fn get_content_hash(&self, path: &str) -> Result<Option<i64>, sqlx::Error>;
@@ -451,6 +452,7 @@ impl DbClient for PgPool {
         content_hash: Option<i64>,
         line_count: i32,
         truncated: bool,
+        content_recoverable_from_disk: bool,
         modified_at: DateTime<Utc>,
     ) -> Result<i64, sqlx::Error> {
         queries::upsert_file(
@@ -464,6 +466,7 @@ impl DbClient for PgPool {
             content_hash,
             line_count,
             truncated,
+            content_recoverable_from_disk,
             modified_at,
         )
         .await
