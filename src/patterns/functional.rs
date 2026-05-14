@@ -693,7 +693,11 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "Parser code is tangled with grammar rules.",
             "Encode productions as DCG clauses and let the engine thread input state.",
             "Excellent for symbolic parsing; may need cuts or constraints for performance.",
-            &["logic_programming", "declarative_programming"],
+            &[
+                "logic_programming",
+                "declarative_programming",
+                "formal_languages_and_automata",
+            ],
             &["logic", "grammar"],
             "https://en.wikipedia.org/wiki/Definite_clause_grammar",
         ),

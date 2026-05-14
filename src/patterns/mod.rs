@@ -15,6 +15,7 @@ mod anti_patterns;
 mod aop;
 mod api_design;
 mod architecture;
+mod automata;
 mod code_smells;
 mod concurrency;
 mod data_engineering;
@@ -186,11 +187,17 @@ pub fn paradigm_seeds() -> Vec<ParadigmSeed> {
             description: "Engineering practice of building, deploying, monitoring, and iterating on ML/AI systems in production.",
             wikipedia_url: "https://en.wikipedia.org/wiki/MLOps",
         },
+        ParadigmSeed {
+            slug: "formal_languages_and_automata",
+            name: "Formal languages and automata",
+            description: "Theory and practice of recognizers, generators, transducers, parsers, lexers, and string-index automata; covers finite/pushdown/tree/ω-automata, parser families, string-index data structures, edit-distance and approximate-matching automata, phonetic encoders, abstract machines, term rewriting, and probabilistic grammars.",
+            wikipedia_url: "https://en.wikipedia.org/wiki/Automata_theory",
+        },
     ]
 }
 
 pub fn pattern_seeds() -> Vec<PatternSeed> {
-    let mut v = Vec::with_capacity(820);
+    let mut v = Vec::with_capacity(900);
     v.extend(gof::seeds());
     v.extend(solid_grasp::seeds());
     v.extend(principles::seeds());
@@ -211,6 +218,7 @@ pub fn pattern_seeds() -> Vec<PatternSeed> {
     v.extend(ml_ai::seeds());
     v.extend(distributed_data::seeds());
     v.extend(kubernetes::seeds());
+    v.extend(automata::seeds());
     v
 }
 
