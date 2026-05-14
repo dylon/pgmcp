@@ -8,11 +8,146 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::MetricsConfig;
-use crate::stats::tracker::StatsTracker;
+use crate::stats::tracker::{PerToolStats, StatsTracker};
 
 #[derive(Clone)]
 struct MetricsState {
     stats: Arc<StatsTracker>,
+}
+
+/// Escape a Prometheus label value: backslash, double-quote, newline.
+/// pgmcp tool names are static ASCII so this is a no-op for them, but
+/// `client_name` is derived from rmcp `clientInfo.name` which an
+/// unfriendly peer could populate with arbitrary text.
+fn escape_label(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Convert a duration in nanoseconds to a Prometheus float-seconds string.
+/// Uses up to 9 fractional digits (ns precision) without trailing zeros for
+/// the +∞ overflow bucket (rendered as `+Inf`).
+fn ns_to_seconds(ns: u64) -> String {
+    if ns == u64::MAX {
+        return "+Inf".to_string();
+    }
+    format!("{:.9}", (ns as f64) / 1_000_000_000.0)
+}
+
+/// Emit a single histogram series for one (tool, client) tuple, in
+/// Prometheus text exposition format. Buckets must be cumulative.
+fn emit_histogram_series(out: &mut String, tool: &str, client: &str, stats: &PerToolStats) {
+    let tool_l = escape_label(tool);
+    let client_l = escape_label(client);
+    let mut cumulative: u64 = 0;
+    for (i, bound_ns) in PerToolStats::BUCKET_UPPER_NS.iter().enumerate() {
+        cumulative = cumulative.saturating_add(
+            stats.duration_buckets[i].load(Ordering::Relaxed),
+        );
+        out.push_str(&format!(
+            "pgmcp_tool_duration_seconds_bucket{{tool=\"{}\",client=\"{}\",le=\"{}\"}} {}\n",
+            tool_l,
+            client_l,
+            ns_to_seconds(*bound_ns),
+            cumulative,
+        ));
+    }
+    let count = stats.count.load(Ordering::Relaxed);
+    let sum_ns = stats.duration_ns_sum.load(Ordering::Relaxed);
+    out.push_str(&format!(
+        "pgmcp_tool_duration_seconds_sum{{tool=\"{}\",client=\"{}\"}} {}\n",
+        tool_l,
+        client_l,
+        (sum_ns as f64) / 1_000_000_000.0,
+    ));
+    out.push_str(&format!(
+        "pgmcp_tool_duration_seconds_count{{tool=\"{}\",client=\"{}\"}} {}\n",
+        tool_l, client_l, count,
+    ));
+}
+
+/// Render all per-tool telemetry as Prometheus text exposition. Produces
+/// `pgmcp_tool_calls_total`, `pgmcp_tool_errors_total`, and
+/// `pgmcp_tool_duration_seconds` (histogram with the 16 PerToolStats
+/// buckets). The labels are `tool` and `client`; cardinality is bounded
+/// by O(tools × distinct-clients-since-start) which for pgmcp is a few
+/// hundred series at most.
+///
+/// `pgmcp_tool_calls_total` is also emitted with `client="*"` from the
+/// per-tool aggregate map, so dashboards that don't want the per-client
+/// breakdown can scrape a single series per tool.
+fn render_per_tool_metrics(stats: &StatsTracker) -> String {
+    let mut out = String::with_capacity(8192);
+
+    // Tool-aggregated calls + errors (client="*").
+    out.push_str("# HELP pgmcp_tool_calls_total Total MCP tool invocations (client=\"*\" aggregate; per-client series have a concrete client label).\n");
+    out.push_str("# TYPE pgmcp_tool_calls_total counter\n");
+    out.push_str("# HELP pgmcp_tool_errors_total Total MCP tool invocations that returned an error.\n");
+    out.push_str("# TYPE pgmcp_tool_errors_total counter\n");
+    for entry in stats.tool_invocations.iter() {
+        let tool = entry.key();
+        let s = entry.value();
+        let tool_l = escape_label(tool);
+        out.push_str(&format!(
+            "pgmcp_tool_calls_total{{tool=\"{}\",client=\"*\"}} {}\n",
+            tool_l,
+            s.count.load(Ordering::Relaxed),
+        ));
+        out.push_str(&format!(
+            "pgmcp_tool_errors_total{{tool=\"{}\",client=\"*\"}} {}\n",
+            tool_l,
+            s.error_count.load(Ordering::Relaxed),
+        ));
+    }
+
+    // Per-(tool, client) calls + errors.
+    for entry in stats.tool_telemetry_by_client.iter() {
+        let (tool, client) = entry.key();
+        let s = entry.value();
+        out.push_str(&format!(
+            "pgmcp_tool_calls_total{{tool=\"{}\",client=\"{}\"}} {}\n",
+            escape_label(tool),
+            escape_label(client),
+            s.count.load(Ordering::Relaxed),
+        ));
+        out.push_str(&format!(
+            "pgmcp_tool_errors_total{{tool=\"{}\",client=\"{}\"}} {}\n",
+            escape_label(tool),
+            escape_label(client),
+            s.error_count.load(Ordering::Relaxed),
+        ));
+    }
+
+    // Per-(tool, client) duration histogram.
+    out.push_str("# HELP pgmcp_tool_duration_seconds Distribution of MCP tool call durations, bucketed at 3× spacing from 100µs to 1000s plus an overflow bucket.\n");
+    out.push_str("# TYPE pgmcp_tool_duration_seconds histogram\n");
+    for entry in stats.tool_telemetry_by_client.iter() {
+        let (tool, client) = entry.key();
+        emit_histogram_series(&mut out, tool, client, entry.value());
+    }
+
+    // Active HTTP MCP sessions, partitioned by transport. Stdio always
+    // reports 1 per running daemon process; HTTP reports the
+    // `http_mcp_sessions` gauge.
+    out.push_str("# HELP pgmcp_tool_active_sessions Currently-connected MCP transport sessions.\n");
+    out.push_str("# TYPE pgmcp_tool_active_sessions gauge\n");
+    out.push_str(&format!(
+        "pgmcp_tool_active_sessions{{transport=\"http\"}} {}\n",
+        stats.http_mcp_sessions.load(Ordering::Relaxed),
+    ));
+    // Stdio session count is structurally 1-per-daemon-process; emitted
+    // unconditionally so dashboards that group by transport see both.
+    out.push_str("pgmcp_tool_active_sessions{transport=\"stdio\"} 1\n");
+
+    out
 }
 
 async fn metrics_handler(State(state): State<MetricsState>) -> String {
@@ -195,7 +330,7 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
         s.read_file_disk_hash_mismatches.load(Ordering::Relaxed),
         s.read_file_disk_io_errors.load(Ordering::Relaxed),
         s.read_file_chunk_stitches.load(Ordering::Relaxed),
-    )
+    ) + &render_per_tool_metrics(s)
 }
 
 /// Start the Prometheus metrics HTTP server.
