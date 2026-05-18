@@ -257,6 +257,46 @@ facts_at, anchors).
   tests, release gpu_fallback_smoke, every-tool-tested check,
   release tests).
 
+### M3 — Memory graph SOTA-shaped (Phase 3.2 pgmcp extensions)
+
+- **Status:** ✅ shipped.
+- **Phase 3.2 query surface** (`src/db/queries.rs`):
+  - `memory_semantic_search` — vector cosine over
+    `memory_observations.embedding` (BGE-M3, 1024d). Strict
+    dim-check rejects mis-sized inputs.
+  - `memory_hybrid_search` — RRF fusion of FTS over observation
+    content + dense vector. Per-subquery candidate pool sized at
+    `3 × target_k`, fused with `1 / (rnk + 60)` (Cormack 2009).
+  - `memory_facts_at` — bi-temporal point-in-time snapshot;
+    entities + observations + relations filtered by
+    `valid_from <= as_of AND (valid_to IS NULL OR valid_to > as_of)`.
+  - `memory_relations_traverse` — depth-bounded BFS over
+    `memory_relations` via recursive CTE; capped by `max_depth`
+    (≤ 6) and `max_nodes` (≤ 1000).
+  - Code-anchor CRUD: `memory_anchor_entity`,
+    `memory_unanchor_entity`, `memory_find_code_for_entity`,
+    `memory_find_entities_for_code` — bidirectional
+    code-graph ↔ memory-graph cross-linking via
+    `memory_code_anchor`.
+- **Phase 3.2 MCP tools** (`src/mcp/tools/tool_memory_ext.rs`):
+  8 new tools wired through `dispatch_tool!`:
+  `memory_semantic_search`, `memory_hybrid_search`,
+  `memory_facts_at`, `memory_relations_traverse`,
+  `memory_anchor_entity`, `memory_unanchor_entity`,
+  `memory_find_code_for_entity`, `memory_find_entities_for_code`.
+  Tier filter validated against the 5 cognitive tiers; RFC3339
+  parsing for `as_of`; clear error mapping
+  (`sqlx::Error::Protocol` → `McpError::invalid_params`).
+- **Tests:** 9 integration tests in
+  `pgmcp-testing/tests/memory_phase3_2.rs` cover cosine-ranking,
+  dim rejection, bi-temporal snapshot correctness (pre- vs
+  post-delete), BFS depth-capping, anchor round-trip + reverse
+  lookup, all-NULL anchor rejection, target-count enforcement on
+  `find_entities_for_code`, tier-filter validation, and the
+  hybrid-search dim-mismatch path.
+- **Verification gate:** `./scripts/verify.sh` green across all 8
+  gates.
+
 <!-- Future milestone entries follow the same pattern. -->
 
 ---

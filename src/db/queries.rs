@@ -1807,6 +1807,465 @@ pub async fn memory_read_graph(
 }
 
 // ============================================================================
+// Memory-server Phase 3.2: pgmcp retrieval extensions
+// ============================================================================
+//
+// Beyond the official-compat substring `memory_search_nodes`, these
+// extensions add vector / hybrid / bi-temporal / graph-traversal /
+// code-anchor surfaces. See `docs/memory-server/06-tools.md` Phase 3.2.
+
+/// Semantic search over `memory_observations.embedding` (BGE-M3 dense).
+/// Returns the top-k observations matching the query embedding, joined
+/// with their parent entities and scope-filtered when `scope_id` is
+/// `Some`.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct MemorySemanticHit {
+    pub observation_id: i64,
+    pub entity_id: i64,
+    pub entity_name: String,
+    pub entity_type: String,
+    pub content: String,
+    pub importance: f32,
+    pub similarity: Option<f64>,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn memory_semantic_search(
+    pool: &PgPool,
+    embedding: &[f32],
+    scope_id: Option<i64>,
+    tier: Option<&str>,
+    limit: i32,
+    ef_search: i32,
+) -> Result<Vec<MemorySemanticHit>, sqlx::Error> {
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "memory_semantic_search: expected 1024d embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let v = pgvector::Vector::from(embedding.to_vec());
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+
+    let rows = sqlx::query_as::<_, MemorySemanticHit>(
+        "SELECT o.id AS observation_id,
+                e.id AS entity_id,
+                e.name AS entity_name,
+                e.entity_type,
+                o.content,
+                o.importance,
+                1 - (o.embedding <=> $1) AS similarity,
+                o.created_at
+         FROM memory_observations o
+         JOIN memory_entities e ON e.id = o.entity_id AND e.valid_to IS NULL
+         LEFT JOIN memory_entity_scope es ON es.entity_id = e.id
+         LEFT JOIN memory_entity_tier  et ON et.entity_id = e.id
+         WHERE o.embedding IS NOT NULL
+           AND o.valid_to IS NULL
+           AND ($2::bigint IS NULL OR es.scope_id = $2)
+           AND ($3::text   IS NULL OR et.tier::text = $3)
+         ORDER BY o.embedding <=> $1
+         LIMIT $4",
+    )
+    .bind(&v)
+    .bind(scope_id)
+    .bind(tier)
+    .bind(limit.clamp(1, 200))
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(rows)
+}
+
+/// Hybrid memory search: RRF fusion of FTS over observation content +
+/// dense vector cosine. Mirrors the existing `hybrid_search` (file
+/// chunks) but over `memory_observations`.
+pub async fn memory_hybrid_search(
+    pool: &PgPool,
+    query_text: &str,
+    embedding: &[f32],
+    scope_id: Option<i64>,
+    tier: Option<&str>,
+    limit: i32,
+    ef_search: i32,
+) -> Result<Vec<MemorySemanticHit>, sqlx::Error> {
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "memory_hybrid_search: expected 1024d embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let v = pgvector::Vector::from(embedding.to_vec());
+    let k = limit.clamp(1, 200);
+    let pool_size = (k * 3).clamp(20, 300);
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+
+    let rows = sqlx::query_as::<_, MemorySemanticHit>(
+        "WITH dense AS (
+            SELECT o.id, o.entity_id, o.content, o.importance, o.created_at,
+                   1 - (o.embedding <=> $1) AS sim,
+                   ROW_NUMBER() OVER (ORDER BY o.embedding <=> $1) AS rnk
+            FROM memory_observations o
+            JOIN memory_entities e ON e.id = o.entity_id AND e.valid_to IS NULL
+            LEFT JOIN memory_entity_scope es ON es.entity_id = e.id
+            LEFT JOIN memory_entity_tier  et ON et.entity_id = e.id
+            WHERE o.embedding IS NOT NULL AND o.valid_to IS NULL
+              AND ($3::bigint IS NULL OR es.scope_id = $3)
+              AND ($4::text   IS NULL OR et.tier::text = $4)
+            ORDER BY o.embedding <=> $1
+            LIMIT $5
+         ),
+         sparse AS (
+            SELECT o.id, o.entity_id, o.content, o.importance, o.created_at,
+                   NULL::float8 AS sim,
+                   ROW_NUMBER() OVER (
+                       ORDER BY ts_rank_cd(
+                          to_tsvector('english', o.content),
+                          plainto_tsquery('english', $2)
+                       ) DESC
+                   ) AS rnk
+            FROM memory_observations o
+            JOIN memory_entities e ON e.id = o.entity_id AND e.valid_to IS NULL
+            LEFT JOIN memory_entity_scope es ON es.entity_id = e.id
+            LEFT JOIN memory_entity_tier  et ON et.entity_id = e.id
+            WHERE o.valid_to IS NULL
+              AND ($3::bigint IS NULL OR es.scope_id = $3)
+              AND ($4::text   IS NULL OR et.tier::text = $4)
+              AND to_tsvector('english', o.content) @@ plainto_tsquery('english', $2)
+            LIMIT $5
+         ),
+         fused AS (
+            SELECT id, entity_id, content, importance, created_at, sim,
+                   SUM(1.0 / (60.0 + rnk)) AS rrf
+            FROM (
+                 SELECT * FROM dense
+                 UNION ALL
+                 SELECT * FROM sparse
+            ) u
+            GROUP BY id, entity_id, content, importance, created_at, sim
+         )
+         SELECT f.id AS observation_id,
+                e.id AS entity_id,
+                e.name AS entity_name,
+                e.entity_type,
+                f.content,
+                f.importance,
+                f.sim AS similarity,
+                f.created_at
+         FROM fused f
+         JOIN memory_entities e ON e.id = f.entity_id
+         ORDER BY rrf DESC
+         LIMIT $6",
+    )
+    .bind(&v)
+    .bind(query_text)
+    .bind(scope_id)
+    .bind(tier)
+    .bind(pool_size)
+    .bind(k)
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(rows)
+}
+
+/// Bi-temporal point-in-time snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryFactsAtSnapshot {
+    pub as_of: DateTime<Utc>,
+    pub entities: Vec<EntityRow>,
+    pub observations: Vec<ObservationRow>,
+    pub relations: Vec<RelationDump>,
+}
+
+pub async fn memory_facts_at(
+    pool: &PgPool,
+    as_of: DateTime<Utc>,
+    scope_id: Option<i64>,
+    tier: Option<&str>,
+    limit_entities: i32,
+) -> Result<MemoryFactsAtSnapshot, sqlx::Error> {
+    let limit = limit_entities.clamp(1, 2000);
+    let entities = sqlx::query_as::<_, EntityRow>(
+        "SELECT DISTINCT e.id, e.name, e.entity_type, e.canonical_name, e.importance,
+                e.source::text AS source, e.created_at, e.valid_from,
+                e.valid_to, e.superseded_by
+         FROM memory_entities e
+         LEFT JOIN memory_entity_scope es ON es.entity_id = e.id
+         LEFT JOIN memory_entity_tier  et ON et.entity_id = e.id
+         WHERE e.valid_from <= $1
+           AND (e.valid_to IS NULL OR e.valid_to > $1)
+           AND ($2::bigint IS NULL OR es.scope_id = $2)
+           AND ($3::text   IS NULL OR et.tier::text = $3)
+         ORDER BY e.importance DESC, e.id
+         LIMIT $4",
+    )
+    .bind(as_of)
+    .bind(scope_id)
+    .bind(tier)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let ids: Vec<i64> = entities.iter().map(|e| e.id).collect();
+    let observations: Vec<ObservationRow> = if ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT id, entity_id, content, importance, source::text AS source,
+                    created_at, valid_from, valid_to
+             FROM memory_observations
+             WHERE entity_id = ANY($1)
+               AND valid_from <= $2
+               AND (valid_to IS NULL OR valid_to > $2)
+             ORDER BY entity_id, created_at",
+        )
+        .bind(&ids)
+        .bind(as_of)
+        .fetch_all(pool)
+        .await?
+    };
+
+    let relations: Vec<RelationDump> = if ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT r.id, r.from_entity_id, r.to_entity_id,
+                    a.name AS from_name, b.name AS to_name, r.relation_type
+             FROM memory_relations r
+             JOIN memory_entities a ON a.id = r.from_entity_id
+             JOIN memory_entities b ON b.id = r.to_entity_id
+             WHERE r.valid_from <= $2
+               AND (r.valid_to IS NULL OR r.valid_to > $2)
+               AND (r.from_entity_id = ANY($1) OR r.to_entity_id = ANY($1))",
+        )
+        .bind(&ids)
+        .bind(as_of)
+        .fetch_all(pool)
+        .await?
+    };
+
+    Ok(MemoryFactsAtSnapshot {
+        as_of,
+        entities,
+        observations,
+        relations,
+    })
+}
+
+/// BFS relation-traversal from one or more seed entities.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryTraversalNode {
+    pub entity_id: i64,
+    pub name: String,
+    pub entity_type: String,
+    pub depth: i32,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryTraversal {
+    pub seeds: Vec<i64>,
+    pub nodes: Vec<MemoryTraversalNode>,
+    pub edges: Vec<RelationDump>,
+}
+
+pub async fn memory_relations_traverse(
+    pool: &PgPool,
+    seed_ids: &[i64],
+    max_depth: i32,
+    relation_filter: Option<&str>,
+    max_nodes: i32,
+) -> Result<MemoryTraversal, sqlx::Error> {
+    if seed_ids.is_empty() {
+        return Ok(MemoryTraversal {
+            seeds: Vec::new(),
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        });
+    }
+    let depth_cap = max_depth.clamp(1, 6);
+    let node_cap = max_nodes.clamp(1, 1000);
+
+    let rows = sqlx::query_as::<_, (i64, String, String, i32)>(
+        "WITH RECURSIVE frontier(entity_id, name, entity_type, depth) AS (
+             SELECT e.id, e.name, e.entity_type, 0::int
+             FROM memory_entities e
+             WHERE e.id = ANY($1) AND e.valid_to IS NULL
+             UNION
+             SELECT e2.id, e2.name, e2.entity_type, f.depth + 1
+             FROM frontier f
+             JOIN memory_relations r
+                  ON  (r.from_entity_id = f.entity_id OR r.to_entity_id = f.entity_id)
+                  AND r.valid_to IS NULL
+                  AND ($2::text IS NULL OR r.relation_type = $2)
+             JOIN memory_entities e2
+                  ON e2.id = CASE WHEN r.from_entity_id = f.entity_id
+                                  THEN r.to_entity_id
+                                  ELSE r.from_entity_id
+                              END
+                  AND e2.valid_to IS NULL
+             WHERE f.depth < $3
+         )
+         SELECT entity_id, name, entity_type, MIN(depth)::int AS depth
+         FROM frontier
+         GROUP BY entity_id, name, entity_type
+         ORDER BY MIN(depth), entity_id
+         LIMIT $4",
+    )
+    .bind(seed_ids)
+    .bind(relation_filter)
+    .bind(depth_cap)
+    .bind(node_cap)
+    .fetch_all(pool)
+    .await?;
+
+    let nodes: Vec<MemoryTraversalNode> = rows
+        .into_iter()
+        .map(|(id, name, entity_type, depth)| MemoryTraversalNode {
+            entity_id: id,
+            name,
+            entity_type,
+            depth,
+        })
+        .collect();
+    let node_ids: Vec<i64> = nodes.iter().map(|n| n.entity_id).collect();
+
+    let edges: Vec<RelationDump> = if node_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT r.id, r.from_entity_id, r.to_entity_id,
+                    a.name AS from_name, b.name AS to_name, r.relation_type
+             FROM memory_relations r
+             JOIN memory_entities a ON a.id = r.from_entity_id
+             JOIN memory_entities b ON b.id = r.to_entity_id
+             WHERE r.valid_to IS NULL
+               AND r.from_entity_id = ANY($1)
+               AND r.to_entity_id = ANY($1)
+               AND ($2::text IS NULL OR r.relation_type = $2)",
+        )
+        .bind(&node_ids)
+        .bind(relation_filter)
+        .fetch_all(pool)
+        .await?
+    };
+
+    Ok(MemoryTraversal {
+        seeds: seed_ids.to_vec(),
+        nodes,
+        edges,
+    })
+}
+
+// ============================================================================
+// Memory-server Phase 3.2: code-anchor cross-graph queries
+// ============================================================================
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct MemoryCodeAnchorRow {
+    pub id: i64,
+    pub entity_id: i64,
+    pub file_id: Option<i64>,
+    pub chunk_id: Option<i64>,
+    pub topic_id: Option<i64>,
+    pub anchor_type: String,
+    pub created_at: DateTime<Utc>,
+}
+
+pub async fn memory_anchor_entity(
+    pool: &PgPool,
+    entity_id: i64,
+    file_id: Option<i64>,
+    chunk_id: Option<i64>,
+    topic_id: Option<i64>,
+    anchor_type: &str,
+) -> Result<i64, sqlx::Error> {
+    if file_id.is_none() && chunk_id.is_none() && topic_id.is_none() {
+        return Err(sqlx::Error::Protocol(
+            "memory_anchor_entity: at least one of file_id/chunk_id/topic_id is required".into(),
+        ));
+    }
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO memory_code_anchor
+            (entity_id, file_id, chunk_id, topic_id, anchor_type)
+         VALUES ($1, $2, $3, $4, $5)
+         RETURNING id",
+    )
+    .bind(entity_id)
+    .bind(file_id)
+    .bind(chunk_id)
+    .bind(topic_id)
+    .bind(anchor_type)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+pub async fn memory_unanchor_entity(pool: &PgPool, anchor_id: i64) -> Result<bool, sqlx::Error> {
+    let res = sqlx::query("DELETE FROM memory_code_anchor WHERE id = $1")
+        .bind(anchor_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+pub async fn memory_find_code_for_entity(
+    pool: &PgPool,
+    entity_id: i64,
+    anchor_type: Option<&str>,
+) -> Result<Vec<MemoryCodeAnchorRow>, sqlx::Error> {
+    sqlx::query_as::<_, MemoryCodeAnchorRow>(
+        "SELECT id, entity_id, file_id, chunk_id, topic_id, anchor_type, created_at
+         FROM memory_code_anchor
+         WHERE entity_id = $1
+           AND ($2::text IS NULL OR anchor_type = $2)
+         ORDER BY created_at DESC",
+    )
+    .bind(entity_id)
+    .bind(anchor_type)
+    .fetch_all(pool)
+    .await
+}
+
+pub async fn memory_find_entities_for_code(
+    pool: &PgPool,
+    file_id: Option<i64>,
+    chunk_id: Option<i64>,
+    topic_id: Option<i64>,
+) -> Result<Vec<MemoryCodeAnchorRow>, sqlx::Error> {
+    let provided = [file_id.is_some(), chunk_id.is_some(), topic_id.is_some()]
+        .iter()
+        .filter(|b| **b)
+        .count();
+    if provided != 1 {
+        return Err(sqlx::Error::Protocol(
+            "memory_find_entities_for_code: pass exactly one of file_id, chunk_id, topic_id".into(),
+        ));
+    }
+    sqlx::query_as::<_, MemoryCodeAnchorRow>(
+        "SELECT id, entity_id, file_id, chunk_id, topic_id, anchor_type, created_at
+         FROM memory_code_anchor
+         WHERE ($1::bigint IS NOT NULL AND file_id  = $1)
+            OR ($2::bigint IS NOT NULL AND chunk_id = $2)
+            OR ($3::bigint IS NOT NULL AND topic_id = $3)
+         ORDER BY created_at DESC",
+    )
+    .bind(file_id)
+    .bind(chunk_id)
+    .bind(topic_id)
+    .fetch_all(pool)
+    .await
+}
+
+// ============================================================================
 // Statistics queries
 // ============================================================================
 

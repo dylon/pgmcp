@@ -1829,6 +1829,77 @@ pub struct MemoryOpenNodesParams {
     pub names: Vec<String>,
 }
 
+// ----------------------------------------------------------------------------
+// Phase 3.2 pgmcp extensions
+// ----------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemorySemanticSearchParams {
+    pub query: String,
+    pub scope: Option<MemoryScopeParam>,
+    #[schemars(
+        description = "Optional cognitive-tier filter: working | episodic | semantic | procedural | reflective."
+    )]
+    pub tier: Option<String>,
+    #[schemars(description = "Max rows (1..=200, default 20).")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryHybridSearchParams {
+    pub query: String,
+    pub scope: Option<MemoryScopeParam>,
+    pub tier: Option<String>,
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryFactsAtParams {
+    #[schemars(description = "RFC3339 timestamp. Defaults to NOW().")]
+    pub as_of: Option<String>,
+    pub scope: Option<MemoryScopeParam>,
+    pub tier: Option<String>,
+    pub limit_entities: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryRelationsTraverseParams {
+    pub seed_entity_ids: Vec<i64>,
+    #[schemars(description = "BFS depth cap (1..=6, default 2).")]
+    pub max_depth: Option<i32>,
+    #[schemars(description = "Restrict expansion to one relation_type. Optional.")]
+    pub relation_filter: Option<String>,
+    #[schemars(description = "Hard cap on total nodes returned (default 200, max 1000).")]
+    pub max_nodes: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryAnchorEntityParams {
+    pub entity_id: i64,
+    pub file_id: Option<i64>,
+    pub chunk_id: Option<i64>,
+    pub topic_id: Option<i64>,
+    pub anchor_type: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryUnanchorEntityParams {
+    pub anchor_id: i64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryFindCodeForEntityParams {
+    pub entity_id: i64,
+    pub anchor_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryFindEntitiesForCodeParams {
+    pub file_id: Option<i64>,
+    pub chunk_id: Option<i64>,
+    pub topic_id: Option<i64>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchMandatesParams {
     #[schemars(description = "Free-text search query — full-text matched against \
@@ -2258,6 +2329,162 @@ observations and incoming/outgoing relations. Drop-in compatible with \
             30,
             &_ctx,
             super::tools::tool_memory_crud::tool_memory_open_nodes(self.ctx(), params),
+        )
+        .await
+    }
+
+    // ============================================================================
+    // Memory-server Phase 3.2: pgmcp retrieval extensions (8 tools)
+    // ============================================================================
+
+    #[tool(
+        description = "Memory-server: BGE-M3 vector search over memory_observations \
+(scope/tier filtered). The pgmcp extension to the official-compat `memory_search_nodes` — \
+embeds the query with the active embedder and ranks observations by cosine similarity."
+    )]
+    async fn memory_semantic_search(
+        &self,
+        Parameters(params): Parameters<MemorySemanticSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_semantic_search",
+            30,
+            &_ctx,
+            super::tools::tool_memory_ext::tool_memory_semantic_search(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: hybrid search over memory_observations — RRF fusion of \
+Postgres FTS and BGE-M3 vector cosine, optionally scope/tier filtered."
+    )]
+    async fn memory_hybrid_search(
+        &self,
+        Parameters(params): Parameters<MemoryHybridSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_hybrid_search",
+            30,
+            &_ctx,
+            super::tools::tool_memory_ext::tool_memory_hybrid_search(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: bi-temporal point-in-time snapshot. Returns the entities, \
+observations, and relations that were active at `as_of` (RFC3339; defaults to NOW())."
+    )]
+    async fn memory_facts_at(
+        &self,
+        Parameters(params): Parameters<MemoryFactsAtParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_facts_at",
+            30,
+            &_ctx,
+            super::tools::tool_memory_ext::tool_memory_facts_at(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: depth-bounded BFS over memory_relations starting from \
+one or more seed entity ids. Capped by max_depth (1..=6, default 2) and max_nodes (default \
+200, max 1000)."
+    )]
+    async fn memory_relations_traverse(
+        &self,
+        Parameters(params): Parameters<MemoryRelationsTraverseParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_relations_traverse",
+            30,
+            &_ctx,
+            super::tools::tool_memory_ext::tool_memory_relations_traverse(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: anchor an entity to a (file | chunk | topic) with a typed \
+anchor_type ('implements', 'tested-by', 'documented-in', 'caused-by', 'applies-to', ...). \
+At least one of file_id, chunk_id, topic_id must be provided."
+    )]
+    async fn memory_anchor_entity(
+        &self,
+        Parameters(params): Parameters<MemoryAnchorEntityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_anchor_entity",
+            30,
+            &_ctx,
+            super::tools::tool_memory_ext::tool_memory_anchor_entity(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Memory-server: delete a code anchor by id.")]
+    async fn memory_unanchor_entity(
+        &self,
+        Parameters(params): Parameters<MemoryUnanchorEntityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_unanchor_entity",
+            30,
+            &_ctx,
+            super::tools::tool_memory_ext::tool_memory_unanchor_entity(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: list code anchors for an entity, optionally filtered by \
+anchor_type."
+    )]
+    async fn memory_find_code_for_entity(
+        &self,
+        Parameters(params): Parameters<MemoryFindCodeForEntityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_find_code_for_entity",
+            30,
+            &_ctx,
+            super::tools::tool_memory_ext::tool_memory_find_code_for_entity(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: reverse lookup — entities anchored to a code object. \
+Pass exactly one of file_id, chunk_id, topic_id."
+    )]
+    async fn memory_find_entities_for_code(
+        &self,
+        Parameters(params): Parameters<MemoryFindEntitiesForCodeParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_find_entities_for_code",
+            30,
+            &_ctx,
+            super::tools::tool_memory_ext::tool_memory_find_entities_for_code(self.ctx(), params),
         )
         .await
     }
@@ -4197,6 +4424,15 @@ impl McpServer {
             "memory_read_graph"          => memory_read_graph(MemoryReadGraphParams) in tool_memory_crud,
             "memory_search_nodes"        => memory_search_nodes(MemorySearchNodesParams) in tool_memory_crud,
             "memory_open_nodes"          => memory_open_nodes(MemoryOpenNodesParams) in tool_memory_crud,
+            // Memory-server Phase 3.2 extensions (share the tool_memory_ext module).
+            "memory_semantic_search"        => memory_semantic_search(MemorySemanticSearchParams) in tool_memory_ext,
+            "memory_hybrid_search"          => memory_hybrid_search(MemoryHybridSearchParams) in tool_memory_ext,
+            "memory_facts_at"               => memory_facts_at(MemoryFactsAtParams) in tool_memory_ext,
+            "memory_relations_traverse"     => memory_relations_traverse(MemoryRelationsTraverseParams) in tool_memory_ext,
+            "memory_anchor_entity"          => memory_anchor_entity(MemoryAnchorEntityParams) in tool_memory_ext,
+            "memory_unanchor_entity"        => memory_unanchor_entity(MemoryUnanchorEntityParams) in tool_memory_ext,
+            "memory_find_code_for_entity"   => memory_find_code_for_entity(MemoryFindCodeForEntityParams) in tool_memory_ext,
+            "memory_find_entities_for_code" => memory_find_entities_for_code(MemoryFindEntitiesForCodeParams) in tool_memory_ext,
             // File info
             "read_file"              => read_file(ReadFileParams),
             "mandate_context"        => mandate_context(MandateContextParams),
