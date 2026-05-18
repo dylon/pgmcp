@@ -1708,6 +1708,43 @@ pub struct FileInfoParams {
     pub path: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecallPromptsParams {
+    #[schemars(
+        description = "Free-text query — embedded and matched by cosine similarity \
+                       against historical prompts in `session_prompts`."
+    )]
+    pub query: String,
+    #[schemars(description = "Optional project filter (matches `projects.name`).")]
+    pub project: Option<String>,
+    #[schemars(description = "Optional session UUID filter.")]
+    pub session: Option<String>,
+    #[schemars(description = "Max rows (1..=200, default 10).")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SearchMandatesParams {
+    #[schemars(description = "Free-text search query — full-text matched against \
+                       `imperative || target` in `durable_mandates`.")]
+    pub query: String,
+    #[schemars(
+        description = "Optional polarity filter (one of: always, never, prefer, avoid, \
+                       remember, from_now_on, correction, permission, constraint, mandate, \
+                       process_rule, project_rule)."
+    )]
+    pub polarity: Option<String>,
+    #[schemars(description = "Optional scope filter ('project' or 'workspace').")]
+    pub scope: Option<String>,
+    #[schemars(
+        description = "Optional project_id filter. Workspace-scoped mandates are always \
+                       returned regardless of this filter."
+    )]
+    pub project_id: Option<i32>,
+    #[schemars(description = "Max rows (1..=200, default 20).")]
+    pub limit: Option<i32>,
+}
+
 #[tool_router]
 impl McpServer {
     /// Create a new MCP server from a `SystemContext` bundle.
@@ -1877,6 +1914,51 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
             30,
             &_ctx,
             super::tools::tool_mandate_context::tool_mandate_context(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server Phase 0: vector-similarity search over historical user \
+prompts captured in `session_prompts`. USE WHEN: you want to recall what the user has \
+previously asked across sessions ('what have I said about X'), useful for grounding \
+agent responses in prior context. Optionally filter by project name or session UUID. \
+Returns the top-k most similar prompts with their session id, timestamp, and similarity \
+score."
+    )]
+    async fn recall_prompts(
+        &self,
+        Parameters(params): Parameters<RecallPromptsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "recall_prompts",
+            30,
+            &_ctx,
+            super::tools::tool_recall_prompts::tool_recall_prompts(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server Phase 0: full-text search over `durable_mandates` \
+(promoted standing directives). USE WHEN: you want to look up project rules or \
+preferences by keyword. Filters: polarity (always/never/prefer/avoid/...), scope \
+('project' or 'workspace'), project_id (workspace-scoped rows are returned regardless). \
+Returns mandates ranked by Postgres full-text relevance, then by promotion recency."
+    )]
+    async fn search_mandates(
+        &self,
+        Parameters(params): Parameters<SearchMandatesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "search_mandates",
+            30,
+            &_ctx,
+            super::tools::tool_search_mandates::tool_search_mandates(self.ctx(), params),
         )
         .await
     }
@@ -3803,6 +3885,9 @@ impl McpServer {
             // Session-level mandates — `promote_session_mandate` shares the `tool_session_mandates` module.
             "session_mandates"           => session_mandates(SessionMandatesParams),
             "promote_session_mandate"    => promote_session_mandate(PromoteSessionMandateParams) in tool_session_mandates,
+            // Memory-server Phase 0 quick wins.
+            "recall_prompts"             => recall_prompts(RecallPromptsParams),
+            "search_mandates"            => search_mandates(SearchMandatesParams),
             // File info
             "read_file"              => read_file(ReadFileParams),
             "mandate_context"        => mandate_context(MandateContextParams),

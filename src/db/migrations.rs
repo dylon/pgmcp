@@ -16,6 +16,12 @@ pub async fn run_migrations(
     sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_trgm")
         .execute(pool)
         .await?;
+    // `fuzzystrmatch` ships `levenshtein_less_equal(a, b, max)` which is the
+    // O(|a|·max)-bounded edit-distance probe used by the Phase 0 mandate
+    // near-duplicate dedupe in `src/sessions.rs::mark_near_duplicate_superseded`.
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch")
+        .execute(pool)
+        .await?;
 
     // Create projects table.
     //

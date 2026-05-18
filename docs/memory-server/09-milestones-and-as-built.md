@@ -133,12 +133,38 @@ facts_at, anchors).
 ### M1 — Foundations
 
 - **Status:** in progress.
-- **Sub-step 1 (docs seeded):** ✅ shipped — initial commit of
-  `docs/memory-server/` and `docs/decisions/002-sota-memory-server-design.md`,
-  with the repo `README.md` linking to the new design directory.
-  Date / commit will be filled in by the commit that lands this
-  file.
-- **Sub-step 2 (Phase 0 quick wins):** ⏳ pending.
+- **Sub-step 1 (docs seeded):** ✅ shipped (commit `9bf5624`) —
+  initial commit of `docs/memory-server/` and
+  `docs/decisions/002-sota-memory-server-design.md`, with the repo
+  `README.md` linking to the new design directory.
+- **Sub-step 2 (Phase 0 quick wins):** ✅ shipped —
+  - **`recall_prompts`** MCP tool: vector search over the
+    `session_prompts.embedding` column that had zero readers before
+    this. Filters by `project` and `session`; returns top-k by
+    cosine similarity. Wired through `RecallPromptsParams` →
+    `tool_recall_prompts` → `queries::recall_prompts_semantic`.
+  - **`search_mandates`** MCP tool: Postgres FTS over
+    `durable_mandates.imperative || target` with optional
+    `polarity`, `scope`, and `project_id` filters. The same tool
+    will gain a semantic mode after Phase 1 cutover adds a 1024d
+    embedding column.
+  - **Mandate supersession**: `mark_near_duplicate_superseded` marks
+    active session mandates with `lower(imperative)` Levenshtein
+    ≤ 3 (same session, same polarity) as `'superseded'`. Wired into
+    `POST /api/session/observe` after `upsert_mandate` runs.
+    Requires `CREATE EXTENSION fuzzystrmatch` (added to migrations).
+    Counter: `pgmcp_memory_mandate_supersessions`.
+  - **Telemetry**: three new Prometheus counters
+    (`pgmcp_memory_recall_prompts`,
+    `pgmcp_memory_search_mandates`,
+    `pgmcp_memory_mandate_supersessions`) and matching
+    `AtomicU64` fields on `StatsTracker`.
+  - **Tests**: 8 new integration tests in
+    `pgmcp-testing/tests/memory_phase0.rs` covering top-k vector
+    search, session filtering, FTS match, polarity filter,
+    invalid-polarity rejection, edit-distance dedupe (positive,
+    negative, and polarity-isolation cases). All pass.
+  - **Verification gate**: `./scripts/verify.sh` green.
 - **Sub-step 3 (Phase 1 embedding upgrade):** ⏳ pending.
 
 <!-- Future milestone entries follow the same pattern. -->

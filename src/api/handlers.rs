@@ -286,9 +286,42 @@ pub async fn session_observe(
 
     let extracted = crate::sessions::extract_mandates(&req.prompt, Some(&req.cwd));
     for m in &extracted {
-        let _ = crate::sessions::upsert_mandate(pool, req.session_id, prompt_id, m)
-            .await
-            .map_err(|e| tracing::warn!(error = %e, "upsert_mandate failed"));
+        match crate::sessions::upsert_mandate(pool, req.session_id, prompt_id, m).await {
+            Ok(keeper_id) => {
+                // Phase 0: mark active near-duplicates (Levenshtein ≤ 3 on
+                // `lower(imperative)`) as Superseded so the active list stays
+                // scannable. Survives `upsert_mandate`'s exact-match dedupe.
+                match crate::sessions::mark_near_duplicate_superseded(
+                    pool,
+                    req.session_id,
+                    keeper_id,
+                    m.polarity.as_str(),
+                    &m.imperative,
+                    3,
+                )
+                .await
+                {
+                    Ok(count) if count > 0 => {
+                        state
+                            .stats
+                            .memory_mandate_supersessions
+                            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                        tracing::debug!(
+                            session = %req.session_id,
+                            polarity = m.polarity.as_str(),
+                            keeper_id,
+                            count,
+                            "marked near-duplicate mandates as superseded",
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = %e, "mark_near_duplicate_superseded failed")
+                    }
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "upsert_mandate failed"),
+        }
     }
 
     let active = crate::sessions::list_active_mandates(pool, Some(req.session_id), None, 20)

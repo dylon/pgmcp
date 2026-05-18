@@ -156,6 +156,11 @@ pub struct StatsTracker {
     pub grep_searches: AtomicU64,
     pub commit_searches: AtomicU64,
 
+    // Memory-server Phase 0 counters
+    pub memory_recall_prompts: AtomicU64,
+    pub memory_search_mandates: AtomicU64,
+    pub memory_mandate_supersessions: AtomicU64,
+
     // Timing (cumulative)
     pub index_duration_ms: AtomicU64,
     pub embedding_duration_ms: AtomicU64,
@@ -424,6 +429,9 @@ impl StatsTracker {
             text_searches: AtomicU64::new(0),
             grep_searches: AtomicU64::new(0),
             commit_searches: AtomicU64::new(0),
+            memory_recall_prompts: AtomicU64::new(0),
+            memory_search_mandates: AtomicU64::new(0),
+            memory_mandate_supersessions: AtomicU64::new(0),
             index_duration_ms: AtomicU64::new(0),
             embedding_duration_ms: AtomicU64::new(0),
             last_index_timestamp: AtomicU64::new(0),
@@ -579,6 +587,9 @@ impl StatsTracker {
             "text_searches": self.text_searches.load(Ordering::Acquire),
             "grep_searches": self.grep_searches.load(Ordering::Acquire),
             "commit_searches": self.commit_searches.load(Ordering::Acquire),
+            "memory_recall_prompts": self.memory_recall_prompts.load(Ordering::Acquire),
+            "memory_search_mandates": self.memory_search_mandates.load(Ordering::Acquire),
+            "memory_mandate_supersessions": self.memory_mandate_supersessions.load(Ordering::Acquire),
             "index_duration_ms": self.index_duration_ms.load(Ordering::Acquire),
             "embedding_duration_ms": self.embedding_duration_ms.load(Ordering::Acquire),
             "files_scanned": self.files_scanned.load(Ordering::Acquire),

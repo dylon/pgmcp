@@ -999,6 +999,53 @@ pub async fn upsert_mandate(
     Ok(id)
 }
 
+/// Memory-server Phase 0: mark active session-mandate near-duplicates of the
+/// newly upserted mandate as `Superseded` and link them via
+/// `source_mandate_id`.
+///
+/// Near-duplicate = same `session_id` and `polarity`, different `lower(imperative)`
+/// (the exact match path is already handled by the UNIQUE constraint in
+/// `upsert_mandate`), with `levenshtein_less_equal(lower(a), lower(b), max)`
+/// returning a value ≤ `max`. We use `levenshtein_less_equal` (from
+/// `fuzzystrmatch`) so Postgres bails out as soon as the edit distance is
+/// known to exceed `max` — the function is O(|s|·max), not O(|s|²).
+///
+/// `max_distance` should be small (default 3): we are de-duplicating
+/// near-identical phrasings ("use rust" vs "use Rust", "use_rust"), not
+/// merging semantically distinct mandates. Cross-imperative pairs that
+/// happen to have a small edit distance but mean different things would
+/// be a false positive — accept this for Phase 0; Phase 4 will replace
+/// the regex+Levenshtein pipeline with the LLM extractor entirely.
+///
+/// Returns the number of rows marked superseded.
+pub async fn mark_near_duplicate_superseded(
+    pool: &PgPool,
+    session_id: Uuid,
+    keeper_id: i64,
+    polarity: &str,
+    imperative: &str,
+    max_distance: i32,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE session_mandates
+            SET status = 'superseded'
+          WHERE session_id = $1
+            AND status = 'active'
+            AND id <> $2
+            AND polarity = $3
+            AND lower(imperative) <> lower($4)
+            AND levenshtein_less_equal(lower(imperative), lower($4), $5) <= $5",
+    )
+    .bind(session_id)
+    .bind(keeper_id)
+    .bind(polarity)
+    .bind(imperative)
+    .bind(max_distance)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 pub async fn list_active_mandates(
     pool: &PgPool,
     session_id: Option<Uuid>,

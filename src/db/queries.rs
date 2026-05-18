@@ -1015,6 +1015,139 @@ pub async fn project_tree(
 }
 
 // ============================================================================
+// Memory-server Phase 0 queries
+// ============================================================================
+//
+// `recall_prompts_semantic` exposes the already-embedded `session_prompts`
+// archive via vector similarity. The column has been populated on every
+// prompt since the session-mandates feature shipped but had zero readers
+// before this; surfacing it as an MCP tool is the cheapest possible
+// memory-server feature (no schema change, HNSW index already exists).
+//
+// `search_mandates_fts` adds a search surface to `durable_mandates`, which
+// previously had a single reader (project-scope dump). Postgres full-text
+// over `imperative || ' ' || target` is the Phase 0 mode; semantic search
+// adds a `durable_mandates.embedding` column after Phase 1 cutover (the
+// 1024d BGE-M3 column).
+
+/// Vector-similarity search over `session_prompts`. Returns the top-k most
+/// similar historical prompts under the given embedding signature.
+///
+/// `signature` is the value of `session_prompts.embedding_signature` to
+/// match (e.g. `"minilm-l6-v2"` pre-cutover, `"bge-m3-v1"` post-cutover).
+/// Pre-Phase-1, the column doesn't exist yet; pass `None` to skip the
+/// signature filter and match the legacy 384d `embedding` column directly.
+///
+/// `project_name` and `session_id` are independent filters; both may be
+/// `None`. `limit` is clamped to [1, 200] by the caller.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct PromptRecallResult {
+    pub id: i64,
+    pub session_id: uuid::Uuid,
+    pub project_name: Option<String>,
+    pub ts: DateTime<Utc>,
+    pub prompt_text: String,
+    pub similarity: Option<f64>,
+}
+
+pub async fn recall_prompts_semantic(
+    pool: &PgPool,
+    embedding: &[f32],
+    project_name: Option<&str>,
+    session_id: Option<uuid::Uuid>,
+    limit: i32,
+    ef_search: i32,
+) -> Result<Vec<PromptRecallResult>, sqlx::Error> {
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+
+    let rows = sqlx::query_as::<_, PromptRecallResult>(
+        "SELECT sp.id,
+                sp.session_id,
+                p.name AS project_name,
+                sp.ts,
+                sp.prompt_text,
+                1 - (sp.embedding <=> $1) AS similarity
+         FROM session_prompts sp
+         JOIN sessions s ON s.id = sp.session_id
+         LEFT JOIN projects p ON p.id = s.project_id
+         WHERE sp.embedding IS NOT NULL
+           AND ($2::text IS NULL OR p.name = $2)
+           AND ($3::uuid IS NULL OR sp.session_id = $3)
+         ORDER BY sp.embedding <=> $1
+         LIMIT $4",
+    )
+    .bind(&embedding_vec)
+    .bind(project_name)
+    .bind(session_id)
+    .bind(limit.clamp(1, 200))
+    .fetch_all(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(rows)
+}
+
+/// Full-text search over `durable_mandates`. Phase 0 surface — adds a
+/// semantic mode after Phase 1 cutover provisions a 1024d embedding
+/// column.
+///
+/// `query_text` is matched against `imperative || ' ' || COALESCE(target,'')`
+/// using `plainto_tsquery('english', $1)`. `polarity` and `scope` are
+/// optional exact-match filters.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct MandateSearchResult {
+    pub id: i64,
+    pub scope: String,
+    pub project_id: Option<i32>,
+    pub project_name: Option<String>,
+    pub polarity: String,
+    pub imperative: String,
+    pub target: Option<String>,
+    pub promoted_at: DateTime<Utc>,
+    pub file_path: Option<String>,
+    pub rank: Option<f32>,
+}
+
+pub async fn search_mandates_fts(
+    pool: &PgPool,
+    query_text: &str,
+    polarity: Option<&str>,
+    scope: Option<&str>,
+    project_id: Option<i32>,
+    limit: i32,
+) -> Result<Vec<MandateSearchResult>, sqlx::Error> {
+    sqlx::query_as::<_, MandateSearchResult>(
+        "SELECT m.id, m.scope, m.project_id, p.name AS project_name,
+                m.polarity, m.imperative, m.target, m.promoted_at, m.file_path,
+                ts_rank_cd(
+                  to_tsvector('english', m.imperative || ' ' || COALESCE(m.target, '')),
+                  plainto_tsquery('english', $1)
+                ) AS rank
+         FROM durable_mandates m
+         LEFT JOIN projects p ON p.id = m.project_id
+         WHERE to_tsvector('english', m.imperative || ' ' || COALESCE(m.target, ''))
+               @@ plainto_tsquery('english', $1)
+           AND ($2::text IS NULL OR m.polarity = $2)
+           AND ($3::text IS NULL OR m.scope = $3)
+           AND ($4::int  IS NULL OR m.project_id = $4 OR m.scope = 'workspace')
+         ORDER BY rank DESC NULLS LAST, m.promoted_at DESC
+         LIMIT $5",
+    )
+    .bind(query_text)
+    .bind(polarity)
+    .bind(scope)
+    .bind(project_id)
+    .bind(limit.clamp(1, 200))
+    .fetch_all(pool)
+    .await
+}
+
+// ============================================================================
 // Statistics queries
 // ============================================================================
 

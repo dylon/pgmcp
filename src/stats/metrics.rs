@@ -282,7 +282,16 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
          pgmcp_read_file_disk_io_errors {}\n\
          # HELP pgmcp_read_file_chunk_stitches read_file MCP tool reconstructed content by joining all file_chunks (slow path, content was NULL and disk fast-path was unavailable or failed)\n\
          # TYPE pgmcp_read_file_chunk_stitches counter\n\
-         pgmcp_read_file_chunk_stitches {}\n",
+         pgmcp_read_file_chunk_stitches {}\n\
+         # HELP pgmcp_memory_recall_prompts Memory-server Phase 0 recall_prompts MCP tool invocations\n\
+         # TYPE pgmcp_memory_recall_prompts counter\n\
+         pgmcp_memory_recall_prompts {}\n\
+         # HELP pgmcp_memory_search_mandates Memory-server Phase 0 search_mandates MCP tool invocations\n\
+         # TYPE pgmcp_memory_search_mandates counter\n\
+         pgmcp_memory_search_mandates {}\n\
+         # HELP pgmcp_memory_mandate_supersessions Mandates marked Superseded by the near-duplicate dedupe pass in the session-observation pipeline\n\
+         # TYPE pgmcp_memory_mandate_supersessions counter\n\
+         pgmcp_memory_mandate_supersessions {}\n",
         s.files_indexed.load(Ordering::Relaxed),
         s.files_failed.load(Ordering::Relaxed),
         s.files_submitted.load(Ordering::Relaxed),
@@ -330,6 +339,9 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
         s.read_file_disk_hash_mismatches.load(Ordering::Relaxed),
         s.read_file_disk_io_errors.load(Ordering::Relaxed),
         s.read_file_chunk_stitches.load(Ordering::Relaxed),
+        s.memory_recall_prompts.load(Ordering::Relaxed),
+        s.memory_search_mandates.load(Ordering::Relaxed),
+        s.memory_mandate_supersessions.load(Ordering::Relaxed),
     ) + &render_per_tool_metrics(s)
 }
 
