@@ -884,6 +884,160 @@ pub async fn run_migrations(
         sqlx::query(idx).execute(pool).await?;
     }
 
+    // ================================================================
+    // Memory-server Phase 1: parallel 1024d embedding columns.
+    //
+    // `embedding_v2 VECTOR(1024)` lives alongside the legacy 384d
+    // `embedding` column on `file_chunks` and `session_prompts` for the
+    // duration of the BGE-M3 cutover. The Phase 1 embedding-migration
+    // cron (`src/cron/embedding_migration.rs`) populates `embedding_v2`
+    // incrementally; when both tables have zero unmigrated rows the
+    // operator flips `pgmcp_metadata.active_embedding_signature` from
+    // `minilm-l6-v2` to `bge-m3-v1` to route reads to the new column.
+    // The old column is dropped in a separate cleanup migration after
+    // one release of soak time.
+    //
+    // `embedding_signature TEXT` stamps each row with the model that
+    // produced it so a mixed-signature transition window cannot silently
+    // mis-rank cosine distances.
+    //
+    // HNSW index `idx_file_chunks_embedding_v2` / `_session_prompts_*`
+    // is rebuilt only when `[vector]` params or signature change — same
+    // pattern as `ensure_hnsw_index` / `ensure_session_prompts_hnsw_index`.
+    // ================================================================
+    ensure_memory_v2_columns(pool).await?;
+    ensure_memory_v2_hnsw_index(pool, vector_config).await?;
+    ensure_active_embedding_signature(pool).await?;
+
+    Ok(())
+}
+
+/// Phase 1: add `embedding_v2 VECTOR(1024)` and `embedding_signature TEXT`
+/// to `file_chunks` and `session_prompts`. Idempotent.
+async fn ensure_memory_v2_columns(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let stmts = [
+        "ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS embedding_v2 vector(1024)",
+        "ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS embedding_signature TEXT",
+        "ALTER TABLE session_prompts ADD COLUMN IF NOT EXISTS embedding_v2 vector(1024)",
+        "ALTER TABLE session_prompts ADD COLUMN IF NOT EXISTS embedding_signature TEXT",
+        "ALTER TABLE durable_mandates ADD COLUMN IF NOT EXISTS embedding vector(1024)",
+        "ALTER TABLE durable_mandates ADD COLUMN IF NOT EXISTS embedding_signature TEXT",
+        "ALTER TABLE session_mandates ADD COLUMN IF NOT EXISTS embedding vector(1024)",
+        "ALTER TABLE session_mandates ADD COLUMN IF NOT EXISTS embedding_signature TEXT",
+    ];
+    for s in stmts {
+        sqlx::query(s).execute(pool).await?;
+    }
+    Ok(())
+}
+
+/// Phase 1: HNSW indices on the new 1024d `embedding_v2` columns. Built only
+/// once and rebuilt when `[vector]` params change. Mirrors the rebuild guard
+/// pattern from `ensure_hnsw_index`.
+async fn ensure_memory_v2_hnsw_index(
+    pool: &PgPool,
+    config: &VectorConfig,
+) -> Result<(), sqlx::Error> {
+    let current_params = format!(
+        "m={},ef_construction={}",
+        config.hnsw_m, config.hnsw_ef_construction
+    );
+
+    // file_chunks.embedding_v2
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'memory_v2_file_chunks_hnsw_params'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if stored.as_deref() != Some(&current_params) {
+        let _ = sqlx::query("DROP INDEX IF EXISTS idx_file_chunks_embedding_v2")
+            .execute(pool)
+            .await;
+        let create_sql = format!(
+            "CREATE INDEX idx_file_chunks_embedding_v2 ON file_chunks \
+             USING hnsw (embedding_v2 vector_cosine_ops) \
+             WITH (m = {}, ef_construction = {})",
+            config.hnsw_m, config.hnsw_ef_construction
+        );
+        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value)
+             VALUES ('memory_v2_file_chunks_hnsw_params', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+    }
+
+    // session_prompts.embedding_v2
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'memory_v2_session_prompts_hnsw_params'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if stored.as_deref() != Some(&current_params) {
+        let _ = sqlx::query("DROP INDEX IF EXISTS idx_session_prompts_embedding_v2")
+            .execute(pool)
+            .await;
+        let create_sql = format!(
+            "CREATE INDEX idx_session_prompts_embedding_v2 ON session_prompts \
+             USING hnsw (embedding_v2 vector_cosine_ops) \
+             WITH (m = {}, ef_construction = {})",
+            config.hnsw_m, config.hnsw_ef_construction
+        );
+        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value)
+             VALUES ('memory_v2_session_prompts_hnsw_params', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+    }
+
+    // durable_mandates.embedding
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'memory_v2_durable_mandates_hnsw_params'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if stored.as_deref() != Some(&current_params) {
+        let _ = sqlx::query("DROP INDEX IF EXISTS idx_durable_mandates_embedding")
+            .execute(pool)
+            .await;
+        let create_sql = format!(
+            "CREATE INDEX idx_durable_mandates_embedding ON durable_mandates \
+             USING hnsw (embedding vector_cosine_ops) \
+             WITH (m = {}, ef_construction = {})",
+            config.hnsw_m, config.hnsw_ef_construction
+        );
+        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value)
+             VALUES ('memory_v2_durable_mandates_hnsw_params', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
+/// Phase 1: initialize the `active_embedding_signature` row in `pgmcp_metadata`.
+/// Defaults to `minilm-l6-v2`; the operator flips it to `bge-m3-v1` once the
+/// embedding-migration cron has drained the backlog.
+async fn ensure_active_embedding_signature(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO pgmcp_metadata (key, value)
+         VALUES ('active_embedding_signature', 'minilm-l6-v2')
+         ON CONFLICT (key) DO NOTHING",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

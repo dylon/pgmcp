@@ -165,7 +165,50 @@ facts_at, anchors).
     invalid-polarity rejection, edit-distance dedupe (positive,
     negative, and polarity-isolation cases). All pass.
   - **Verification gate**: `./scripts/verify.sh` green.
-- **Sub-step 3 (Phase 1 embedding upgrade):** ⏳ pending.
+- **Sub-step 3 (Phase 1 embedding upgrade):** ✅ shipped —
+  - **Schema**: `file_chunks` and `session_prompts` gained
+    `embedding_v2 vector(1024)` + `embedding_signature TEXT`
+    (idempotent `ADD COLUMN IF NOT EXISTS`). HNSW indices on the
+    new columns. Same shape added to `durable_mandates` and
+    `session_mandates` to unblock Phase 0 Section 3.3 promotion.
+  - **`pgmcp_metadata.active_embedding_signature`** row seeded
+    with `'minilm-l6-v2'`; flipped to `'bge-m3-v1'` after the
+    operator drains the backlog.
+  - **BGE-M3 embedder** (`src/embed/model.rs`): refactored
+    `Embedder` into a closed-set backbone enum
+    (`MiniLm(BertModel)` vs `Bgem3(XLMRobertaModel)`); each
+    backbone owns its pooling strategy (mean-pool with mask vs
+    CLS-pool) and produces L2-normalized vectors of its dim
+    (384 / 1024). HF cache resolves
+    `BAAI/bge-m3` on first use.
+  - **Matryoshka helper** `matryoshka_truncate` (prefix-truncate +
+    re-normalize) ready for Phase 6 / 7 query-time downsampling.
+  - **Embedding-migration cron** (`src/cron/embedding_migration.rs`):
+    drains `embedding_v2 IS NULL` rows from both tables in
+    `batch_size × max_batches` chunks per tick (default 64 × 32 =
+    2048 rows). Uses `FOR UPDATE SKIP LOCKED` so concurrent ticks
+    don't race. Operator helpers `migration_complete`,
+    `promote_to_bge_m3(force=false)`, and
+    `active_embedding_signature` round out the cutover surface.
+  - **Cutover dispatch** in `recall_prompts_semantic`: routes 384d
+    queries to `embedding` and 1024d queries to `embedding_v2`;
+    rejects other dims with a clear protocol error so a misconfig
+    can't silently produce wrong-shape arithmetic.
+  - **Telemetry**: four new counters
+    (`embeddings_migration_runs`, `embeddings_migrated_file_chunks`,
+    `embeddings_migrated_session_prompts`,
+    `embeddings_migration_errors`) wired through the JSON snapshot
+    and the Prometheus exposition.
+  - **Tests**: 5 active + 1 ignored integration tests in
+    `pgmcp-testing/tests/memory_phase1.rs` cover the new column,
+    operator-helper semantics, cutover dispatch, and dim
+    rejection. The `#[ignore]`-gated test downloads the BGE-M3
+    weights and validates 1024d L2-normalized output — opt-in to
+    avoid a 1.2 GB pull on every `cargo test`.
+  - **Verification gate**: `./scripts/verify.sh` green (604 unit
+    tests, format check, clippy zero-warnings, full integration
+    suite).
+- **M1 status:** ✅ all sub-steps shipped.
 
 <!-- Future milestone entries follow the same pattern. -->
 

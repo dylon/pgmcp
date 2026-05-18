@@ -291,7 +291,19 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
          pgmcp_memory_search_mandates {}\n\
          # HELP pgmcp_memory_mandate_supersessions Mandates marked Superseded by the near-duplicate dedupe pass in the session-observation pipeline\n\
          # TYPE pgmcp_memory_mandate_supersessions counter\n\
-         pgmcp_memory_mandate_supersessions {}\n",
+         pgmcp_memory_mandate_supersessions {}\n\
+         # HELP pgmcp_embeddings_migration_runs Total invocations of the BGE-M3 embedding-migration cron pass\n\
+         # TYPE pgmcp_embeddings_migration_runs counter\n\
+         pgmcp_embeddings_migration_runs {}\n\
+         # HELP pgmcp_embeddings_migrated_file_chunks file_chunks rows whose embedding_v2 column was populated by the migration cron\n\
+         # TYPE pgmcp_embeddings_migrated_file_chunks counter\n\
+         pgmcp_embeddings_migrated_file_chunks {}\n\
+         # HELP pgmcp_embeddings_migrated_session_prompts session_prompts rows whose embedding_v2 column was populated by the migration cron\n\
+         # TYPE pgmcp_embeddings_migrated_session_prompts counter\n\
+         pgmcp_embeddings_migrated_session_prompts {}\n\
+         # HELP pgmcp_embeddings_migration_errors Embedding-migration cron failures (per-batch granularity)\n\
+         # TYPE pgmcp_embeddings_migration_errors counter\n\
+         pgmcp_embeddings_migration_errors {}\n",
         s.files_indexed.load(Ordering::Relaxed),
         s.files_failed.load(Ordering::Relaxed),
         s.files_submitted.load(Ordering::Relaxed),
@@ -342,6 +354,11 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
         s.memory_recall_prompts.load(Ordering::Relaxed),
         s.memory_search_mandates.load(Ordering::Relaxed),
         s.memory_mandate_supersessions.load(Ordering::Relaxed),
+        s.embeddings_migration_runs.load(Ordering::Relaxed),
+        s.embeddings_migrated_file_chunks.load(Ordering::Relaxed),
+        s.embeddings_migrated_session_prompts
+            .load(Ordering::Relaxed),
+        s.embeddings_migration_errors.load(Ordering::Relaxed),
     ) + &render_per_tool_metrics(s)
 }
 

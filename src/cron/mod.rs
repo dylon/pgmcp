@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+pub mod embedding_migration;
+#[allow(dead_code)]
 pub mod gpu_fcm;
 #[allow(dead_code)]
 pub mod graph_analysis;

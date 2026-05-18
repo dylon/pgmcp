@@ -1060,33 +1060,55 @@ pub async fn recall_prompts_semantic(
 ) -> Result<Vec<PromptRecallResult>, sqlx::Error> {
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
 
+    // Phase 1 cutover dispatch: query length (384 vs 1024) selects the
+    // column we read from. 384d → legacy MiniLM `embedding`; 1024d →
+    // BGE-M3 `embedding_v2`. Other dims are rejected here so an
+    // accidental mid-cutover misconfiguration surfaces as a clear error
+    // instead of as wrong-shape vector arithmetic at the pgvector layer.
+    let column = match embedding.len() {
+        384 => "embedding",
+        1024 => "embedding_v2",
+        other => {
+            return Err(sqlx::Error::Protocol(format!(
+                "recall_prompts: unsupported query-embedding dim {} \
+                 (expected 384 for MiniLM or 1024 for BGE-M3)",
+                other
+            )));
+        }
+    };
+
     let mut tx = pool.begin().await?;
     sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
         .execute(&mut *tx)
         .await?;
 
-    let rows = sqlx::query_as::<_, PromptRecallResult>(
+    // Column-name interpolation is safe — it's chosen from a closed
+    // whitelist above, not from user input.
+    let sql = format!(
         "SELECT sp.id,
                 sp.session_id,
                 p.name AS project_name,
                 sp.ts,
                 sp.prompt_text,
-                1 - (sp.embedding <=> $1) AS similarity
+                1 - (sp.{col} <=> $1) AS similarity
          FROM session_prompts sp
          JOIN sessions s ON s.id = sp.session_id
          LEFT JOIN projects p ON p.id = s.project_id
-         WHERE sp.embedding IS NOT NULL
+         WHERE sp.{col} IS NOT NULL
            AND ($2::text IS NULL OR p.name = $2)
            AND ($3::uuid IS NULL OR sp.session_id = $3)
-         ORDER BY sp.embedding <=> $1
+         ORDER BY sp.{col} <=> $1
          LIMIT $4",
-    )
-    .bind(&embedding_vec)
-    .bind(project_name)
-    .bind(session_id)
-    .bind(limit.clamp(1, 200))
-    .fetch_all(&mut *tx)
-    .await?;
+        col = column,
+    );
+
+    let rows = sqlx::query_as::<_, PromptRecallResult>(&sql)
+        .bind(&embedding_vec)
+        .bind(project_name)
+        .bind(session_id)
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&mut *tx)
+        .await?;
 
     tx.commit().await?;
     Ok(rows)

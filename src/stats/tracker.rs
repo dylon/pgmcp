@@ -161,6 +161,12 @@ pub struct StatsTracker {
     pub memory_search_mandates: AtomicU64,
     pub memory_mandate_supersessions: AtomicU64,
 
+    // Memory-server Phase 1 (BGE-M3 migration) counters
+    pub embeddings_migration_runs: AtomicU64,
+    pub embeddings_migrated_file_chunks: AtomicU64,
+    pub embeddings_migrated_session_prompts: AtomicU64,
+    pub embeddings_migration_errors: AtomicU64,
+
     // Timing (cumulative)
     pub index_duration_ms: AtomicU64,
     pub embedding_duration_ms: AtomicU64,
@@ -432,6 +438,10 @@ impl StatsTracker {
             memory_recall_prompts: AtomicU64::new(0),
             memory_search_mandates: AtomicU64::new(0),
             memory_mandate_supersessions: AtomicU64::new(0),
+            embeddings_migration_runs: AtomicU64::new(0),
+            embeddings_migrated_file_chunks: AtomicU64::new(0),
+            embeddings_migrated_session_prompts: AtomicU64::new(0),
+            embeddings_migration_errors: AtomicU64::new(0),
             index_duration_ms: AtomicU64::new(0),
             embedding_duration_ms: AtomicU64::new(0),
             last_index_timestamp: AtomicU64::new(0),
@@ -590,6 +600,10 @@ impl StatsTracker {
             "memory_recall_prompts": self.memory_recall_prompts.load(Ordering::Acquire),
             "memory_search_mandates": self.memory_search_mandates.load(Ordering::Acquire),
             "memory_mandate_supersessions": self.memory_mandate_supersessions.load(Ordering::Acquire),
+            "embeddings_migration_runs": self.embeddings_migration_runs.load(Ordering::Acquire),
+            "embeddings_migrated_file_chunks": self.embeddings_migrated_file_chunks.load(Ordering::Acquire),
+            "embeddings_migrated_session_prompts": self.embeddings_migrated_session_prompts.load(Ordering::Acquire),
+            "embeddings_migration_errors": self.embeddings_migration_errors.load(Ordering::Acquire),
             "index_duration_ms": self.index_duration_ms.load(Ordering::Acquire),
             "embedding_duration_ms": self.embedding_duration_ms.load(Ordering::Acquire),
             "files_scanned": self.files_scanned.load(Ordering::Acquire),
