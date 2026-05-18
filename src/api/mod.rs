@@ -8,6 +8,8 @@ use crate::config::Config;
 use crate::daemon_state::DaemonLifecycle;
 use crate::db::DbClient;
 use crate::embed::pool::QueryEmbedder;
+use crate::llm::LlmExtractor;
+use crate::llm::extractor_worker::DebounceMap;
 use crate::stats::tracker::StatsTracker;
 
 /// Shared state for REST API handlers.
@@ -23,4 +25,12 @@ pub struct ApiState {
     /// cheap 200/503 liveness without touching the database.
     /// `DaemonLifecycle` is `Clone` (internally Arc) so this is cheap.
     pub lifecycle: DaemonLifecycle,
+    /// Memory-server Phase 4: LLM-driven salience extractor. `None` =
+    /// extraction disabled (`[memory.extractor] backend = "disabled"`),
+    /// in which case the session-observation pipeline runs Stage A
+    /// only.
+    pub llm_extractor: Option<Arc<dyn LlmExtractor>>,
+    /// Per-session debounce ledger for the Stage-B worker. Empty until
+    /// the first observation; `extractor_worker` populates it.
+    pub extractor_debounce: DebounceMap,
 }

@@ -297,6 +297,77 @@ facts_at, anchors).
 - **Verification gate:** `./scripts/verify.sh` green across all 8
   gates.
 
+### M4 — Intelligent writes (Phase 4 LLM extractor + Phase 5 reflection)
+
+- **Status:** ✅ shipped.
+- **`LlmExtractor` trait** (`src/llm/mod.rs`): closed-set
+  `LlmBackendChoice` enum (`Qwen38b`, `Qwen34b`,
+  `Cloud(CloudProvider)`, `Disabled`) + factory mirroring the
+  `FcmBackend` pattern. `ExtractionResult` JSON shape matches the
+  prompt template; round-trips through `serde_json` in tests.
+- **Phase 4.2 cloud backend** (`src/llm/cloud.rs`): Anthropic
+  Messages API via `ureq` against
+  `https://api.anthropic.com/v1/messages` (`anthropic-version:
+  2023-06-01`), model `claude-haiku-4-5`. Reads
+  `ANTHROPIC_API_KEY`; refuses to construct if absent. Response
+  parsing tolerates `\`\`\`json` fences and "preamble + JSON" mixed
+  output via three fallback stages.
+- **Phase 4.3 Qwen3 local backend** (`src/llm/qwen3.rs`): loads a
+  Qwen3-Instruct GGUF Q4_K_M via candle-transformers'
+  `quantized_qwen3::ModelWeights`. Greedy generation with
+  `<|im_end|>` / `<|endoftext|>` EOS detection; chat-template
+  formatting hand-rolled; serializes through a `Mutex<Qwen3Inner>`
+  so concurrent extraction calls don't race the KV cache.
+  Defaults to `unsloth/Qwen3-{8B,4B}-Instruct-GGUF` repos;
+  override via `PGMCP_QWEN3_{8B,4B}_GGUF_{REPO,FILE}` and
+  `PGMCP_QWEN3_TOKENIZER_REPO` env vars.
+- **Phase 4.4 prompt + schema** (`src/llm/prompt.rs`): versioned
+  extraction + reflection prompt templates, JSON-schema string for
+  `ExtractionResult` and reflection-array shapes, helpers for
+  stripping code fences and extracting the first balanced JSON
+  substring from a model preamble.
+- **Phase 4.5 extractor worker** (`src/llm/extractor_worker.rs`):
+  Stage-B background task fired by `tokio::spawn` from
+  `POST /api/session/observe`. Per-session debounce via
+  `DashMap<Uuid, Instant>`. Pulls top-K grounding entities from
+  the scope, calls the extractor inside `block_in_place`, persists
+  results into `memory_*` tables, and bi-temporally invalidates
+  any rows the LLM flagged as contradicted (`UPDATE … SET
+  valid_to = NOW()` on the conflict target).
+- **Phase 5 reflection** (`src/llm/reflect.rs`,
+  `src/mcp/tools/tool_memory_reflect.rs`,
+  `src/cron/memory_reflect.rs`): one shared `run_reflection`
+  body services both the agent-driven `memory_reflect` MCP tool
+  and the `memory-reflect` cron. Inserts a `memory_reflection_runs`
+  row up front, gathers the window, calls `LlmExtractor::reflect`,
+  persists higher-order observations with `source = 'reflection'`
+  and `derived_from = [obs_ids]`, finalizes the run row. The MCP
+  tool refuses cleanly with an invalid-params error when the
+  extractor is `Disabled` or
+  `[memory.reflection] agent_enabled = false`.
+- **Config:** new `[memory]` section with subsections
+  `extractor`, `reflection`, `retention` (Phase 8 stub),
+  `graph_rag`. Default `backend = "disabled"` so a stock pgmcp
+  install never touches the LLM path until the operator opts in.
+- **Telemetry:** 10 new `AtomicU64` counters on `StatsTracker`
+  (`memory_extractor_runs`, `_errors`, `_entities_written`,
+  `_relations_written`, `_observations_written`,
+  `_contradictions_resolved`; `memory_reflection_runs_agent`,
+  `_runs_cron`, `_facts_emitted`, `_errors`), exposed via the
+  JSON snapshot.
+- **Tests:** 5 integration tests in
+  `pgmcp-testing/tests/memory_phase4_5.rs` using a deterministic
+  `MockExtractor` exercise the extractor worker end-to-end
+  (entities + relations + observations written), the contradiction
+  path (prior observation's `valid_to` set), reflection
+  provenance (`derived_from` contains every source observation
+  id), the refusal path when the extractor is disabled, and the
+  backend-choice parser. The cloud and Qwen3 backends are tested
+  via their own unit-test modules (JSON-parse fallbacks, chat
+  template, variant defaults).
+- **Verification gate:** `./scripts/verify.sh` green across all 8
+  gates.
+
 <!-- Future milestone entries follow the same pattern. -->
 
 ---

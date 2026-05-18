@@ -29,6 +29,7 @@ use crate::config::Config;
 use crate::daemon_state::DaemonLifecycle;
 use crate::db::DbClient;
 use crate::embed::EmbedSource;
+use crate::llm::LlmExtractor;
 use crate::mcp::logging::LogBroadcaster;
 use crate::mcp::tasks::TaskStore;
 use crate::stats::tracker::StatsTracker;
@@ -50,6 +51,11 @@ pub struct SystemContext {
     /// internally `Arc<AtomicU8>` + `Arc<Subject>`, so we hold by value
     /// and rely on its derived `Clone` for cheap propagation.
     lifecycle: DaemonLifecycle,
+    /// Memory-server Phase 4+5 LLM extractor. `None` = extraction
+    /// disabled (operator hasn't opted in or construction failed). MCP
+    /// tools that need the extractor (currently `memory_reflect`)
+    /// refuse cleanly when this is `None`.
+    llm_extractor: Option<Arc<dyn LlmExtractor>>,
 }
 
 impl SystemContext {
@@ -75,6 +81,33 @@ impl SystemContext {
             log_broadcaster,
             task_store,
             lifecycle,
+            llm_extractor: None,
+        }
+    }
+
+    /// Variant of `production` that attaches an LLM extractor. The
+    /// daemon constructs the extractor in `cli/daemon.rs::serve_daemon`
+    /// and threads it through here.
+    #[allow(clippy::too_many_arguments)]
+    pub fn production_with_extractor(
+        db: Arc<dyn DbClient>,
+        embed: EmbedSource,
+        stats: Arc<StatsTracker>,
+        config: Arc<ArcSwap<Config>>,
+        log_broadcaster: Arc<LogBroadcaster>,
+        task_store: Arc<TaskStore>,
+        lifecycle: DaemonLifecycle,
+        llm_extractor: Option<Arc<dyn LlmExtractor>>,
+    ) -> Self {
+        Self {
+            db,
+            embed,
+            stats,
+            config,
+            log_broadcaster,
+            task_store,
+            lifecycle,
+            llm_extractor,
         }
     }
 
@@ -87,6 +120,12 @@ impl SystemContext {
     }
 
     pub fn stats(&self) -> &Arc<StatsTracker> {
+        &self.stats
+    }
+
+    /// Same as `stats()` but returns the cloneable Arc directly for
+    /// callers that spawn tasks needing ownership.
+    pub fn stats_arc(&self) -> &Arc<StatsTracker> {
         &self.stats
     }
 
@@ -104,6 +143,13 @@ impl SystemContext {
 
     pub fn lifecycle(&self) -> &DaemonLifecycle {
         &self.lifecycle
+    }
+
+    /// Returns the optional LLM extractor handle. `None` when the
+    /// operator hasn't opted in (or construction failed at daemon
+    /// startup).
+    pub fn llm_extractor(&self) -> Option<&Arc<dyn LlmExtractor>> {
+        self.llm_extractor.as_ref()
     }
 }
 

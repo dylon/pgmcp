@@ -29,6 +29,7 @@ pub mod error;
 pub mod fcm;
 pub mod graph;
 pub mod indexer;
+pub mod llm;
 pub mod logging;
 pub mod mandates;
 pub mod mcp;

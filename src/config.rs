@@ -31,6 +31,181 @@ pub struct Config {
     pub cron: CronConfig,
     #[serde(default)]
     pub system: SystemConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+}
+
+/// Memory-server configuration. Holds Phase 4+ knobs grouped under
+/// `[memory.*]` in the TOML.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MemoryConfig {
+    #[serde(default)]
+    pub extractor: MemoryExtractorConfig,
+    #[serde(default)]
+    pub reflection: MemoryReflectionConfig,
+    #[serde(default)]
+    pub retention: MemoryRetentionConfig,
+    #[serde(default)]
+    pub graph_rag: MemoryGraphRagConfig,
+}
+
+/// `[memory.extractor]` — LLM-driven salience extraction (Phase 4).
+/// Default backend is `disabled` so a stock pgmcp install does not
+/// touch the LLM path until the operator opts in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryExtractorConfig {
+    /// One of: `qwen3-8b`, `qwen3-4b`, `cloud`, `disabled`.
+    #[serde(default = "default_extractor_backend")]
+    pub backend: String,
+    /// Stage-B debounce per session, in seconds. Stops a flurry of
+    /// quick prompts from spamming the GPU.
+    #[serde(default = "default_extractor_debounce_secs")]
+    pub inline_debounce_secs: u64,
+    /// LLM-judged importance threshold for auto-promotion into
+    /// `memory_*`. Facts below the threshold are emitted but stamped
+    /// with a lower importance (the entity row's `importance` column
+    /// reflects the LLM's score directly).
+    #[serde(default = "default_extractor_auto_promote_threshold")]
+    pub auto_promote_threshold: f32,
+    /// Schema-validation strictness: `"strict"` rejects any parse
+    /// failure (default); `"lenient"` keeps best-effort parses.
+    #[serde(default = "default_extractor_schema_validation")]
+    pub schema_validation: String,
+}
+
+impl Default for MemoryExtractorConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_extractor_backend(),
+            inline_debounce_secs: default_extractor_debounce_secs(),
+            auto_promote_threshold: default_extractor_auto_promote_threshold(),
+            schema_validation: default_extractor_schema_validation(),
+        }
+    }
+}
+
+fn default_extractor_backend() -> String {
+    "disabled".into()
+}
+fn default_extractor_debounce_secs() -> u64 {
+    30
+}
+fn default_extractor_auto_promote_threshold() -> f32 {
+    0.6
+}
+fn default_extractor_schema_validation() -> String {
+    "strict".into()
+}
+
+/// `[memory.reflection]` — agent-driven + cron reflection (Phase 5).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryReflectionConfig {
+    /// The MCP tool `memory_reflect` is always wired; this flag controls
+    /// whether the daemon refuses agent calls (off when the operator
+    /// wants to avoid LLM spend even with the tool present).
+    #[serde(default = "default_true")]
+    pub agent_enabled: bool,
+    /// Whether the periodic `memory-reflect` cron runs.
+    #[serde(default)]
+    pub cron_enabled: bool,
+    #[serde(default = "default_reflection_cron_interval")]
+    pub cron_interval_secs: u64,
+    /// Don't reflect on a scope that has fewer than this many new
+    /// observations since the last reflection — avoid wasting calls.
+    #[serde(default = "default_reflection_min_new")]
+    pub min_new_observations: i64,
+    /// Max observations included as grounding context for one
+    /// reflection call. Bounded by the prompt size budget.
+    #[serde(default = "default_reflection_window")]
+    pub max_observations: i64,
+}
+
+impl Default for MemoryReflectionConfig {
+    fn default() -> Self {
+        Self {
+            agent_enabled: true,
+            cron_enabled: false,
+            cron_interval_secs: default_reflection_cron_interval(),
+            min_new_observations: default_reflection_min_new(),
+            max_observations: default_reflection_window(),
+        }
+    }
+}
+
+fn default_true() -> bool {
+    true
+}
+fn default_reflection_cron_interval() -> u64 {
+    86400
+}
+fn default_reflection_min_new() -> i64 {
+    50
+}
+fn default_reflection_window() -> i64 {
+    200
+}
+
+/// `[memory.retention]` — Phase 8 eviction policy. Stub config now so
+/// the TOML accepts the section even though the cron lands in Phase 8.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryRetentionConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_retention_window_days")]
+    pub window_days: i64,
+    #[serde(default = "default_retention_importance")]
+    pub importance_threshold: f32,
+}
+
+impl Default for MemoryRetentionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            window_days: default_retention_window_days(),
+            importance_threshold: default_retention_importance(),
+        }
+    }
+}
+
+fn default_retention_window_days() -> i64 {
+    90
+}
+fn default_retention_importance() -> f32 {
+    0.3
+}
+
+/// `[memory.graph_rag]` — Phase 6.3–6.5 graph retrieval gating.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryGraphRagConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_graph_rag_max_latency")]
+    pub max_latency_ms: i64,
+    #[serde(default = "default_graph_rag_path_max_hops")]
+    pub path_search_default_max_hops: i32,
+    #[serde(default = "default_graph_rag_prune_jaccard")]
+    pub path_search_prune_jaccard: f32,
+}
+
+impl Default for MemoryGraphRagConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_latency_ms: default_graph_rag_max_latency(),
+            path_search_default_max_hops: default_graph_rag_path_max_hops(),
+            path_search_prune_jaccard: default_graph_rag_prune_jaccard(),
+        }
+    }
+}
+
+fn default_graph_rag_max_latency() -> i64 {
+    500
+}
+fn default_graph_rag_path_max_hops() -> i32 {
+    3
+}
+fn default_graph_rag_prune_jaccard() -> f32 {
+    0.7
 }
 
 /// Process-level resource budgets.

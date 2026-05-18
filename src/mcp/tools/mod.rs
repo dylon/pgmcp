@@ -63,6 +63,7 @@ pub mod tool_mandate_context;
 pub mod tool_mcp_tool_telemetry;
 pub mod tool_memory_crud;
 pub mod tool_memory_ext;
+pub mod tool_memory_reflect;
 pub mod tool_merge_conflict_risk;
 pub mod tool_module_growth;
 pub mod tool_naming_consistency;

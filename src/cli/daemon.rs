@@ -295,9 +295,38 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     let log_broadcaster = Arc::new(mcp::logging::LogBroadcaster::new());
     let task_store = Arc::new(mcp::tasks::TaskStore::new());
 
+    // Memory-server Phase 4: construct the optional LLM extractor per
+    // config. Disabled by default; logged-and-skipped on construction
+    // failure so the daemon never crashes over an optional path.
+    let llm_extractor: Option<std::sync::Arc<dyn crate::llm::LlmExtractor>> = {
+        let cfg = config.load();
+        let backend_str = cfg.memory.extractor.backend.clone();
+        match crate::llm::parse_backend_choice(&backend_str) {
+            Ok(choice) => match crate::llm::make_extractor(choice) {
+                Ok(opt) => opt.map(std::sync::Arc::from),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        backend = %backend_str,
+                        "LLM extractor construction failed; Stage B + memory_reflect disabled"
+                    );
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    backend = %backend_str,
+                    "LLM extractor backend invalid; Stage B + memory_reflect disabled"
+                );
+                None
+            }
+        }
+    };
+
     // 9. Build the SystemContext bundle. One context, shared by the
     // indexer, MCP server, and REST API — Arc-clone per field, no deep copy.
-    let system_ctx = SystemContext::production(
+    let system_ctx = SystemContext::production_with_extractor(
         Arc::clone(&cron_db),
         embed::EmbedSource::Pool(query_embedder.clone()),
         Arc::clone(&stats_tracker),
@@ -305,6 +334,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         Arc::clone(&log_broadcaster),
         Arc::clone(&task_store),
         lifecycle.clone(),
+        llm_extractor.clone(),
     );
 
     // 10. Start file watcher + scanner
@@ -433,6 +463,13 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             },
         );
 
+        // Memory-server Phase 4: reuse the LLM extractor built earlier
+        // (already wired into SystemContext). The REST API gets the same
+        // handle so /api/session/observe can fire Stage B.
+        let api_llm_extractor = llm_extractor.clone();
+        let extractor_debounce: crate::llm::extractor_worker::DebounceMap =
+            std::sync::Arc::new(dashmap::DashMap::new());
+
         // REST API state (shares query_embedder, db, and stats with MCP server)
         let api_state = api::ApiState {
             db: Arc::clone(&cron_db),
@@ -440,6 +477,8 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             config: Arc::clone(&config),
             stats: Arc::clone(&stats_tracker),
             lifecycle: lifecycle.clone(),
+            llm_extractor: api_llm_extractor,
+            extractor_debounce,
         };
 
         let router = axum::Router::new()

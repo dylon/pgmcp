@@ -1,5 +1,7 @@
 //! REST API handlers for the pgmcp daemon.
 
+use std::sync::Arc;
+
 use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -332,6 +334,48 @@ pub async fn session_observe(
                 format!("list_active_mandates failed: {}", e),
             )
         })?;
+
+    // Memory-server Phase 4 Stage B: spawn the LLM extractor in the
+    // background. Does NOT block the HTTP response — the inline path
+    // (mandates + RAG) returns to the caller immediately while the
+    // extractor runs on the runtime's blocking-pool thread.
+    if let Some(extractor) = state.llm_extractor.clone() {
+        let pool_clone = pool.clone();
+        let stats_clone = Arc::clone(&state.stats);
+        let debounce_clone = Arc::clone(&state.extractor_debounce);
+        let config_snapshot = state.config.load();
+        let worker_config = crate::llm::extractor_worker::ExtractorWorkerConfig {
+            debounce: std::time::Duration::from_secs(
+                config_snapshot.memory.extractor.inline_debounce_secs,
+            ),
+            ..crate::llm::extractor_worker::ExtractorWorkerConfig::default()
+        };
+        // Resolve project_id by longest-cwd-prefix (best-effort; None on miss).
+        let project_id = crate::db::queries::find_project_by_cwd(pool, &req.cwd)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.id);
+        let job = crate::llm::extractor_worker::ExtractorJob {
+            session_id: req.session_id,
+            source_prompt_id: prompt_id,
+            project_id,
+            agent_id: None, // populated from MCP clientInfo in a future phase
+            user_id: std::env::var("USER").ok(),
+            prompt_text: req.prompt.clone(),
+        };
+        tokio::spawn(async move {
+            crate::llm::extractor_worker::run_extraction_for_prompt(
+                pool_clone,
+                stats_clone,
+                extractor,
+                debounce_clone,
+                worker_config,
+                job,
+            )
+            .await;
+        });
+    }
 
     // Optional RAG hits using the existing semantic_search path.
     let mut rag_hits: Vec<SearchResultItem> = Vec::new();

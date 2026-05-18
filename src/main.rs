@@ -13,6 +13,7 @@ mod error;
 mod fcm;
 mod graph;
 mod indexer;
+mod llm;
 mod logging;
 mod mandates;
 mod mcp;

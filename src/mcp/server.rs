@@ -1901,6 +1901,21 @@ pub struct MemoryFindEntitiesForCodeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryReflectParams {
+    pub scope: Option<MemoryScopeParam>,
+    #[schemars(
+        description = "Optional session UUID — stamps the source on reflection-emitted observations."
+    )]
+    pub session_id: Option<String>,
+    #[schemars(description = "RFC3339 lower-bound on observation creation time. Optional.")]
+    pub since: Option<String>,
+    #[schemars(
+        description = "Max observations to consider in the reflection window. Default 200."
+    )]
+    pub max_observations: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchMandatesParams {
     #[schemars(description = "Free-text search query — full-text matched against \
                        `imperative || target` in `durable_mandates`.")]
@@ -2485,6 +2500,29 @@ Pass exactly one of file_id, chunk_id, topic_id."
             30,
             &_ctx,
             super::tools::tool_memory_ext::tool_memory_find_entities_for_code(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server Phase 5: reflection. Pull recent observations from the given \
+scope (or workspace-wide), call the LLM extractor's reflect path, persist higher-order \
+observations with source='reflection' and derived_from = [obs_ids]. Refuses if the \
+extractor is disabled or `[memory.reflection] agent_enabled = false`."
+    )]
+    async fn memory_reflect(
+        &self,
+        Parameters(params): Parameters<MemoryReflectParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_reflect",
+            // Reflection involves an LLM call; allow up to 120 s before the
+            // wrapper times out. The cron path runs without this wrapper.
+            120,
+            &_ctx,
+            super::tools::tool_memory_reflect::tool_memory_reflect(self.ctx(), params),
         )
         .await
     }
@@ -4433,6 +4471,7 @@ impl McpServer {
             "memory_unanchor_entity"        => memory_unanchor_entity(MemoryUnanchorEntityParams) in tool_memory_ext,
             "memory_find_code_for_entity"   => memory_find_code_for_entity(MemoryFindCodeForEntityParams) in tool_memory_ext,
             "memory_find_entities_for_code" => memory_find_entities_for_code(MemoryFindEntitiesForCodeParams) in tool_memory_ext,
+            "memory_reflect"                => memory_reflect(MemoryReflectParams) in tool_memory_reflect,
             // File info
             "read_file"              => read_file(ReadFileParams),
             "mandate_context"        => mandate_context(MandateContextParams),
