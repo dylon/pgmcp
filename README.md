@@ -1652,6 +1652,31 @@ cargo test --test mcp_protocol -- --ignored
 
 ---
 
+## Design Documents
+
+Forward-looking architectural designs live under
+[`docs/`](docs/), organized by purpose:
+
+- [`docs/memory-server/`](docs/memory-server/) — full design for
+  extending pgmcp into a SOTA memory server for LLM agents (entity/
+  relation graph, bi-temporal facts, LLM-driven salience extraction,
+  BGE-M3 embeddings, hierarchical & graph-enhanced retrieval,
+  internal latent-space pipeline). Start with the directory
+  [`README.md`](docs/memory-server/README.md) for an overview;
+  decisions and rationale split across 11 files (00–10).
+- [`docs/decisions/`](docs/decisions/) — short Architectural
+  Decision Records (ADRs):
+  - [`001-no-pgvectorscale-migration.md`](docs/decisions/001-no-pgvectorscale-migration.md)
+    — why we stayed on pgvector HNSW.
+  - [`002-sota-memory-server-design.md`](docs/decisions/002-sota-memory-server-design.md)
+    — the 13 commitments behind the memory-server design.
+- [`docs/scientific-ledger/`](docs/scientific-ledger/) — incident
+  and debugging write-ups (OOM fix, recovery times).
+- [`docs/DEVELOPING.md`](docs/DEVELOPING.md) — local development
+  setup.
+
+---
+
 ## License
 
 Copyright 2026 Dylon Edwards
