@@ -303,7 +303,34 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
          pgmcp_embeddings_migrated_session_prompts {}\n\
          # HELP pgmcp_embeddings_migration_errors Embedding-migration cron failures (per-batch granularity)\n\
          # TYPE pgmcp_embeddings_migration_errors counter\n\
-         pgmcp_embeddings_migration_errors {}\n",
+         pgmcp_embeddings_migration_errors {}\n\
+         # HELP pgmcp_memory_entities_created Entities created via memory_create_entities\n\
+         # TYPE pgmcp_memory_entities_created counter\n\
+         pgmcp_memory_entities_created {}\n\
+         # HELP pgmcp_memory_relations_created Relations created via memory_create_relations\n\
+         # TYPE pgmcp_memory_relations_created counter\n\
+         pgmcp_memory_relations_created {}\n\
+         # HELP pgmcp_memory_observations_added Observations appended via memory_add_observations or memory_create_entities\n\
+         # TYPE pgmcp_memory_observations_added counter\n\
+         pgmcp_memory_observations_added {}\n\
+         # HELP pgmcp_memory_entities_deleted Entities soft-deleted via memory_delete_entities\n\
+         # TYPE pgmcp_memory_entities_deleted counter\n\
+         pgmcp_memory_entities_deleted {}\n\
+         # HELP pgmcp_memory_observations_deleted Observations soft-deleted via memory_delete_observations\n\
+         # TYPE pgmcp_memory_observations_deleted counter\n\
+         pgmcp_memory_observations_deleted {}\n\
+         # HELP pgmcp_memory_relations_deleted Relations soft-deleted via memory_delete_relations\n\
+         # TYPE pgmcp_memory_relations_deleted counter\n\
+         pgmcp_memory_relations_deleted {}\n\
+         # HELP pgmcp_memory_read_graph_calls memory_read_graph MCP tool invocations\n\
+         # TYPE pgmcp_memory_read_graph_calls counter\n\
+         pgmcp_memory_read_graph_calls {}\n\
+         # HELP pgmcp_memory_search_nodes_calls memory_search_nodes MCP tool invocations\n\
+         # TYPE pgmcp_memory_search_nodes_calls counter\n\
+         pgmcp_memory_search_nodes_calls {}\n\
+         # HELP pgmcp_memory_open_nodes_calls memory_open_nodes MCP tool invocations\n\
+         # TYPE pgmcp_memory_open_nodes_calls counter\n\
+         pgmcp_memory_open_nodes_calls {}\n",
         s.files_indexed.load(Ordering::Relaxed),
         s.files_failed.load(Ordering::Relaxed),
         s.files_submitted.load(Ordering::Relaxed),
@@ -359,6 +386,15 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
         s.embeddings_migrated_session_prompts
             .load(Ordering::Relaxed),
         s.embeddings_migration_errors.load(Ordering::Relaxed),
+        s.memory_entities_created.load(Ordering::Relaxed),
+        s.memory_relations_created.load(Ordering::Relaxed),
+        s.memory_observations_added.load(Ordering::Relaxed),
+        s.memory_entities_deleted.load(Ordering::Relaxed),
+        s.memory_observations_deleted.load(Ordering::Relaxed),
+        s.memory_relations_deleted.load(Ordering::Relaxed),
+        s.memory_read_graph_calls.load(Ordering::Relaxed),
+        s.memory_search_nodes_calls.load(Ordering::Relaxed),
+        s.memory_open_nodes_calls.load(Ordering::Relaxed),
     ) + &render_per_tool_metrics(s)
 }
 

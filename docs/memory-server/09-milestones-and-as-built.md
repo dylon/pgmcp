@@ -210,6 +210,53 @@ facts_at, anchors).
     suite).
 - **M1 status:** ✅ all sub-steps shipped.
 
+### M2 — Memory graph live
+
+- **Status:** ✅ shipped.
+- **Phase 2 schema:** `memory_tier` and `memory_source` ENUMs;
+  `memory_scope` (bi-temporal scope tuple with optional
+  user/agent/session/project dimensions); `memory_entities`,
+  `memory_observations`, `memory_relations` (all bi-temporal with
+  `valid_from` / `valid_to` / `superseded_by`); M:N joins
+  `memory_entity_scope` and `memory_entity_tier` (with fuzzy
+  weight); `memory_code_anchor` (cross-graph link with CHECK
+  constraint requiring ≥ 1 FK populated); `memory_summary_tree`
+  (RAPTOR, reserved for Phase 6.1); `memory_forget_log` and
+  `memory_reflection_runs` (reserved for Phases 8 and 5). HNSW
+  indices on `memory_observations.embedding` and
+  `memory_summary_tree.summary_embedding`. All Phase-2 tables
+  ship together so the bi-temporal invariants and FK relations
+  are coherent at migration completion.
+- **Phase 3.1 official-compat tools:** 9 MCP tools wired through
+  `tool_memory_crud.rs` mirror
+  `@modelcontextprotocol/server-memory` exactly:
+  `memory_create_entities`, `memory_create_relations`,
+  `memory_add_observations`, `memory_delete_entities`,
+  `memory_delete_observations`, `memory_delete_relations`,
+  `memory_read_graph`, `memory_search_nodes`, `memory_open_nodes`.
+  All deletes are soft-deletes via `valid_to = NOW()` per the
+  bi-temporal contract (decision 7). The scope-tuple
+  `{user_id?, agent_id?, session_id?, project_id?}` is honored
+  on every create / read / search call; defaults to workspace-wide.
+- **Telemetry:** 9 new `AtomicU64` counters on `StatsTracker`
+  (`memory_entities_created`, `_relations_created`,
+  `_observations_added`, `_entities_deleted`,
+  `_observations_deleted`, `_relations_deleted`,
+  `_read_graph_calls`, `_search_nodes_calls`, `_open_nodes_calls`)
+  + matching Prometheus exposition + JSON snapshot fields.
+- **Tests:** 8 integration tests in
+  `pgmcp-testing/tests/memory_phase2_3.rs` covering schema
+  table-existence, bi-temporal column presence, CHECK enforcement
+  on `memory_code_anchor`, CRUD round-trips (create → search →
+  open → delete → re-read), soft-delete semantics, observation
+  dedupe, and empty-input rejection. Inventory-coverage test
+  (`query_inventory_vs_coverage`) passes — every dispatched memory
+  tool has a corresponding integration test.
+- **Verification gate:** `./scripts/verify.sh` green across all 8
+  gates (preflight, fmt, clippy zero-warnings, debug build, debug
+  tests, release gpu_fallback_smoke, every-tool-tested check,
+  release tests).
+
 <!-- Future milestone entries follow the same pattern. -->
 
 ---

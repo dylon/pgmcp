@@ -1,0 +1,396 @@
+//! Memory-server Phase 3.1: official MCP memory-server compatible CRUD.
+//!
+//! Implements the 9 tools defined by `@modelcontextprotocol/server-memory`
+//! over pgmcp's `memory_*` tables. Drop-in replacement for the official
+//! reference implementation — JSON shapes match upstream so agents that
+//! target the official server can swap pgmcp in unchanged.
+//!
+//! All tools accept an optional `scope` object
+//! `{user_id?, agent_id?, session_id?, project_id?}`; missing scope
+//! resolves to `(NULL, NULL, NULL, NULL)` ("workspace-wide"). Every
+//! created entity is attached to the resolved scope via
+//! `memory_entity_scope`.
+//!
+//! Source provenance for these tools is `'agent_write'` — the agent
+//! explicitly called CRUD. The LLM-driven extraction path (Phase 4)
+//! uses `'llm_extraction'`.
+
+use std::sync::atomic::Ordering;
+use std::time::Instant;
+
+use rmcp::ErrorData as McpError;
+use rmcp::model::CallToolResult;
+use serde_json::json;
+use tracing::{debug, error};
+use uuid::Uuid;
+
+use crate::context::SystemContext;
+use crate::db::queries::{
+    self, AddObservationInput, DeleteObservationInput, NewEntityInput, NewRelationInput, ScopeSpec,
+};
+use crate::mcp::server::{
+    MemoryAddObservationsParams, MemoryCreateEntitiesParams, MemoryCreateRelationsParams,
+    MemoryDeleteEntitiesParams, MemoryDeleteObservationsParams, MemoryDeleteRelationsParams,
+    MemoryOpenNodesParams, MemoryReadGraphParams, MemoryScopeParam, MemorySearchNodesParams,
+};
+
+fn raw_pool(ctx: &SystemContext) -> Result<&sqlx::PgPool, McpError> {
+    ctx.db()
+        .pool()
+        .ok_or_else(|| McpError::internal_error("raw pool unavailable", None))
+}
+
+fn json_result(value: serde_json::Value) -> Result<CallToolResult, McpError> {
+    let text = serde_json::to_string_pretty(&value)
+        .map_err(|e| McpError::internal_error(format!("serialize failed: {}", e), None))?;
+    Ok(CallToolResult::success(vec![rmcp::model::Content::text(
+        text,
+    )]))
+}
+
+fn parse_scope(p: Option<&MemoryScopeParam>) -> Result<ScopeSpec, McpError> {
+    let Some(p) = p else {
+        return Ok(ScopeSpec::default());
+    };
+    let session_id = match p.session_id.as_deref() {
+        Some(s) => Some(Uuid::parse_str(s).map_err(|e| {
+            McpError::invalid_params(format!("invalid session_id UUID: {}", e), None)
+        })?),
+        None => None,
+    };
+    Ok(ScopeSpec {
+        user_id: p.user_id.clone(),
+        agent_id: p.agent_id.clone(),
+        session_id,
+        project_id: p.project_id,
+    })
+}
+
+// ----------------------------------------------------------------------------
+// memory_create_entities
+// ----------------------------------------------------------------------------
+
+pub async fn tool_memory_create_entities(
+    ctx: &SystemContext,
+    params: MemoryCreateEntitiesParams,
+) -> Result<CallToolResult, McpError> {
+    let start = Instant::now();
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    let pool = raw_pool(ctx)?;
+    let scope = parse_scope(params.scope.as_ref())?;
+    let scope_id = queries::find_or_create_scope(pool, &scope)
+        .await
+        .map_err(|e| McpError::internal_error(format!("scope: {}", e), None))?;
+
+    if params.entities.is_empty() {
+        return Err(McpError::invalid_params("entities must not be empty", None));
+    }
+
+    let inputs: Vec<NewEntityInput> = params
+        .entities
+        .into_iter()
+        .map(|e| NewEntityInput {
+            name: e.name,
+            entity_type: e.entity_type,
+            observations: e.observations.unwrap_or_default(),
+        })
+        .collect();
+    let total_obs: usize = inputs.iter().map(|i| i.observations.len()).sum();
+
+    let ids = queries::memory_create_entities(pool, &inputs, scope_id, "agent_write")
+        .await
+        .map_err(|e| {
+            error!(tool = "memory_create_entities", error = %e, "query failed");
+            McpError::internal_error(format!("query failed: {}", e), None)
+        })?;
+
+    ctx.stats()
+        .memory_entities_created
+        .fetch_add(ids.len() as u64, Ordering::Relaxed);
+    ctx.stats()
+        .memory_observations_added
+        .fetch_add(total_obs as u64, Ordering::Relaxed);
+
+    debug!(
+        tool = "memory_create_entities",
+        scope_id,
+        count = ids.len(),
+        observations_added = total_obs,
+        duration_ms = start.elapsed().as_millis() as u64,
+        "MCP tool completed",
+    );
+    json_result(json!({
+        "scope_id": scope_id,
+        "entities_created": ids.len(),
+        "ids": ids,
+        "observations_attached": total_obs,
+    }))
+}
+
+// ----------------------------------------------------------------------------
+// memory_create_relations
+// ----------------------------------------------------------------------------
+
+pub async fn tool_memory_create_relations(
+    ctx: &SystemContext,
+    params: MemoryCreateRelationsParams,
+) -> Result<CallToolResult, McpError> {
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    let pool = raw_pool(ctx)?;
+    if params.relations.is_empty() {
+        return Err(McpError::invalid_params(
+            "relations must not be empty",
+            None,
+        ));
+    }
+    let inputs: Vec<NewRelationInput> = params
+        .relations
+        .into_iter()
+        .map(|r| NewRelationInput {
+            from: r.from,
+            to: r.to,
+            relation_type: r.relation_type,
+        })
+        .collect();
+    let ids = queries::memory_create_relations(pool, &inputs, "agent_write")
+        .await
+        .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
+    let resolved = ids.iter().filter(|i| **i >= 0).count();
+    let unresolved = ids.iter().filter(|i| **i < 0).count();
+    ctx.stats()
+        .memory_relations_created
+        .fetch_add(resolved as u64, Ordering::Relaxed);
+    json_result(json!({
+        "relations_created": resolved,
+        "unresolved_endpoints": unresolved,
+        "ids": ids,
+    }))
+}
+
+// ----------------------------------------------------------------------------
+// memory_add_observations
+// ----------------------------------------------------------------------------
+
+pub async fn tool_memory_add_observations(
+    ctx: &SystemContext,
+    params: MemoryAddObservationsParams,
+) -> Result<CallToolResult, McpError> {
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    let pool = raw_pool(ctx)?;
+    if params.observations.is_empty() {
+        return Err(McpError::invalid_params(
+            "observations must not be empty",
+            None,
+        ));
+    }
+    let inputs: Vec<AddObservationInput> = params
+        .observations
+        .into_iter()
+        .map(|o| AddObservationInput {
+            entity_name: o.entity_name,
+            contents: o.contents,
+        })
+        .collect();
+    let ids = queries::memory_add_observations(pool, &inputs, "agent_write")
+        .await
+        .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
+    ctx.stats()
+        .memory_observations_added
+        .fetch_add(ids.len() as u64, Ordering::Relaxed);
+    json_result(json!({
+        "observations_added": ids.len(),
+        "ids": ids,
+    }))
+}
+
+// ----------------------------------------------------------------------------
+// memory_delete_entities (soft delete)
+// ----------------------------------------------------------------------------
+
+pub async fn tool_memory_delete_entities(
+    ctx: &SystemContext,
+    params: MemoryDeleteEntitiesParams,
+) -> Result<CallToolResult, McpError> {
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    let pool = raw_pool(ctx)?;
+    if params.names.is_empty() {
+        return Err(McpError::invalid_params("names must not be empty", None));
+    }
+    let affected = queries::memory_delete_entities(pool, &params.names)
+        .await
+        .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
+    ctx.stats()
+        .memory_entities_deleted
+        .fetch_add(affected, Ordering::Relaxed);
+    json_result(json!({
+        "soft_deleted": affected,
+        "names": params.names,
+        "mode": "soft_delete_via_valid_to",
+    }))
+}
+
+// ----------------------------------------------------------------------------
+// memory_delete_observations (soft delete)
+// ----------------------------------------------------------------------------
+
+pub async fn tool_memory_delete_observations(
+    ctx: &SystemContext,
+    params: MemoryDeleteObservationsParams,
+) -> Result<CallToolResult, McpError> {
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    let pool = raw_pool(ctx)?;
+    if params.deletions.is_empty() {
+        return Err(McpError::invalid_params(
+            "deletions must not be empty",
+            None,
+        ));
+    }
+    let inputs: Vec<DeleteObservationInput> = params
+        .deletions
+        .into_iter()
+        .map(|d| DeleteObservationInput {
+            entity_name: d.entity_name,
+            observations: d.observations,
+        })
+        .collect();
+    let affected = queries::memory_delete_observations(pool, &inputs)
+        .await
+        .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
+    ctx.stats()
+        .memory_observations_deleted
+        .fetch_add(affected, Ordering::Relaxed);
+    json_result(json!({
+        "soft_deleted": affected,
+        "mode": "soft_delete_via_valid_to",
+    }))
+}
+
+// ----------------------------------------------------------------------------
+// memory_delete_relations (soft delete)
+// ----------------------------------------------------------------------------
+
+pub async fn tool_memory_delete_relations(
+    ctx: &SystemContext,
+    params: MemoryDeleteRelationsParams,
+) -> Result<CallToolResult, McpError> {
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    let pool = raw_pool(ctx)?;
+    if params.relations.is_empty() {
+        return Err(McpError::invalid_params(
+            "relations must not be empty",
+            None,
+        ));
+    }
+    let inputs: Vec<NewRelationInput> = params
+        .relations
+        .into_iter()
+        .map(|r| NewRelationInput {
+            from: r.from,
+            to: r.to,
+            relation_type: r.relation_type,
+        })
+        .collect();
+    let affected = queries::memory_delete_relations(pool, &inputs)
+        .await
+        .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
+    ctx.stats()
+        .memory_relations_deleted
+        .fetch_add(affected, Ordering::Relaxed);
+    json_result(json!({
+        "soft_deleted": affected,
+        "mode": "soft_delete_via_valid_to",
+    }))
+}
+
+// ----------------------------------------------------------------------------
+// memory_read_graph
+// ----------------------------------------------------------------------------
+
+pub async fn tool_memory_read_graph(
+    ctx: &SystemContext,
+    params: MemoryReadGraphParams,
+) -> Result<CallToolResult, McpError> {
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    ctx.stats()
+        .memory_read_graph_calls
+        .fetch_add(1, Ordering::Relaxed);
+    let pool = raw_pool(ctx)?;
+    let scope_id = match params.scope.as_ref() {
+        Some(scope) => {
+            let spec = parse_scope(Some(scope))?;
+            Some(
+                queries::find_or_create_scope(pool, &spec)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("scope: {}", e), None))?,
+            )
+        }
+        None => None,
+    };
+    let limit = params.limit_entities.unwrap_or(200);
+    let dump = queries::memory_read_graph(pool, scope_id, limit)
+        .await
+        .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
+    json_result(json!(dump))
+}
+
+// ----------------------------------------------------------------------------
+// memory_search_nodes
+// ----------------------------------------------------------------------------
+
+pub async fn tool_memory_search_nodes(
+    ctx: &SystemContext,
+    params: MemorySearchNodesParams,
+) -> Result<CallToolResult, McpError> {
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    ctx.stats()
+        .memory_search_nodes_calls
+        .fetch_add(1, Ordering::Relaxed);
+    let pool = raw_pool(ctx)?;
+    if params.query.trim().is_empty() {
+        return Err(McpError::invalid_params("query must not be empty", None));
+    }
+    let scope_id = match params.scope.as_ref() {
+        Some(scope) => {
+            let spec = parse_scope(Some(scope))?;
+            Some(
+                queries::find_or_create_scope(pool, &spec)
+                    .await
+                    .map_err(|e| McpError::internal_error(format!("scope: {}", e), None))?,
+            )
+        }
+        None => None,
+    };
+    let limit = params.limit.unwrap_or(20);
+    let hits = queries::memory_search_nodes(pool, &params.query, scope_id, limit)
+        .await
+        .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
+    json_result(json!({
+        "count": hits.len(),
+        "results": hits,
+    }))
+}
+
+// ----------------------------------------------------------------------------
+// memory_open_nodes
+// ----------------------------------------------------------------------------
+
+pub async fn tool_memory_open_nodes(
+    ctx: &SystemContext,
+    params: MemoryOpenNodesParams,
+) -> Result<CallToolResult, McpError> {
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    ctx.stats()
+        .memory_open_nodes_calls
+        .fetch_add(1, Ordering::Relaxed);
+    let pool = raw_pool(ctx)?;
+    if params.names.is_empty() {
+        return Err(McpError::invalid_params("names must not be empty", None));
+    }
+    let nodes = queries::memory_open_nodes(pool, &params.names)
+        .await
+        .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
+    json_result(json!({
+        "count": nodes.len(),
+        "nodes": nodes,
+    }))
+}

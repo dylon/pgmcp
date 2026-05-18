@@ -1170,6 +1170,643 @@ pub async fn search_mandates_fts(
 }
 
 // ============================================================================
+// Memory-server Phase 2 + 3: knowledge-graph CRUD queries
+// ============================================================================
+//
+// Drop-in replacement surface for `@modelcontextprotocol/server-memory` —
+// entities + relations + observations stored in PostgreSQL with
+// bi-temporal columns. See `docs/memory-server/05-schema.md` for the
+// schema and `docs/memory-server/06-tools.md` for the tool catalog.
+
+/// Scope tuple. Each dimension is optional; NULL means "any". Used both
+/// as a search filter (find entities visible under this scope) and as an
+/// attachment key (create_entities attaches to this scope row).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ScopeSpec {
+    pub user_id: Option<String>,
+    pub agent_id: Option<String>,
+    pub session_id: Option<uuid::Uuid>,
+    pub project_id: Option<i32>,
+}
+
+/// Find an existing `memory_scope` row matching the spec, or create one.
+/// Returns the scope id.
+///
+/// Postgres 15+ supports `UNIQUE NULLS NOT DISTINCT`; on older versions
+/// we fall back to an `INSERT ... WHERE NOT EXISTS` race-tolerant path.
+pub async fn find_or_create_scope(pool: &PgPool, scope: &ScopeSpec) -> Result<i64, sqlx::Error> {
+    if let Some(id) = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM memory_scope
+         WHERE user_id IS NOT DISTINCT FROM $1
+           AND agent_id IS NOT DISTINCT FROM $2
+           AND session_id IS NOT DISTINCT FROM $3
+           AND project_id IS NOT DISTINCT FROM $4
+         LIMIT 1",
+    )
+    .bind(scope.user_id.as_deref())
+    .bind(scope.agent_id.as_deref())
+    .bind(scope.session_id)
+    .bind(scope.project_id)
+    .fetch_optional(pool)
+    .await?
+    {
+        return Ok(id);
+    }
+
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO memory_scope (user_id, agent_id, session_id, project_id)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id",
+    )
+    .bind(scope.user_id.as_deref())
+    .bind(scope.agent_id.as_deref())
+    .bind(scope.session_id)
+    .bind(scope.project_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Compute a sha256 hex digest. Mirrors `sessions::prompt_sha256` but
+/// kept local to this module to avoid the API surface widening.
+fn observation_sha256(content: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(content.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// `memory_create_entities` payload row.
+#[derive(Debug, Clone)]
+pub struct NewEntityInput {
+    pub name: String,
+    pub entity_type: String,
+    /// Initial observations attached at entity-creation time. May be empty.
+    pub observations: Vec<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct EntityRow {
+    pub id: i64,
+    pub name: String,
+    pub entity_type: String,
+    pub canonical_name: Option<String>,
+    pub importance: f32,
+    pub source: String,
+    pub created_at: DateTime<Utc>,
+    pub valid_from: DateTime<Utc>,
+    pub valid_to: Option<DateTime<Utc>>,
+    pub superseded_by: Option<i64>,
+}
+
+/// Create entities (and optionally initial observations) under the given
+/// scope. Returns the inserted entity ids in input order. Idempotent on
+/// `(name, entity_type)` when an active row exists — re-using the prior
+/// id and appending observations.
+pub async fn memory_create_entities(
+    pool: &PgPool,
+    inputs: &[NewEntityInput],
+    scope_id: i64,
+    source: &str,
+) -> Result<Vec<i64>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let mut out = Vec::with_capacity(inputs.len());
+
+    for input in inputs {
+        // Re-use the active row if one exists; otherwise insert.
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM memory_entities
+             WHERE name = $1 AND entity_type = $2 AND valid_to IS NULL
+             LIMIT 1",
+        )
+        .bind(&input.name)
+        .bind(&input.entity_type)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let entity_id: i64 = match existing {
+            Some(id) => id,
+            None => {
+                sqlx::query_scalar(
+                    "INSERT INTO memory_entities
+                        (name, entity_type, importance, source)
+                     VALUES ($1, $2, 0.5, $3::memory_source)
+                     RETURNING id",
+                )
+                .bind(&input.name)
+                .bind(&input.entity_type)
+                .bind(source)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+        };
+
+        // Attach scope (idempotent).
+        sqlx::query(
+            "INSERT INTO memory_entity_scope (entity_id, scope_id)
+             VALUES ($1, $2)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(entity_id)
+        .bind(scope_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // Append observations (idempotent on (entity_id, content_sha256, valid_from);
+        // re-creating the same observation gets eaten by the UNIQUE).
+        for obs in &input.observations {
+            let sha = observation_sha256(obs);
+            let _ = sqlx::query(
+                "INSERT INTO memory_observations
+                    (entity_id, content, content_sha256, source)
+                 VALUES ($1, $2, $3, $4::memory_source)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(entity_id)
+            .bind(obs)
+            .bind(&sha)
+            .bind(source)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        out.push(entity_id);
+    }
+
+    tx.commit().await?;
+    Ok(out)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct NewRelationInput {
+    pub from: String,
+    pub to: String,
+    pub relation_type: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct RelationRow {
+    pub id: i64,
+    pub from_entity_id: i64,
+    pub to_entity_id: i64,
+    pub relation_type: String,
+    pub importance: f32,
+    pub source: String,
+    pub created_at: DateTime<Utc>,
+    pub valid_from: DateTime<Utc>,
+    pub valid_to: Option<DateTime<Utc>>,
+}
+
+/// Create relations between existing entities (looked up by name). Returns
+/// the inserted relation ids; -1 sentinel for entries whose endpoints
+/// couldn't be found.
+pub async fn memory_create_relations(
+    pool: &PgPool,
+    inputs: &[NewRelationInput],
+    source: &str,
+) -> Result<Vec<i64>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let mut out = Vec::with_capacity(inputs.len());
+
+    for input in inputs {
+        // Resolve endpoints (active rows only).
+        let from_id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM memory_entities WHERE name = $1 AND valid_to IS NULL LIMIT 1",
+        )
+        .bind(&input.from)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let to_id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM memory_entities WHERE name = $1 AND valid_to IS NULL LIMIT 1",
+        )
+        .bind(&input.to)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (Some(from_id), Some(to_id)) = (from_id, to_id) else {
+            out.push(-1);
+            continue;
+        };
+        if from_id == to_id {
+            out.push(-1);
+            continue;
+        }
+
+        // Existing active relation with same triple? Reuse.
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM memory_relations
+             WHERE from_entity_id = $1 AND to_entity_id = $2 AND relation_type = $3
+               AND valid_to IS NULL
+             LIMIT 1",
+        )
+        .bind(from_id)
+        .bind(to_id)
+        .bind(&input.relation_type)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(id) = existing {
+            out.push(id);
+            continue;
+        }
+
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO memory_relations
+                (from_entity_id, to_entity_id, relation_type, source)
+             VALUES ($1, $2, $3, $4::memory_source)
+             RETURNING id",
+        )
+        .bind(from_id)
+        .bind(to_id)
+        .bind(&input.relation_type)
+        .bind(source)
+        .fetch_one(&mut *tx)
+        .await?;
+        out.push(id);
+    }
+
+    tx.commit().await?;
+    Ok(out)
+}
+
+#[derive(Debug, Clone)]
+pub struct AddObservationInput {
+    pub entity_name: String,
+    pub contents: Vec<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct ObservationRow {
+    pub id: i64,
+    pub entity_id: i64,
+    pub content: String,
+    pub importance: f32,
+    pub source: String,
+    pub created_at: DateTime<Utc>,
+    pub valid_from: DateTime<Utc>,
+    pub valid_to: Option<DateTime<Utc>>,
+}
+
+/// Append observations to an existing entity. Returns ids of newly-inserted
+/// observations (skips duplicates via the UNIQUE constraint). The caller
+/// can detect missing entities by counting fewer returned ids than inputs.
+pub async fn memory_add_observations(
+    pool: &PgPool,
+    inputs: &[AddObservationInput],
+    source: &str,
+) -> Result<Vec<i64>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let mut out = Vec::new();
+
+    for input in inputs {
+        let entity_id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM memory_entities WHERE name = $1 AND valid_to IS NULL LIMIT 1",
+        )
+        .bind(&input.entity_name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(entity_id) = entity_id else {
+            continue;
+        };
+
+        for content in &input.contents {
+            let sha = observation_sha256(content);
+            let inserted: Option<i64> = sqlx::query_scalar(
+                "INSERT INTO memory_observations
+                    (entity_id, content, content_sha256, source)
+                 VALUES ($1, $2, $3, $4::memory_source)
+                 ON CONFLICT DO NOTHING
+                 RETURNING id",
+            )
+            .bind(entity_id)
+            .bind(content)
+            .bind(&sha)
+            .bind(source)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if let Some(id) = inserted {
+                out.push(id);
+            }
+        }
+    }
+
+    tx.commit().await?;
+    Ok(out)
+}
+
+/// Soft-delete entities by name. Sets `valid_to = NOW()` on the active
+/// row for each name; observations and relations remain queryable via
+/// `memory_facts_at(t < deletion_time)` per the bi-temporal contract.
+///
+/// Returns the number of entity rows affected.
+pub async fn memory_delete_entities(pool: &PgPool, names: &[String]) -> Result<u64, sqlx::Error> {
+    if names.is_empty() {
+        return Ok(0);
+    }
+    let res = sqlx::query(
+        "UPDATE memory_entities
+            SET valid_to = NOW()
+          WHERE name = ANY($1) AND valid_to IS NULL",
+    )
+    .bind(names)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+#[derive(Debug, Clone)]
+pub struct DeleteObservationInput {
+    pub entity_name: String,
+    pub observations: Vec<String>,
+}
+
+/// Soft-delete observations by content text under a named entity.
+pub async fn memory_delete_observations(
+    pool: &PgPool,
+    inputs: &[DeleteObservationInput],
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let mut affected = 0_u64;
+    for input in inputs {
+        let entity_id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM memory_entities WHERE name = $1 AND valid_to IS NULL LIMIT 1",
+        )
+        .bind(&input.entity_name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(entity_id) = entity_id else {
+            continue;
+        };
+        for content in &input.observations {
+            let res = sqlx::query(
+                "UPDATE memory_observations
+                    SET valid_to = NOW()
+                  WHERE entity_id = $1 AND content = $2 AND valid_to IS NULL",
+            )
+            .bind(entity_id)
+            .bind(content)
+            .execute(&mut *tx)
+            .await?;
+            affected += res.rows_affected();
+        }
+    }
+    tx.commit().await?;
+    Ok(affected)
+}
+
+/// Soft-delete relations matching `(from_name, to_name, relation_type)`.
+pub async fn memory_delete_relations(
+    pool: &PgPool,
+    inputs: &[NewRelationInput],
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let mut affected = 0_u64;
+    for input in inputs {
+        let res = sqlx::query(
+            "UPDATE memory_relations r
+                SET valid_to = NOW()
+              FROM memory_entities a, memory_entities b
+              WHERE r.from_entity_id = a.id
+                AND r.to_entity_id = b.id
+                AND a.name = $1 AND a.valid_to IS NULL
+                AND b.name = $2 AND b.valid_to IS NULL
+                AND r.relation_type = $3
+                AND r.valid_to IS NULL",
+        )
+        .bind(&input.from)
+        .bind(&input.to)
+        .bind(&input.relation_type)
+        .execute(&mut *tx)
+        .await?;
+        affected += res.rows_affected();
+    }
+    tx.commit().await?;
+    Ok(affected)
+}
+
+/// Substring/ILIKE search across entity names, types, and observation
+/// content (Phase 3 baseline; semantic search is `memory_semantic_search`
+/// in §3.2). Scope-filtered when `scope_id` is `Some`.
+///
+/// Returns the matched entities (deduped) with their observation hit
+/// count. Limited to `limit` rows.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct EntitySearchHit {
+    pub id: i64,
+    pub name: String,
+    pub entity_type: String,
+    pub canonical_name: Option<String>,
+    pub importance: f32,
+    pub matched_observations: i64,
+}
+
+pub async fn memory_search_nodes(
+    pool: &PgPool,
+    query: &str,
+    scope_id: Option<i64>,
+    limit: i32,
+) -> Result<Vec<EntitySearchHit>, sqlx::Error> {
+    let like = format!("%{}%", query);
+    sqlx::query_as::<_, EntitySearchHit>(
+        "SELECT e.id, e.name, e.entity_type, e.canonical_name, e.importance,
+                COUNT(o.id) FILTER (WHERE o.content ILIKE $1) AS matched_observations
+         FROM memory_entities e
+         LEFT JOIN memory_observations o
+            ON o.entity_id = e.id AND o.valid_to IS NULL
+         LEFT JOIN memory_entity_scope es ON es.entity_id = e.id
+         WHERE e.valid_to IS NULL
+           AND ($2::bigint IS NULL OR es.scope_id = $2)
+           AND (
+             e.name ILIKE $1
+             OR e.entity_type ILIKE $1
+             OR e.canonical_name ILIKE $1
+             OR o.content ILIKE $1
+           )
+         GROUP BY e.id
+         ORDER BY matched_observations DESC, e.importance DESC, e.id
+         LIMIT $3",
+    )
+    .bind(&like)
+    .bind(scope_id)
+    .bind(limit.clamp(1, 500))
+    .fetch_all(pool)
+    .await
+}
+
+/// Read entities + their observations + their relations by name (active
+/// rows only). The official server's `open_nodes`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OpenedNode {
+    pub entity: EntityRow,
+    pub observations: Vec<String>,
+    pub relations_out: Vec<NewRelationInput>,
+    pub relations_in: Vec<NewRelationInput>,
+}
+
+pub async fn memory_open_nodes(
+    pool: &PgPool,
+    names: &[String],
+) -> Result<Vec<OpenedNode>, sqlx::Error> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let entities = sqlx::query_as::<_, EntityRow>(
+        "SELECT id, name, entity_type, canonical_name, importance,
+                source::text AS source, created_at, valid_from, valid_to, superseded_by
+         FROM memory_entities
+         WHERE name = ANY($1) AND valid_to IS NULL",
+    )
+    .bind(names)
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = Vec::with_capacity(entities.len());
+    for e in entities {
+        let obs: Vec<String> = sqlx::query_scalar(
+            "SELECT content FROM memory_observations
+             WHERE entity_id = $1 AND valid_to IS NULL
+             ORDER BY created_at",
+        )
+        .bind(e.id)
+        .fetch_all(pool)
+        .await?;
+
+        let rel_out: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT a.name AS from_name, b.name AS to_name, r.relation_type
+             FROM memory_relations r
+             JOIN memory_entities a ON a.id = r.from_entity_id
+             JOIN memory_entities b ON b.id = r.to_entity_id
+             WHERE r.from_entity_id = $1 AND r.valid_to IS NULL",
+        )
+        .bind(e.id)
+        .fetch_all(pool)
+        .await?;
+        let rel_in: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT a.name AS from_name, b.name AS to_name, r.relation_type
+             FROM memory_relations r
+             JOIN memory_entities a ON a.id = r.from_entity_id
+             JOIN memory_entities b ON b.id = r.to_entity_id
+             WHERE r.to_entity_id = $1 AND r.valid_to IS NULL",
+        )
+        .bind(e.id)
+        .fetch_all(pool)
+        .await?;
+        let relations_out = rel_out
+            .into_iter()
+            .map(|(from, to, rt)| NewRelationInput {
+                from,
+                to,
+                relation_type: rt,
+            })
+            .collect();
+        let relations_in = rel_in
+            .into_iter()
+            .map(|(from, to, rt)| NewRelationInput {
+                from,
+                to,
+                relation_type: rt,
+            })
+            .collect();
+        out.push(OpenedNode {
+            entity: e,
+            observations: obs,
+            relations_out,
+            relations_in,
+        });
+    }
+    Ok(out)
+}
+
+/// Full-graph dump (active rows only) for the given scope or workspace-
+/// wide when `scope_id` is `None`. Returns entities, observations, and
+/// relations as parallel arrays.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryGraphDump {
+    pub entities: Vec<EntityRow>,
+    pub observations: Vec<ObservationRow>,
+    pub relations: Vec<RelationDump>,
+    pub entity_count: i64,
+    pub observation_count: i64,
+    pub relation_count: i64,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct RelationDump {
+    pub id: i64,
+    pub from_entity_id: i64,
+    pub to_entity_id: i64,
+    pub from_name: String,
+    pub to_name: String,
+    pub relation_type: String,
+}
+
+pub async fn memory_read_graph(
+    pool: &PgPool,
+    scope_id: Option<i64>,
+    limit_entities: i32,
+) -> Result<MemoryGraphDump, sqlx::Error> {
+    let limit = limit_entities.clamp(1, 2000);
+    let entities = sqlx::query_as::<_, EntityRow>(
+        "SELECT DISTINCT e.id, e.name, e.entity_type, e.canonical_name, e.importance,
+                e.source::text AS source, e.created_at, e.valid_from,
+                e.valid_to, e.superseded_by
+         FROM memory_entities e
+         LEFT JOIN memory_entity_scope es ON es.entity_id = e.id
+         WHERE e.valid_to IS NULL
+           AND ($1::bigint IS NULL OR es.scope_id = $1)
+         ORDER BY e.importance DESC, e.id
+         LIMIT $2",
+    )
+    .bind(scope_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+
+    let ids: Vec<i64> = entities.iter().map(|e| e.id).collect();
+    let observations: Vec<ObservationRow> = if ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT id, entity_id, content, importance, source::text AS source,
+                    created_at, valid_from, valid_to
+             FROM memory_observations
+             WHERE entity_id = ANY($1) AND valid_to IS NULL
+             ORDER BY entity_id, created_at",
+        )
+        .bind(&ids)
+        .fetch_all(pool)
+        .await?
+    };
+
+    let relations: Vec<RelationDump> = if ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT r.id, r.from_entity_id, r.to_entity_id,
+                    a.name AS from_name, b.name AS to_name, r.relation_type
+             FROM memory_relations r
+             JOIN memory_entities a ON a.id = r.from_entity_id
+             JOIN memory_entities b ON b.id = r.to_entity_id
+             WHERE r.valid_to IS NULL
+               AND (r.from_entity_id = ANY($1) OR r.to_entity_id = ANY($1))",
+        )
+        .bind(&ids)
+        .fetch_all(pool)
+        .await?
+    };
+
+    let entity_count = entities.len() as i64;
+    let observation_count = observations.len() as i64;
+    let relation_count = relations.len() as i64;
+    Ok(MemoryGraphDump {
+        entities,
+        observations,
+        relations,
+        entity_count,
+        observation_count,
+        relation_count,
+    })
+}
+
+// ============================================================================
 // Statistics queries
 // ============================================================================
 

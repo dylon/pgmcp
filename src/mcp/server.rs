@@ -1723,6 +1723,112 @@ pub struct RecallPromptsParams {
     pub limit: Option<i32>,
 }
 
+// ----------------------------------------------------------------------------
+// Memory-server Phase 3.1: official MCP memory-server compatible CRUD Params
+// ----------------------------------------------------------------------------
+
+/// Shared scope-filter object accepted by every `memory_*` tool. Each
+/// field is optional; missing fields resolve to NULL ("any") on the
+/// `memory_scope` row.
+#[derive(Debug, Clone, Deserialize, serde::Serialize, schemars::JsonSchema)]
+pub struct MemoryScopeParam {
+    pub user_id: Option<String>,
+    pub agent_id: Option<String>,
+    /// Optional session UUID (string-encoded).
+    pub session_id: Option<String>,
+    pub project_id: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryEntityInput {
+    #[schemars(description = "Entity name (the unique identifier used by the official server).")]
+    pub name: String,
+    #[schemars(
+        description = "Entity type (free-form string, e.g. 'person', 'project', 'concept')."
+    )]
+    pub entity_type: String,
+    #[schemars(description = "Initial observations attached at create-time. Optional.")]
+    pub observations: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryCreateEntitiesParams {
+    #[schemars(description = "Entities to create or extend. Idempotent on (name, entity_type).")]
+    pub entities: Vec<MemoryEntityInput>,
+    #[schemars(
+        description = "Scope under which to attach the entities. Defaults to workspace-wide."
+    )]
+    pub scope: Option<MemoryScopeParam>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryRelationInput {
+    pub from: String,
+    pub to: String,
+    pub relation_type: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryCreateRelationsParams {
+    #[schemars(description = "Directed relations between entities. Endpoints must already exist.")]
+    pub relations: Vec<MemoryRelationInput>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryObservationInput {
+    pub entity_name: String,
+    pub contents: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryAddObservationsParams {
+    pub observations: Vec<MemoryObservationInput>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryDeleteEntitiesParams {
+    pub names: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryObservationDeletionInput {
+    pub entity_name: String,
+    pub observations: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryDeleteObservationsParams {
+    pub deletions: Vec<MemoryObservationDeletionInput>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryDeleteRelationsParams {
+    pub relations: Vec<MemoryRelationInput>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryReadGraphParams {
+    pub scope: Option<MemoryScopeParam>,
+    #[schemars(description = "Max entities returned (default 200, max 2000).")]
+    pub limit_entities: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemorySearchNodesParams {
+    #[schemars(
+        description = "Substring matched against entity name/type/canonical_name and observation content (ILIKE)."
+    )]
+    pub query: String,
+    pub scope: Option<MemoryScopeParam>,
+    #[schemars(description = "Max rows (1..=500, default 20).")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryOpenNodesParams {
+    pub names: Vec<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchMandatesParams {
     #[schemars(description = "Free-text search query — full-text matched against \
@@ -1959,6 +2065,199 @@ Returns mandates ranked by Postgres full-text relevance, then by promotion recen
             30,
             &_ctx,
             super::tools::tool_search_mandates::tool_search_mandates(self.ctx(), params),
+        )
+        .await
+    }
+
+    // ============================================================================
+    // Memory-server Phase 3.1: official-compat MCP memory CRUD (9 tools)
+    // ============================================================================
+    //
+    // Drop-in compatible with @modelcontextprotocol/server-memory. Each tool
+    // accepts an optional `scope` object {user_id?, agent_id?, session_id?,
+    // project_id?} that maps onto `memory_scope`; missing scope = workspace-
+    // wide. All deletes are soft-deletes via `valid_to = NOW()` per the
+    // bi-temporal contract (decision 3 + decision 7).
+
+    #[tool(
+        description = "Memory-server: create entities (knowledge-graph nodes). Drop-in compatible \
+with @modelcontextprotocol/server-memory's `create_entities`. Idempotent on \
+(name, entity_type): re-use the active row and append observations. Optional \
+`scope` attaches the entities to a (user_id, agent_id, session_id, project_id) \
+tuple — defaults to workspace-wide."
+    )]
+    async fn memory_create_entities(
+        &self,
+        Parameters(params): Parameters<MemoryCreateEntitiesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_create_entities",
+            30,
+            &_ctx,
+            super::tools::tool_memory_crud::tool_memory_create_entities(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: create directed typed relations between existing entities. \
+Drop-in compatible with @modelcontextprotocol/server-memory's `create_relations`. \
+Each input `{from, to, relation_type}` is resolved against active entities by \
+name; unresolved endpoints return id=-1 in the response."
+    )]
+    async fn memory_create_relations(
+        &self,
+        Parameters(params): Parameters<MemoryCreateRelationsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_create_relations",
+            30,
+            &_ctx,
+            super::tools::tool_memory_crud::tool_memory_create_relations(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: append observations to existing entities. Drop-in \
+compatible with @modelcontextprotocol/server-memory's `add_observations`. \
+Observations are content-deduped per entity (content_sha256 UNIQUE)."
+    )]
+    async fn memory_add_observations(
+        &self,
+        Parameters(params): Parameters<MemoryAddObservationsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_add_observations",
+            30,
+            &_ctx,
+            super::tools::tool_memory_crud::tool_memory_add_observations(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: soft-delete entities by name (sets valid_to = NOW()). \
+Bi-temporal: deleted rows remain queryable via `memory_facts_at(t < deletion_time)`. \
+Drop-in compatible with @modelcontextprotocol/server-memory's `delete_entities`."
+    )]
+    async fn memory_delete_entities(
+        &self,
+        Parameters(params): Parameters<MemoryDeleteEntitiesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_delete_entities",
+            30,
+            &_ctx,
+            super::tools::tool_memory_crud::tool_memory_delete_entities(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: soft-delete observations by content text under named \
+entities. Drop-in compatible with @modelcontextprotocol/server-memory's \
+`delete_observations`."
+    )]
+    async fn memory_delete_observations(
+        &self,
+        Parameters(params): Parameters<MemoryDeleteObservationsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_delete_observations",
+            30,
+            &_ctx,
+            super::tools::tool_memory_crud::tool_memory_delete_observations(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: soft-delete relations by (from, to, relation_type). \
+Drop-in compatible with @modelcontextprotocol/server-memory's `delete_relations`."
+    )]
+    async fn memory_delete_relations(
+        &self,
+        Parameters(params): Parameters<MemoryDeleteRelationsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_delete_relations",
+            30,
+            &_ctx,
+            super::tools::tool_memory_crud::tool_memory_delete_relations(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: dump the active knowledge graph (entities + observations + \
+relations) under an optional scope. Capped by limit_entities (default 200, max 2000). \
+Drop-in compatible with @modelcontextprotocol/server-memory's `read_graph`."
+    )]
+    async fn memory_read_graph(
+        &self,
+        Parameters(params): Parameters<MemoryReadGraphParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_read_graph",
+            30,
+            &_ctx,
+            super::tools::tool_memory_crud::tool_memory_read_graph(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: ILIKE substring search across entity name/type/canonical_name \
+and observation content. The Phase 3.1 baseline matching the official server's \
+`search_nodes`; the pgmcp-extension `memory_semantic_search` (Phase 3.2, lands \
+with BGE-M3 cutover) adds vector similarity."
+    )]
+    async fn memory_search_nodes(
+        &self,
+        Parameters(params): Parameters<MemorySearchNodesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_search_nodes",
+            30,
+            &_ctx,
+            super::tools::tool_memory_crud::tool_memory_search_nodes(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server: open named entities — returns each entity plus its active \
+observations and incoming/outgoing relations. Drop-in compatible with \
+@modelcontextprotocol/server-memory's `open_nodes`."
+    )]
+    async fn memory_open_nodes(
+        &self,
+        Parameters(params): Parameters<MemoryOpenNodesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_open_nodes",
+            30,
+            &_ctx,
+            super::tools::tool_memory_crud::tool_memory_open_nodes(self.ctx(), params),
         )
         .await
     }
@@ -3888,6 +4187,16 @@ impl McpServer {
             // Memory-server Phase 0 quick wins.
             "recall_prompts"             => recall_prompts(RecallPromptsParams),
             "search_mandates"            => search_mandates(SearchMandatesParams),
+            // Memory-server Phase 3.1 official-compat CRUD (9 tools share the `tool_memory_crud` module).
+            "memory_create_entities"     => memory_create_entities(MemoryCreateEntitiesParams) in tool_memory_crud,
+            "memory_create_relations"    => memory_create_relations(MemoryCreateRelationsParams) in tool_memory_crud,
+            "memory_add_observations"    => memory_add_observations(MemoryAddObservationsParams) in tool_memory_crud,
+            "memory_delete_entities"     => memory_delete_entities(MemoryDeleteEntitiesParams) in tool_memory_crud,
+            "memory_delete_observations" => memory_delete_observations(MemoryDeleteObservationsParams) in tool_memory_crud,
+            "memory_delete_relations"    => memory_delete_relations(MemoryDeleteRelationsParams) in tool_memory_crud,
+            "memory_read_graph"          => memory_read_graph(MemoryReadGraphParams) in tool_memory_crud,
+            "memory_search_nodes"        => memory_search_nodes(MemorySearchNodesParams) in tool_memory_crud,
+            "memory_open_nodes"          => memory_open_nodes(MemoryOpenNodesParams) in tool_memory_crud,
             // File info
             "read_file"              => read_file(ReadFileParams),
             "mandate_context"        => mandate_context(MandateContextParams),

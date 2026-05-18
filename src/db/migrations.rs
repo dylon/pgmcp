@@ -909,6 +909,377 @@ pub async fn run_migrations(
     ensure_memory_v2_hnsw_index(pool, vector_config).await?;
     ensure_active_embedding_signature(pool).await?;
 
+    // ================================================================
+    // Memory-server Phase 2: knowledge-graph tables.
+    //
+    // Scope tuple, bi-temporal entities/observations/relations, M:N
+    // join tables for scope and cognitive tier, code-graph anchor,
+    // RAPTOR summary tree (Phase 6.1, reserved), forget audit log
+    // (Phase 8), reflection-run bookkeeping (Phase 5). See
+    // `docs/memory-server/05-schema.md` §12.2 for the SQL contract this
+    // function implements.
+    //
+    // All Phase-2 tables ship together so the bi-temporal invariants
+    // (valid_from/valid_to/superseded_by chains) and FK relations are
+    // coherent at migration completion.
+    // ================================================================
+    ensure_memory_phase2_tables(pool).await?;
+    ensure_memory_phase2_hnsw_index(pool, vector_config).await?;
+
+    Ok(())
+}
+
+/// Phase 2: knowledge-graph base tables, enums, indices, and CHECK
+/// constraints. Idempotent — drop+recreate is avoided so existing rows
+/// survive re-migration; new tables get `CREATE TABLE IF NOT EXISTS`.
+async fn ensure_memory_phase2_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
+    // ENUM types. `IF NOT EXISTS` for types arrived in Postgres 14; the
+    // fallback for older clusters uses pg_catalog probing.
+    let enum_stmts = [
+        (
+            "memory_tier",
+            "CREATE TYPE memory_tier AS ENUM ('working','episodic','semantic','procedural','reflective')",
+        ),
+        (
+            "memory_source",
+            "CREATE TYPE memory_source AS ENUM ('user_explicit','llm_extraction','reflection','consolidation','agent_write','migration')",
+        ),
+    ];
+    for (name, create_sql) in enum_stmts {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname = $1)")
+                .bind(name)
+                .fetch_one(pool)
+                .await?;
+        if !exists {
+            sqlx::query(create_sql).execute(pool).await?;
+        }
+    }
+
+    // Scope tuple. Each dimension nullable → NULL means "any". The
+    // composite UNIQUE constraint relies on Postgres's
+    // `NULLS NOT DISTINCT` (PG15+); for older servers, two NULLs would
+    // still be considered distinct and the constraint wouldn't prevent
+    // duplicates — at which point the `upsert_scope` helper in queries.rs
+    // becomes the authoritative dedupe path.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_scope (
+            id          BIGSERIAL PRIMARY KEY,
+            user_id     TEXT,
+            agent_id    TEXT,
+            session_id  UUID REFERENCES sessions(id) ON DELETE CASCADE,
+            project_id  INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+    // Unique-or-null tuple. We emit a `UNIQUE NULLS NOT DISTINCT` when
+    // the server supports it (PG15+). On older servers we still create
+    // a regular UNIQUE — duplicates are then disambiguated by the
+    // `find_or_create_scope` query.
+    let pg_version: i32 = sqlx::query_scalar("SHOW server_version_num")
+        .fetch_one(pool)
+        .await
+        .map(|s: String| s.parse().unwrap_or(0))
+        .unwrap_or(0);
+    let unique_clause = if pg_version >= 150000 {
+        "UNIQUE NULLS NOT DISTINCT"
+    } else {
+        "UNIQUE"
+    };
+    let _ = sqlx::query(&format!(
+        "ALTER TABLE memory_scope
+            ADD CONSTRAINT memory_scope_tuple_uq
+            {} (user_id, agent_id, session_id, project_id)",
+        unique_clause
+    ))
+    .execute(pool)
+    .await; // ignore — re-running migrations will hit "already exists"
+
+    // Entities. Bi-temporal columns are NOT NULL on valid_from with a
+    // sentinel default (NOW()); valid_to and superseded_by stay NULL
+    // for the active row.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_entities (
+            id              BIGSERIAL PRIMARY KEY,
+            name            TEXT NOT NULL,
+            entity_type     TEXT NOT NULL,
+            canonical_name  TEXT,
+            importance      REAL NOT NULL DEFAULT 0.5,
+            source          memory_source NOT NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_from      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_to        TIMESTAMPTZ,
+            superseded_by   BIGINT REFERENCES memory_entities(id),
+            UNIQUE (name, entity_type, valid_from)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let entity_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_memory_entities_active
+            ON memory_entities (name, entity_type) WHERE valid_to IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_memory_entities_temporal
+            ON memory_entities (valid_from, valid_to)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_entities_canonical
+            ON memory_entities (canonical_name) WHERE valid_to IS NULL",
+    ];
+    for s in entity_indexes {
+        sqlx::query(s).execute(pool).await?;
+    }
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_entity_scope (
+            entity_id  BIGINT NOT NULL REFERENCES memory_entities(id) ON DELETE CASCADE,
+            scope_id   BIGINT NOT NULL REFERENCES memory_scope(id) ON DELETE CASCADE,
+            PRIMARY KEY (entity_id, scope_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_entity_scope_scope
+            ON memory_entity_scope (scope_id)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_entity_tier (
+            entity_id  BIGINT NOT NULL REFERENCES memory_entities(id) ON DELETE CASCADE,
+            tier       memory_tier NOT NULL,
+            weight     REAL NOT NULL DEFAULT 1.0,
+            PRIMARY KEY (entity_id, tier),
+            CHECK (weight >= 0.0 AND weight <= 1.0)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_entity_tier_tier
+            ON memory_entity_tier (tier)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_observations (
+            id                    BIGSERIAL PRIMARY KEY,
+            entity_id             BIGINT NOT NULL REFERENCES memory_entities(id) ON DELETE CASCADE,
+            content               TEXT NOT NULL,
+            content_sha256        CHAR(64) NOT NULL,
+            embedding             vector(1024),
+            embedding_signature   TEXT NOT NULL DEFAULT 'bge-m3-v1',
+            importance            REAL NOT NULL DEFAULT 0.5,
+            source                memory_source NOT NULL,
+            source_session_id     UUID REFERENCES sessions(id),
+            source_prompt_id      BIGINT REFERENCES session_prompts(id),
+            derived_from          BIGINT[],
+            created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_from            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_to              TIMESTAMPTZ,
+            superseded_by         BIGINT REFERENCES memory_observations(id),
+            UNIQUE (entity_id, content_sha256, valid_from)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let obs_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_memory_observations_active
+            ON memory_observations (entity_id) WHERE valid_to IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_memory_observations_temporal
+            ON memory_observations (valid_from, valid_to)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_observations_fts
+            ON memory_observations USING gin (to_tsvector('english', content))",
+    ];
+    for s in obs_indexes {
+        sqlx::query(s).execute(pool).await?;
+    }
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_relations (
+            id              BIGSERIAL PRIMARY KEY,
+            from_entity_id  BIGINT NOT NULL REFERENCES memory_entities(id) ON DELETE CASCADE,
+            to_entity_id    BIGINT NOT NULL REFERENCES memory_entities(id) ON DELETE CASCADE,
+            relation_type   TEXT NOT NULL,
+            importance      REAL NOT NULL DEFAULT 0.5,
+            source          memory_source NOT NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_from      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_to        TIMESTAMPTZ,
+            superseded_by   BIGINT REFERENCES memory_relations(id),
+            UNIQUE (from_entity_id, to_entity_id, relation_type, valid_from),
+            CHECK (from_entity_id <> to_entity_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let rel_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_memory_relations_from
+            ON memory_relations (from_entity_id) WHERE valid_to IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_memory_relations_to
+            ON memory_relations (to_entity_id) WHERE valid_to IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_memory_relations_type
+            ON memory_relations (relation_type) WHERE valid_to IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_memory_relations_temporal
+            ON memory_relations (valid_from, valid_to)",
+    ];
+    for s in rel_indexes {
+        sqlx::query(s).execute(pool).await?;
+    }
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_code_anchor (
+            id           BIGSERIAL PRIMARY KEY,
+            entity_id    BIGINT NOT NULL REFERENCES memory_entities(id) ON DELETE CASCADE,
+            file_id      BIGINT REFERENCES indexed_files(id) ON DELETE CASCADE,
+            chunk_id     BIGINT REFERENCES file_chunks(id) ON DELETE CASCADE,
+            topic_id     BIGINT REFERENCES code_topics(id) ON DELETE CASCADE,
+            anchor_type  TEXT NOT NULL,
+            created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (file_id IS NOT NULL OR chunk_id IS NOT NULL OR topic_id IS NOT NULL)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let anchor_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_memory_code_anchor_entity ON memory_code_anchor (entity_id)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_code_anchor_file   ON memory_code_anchor (file_id)   WHERE file_id   IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_memory_code_anchor_chunk  ON memory_code_anchor (chunk_id)  WHERE chunk_id  IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_memory_code_anchor_topic  ON memory_code_anchor (topic_id)  WHERE topic_id  IS NOT NULL",
+    ];
+    for s in anchor_indexes {
+        sqlx::query(s).execute(pool).await?;
+    }
+
+    // RAPTOR summary tree (Phase 6.1, reserved). Shipped with Phase 2
+    // so all memory_* tables land in one migration; the cron that
+    // populates it lands later.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_summary_tree (
+            id                BIGSERIAL PRIMARY KEY,
+            scope_id          BIGINT NOT NULL REFERENCES memory_scope(id) ON DELETE CASCADE,
+            level             INTEGER NOT NULL,
+            parent_id         BIGINT REFERENCES memory_summary_tree(id),
+            observation_id    BIGINT REFERENCES memory_observations(id),
+            summary_text      TEXT,
+            summary_embedding vector(1024),
+            child_count       INTEGER,
+            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK ((level = 0 AND observation_id IS NOT NULL AND summary_text IS NULL)
+                OR (level > 0 AND observation_id IS NULL     AND summary_text IS NOT NULL))
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_summary_tree_level
+            ON memory_summary_tree (scope_id, level)",
+    )
+    .execute(pool)
+    .await?;
+
+    // Forget audit log (Phase 8).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_forget_log (
+            id             BIGSERIAL PRIMARY KEY,
+            actor          TEXT NOT NULL,
+            target_type    TEXT NOT NULL,
+            target_id      BIGINT NOT NULL,
+            cascade        BOOLEAN NOT NULL,
+            rows_affected  INTEGER NOT NULL,
+            manifest_json  JSONB,
+            forgotten_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // Reflection bookkeeping (Phase 5).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS memory_reflection_runs (
+            id                BIGSERIAL PRIMARY KEY,
+            scope_id          BIGINT REFERENCES memory_scope(id) ON DELETE SET NULL,
+            started_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at       TIMESTAMPTZ,
+            observation_count INTEGER,
+            facts_emitted     INTEGER,
+            trigger           TEXT NOT NULL,
+            CHECK (trigger IN ('agent','cron'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Phase 2 HNSW indices on `memory_observations.embedding` and
+/// `memory_summary_tree.summary_embedding`. Rebuild guard mirrors the
+/// existing `ensure_*_hnsw_index` helpers.
+async fn ensure_memory_phase2_hnsw_index(
+    pool: &PgPool,
+    config: &VectorConfig,
+) -> Result<(), sqlx::Error> {
+    let current_params = format!(
+        "m={},ef_construction={}",
+        config.hnsw_m, config.hnsw_ef_construction
+    );
+
+    // memory_observations.embedding
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'memory_observations_hnsw_params'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if stored.as_deref() != Some(&current_params) {
+        let _ = sqlx::query("DROP INDEX IF EXISTS idx_memory_observations_embedding")
+            .execute(pool)
+            .await;
+        let create_sql = format!(
+            "CREATE INDEX idx_memory_observations_embedding ON memory_observations \
+             USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
+            config.hnsw_m, config.hnsw_ef_construction
+        );
+        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value)
+             VALUES ('memory_observations_hnsw_params', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+    }
+
+    // memory_summary_tree.summary_embedding
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'memory_summary_tree_hnsw_params'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if stored.as_deref() != Some(&current_params) {
+        let _ = sqlx::query("DROP INDEX IF EXISTS idx_memory_summary_tree_embedding")
+            .execute(pool)
+            .await;
+        let create_sql = format!(
+            "CREATE INDEX idx_memory_summary_tree_embedding ON memory_summary_tree \
+             USING hnsw (summary_embedding vector_cosine_ops) \
+             WITH (m = {}, ef_construction = {})",
+            config.hnsw_m, config.hnsw_ef_construction
+        );
+        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value)
+             VALUES ('memory_summary_tree_hnsw_params', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+    }
+
     Ok(())
 }
 
