@@ -137,14 +137,14 @@ pub async fn tool_orient(
     struct TopicSummary {
         topic_id: i32,
         scope: String,
-        keywords: Option<sqlx::types::Json<Vec<String>>>,
+        keywords: Option<Vec<String>>,
         member_count: Option<i32>,
     }
     let topics: Vec<TopicSummary> = sqlx::query_as(
-        "SELECT topic_id, scope, keywords, member_count
+        "SELECT id AS topic_id, scope, keywords, chunk_count AS member_count
          FROM code_topics
-         WHERE scope = $1 OR scope = '*'
-         ORDER BY member_count DESC NULLS LAST
+         WHERE scope = $1 OR scope = 'global'
+         ORDER BY chunk_count DESC NULLS LAST
          LIMIT 8",
     )
     .bind(format!("project:{}", project_name))
@@ -187,7 +187,7 @@ pub async fn tool_orient(
         "top_topics": topics.iter().map(|t| json!({
             "topic_id": t.topic_id,
             "scope": t.scope,
-            "keywords": t.keywords.as_ref().map(|k| &k.0),
+            "keywords": t.keywords.as_ref(),
             "member_count": t.member_count,
         })).collect::<Vec<_>>(),
         "mandates": crate::mandates::compact_sources(&mandates),

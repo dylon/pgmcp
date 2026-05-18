@@ -24,12 +24,11 @@ pub async fn run_telemetry_retention(
 ) -> Result<u64, sqlx::Error> {
     let days = retention_days.max(1) as i32;
     debug!(retention_days = days, "telemetry-retention pass starting");
-    let res = sqlx::query(
-        "DELETE FROM mcp_tool_calls WHERE ts < now() - ($1::int * interval '1 day')",
-    )
-    .bind(days)
-    .execute(pool)
-    .await?;
+    let res =
+        sqlx::query("DELETE FROM mcp_tool_calls WHERE ts < now() - ($1::int * interval '1 day')")
+            .bind(days)
+            .execute(pool)
+            .await?;
     let removed = res.rows_affected();
     if removed > 0 {
         info!(

@@ -65,7 +65,8 @@ impl PerToolStats {
         if !ok {
             self.error_count.fetch_add(1, Ordering::Relaxed);
         }
-        self.duration_ns_sum.fetch_add(duration_ns, Ordering::Relaxed);
+        self.duration_ns_sum
+            .fetch_add(duration_ns, Ordering::Relaxed);
         let bucket = Self::BUCKET_UPPER_NS
             .iter()
             .position(|&upper| duration_ns <= upper)
@@ -78,9 +79,8 @@ impl PerToolStats {
     /// Returns the bucket's upper bound; precision is therefore 3× the
     /// underlying bucket spacing.
     pub fn percentile_ns(&self, p: f64) -> u64 {
-        let counts: [u64; 16] = std::array::from_fn(|i| {
-            self.duration_buckets[i].load(Ordering::Relaxed)
-        });
+        let counts: [u64; 16] =
+            std::array::from_fn(|i| self.duration_buckets[i].load(Ordering::Relaxed));
         let total: u64 = counts.iter().sum();
         if total == 0 {
             return 0;
@@ -556,11 +556,11 @@ impl StatsTracker {
     pub fn record_tool_call(&self, name: &str, client: &str, duration_ns: u64, ok: bool) {
         self.tool_invocations
             .entry(name.to_string())
-            .or_insert_with(PerToolStats::new)
+            .or_default()
             .record(duration_ns, ok);
         self.tool_telemetry_by_client
             .entry((name.to_string(), client.to_string()))
-            .or_insert_with(PerToolStats::new)
+            .or_default()
             .record(duration_ns, ok);
     }
 

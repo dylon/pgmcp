@@ -382,12 +382,8 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
                 let pool = pool.clone();
                 let stats = Arc::clone(&stats_for_retention);
                 rt_for_retention.spawn(async move {
-                    cron::telemetry_retention::run_or_log(
-                        Arc::new(pool),
-                        stats,
-                        retention_days,
-                    )
-                    .await;
+                    cron::telemetry_retention::run_or_log(Arc::new(pool), stats, retention_days)
+                        .await;
                 });
                 true
             },

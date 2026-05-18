@@ -49,9 +49,7 @@ fn emit_histogram_series(out: &mut String, tool: &str, client: &str, stats: &Per
     let client_l = escape_label(client);
     let mut cumulative: u64 = 0;
     for (i, bound_ns) in PerToolStats::BUCKET_UPPER_NS.iter().enumerate() {
-        cumulative = cumulative.saturating_add(
-            stats.duration_buckets[i].load(Ordering::Relaxed),
-        );
+        cumulative = cumulative.saturating_add(stats.duration_buckets[i].load(Ordering::Relaxed));
         out.push_str(&format!(
             "pgmcp_tool_duration_seconds_bucket{{tool=\"{}\",client=\"{}\",le=\"{}\"}} {}\n",
             tool_l,
@@ -90,7 +88,9 @@ fn render_per_tool_metrics(stats: &StatsTracker) -> String {
     // Tool-aggregated calls + errors (client="*").
     out.push_str("# HELP pgmcp_tool_calls_total Total MCP tool invocations (client=\"*\" aggregate; per-client series have a concrete client label).\n");
     out.push_str("# TYPE pgmcp_tool_calls_total counter\n");
-    out.push_str("# HELP pgmcp_tool_errors_total Total MCP tool invocations that returned an error.\n");
+    out.push_str(
+        "# HELP pgmcp_tool_errors_total Total MCP tool invocations that returned an error.\n",
+    );
     out.push_str("# TYPE pgmcp_tool_errors_total counter\n");
     for entry in stats.tool_invocations.iter() {
         let tool = entry.key();

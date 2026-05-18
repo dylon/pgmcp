@@ -238,7 +238,9 @@ pub fn try_enqueue(stats: &StatsTracker, row: TelemetryRow) -> bool {
     match tx.try_send(row) {
         Ok(()) => true,
         Err(mpsc::error::TrySendError::Full(_)) => {
-            stats.telemetry_writes_dropped.fetch_add(1, Ordering::Relaxed);
+            stats
+                .telemetry_writes_dropped
+                .fetch_add(1, Ordering::Relaxed);
             false
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {

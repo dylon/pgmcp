@@ -34,10 +34,9 @@ pub async fn tool_mcp_tool_telemetry(
         "MCP tool invoked"
     );
 
-    let pool = ctx
-        .db()
-        .pool()
-        .ok_or_else(|| McpError::internal_error("mcp_tool_telemetry requires a real PgPool", None))?;
+    let pool = ctx.db().pool().ok_or_else(|| {
+        McpError::internal_error("mcp_tool_telemetry requires a real PgPool", None)
+    })?;
 
     let since_minutes = params.since_minutes.unwrap_or(60).clamp(1, 60 * 24 * 31);
     let aggregation = params
@@ -92,6 +91,7 @@ async fn agg_summary(
     params: &McpToolTelemetryParams,
     since_minutes: i32,
 ) -> Result<Value, McpError> {
+    #[allow(clippy::type_complexity)]
     let rows: Vec<(String, String, Option<String>, i64, i64, f64, f64, f64, f64, i64)> =
         sqlx::query_as(
             "SELECT
@@ -124,20 +124,22 @@ async fn agg_summary(
 
     let arr: Vec<Value> = rows
         .into_iter()
-        .map(|(tool, client, project, calls, errs, mean, p50, p95, p99, max_ms)| {
-            json!({
-                "tool": tool,
-                "client_name": client,
-                "project": project,
-                "calls": calls,
-                "errors": errs,
-                "mean_ms": mean,
-                "p50_ms": p50,
-                "p95_ms": p95,
-                "p99_ms": p99,
-                "max_ms": max_ms,
-            })
-        })
+        .map(
+            |(tool, client, project, calls, errs, mean, p50, p95, p99, max_ms)| {
+                json!({
+                    "tool": tool,
+                    "client_name": client,
+                    "project": project,
+                    "calls": calls,
+                    "errors": errs,
+                    "mean_ms": mean,
+                    "p50_ms": p50,
+                    "p95_ms": p95,
+                    "p99_ms": p99,
+                    "max_ms": max_ms,
+                })
+            },
+        )
         .collect();
     Ok(json!({ "rows": arr }))
 }
@@ -301,8 +303,7 @@ async fn agg_histogram(
     .map_err(map_db_err)?;
 
     let labels = [
-        "≤1ms", "≤3ms", "≤10ms", "≤30ms", "≤100ms", "≤300ms",
-        "≤1s", "≤3s", "≤10s", "≤30s", ">30s",
+        "≤1ms", "≤3ms", "≤10ms", "≤30ms", "≤100ms", "≤300ms", "≤1s", "≤3s", "≤10s", "≤30s", ">30s",
     ];
     Ok(json!({
         "buckets": labels,
@@ -318,6 +319,7 @@ async fn agg_raw(
     since_minutes: i32,
 ) -> Result<Value, McpError> {
     let limit = params.limit.unwrap_or(100).clamp(1, 1000);
+    #[allow(clippy::type_complexity)]
     let rows: Vec<(
         i64,
         chrono::DateTime<chrono::Utc>,

@@ -1630,17 +1630,25 @@ pub struct OrientParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct McpToolTelemetryParams {
-    #[schemars(description = "Filter to a specific MCP tool name (e.g. \"grep\", \"semantic_search\").")]
+    #[schemars(
+        description = "Filter to a specific MCP tool name (e.g. \"grep\", \"semantic_search\")."
+    )]
     pub tool: Option<String>,
-    #[schemars(description = "Filter to a specific MCP client name (e.g. \"claude-code\", \"cursor\"). Matched case-sensitively against the lowercased name stored in mcp_tool_calls.")]
+    #[schemars(
+        description = "Filter to a specific MCP client name (e.g. \"claude-code\", \"cursor\"). Matched case-sensitively against the lowercased name stored in mcp_tool_calls."
+    )]
     pub client_name: Option<String>,
-    #[schemars(description = "Filter to calls that named this project as the `project` parameter.")]
+    #[schemars(
+        description = "Filter to calls that named this project as the `project` parameter."
+    )]
     pub project: Option<String>,
     #[schemars(description = "Lookback window in minutes (default 60, max 44640 = 31 days).")]
     pub since_minutes: Option<i32>,
     #[schemars(description = "Result limit for `aggregation=\"raw\"` (default 100, max 1000).")]
     pub limit: Option<i32>,
-    #[schemars(description = "Aggregation shape: one of `summary`, `top_tools`, `top_callers`, `top_projects`, `error_rate`, `histogram`, `raw`. Default `summary`.")]
+    #[schemars(
+        description = "Aggregation shape: one of `summary`, `top_tools`, `top_callers`, `top_projects`, `error_rate`, `histogram`, `raw`. Default `summary`."
+    )]
     pub aggregation: Option<String>,
 }
 
@@ -1823,7 +1831,10 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
     }
 
     #[tool(description = "List all discovered projects with file counts.")]
-    async fn list_projects(&self, _ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+    async fn list_projects(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         instrumented_tool_wrap(
             self.stats(),
             "list_projects",
@@ -1954,7 +1965,10 @@ use the built-in `Bash: stat` or `Read` instead."
     #[tool(
         description = "Get overall indexing statistics including file counts, search counts, and pool state."
     )]
-    async fn index_stats(&self, _ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+    async fn index_stats(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         instrumented_tool_wrap(
             self.stats(),
             "index_stats",
@@ -1999,8 +2013,11 @@ Default lookback is 60 minutes; pass `since_minutes` up to 44640 (31 days) to wi
         let result = super::tools::tool_reindex::tool_reindex(self.ctx()).await;
         let duration_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
         let ok = result.is_ok();
-        self.stats().record_tool_call("reindex", &caller.client_name, duration_ns, ok);
-        if !ok { self.stats().mcp_errors.fetch_add(1, Ordering::Relaxed); }
+        self.stats()
+            .record_tool_call("reindex", &caller.client_name, duration_ns, ok);
+        if !ok {
+            self.stats().mcp_errors.fetch_add(1, Ordering::Relaxed);
+        }
         result
     }
 
@@ -2736,7 +2753,10 @@ USE WHEN: checking a plan for anti-pattern risks and better paradigm-specific al
     #[tool(
         description = "Pattern catalog statistics: paradigms, patterns, source families, chunks, and embedding status."
     )]
-    async fn pattern_catalog_stats(&self, _ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+    async fn pattern_catalog_stats(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         instrumented_tool_wrap(
             self.stats(),
             "pattern_catalog_stats",
@@ -3825,6 +3845,32 @@ impl McpServer {
             "engineering_scorecard"  => engineering_scorecard(EngineeringScorecardParams),
             // Telemetry
             "mcp_tool_telemetry"     => mcp_tool_telemetry(McpToolTelemetryParams),
+            // Orientation / multi-axis tools previously omitted from the
+            // dispatch — added so `call_tool_cli` can drive every #[tool]
+            // method from harness tests. See `query_smoke_mcp_tools.rs`.
+            "orient"                         => orient(OrientParams),
+            "topic_hierarchy_fcm"            => topic_hierarchy_fcm(TopicHierarchyFcmParams),
+            "dependency_health"              => dependency_health(DependencyHealthParams),
+            "shotgun_surgery_fix"            => shotgun_surgery_fix(ShotgunSurgeryFixParams),
+            "pr_scope_recommender"           => pr_scope(PrScopeRecommenderParams) in tool_pr_scope,
+            "naming_consistency"             => naming_consistency(NamingConsistencyParams),
+            "adoption_lag"                   => adoption_lag(AdoptionLagParams),
+            "merge_conflict_risk"            => merge_conflict_risk(MergeConflictRiskParams),
+            "hot_path_audit"                 => hot_path_audit(HotPathAuditParams),
+            "bus_factor_map"                 => bus_factor_map(BusFactorMapParams),
+            "module_growth_trajectory"       => module_growth(ModuleGrowthParams) in tool_module_growth,
+            "stale_zombie_detector"          => stale_zombie(StaleZombieParams) in tool_stale_zombie,
+            "tech_debt_burn_down"            => tech_debt_burn_down(TechDebtBurnDownParams),
+            "internal_dry"                   => internal_dry(InternalDryParams),
+            "extraction_candidates"          => extraction_candidates(ExtractionCandidatesParams),
+            "boilerplate_clusters"           => boilerplate_clusters(BoilerplateClustersParams),
+            "chunk_clusters"                 => chunk_clusters(ChunkClustersParams),
+            "pattern_abstraction_candidates" => pattern_abstraction(PatternAbstractionParams) in tool_pattern_abstraction,
+            "pattern_search"                 => pattern_search(PatternSearchParams),
+            "recommend_layering"             => recommend_layering(RecommendLayeringParams),
+            "recommend_module_split"         => recommend_module_split(RecommendModuleSplitParams),
+            "reviewer_recommender"           => reviewer_recommender(ReviewerRecommenderParams),
+            "fix_circular_dependency"        => fix_circular_dependency(FixCircularDependencyParams),
         }, no_params: {
             "list_projects" => list_projects,
             "index_stats"   => index_stats,
