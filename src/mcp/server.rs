@@ -1900,6 +1900,60 @@ pub struct MemoryFindEntitiesForCodeParams {
     pub topic_id: Option<i64>,
 }
 
+// ----------------------------------------------------------------------------
+// Phase 6 graph-enhanced retrieval Params
+// ----------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryUnifiedSearchParams {
+    pub query: String,
+    #[schemars(
+        description = "Optional whitelist of node_types to include (e.g. ['memory_entity','observation','chunk','topic','durable_mandate','commit'])."
+    )]
+    pub node_types: Option<Vec<String>>,
+    pub k: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryNeighborsParams {
+    #[schemars(description = "Composite node_id of the seed (e.g. 'memory_entity:42').")]
+    pub node_id: String,
+    pub depth: Option<i32>,
+    pub edge_filter: Option<String>,
+    pub max_nodes: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryPathSearchParams {
+    pub query: String,
+    pub seed_node_types: Option<Vec<String>>,
+    pub target_node_types: Option<Vec<String>>,
+    pub max_hops: Option<i32>,
+    pub k: Option<i32>,
+    #[schemars(description = "PathRAG prune threshold; paths with Jaccard ≥ this are pruned.")]
+    pub prune_jaccard: Option<f32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryPprSearchParams {
+    pub query: String,
+    pub k: Option<i32>,
+    #[schemars(description = "PageRank teleport probability (default 0.85).")]
+    pub alpha: Option<f64>,
+    pub max_seeds: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryRaptorSearchParams {
+    pub query: String,
+    pub scope_id: Option<i64>,
+    #[schemars(
+        description = "Optional tree-level filter. Level 0 = leaves; level k = k-th summary tier."
+    )]
+    pub levels: Option<Vec<i32>>,
+    pub k: Option<i32>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MemoryReflectParams {
     pub scope: Option<MemoryScopeParam>,
@@ -2500,6 +2554,105 @@ Pass exactly one of file_id, chunk_id, topic_id."
             30,
             &_ctx,
             super::tools::tool_memory_ext::tool_memory_find_entities_for_code(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server Phase 6.3: vector retrieval over the heterogeneous \
+unified-nodes view (memory_entity / observation / chunk / topic / durable_mandate / \
+commit). Optionally filter to a subset of node_types."
+    )]
+    async fn memory_unified_search(
+        &self,
+        Parameters(params): Parameters<MemoryUnifiedSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_unified_search",
+            30,
+            &_ctx,
+            super::tools::tool_memory_graph_rag::tool_memory_unified_search(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server Phase 6.3: BFS over the heterogeneous unified-edge view. \
+Returns reachable nodes and the edges that connect them, capped by depth ≤ 4 and \
+max_nodes ≤ 500."
+    )]
+    async fn memory_neighbors(
+        &self,
+        Parameters(params): Parameters<MemoryNeighborsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_neighbors",
+            30,
+            &_ctx,
+            super::tools::tool_memory_graph_rag::tool_memory_neighbors(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server Phase 6.4: PathRAG-style path retrieval. Embed the query, \
+seed top-k unified nodes, BFS-expand within max_hops, score paths, then flow-prune \
+paths whose Jaccard overlap with a kept path exceeds prune_jaccard."
+    )]
+    async fn memory_path_search(
+        &self,
+        Parameters(params): Parameters<MemoryPathSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_path_search",
+            60,
+            &_ctx,
+            super::tools::tool_memory_graph_rag::tool_memory_path_search(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server Phase 6.2: HippoRAG-style Personalized PageRank over \
+memory_relations. Seeds are the top-k entities by best-observation cosine; PPR runs \
+25 iterations with the given alpha (teleport probability)."
+    )]
+    async fn memory_ppr_search(
+        &self,
+        Parameters(params): Parameters<MemoryPprSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_ppr_search",
+            60,
+            &_ctx,
+            super::tools::tool_memory_graph_rag::tool_memory_ppr_search(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server Phase 6.1: RAPTOR summary-tree query. Returns top-k summary \
+nodes by cosine over summary_embedding, optionally filtered by tree level."
+    )]
+    async fn memory_raptor_search(
+        &self,
+        Parameters(params): Parameters<MemoryRaptorSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_raptor_search",
+            30,
+            &_ctx,
+            super::tools::tool_memory_graph_rag::tool_memory_raptor_search(self.ctx(), params),
         )
         .await
     }
@@ -4472,6 +4625,12 @@ impl McpServer {
             "memory_find_code_for_entity"   => memory_find_code_for_entity(MemoryFindCodeForEntityParams) in tool_memory_ext,
             "memory_find_entities_for_code" => memory_find_entities_for_code(MemoryFindEntitiesForCodeParams) in tool_memory_ext,
             "memory_reflect"                => memory_reflect(MemoryReflectParams) in tool_memory_reflect,
+            // Memory-server Phase 6 graph-enhanced retrieval.
+            "memory_unified_search"         => memory_unified_search(MemoryUnifiedSearchParams) in tool_memory_graph_rag,
+            "memory_neighbors"              => memory_neighbors(MemoryNeighborsParams) in tool_memory_graph_rag,
+            "memory_path_search"            => memory_path_search(MemoryPathSearchParams) in tool_memory_graph_rag,
+            "memory_ppr_search"             => memory_ppr_search(MemoryPprSearchParams) in tool_memory_graph_rag,
+            "memory_raptor_search"          => memory_raptor_search(MemoryRaptorSearchParams) in tool_memory_graph_rag,
             // File info
             "read_file"              => read_file(ReadFileParams),
             "mandate_context"        => mandate_context(MandateContextParams),

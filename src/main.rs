@@ -22,6 +22,7 @@ mod mmap_array;
 mod parsing;
 mod patterns;
 mod reactive;
+mod reranker;
 mod sessions;
 mod shutdown;
 mod stats;

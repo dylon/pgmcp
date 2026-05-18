@@ -7,6 +7,8 @@ pub mod graph_analysis;
 #[allow(dead_code)]
 pub mod k_selector;
 #[allow(dead_code)]
+pub mod memory_raptor;
+#[allow(dead_code)]
 pub mod memory_reflect;
 #[allow(dead_code)]
 pub mod scheduler;

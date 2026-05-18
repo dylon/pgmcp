@@ -38,6 +38,7 @@ pub mod mmap_array;
 pub mod parsing;
 pub mod patterns;
 pub mod reactive;
+pub mod reranker;
 pub mod sessions;
 pub mod shutdown;
 pub mod stats;

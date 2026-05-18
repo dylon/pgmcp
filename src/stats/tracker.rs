@@ -192,6 +192,17 @@ pub struct StatsTracker {
     pub memory_reflection_facts_emitted: AtomicU64,
     pub memory_reflection_errors: AtomicU64,
 
+    // Memory-server Phase 6 (graph-enhanced retrieval) counters
+    pub graph_retrieval_latency_violations: AtomicU64,
+    pub graph_retrieval_underperformance: AtomicU64,
+    pub memory_raptor_build_runs: AtomicU64,
+    pub memory_raptor_build_errors: AtomicU64,
+    pub memory_raptor_summaries_written: AtomicU64,
+
+    // Memory-server Phase 7 (reranker) counters
+    pub memory_reranker_calls: AtomicU64,
+    pub memory_reranker_errors: AtomicU64,
+
     // Timing (cumulative)
     pub index_duration_ms: AtomicU64,
     pub embedding_duration_ms: AtomicU64,
@@ -486,6 +497,13 @@ impl StatsTracker {
             memory_reflection_runs_cron: AtomicU64::new(0),
             memory_reflection_facts_emitted: AtomicU64::new(0),
             memory_reflection_errors: AtomicU64::new(0),
+            graph_retrieval_latency_violations: AtomicU64::new(0),
+            graph_retrieval_underperformance: AtomicU64::new(0),
+            memory_raptor_build_runs: AtomicU64::new(0),
+            memory_raptor_build_errors: AtomicU64::new(0),
+            memory_raptor_summaries_written: AtomicU64::new(0),
+            memory_reranker_calls: AtomicU64::new(0),
+            memory_reranker_errors: AtomicU64::new(0),
             index_duration_ms: AtomicU64::new(0),
             embedding_duration_ms: AtomicU64::new(0),
             last_index_timestamp: AtomicU64::new(0),
@@ -667,6 +685,13 @@ impl StatsTracker {
             "memory_reflection_runs_cron": self.memory_reflection_runs_cron.load(Ordering::Acquire),
             "memory_reflection_facts_emitted": self.memory_reflection_facts_emitted.load(Ordering::Acquire),
             "memory_reflection_errors": self.memory_reflection_errors.load(Ordering::Acquire),
+            "graph_retrieval_latency_violations": self.graph_retrieval_latency_violations.load(Ordering::Acquire),
+            "graph_retrieval_underperformance": self.graph_retrieval_underperformance.load(Ordering::Acquire),
+            "memory_raptor_build_runs": self.memory_raptor_build_runs.load(Ordering::Acquire),
+            "memory_raptor_build_errors": self.memory_raptor_build_errors.load(Ordering::Acquire),
+            "memory_raptor_summaries_written": self.memory_raptor_summaries_written.load(Ordering::Acquire),
+            "memory_reranker_calls": self.memory_reranker_calls.load(Ordering::Acquire),
+            "memory_reranker_errors": self.memory_reranker_errors.load(Ordering::Acquire),
             "index_duration_ms": self.index_duration_ms.load(Ordering::Acquire),
             "embedding_duration_ms": self.embedding_duration_ms.load(Ordering::Acquire),
             "files_scanned": self.files_scanned.load(Ordering::Acquire),

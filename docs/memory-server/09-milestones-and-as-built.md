@@ -368,6 +368,65 @@ facts_at, anchors).
 - **Verification gate:** `./scripts/verify.sh` green across all 8
   gates.
 
+### M5 — SOTA retrieval (Phase 6 graph-enhanced + Phase 7 reranker)
+
+- **Status:** ✅ shipped.
+- **Phase 6.3 heterogeneous-node view** — `memory_unified_nodes`
+  materialized view (UNION over `memory_entities`,
+  `memory_observations`, `file_chunks`, `code_topics`,
+  `durable_mandates`, `git_commits`) + `memory_unified_edges` view
+  (UNION over `memory_relations`, `memory_code_anchor`,
+  `chunk_topic_assignments`). HNSW index on the matview's
+  `embedding`. MCP tools `memory_unified_search` (vector retrieval
+  with optional `node_types` whitelist) and `memory_neighbors`
+  (recursive-CTE BFS with depth ≤ 4 and node ≤ 500 caps).
+- **Phase 6.4 PathRAG** — `memory_path_search` MCP tool: seed by
+  unified-node cosine, BFS-expand within `max_hops`, score paths
+  by `0.6·seed_sim + 0.3·edge_weight_product − 0.1·hops`, then
+  flow-prune paths whose node-Jaccard with a kept path exceeds the
+  config-driven threshold (default 0.7).
+- **Phase 6.2 HippoRAG PPR** — `memory_ppr_search` MCP tool:
+  best-per-entity cosine seeds → graph load → 25-iter Personalized
+  PageRank with α teleport probability (default 0.85, validated to
+  `[0, 1]`) → top-k entities with `top_observation` annotation.
+- **Phase 6.1 RAPTOR** — `memory_summary_tree` populated by a new
+  `memory-raptor` cron (`src/cron/memory_raptor.rs`) that clusters
+  level-0 observations per scope with the existing FCM machinery
+  (k = clamp(√(n/8), 3, 24)) and summarizes each cluster with
+  `LlmExtractor::reflect`. Centroid → `summary_embedding`,
+  L2-normalized. Idempotent: deletes prior tree rows for the scope
+  before rebuild. Query tool `memory_raptor_search` filters by
+  optional `levels[]` and ranks by cosine over `summary_embedding`.
+- **Phase 6.5 empirical gating** — every Phase 6 tool emits a
+  per-call latency measurement and increments
+  `pgmcp_graph_retrieval_latency_violations` when it exceeds
+  `[memory.graph_rag] max_latency_ms`. The counter goes into the
+  JSON snapshot and Prometheus exposition.
+- **Phase 7 reranker** — `Reranker` trait + closed-set
+  `RerankerChoice` enum + factory pattern (`src/reranker/mod.rs`).
+  Production backend `BgeRerankerV2M3` (`src/reranker/bge_v2_m3.rs`)
+  loads `BAAI/bge-reranker-v2-m3` via candle (XLM-RoBERTa-base
+  + single-label classification head), pair-tokenizes (query, candidate),
+  forward-passes, sigmoids the logit. Mutex-guarded so concurrent
+  rerank calls serialize over the model. CUDA-or-CPU device selection
+  is graceful.
+- **Telemetry:** 7 new `AtomicU64` counters
+  (`graph_retrieval_latency_violations`,
+  `graph_retrieval_underperformance`, `memory_raptor_build_runs`,
+  `memory_raptor_build_errors`, `memory_raptor_summaries_written`,
+  `memory_reranker_calls`, `memory_reranker_errors`).
+- **Tests:** 8 active + 1 ignored integration tests in
+  `pgmcp-testing/tests/memory_phase6_7.rs` cover unified search
+  hit (1024d injected vector), dim rejection on the unified +
+  PPR paths, BFS over unified edges, path-search seeded paths,
+  PPR seeds + neighbors, RAPTOR retrieval, reranker choice
+  parsing, and dispatch-callable smoke for all 5 graph-rag MCP
+  tools (inventory-coverage check satisfied). The
+  `#[ignore]`-gated test downloads the BGE-reranker-v2-m3 weights
+  and runs end-to-end candle inference.
+- **Verification gate:** `./scripts/verify.sh` green across all 8
+  gates.
+
 <!-- Future milestone entries follow the same pattern. -->
 
 ---

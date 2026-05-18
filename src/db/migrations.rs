@@ -926,6 +926,122 @@ pub async fn run_migrations(
     ensure_memory_phase2_tables(pool).await?;
     ensure_memory_phase2_hnsw_index(pool, vector_config).await?;
 
+    // ================================================================
+    // Memory-server Phase 6.3: heterogeneous-node graph view
+    // (NodeRAG-inspired). UNION ALL projection across the existing
+    // node-typed tables. See `docs/memory-server/05-schema.md` §12.3.
+    // ================================================================
+    ensure_memory_unified_views(pool).await?;
+
+    Ok(())
+}
+
+/// Phase 6.3: materialized `memory_unified_nodes` view + `memory_unified_edges`
+/// view. Idempotent — drops and recreates on every startup so schema
+/// changes (e.g. adding a new node-typed table later) take effect via
+/// a daemon restart.
+async fn ensure_memory_unified_views(pool: &PgPool) -> Result<(), sqlx::Error> {
+    // Drop the matview if it already exists so we can rebuild against
+    // the latest column shapes. Order matters: drop the view first
+    // (it depends on the matview indirectly through underlying tables
+    // only, but explicit drops keep refresh semantics simple).
+    let _ = sqlx::query("DROP VIEW IF EXISTS memory_unified_edges")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("DROP MATERIALIZED VIEW IF EXISTS memory_unified_nodes")
+        .execute(pool)
+        .await;
+
+    sqlx::query(
+        "CREATE MATERIALIZED VIEW memory_unified_nodes AS
+            SELECT 'memory_entity:' || id::TEXT AS node_id,
+                   'memory_entity'::TEXT AS node_type,
+                   name AS label,
+                   NULL::VECTOR(1024) AS embedding,
+                   importance
+              FROM memory_entities WHERE valid_to IS NULL
+            UNION ALL
+            SELECT 'observation:' || id::TEXT, 'observation',
+                   LEFT(content, 200), embedding, importance
+              FROM memory_observations WHERE valid_to IS NULL
+            UNION ALL
+            SELECT 'chunk:' || id::TEXT, 'chunk',
+                   LEFT(content, 200), embedding_v2, 0.5
+              FROM file_chunks
+            UNION ALL
+            SELECT 'topic:' || id::TEXT, 'topic',
+                   label, NULL::VECTOR(1024), 0.5
+              FROM code_topics
+            UNION ALL
+            SELECT 'durable_mandate:' || id::TEXT, 'durable_mandate',
+                   imperative, embedding, 0.7
+              FROM durable_mandates
+            UNION ALL
+            SELECT 'commit:' || id::TEXT, 'commit',
+                   subject, NULL::VECTOR(1024), 0.5
+              FROM git_commits",
+    )
+    .execute(pool)
+    .await?;
+    // Lookup index by (node_type, node_id-suffix prefix) for the
+    // neighbors / search paths. Cheap b-tree; the HNSW would be on
+    // `embedding` but a matview supports HNSW only if pgvector is
+    // recent enough — we keep the cosine index implicit (matview is
+    // rebuilt on refresh, not incrementally).
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_unified_nodes_type
+            ON memory_unified_nodes (node_type)",
+    )
+    .execute(pool)
+    .await;
+    // HNSW on embedding for vector retrieval. Built only if the matview
+    // has rows — empty-table HNSW build is fast but harmless either way.
+    let _ = sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_memory_unified_nodes_embedding
+            ON memory_unified_nodes USING hnsw (embedding vector_cosine_ops)
+            WITH (m = 24, ef_construction = 200)",
+    )
+    .execute(pool)
+    .await;
+
+    sqlx::query(
+        "CREATE VIEW memory_unified_edges AS
+            SELECT 'memory_entity:' || from_entity_id::TEXT AS from_id,
+                   'memory_entity'::TEXT AS from_type,
+                   'memory_entity:' || to_entity_id::TEXT AS to_id,
+                   'memory_entity'::TEXT AS to_type,
+                   relation_type AS edge_type,
+                   importance::DOUBLE PRECISION AS weight
+              FROM memory_relations WHERE valid_to IS NULL
+            UNION ALL
+            SELECT 'memory_entity:' || entity_id::TEXT,
+                   'memory_entity',
+                   CASE
+                     WHEN file_id IS NOT NULL THEN 'chunk:' || file_id::TEXT
+                     WHEN chunk_id IS NOT NULL THEN 'chunk:' || chunk_id::TEXT
+                     ELSE 'topic:' || topic_id::TEXT
+                   END,
+                   CASE
+                     WHEN file_id IS NOT NULL THEN 'chunk'
+                     WHEN chunk_id IS NOT NULL THEN 'chunk'
+                     ELSE 'topic'
+                   END,
+                   anchor_type,
+                   1.0::DOUBLE PRECISION
+              FROM memory_code_anchor
+            UNION ALL
+            SELECT 'chunk:' || chunk_id::TEXT,
+                   'chunk',
+                   'topic:' || topic_id::TEXT,
+                   'topic',
+                   'belongs_to',
+                   membership_score
+              FROM chunk_topic_assignments
+              WHERE membership_score >= 0.05",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 

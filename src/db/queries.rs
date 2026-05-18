@@ -2266,6 +2266,611 @@ pub async fn memory_find_entities_for_code(
 }
 
 // ============================================================================
+// Memory-server Phase 6: hierarchical + graph-enhanced retrieval queries
+// ============================================================================
+
+/// Phase 6.3 result row from `memory_unified_nodes` matview.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct UnifiedNodeHit {
+    pub node_id: String,
+    pub node_type: String,
+    pub label: String,
+    pub importance: f64,
+    pub similarity: Option<f64>,
+}
+
+/// Phase 6.3: vector-similarity search over the unified-nodes matview.
+/// Optionally filter to a subset of node_type strings.
+pub async fn memory_unified_search(
+    pool: &PgPool,
+    embedding: &[f32],
+    node_types: Option<&[String]>,
+    limit: i32,
+    ef_search: i32,
+) -> Result<Vec<UnifiedNodeHit>, sqlx::Error> {
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "memory_unified_search: expected 1024d embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let v = pgvector::Vector::from(embedding.to_vec());
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query_as::<_, UnifiedNodeHit>(
+        "SELECT node_id, node_type, label, importance,
+                1 - (embedding <=> $1) AS similarity
+         FROM memory_unified_nodes
+         WHERE embedding IS NOT NULL
+           AND ($2::text[] IS NULL OR node_type = ANY($2))
+         ORDER BY embedding <=> $1
+         LIMIT $3",
+    )
+    .bind(&v)
+    .bind(node_types)
+    .bind(limit.clamp(1, 200))
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
+}
+
+/// Phase 6.3: refresh the materialized view. Cheap relative to topic
+/// clustering — a UNION ALL over indexed tables. Called from
+/// `similarity-scan` cadence or on-demand by the operator.
+pub async fn refresh_memory_unified_nodes(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("REFRESH MATERIALIZED VIEW memory_unified_nodes")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Phase 6.3: BFS neighbors of a typed node over `memory_unified_edges`.
+/// Returns the reachable nodes up to `depth` plus the edges that connect
+/// them.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct UnifiedNeighborNode {
+    pub node_id: String,
+    pub node_type: String,
+    pub depth: i32,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct UnifiedEdge {
+    pub from_id: String,
+    pub from_type: String,
+    pub to_id: String,
+    pub to_type: String,
+    pub edge_type: String,
+    pub weight: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UnifiedNeighborhood {
+    pub seed: String,
+    pub nodes: Vec<UnifiedNeighborNode>,
+    pub edges: Vec<UnifiedEdge>,
+}
+
+pub async fn memory_neighbors(
+    pool: &PgPool,
+    node_id: &str,
+    depth: i32,
+    edge_filter: Option<&str>,
+    max_nodes: i32,
+) -> Result<UnifiedNeighborhood, sqlx::Error> {
+    let depth_cap = depth.clamp(1, 4);
+    let node_cap = max_nodes.clamp(1, 500);
+    let rows: Vec<(String, String, i32)> = sqlx::query_as(
+        "WITH RECURSIVE frontier(node_id, node_type, depth) AS (
+             SELECT node_id, node_type, 0::int
+             FROM memory_unified_nodes
+             WHERE node_id = $1
+             UNION
+             SELECT CASE WHEN e.from_id = f.node_id THEN e.to_id ELSE e.from_id END,
+                    CASE WHEN e.from_id = f.node_id THEN e.to_type ELSE e.from_type END,
+                    f.depth + 1
+             FROM frontier f
+             JOIN memory_unified_edges e
+                  ON  (e.from_id = f.node_id OR e.to_id = f.node_id)
+                  AND ($2::text IS NULL OR e.edge_type = $2)
+             WHERE f.depth < $3
+         )
+         SELECT node_id, node_type, MIN(depth)::int AS depth
+         FROM frontier
+         GROUP BY node_id, node_type
+         ORDER BY MIN(depth), node_id
+         LIMIT $4",
+    )
+    .bind(node_id)
+    .bind(edge_filter)
+    .bind(depth_cap)
+    .bind(node_cap)
+    .fetch_all(pool)
+    .await?;
+
+    let nodes: Vec<UnifiedNeighborNode> = rows
+        .into_iter()
+        .map(|(id, t, d)| UnifiedNeighborNode {
+            node_id: id,
+            node_type: t,
+            depth: d,
+        })
+        .collect();
+    let node_ids: Vec<String> = nodes.iter().map(|n| n.node_id.clone()).collect();
+    let edges: Vec<UnifiedEdge> = if node_ids.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT from_id, from_type, to_id, to_type, edge_type, weight
+             FROM memory_unified_edges
+             WHERE from_id = ANY($1) AND to_id = ANY($1)
+               AND ($2::text IS NULL OR edge_type = $2)",
+        )
+        .bind(&node_ids)
+        .bind(edge_filter)
+        .fetch_all(pool)
+        .await?
+    };
+
+    Ok(UnifiedNeighborhood {
+        seed: node_id.to_string(),
+        nodes,
+        edges,
+    })
+}
+
+/// Phase 6.4 PathRAG: ranked paths through the unified graph. Seeds
+/// from `memory_unified_search`, then BFS-expands within
+/// `max_hops`, ranks by a composite (cosine of last-node vs query,
+/// minus hop-length penalty, plus edge-weight product), and prunes
+/// near-duplicate paths via Jaccard overlap on the node-set.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryPath {
+    /// node_ids in order, starting from the seed.
+    pub nodes: Vec<String>,
+    pub edge_types: Vec<String>,
+    pub score: f64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MemoryPathSearchResult {
+    pub seeds: Vec<String>,
+    pub paths: Vec<MemoryPath>,
+    /// Paths considered before pruning (telemetry).
+    pub considered: i64,
+    pub pruned: i64,
+}
+
+pub async fn memory_path_search(
+    pool: &PgPool,
+    embedding: &[f32],
+    seed_node_types: Option<&[String]>,
+    target_node_types: Option<&[String]>,
+    max_hops: i32,
+    k: i32,
+    prune_jaccard: f64,
+    ef_search: i32,
+) -> Result<MemoryPathSearchResult, sqlx::Error> {
+    let hop_cap = max_hops.clamp(1, 5);
+    let k = k.clamp(1, 100);
+
+    // 1. Seed by top-k semantic over unified-nodes (k seeds = k).
+    let seeds =
+        memory_unified_search(pool, embedding, seed_node_types, k.max(5), ef_search).await?;
+    if seeds.is_empty() {
+        return Ok(MemoryPathSearchResult {
+            seeds: Vec::new(),
+            paths: Vec::new(),
+            considered: 0,
+            pruned: 0,
+        });
+    }
+    let seed_ids: Vec<String> = seeds.iter().map(|s| s.node_id.clone()).collect();
+
+    // 2. BFS-expand and emit complete paths. Bound output via hop_cap
+    // (worst-case branching is bounded since each step joins through
+    // `memory_unified_edges`, which is already capped by the membership
+    // and code_anchor filters). LIMIT 400 keeps it sane.
+    let rows: Vec<(String, String, String, String, String, f64, i32)> = sqlx::query_as(
+        "WITH RECURSIVE walk(start_id, current_id, current_type,
+                              last_edge, last_to_type, weight_product, hops,
+                              path_nodes, path_edges) AS (
+             SELECT s.node_id, s.node_id, s.node_type,
+                    ''::text, s.node_type, 1.0::float8, 0::int,
+                    ARRAY[s.node_id], ARRAY[]::text[]
+             FROM memory_unified_nodes s
+             WHERE s.node_id = ANY($1)
+             UNION
+             SELECT w.start_id,
+                    CASE WHEN e.from_id = w.current_id THEN e.to_id ELSE e.from_id END,
+                    CASE WHEN e.from_id = w.current_id THEN e.to_type ELSE e.from_type END,
+                    e.edge_type,
+                    CASE WHEN e.from_id = w.current_id THEN e.to_type ELSE e.from_type END,
+                    w.weight_product * e.weight,
+                    w.hops + 1,
+                    w.path_nodes || (CASE WHEN e.from_id = w.current_id THEN e.to_id ELSE e.from_id END),
+                    w.path_edges || e.edge_type
+             FROM walk w
+             JOIN memory_unified_edges e
+                  ON e.from_id = w.current_id OR e.to_id = w.current_id
+             WHERE w.hops < $2
+               AND NOT (
+                   CASE WHEN e.from_id = w.current_id THEN e.to_id ELSE e.from_id END
+                       = ANY(w.path_nodes)
+               )
+         )
+         SELECT start_id, current_id, current_type, last_edge, last_to_type,
+                weight_product, hops
+         FROM walk
+         WHERE hops > 0
+           AND ($3::text[] IS NULL OR current_type = ANY($3))
+         ORDER BY hops, weight_product DESC
+         LIMIT 400",
+    )
+    .bind(&seed_ids)
+    .bind(hop_cap)
+    .bind(target_node_types)
+    .fetch_all(pool)
+    .await?;
+    let considered = rows.len() as i64;
+
+    // We need the actual path nodes to render paths cleanly. Re-query
+    // a richer set including the path_nodes / path_edges arrays.
+    let path_rows: Vec<(Vec<String>, Vec<String>, f64, i32)> = sqlx::query_as(
+        "WITH RECURSIVE walk(start_id, current_id, weight_product, hops,
+                              path_nodes, path_edges) AS (
+             SELECT s.node_id, s.node_id, 1.0::float8, 0::int,
+                    ARRAY[s.node_id], ARRAY[]::text[]
+             FROM memory_unified_nodes s
+             WHERE s.node_id = ANY($1)
+             UNION
+             SELECT w.start_id,
+                    CASE WHEN e.from_id = w.current_id THEN e.to_id ELSE e.from_id END,
+                    w.weight_product * e.weight,
+                    w.hops + 1,
+                    w.path_nodes || (CASE WHEN e.from_id = w.current_id THEN e.to_id ELSE e.from_id END),
+                    w.path_edges || e.edge_type
+             FROM walk w
+             JOIN memory_unified_edges e
+                  ON e.from_id = w.current_id OR e.to_id = w.current_id
+             WHERE w.hops < $2
+               AND NOT (
+                   CASE WHEN e.from_id = w.current_id THEN e.to_id ELSE e.from_id END
+                       = ANY(w.path_nodes)
+               )
+         ),
+         filtered AS (
+             SELECT path_nodes, path_edges, weight_product, hops
+             FROM walk
+             JOIN memory_unified_nodes n ON n.node_id = walk.current_id
+             WHERE hops > 0
+               AND ($3::text[] IS NULL OR n.node_type = ANY($3))
+         )
+         SELECT path_nodes, path_edges, weight_product, hops
+         FROM filtered
+         ORDER BY weight_product DESC, hops
+         LIMIT 200",
+    )
+    .bind(&seed_ids)
+    .bind(hop_cap)
+    .bind(target_node_types)
+    .fetch_all(pool)
+    .await?;
+
+    // 3. Score each path. Composite: weight_product − 0.1·hops (we
+    // don't have the query embedding cosine for intermediate nodes
+    // cheaply; the seed cosine is baked into `seeds[i].similarity`,
+    // which we incorporate by weighting the start-seed similarity).
+    let seed_sim_map: std::collections::HashMap<String, f64> = seeds
+        .iter()
+        .map(|s| (s.node_id.clone(), s.similarity.unwrap_or(0.0)))
+        .collect();
+
+    let mut scored: Vec<MemoryPath> = Vec::with_capacity(path_rows.len());
+    for (nodes, edges, weight_product, hops) in path_rows {
+        let seed_sim = nodes
+            .first()
+            .and_then(|id| seed_sim_map.get(id))
+            .copied()
+            .unwrap_or(0.0);
+        let score = 0.6 * seed_sim + 0.3 * weight_product - 0.1 * (hops as f64);
+        scored.push(MemoryPath {
+            nodes,
+            edge_types: edges,
+            score,
+        });
+    }
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // 4. PathRAG flow-style pruning: drop paths whose node-set
+    // overlaps a kept path's node-set above `prune_jaccard`.
+    let mut kept: Vec<MemoryPath> = Vec::with_capacity(k as usize);
+    let mut pruned = 0_i64;
+    for p in scored {
+        let pset: std::collections::BTreeSet<&String> = p.nodes.iter().collect();
+        let mut overlaps = false;
+        for q in &kept {
+            let qset: std::collections::BTreeSet<&String> = q.nodes.iter().collect();
+            let inter = pset.intersection(&qset).count() as f64;
+            let union = pset.union(&qset).count() as f64;
+            let jacc = if union > 0.0 { inter / union } else { 0.0 };
+            if jacc >= prune_jaccard {
+                overlaps = true;
+                pruned += 1;
+                break;
+            }
+        }
+        if !overlaps {
+            kept.push(p);
+            if kept.len() as i32 >= k {
+                break;
+            }
+        }
+    }
+
+    Ok(MemoryPathSearchResult {
+        seeds: seed_ids,
+        paths: kept,
+        considered,
+        pruned,
+    })
+}
+
+/// Phase 6.2 HippoRAG-style PPR result row.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PprHit {
+    pub entity_id: i64,
+    pub entity_name: String,
+    pub entity_type: String,
+    pub ppr_score: f64,
+    pub top_observation: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PprSearchResult {
+    pub seeds: Vec<i64>,
+    pub hits: Vec<PprHit>,
+}
+
+/// Phase 6.2: HippoRAG-style Personalized PageRank over `memory_relations`.
+/// Seeds are the top-k entities by cosine similarity of their best
+/// observation against the query embedding.
+pub async fn memory_ppr_search(
+    pool: &PgPool,
+    embedding: &[f32],
+    k: i32,
+    alpha: f64,
+    max_seeds: i32,
+    ef_search: i32,
+) -> Result<PprSearchResult, sqlx::Error> {
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "memory_ppr_search: expected 1024d embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let v = pgvector::Vector::from(embedding.to_vec());
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+
+    // 1. Resolve seed entities by best-per-entity cosine of their
+    // observations against the query embedding.
+    #[derive(sqlx::FromRow)]
+    struct Seed {
+        entity_id: i64,
+        sim: Option<f64>,
+    }
+    let seeds: Vec<Seed> = sqlx::query_as(
+        "SELECT DISTINCT ON (e.id) e.id AS entity_id, 1 - (o.embedding <=> $1) AS sim
+         FROM memory_observations o
+         JOIN memory_entities e ON e.id = o.entity_id AND e.valid_to IS NULL
+         WHERE o.embedding IS NOT NULL AND o.valid_to IS NULL
+         ORDER BY e.id, o.embedding <=> $1
+         LIMIT $2",
+    )
+    .bind(&v)
+    .bind(max_seeds.clamp(1, 100))
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+
+    let seed_ids: Vec<i64> = seeds.iter().map(|s| s.entity_id).collect();
+    if seed_ids.is_empty() {
+        return Ok(PprSearchResult {
+            seeds: Vec::new(),
+            hits: Vec::new(),
+        });
+    }
+
+    // 2. Load the relation graph into a petgraph.
+    let edges: Vec<(i64, i64, f32)> = sqlx::query_as(
+        "SELECT from_entity_id, to_entity_id, importance
+         FROM memory_relations
+         WHERE valid_to IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let mut node_to_idx: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
+    let mut idx_to_node: Vec<i64> = Vec::new();
+    let mut adjacency: Vec<Vec<(usize, f64)>> = Vec::new();
+    let ensure_idx = |n: i64,
+                      node_to_idx: &mut std::collections::HashMap<i64, usize>,
+                      idx_to_node: &mut Vec<i64>,
+                      adj: &mut Vec<Vec<(usize, f64)>>|
+     -> usize {
+        if let Some(&idx) = node_to_idx.get(&n) {
+            return idx;
+        }
+        let idx = idx_to_node.len();
+        node_to_idx.insert(n, idx);
+        idx_to_node.push(n);
+        adj.push(Vec::new());
+        idx
+    };
+    for (from, to, w) in edges {
+        let fi = ensure_idx(from, &mut node_to_idx, &mut idx_to_node, &mut adjacency);
+        let ti = ensure_idx(to, &mut node_to_idx, &mut idx_to_node, &mut adjacency);
+        let w = w as f64;
+        adjacency[fi].push((ti, w));
+        adjacency[ti].push((fi, w));
+    }
+    // Make sure every seed is present in the graph (some may have no
+    // outgoing relations; they're still valid restart nodes for PPR).
+    for &sid in &seed_ids {
+        ensure_idx(sid, &mut node_to_idx, &mut idx_to_node, &mut adjacency);
+    }
+
+    let n = idx_to_node.len();
+    if n == 0 {
+        return Ok(PprSearchResult {
+            seeds: seed_ids,
+            hits: Vec::new(),
+        });
+    }
+
+    // 3. Power iteration: PR(v) = α · (Σ PR(u)·w(u,v)/d(u)) + (1-α) · r(v),
+    // where r is the restart distribution concentrated on the seeds.
+    let mut restart = vec![0.0_f64; n];
+    let seed_indices: Vec<usize> = seed_ids
+        .iter()
+        .filter_map(|&id| node_to_idx.get(&id).copied())
+        .collect();
+    let restart_mass = 1.0 / seed_indices.len() as f64;
+    for &si in &seed_indices {
+        restart[si] = restart_mass;
+    }
+    let mut rank = restart.clone();
+    // Precompute row sums for normalization.
+    let row_sums: Vec<f64> = adjacency
+        .iter()
+        .map(|row| row.iter().map(|(_, w)| *w).sum::<f64>().max(1e-12))
+        .collect();
+
+    let iters = 25_usize;
+    for _ in 0..iters {
+        let mut next = vec![0.0_f64; n];
+        for (u, neighbors) in adjacency.iter().enumerate() {
+            if rank[u] == 0.0 {
+                continue;
+            }
+            let share = rank[u] / row_sums[u];
+            for (v, w) in neighbors {
+                next[*v] += alpha * share * *w;
+            }
+        }
+        for i in 0..n {
+            next[i] += (1.0 - alpha) * restart[i];
+        }
+        rank = next;
+    }
+
+    // 4. Take top-k by PR score, attach entity metadata + top observation.
+    let mut ranked: Vec<(usize, f64)> = rank.iter().enumerate().map(|(i, r)| (i, *r)).collect();
+    ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    ranked.truncate(k.clamp(1, 200) as usize);
+
+    let top_ids: Vec<i64> = ranked.iter().map(|(i, _)| idx_to_node[*i]).collect();
+    let mut hits: Vec<PprHit> = Vec::with_capacity(top_ids.len());
+    if !top_ids.is_empty() {
+        let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT e.id, e.name, e.entity_type,
+                    (SELECT o.content FROM memory_observations o
+                     WHERE o.entity_id = e.id AND o.valid_to IS NULL
+                     ORDER BY o.importance DESC, o.created_at DESC
+                     LIMIT 1)
+             FROM memory_entities e
+             WHERE e.id = ANY($1) AND e.valid_to IS NULL",
+        )
+        .bind(&top_ids)
+        .fetch_all(pool)
+        .await?;
+        let score_map: std::collections::HashMap<i64, f64> =
+            ranked.iter().map(|(i, r)| (idx_to_node[*i], *r)).collect();
+        for (id, name, etype, top_obs) in rows {
+            hits.push(PprHit {
+                entity_id: id,
+                entity_name: name,
+                entity_type: etype,
+                ppr_score: *score_map.get(&id).unwrap_or(&0.0),
+                top_observation: top_obs,
+            });
+        }
+        hits.sort_by(|a, b| {
+            b.ppr_score
+                .partial_cmp(&a.ppr_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    }
+
+    Ok(PprSearchResult {
+        seeds: seed_ids,
+        hits,
+    })
+}
+
+/// Phase 6.1 RAPTOR query result.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct RaptorHit {
+    pub node_id: i64,
+    pub level: i32,
+    pub label: String,
+    pub similarity: Option<f64>,
+}
+
+/// Phase 6.1: query against `memory_summary_tree`. Returns top-k
+/// summary nodes at each requested level (or all levels), ranked
+/// by cosine over `summary_embedding`. Useful for "thematic"
+/// queries that span many observations.
+pub async fn memory_raptor_search(
+    pool: &PgPool,
+    embedding: &[f32],
+    scope_id: Option<i64>,
+    levels: Option<&[i32]>,
+    k: i32,
+    ef_search: i32,
+) -> Result<Vec<RaptorHit>, sqlx::Error> {
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "memory_raptor_search: expected 1024d embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let v = pgvector::Vector::from(embedding.to_vec());
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query_as::<_, RaptorHit>(
+        "SELECT id AS node_id, level,
+                COALESCE(summary_text, '<leaf>') AS label,
+                1 - (summary_embedding <=> $1) AS similarity
+         FROM memory_summary_tree
+         WHERE summary_embedding IS NOT NULL
+           AND ($2::bigint IS NULL OR scope_id = $2)
+           AND ($3::int[] IS NULL OR level = ANY($3))
+         ORDER BY summary_embedding <=> $1
+         LIMIT $4",
+    )
+    .bind(&v)
+    .bind(scope_id)
+    .bind(levels)
+    .bind(k.clamp(1, 200))
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
+}
+
+// ============================================================================
 // Statistics queries
 // ============================================================================
 
