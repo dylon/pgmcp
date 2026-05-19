@@ -767,10 +767,10 @@ optimization's value.
 - **No `[features]` table.** All backend swaps are traits +
   closed-set enums, per the
   `feedback_feature_gated_build_verification.md` discipline.
-- **CUDA mandatory.** Every new compute path (embedder, extractor,
-  reranker, RAPTOR summarization, latent pipeline) defaults to CUDA
-  via candle; a CPU fallback returns degraded-mode results (smaller
-  batches, longer latencies) but never feature-gates.
+- **CUDA mandatory.** Every new production compute path (embedder, extractor,
+  reranker, RAPTOR summarization, latent pipeline) uses CUDA via candle and
+  fails closed when GPU initialization fails; CPU paths are limited to tests
+  and explicit diagnostics, not feature-gated runtime fallback.
 - **Verification gate.** Every phase ends with `scripts/verify.sh`
   green, no new clippy warnings, integration tests added in
   `pgmcp-testing/`.

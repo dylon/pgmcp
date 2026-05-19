@@ -20,7 +20,7 @@
 use ndarray::{Array2, ArrayView2};
 use tracing::info;
 
-use crate::cron::topic_clustering::fuzzy_c_means;
+use crate::cron::topic_clustering::{FcmResult, fuzzy_c_means};
 
 /// Validity index selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -206,6 +206,19 @@ pub struct SweepEntry {
 /// the validity index. Entries sorted by K; `best_idx` points at the
 /// winner (minimal XB or maximal FS/Gap).
 pub fn sweep_k(data: ArrayView2<f32>, cfg: &SweepConfig) -> (usize, Vec<SweepEntry>) {
+    sweep_k_with_runner(data, cfg, |data, k, m, max_iters, tolerance| {
+        fuzzy_c_means(data, k, m, max_iters, tolerance, None)
+    })
+}
+
+fn sweep_k_with_runner<F>(
+    data: ArrayView2<f32>,
+    cfg: &SweepConfig,
+    mut run_fcm: F,
+) -> (usize, Vec<SweepEntry>)
+where
+    F: for<'a> FnMut(ArrayView2<'a, f32>, usize, f64, usize, f64) -> FcmResult,
+{
     let n = data.nrows();
     assert!(
         !cfg.candidates.is_empty(),
@@ -219,7 +232,7 @@ pub fn sweep_k(data: ArrayView2<f32>, cfg: &SweepConfig) -> (usize, Vec<SweepEnt
             continue;
         }
         let t0 = std::time::Instant::now();
-        let result = fuzzy_c_means(data, k_cand, cfg.m, cfg.max_iters, cfg.tolerance, None);
+        let result = run_fcm(data, k_cand, cfg.m, cfg.max_iters, cfg.tolerance);
 
         let idx_val = match cfg.index {
             Index::XieBeni => xie_beni(
@@ -317,6 +330,7 @@ pub fn subsample_data(data: &Array2<f32>, n_subsample: usize) -> Array2<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cron::topic_clustering::fuzzy_c_means_seeded;
 
     fn make_well_separated(k_true: usize, pts_per_cluster: usize, d: usize) -> Array2<f32> {
         let n = k_true * pts_per_cluster;
@@ -328,6 +342,21 @@ mod tests {
             }
         }
         data
+    }
+
+    fn test_fcm(
+        data: ArrayView2<'_, f32>,
+        k: usize,
+        max_iters: usize,
+        tolerance: f64,
+    ) -> FcmResult {
+        fuzzy_c_means_seeded(data, k, 2.0, max_iters, tolerance, 42)
+    }
+
+    fn sweep_k_for_tests(data: ArrayView2<'_, f32>, cfg: &SweepConfig) -> (usize, Vec<SweepEntry>) {
+        sweep_k_with_runner(data, cfg, |data, k, m, max_iters, tolerance| {
+            fuzzy_c_means_seeded(data, k, m, max_iters, tolerance, 42)
+        })
     }
 
     #[test]
@@ -379,7 +408,7 @@ mod tests {
             tolerance: 1e-4,
             gap_n_refs: 0,
         };
-        let (best_k, entries) = sweep_k(data.view(), &cfg);
+        let (best_k, entries) = sweep_k_for_tests(data.view(), &cfg);
         assert!(entries.len() == 4, "all 4 candidates evaluated");
         // We expect K=3 or a close neighbor to win on a 3-cluster synthetic.
         // Xie-Beni may also pick 2 if clusters are very well-separated; allow 2-4.
@@ -393,7 +422,7 @@ mod tests {
     #[test]
     fn test_fuzzy_silhouette_produces_reasonable_score() {
         let data = make_well_separated(3, 20, 4);
-        let fcm = fuzzy_c_means(data.view(), 3, 2.0, 50, 1e-4, None);
+        let fcm = test_fcm(data.view(), 3, 50, 1e-4);
         let s = fuzzy_silhouette(
             data.view(),
             fcm.membership.view(),
@@ -559,7 +588,7 @@ mod tests {
             d in 3usize..6,
         ) {
             let data = make_well_separated(k_true, pts_per_cluster, d);
-            let result = fuzzy_c_means(data.view(), k_true, 2.0, 30, 1e-4, None);
+            let result = test_fcm(data.view(), k_true, 30, 1e-4);
             let xb = xie_beni(data.view(), result.membership.view(), result.centroids.view(), 2.0);
             prop_assert!(xb >= 0.0, "xie_beni {} must be ≥ 0", xb);
             prop_assert!(xb.is_finite(), "xie_beni {} must be finite", xb);
@@ -587,7 +616,7 @@ mod tests {
                 }
             }
             let run_at = |k: usize| -> f64 {
-                let result = fuzzy_c_means(data.view(), k, 2.0, 60, 1e-5, None);
+                let result = test_fcm(data.view(), k, 60, 1e-5);
                 xie_beni(data.view(), result.membership.view(), result.centroids.view(), 2.0)
             };
             let xb_true = run_at(k_true);

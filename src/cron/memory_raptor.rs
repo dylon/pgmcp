@@ -2,9 +2,8 @@
 //!
 //! For each scope, clusters the level-0 observations by embedding
 //! similarity (cosine via dot product on L2-normalized vectors) and
-//! emits a level-1 summary per cluster. Re-uses pgmcp's existing FCM
-//! machinery (`src/fcm/cpu.rs`) for clustering on the CPU side; the
-//! LLM extractor (Phase 4) handles summarization.
+//! emits a level-1 summary per cluster. Re-uses pgmcp's existing CUDA FCM
+//! machinery for clustering; the LLM extractor handles summarization.
 //!
 //! Idempotency: the cron deletes the prior `memory_summary_tree` rows
 //! for the scope before re-building. This is acceptable because the
@@ -20,7 +19,7 @@ use pgvector::Vector;
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
-use crate::fcm::{self, BackendChoice, FcmBackend};
+use crate::fcm::{self, BackendChoice, FcmBackend, GpuPrecision};
 use crate::llm::LlmExtractor;
 use crate::stats::tracker::StatsTracker;
 
@@ -172,11 +171,10 @@ async fn build_scope_tree(
         .context("level-0 leaf insert")?;
     }
 
-    // Cluster with FCM. The `make_backend` call returns a CPU backend
-    // when GPU is unavailable; the level-1 build is one-shot per cron
-    // tick so the CPU path is fast enough.
+    // Cluster with FCM. CUDA is mandatory for production pgmcp; surface init
+    // failures instead of silently falling back to CPU.
     let mut backend: Box<dyn FcmBackend> =
-        fcm::make_backend(data.clone(), k, BackendChoice::Cpu)
+        fcm::make_backend(data.clone(), k, BackendChoice::Cuda(GpuPrecision::Fp32))
             .map_err(|e| anyhow::anyhow!("fcm backend init: {}", e))?;
     let result = fcm::run_seeded(
         backend.as_mut(),

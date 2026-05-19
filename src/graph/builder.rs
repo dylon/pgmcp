@@ -1,6 +1,6 @@
 //! Builds a CodeGraph from database edge rows.
 
-use super::{CodeGraph, EdgeType, EdgeWeight, FileNode};
+use super::types::{CodeGraph, EdgeType, EdgeWeight, FileNode};
 
 /// A row from the code_graph_edges table joined with file metadata.
 #[derive(Debug, Clone)]

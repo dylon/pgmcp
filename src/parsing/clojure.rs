@@ -11,7 +11,7 @@ use std::sync::OnceLock;
 
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
-use crate::parsing::LanguageBackend;
+use crate::parsing::backend::LanguageBackend;
 use crate::parsing::symbols::{Import, Symbol, SymbolKind, SymbolRefKind, SymbolReference};
 
 #[derive(Clone, Copy)]

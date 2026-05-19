@@ -11,16 +11,11 @@ edition = "2024"
 description = "PostgreSQL + pgvector MCP File Indexer for Claude Code and Codex"
 license = "Apache-2.0"
 
-# CUDA is a mandatory dependency. The daemon is split into a CUDA backend
-# (GPU FCM) and a CPU fallback backend that cooperate at runtime — both
-# are always compiled. A pure-CPU build mode is intentionally NOT provided;
-# the FcmBackend trait in src/fcm/ is the seam where a future non-CUDA
-# implementation could be plugged in without feature gates.
-[features]
+# CUDA is a mandatory dependency. Production compute paths fail closed when
+# CUDA initialization fails. The CPU FCM backend is retained for deterministic
+# tests and explicit diagnostics, not as a build or runtime fallback mode.
 
 [dependencies]
-# ONNX Runtime — GPU-accelerated embedding inference via CUDA execution provider.
-# CUDA is mandatory; `ort/cuda` is unconditional.
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
@@ -73,12 +68,10 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 # Document indexing: subprocess + Unicode normalization for the extraction
 # pipeline (PDF/PostScript/DOCX/EPUB → normalized plain text). `which` is
 # used at daemon startup to preflight CLI tools (`pdftotext`, `ps2ascii`,
-# `pandoc`); `wait-timeout` enforces per-extraction subprocess timeouts so
-# malformed inputs cannot wedge a worker; `unicode-normalization` provides
-# the NFKC pass that collapses ligatures and fancy punctuation before
-# storage so MCP tool results are token-efficient.
+# `pandoc`); `unicode-normalization` provides the NFKC pass that collapses
+# ligatures and fancy punctuation before storage so MCP tool results are
+# token-efficient.
 which = "6"
-wait-timeout = "0.2"
 unicode-normalization = "0.1"
 
 # Configuration

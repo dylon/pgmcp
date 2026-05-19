@@ -6,7 +6,7 @@ use regex::Regex;
 use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
-use super::{CodeGraph, EdgeType};
+use super::types::{CodeGraph, EdgeType};
 use petgraph::Direction;
 
 /// Metrics for a single module (directory grouping).
@@ -190,7 +190,7 @@ pub fn update_abstractness(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::{CodeGraph, EdgeType, EdgeWeight, FileNode};
+    use crate::graph::types::{CodeGraph, EdgeType, EdgeWeight, FileNode};
     use proptest::prelude::*;
 
     fn make_graph(files: Vec<(i64, &str, &str)>, edges: Vec<(i64, i64)>) -> CodeGraph {

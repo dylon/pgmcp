@@ -293,9 +293,9 @@ mod cuda_impl {
     }
 
     /// Attempt an fp16 run large enough that it *might* OOM on constrained
-    /// GPUs — but within a safe budget for a 4060 Ti / 8 GB. On success,
-    /// the fp16 path handles the load; on OOM, `fuzzy_c_means_gpu` catches
-    /// the error and returns a CPU-fallback result. Either outcome passes.
+    /// GPUs — but within a safe budget for a 4060 Ti / 8 GB. Production FCM
+    /// must complete on GPU; OOM returns a degenerate result and fails this
+    /// smoke scenario.
     fn scenario_fp16_oom_falls_back() -> Result<String, String> {
         use pgmcp::cron::topic_clustering::fuzzy_c_means_gpu;
         use pgmcp::fcm::GpuPrecision;
@@ -312,15 +312,14 @@ mod cuda_impl {
         }
         let result = fuzzy_c_means_gpu(data.view(), k, 2.0, 10, 1e-2, GpuPrecision::Fp16);
         if result.iterations == 0 {
-            return Err("iterations=0 — neither GPU nor CPU fallback ran".into());
+            return Err("iterations=0 — GPU FCM did not complete".into());
         }
-        // The result shape must match the contract regardless of which
-        // backend produced it.
+        // The result shape must match the contract.
         if result.membership.nrows() != n || result.membership.ncols() != k {
             return Err("wrong shape".into());
         }
         Ok(format!(
-            "n={} d={} k={} iters={} (GPU or fallback)",
+            "n={} d={} k={} iters={} (GPU)",
             n, dim, k, result.iterations
         ))
     }

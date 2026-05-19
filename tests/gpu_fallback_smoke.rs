@@ -1,10 +1,9 @@
-//! Fallback-to-CPU smoke test for the cuda dispatch path.
+//! CUDA-mandatory smoke test for the CUDA dispatch path.
 //!
 //! Sets `CUDA_VISIBLE_DEVICES=""` before any `CudaContext::new()` runs,
 //! which forces the cudarc runtime probe to fail. The `GpuFcm*::new()`
-//! constructor then returns `Err`, and `fuzzy_c_means_gpu` routes through
-//! its existing WARN + CPU fallback. This verifies the fallback path
-//! produces a valid (converged) FCM result.
+//! constructor then returns `Err`, and `fuzzy_c_means_gpu` returns a
+//! degenerate result instead of silently falling back to CPU.
 //!
 //! Run with:
 //!   cargo test --release --test gpu_fallback_smoke -- --ignored
@@ -12,14 +11,14 @@
 //! This test is `#[ignore]` by default because:
 //!   (a) it mutates process-wide CUDA runtime state, so must run in an
 //!       isolated test binary;
-//!   (b) on a GPU-less host the fallback path is exercised by every
-//!       test — this binary's job is to prove it works on a GPU host too.
+//!   (b) this binary mutates CUDA visibility to prove the production path
+//!       fails closed even on a GPU host.
 
 use ndarray::Array2;
 
 #[test]
-#[ignore = "requires CUDA feature; forces GPU-unavailable to exercise fallback"]
-fn gpu_init_failure_falls_back_to_cpu() {
+#[ignore = "requires CUDA feature; forces GPU-unavailable to exercise fail-closed behavior"]
+fn gpu_init_failure_returns_degenerate_result() {
     // SAFETY: This must run before ANY CudaContext::new() call is made in
     // this process. Because `tests/gpu_fallback_smoke.rs` is a standalone
     // test binary with a single `#[test]`, this is always the first CUDA
@@ -52,31 +51,21 @@ fn gpu_init_failure_falls_back_to_cpu() {
         pgmcp::fcm::GpuPrecision::Fp16,
     );
 
-    assert!(
-        result.iterations > 0,
-        "fallback path did not run (iters = 0)"
-    );
+    assert_eq!(result.iterations, 0);
+    assert!(!result.converged);
     assert_eq!(result.membership.nrows(), 2000);
     assert_eq!(result.membership.ncols(), 2);
-
-    // Centroids should reflect the two blobs even from the CPU fallback.
-    let c0 = result.centroids.row(0);
-    let c1 = result.centroids.row(1);
-    let dist_sq: f32 = c0.iter().zip(c1.iter()).map(|(a, b)| (a - b).powi(2)).sum();
     assert!(
-        dist_sq.sqrt() > 0.5,
-        "fallback centroids are collapsed: dist = {}",
-        dist_sq.sqrt()
+        result.membership.iter().all(|&v| v == 0.0),
+        "mandatory CUDA failure should not synthesize CPU memberships"
     );
 }
 
-/// Same fallback path, but driven with deterministic 384-dim "realistic"
-/// embeddings (matching production vector dimensionality) instead of
-/// synthetic 2-D blobs. Proves the CPU fallback converges on data whose
-/// shape matches what pgmcp actually indexes.
+/// Same fail-closed path, but driven with deterministic 384-dim "realistic"
+/// embeddings (matching production vector dimensionality).
 #[test]
-#[ignore = "requires CUDA feature; forces GPU-unavailable to exercise fallback with real-width vectors"]
-fn gpu_init_failure_with_realistic_embeddings_falls_back_to_cpu() {
+#[ignore = "requires CUDA feature; forces GPU-unavailable with real-width vectors"]
+fn gpu_init_failure_with_realistic_embeddings_returns_degenerate_result() {
     // SAFETY: single-threaded in this test binary before CUDA init.
     unsafe {
         std::env::set_var("CUDA_VISIBLE_DEVICES", "");
@@ -106,17 +95,9 @@ fn gpu_init_failure_with_realistic_embeddings_falls_back_to_cpu() {
         1e-4,
         pgmcp::fcm::GpuPrecision::Fp16,
     );
-    assert!(result.iterations > 0);
+    assert_eq!(result.iterations, 0);
+    assert!(!result.converged);
     assert_eq!(result.membership.nrows(), n);
     assert_eq!(result.membership.ncols(), k_true);
-    // Every row of U sums to ~1 (FCM invariant).
-    for i in 0..n {
-        let sum: f32 = result.membership.row(i).iter().sum();
-        assert!(
-            (sum - 1.0).abs() < 1e-3,
-            "row {} sum = {} (expected ≈ 1)",
-            i,
-            sum
-        );
-    }
+    assert!(result.membership.iter().all(|&v| v == 0.0));
 }

@@ -2832,7 +2832,6 @@ dependencies = [
  "unicode-normalization",
  "ureq",
  "uuid",
- "wait-timeout",
  "which 6.0.3",
  "xxhash-rust",
 ]

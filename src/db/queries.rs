@@ -3815,6 +3815,56 @@ pub struct SimilarityNeighborRow {
     pub similarity: f64,
 }
 
+#[derive(Debug)]
+struct SimilarityPairInsert<'a> {
+    chunk_id_a: i64,
+    file_id_a: i64,
+    project_id_a: i32,
+    path_a: &'a str,
+    project_name_a: &'a str,
+    chunk_id_b: i64,
+    file_id_b: i64,
+    project_id_b: i32,
+    path_b: &'a str,
+    project_name_b: &'a str,
+    similarity: f64,
+    language: &'a str,
+}
+
+fn normalize_similarity_pair(row: &SimilarityNeighborRow) -> SimilarityPairInsert<'_> {
+    if row.chunk_id_a <= row.chunk_id_b {
+        SimilarityPairInsert {
+            chunk_id_a: row.chunk_id_a,
+            file_id_a: row.file_id_a,
+            project_id_a: row.project_id_a,
+            path_a: &row.path_a,
+            project_name_a: &row.project_name_a,
+            chunk_id_b: row.chunk_id_b,
+            file_id_b: row.file_id_b,
+            project_id_b: row.project_id_b,
+            path_b: &row.path_b,
+            project_name_b: &row.project_name_b,
+            similarity: row.similarity,
+            language: &row.language,
+        }
+    } else {
+        SimilarityPairInsert {
+            chunk_id_a: row.chunk_id_b,
+            file_id_a: row.file_id_b,
+            project_id_a: row.project_id_b,
+            path_a: &row.path_b,
+            project_name_a: &row.project_name_b,
+            chunk_id_b: row.chunk_id_a,
+            file_id_b: row.file_id_a,
+            project_id_b: row.project_id_a,
+            path_b: &row.path_a,
+            project_name_b: &row.project_name_a,
+            similarity: row.similarity,
+            language: &row.language,
+        }
+    }
+}
+
 /// Find cross-project nearest neighbors for a batch of chunks.
 /// Uses CROSS JOIN LATERAL with the HNSW index for efficient ANN lookups.
 /// Returns rows with chunk_id_a from the batch and their nearest cross-project neighbors.
@@ -3900,35 +3950,7 @@ pub async fn insert_similarity_pairs(
 
     let mut inserted = 0u64;
     for row in rows {
-        // Normalize so chunk_id_a < chunk_id_b
-        let (cid_a, fid_a, pid_a, pa, pna, cid_b, fid_b, pid_b, pb, pnb) =
-            if row.chunk_id_a < row.chunk_id_b {
-                (
-                    row.chunk_id_a,
-                    row.file_id_a,
-                    row.project_id_a,
-                    &row.path_a,
-                    &row.project_name_a,
-                    row.chunk_id_b,
-                    row.file_id_b,
-                    row.project_id_b,
-                    &row.path_b,
-                    &row.project_name_b,
-                )
-            } else {
-                (
-                    row.chunk_id_b,
-                    row.file_id_b,
-                    row.project_id_b,
-                    &row.path_b,
-                    &row.project_name_b,
-                    row.chunk_id_a,
-                    row.file_id_a,
-                    row.project_id_a,
-                    &row.path_a,
-                    &row.project_name_a,
-                )
-            };
+        let pair = normalize_similarity_pair(row);
 
         let result = sqlx::query(
             "INSERT INTO cross_project_similarities
@@ -3938,18 +3960,18 @@ pub async fn insert_similarity_pairs(
              ON CONFLICT (chunk_id_a, chunk_id_b) DO UPDATE SET
                 chunk_similarity = GREATEST(cross_project_similarities.chunk_similarity, EXCLUDED.chunk_similarity)"
         )
-        .bind(cid_a)
-        .bind(fid_a)
-        .bind(pid_a)
-        .bind(cid_b)
-        .bind(fid_b)
-        .bind(pid_b)
-        .bind(row.similarity)
-        .bind(pa)
-        .bind(pna)
-        .bind(pb)
-        .bind(pnb)
-        .bind(&row.language)
+        .bind(pair.chunk_id_a)
+        .bind(pair.file_id_a)
+        .bind(pair.project_id_a)
+        .bind(pair.chunk_id_b)
+        .bind(pair.file_id_b)
+        .bind(pair.project_id_b)
+        .bind(pair.similarity)
+        .bind(pair.path_a)
+        .bind(pair.path_b)
+        .bind(pair.project_name_a)
+        .bind(pair.project_name_b)
+        .bind(pair.language)
         .execute(pool)
         .await?;
 
@@ -3957,6 +3979,57 @@ pub async fn insert_similarity_pairs(
     }
 
     Ok(inserted)
+}
+
+#[cfg(test)]
+mod similarity_pair_tests {
+    use super::{SimilarityNeighborRow, normalize_similarity_pair};
+
+    fn row(chunk_id_a: i64, chunk_id_b: i64) -> SimilarityNeighborRow {
+        SimilarityNeighborRow {
+            chunk_id_a,
+            file_id_a: 10,
+            project_id_a: 100,
+            path_a: "src/a.rs".to_string(),
+            project_name_a: "project-a".to_string(),
+            language: "rust".to_string(),
+            chunk_id_b,
+            file_id_b: 20,
+            project_id_b: 200,
+            path_b: "src/b.rs".to_string(),
+            project_name_b: "project-b".to_string(),
+            similarity: 0.91,
+        }
+    }
+
+    #[test]
+    fn similarity_pair_bind_order_keeps_paths_and_projects_distinct() {
+        let input = row(1, 2);
+        let pair = normalize_similarity_pair(&input);
+
+        assert_eq!(pair.chunk_id_a, 1);
+        assert_eq!(pair.path_a, "src/a.rs");
+        assert_eq!(pair.path_b, "src/b.rs");
+        assert_eq!(pair.project_name_a, "project-a");
+        assert_eq!(pair.project_name_b, "project-b");
+    }
+
+    #[test]
+    fn similarity_pair_normalization_swaps_all_metadata_together() {
+        let input = row(2, 1);
+        let pair = normalize_similarity_pair(&input);
+
+        assert_eq!(pair.chunk_id_a, 1);
+        assert_eq!(pair.file_id_a, 20);
+        assert_eq!(pair.project_id_a, 200);
+        assert_eq!(pair.path_a, "src/b.rs");
+        assert_eq!(pair.project_name_a, "project-b");
+        assert_eq!(pair.chunk_id_b, 2);
+        assert_eq!(pair.file_id_b, 10);
+        assert_eq!(pair.project_id_b, 100);
+        assert_eq!(pair.path_b, "src/a.rs");
+        assert_eq!(pair.project_name_b, "project-a");
+    }
 }
 
 /// Clear the cross_project_similarities table (before a fresh scan).

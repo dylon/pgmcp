@@ -50,6 +50,25 @@ pub fn cluster_topic_hierarchy(
     max_iters: usize,
     tolerance: f64,
 ) -> (Vec<MetaGroup>, FcmResult) {
+    cluster_topic_hierarchy_with_runner(
+        inputs,
+        m,
+        max_iters,
+        tolerance,
+        |data, k, m, max_iters, tolerance| fuzzy_c_means(data, k, m, max_iters, tolerance, None),
+    )
+}
+
+fn cluster_topic_hierarchy_with_runner<F>(
+    inputs: &[TopicCentroid],
+    m: f64,
+    max_iters: usize,
+    tolerance: f64,
+    mut run_fcm: F,
+) -> (Vec<MetaGroup>, FcmResult)
+where
+    F: for<'a> FnMut(ndarray::ArrayView2<'a, f32>, usize, f64, usize, f64) -> FcmResult,
+{
     if inputs.is_empty() {
         return (
             Vec::new(),
@@ -89,7 +108,7 @@ pub fn cluster_topic_hierarchy(
         }
     }
 
-    let fcm_result = fuzzy_c_means(data.view(), k_meta, m, max_iters, tolerance, None);
+    let fcm_result = run_fcm(data.view(), k_meta, m, max_iters, tolerance);
 
     // Assign each global topic to its argmax meta-cluster.
     let mut groups: Vec<Vec<(i64, String)>> = vec![Vec::new(); k_meta];
@@ -146,6 +165,7 @@ pub fn label_meta_group(group: &MetaGroup, top_n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cron::topic_clustering::fuzzy_c_means_seeded;
 
     fn make_centroid(topic_id: i64, label: &str, v0: f32, v1: f32) -> TopicCentroid {
         // 4-D centroid, L2-normalised.
@@ -182,7 +202,15 @@ mod tests {
             make_centroid(6, "auth", 0.01, 0.98),
         ];
 
-        let (groups, _result) = cluster_topic_hierarchy(&inputs, 2.0, 100, 1e-5);
+        let (groups, _result) = cluster_topic_hierarchy_with_runner(
+            &inputs,
+            2.0,
+            100,
+            1e-5,
+            |data, k, m, max_iters, tolerance| {
+                fuzzy_c_means_seeded(data, k, m, max_iters, tolerance, 42)
+            },
+        );
         // K_meta=4 on 6 points may leave 0-2 groups empty after argmax
         // assignment; the algorithm filters them. Require at least 2
         // (the natural groupings) and no more than 4.

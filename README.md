@@ -163,7 +163,7 @@ High-level project understanding and engineering quality assessment.
 - **systemd integration** -- `sd-notify` ready/stopping protocol
 - **17 file types** -- Rust, Python, TypeScript, JavaScript, Go, Rholang, MeTTa, Prolog, Shell, JSONL, Markdown, and more
 - **Per-project overrides** -- `.pgmcp.toml` in project roots for custom exclusions and file types
-- **CUDA acceleration** -- optional GPU-accelerated embeddings via ONNX Runtime
+- **CUDA acceleration** -- mandatory GPU-accelerated embedding and FCM paths via Candle/cudarc
 - **Cross-agent memory search** -- synthetic `claude` and `codex` projects make both clients' config, prompt history, and sessions queryable through the same MCP tools
 - **Software pattern knowledge index** -- separate pgvector tables for local full-text design pattern/anti-pattern sources; file search tools never return pattern docs
 - **Auto-RAG context injection** -- Claude Code hooks inject project context and relevant code on every prompt
@@ -242,8 +242,8 @@ High-level project understanding and engineering quality assessment.
 - **Rust** (2024 edition, nightly or stable 1.85+)
 - **PostgreSQL 15+** with [pgvector](https://github.com/pgvector/pgvector) and `pg_trgm` extensions
 - **CUDA toolkit 12+** with `nvcc` on PATH, plus an NVIDIA GPU
-- **AOCL-BLIS** (for ndarray BLAS on the CPU fallback; on Arch: `pacman -S aocl-blis`)
-- ~500 MB disk for the all-MiniLM-L6-v2 ONNX model (downloaded on first run)
+- **AOCL-BLIS** (for ndarray BLAS used by deterministic CPU FCM tests; on Arch: `pacman -S aocl-blis`)
+- Model cache space for Candle/Hugging Face embedding weights downloaded on first run
 
 #### Optional — document indexing
 
@@ -264,9 +264,9 @@ formats (`.md`, `.txt`, `.rst`, `.bib`) need no extra tools.
 
 ### Build & Install
 
-CUDA is mandatory. `Cargo.toml` has no `[features]` table; there is no
-CPU-only build mode. The daemon's `src/fcm/` module provides a CPU fallback
-at runtime if GPU init fails, but the CPU path is not a build-time choice.
+CUDA is mandatory. `Cargo.toml` has no crate feature flags and there is no
+CPU-only build mode. Production compute paths fail closed if GPU initialization
+fails; the CPU FCM backend exists for deterministic tests and diagnostics only.
 
 ```bash
 cargo build --release

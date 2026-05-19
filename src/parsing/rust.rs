@@ -19,7 +19,7 @@ use syn::{
     ItemTrait, ItemType, UseTree, Visibility,
 };
 
-use crate::parsing::LanguageBackend;
+use crate::parsing::backend::LanguageBackend;
 use crate::parsing::symbols::{Import, Symbol, SymbolKind, SymbolRefKind, SymbolReference};
 
 /// Static instance returned by `LanguageRegistry::for_language("rust")`.

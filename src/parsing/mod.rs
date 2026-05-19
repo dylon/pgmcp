@@ -19,11 +19,13 @@
 //! for the full plan, including the migration of `import_extractor.rs` and
 //! the `symbol-extraction` cron job.
 
+pub mod backend;
 pub mod c_cpp;
 pub mod clojure;
 pub mod java;
 pub mod javascript;
 pub mod python;
+pub mod registry;
 pub mod rholang;
 pub mod rust;
 pub mod scala;
@@ -35,69 +37,11 @@ pub mod symbols;
 // rustc would otherwise reject the re-export. The types ARE used by
 // downstream callers via `crate::parsing::SymbolKind` once any backend lands.
 #[allow(unused_imports)]
+pub use backend::LanguageBackend;
+#[allow(unused_imports)]
+pub use registry::LanguageRegistry;
+#[allow(unused_imports)]
 pub use symbols::{Import, Symbol, SymbolKind, SymbolRefKind, SymbolReference};
-
-/// One language's tree-sitter-driven extraction.
-///
-/// Implementations are stateless wrappers around a tree-sitter `Parser` plus
-/// pre-compiled `Query` objects for symbols / imports / references. Each
-/// `extract_*` call parses fresh from `content` because we don't cache parsed
-/// trees across files.
-#[allow(dead_code)] // Trait is wired up incrementally; first impl arrives with `parsing/rust.rs`.
-pub trait LanguageBackend: Send + Sync {
-    /// Stable language name (matches `indexed_files.language`, e.g. "rust").
-    fn language_name(&self) -> &'static str;
-
-    /// Extract symbol definitions from `content`. Returned `Symbol` rows have
-    /// `file_id = 0` placeholder; the caller fills it in before persisting.
-    fn extract_symbols(&self, content: &str) -> Vec<Symbol>;
-
-    /// Extract import statements. Each `Import.target_raw` is the canonical
-    /// resolvable form for this language (Rust path, Python module, JS specifier).
-    fn extract_imports(&self, content: &str) -> Vec<Import>;
-
-    /// Extract symbol-reference edges. Returned `SymbolReference` rows have
-    /// `source_file_id = 0`/`target_*_id = None` placeholders; the cron job
-    /// resolves `target_symbol_id` by joining `target_raw` against
-    /// `file_symbols.name` after symbol persistence.
-    fn extract_references(&self, content: &str) -> Vec<SymbolReference>;
-}
-
-/// Registry: dispatches a language string to the matching backend, or `None`
-/// when no backend has been wired yet. The cron job uses the `None` arm to
-/// fall back to the regex-based `src/graph/import_extractor.rs`.
-#[allow(dead_code)] // Used by the future symbol-extraction cron job.
-pub struct LanguageRegistry;
-
-#[allow(dead_code)]
-impl LanguageRegistry {
-    /// Resolve a language name (matching `indexed_files.language`) to its
-    /// backend. Returns `None` for languages whose backend hasn't landed yet.
-    pub fn for_language(language: &str) -> Option<&'static dyn LanguageBackend> {
-        match language {
-            "rust" => Some(&rust::RUST_BACKEND),
-            "python" => Some(&python::PYTHON_BACKEND),
-            "javascript" => Some(&javascript::JS_BACKEND),
-            "typescript" => Some(&javascript::TS_BACKEND),
-            "tsx" => Some(&javascript::TSX_BACKEND),
-            "java" => Some(&java::JAVA_BACKEND),
-            "scala" => Some(&scala::SCALA_BACKEND),
-            "c" => Some(&c_cpp::C_BACKEND),
-            "cpp" => Some(&c_cpp::CPP_BACKEND),
-            "rholang" => Some(&rholang::RHOLANG_BACKEND),
-            "clojure" => Some(&clojure::CLOJURE_BACKEND),
-            "clojurescript" => Some(&clojure::CLOJURESCRIPT_BACKEND),
-            _ => None,
-        }
-    }
-
-    /// Whether *any* backend is available. Used by tools that emit a
-    /// `health.symbols_present` envelope to differentiate "no backend
-    /// implemented yet" from "backend exists but no symbols extracted".
-    pub fn any_backend_available() -> bool {
-        true
-    }
-}
 
 #[cfg(test)]
 mod tests {

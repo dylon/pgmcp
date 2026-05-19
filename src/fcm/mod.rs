@@ -2,9 +2,9 @@
 //!
 //! This module is the **swap seam** between compute backends. The primary
 //! path is CUDA (cuBLAS GEMM + a nvcc-compiled fused post-GEMM reduction
-//! kernel). The CPU backend exists only as a runtime fallback when CUDA
-//! initialization fails. A future third backend (Metal, ROCm, …) would plug
-//! in as a new `FcmBackend` impl without touching callers.
+//! kernel). The CPU backend exists for deterministic tests and explicit
+//! diagnostic callers; production CUDA construction failures are surfaced
+//! instead of silently falling back.
 //!
 //! ## Design choices
 //!
@@ -101,11 +101,11 @@ impl GpuPrecision {
 /// Construction-time backend selector.
 #[derive(Debug, Clone, Copy)]
 pub enum BackendChoice {
-    /// Try CUDA with the given precision. On construction failure,
-    /// `make_backend` falls back to CPU and logs a warning.
+    /// Try CUDA with the given precision. Construction failure is returned to
+    /// the caller; production code must not silently fall back to CPU.
     Cuda(GpuPrecision),
-    /// Force the CPU backend. Used by tests and by the dispatcher's
-    /// fallback path.
+    /// Force the CPU backend. Used by deterministic tests and explicit
+    /// diagnostics.
     Cpu,
 }
 
@@ -172,9 +172,7 @@ pub trait FcmBackend: Send {
 // Backend factory
 // ============================================================================
 
-/// Construct a backend honoring `choice`. When `choice` is `Cuda(...)` and
-/// CUDA init fails, logs a warning and returns a CPU backend — this is the
-/// runtime CPU-fallback hook.
+/// Construct a backend honoring `choice`.
 pub fn make_backend(
     data: Array2<f32>,
     k: usize,
@@ -184,16 +182,9 @@ pub fn make_backend(
         BackendChoice::Cuda(precision) => {
             let max_abs = data.iter().fold(0.0f32, |a, &b| a.max(b.abs()));
             let adjusted = precision.auto_adjust_for_un_normalized(max_abs);
-            match cuda::CudaFcmBackend::new(&data, k, adjusted) {
-                Ok(b) => {
-                    info!(backend = b.name(), n = data.nrows(), k, "FCM backend: CUDA");
-                    Ok(Box::new(b))
-                }
-                Err(e) => {
-                    warn!(error = %e, "CUDA backend init failed; falling back to CPU");
-                    Ok(Box::new(cpu::CpuFcmBackend::new(data, k)?))
-                }
-            }
+            let b = cuda::CudaFcmBackend::new(&data, k, adjusted)?;
+            info!(backend = b.name(), n = data.nrows(), k, "FCM backend: CUDA");
+            Ok(Box::new(b))
         }
         BackendChoice::Cpu => {
             info!(n = data.nrows(), k, "FCM backend: CPU");

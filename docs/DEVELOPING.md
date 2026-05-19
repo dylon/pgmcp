@@ -4,12 +4,10 @@
 
 - Rust 1.85+ (edition 2024)
 - PostgreSQL 15+ with `pgvector` and `pg_trgm` extensions
-- AOCL-BLIS (for ndarray BLAS on the CPU fallback; Arch: `pacman -S aocl-blis`)
+- AOCL-BLIS (for ndarray BLAS used by deterministic CPU FCM tests; Arch: `pacman -S aocl-blis`)
 - **CUDA toolkit 12+ with `nvcc` on PATH, plus an NVIDIA GPU.** CUDA is
-  mandatory. There is no CPU-only build mode; `Cargo.toml` has no
-  `[features]` table. The daemon's `src/fcm/` module provides a CPU
-  fallback at runtime if GPU init fails, but the CPU path is not a
-  build-time configuration.
+  mandatory. There is no CPU-only build mode; `Cargo.toml` has no crate
+  feature flags. Production compute paths fail closed when GPU init fails.
 
 ## First-clone setup
 
@@ -33,12 +31,12 @@ script exits non-zero on the first failure.
 | 2 | `cargo build --all-targets` | Full build (nvcc runs in build.rs) |
 | 3 | `cargo clippy --all-targets -- -D warnings` | Lints clean |
 | 4 | `cargo test --release --bin pgmcp` | Unit / proptest suite |
-| 5 | `cargo test --release --test gpu_fallback_smoke -- --ignored` | GPU-init-failure → CPU-fallback path |
+| 5 | `cargo test --release --test gpu_fallback_smoke -- --ignored` | GPU-init-failure fail-closed behavior |
 | 6 | `cargo smoke` | GPU smoke scenarios (`examples/gpu_smoke.rs`) |
 
 All six gates require a working CUDA toolkit and GPU. Gate 5 intentionally
-forces GPU-unavailable via `CUDA_VISIBLE_DEVICES=""` to exercise the CPU
-fallback inside `src/fcm/make_backend`.
+forces GPU-unavailable via `CUDA_VISIBLE_DEVICES=""` to verify that production
+FCM returns a degenerate result instead of silently switching to CPU.
 
 ## Adding a compile-time choice
 

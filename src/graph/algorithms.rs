@@ -8,7 +8,7 @@ use petgraph::algo::tarjan_scc;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 
-use super::{CodeGraph, EdgeWeight, FileNode};
+use super::types::{CodeGraph, EdgeWeight, FileNode};
 
 /// PageRank scores per node.
 pub struct PageRankResult {

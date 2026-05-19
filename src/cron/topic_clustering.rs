@@ -22,7 +22,7 @@ use crate::fcm;
 use crate::stats::tracker::StatsTracker;
 
 // Re-exports so existing callers in the topic_hierarchy / k_selector /
-// topic_clustering_online / gpu_smoke / gpu_fallback_smoke modules keep
+// topic_clustering_online / gpu_smoke modules keep
 // their current import paths (`use crate::cron::topic_clustering::FcmResult`
 // etc.). The canonical definitions live in `crate::fcm`.
 pub use crate::fcm::{CancelFn, FcmResult, GpuPrecision, kmeans_plus_plus_init};
@@ -110,7 +110,7 @@ pub fn estimate_k(n: usize, min_cluster_size: usize) -> usize {
 /// Thin adapter over [`crate::fcm::run_seeded`] — constructs a CUDA backend with
 /// fp32 precision (mid-iteration arithmetic stays in f32, which matches the
 /// precision callers expect from the pre-backend CPU path) and runs the
-/// canonical FCM iteration loop. On CUDA init failure, falls back to CPU.
+/// canonical FCM iteration loop. On CUDA failure, returns a degenerate result.
 ///
 /// The cron path goes through `dispatch_fcm` which honours
 /// `CronConfig.gpu_fcm_precision` (default fp16) — that is where the fp16
@@ -128,8 +128,8 @@ pub fn fuzzy_c_means(
 }
 
 /// Route FCM through the backend seam picked by `params.gpu_fcm_precision`.
-/// On CUDA-init failure, `make_backend` logs a warning and returns a
-/// `CpuFcmBackend`; mid-iteration CUDA errors propagate as `FcmError`.
+/// CUDA-init and mid-iteration CUDA errors are surfaced as degenerate results;
+/// production topic scans do not silently fall back to CPU.
 fn dispatch_fcm(
     data: ArrayView2<'_, f32>,
     k: usize,
@@ -225,11 +225,9 @@ pub fn fuzzy_c_means_seeded(
 }
 
 /// Shared body: build a backend with the requested choice, then run the
-/// canonical FCM loop in `crate::fcm::run_seeded`. On any error (backend
-/// construction, mid-iteration kernel launch), log and fall back to CPU —
-/// the fallback goes through a fresh `CpuFcmBackend` constructed from
-/// a full data clone, so callers always see an `FcmResult` (never propagate
-/// `FcmError`).
+/// canonical FCM loop in `crate::fcm::run_seeded`. On any production CUDA
+/// error, return a degenerate result so downstream code skips topic
+/// construction rather than silently changing compute backends.
 #[allow(clippy::too_many_arguments)]
 fn run_through_backend(
     data: ArrayView2<'_, f32>,
@@ -242,15 +240,10 @@ fn run_through_backend(
     choice: fcm::BackendChoice,
     seed: Option<u64>,
 ) -> FcmResult {
-    let data_owned = data.to_owned();
-
-    // Build backend. `make_backend` handles CUDA → CPU fallback on init
-    // failure internally. Only Config errors can still escape, which would
-    // only happen if k/n are invalid — bail with a degenerate (empty) result.
-    let mut backend = match fcm::make_backend(data_owned.clone(), k, choice) {
+    let mut backend = match fcm::make_backend(data.to_owned(), k, choice) {
         Ok(b) => b,
         Err(e) => {
-            warn!(error = %e, "backend construction failed entirely");
+            warn!(error = %e, "FCM backend construction failed");
             return degenerate_result(data.nrows(), data.ncols(), k);
         }
     };
@@ -268,32 +261,8 @@ fn run_through_backend(
     ) {
         Ok(r) => r,
         Err(e) => {
-            warn!(
-                error = %e,
-                "CUDA FCM failed mid-iteration; retrying on CPU backend"
-            );
-            // Retry on CPU with a fresh backend.
-            match fcm::make_backend(data_owned, k, fcm::BackendChoice::Cpu) {
-                Ok(mut cpu_backend) => fcm::run_seeded(
-                    &mut *cpu_backend,
-                    data,
-                    k,
-                    m,
-                    max_iters,
-                    tolerance,
-                    should_cancel,
-                    warm_centroids,
-                    seed,
-                )
-                .unwrap_or_else(|e| {
-                    error!(error = %e, "CPU backend also failed");
-                    degenerate_result(data.nrows(), data.ncols(), k)
-                }),
-                Err(e) => {
-                    error!(error = %e, "CPU backend construction failed");
-                    degenerate_result(data.nrows(), data.ncols(), k)
-                }
-            }
+            error!(error = %e, "FCM run failed");
+            degenerate_result(data.nrows(), data.ncols(), k)
         }
     }
 }
@@ -729,8 +698,8 @@ struct FcmParams {
     tolerance: f64,
     membership_threshold: f64,
     label_top_k: usize,
-    /// Phase 5: GPU precision selector ("fp32" | "fp16" | "bf16"). Read in
-    /// `dispatch_fcm` to pick the GPU backend; ignored on the CPU path.
+    /// GPU precision selector ("fp32" | "fp16" | "bf16"). Read in
+    /// `dispatch_fcm` to pick the CUDA backend.
     gpu_fcm_precision: String,
     /// Phase 12: adaptive K selector config.
     k_selector: String,
@@ -934,6 +903,20 @@ fn cluster_embeddings(
     params: &FcmParams,
     scope: &str,
 ) -> ClusteringSummary {
+    cluster_embeddings_with_runner(rows, params, scope, |data, k, params, warm_centroids| {
+        dispatch_fcm(data, k, params, warm_centroids)
+    })
+}
+
+fn cluster_embeddings_with_runner<F>(
+    rows: &[ChunkEmbeddingRow],
+    params: &FcmParams,
+    scope: &str,
+    mut run_fcm: F,
+) -> ClusteringSummary
+where
+    F: for<'a> FnMut(ArrayView2<'a, f32>, usize, &FcmParams, Option<Array2<f32>>) -> FcmResult,
+{
     if rows.is_empty() {
         return ClusteringSummary {
             scope: scope.to_string(),
@@ -983,12 +966,7 @@ fn cluster_embeddings(
     };
 
     // Run FCM (f32 internals, preallocated buffers, ping-pong membership).
-    // Phase 5: GPU dispatch when cuda feature is compiled in AND
-    // precision != "fp32" (fp32 CPU path is already competitive).
-    // Warm-start centroids are an optimisation for CPU path; GPU path
-    // always starts from k-means++ for simplicity (warm-start on GPU
-    // requires plumbing initial_centroids into GpuFcm::new).
-    let fcm_result = dispatch_fcm(data.view(), k, params, warm_centroids);
+    let fcm_result = run_fcm(data.view(), k, params, warm_centroids);
 
     // Phase 7: persist final centroids for next-run warm-start.
     if params.lmdb_enabled {
@@ -2426,6 +2404,53 @@ pub async fn run_project_topic_scan(
 mod tests {
     use super::*;
 
+    fn test_fcm(
+        data: ndarray::ArrayView2<'_, f32>,
+        k: usize,
+        m: f64,
+        max_iters: usize,
+        tolerance: f64,
+    ) -> FcmResult {
+        fuzzy_c_means_seeded(data, k, m, max_iters, tolerance, 42)
+    }
+
+    fn test_fcm_with_cancel(
+        data: ndarray::ArrayView2<'_, f32>,
+        k: usize,
+        m: f64,
+        max_iters: usize,
+        tolerance: f64,
+        should_cancel: CancelFn<'_>,
+    ) -> FcmResult {
+        run_through_backend(
+            data,
+            k,
+            m,
+            max_iters,
+            tolerance,
+            should_cancel,
+            None,
+            fcm::BackendChoice::Cpu,
+            Some(42),
+        )
+    }
+
+    fn cluster_embeddings_for_tests(
+        rows: &[ChunkEmbeddingRow],
+        params: &FcmParams,
+        scope: &str,
+    ) -> ClusteringSummary {
+        cluster_embeddings_with_runner(rows, params, scope, |data, k, params, _warm| {
+            test_fcm(
+                data,
+                k,
+                params.fuzziness,
+                params.max_iters,
+                params.tolerance,
+            )
+        })
+    }
+
     // ----- Phase 9: pure helpers extracted from run_global_topic_scan -----
 
     fn cron_config_with_thresholds(mmap: usize, online: usize) -> CronConfig {
@@ -2596,7 +2621,7 @@ mod tests {
             data[[i, 3]] = 0.01 * (i - 20) as f32;
         }
 
-        let result = fuzzy_c_means(data.view(), 2, 2.0, 100, 1e-5, None);
+        let result = test_fcm(data.view(), 2, 2.0, 100, 1e-5);
         assert!(
             result.converged,
             "FCM should converge on well-separated blobs"
@@ -2651,7 +2676,7 @@ mod tests {
         data[[20, 0]] = 0.0;
         data[[20, 1]] = 0.0;
 
-        let result = fuzzy_c_means(data.view(), 2, 2.0, 100, 1e-5, None);
+        let result = test_fcm(data.view(), 2, 2.0, 100, 1e-5);
 
         // Boundary point should have split membership (close to 0.5/0.5)
         let mu0 = result.membership[[20, 0]];
@@ -2668,7 +2693,7 @@ mod tests {
     fn test_fcm_convergence() {
         let data: Array2<f32> =
             Array2::from_shape_fn((50, 10), |(i, j)| ((i * 7 + j * 3) % 100) as f32 / 100.0);
-        let result = fuzzy_c_means(data.view(), 3, 2.0, 200, 1e-5, None);
+        let result = test_fcm(data.view(), 3, 2.0, 200, 1e-5);
         assert!(result.iterations <= 200);
         // Membership rows should sum to ~1.0 (f32 tolerance)
         for i in 0..50 {
@@ -2691,7 +2716,7 @@ mod tests {
             cancelled.store(true, std::sync::atomic::Ordering::Release);
             true
         };
-        let result = fuzzy_c_means(data.view(), 3, 2.0, 100, 1e-5, Some(cancel_fn));
+        let result = test_fcm_with_cancel(data.view(), 3, 2.0, 100, 1e-5, Some(cancel_fn));
         assert!(result.cancelled, "FCM should report cancelled=true");
         assert!(cancelled.load(std::sync::atomic::Ordering::Acquire));
         assert!(
@@ -2807,7 +2832,7 @@ mod tests {
             data[[i, 2]] = 10.0 + 0.01 * (i - 10) as f32;
         }
 
-        let result = fuzzy_c_means(data.view(), 2, 2.0, 100, 1e-5, None);
+        let result = test_fcm(data.view(), 2, 2.0, 100, 1e-5);
 
         // Count assignments above threshold 0.05
         let threshold = 0.05;
@@ -2837,9 +2862,7 @@ mod tests {
             tolerance: 1e-5,
             membership_threshold: 0.05,
             label_top_k: 5,
-            // Tests run small-n datasets that fall under GPU_DISPATCH_MIN_N
-            // anyway, so this string only matters for code coverage of the
-            // dispatch path. "fp32" pins behavior to the CPU branch.
+            // Tests use fp32 for deterministic CUDA arithmetic.
             gpu_fcm_precision: "fp32".into(),
             k_selector: "xie_beni".into(),
             k_candidates: Vec::new(),
@@ -2856,7 +2879,7 @@ mod tests {
     fn test_cluster_embeddings_empty() {
         let rows: Vec<ChunkEmbeddingRow> = Vec::new();
         let params = test_params(None, 5);
-        let summary = cluster_embeddings(&rows, &params, "test");
+        let summary = cluster_embeddings_for_tests(&rows, &params, "test");
         assert_eq!(summary.topics_found, 0);
         assert_eq!(summary.chunks_analyzed, 0);
     }
@@ -2898,7 +2921,7 @@ mod tests {
         }
 
         let params = test_params(Some(2), 3);
-        let summary = cluster_embeddings(&rows, &params, "test");
+        let summary = cluster_embeddings_for_tests(&rows, &params, "test");
         assert_eq!(summary.chunks_analyzed, 20);
         assert!(
             summary.topics_found >= 1,
@@ -2975,7 +2998,7 @@ mod tests {
             d in 2usize..5,
         ) {
             let data = make_blobs(k, pts, d);
-            let result = fuzzy_c_means(data.view(), k, 2.0, 30, 1e-4, None);
+            let result = test_fcm(data.view(), k, 2.0, 30, 1e-4);
             for i in 0..result.membership.nrows() {
                 let sum: f32 = result.membership.row(i).iter().sum();
                 prop_assert!((sum - 1.0).abs() < 1e-3,
@@ -2993,7 +3016,7 @@ mod tests {
             max_iters in 5usize..30,
         ) {
             let data = make_blobs(k, pts, d);
-            let result = fuzzy_c_means(data.view(), k, 2.0, max_iters, 1e-10, None);
+            let result = test_fcm(data.view(), k, 2.0, max_iters, 1e-10);
             prop_assert!(result.iterations <= max_iters,
                 "ran {} iterations but cap was {}", result.iterations, max_iters);
         }
@@ -3011,7 +3034,7 @@ mod tests {
             threshold_bps in 100u32..500u32,  // basis points → 0.01..0.05
         ) {
             let data = make_blobs(k, pts, d);
-            let result = fuzzy_c_means(data.view(), k, 2.0, 30, 1e-4, None);
+            let result = test_fcm(data.view(), k, 2.0, 30, 1e-4);
             let threshold = (threshold_bps as f32) * 0.0001;
             // For every row, find the primary membership. If above threshold,
             // it would be kept; if below, the chunk becomes noise.
@@ -3041,7 +3064,7 @@ mod tests {
             d in 2usize..4,
         ) {
             let data = make_blobs(k, pts, d);
-            let result = fuzzy_c_means(data.view(), k, 2.0, 30, 1e-4, None);
+            let result = test_fcm(data.view(), k, 2.0, 30, 1e-4);
             for &v in result.membership.iter() {
                 prop_assert!((-1e-5..=1.0 + 1e-5).contains(&v),
                     "membership {} outside [0, 1]", v);

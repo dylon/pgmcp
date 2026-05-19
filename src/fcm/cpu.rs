@@ -1,8 +1,9 @@
 //! CPU-only FCM backend.
 //!
-//! Used only as a runtime fallback when CUDA init fails. The two GEMMs run
-//! through `ndarray::linalg::general_mat_mul`, which dispatches to AOCL-BLIS
-//! (libblis-mt) via cblas-sys; the link directive lives in `build.rs`.
+//! Used by deterministic tests and explicit diagnostics. Production callers
+//! request the CUDA backend and surface CUDA initialization failures. The two
+//! GEMMs run through `ndarray::linalg::general_mat_mul`, which dispatches to
+//! AOCL-BLIS (libblis-mt) via cblas-sys; the link directive lives in `build.rs`.
 
 use ndarray::{Array1, Array2, Axis, linalg::general_mat_mul};
 

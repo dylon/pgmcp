@@ -1,10 +1,8 @@
 use std::io::Read;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
-
-use wait_timeout::ChildExt;
 
 use super::ExtractError;
 
@@ -120,7 +118,7 @@ pub(super) fn run_bounded(
             }
         }
     } else {
-        match child.wait_timeout(remaining) {
+        match wait_child_until(&mut child, Instant::now() + remaining) {
             Ok(Some(s)) => s,
             Ok(None) => {
                 let _ = child.kill();
@@ -162,6 +160,21 @@ pub(super) fn run_bounded(
         stderr: stderr_buf,
         truncated,
     })
+}
+
+fn wait_child_until(child: &mut Child, deadline: Instant) -> std::io::Result<Option<ExitStatus>> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+
+        let now = Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+
+        std::thread::sleep((deadline - now).min(Duration::from_millis(10)));
+    }
 }
 
 /// Convenience: invoke a CLI tool with the given args, returning the

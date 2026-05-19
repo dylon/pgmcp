@@ -15,6 +15,8 @@ use tracing::{debug, error, info, warn};
 use crate::context::SystemContext;
 use crate::mcp::server::*;
 
+const DEBT_MARKER_PATTERN: &str = r"(?i)\b(TODO|FIXME|HACK|XXX|TEMP|WORKAROUND)\b";
+
 pub async fn tool_technical_debt_analysis(
     ctx: &SystemContext,
     params: TechnicalDebtAnalysisParams,
@@ -69,8 +71,7 @@ pub async fn tool_technical_debt_analysis(
         )]));
     }
 
-    let todo_re =
-        regex::Regex::new(r"(?i)(TODO|FIXME|HACK|XXX|TEMP|WORKAROUND)").expect("valid regex");
+    let todo_re = regex::Regex::new(DEBT_MARKER_PATTERN).expect("valid regex");
     let branch_re =
         regex::Regex::new(r"(?m)^\s*(if|else\s+if|elif|for|while|match|case|catch|except)\b")
             .expect("valid regex");
@@ -172,4 +173,28 @@ pub async fn tool_technical_debt_analysis(
     );
 
     Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DEBT_MARKER_PATTERN;
+
+    #[test]
+    fn debt_marker_regex_does_not_match_temp_substrings() {
+        let re = regex::Regex::new(DEBT_MARKER_PATTERN).expect("valid regex");
+
+        assert!(!re.is_match("let file = tempfile::NamedTempFile::new();"));
+        assert!(!re.is_match("render_template(ctx)"));
+        assert!(!re.is_match("temporary staging variable"));
+    }
+
+    #[test]
+    fn debt_marker_regex_matches_explicit_markers() {
+        let re = regex::Regex::new(DEBT_MARKER_PATTERN).expect("valid regex");
+
+        assert!(re.is_match("// TODO: tighten this"));
+        assert!(re.is_match("// FIXME handle error"));
+        assert!(re.is_match("// TEMP cache until migration"));
+        assert!(re.is_match("// WORKAROUND for upstream bug"));
+    }
 }

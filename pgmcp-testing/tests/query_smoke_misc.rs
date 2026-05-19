@@ -88,21 +88,46 @@ async fn pool_health_check_smoke() {
 
 #[tokio::test]
 async fn pool_create_pool_smoke() {
-    // Probe via the same DB the test harness is using. We extract host /
-    // port / user from the test config so the test doesn't hard-code.
-    // The harness sets up `test-config.toml` so the same file works here.
-    let cfg_path = std::env::var("PGMCP_TEST_DATABASE_URL").ok();
-    let db_cfg = if let Some(_url) = cfg_path {
-        // Env-var path → parse a minimal config object.
-        // Fall back to default (peer auth on localhost) — the test DB
-        // was already opened by `require_test_db!`.
-        pgmcp::config::DatabaseConfig::default()
-    } else {
-        pgmcp::config::DatabaseConfig::default()
-    };
+    let db = require_test_db!();
+    let db_cfg = database_config_from_url(&db.connection_url());
     let _ = pool::create_pool(&db_cfg)
         .await
         .expect("create_pool must succeed using the same DB the harness uses");
+}
+
+fn database_config_from_url(url: &str) -> pgmcp::config::DatabaseConfig {
+    let without_scheme = url
+        .strip_prefix("postgres://")
+        .expect("test harness uses postgres:// URLs");
+    let (authority, name) = without_scheme
+        .rsplit_once('/')
+        .expect("test harness URL includes database name");
+    let (userinfo, host_port) = authority
+        .rsplit_once('@')
+        .map_or((None, authority), |(user, host)| (Some(user), host));
+    let (user, password) = match userinfo.and_then(|u| u.split_once(':')) {
+        Some((user, password)) => (user.to_string(), Some(password.to_string())),
+        None => (
+            userinfo
+                .map(str::to_string)
+                .unwrap_or_else(|| pgmcp::config::DatabaseConfig::default().user),
+            None,
+        ),
+    };
+    let (host, port) = host_port
+        .rsplit_once(':')
+        .map_or((host_port, 5432), |(h, p)| {
+            (h, p.parse::<u16>().expect("test DB port is numeric"))
+        });
+
+    pgmcp::config::DatabaseConfig {
+        host: host.to_string(),
+        port,
+        name: name.to_string(),
+        user,
+        password,
+        max_connections: 1,
+    }
 }
 
 // =============================================================================
