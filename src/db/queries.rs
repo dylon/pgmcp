@@ -3880,6 +3880,13 @@ pub async fn batch_find_cross_project_neighbors(
     sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
         .execute(&mut *tx)
         .await?;
+    // The cross-project nearest-neighbor batch can legitimately run
+    // longer than the daemon-wide statement_timeout on large indexes
+    // (HNSW scan × 500-row batches). Raise the ceiling for this
+    // transaction only.
+    sqlx::query("SET LOCAL statement_timeout = '5min'")
+        .execute(&mut *tx)
+        .await?;
 
     // Worktree-awareness: skip pairs whose two projects are different
     // worktrees / sibling clones of the same upstream repo (same
@@ -6020,7 +6027,14 @@ pub async fn load_chunk_topic_assignments_for_files(
     pool: &PgPool,
     project: Option<&str>,
 ) -> Result<Vec<FileTopicRow>, sqlx::Error> {
-    if let Some(proj) = project {
+    // The five-way join + GROUP BY can scan the full chunk_topic_assignments
+    // table; raise the per-transaction ceiling so the daemon-wide
+    // statement_timeout doesn't fire mid-aggregation on large projects.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '2min'")
+        .execute(&mut *tx)
+        .await?;
+    let results = if let Some(proj) = project {
         sqlx::query_as::<_, FileTopicRow>(
             "SELECT f.path, p.name as project_name, ct.label as topic_label,
                     ct.id as topic_id, COUNT(*) as chunks_in_topic
@@ -6034,8 +6048,8 @@ pub async fn load_chunk_topic_assignments_for_files(
              ORDER BY f.path, chunks_in_topic DESC",
         )
         .bind(proj)
-        .fetch_all(pool)
-        .await
+        .fetch_all(&mut *tx)
+        .await?
     } else {
         sqlx::query_as::<_, FileTopicRow>(
             "SELECT f.path, p.name as project_name, ct.label as topic_label,
@@ -6048,9 +6062,11 @@ pub async fn load_chunk_topic_assignments_for_files(
              GROUP BY f.path, p.name, ct.label, ct.id
              ORDER BY f.path, chunks_in_topic DESC",
         )
-        .fetch_all(pool)
-        .await
-    }
+        .fetch_all(&mut *tx)
+        .await?
+    };
+    tx.commit().await?;
+    Ok(results)
 }
 
 /// Co-change coupled file pair from git history.

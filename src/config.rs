@@ -819,6 +819,45 @@ pub struct DatabaseConfig {
     pub password: Option<String>,
     #[serde(default = "default_max_connections")]
     pub max_connections: u32,
+
+    /// Server-side `statement_timeout` applied to every pooled connection.
+    /// Stops runaway analytic queries from holding a connection + locks for
+    /// hours. Long-running cron queries that legitimately exceed this raise
+    /// it via `SET LOCAL statement_timeout` inside their own transaction.
+    #[serde(default = "default_statement_timeout_ms")]
+    pub statement_timeout_ms: u32,
+
+    /// Server-side `idle_in_transaction_session_timeout`. Caps the window
+    /// during which a misbehaving caller can keep a transaction open
+    /// without doing work — Postgres terminates the session past this.
+    #[serde(default = "default_idle_in_transaction_timeout_ms")]
+    pub idle_in_transaction_timeout_ms: u32,
+
+    /// Server-side `lock_timeout`. Caps the time a query waits to acquire
+    /// any individual lock. Avoids unbounded wait on a long-running DDL
+    /// or vacuum holding a conflicting lock.
+    #[serde(default = "default_lock_timeout_ms")]
+    pub lock_timeout_ms: u32,
+
+    /// `sqlx` pool-level `idle_timeout`. Connections idle longer than
+    /// this are returned to the OS, forcing reconnects through natural
+    /// churn instead of waiting for a Postgres-restart cliff to surface
+    /// stale connections.
+    #[serde(default = "default_pool_idle_timeout_secs")]
+    pub pool_idle_timeout_secs: u64,
+
+    /// `sqlx` pool-level `max_lifetime`. Connections older than this are
+    /// recycled regardless of activity. Bounds long-term resource drift
+    /// in pgbouncer/pgpool middle-tier scenarios.
+    #[serde(default = "default_pool_max_lifetime_secs")]
+    pub pool_max_lifetime_secs: u64,
+
+    /// `sqlx` `test_before_acquire`. Issues `SELECT 1` on each checkout
+    /// to confirm the connection is alive; trades one round-trip for the
+    /// guarantee that the caller doesn't get a dead connection after
+    /// Postgres restarts.
+    #[serde(default = "default_test_before_acquire")]
+    pub test_before_acquire: bool,
 }
 
 impl Default for DatabaseConfig {
@@ -830,6 +869,12 @@ impl Default for DatabaseConfig {
             user: default_db_user(),
             password: None,
             max_connections: default_max_connections(),
+            statement_timeout_ms: default_statement_timeout_ms(),
+            idle_in_transaction_timeout_ms: default_idle_in_transaction_timeout_ms(),
+            lock_timeout_ms: default_lock_timeout_ms(),
+            pool_idle_timeout_secs: default_pool_idle_timeout_secs(),
+            pool_max_lifetime_secs: default_pool_max_lifetime_secs(),
+            test_before_acquire: default_test_before_acquire(),
         }
     }
 }
@@ -883,6 +928,24 @@ fn default_db_user() -> String {
 }
 fn default_max_connections() -> u32 {
     20
+}
+fn default_statement_timeout_ms() -> u32 {
+    30_000
+}
+fn default_idle_in_transaction_timeout_ms() -> u32 {
+    60_000
+}
+fn default_lock_timeout_ms() -> u32 {
+    5_000
+}
+fn default_pool_idle_timeout_secs() -> u64 {
+    1_800
+}
+fn default_pool_max_lifetime_secs() -> u64 {
+    7_200
+}
+fn default_test_before_acquire() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

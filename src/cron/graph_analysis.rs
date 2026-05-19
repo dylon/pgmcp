@@ -538,6 +538,15 @@ async fn compute_and_store_cochange_edges(
         .execute(pool)
         .await?;
 
+    // The Jaccard aggregation is O(commits × files²) on the PG side and
+    // can pin a connection for several minutes on large histories. Raise
+    // the per-transaction statement_timeout so the daemon-wide ceiling
+    // doesn't fire mid-compute.
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '10min'")
+        .execute(&mut *tx)
+        .await?;
+
     // Compute Jaccard similarity from git_commit_files
     let pairs = sqlx::query_as::<_, CoChangePairDb>(
         "WITH file_commits AS (
@@ -566,8 +575,9 @@ async fn compute_and_store_cochange_edges(
     )
     .bind(project_id)
     .bind(min_jaccard)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     // Resolve file paths to IDs using the in-memory map (no per-pair SELECTs).
     // Build parallel Vecs for a single UNNEST-based batch INSERT.

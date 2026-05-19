@@ -12,11 +12,9 @@
 
 use std::path::Path;
 
+use crate::config::Config;
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
-use sqlx::postgres::PgPoolOptions;
-
-use crate::config::Config;
 
 /// Top-level request entry. `model` filters the rendered sections;
 /// `json` prints the full snapshot as pretty JSON regardless of model.
@@ -234,10 +232,12 @@ pub struct GitProjectStat {
 // ============================================================================
 
 async fn fallback_snapshot(config: &Config) -> anyhow::Result<StatusResponse> {
-    let pool = PgPoolOptions::new()
-        .max_connections(2)
-        .connect(&config.database.connection_url())
-        .await?;
+    // Route through `create_pool` so the fallback inherits the same
+    // session timeouts and acquire safeguards as the daemon pool — a
+    // status check should fail fast on a degraded DB, not hang.
+    let mut db_cfg = config.database.clone();
+    db_cfg.max_connections = 2;
+    let pool = crate::db::pool::create_pool(&db_cfg).await?;
 
     let snap = crate::db::queries::status_snapshot(&pool).await?;
     let pool_size = pool.size();

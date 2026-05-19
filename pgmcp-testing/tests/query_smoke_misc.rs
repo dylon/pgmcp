@@ -127,6 +127,7 @@ fn database_config_from_url(url: &str) -> pgmcp::config::DatabaseConfig {
         user,
         password,
         max_connections: 1,
+        ..pgmcp::config::DatabaseConfig::default()
     }
 }
 
