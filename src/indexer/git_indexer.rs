@@ -144,7 +144,27 @@ pub async fn index_git_history(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(project = %project_root.display(), stderr = %stderr, "git log failed");
+        // Classify the git stderr — if it's a permanent fault for this
+        // project (e.g. the on-disk `.git/` corrupted in a way that
+        // makes git refuse to operate on it), mark the cron job as
+        // disabled so the scheduler stops retrying every hour.
+        let action = crate::cron::shutdown::classify_git_error(&stderr);
+        warn!(
+            project = %project_root.display(),
+            stderr = %stderr,
+            action = ?action,
+            "git log failed"
+        );
+        if action == crate::cron::shutdown::CronAction::Disable {
+            stats.disable_cron_job(
+                "git-history-index",
+                format!(
+                    "permanent git fault in {}: {}",
+                    project_root.display(),
+                    stderr.lines().next().unwrap_or("").trim()
+                ),
+            );
+        }
         return Ok(());
     }
 

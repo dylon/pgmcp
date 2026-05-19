@@ -348,10 +348,26 @@ impl CronStateMachine {
         queue: &mut BinaryHeap<ScheduledTask>,
         stats: &Option<Arc<StatsTracker>>,
     ) {
+        let task_name = task.metadata.name().to_string();
+
+        // Skip-check: if a previous run of this cron body classified a
+        // permanent fault via `CronAction::Disable`, don't re-run.
+        // Re-queue the recurrence so the scheduler keeps tracking the
+        // job (and operators can see the "disabled" state next to the
+        // last-known outcome), but don't burn cycles invoking it.
+        if let Some(s) = stats
+            && s.is_cron_job_disabled(&task_name)
+        {
+            if let Some(interval) = task.metadata.recurrence_interval() {
+                task.scheduled_time_ms = now_ms() + interval;
+                queue.push(task);
+            }
+            return;
+        }
+
         let started = Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (task.task)()));
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let task_name = task.metadata.name().to_string();
 
         if let Some(s) = stats {
             s.cron_executions.fetch_add(1, AtomicOrdering::Relaxed);
@@ -743,6 +759,27 @@ pub fn schedule_maintenance_jobs(
                     };
                     let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_git));
                     let stats = Arc::clone(&stats_for_git);
+
+                    // Once-per-tick `git` binary preflight. A missing `git`
+                    // is a permanent fault for this cron — keep retrying
+                    // would just log-spam at every interval until daemon
+                    // restart. `classify_io_error` maps `NotFound` to
+                    // `Disable`; we record the reason on the stats tracker
+                    // so the scheduler skip-check elides future runs.
+                    if let Err(io_err) = std::process::Command::new("git").arg("--version").output()
+                        && crate::cron::shutdown::classify_io_error(&io_err)
+                            == crate::cron::shutdown::CronAction::Disable
+                    {
+                        let reason = format!("git binary unavailable: {io_err}");
+                        tracing::error!(
+                            job = "git-history-index",
+                            error = %io_err,
+                            "permanent fault — disabling cron job until daemon restart"
+                        );
+                        stats.disable_cron_job("git-history-index", reason);
+                        return;
+                    }
+
                     let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
                     let t0 = Instant::now();
                     rt.block_on(async {

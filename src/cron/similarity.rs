@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 use tracing::{error, info, warn};
 
 use crate::config::CronConfig;
-use crate::cron::shutdown::is_terminal_db_error;
+use crate::cron::shutdown::{CronAction, classify_db_error};
 use crate::daemon_state::DaemonLifecycle;
 use crate::db::DbClient;
 use crate::stats::tracker::StatsTracker;
@@ -81,7 +81,7 @@ pub async fn run_similarity_scan(
         {
             Ok(rows) => rows,
             Err(e) => {
-                if is_terminal_db_error(&e) {
+                if classify_db_error(&e) == CronAction::AbortRun {
                     warn!(
                         error = %e,
                         last_id,

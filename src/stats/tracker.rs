@@ -343,6 +343,13 @@ pub struct StatsTracker {
     /// `/api/status` poll always sees the actual last run, not a
     /// race-window-old value.
     pub last_cron_outcomes: DashMap<String, CronJobStatus>,
+    /// Cron jobs whose body classified a permanent fault
+    /// (`CronAction::Disable`) and which the scheduler must skip on
+    /// subsequent ticks. Cleared on daemon restart. The map value is a
+    /// short human-readable reason (e.g. "git binary missing") that
+    /// also surfaces in `/api/status` so operators can see why a job
+    /// stopped without grepping logs.
+    pub disabled_cron_jobs: DashMap<String, String>,
 
     // Work pool lifetime counters
     pub work_pool_tasks_completed: AtomicU64,
@@ -645,6 +652,7 @@ impl StatsTracker {
             inotify_overflows_total: AtomicU64::new(0),
             rag_search_failures_total: AtomicU64::new(0),
             last_cron_outcomes: DashMap::new(),
+            disabled_cron_jobs: DashMap::new(),
             watcher_events_received: AtomicU64::new(0),
             watcher_events_filtered: AtomicU64::new(0),
             watcher_events_debounced: AtomicU64::new(0),
@@ -781,6 +789,24 @@ impl StatsTracker {
         );
     }
 
+    /// Mark a named cron job as permanently disabled until daemon
+    /// restart. Idempotent — later calls overwrite the reason string.
+    /// Un-named tasks are skipped (same reasoning as
+    /// `record_cron_outcome`).
+    pub fn disable_cron_job(&self, name: &str, reason: impl Into<String>) {
+        if name == "one-shot" || name == "recurring" {
+            return;
+        }
+        self.disabled_cron_jobs
+            .insert(name.to_string(), reason.into());
+    }
+
+    /// True if this cron job has been disabled. Checked by the scheduler
+    /// before running each task body.
+    pub fn is_cron_job_disabled(&self, name: &str) -> bool {
+        self.disabled_cron_jobs.contains_key(name)
+    }
+
     /// Serialize `last_cron_outcomes` as a JSON object suitable for the
     /// top-level snapshot.
     fn cron_outcomes_snapshot(&self) -> serde_json::Value {
@@ -794,6 +820,18 @@ impl StatsTracker {
                     "at": v.at.to_rfc3339(),
                     "duration_ms": v.duration_ms,
                 }),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+
+    /// Serialize `disabled_cron_jobs` as a JSON object `{ name: reason }`.
+    fn disabled_cron_jobs_snapshot(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::with_capacity(self.disabled_cron_jobs.len());
+        for entry in self.disabled_cron_jobs.iter() {
+            map.insert(
+                entry.key().clone(),
+                serde_json::Value::String(entry.value().clone()),
             );
         }
         serde_json::Value::Object(map)
@@ -891,6 +929,7 @@ impl StatsTracker {
             "inotify_overflows_total": self.inotify_overflows_total.load(Ordering::Acquire),
             "rag_search_failures_total": self.rag_search_failures_total.load(Ordering::Acquire),
             "last_cron_outcomes": self.cron_outcomes_snapshot(),
+            "disabled_cron_jobs": self.disabled_cron_jobs_snapshot(),
             "embed_errors": self.embed_errors.load(Ordering::Acquire),
             "watcher_events_received": self.watcher_events_received.load(Ordering::Acquire),
             "watcher_events_filtered": self.watcher_events_filtered.load(Ordering::Acquire),
@@ -1028,6 +1067,46 @@ mod tests {
             .expect("entry present");
         assert_eq!(entry.value().outcome, CronJobOutcome::Panicked);
         assert_eq!(entry.value().duration_ms, 50);
+    }
+
+    #[test]
+    fn disable_cron_job_records_reason_and_is_observable() {
+        let stats = StatsTracker::new();
+        assert!(!stats.is_cron_job_disabled("git-history-index"));
+        stats.disable_cron_job("git-history-index", "git binary missing");
+        assert!(stats.is_cron_job_disabled("git-history-index"));
+        let reason = stats
+            .disabled_cron_jobs
+            .get("git-history-index")
+            .expect("entry present")
+            .value()
+            .clone();
+        assert_eq!(reason, "git binary missing");
+    }
+
+    #[test]
+    fn disable_cron_job_skips_unnamed_tasks() {
+        let stats = StatsTracker::new();
+        stats.disable_cron_job("one-shot", "should be ignored");
+        stats.disable_cron_job("recurring", "should be ignored");
+        assert!(!stats.is_cron_job_disabled("one-shot"));
+        assert!(!stats.is_cron_job_disabled("recurring"));
+        assert_eq!(stats.disabled_cron_jobs.len(), 0);
+    }
+
+    #[test]
+    fn disabled_cron_jobs_appear_in_snapshot_json() {
+        let stats = StatsTracker::new();
+        stats.disable_cron_job("similarity-scan", "ENOSPC");
+        let snap = stats.snapshot();
+        let map = snap
+            .get("disabled_cron_jobs")
+            .and_then(|v| v.as_object())
+            .expect("snapshot has disabled_cron_jobs object");
+        assert_eq!(
+            map.get("similarity-scan").and_then(|v| v.as_str()),
+            Some("ENOSPC"),
+        );
     }
 
     #[test]
