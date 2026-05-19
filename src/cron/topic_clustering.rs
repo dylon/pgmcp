@@ -1243,6 +1243,7 @@ pub async fn run_global_topic_scan(
     db: &dyn DbClient,
     config: &CronConfig,
     stats: &Arc<StatsTracker>,
+    lifecycle: &crate::daemon_state::DaemonLifecycle,
 ) {
     let params = FcmParams::from_config(config);
     info!(
@@ -1273,7 +1274,7 @@ pub async fn run_global_topic_scan(
                     threshold = config.topic_mmap_n_threshold,
                     "Dispatching to mmap-streaming FCM for global topic scan"
                 );
-                run_mmap_global_topic_scan(db, config, stats, chunk_count).await;
+                run_mmap_global_topic_scan(db, config, stats, chunk_count, lifecycle).await;
                 return;
             }
             ScanStrategy::InMemory => { /* fall through to in-memory path */ }
@@ -1513,6 +1514,7 @@ async fn run_mmap_global_topic_scan(
     config: &CronConfig,
     stats: &Arc<StatsTracker>,
     n_total: usize,
+    lifecycle: &crate::daemon_state::DaemonLifecycle,
 ) {
     // Inline SQL not on the trait — escape hatch.
     let pool = db
@@ -1703,6 +1705,7 @@ async fn run_mmap_global_topic_scan(
         &chunk_metas,
         &fcm_result.membership,
         params.label_top_k,
+        lifecycle,
     )
     .await;
 
@@ -1790,11 +1793,17 @@ struct ChunkMetaLite {
 /// Streaming c-TF-IDF: fetches chunk content in 1024-id batches, tokenises
 /// into a reused scratch Vec<String>, and updates weighted topic_word_counts
 /// in-place. Never holds more than one batch of content in RAM.
+///
+/// `lifecycle` is consulted between batches so daemon shutdown breaks the
+/// loop instead of hitting the closed pool 1024 IDs at a time. Pass an
+/// `is_stopping() == false` lifecycle when invoking from a CLI / one-off
+/// context.
 async fn compute_ctf_idf_streaming(
     db: &dyn DbClient,
     metas: &[ChunkMetaLite],
     membership: &Array2<f32>,
     top_k: usize,
+    lifecycle: &crate::daemon_state::DaemonLifecycle,
 ) -> Vec<Vec<TopicKeyword>> {
     // Inline SQL not on the trait — escape hatch.
     let pool = db
@@ -1827,6 +1836,17 @@ async fn compute_ctf_idf_streaming(
         .collect();
 
     for ids in &batch_ids {
+        if lifecycle.is_stopping() {
+            info!(
+                processed_batches = batch_ids
+                    .iter()
+                    .position(|b| std::ptr::eq(b.as_ptr(), ids.as_ptr()))
+                    .unwrap_or(0),
+                total_batches = batch_ids.len(),
+                "streaming c-TF-IDF: lifecycle stopping, breaking loop"
+            );
+            break;
+        }
         let rows = match sqlx::query_as::<_, ContentRow>(
             "SELECT id, content FROM file_chunks WHERE id = ANY($1::bigint[])",
         )
@@ -1836,6 +1856,13 @@ async fn compute_ctf_idf_streaming(
         {
             Ok(r) => r,
             Err(e) => {
+                if crate::cron::shutdown::is_terminal_db_error(&e) {
+                    warn!(
+                        error = %e,
+                        "streaming c-TF-IDF: DB pool closed or runtime shutting down, aborting"
+                    );
+                    break;
+                }
                 warn!(error = %e, "streaming c-TF-IDF: content batch fetch failed");
                 continue;
             }

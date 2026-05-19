@@ -89,7 +89,18 @@ async fn run_analyze_similarity(
         cron_config.similarity_threshold, cron_config.similarity_top_k, vector_config.ef_search,
     );
     let start = std::time::Instant::now();
-    cron::similarity::run_similarity_scan(db, cron_config, vector_config.ef_search, stats).await;
+    // CLI-driven analyze: no daemon lifecycle is in play, so build a fresh one
+    // that stays in Initializing for the duration. `is_stopping()` will always
+    // return false, matching the prior unconditional-loop behaviour.
+    let lifecycle = crate::daemon_state::DaemonLifecycle::new();
+    cron::similarity::run_similarity_scan(
+        db,
+        cron_config,
+        vector_config.ef_search,
+        stats,
+        &lifecycle,
+    )
+    .await;
     let elapsed = start.elapsed();
     let pairs = stats
         .similarity_pairs_found
@@ -116,7 +127,9 @@ async fn run_analyze_topics(
         cron_config.topic_fuzziness,
     );
     let start = std::time::Instant::now();
-    cron::topic_clustering::run_global_topic_scan(db, cron_config, stats).await;
+    // CLI-driven analyze: no daemon lifecycle is in play.
+    let lifecycle = crate::daemon_state::DaemonLifecycle::new();
+    cron::topic_clustering::run_global_topic_scan(db, cron_config, stats, &lifecycle).await;
     let elapsed = start.elapsed();
     let topics = stats
         .topics_discovered

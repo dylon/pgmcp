@@ -835,12 +835,14 @@ pub fn schedule_maintenance_jobs(
                 let stats = Arc::clone(&stats_for_sim);
                 let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
                 let t0 = Instant::now();
+                let lc_inner = lc.clone();
                 rt.block_on(async {
                     crate::cron::similarity::run_similarity_scan(
                         db.as_ref(),
                         &cfg,
                         sim_ef_search,
                         &stats,
+                        &lc_inner,
                     )
                     .await;
                 });
@@ -1042,11 +1044,13 @@ pub fn schedule_maintenance_jobs(
                     let stats = Arc::clone(&stats_for_topic);
                     let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
                     let t0 = Instant::now();
+                    let lc_inner = lc.clone();
                     rt.block_on(async {
                         crate::cron::topic_clustering::run_global_topic_scan(
                             db.as_ref(),
                             &cfg,
                             &stats,
+                            &lc_inner,
                         )
                         .await;
                     });

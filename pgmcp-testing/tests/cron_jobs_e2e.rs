@@ -9,6 +9,7 @@ use pgmcp::config::{CronConfig, VectorConfig};
 use pgmcp::cron::graph_analysis::run_graph_analysis;
 use pgmcp::cron::similarity::run_similarity_scan;
 use pgmcp::cron::topic_clustering::run_global_topic_scan;
+use pgmcp::daemon_state::DaemonLifecycle;
 use pgmcp::db::DbClient;
 use pgmcp::embed::EmbeddingBackend;
 use pgmcp::stats::tracker::StatsTracker;
@@ -104,7 +105,14 @@ async fn similarity_scan_populates_cross_project_similarities() {
     cron_cfg.similarity_top_k = 5;
     let vector_cfg = VectorConfig::default();
 
-    run_similarity_scan(db.as_ref(), &cron_cfg, vector_cfg.ef_search, &stats).await;
+    run_similarity_scan(
+        db.as_ref(),
+        &cron_cfg,
+        vector_cfg.ef_search,
+        &stats,
+        &DaemonLifecycle::new(),
+    )
+    .await;
 
     let (pair_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM cross_project_similarities")
         .fetch_one(testdb.pool())
@@ -147,7 +155,7 @@ async fn topic_clustering_populates_code_topics() {
     cron_cfg.topic_num_clusters = Some(3);
     cron_cfg.topic_fcm_max_iters = 20;
 
-    run_global_topic_scan(db.as_ref(), &cron_cfg, &stats).await;
+    run_global_topic_scan(db.as_ref(), &cron_cfg, &stats, &DaemonLifecycle::new()).await;
 
     let (topic_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM code_topics")
         .fetch_one(testdb.pool())
@@ -238,7 +246,14 @@ async fn similarity_scan_below_threshold_emits_nothing() {
     cron_cfg.similarity_threshold = 0.99; // unreachable for distinct content
     cron_cfg.similarity_top_k = 5;
     let vector_cfg = VectorConfig::default();
-    run_similarity_scan(db.as_ref(), &cron_cfg, vector_cfg.ef_search, &stats).await;
+    run_similarity_scan(
+        db.as_ref(),
+        &cron_cfg,
+        vector_cfg.ef_search,
+        &stats,
+        &DaemonLifecycle::new(),
+    )
+    .await;
     let (count,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM cross_project_similarities \
          WHERE project_name_a IN ('zeta', 'eta') OR project_name_b IN ('zeta', 'eta')",
@@ -276,7 +291,7 @@ async fn topic_clustering_assigns_chunks_above_threshold() {
     cron_cfg.topic_num_clusters = Some(3);
     cron_cfg.topic_fcm_max_iters = 20;
     cron_cfg.topic_membership_threshold = 0.1;
-    run_global_topic_scan(db.as_ref(), &cron_cfg, &stats).await;
+    run_global_topic_scan(db.as_ref(), &cron_cfg, &stats, &DaemonLifecycle::new()).await;
     let (assignment_count,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM chunk_topic_assignments")
             .fetch_one(testdb.pool())
@@ -370,7 +385,14 @@ async fn similarity_scan_is_idempotent_across_runs() {
     cron_cfg.similarity_threshold = 0.5;
     cron_cfg.similarity_top_k = 5;
     let vector_cfg = VectorConfig::default();
-    run_similarity_scan(db.as_ref(), &cron_cfg, vector_cfg.ef_search, &stats).await;
+    run_similarity_scan(
+        db.as_ref(),
+        &cron_cfg,
+        vector_cfg.ef_search,
+        &stats,
+        &DaemonLifecycle::new(),
+    )
+    .await;
     let (count_after_first,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM cross_project_similarities \
          WHERE project_name_a IN ('ida', 'idb') OR project_name_b IN ('ida', 'idb')",
@@ -378,7 +400,14 @@ async fn similarity_scan_is_idempotent_across_runs() {
     .fetch_one(testdb.pool())
     .await
     .expect("count1");
-    run_similarity_scan(db.as_ref(), &cron_cfg, vector_cfg.ef_search, &stats).await;
+    run_similarity_scan(
+        db.as_ref(),
+        &cron_cfg,
+        vector_cfg.ef_search,
+        &stats,
+        &DaemonLifecycle::new(),
+    )
+    .await;
     let (count_after_second,): (i64,) = sqlx::query_as(
         "SELECT COUNT(*) FROM cross_project_similarities \
          WHERE project_name_a IN ('ida', 'idb') OR project_name_b IN ('ida', 'idb')",
@@ -410,7 +439,7 @@ async fn topic_clustering_with_insufficient_chunks_handles_gracefully() {
     let stats = Arc::new(StatsTracker::new());
     let cron_cfg = CronConfig::default();
     // Must not panic, even with insufficient data.
-    run_global_topic_scan(db.as_ref(), &cron_cfg, &stats).await;
+    run_global_topic_scan(db.as_ref(), &cron_cfg, &stats, &DaemonLifecycle::new()).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -517,7 +546,7 @@ async fn topic_clustering_num_clusters_override_is_honored() {
     cron_cfg.topic_min_cluster_size = 2;
     cron_cfg.topic_num_clusters = Some(2);
     cron_cfg.topic_fcm_max_iters = 20;
-    run_global_topic_scan(db.as_ref(), &cron_cfg, &stats).await;
+    run_global_topic_scan(db.as_ref(), &cron_cfg, &stats, &DaemonLifecycle::new()).await;
     let (topic_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM code_topics")
         .fetch_one(testdb.pool())
         .await

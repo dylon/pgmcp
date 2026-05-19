@@ -18,6 +18,7 @@ pub mod memory_reflect;
 pub mod memory_retention;
 #[allow(dead_code)]
 pub mod scheduler;
+pub mod shutdown;
 #[allow(dead_code)]
 pub mod similarity;
 #[allow(dead_code)]

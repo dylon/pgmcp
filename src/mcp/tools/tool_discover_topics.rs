@@ -78,6 +78,7 @@ pub async fn tool_discover_topics(
                 ),
                 &config.cron,
                 &stats,
+                ctx.lifecycle(),
             )
             .await;
         }

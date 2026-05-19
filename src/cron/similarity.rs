@@ -11,6 +11,8 @@ use std::sync::atomic::Ordering;
 use tracing::{error, info, warn};
 
 use crate::config::CronConfig;
+use crate::cron::shutdown::is_terminal_db_error;
+use crate::daemon_state::DaemonLifecycle;
 use crate::db::DbClient;
 use crate::stats::tracker::StatsTracker;
 
@@ -26,6 +28,7 @@ pub async fn run_similarity_scan(
     config: &CronConfig,
     ef_search: i32,
     stats: &Arc<StatsTracker>,
+    lifecycle: &DaemonLifecycle,
 ) {
     let threshold = config.similarity_threshold;
     let top_k = config.similarity_top_k;
@@ -64,12 +67,28 @@ pub async fn run_similarity_scan(
             break;
         }
 
+        if lifecycle.is_stopping() {
+            info!(
+                last_id,
+                batches_processed, "similarity-scan: lifecycle stopping, breaking loop"
+            );
+            break;
+        }
+
         let neighbors = match db
             .batch_find_cross_project_neighbors(last_id, batch_size, top_k, threshold, ef_search)
             .await
         {
             Ok(rows) => rows,
             Err(e) => {
+                if is_terminal_db_error(&e) {
+                    warn!(
+                        error = %e,
+                        last_id,
+                        "similarity-scan: DB pool closed or runtime shutting down, aborting scan"
+                    );
+                    break;
+                }
                 error!(
                     error = %e,
                     last_id,
