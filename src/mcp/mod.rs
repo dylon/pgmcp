@@ -1,3 +1,4 @@
+pub mod client_profile;
 pub mod completions;
 pub mod logging;
 pub mod resources;

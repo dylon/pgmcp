@@ -1954,6 +1954,48 @@ pub struct MemoryRaptorSearchParams {
     pub k: Option<i32>,
 }
 
+// ----------------------------------------------------------------------------
+// Phase 10 client-profile introspection Params
+// ----------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PgmcpClientProfileParams {
+    #[schemars(
+        description = "Client name to look up (case-insensitive). Defaults to 'generic' when omitted. Match against MCP `clientInfo.name`."
+    )]
+    pub client_name: Option<String>,
+    #[schemars(
+        description = "When true, return every registered profile instead of resolving one client name. Default false."
+    )]
+    pub list_all: Option<bool>,
+}
+
+// ----------------------------------------------------------------------------
+// Phase 8 forget Params
+// ----------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryForgetParams {
+    #[schemars(description = "Target row type: 'entity' | 'observation' | 'relation'.")]
+    pub target_type: String,
+    pub target_id: i64,
+    #[schemars(
+        description = "When true, hard-delete the row + every dependent FK row and write an audit manifest. \
+                       Default false (soft-delete via valid_to)."
+    )]
+    pub cascade: Option<bool>,
+    #[schemars(description = "Actor label written to memory_forget_log (default 'agent').")]
+    pub actor: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryPurgeExpiredParams {
+    pub window_days: Option<i64>,
+    pub importance_threshold: Option<f32>,
+    #[schemars(description = "When true (default), report counts only — do not delete.")]
+    pub dry_run: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MemoryReflectParams {
     pub scope: Option<MemoryScopeParam>,
@@ -2653,6 +2695,70 @@ nodes by cosine over summary_embedding, optionally filtered by tree level."
             30,
             &_ctx,
             super::tools::tool_memory_graph_rag::tool_memory_raptor_search(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server Phase 10: resolve or list pgmcp client profiles. Pass \
+`client_name` to see how pgmcp will format responses for that client (output_format, \
+default_brief, include_provenance, per-tool description_overrides); pass `list_all=true` to \
+see every profile pgmcp knows about. Built-in defaults for claude-code, codex, and \
+generic ship with the binary; assets/client_profiles.toml overrides them."
+    )]
+    async fn pgmcp_client_profile(
+        &self,
+        Parameters(params): Parameters<PgmcpClientProfileParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "pgmcp_client_profile",
+            10,
+            &_ctx,
+            super::tools::tool_client_profile::tool_pgmcp_client_profile(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server Phase 8.4: forget an entity / observation / relation. \
+cascade=false (default) sets valid_to = NOW() (soft delete, queryable via \
+memory_facts_at); cascade=true hard-deletes + every dependent FK row and writes an \
+audit manifest to memory_forget_log."
+    )]
+    async fn memory_forget(
+        &self,
+        Parameters(params): Parameters<MemoryForgetParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_forget",
+            30,
+            &_ctx,
+            super::tools::tool_memory_forget::tool_memory_forget(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Memory-server Phase 8.2: report (dry_run=true, default) or perform \
+(dry_run=false) the retention purge — hard-deletes soft-deleted, past-window, \
+low-importance, non-superseded memory_* rows. Defaults pulled from \
+[memory.retention] when not provided."
+    )]
+    async fn memory_purge_expired(
+        &self,
+        Parameters(params): Parameters<MemoryPurgeExpiredParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "memory_purge_expired",
+            60,
+            &_ctx,
+            super::tools::tool_memory_forget::tool_memory_purge_expired(self.ctx(), params),
         )
         .await
     }
@@ -4631,6 +4737,11 @@ impl McpServer {
             "memory_path_search"            => memory_path_search(MemoryPathSearchParams) in tool_memory_graph_rag,
             "memory_ppr_search"             => memory_ppr_search(MemoryPprSearchParams) in tool_memory_graph_rag,
             "memory_raptor_search"          => memory_raptor_search(MemoryRaptorSearchParams) in tool_memory_graph_rag,
+            // Memory-server Phase 8: forget + retention.
+            "memory_forget"                 => memory_forget(MemoryForgetParams) in tool_memory_forget,
+            "memory_purge_expired"          => memory_purge_expired(MemoryPurgeExpiredParams) in tool_memory_forget,
+            // Memory-server Phase 10: client-profile introspection.
+            "pgmcp_client_profile"          => pgmcp_client_profile(PgmcpClientProfileParams) in tool_client_profile,
             // File info
             "read_file"              => read_file(ReadFileParams),
             "mandate_context"        => mandate_context(MandateContextParams),

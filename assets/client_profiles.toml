@@ -1,0 +1,26 @@
+# Per-client protocol customization (Memory-server Phase 10).
+#
+# Matched case-insensitively against MCP `clientInfo.name`. Built-in
+# fallback profiles for `claude-code`, `codex`, and `generic` ship in
+# `src/mcp/client_profile.rs::builtin_profiles()`; entries here override
+# those defaults.
+#
+# output_format: "markdown" | "compact_json" | "text"
+
+[[profiles]]
+name = "claude-code"
+output_format = "markdown"
+default_brief = false
+include_provenance = true
+
+[[profiles]]
+name = "codex"
+output_format = "compact_json"
+default_brief = true
+include_provenance = false
+
+[[profiles]]
+name = "generic"
+output_format = "markdown"
+default_brief = false
+include_provenance = true

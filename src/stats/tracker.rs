@@ -203,6 +203,21 @@ pub struct StatsTracker {
     pub memory_reranker_calls: AtomicU64,
     pub memory_reranker_errors: AtomicU64,
 
+    // Memory-server Phase 8 (forget / retention) counters
+    pub memory_forget_soft: AtomicU64,
+    pub memory_forget_cascade: AtomicU64,
+    pub memory_retention_entities_purged: AtomicU64,
+    pub memory_retention_observations_purged: AtomicU64,
+    pub memory_retention_relations_purged: AtomicU64,
+
+    // Memory-server Phase 9 (eval harness) counters
+    pub memory_eval_runs: AtomicU64,
+    pub memory_eval_scenarios_passed: AtomicU64,
+    pub memory_eval_scenarios_failed: AtomicU64,
+    /// Sum of invariant violations across `memory_eval_invariants` rows
+    /// (bi-temporal, supersession cycles, orphans, dangling forget log).
+    pub memory_eval_invariant_violations: AtomicU64,
+
     // Timing (cumulative)
     pub index_duration_ms: AtomicU64,
     pub embedding_duration_ms: AtomicU64,
@@ -504,6 +519,15 @@ impl StatsTracker {
             memory_raptor_summaries_written: AtomicU64::new(0),
             memory_reranker_calls: AtomicU64::new(0),
             memory_reranker_errors: AtomicU64::new(0),
+            memory_forget_soft: AtomicU64::new(0),
+            memory_forget_cascade: AtomicU64::new(0),
+            memory_retention_entities_purged: AtomicU64::new(0),
+            memory_retention_observations_purged: AtomicU64::new(0),
+            memory_retention_relations_purged: AtomicU64::new(0),
+            memory_eval_runs: AtomicU64::new(0),
+            memory_eval_scenarios_passed: AtomicU64::new(0),
+            memory_eval_scenarios_failed: AtomicU64::new(0),
+            memory_eval_invariant_violations: AtomicU64::new(0),
             index_duration_ms: AtomicU64::new(0),
             embedding_duration_ms: AtomicU64::new(0),
             last_index_timestamp: AtomicU64::new(0),
@@ -692,6 +716,15 @@ impl StatsTracker {
             "memory_raptor_summaries_written": self.memory_raptor_summaries_written.load(Ordering::Acquire),
             "memory_reranker_calls": self.memory_reranker_calls.load(Ordering::Acquire),
             "memory_reranker_errors": self.memory_reranker_errors.load(Ordering::Acquire),
+            "memory_forget_soft": self.memory_forget_soft.load(Ordering::Acquire),
+            "memory_forget_cascade": self.memory_forget_cascade.load(Ordering::Acquire),
+            "memory_retention_entities_purged": self.memory_retention_entities_purged.load(Ordering::Acquire),
+            "memory_retention_observations_purged": self.memory_retention_observations_purged.load(Ordering::Acquire),
+            "memory_retention_relations_purged": self.memory_retention_relations_purged.load(Ordering::Acquire),
+            "memory_eval_runs": self.memory_eval_runs.load(Ordering::Acquire),
+            "memory_eval_scenarios_passed": self.memory_eval_scenarios_passed.load(Ordering::Acquire),
+            "memory_eval_scenarios_failed": self.memory_eval_scenarios_failed.load(Ordering::Acquire),
+            "memory_eval_invariant_violations": self.memory_eval_invariant_violations.load(Ordering::Acquire),
             "index_duration_ms": self.index_duration_ms.load(Ordering::Acquire),
             "embedding_duration_ms": self.embedding_duration_ms.load(Ordering::Acquire),
             "files_scanned": self.files_scanned.load(Ordering::Acquire),

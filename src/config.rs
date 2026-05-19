@@ -47,6 +47,46 @@ pub struct MemoryConfig {
     pub retention: MemoryRetentionConfig,
     #[serde(default)]
     pub graph_rag: MemoryGraphRagConfig,
+    #[serde(default)]
+    pub eval: MemoryEvalConfig,
+}
+
+/// `[memory.eval]` — Phase 9 internal eval harness. The MCP-visible
+/// scenarios live in `pgmcp-testing/tests/memory_eval.rs` and run as
+/// part of `cargo test` / `scripts/verify.sh`. The cron variant
+/// additionally records bi-temporal + provenance invariants into
+/// `pgmcp_metadata` on a schedule, so a long-running daemon can detect
+/// drift between deploys.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryEvalConfig {
+    /// When `false` (default) the periodic invariant scan is skipped
+    /// entirely. The integration test suite is always built.
+    #[serde(default)]
+    pub cron_enabled: bool,
+    #[serde(default = "default_memory_eval_interval_secs")]
+    pub cron_interval_secs: u64,
+    /// Hard cap on rows examined per invariant pass. Keeps the scan
+    /// O(N) bounded even on a million-row memory graph.
+    #[serde(default = "default_memory_eval_row_cap")]
+    pub row_cap: i64,
+}
+
+impl Default for MemoryEvalConfig {
+    fn default() -> Self {
+        Self {
+            cron_enabled: false,
+            cron_interval_secs: default_memory_eval_interval_secs(),
+            row_cap: default_memory_eval_row_cap(),
+        }
+    }
+}
+
+fn default_memory_eval_interval_secs() -> u64 {
+    86400
+}
+
+fn default_memory_eval_row_cap() -> i64 {
+    50_000
 }
 
 /// `[memory.extractor]` — LLM-driven salience extraction (Phase 4).

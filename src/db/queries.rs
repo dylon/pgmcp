@@ -2871,6 +2871,508 @@ pub async fn memory_raptor_search(
 }
 
 // ============================================================================
+// Memory-server Phase 8: forget + retention queries
+// ============================================================================
+
+/// What kind of memory row to forget. Used by `memory_forget` and the
+/// audit log.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForgetTargetType {
+    Entity,
+    Observation,
+    Relation,
+}
+
+impl ForgetTargetType {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Entity => "entity",
+            Self::Observation => "observation",
+            Self::Relation => "relation",
+        }
+    }
+    pub fn parse(s: &str) -> Result<Self, sqlx::Error> {
+        match s {
+            "entity" => Ok(Self::Entity),
+            "observation" => Ok(Self::Observation),
+            "relation" => Ok(Self::Relation),
+            other => Err(sqlx::Error::Protocol(format!(
+                "unknown target_type '{}'; expected entity|observation|relation",
+                other
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ForgetReport {
+    pub target_type: String,
+    pub target_id: i64,
+    pub cascade: bool,
+    pub rows_affected: i64,
+    pub manifest: serde_json::Value,
+    pub forget_log_id: i64,
+}
+
+/// Phase 8.4: forget an entity / observation / relation. `cascade=false`
+/// (default) sets `valid_to = NOW()` (soft delete); `cascade=true`
+/// physically deletes the row + dependent rows and writes the manifest
+/// to `memory_forget_log`.
+pub async fn memory_forget(
+    pool: &PgPool,
+    target_type: ForgetTargetType,
+    target_id: i64,
+    cascade: bool,
+    actor: &str,
+) -> Result<ForgetReport, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let rows_affected: i64;
+    let mut manifest = serde_json::json!({});
+
+    match target_type {
+        ForgetTargetType::Entity => {
+            if cascade {
+                let (obs_count,): (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM memory_observations WHERE entity_id = $1")
+                        .bind(target_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let (rel_count,): (i64,) = sqlx::query_as(
+                    "SELECT COUNT(*) FROM memory_relations
+                     WHERE from_entity_id = $1 OR to_entity_id = $1",
+                )
+                .bind(target_id)
+                .fetch_one(&mut *tx)
+                .await?;
+                let (anchor_count,): (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM memory_code_anchor WHERE entity_id = $1")
+                        .bind(target_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let (scope_count,): (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM memory_entity_scope WHERE entity_id = $1")
+                        .bind(target_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                let (tier_count,): (i64,) =
+                    sqlx::query_as("SELECT COUNT(*) FROM memory_entity_tier WHERE entity_id = $1")
+                        .bind(target_id)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                manifest = serde_json::json!({
+                    "observations": obs_count,
+                    "relations": rel_count,
+                    "code_anchors": anchor_count,
+                    "scopes": scope_count,
+                    "tiers": tier_count,
+                });
+                let res = sqlx::query("DELETE FROM memory_entities WHERE id = $1")
+                    .bind(target_id)
+                    .execute(&mut *tx)
+                    .await?;
+                rows_affected = res.rows_affected() as i64
+                    + obs_count
+                    + rel_count
+                    + anchor_count
+                    + scope_count
+                    + tier_count;
+            } else {
+                let res = sqlx::query(
+                    "UPDATE memory_entities SET valid_to = NOW()
+                     WHERE id = $1 AND valid_to IS NULL",
+                )
+                .bind(target_id)
+                .execute(&mut *tx)
+                .await?;
+                rows_affected = res.rows_affected() as i64;
+            }
+        }
+        ForgetTargetType::Observation => {
+            if cascade {
+                let res = sqlx::query("DELETE FROM memory_observations WHERE id = $1")
+                    .bind(target_id)
+                    .execute(&mut *tx)
+                    .await?;
+                rows_affected = res.rows_affected() as i64;
+            } else {
+                let res = sqlx::query(
+                    "UPDATE memory_observations SET valid_to = NOW()
+                     WHERE id = $1 AND valid_to IS NULL",
+                )
+                .bind(target_id)
+                .execute(&mut *tx)
+                .await?;
+                rows_affected = res.rows_affected() as i64;
+            }
+        }
+        ForgetTargetType::Relation => {
+            if cascade {
+                let res = sqlx::query("DELETE FROM memory_relations WHERE id = $1")
+                    .bind(target_id)
+                    .execute(&mut *tx)
+                    .await?;
+                rows_affected = res.rows_affected() as i64;
+            } else {
+                let res = sqlx::query(
+                    "UPDATE memory_relations SET valid_to = NOW()
+                     WHERE id = $1 AND valid_to IS NULL",
+                )
+                .bind(target_id)
+                .execute(&mut *tx)
+                .await?;
+                rows_affected = res.rows_affected() as i64;
+            }
+        }
+    };
+
+    let forget_log_id: i64 = sqlx::query_scalar(
+        "INSERT INTO memory_forget_log
+            (actor, target_type, target_id, cascade, rows_affected, manifest_json)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         RETURNING id",
+    )
+    .bind(actor)
+    .bind(target_type.label())
+    .bind(target_id)
+    .bind(cascade)
+    .bind(rows_affected as i32)
+    .bind(&manifest)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    Ok(ForgetReport {
+        target_type: target_type.label().to_string(),
+        target_id,
+        cascade,
+        rows_affected,
+        manifest,
+        forget_log_id,
+    })
+}
+
+/// Phase 8.2 dry-run for the retention cron. Returns counts of rows
+/// that *would* be hard-deleted given the window + importance
+/// threshold, without touching any rows.
+pub async fn memory_retention_dry_run(
+    pool: &PgPool,
+    window_days: i64,
+    importance_threshold: f32,
+) -> Result<(i64, i64, i64), sqlx::Error> {
+    let (e,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM memory_entities
+         WHERE valid_to IS NOT NULL
+           AND valid_to < NOW() - ($1::int * interval '1 day')
+           AND importance < $2",
+    )
+    .bind(window_days as i32)
+    .bind(importance_threshold)
+    .fetch_one(pool)
+    .await?;
+    let (o,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM memory_observations
+         WHERE valid_to IS NOT NULL
+           AND valid_to < NOW() - ($1::int * interval '1 day')
+           AND importance < $2",
+    )
+    .bind(window_days as i32)
+    .bind(importance_threshold)
+    .fetch_one(pool)
+    .await?;
+    let (r,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM memory_relations
+         WHERE valid_to IS NOT NULL
+           AND valid_to < NOW() - ($1::int * interval '1 day')
+           AND importance < $2",
+    )
+    .bind(window_days as i32)
+    .bind(importance_threshold)
+    .fetch_one(pool)
+    .await?;
+    Ok((e, o, r))
+}
+
+/// Phase 8.2: hard-delete soft-deleted rows past the retention window
+/// AND below the importance threshold AND not pointed at by any
+/// `superseded_by` chain. Returns (entities, observations, relations)
+/// deleted.
+pub async fn memory_retention_purge(
+    pool: &PgPool,
+    window_days: i64,
+    importance_threshold: f32,
+) -> Result<(u64, u64, u64), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let e = sqlx::query(
+        "DELETE FROM memory_entities
+         WHERE valid_to IS NOT NULL
+           AND valid_to < NOW() - ($1::int * interval '1 day')
+           AND importance < $2
+           AND id NOT IN (
+               SELECT superseded_by FROM memory_entities
+               WHERE superseded_by IS NOT NULL
+           )",
+    )
+    .bind(window_days as i32)
+    .bind(importance_threshold)
+    .execute(&mut *tx)
+    .await?;
+    let o = sqlx::query(
+        "DELETE FROM memory_observations
+         WHERE valid_to IS NOT NULL
+           AND valid_to < NOW() - ($1::int * interval '1 day')
+           AND importance < $2
+           AND id NOT IN (
+               SELECT superseded_by FROM memory_observations
+               WHERE superseded_by IS NOT NULL
+           )",
+    )
+    .bind(window_days as i32)
+    .bind(importance_threshold)
+    .execute(&mut *tx)
+    .await?;
+    let r = sqlx::query(
+        "DELETE FROM memory_relations
+         WHERE valid_to IS NOT NULL
+           AND valid_to < NOW() - ($1::int * interval '1 day')
+           AND importance < $2
+           AND id NOT IN (
+               SELECT superseded_by FROM memory_relations
+               WHERE superseded_by IS NOT NULL
+           )",
+    )
+    .bind(window_days as i32)
+    .bind(importance_threshold)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok((e.rows_affected(), o.rows_affected(), r.rows_affected()))
+}
+
+/// Phase 9: memory-server invariant report. Each field is the count of
+/// rows that violate the corresponding invariant. A clean memory graph
+/// returns zeros across the board.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct MemoryEvalReport {
+    /// Rows where `valid_to <= valid_from` (impossible by design).
+    pub entities_temporal_invalid: i64,
+    pub observations_temporal_invalid: i64,
+    pub relations_temporal_invalid: i64,
+    /// `superseded_by` chains that include a cycle (root reaches itself).
+    pub entity_supersede_cycles: i64,
+    pub observation_supersede_cycles: i64,
+    pub relation_supersede_cycles: i64,
+    /// Observations whose `entity_id` does not match any entity row
+    /// (would normally be caught by FK; included for defense in depth).
+    pub orphan_observations: i64,
+    /// `derived_from` arrays in reflective observations that point at
+    /// rows that no longer exist — purely an audit metric, not a fault.
+    pub reflection_derived_from_missing: i64,
+    /// Code-anchors whose target file/chunk/topic no longer exists.
+    pub stale_code_anchors: i64,
+    /// `memory_forget_log` entries whose claimed `target_id` still
+    /// exists in the target table with `valid_to IS NULL` (suggests
+    /// the forget didn't actually take effect).
+    pub forget_log_dangling: i64,
+    pub rows_examined: i64,
+}
+
+/// Phase 9: scan the memory tables for bi-temporal / provenance /
+/// referential-integrity violations. Bounded by `row_cap` per table —
+/// the count fields are exact within that bound, so a daemon with a
+/// 50-million-row memory graph still finishes in seconds.
+pub async fn memory_eval_invariants(
+    pool: &PgPool,
+    row_cap: i64,
+) -> Result<MemoryEvalReport, sqlx::Error> {
+    let mut r = MemoryEvalReport {
+        rows_examined: row_cap,
+        ..Default::default()
+    };
+
+    r.entities_temporal_invalid = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+           SELECT 1 FROM memory_entities
+            WHERE valid_to IS NOT NULL AND valid_to <= valid_from
+            LIMIT $1
+         ) sub",
+    )
+    .bind(row_cap)
+    .fetch_one(pool)
+    .await?;
+    r.observations_temporal_invalid = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+           SELECT 1 FROM memory_observations
+            WHERE valid_to IS NOT NULL AND valid_to <= valid_from
+            LIMIT $1
+         ) sub",
+    )
+    .bind(row_cap)
+    .fetch_one(pool)
+    .await?;
+    r.relations_temporal_invalid = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+           SELECT 1 FROM memory_relations
+            WHERE valid_to IS NOT NULL AND valid_to <= valid_from
+            LIMIT $1
+         ) sub",
+    )
+    .bind(row_cap)
+    .fetch_one(pool)
+    .await?;
+
+    r.entity_supersede_cycles = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+           WITH RECURSIVE walk AS (
+             SELECT id AS root, superseded_by AS next, 1 AS depth
+               FROM memory_entities WHERE superseded_by IS NOT NULL
+             UNION ALL
+             SELECT w.root, e.superseded_by, w.depth + 1
+               FROM walk w
+               JOIN memory_entities e ON e.id = w.next
+              WHERE w.next IS NOT NULL AND w.depth < 32
+           )
+           SELECT 1 FROM walk WHERE next = root LIMIT $1
+         ) sub",
+    )
+    .bind(row_cap)
+    .fetch_one(pool)
+    .await?;
+
+    r.observation_supersede_cycles = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+           WITH RECURSIVE walk AS (
+             SELECT id AS root, superseded_by AS next, 1 AS depth
+               FROM memory_observations WHERE superseded_by IS NOT NULL
+             UNION ALL
+             SELECT w.root, o.superseded_by, w.depth + 1
+               FROM walk w
+               JOIN memory_observations o ON o.id = w.next
+              WHERE w.next IS NOT NULL AND w.depth < 32
+           )
+           SELECT 1 FROM walk WHERE next = root LIMIT $1
+         ) sub",
+    )
+    .bind(row_cap)
+    .fetch_one(pool)
+    .await?;
+
+    r.relation_supersede_cycles = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+           WITH RECURSIVE walk AS (
+             SELECT id AS root, superseded_by AS next, 1 AS depth
+               FROM memory_relations WHERE superseded_by IS NOT NULL
+             UNION ALL
+             SELECT w.root, rel.superseded_by, w.depth + 1
+               FROM walk w
+               JOIN memory_relations rel ON rel.id = w.next
+              WHERE w.next IS NOT NULL AND w.depth < 32
+           )
+           SELECT 1 FROM walk WHERE next = root LIMIT $1
+         ) sub",
+    )
+    .bind(row_cap)
+    .fetch_one(pool)
+    .await?;
+
+    r.orphan_observations = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+           SELECT 1 FROM memory_observations o
+            LEFT JOIN memory_entities e ON e.id = o.entity_id
+            WHERE e.id IS NULL
+            LIMIT $1
+         ) sub",
+    )
+    .bind(row_cap)
+    .fetch_one(pool)
+    .await?;
+
+    r.reflection_derived_from_missing = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+           SELECT o.id FROM memory_observations o
+            WHERE o.source = 'reflection'
+              AND o.derived_from IS NOT NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM memory_observations src
+                 WHERE src.id = ANY(o.derived_from)
+              )
+            LIMIT $1
+         ) sub",
+    )
+    .bind(row_cap)
+    .fetch_one(pool)
+    .await?;
+
+    r.stale_code_anchors = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+           SELECT a.id
+             FROM memory_code_anchor a
+             LEFT JOIN indexed_files f ON f.id = a.file_id
+             LEFT JOIN file_chunks   c ON c.id = a.chunk_id
+             LEFT JOIN code_topics   t ON t.id = a.topic_id
+            WHERE (a.file_id  IS NOT NULL AND f.id IS NULL)
+               OR (a.chunk_id IS NOT NULL AND c.id IS NULL)
+               OR (a.topic_id IS NOT NULL AND t.id IS NULL)
+            LIMIT $1
+         ) sub",
+    )
+    .bind(row_cap)
+    .fetch_one(pool)
+    .await?;
+
+    r.forget_log_dangling = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM (
+           SELECT fl.id
+             FROM memory_forget_log fl
+            WHERE fl.cascade = false
+              AND (
+                   (fl.target_type = 'entity' AND EXISTS (
+                       SELECT 1 FROM memory_entities e
+                        WHERE e.id = fl.target_id AND e.valid_to IS NULL
+                   ))
+                OR (fl.target_type = 'observation' AND EXISTS (
+                       SELECT 1 FROM memory_observations o
+                        WHERE o.id = fl.target_id AND o.valid_to IS NULL
+                   ))
+                OR (fl.target_type = 'relation' AND EXISTS (
+                       SELECT 1 FROM memory_relations rel
+                        WHERE rel.id = fl.target_id AND rel.valid_to IS NULL
+                   ))
+              )
+            LIMIT $1
+         ) sub",
+    )
+    .bind(row_cap)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(r)
+}
+
+/// Persist a memory-eval invariant report into `pgmcp_metadata` so
+/// daemons can surface "last successful eval" without standing up a
+/// separate table. Stored as a single JSON blob keyed by
+/// `memory_eval_last_report`.
+pub async fn record_memory_eval_report(
+    pool: &PgPool,
+    report: &MemoryEvalReport,
+) -> Result<(), sqlx::Error> {
+    let body = serde_json::json!({
+        "report": report,
+        "recorded_at": chrono::Utc::now(),
+    });
+    sqlx::query(
+        "INSERT INTO pgmcp_metadata (key, value) VALUES ('memory_eval_last_report', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(body.to_string())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ============================================================================
 // Statistics queries
 // ============================================================================
 

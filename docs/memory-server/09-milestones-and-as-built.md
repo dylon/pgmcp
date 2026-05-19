@@ -427,6 +427,64 @@ facts_at, anchors).
 - **Verification gate:** `./scripts/verify.sh` green across all 8
   gates.
 
+### M6 — Production-ready (Phase 8 forget + Phase 9 eval + Phase 10 client profiles)
+
+- **Status:** ✅ shipped.
+- **Phase 8 explicit forget** (`src/db/queries.rs`,
+  `src/mcp/tools/tool_memory_forget.rs`,
+  `src/cron/memory_retention.rs`):
+  - `memory_forget(target_type, target_id, cascade, actor)` —
+    default soft-delete sets `valid_to = NOW()` and writes a
+    `memory_forget_log` row; `cascade=true` hard-deletes the row +
+    every FK-dependent row in one transaction and stamps the
+    `manifest_json` audit blob with per-table counts.
+  - `memory_purge_expired(window_days?, importance_threshold?,
+    dry_run=true)` — admin tool that previews (or executes) what the
+    `memory-retention` cron would delete.
+  - `memory-retention` cron (`run_or_log`) periodically purges
+    soft-deleted rows past `[memory.retention] window_days` with
+    `importance < threshold` that are not pointed at by any active
+    `superseded_by` chain.
+- **Phase 9 internal eval harness** (`pgmcp-testing/tests/memory_eval.rs`,
+  `src/cron/memory_eval.rs`):
+  - 23 `#[tokio::test]` scenarios cover the 8 categories from
+    `02-phases.md` §9.1 — recall (5), contradiction (3), multi-hop
+    (3), cross-graph (2), scope isolation (2), tier filter (1),
+    forgetting (2), reflection (2), end-to-end extractor sanity (1),
+    plus three MCP-surface coverage tests (`memory_forget`,
+    `memory_purge_expired`, `pgmcp_client_profile`) that close the
+    `query_inventory_vs_coverage` loop.
+  - `memory-eval` cron + `queries::memory_eval_invariants` scan the
+    live memory graph for bi-temporal violations, supersession
+    cycles, orphan observations, dangling `derived_from` arrays,
+    stale code anchors, and dangling forget-log entries. Bounded by
+    `[memory.eval] row_cap` (default 50 000); writes a JSON report
+    to `pgmcp_metadata[memory_eval_last_report]` on every run.
+    Default `cron_enabled = false` — the harness runs under
+    `cargo test` whether or not the cron is on.
+- **Phase 10 client profiles** (`src/mcp/client_profile.rs`,
+  `assets/client_profiles.toml`,
+  `src/mcp/tools/tool_client_profile.rs`):
+  - `OutputFormat { Markdown, CompactJson, Text }` selects per-call
+    serialization style.
+  - `ClientProfileRegistry::load_or_builtin` layers
+    `assets/client_profiles.toml` over built-in profiles for
+    `claude-code` (Markdown, full provenance), `codex` (CompactJson,
+    brief default, no provenance), and `generic` (Markdown).
+    Names are normalized — `"Claude Code"`, `"claude_code"`, and
+    `"claude-code"` all resolve to the same profile.
+  - MCP tool `pgmcp_client_profile(client_name?, list_all?)` lets the
+    agent introspect "which profile am I served under?".
+- **Telemetry:** `memory_eval_runs`, `memory_eval_scenarios_passed`,
+  `memory_eval_scenarios_failed`, `memory_eval_invariant_violations`
+  counters on `StatsTracker`; new JSON-snapshot keys for each;
+  retention counters reused from Phase 8.
+- **Verification gate:** `./scripts/verify.sh` green across all 8
+  gates (preflight, fmt, clippy zero-warnings, debug build, debug
+  tests, release gpu_fallback_smoke, every-tool-tested check,
+  release tests). The inventory-coverage gate now passes for all
+  Phase 8 + Phase 10 tools.
+
 <!-- Future milestone entries follow the same pattern. -->
 
 ---
