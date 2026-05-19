@@ -49,6 +49,124 @@ pub struct MemoryConfig {
     pub graph_rag: MemoryGraphRagConfig,
     #[serde(default)]
     pub eval: MemoryEvalConfig,
+    #[serde(default)]
+    pub latent_pipeline: MemoryLatentPipelineConfig,
+}
+
+/// `[memory.latent_pipeline]` — Phase 11 RecursiveLink hand-off
+/// between same-backbone pipeline stages. Default `Disabled` per the
+/// plan §11.3: the pipeline is opt-in once the operator has (a) the
+/// hardware budget and (b) a trained RecursiveLink weights file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryLatentPipelineConfig {
+    /// `"qwen3-rlv1"` or `"disabled"`. Default disabled.
+    #[serde(default = "default_latent_backend")]
+    pub backend: String,
+    /// Path to the trained RecursiveLink safetensors file.
+    /// Recommended: `models/recursive_link_qwen3_8b.safetensors`.
+    #[serde(default = "default_latent_link_path")]
+    pub link_weights_path: std::path::PathBuf,
+    /// Signature stamped on the weights — bump when retraining with a
+    /// new prompt template or backbone variant. Stored alongside
+    /// `latent_pipeline_active` in `pgmcp_metadata`.
+    #[serde(default = "default_latent_link_signature")]
+    pub link_signature: String,
+    /// Auto-downgrade threshold: when the daily quality validator
+    /// detects `(text_score − latent_score) > quality_regression_threshold`
+    /// over a `regression_window` days, the dispatcher demotes back
+    /// to the text path. Default 0.05 — a 5-pp absolute quality
+    /// regression triggers the downgrade.
+    #[serde(default = "default_latent_quality_threshold")]
+    pub quality_regression_threshold: f32,
+    /// Days of A/B comparison data the validator looks at when deciding.
+    #[serde(default = "default_latent_regression_window")]
+    pub regression_window_days: i64,
+    /// When `true`, the dispatcher attempts a short forward-pass on
+    /// startup to confirm VRAM headroom; failure → demote to text.
+    #[serde(default = "default_true")]
+    pub vram_probe_at_startup: bool,
+    #[serde(default)]
+    pub train: MemoryLatentTrainConfig,
+}
+
+impl Default for MemoryLatentPipelineConfig {
+    fn default() -> Self {
+        Self {
+            backend: default_latent_backend(),
+            link_weights_path: default_latent_link_path(),
+            link_signature: default_latent_link_signature(),
+            quality_regression_threshold: default_latent_quality_threshold(),
+            regression_window_days: default_latent_regression_window(),
+            vram_probe_at_startup: true,
+            train: MemoryLatentTrainConfig::default(),
+        }
+    }
+}
+
+fn default_latent_backend() -> String {
+    "disabled".into()
+}
+fn default_latent_link_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("models/recursive_link_qwen3_8b.safetensors")
+}
+fn default_latent_link_signature() -> String {
+    "rlv1".into()
+}
+fn default_latent_quality_threshold() -> f32 {
+    0.05
+}
+fn default_latent_regression_window() -> i64 {
+    7
+}
+
+/// `[memory.latent_pipeline.train]` — one-shot trainer settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryLatentTrainConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_latent_train_samples")]
+    pub samples_from_session_prompts: usize,
+    #[serde(default = "default_latent_train_epochs")]
+    pub epochs: usize,
+    #[serde(default = "default_latent_train_batch")]
+    pub batch_size: usize,
+    #[serde(default = "default_latent_train_lr")]
+    pub learning_rate: f64,
+    #[serde(default = "default_latent_train_seqcap")]
+    pub seq_len_cap: usize,
+    /// Output path for the trained safetensors file.
+    #[serde(default = "default_latent_link_path")]
+    pub output_path: std::path::PathBuf,
+}
+
+impl Default for MemoryLatentTrainConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            samples_from_session_prompts: default_latent_train_samples(),
+            epochs: default_latent_train_epochs(),
+            batch_size: default_latent_train_batch(),
+            learning_rate: default_latent_train_lr(),
+            seq_len_cap: default_latent_train_seqcap(),
+            output_path: default_latent_link_path(),
+        }
+    }
+}
+
+fn default_latent_train_samples() -> usize {
+    10_000
+}
+fn default_latent_train_epochs() -> usize {
+    3
+}
+fn default_latent_train_batch() -> usize {
+    1
+}
+fn default_latent_train_lr() -> f64 {
+    5e-4
+}
+fn default_latent_train_seqcap() -> usize {
+    1024
 }
 
 /// `[memory.eval]` — Phase 9 internal eval harness. The MCP-visible

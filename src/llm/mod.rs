@@ -23,8 +23,12 @@ use anyhow::Result;
 
 pub mod cloud;
 pub mod extractor_worker;
+pub mod latent_pipeline;
+pub mod latent_train;
 pub mod prompt;
 pub mod qwen3;
+pub mod qwen3_latent_model;
+pub mod recursive_link;
 pub mod reflect;
 
 /// Reference to an existing entity passed to the extractor as grounding

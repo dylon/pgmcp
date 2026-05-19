@@ -485,6 +485,80 @@ facts_at, anchors).
   release tests). The inventory-coverage gate now passes for all
   Phase 8 + Phase 10 tools.
 
+### M7 — Latent-pipeline opt-in (Phase 11 RecursiveLink)
+
+- **Status:** ✅ shipped.
+- **`LatentPipeline` trait + factory** (`src/llm/latent_pipeline.rs`):
+  closed-set `LatentPipelineChoice { Qwen3Rlv1, Disabled }` mirrors
+  the `FcmBackend`/`LlmExtractor` pattern. `make_latent_pipeline`
+  returns `Ok(None)` when the choice is `Disabled` or the
+  RecursiveLink weights file is missing — the dispatcher uses that
+  signal to gracefully fall back to the text-mediated path, no
+  feature flags required.
+- **RecursiveLink module** (`src/llm/recursive_link.rs`):
+  `R_in(h) = h + W_2 · GELU(W_1 · h)` per Yang et al.
+  arXiv:2604.25917 §3.2. Residual-identity initialization
+  (`W_2 = 0`) keeps a freshly-spawned link semantically equivalent
+  to the text path; training only adds task-specific corrections.
+  Safetensors save/load round-trips via candle's `VarMap`. Cosine
+  alignment loss (`1 − cos(predicted, gold)`) is the training
+  objective.
+- **Vendored Qwen3-Q4 with hidden-state hooks**
+  (`src/llm/qwen3_latent_model.rs`): in-tree copy of
+  `candle-transformers 0.10.2`'s `quantized_qwen3`, adjusted to use
+  the crate's public `quantized_nn`, `utils`, and
+  `models::with_tracing` exports plus two surgical additions:
+  `forward_with_hidden` returns `(logits, last_hidden_state)`, and
+  `forward_from_input_embeds` runs the transformer stack from a
+  caller-supplied embedding tensor (the seam RecursiveLink needs
+  for stage-`k+1` prefill). Upstream parity is otherwise bit-for-bit.
+  When upstream candle exposes equivalent hooks the module can be
+  deleted; the trait keeps the seam clean.
+- **`Qwen3LatentPipeline`** (`src/llm/latent_pipeline.rs`): production
+  impl that fuses extract → reflect on the same Qwen3-Q4 backbone.
+  Stage 1 runs the extraction prompt through `forward_with_hidden`
+  and captures the EOS-position hidden state. Stage 2 projects that
+  state through `R_in`, prepends the projected embedding to the
+  reflection prompt's token embeddings, and runs
+  `forward_from_input_embeds` — eliminating the decode → re-tokenize
+  round-trip the plan §11 targets.
+- **One-shot trainer** (`src/llm/latent_train.rs`):
+  `train_recursive_link(pairs, hidden_size, cfg, …)` runs candle's
+  AdamW against `cosine_alignment_loss`. Defaults match the plan
+  recipe: 3 epochs · batch 1 · lr 5e-4. Pre-validates
+  hidden/gold dim matching and rejects empty training sets so a
+  caller can never write degenerate weights.
+- **Quality-validator cron**
+  (`src/cron/latent_pipeline_quality.rs`): periodically aggregates
+  A/B records under `pgmcp_metadata` key
+  `latent_quality_sample:*`, computes mean
+  `text_score − latent_score` over a configurable window, and flips
+  `pgmcp_metadata.latent_pipeline_active = 'false'` if the average
+  exceeds `quality_regression_threshold` (default 0.05). Default
+  off via `[memory.latent_pipeline] backend = "disabled"`.
+- **Config** (`[memory.latent_pipeline]`): `backend`
+  (`qwen3-rlv1` | `disabled`), `link_weights_path`,
+  `link_signature`, `quality_regression_threshold`,
+  `regression_window_days`, `vram_probe_at_startup`, plus a
+  nested `[memory.latent_pipeline.train]` section for trainer
+  hyperparameters.
+- **Telemetry:** 7 new `AtomicU64` counters
+  (`memory_latent_pipeline_runs`, `_errors`, `_fallbacks`,
+  `memory_latent_tokens_saved`, `memory_latent_quality_samples`,
+  `memory_latent_quality_regressions`,
+  `memory_latent_train_steps`) wired into the JSON snapshot.
+- **Tests:** 9 unit tests in-tree —
+  `recursive_link::tests` (residual identity, dim rejection, cosine
+  loss extremes, save/load round-trip);
+  `latent_pipeline::tests` (choice-parse round-trip, factory
+  no-error on disabled, factory downgrade on missing weights);
+  `latent_train::tests` (loss reduction on solvable task, dim
+  rejection, empty-set rejection). The qwen3_latent_model is
+  exercised via the same integration paths as the existing
+  Phase 4 qwen3 extractor (its forward is the upstream forward).
+- **Verification gate:** `./scripts/verify.sh` green across all 8
+  gates.
+
 <!-- Future milestone entries follow the same pattern. -->
 
 ---

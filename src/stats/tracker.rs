@@ -218,6 +218,21 @@ pub struct StatsTracker {
     /// (bi-temporal, supersession cycles, orphans, dangling forget log).
     pub memory_eval_invariant_violations: AtomicU64,
 
+    // Memory-server Phase 11 (latent pipeline) counters.
+    pub memory_latent_pipeline_runs: AtomicU64,
+    pub memory_latent_pipeline_errors: AtomicU64,
+    pub memory_latent_pipeline_fallbacks: AtomicU64,
+    /// Approximate output tokens skipped vs the text-mediated pipeline
+    /// (estimate: stage_A_output_tokens × 1 per fused call).
+    pub memory_latent_tokens_saved: AtomicU64,
+    /// Quality validator: total A/B comparisons recorded so far.
+    pub memory_latent_quality_samples: AtomicU64,
+    /// Quality validator: count of samples where the latent path
+    /// scored strictly worse than the text path.
+    pub memory_latent_quality_regressions: AtomicU64,
+    /// Trainer: total backward steps completed so far across runs.
+    pub memory_latent_train_steps: AtomicU64,
+
     // Timing (cumulative)
     pub index_duration_ms: AtomicU64,
     pub embedding_duration_ms: AtomicU64,
@@ -528,6 +543,13 @@ impl StatsTracker {
             memory_eval_scenarios_passed: AtomicU64::new(0),
             memory_eval_scenarios_failed: AtomicU64::new(0),
             memory_eval_invariant_violations: AtomicU64::new(0),
+            memory_latent_pipeline_runs: AtomicU64::new(0),
+            memory_latent_pipeline_errors: AtomicU64::new(0),
+            memory_latent_pipeline_fallbacks: AtomicU64::new(0),
+            memory_latent_tokens_saved: AtomicU64::new(0),
+            memory_latent_quality_samples: AtomicU64::new(0),
+            memory_latent_quality_regressions: AtomicU64::new(0),
+            memory_latent_train_steps: AtomicU64::new(0),
             index_duration_ms: AtomicU64::new(0),
             embedding_duration_ms: AtomicU64::new(0),
             last_index_timestamp: AtomicU64::new(0),
@@ -725,6 +747,13 @@ impl StatsTracker {
             "memory_eval_scenarios_passed": self.memory_eval_scenarios_passed.load(Ordering::Acquire),
             "memory_eval_scenarios_failed": self.memory_eval_scenarios_failed.load(Ordering::Acquire),
             "memory_eval_invariant_violations": self.memory_eval_invariant_violations.load(Ordering::Acquire),
+            "memory_latent_pipeline_runs": self.memory_latent_pipeline_runs.load(Ordering::Acquire),
+            "memory_latent_pipeline_errors": self.memory_latent_pipeline_errors.load(Ordering::Acquire),
+            "memory_latent_pipeline_fallbacks": self.memory_latent_pipeline_fallbacks.load(Ordering::Acquire),
+            "memory_latent_tokens_saved": self.memory_latent_tokens_saved.load(Ordering::Acquire),
+            "memory_latent_quality_samples": self.memory_latent_quality_samples.load(Ordering::Acquire),
+            "memory_latent_quality_regressions": self.memory_latent_quality_regressions.load(Ordering::Acquire),
+            "memory_latent_train_steps": self.memory_latent_train_steps.load(Ordering::Acquire),
             "index_duration_ms": self.index_duration_ms.load(Ordering::Acquire),
             "embedding_duration_ms": self.embedding_duration_ms.load(Ordering::Acquire),
             "files_scanned": self.files_scanned.load(Ordering::Acquire),

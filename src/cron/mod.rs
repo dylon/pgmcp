@@ -7,6 +7,8 @@ pub mod graph_analysis;
 #[allow(dead_code)]
 pub mod k_selector;
 #[allow(dead_code)]
+pub mod latent_pipeline_quality;
+#[allow(dead_code)]
 pub mod memory_eval;
 #[allow(dead_code)]
 pub mod memory_raptor;
