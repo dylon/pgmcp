@@ -22,8 +22,12 @@ pub enum EmbedSource {
     /// Daemon mode: route through the embed pool's priority query channel.
     Pool(pool::QueryEmbedder),
     /// CLI mode: lazily create a local model on first use (no pool running).
+    /// The model is held behind a `parking_lot::Mutex` so the synchronous
+    /// `embed` call inside `embed_query` doesn't park the calling tokio
+    /// task with a tokio mutex held — see the rationale on
+    /// [`backend::CandleBackend`].
     Lazy {
-        cell: Arc<tokio::sync::OnceCell<Arc<tokio::sync::Mutex<Embedder>>>>,
+        cell: Arc<tokio::sync::OnceCell<Arc<parking_lot::Mutex<Embedder>>>>,
         config: EmbeddingsConfig,
     },
     /// Direct trait dispatch — production wraps `CandleBackend`; tests
@@ -60,10 +64,10 @@ impl EmbedSource {
                 let model_arc = cell
                     .get_or_try_init(|| async {
                         let m = Embedder::new(config)?;
-                        Ok::<_, PgmcpError>(Arc::new(tokio::sync::Mutex::new(m)))
+                        Ok::<_, PgmcpError>(Arc::new(parking_lot::Mutex::new(m)))
                     })
                     .await?;
-                let guard = model_arc.lock().await;
+                let guard = model_arc.lock();
                 let mut vecs = guard.embed(&[text])?;
                 vecs.pop()
                     .ok_or_else(|| PgmcpError::Embedding("No embedding returned".into()))

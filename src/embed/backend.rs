@@ -46,10 +46,14 @@ pub trait EmbeddingBackend: Send + Sync {
 /// Production embedding backend backed by the candle `Embedder`.
 ///
 /// Inference happens synchronously inside `embed_one` / `embed_batch`. The
-/// backend holds the model behind a `tokio::sync::Mutex` so concurrent
-/// calls serialize safely. (candle's `BertModel` is `Send` but not `Sync`
-/// — concurrent `forward` against the same instance would race the
-/// underlying CUDA stream.)
+/// backend holds the model behind a `parking_lot::Mutex` rather than a
+/// `tokio::sync::Mutex` because every `embed` call is pure CPU/GPU work
+/// — a tokio mutex held across that synchronous block parks the running
+/// task while holding the guard, starving other tokio tasks contending
+/// on the same mutex. The parking-lot guard has the same serializing
+/// semantics (candle's `BertModel` is `Send` but not `Sync`), but does
+/// not pretend to cooperate with the tokio scheduler. No `.await`
+/// happens while the guard is alive, so the future remains `Send`.
 ///
 /// Currently the daemon's primary embedding path goes through the
 /// dedicated worker pool (`EmbedSource::Pool`) for backpressure, and the
@@ -60,7 +64,7 @@ pub trait EmbeddingBackend: Send + Sync {
 /// code that bypasses the pool.
 #[allow(dead_code)]
 pub struct CandleBackend {
-    model: tokio::sync::Mutex<Embedder>,
+    model: parking_lot::Mutex<Embedder>,
 }
 
 #[allow(dead_code)]
@@ -68,7 +72,7 @@ impl CandleBackend {
     pub fn new(config: &EmbeddingsConfig) -> Result<Self> {
         let model = Embedder::new(config)?;
         Ok(Self {
-            model: tokio::sync::Mutex::new(model),
+            model: parking_lot::Mutex::new(model),
         })
     }
 }
@@ -77,14 +81,14 @@ impl CandleBackend {
 #[allow(dead_code)]
 impl EmbeddingBackend for CandleBackend {
     async fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
-        let guard = self.model.lock().await;
+        let guard = self.model.lock();
         let mut vecs = guard.embed(&[text])?;
         vecs.pop()
             .ok_or_else(|| PgmcpError::Embedding("No embedding returned".into()))
     }
 
     async fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let guard = self.model.lock().await;
+        let guard = self.model.lock();
         guard.embed(texts)
     }
 

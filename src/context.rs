@@ -56,6 +56,13 @@ pub struct SystemContext {
     /// tools that need the extractor (currently `memory_reflect`)
     /// refuse cleanly when this is `None`.
     llm_extractor: Option<Arc<dyn LlmExtractor>>,
+    /// Serializes any caller that performs a mass-delete reindex (the
+    /// MCP `reindex` tool, future cron equivalents, etc.). Held for the
+    /// duration of the destructive operation so two reindexes cannot
+    /// race the live indexer pool and each other. Acquired non-blocking
+    /// via `try_lock`; a held lock surfaces as a `Conflict`-style error
+    /// to the caller rather than queueing.
+    reindex_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl SystemContext {
@@ -82,6 +89,7 @@ impl SystemContext {
             task_store,
             lifecycle,
             llm_extractor: None,
+            reindex_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -108,6 +116,7 @@ impl SystemContext {
             task_store,
             lifecycle,
             llm_extractor,
+            reindex_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -131,6 +140,11 @@ impl SystemContext {
 
     pub fn config(&self) -> &Arc<ArcSwap<Config>> {
         &self.config
+    }
+
+    /// The reindex serialization lock — see field-level docstring.
+    pub fn reindex_lock(&self) -> &Arc<tokio::sync::Mutex<()>> {
+        &self.reindex_lock
     }
 
     pub fn log_broadcaster(&self) -> &Arc<LogBroadcaster> {

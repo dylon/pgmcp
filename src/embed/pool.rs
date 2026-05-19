@@ -247,6 +247,23 @@ impl EmbeddingPool {
     }
 }
 
+/// Maximum consecutive `Embedder::new` failures before the supervisor
+/// gives up on a worker slot. With 1s/2s/4s/.../60s backoff this caps
+/// retry duration at roughly 10 minutes — long enough for a transient
+/// CUDA reset / weights download to recover, short enough that a
+/// permanent fault surfaces in `embed_worker_permanent_failures` rather
+/// than spinning forever.
+const MAX_CONSECUTIVE_WORKER_FAILURES: u32 = 10;
+
+/// Cap on the supervisor's exponential backoff between retries.
+const MAX_WORKER_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Supervisor entry point. Constructs the worker's model with retry +
+/// exponential backoff so a transient `Embedder::new` failure (driver
+/// reset, OOM during model load, transient HF download error) doesn't
+/// silently kill the worker slot. Each successful construction runs the
+/// event loop until shutdown; if the event loop returns due to channel
+/// disconnect (pool shutdown), the supervisor exits without retrying.
 fn embedding_worker(
     id: usize,
     index_rx: Receiver<EmbedIndexRequest>,
@@ -256,17 +273,81 @@ fn embedding_worker(
     shutdown: &AtomicBool,
     rt: &tokio::runtime::Handle,
 ) {
-    // Each worker owns its own model instance, bound to its own device.
-    let model = match Embedder::new(config) {
-        Ok(m) => m,
-        Err(e) => {
-            error!(worker_id = id, error = %e, "Failed to create embedding model");
+    let mut consecutive_failures: u32 = 0;
+    let mut backoff = std::time::Duration::from_secs(1);
+
+    while !shutdown.load(Ordering::Acquire) {
+        let model = match Embedder::new(config) {
+            Ok(m) => {
+                if consecutive_failures > 0 {
+                    info!(
+                        worker_id = id,
+                        attempts = consecutive_failures + 1,
+                        "Embedding worker recovered after retry"
+                    );
+                    stats.embed_worker_restarts.fetch_add(1, Ordering::Relaxed);
+                }
+                m
+            }
+            Err(e) => {
+                consecutive_failures += 1;
+                error!(
+                    worker_id = id,
+                    error = %e,
+                    attempt = consecutive_failures,
+                    "Embedder::new failed; supervisor will retry"
+                );
+                stats.embed_errors.fetch_add(1, Ordering::Relaxed);
+                if consecutive_failures >= MAX_CONSECUTIVE_WORKER_FAILURES {
+                    error!(
+                        worker_id = id,
+                        attempts = consecutive_failures,
+                        "Embedding worker permanently disabled (exceeded retry budget)"
+                    );
+                    stats
+                        .embed_worker_permanent_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                sleep_with_shutdown(backoff, shutdown);
+                backoff = std::cmp::min(backoff.saturating_mul(2), MAX_WORKER_BACKOFF);
+                continue;
+            }
+        };
+
+        stats.embed_workers_alive.fetch_add(1, Ordering::Relaxed);
+        debug!(worker_id = id, "Embedding worker started");
+        run_worker_event_loop(id, &model, &index_rx, &query_rx, stats, shutdown, rt);
+        stats.embed_workers_alive.fetch_sub(1, Ordering::Relaxed);
+        debug!(worker_id = id, "Embedding worker exiting");
+        // Normal exit means the event loop saw shutdown or a disconnected
+        // channel; either way the supervisor is done — no retry.
+        return;
+    }
+}
+
+/// Sleep for at most `dur`, returning early if shutdown is signalled.
+/// Polled at 100ms granularity so the daemon's shutdown watchdog isn't
+/// blocked by a worker still in its retry backoff.
+fn sleep_with_shutdown(dur: std::time::Duration, shutdown: &AtomicBool) {
+    let start = std::time::Instant::now();
+    while start.elapsed() < dur {
+        if shutdown.load(Ordering::Acquire) {
             return;
         }
-    };
+        std::thread::sleep(std::time::Duration::from_millis(100).min(dur - start.elapsed()));
+    }
+}
 
-    debug!(worker_id = id, "Embedding worker started");
-
+fn run_worker_event_loop(
+    id: usize,
+    model: &Embedder,
+    index_rx: &Receiver<EmbedIndexRequest>,
+    query_rx: &Receiver<EmbedQueryRequest>,
+    stats: &StatsTracker,
+    shutdown: &AtomicBool,
+    rt: &tokio::runtime::Handle,
+) {
     loop {
         if shutdown.load(Ordering::Acquire) {
             break;
@@ -275,7 +356,7 @@ fn embedding_worker(
         // Priority: drain ALL pending query requests first
         loop {
             match query_rx.try_recv() {
-                Ok(req) => process_query_request(&model, req, stats),
+                Ok(req) => process_query_request(model, req, stats),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
@@ -285,7 +366,7 @@ fn embedding_worker(
         crossbeam_channel::select! {
             recv(query_rx) -> msg => {
                 match msg {
-                    Ok(req) => process_query_request(&model, req, stats),
+                    Ok(req) => process_query_request(model, req, stats),
                     Err(_) => return,
                 }
             }
@@ -295,13 +376,13 @@ fn embedding_worker(
                         let start = std::time::Instant::now();
                         match req {
                             EmbedIndexRequest::IndexFile(task) => {
-                                process_index_file_task(&model, task, stats, rt, id);
+                                process_index_file_task(model, task, stats, rt, id);
                             }
                             EmbedIndexRequest::File(file_req) => {
-                                process_file_request(&model, file_req, stats, rt, id);
+                                process_file_request(model, file_req, stats, rt, id);
                             }
                             EmbedIndexRequest::Commit(commit_req) => {
-                                process_commit_request(&model, commit_req, stats, rt, id);
+                                process_commit_request(model, commit_req, stats, rt, id);
                             }
                         }
                         let elapsed = start.elapsed().as_millis() as u64;
@@ -313,8 +394,6 @@ fn embedding_worker(
             default(std::time::Duration::from_millis(500)) => {}
         }
     }
-
-    debug!(worker_id = id, "Embedding worker exiting");
 }
 
 fn process_query_request(model: &Embedder, request: EmbedQueryRequest, stats: &StatsTracker) {

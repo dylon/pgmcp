@@ -273,6 +273,20 @@ pub struct StatsTracker {
     pub embed_commit_batches: AtomicU64,
     pub embed_query_count: AtomicU64,
     pub embed_errors: AtomicU64,
+    /// Number of embedding workers that currently hold a live `Embedder`.
+    /// Decrements when a worker exits (shutdown or permanent supervisor
+    /// failure). A long-running value below the configured `pool_size`
+    /// signals degraded throughput before user-visible latency rises.
+    pub embed_workers_alive: AtomicU64,
+    /// Total restart attempts the supervisor has performed across all
+    /// workers (i.e., `Embedder::new` failures that were retried). Rises
+    /// monotonically; never resets.
+    pub embed_worker_restarts: AtomicU64,
+    /// Number of worker slots the supervisor abandoned permanently after
+    /// exceeding the consecutive-failure threshold. Once non-zero, the
+    /// daemon needs operator attention (usually a CUDA reset or weights
+    /// re-download).
+    pub embed_worker_permanent_failures: AtomicU64,
 
     // File watcher counters
     pub watcher_events_received: AtomicU64,
@@ -573,6 +587,9 @@ impl StatsTracker {
             embed_commit_batches: AtomicU64::new(0),
             embed_query_count: AtomicU64::new(0),
             embed_errors: AtomicU64::new(0),
+            embed_workers_alive: AtomicU64::new(0),
+            embed_worker_restarts: AtomicU64::new(0),
+            embed_worker_permanent_failures: AtomicU64::new(0),
             watcher_events_received: AtomicU64::new(0),
             watcher_events_filtered: AtomicU64::new(0),
             watcher_events_debounced: AtomicU64::new(0),
@@ -775,6 +792,9 @@ impl StatsTracker {
             "embed_file_batches": self.embed_file_batches.load(Ordering::Acquire),
             "embed_commit_batches": self.embed_commit_batches.load(Ordering::Acquire),
             "embed_query_count": self.embed_query_count.load(Ordering::Acquire),
+            "embed_workers_alive": self.embed_workers_alive.load(Ordering::Acquire),
+            "embed_worker_restarts": self.embed_worker_restarts.load(Ordering::Acquire),
+            "embed_worker_permanent_failures": self.embed_worker_permanent_failures.load(Ordering::Acquire),
             "embed_errors": self.embed_errors.load(Ordering::Acquire),
             "watcher_events_received": self.watcher_events_received.load(Ordering::Acquire),
             "watcher_events_filtered": self.watcher_events_filtered.load(Ordering::Acquire),
