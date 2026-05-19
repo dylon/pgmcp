@@ -292,6 +292,15 @@ pub struct StatsTracker {
     pub watcher_events_received: AtomicU64,
     pub watcher_events_filtered: AtomicU64,
     pub watcher_events_debounced: AtomicU64,
+    /// Total watcher errors of any kind delivered to the notify callback.
+    /// Rises on inotify queue overflow, unmounted-path errors, transient
+    /// filesystem hiccups. Monotonic.
+    pub watcher_errors_total: AtomicU64,
+    /// Subset of `watcher_errors_total` classified as inotify queue
+    /// overflow. Each increment means events were dropped and the
+    /// workspace index is now divergent from disk until the daemon
+    /// restarts (full automatic re-arm is a follow-up).
+    pub inotify_overflows_total: AtomicU64,
 
     // Work pool lifetime counters
     pub work_pool_tasks_completed: AtomicU64,
@@ -590,6 +599,8 @@ impl StatsTracker {
             embed_workers_alive: AtomicU64::new(0),
             embed_worker_restarts: AtomicU64::new(0),
             embed_worker_permanent_failures: AtomicU64::new(0),
+            watcher_errors_total: AtomicU64::new(0),
+            inotify_overflows_total: AtomicU64::new(0),
             watcher_events_received: AtomicU64::new(0),
             watcher_events_filtered: AtomicU64::new(0),
             watcher_events_debounced: AtomicU64::new(0),
@@ -795,6 +806,8 @@ impl StatsTracker {
             "embed_workers_alive": self.embed_workers_alive.load(Ordering::Acquire),
             "embed_worker_restarts": self.embed_worker_restarts.load(Ordering::Acquire),
             "embed_worker_permanent_failures": self.embed_worker_permanent_failures.load(Ordering::Acquire),
+            "watcher_errors_total": self.watcher_errors_total.load(Ordering::Acquire),
+            "inotify_overflows_total": self.inotify_overflows_total.load(Ordering::Acquire),
             "embed_errors": self.embed_errors.load(Ordering::Acquire),
             "watcher_events_received": self.watcher_events_received.load(Ordering::Acquire),
             "watcher_events_filtered": self.watcher_events_filtered.load(Ordering::Acquire),

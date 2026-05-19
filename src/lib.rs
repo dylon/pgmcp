@@ -9,7 +9,7 @@
 //! Module layout mirrors `src/main.rs`; if you add a new top-level module
 //! there, add it here too so external test/example surface stays aligned.
 
-#![recursion_limit = "512"]
+#![recursion_limit = "1024"]
 
 // BLAS provider for ndarray's `blas` feature (cblas-sys FFI) is wired by
 // `build.rs`, which emits `cargo:rustc-link-lib=dylib=blis-mt` so the

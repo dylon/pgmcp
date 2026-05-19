@@ -1345,6 +1345,19 @@ pub async fn run_global_topic_scan(
         .topic_noise_chunks
         .store(summary.noise_chunks as u64, Ordering::Relaxed);
 
+    // Wipe-protection: if FCM produced a degenerate result (CUDA OOM,
+    // cancellation, backend failure), `iterations == 0` and `topics` is
+    // empty. Clearing the prior-cycle topics here would replace good data
+    // with nothing — the very failure mode F12 in the robustness plan
+    // calls out. Skip the swap and let the next successful run resync.
+    if summary.iterations == 0 && summary.topics_found == 0 {
+        warn!(
+            chunks_analyzed = summary.chunks_analyzed,
+            "FCM produced no topics (degenerate result or cancellation); preserving prior-cycle global topics"
+        );
+        return;
+    }
+
     // Store results
     if let Err(e) = db.clear_topics_for_scope("global").await {
         error!(
@@ -1464,6 +1477,12 @@ async fn run_hierarchy_pass(db: &dyn DbClient, config: &CronConfig, stats: &Arc<
         })
         .collect();
 
+    // Wipe-protection: if the hierarchy FCM produced no meta-groups,
+    // preserve the prior-cycle hierarchy rather than clearing it.
+    if meta_topics.is_empty() {
+        warn!("hierarchy: meta-clustering produced no groups; preserving prior-cycle hierarchy");
+        return;
+    }
     if let Err(e) = db.clear_topics_for_scope("hierarchy").await {
         warn!(error = %e, "hierarchy: clear failed");
         return;
@@ -1724,6 +1743,16 @@ async fn run_mmap_global_topic_scan(
         .topic_noise_chunks
         .store(summary.noise_chunks as u64, Ordering::Relaxed);
 
+    // Wipe-protection: see F12 in the robustness plan. The mmap-streaming
+    // path is the global-scope's primary mode; a degenerate FCM result
+    // here would clear good data and replace it with nothing.
+    if summary.iterations == 0 && summary.topics_found == 0 {
+        warn!(
+            chunks_analyzed = n,
+            "mmap-streaming: FCM produced no topics; preserving prior-cycle global topics"
+        );
+        return;
+    }
     if let Err(e) = db.clear_topics_for_scope("global").await {
         error!(
             error = %e,
@@ -2315,7 +2344,23 @@ async fn run_per_project_emergency_fallback(
         {
             Ok(summary) => {
                 let scope = format!("project:{}", project_name);
-                let _ = db.clear_topics_for_scope(&scope).await;
+                // Wipe-protection: don't clear an existing per-project
+                // topic set when this iteration produced nothing.
+                if summary.iterations == 0 && summary.topics_found == 0 {
+                    warn!(
+                        project = %project_name,
+                        "emergency fallback: FCM produced no topics; preserving prior per-project topics"
+                    );
+                    continue;
+                }
+                if let Err(e) = db.clear_topics_for_scope(&scope).await {
+                    warn!(
+                        project = %project_name,
+                        error = %e,
+                        "emergency fallback: clear_topics failed; skipping store to preserve prior topics"
+                    );
+                    continue;
+                }
                 if let Err(e) = db.store_topics(&scope, &summary.topics).await {
                     error!(
                         project = %project_name,
