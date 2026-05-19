@@ -1,14 +1,78 @@
 //! Database schema migrations.
+//!
+//! ## Versioning
+//!
+//! `pgmcp_schema_versions` records the set of numbered migration steps
+//! that have completed against this database. New schema changes that
+//! aren't naturally idempotent (e.g. table-level data backfills, type
+//! transformations) should be added as `apply_step(pool, N,
+//! "name", || async { ... })`. The pre-versioning body that builds the
+//! initial schema is registered as version 1 at the end of
+//! `run_migrations` — it stays inline rather than getting moved inside
+//! an `apply_step` closure because every statement in it is already
+//! `IF NOT EXISTS` / `IF EXISTS` idempotent and the body bundles
+//! cross-cutting concerns (HNSW index rebuilds keyed off
+//! `pgmcp_metadata`, conditional column adds) that don't slot cleanly
+//! into a numbered-step model. The version stamp is what makes the
+//! "this DB has been through `run_migrations` at least once" check
+//! cheap going forward.
 
 use sqlx::PgPool;
+use tracing::info;
 
 use crate::config::VectorConfig;
+
+const INITIAL_SCHEMA_VERSION: i32 = 1;
+
+/// Ensure `pgmcp_schema_versions` exists. Run before any
+/// `version_applied` / `record_version` call.
+async fn ensure_schema_versions_table(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS pgmcp_schema_versions (
+            version INT PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Has the numbered migration step `version` been recorded?
+async fn version_applied(pool: &PgPool, version: i32) -> Result<bool, sqlx::Error> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pgmcp_schema_versions WHERE version = $1")
+            .bind(version)
+            .fetch_one(pool)
+            .await?;
+    Ok(count > 0)
+}
+
+/// Record successful completion of a numbered migration step. Idempotent
+/// via `ON CONFLICT DO NOTHING`.
+async fn record_version(pool: &PgPool, version: i32, name: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO pgmcp_schema_versions (version, name) VALUES ($1, $2)
+         ON CONFLICT (version) DO NOTHING",
+    )
+    .bind(version)
+    .bind(name)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
 
 /// Run all migrations to set up the schema.
 pub async fn run_migrations(
     pool: &PgPool,
     vector_config: &VectorConfig,
 ) -> Result<(), sqlx::Error> {
+    // Bootstrap the version table first. Subsequent migration code can
+    // call `version_applied` / `record_version` to short-circuit work
+    // that has already been performed.
+    ensure_schema_versions_table(pool).await?;
+    let initial_schema_done = version_applied(pool, INITIAL_SCHEMA_VERSION).await?;
     // Create extensions
     sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
         .execute(pool)
@@ -63,12 +127,12 @@ pub async fn run_migrations(
     // Migration: add worktree-grouping columns to existing installs.
     // Idempotent — no-op when columns already present (e.g. fresh install
     // via the CREATE TABLE above).
-    let _ = sqlx::query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS git_common_dir TEXT")
+    sqlx::query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS git_common_dir TEXT")
         .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS git_root_commits TEXT")
+        .await?;
+    sqlx::query("ALTER TABLE projects ADD COLUMN IF NOT EXISTS git_root_commits TEXT")
         .execute(pool)
-        .await;
+        .await?;
 
     // Create indexed_files table
     sqlx::query(
@@ -108,9 +172,9 @@ pub async fn run_migrations(
 
     // Migration: allow content_hash to be NULL (deferred commit for resume-safety).
     // Existing databases may have NOT NULL; this is metadata-only in PostgreSQL.
-    let _ = sqlx::query("ALTER TABLE indexed_files ALTER COLUMN content_hash DROP NOT NULL")
+    sqlx::query("ALTER TABLE indexed_files ALTER COLUMN content_hash DROP NOT NULL")
         .execute(pool)
-        .await;
+        .await?;
 
     // Migration: content-based dedup + rename detection.
     //
@@ -122,13 +186,13 @@ pub async fn run_migrations(
     // `ON DELETE SET NULL` so deleting a canonical leaves orphan
     // duplicates that can be promoted on the next scan (see
     // `delete_file_with_promotion` in queries.rs).
-    let _ = sqlx::query(
+    sqlx::query(
         "ALTER TABLE indexed_files
          ADD COLUMN IF NOT EXISTS duplicate_of_file_id BIGINT
          REFERENCES indexed_files(id) ON DELETE SET NULL",
     )
     .execute(pool)
-    .await;
+    .await?;
 
     // Asymmetric content storage flag. `content_recoverable_from_disk =
     // true` means the row deliberately stores `content = NULL` because
@@ -140,22 +204,22 @@ pub async fn run_migrations(
     // already-extracted pandoc/pdftotext output that would be expensive
     // to recreate. The flag is independent of the `truncated` flag
     // (which still signals size-gated oversize files).
-    let _ = sqlx::query(
+    sqlx::query(
         "ALTER TABLE indexed_files
          ADD COLUMN IF NOT EXISTS content_recoverable_from_disk BOOLEAN
          NOT NULL DEFAULT FALSE",
     )
     .execute(pool)
-    .await;
+    .await?;
 
     // Migration: drop the old UNIQUE composite index on projects(workspace_path, path)
     // if it exists. The path column is already UNIQUE on its own, so the composite
     // index only needs to be a regular (non-unique) index for query performance.
     // Without this, concurrent upserts hit the composite UNIQUE constraint which
     // isn't covered by ON CONFLICT (path).
-    let _ = sqlx::query("DROP INDEX IF EXISTS idx_projects_workspace_path")
+    sqlx::query("DROP INDEX IF EXISTS idx_projects_workspace_path")
         .execute(pool)
-        .await;
+        .await?;
 
     // Drop the legacy per-file FTS index — `text_search` now queries
     // `file_chunks.content` exclusively. The legacy index would also
@@ -163,9 +227,9 @@ pub async fn run_migrations(
     // tool-result transcripts (whose content was the cause of the
     // 2026-05-13 "string is too long for tsvector" errors before the
     // byte-aware chunker landed).
-    let _ = sqlx::query("DROP INDEX IF EXISTS idx_files_fts")
+    sqlx::query("DROP INDEX IF EXISTS idx_files_fts")
         .execute(pool)
-        .await;
+        .await?;
 
     // Create indexes (IF NOT EXISTS for idempotency)
     let indexes = [
@@ -232,15 +296,15 @@ pub async fn run_migrations(
     .await?;
 
     // Blame metadata on file_chunks (idempotent ALTER)
-    let _ = sqlx::query("ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS blame_commit TEXT")
+    sqlx::query("ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS blame_commit TEXT")
         .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS blame_author TEXT")
+        .await?;
+    sqlx::query("ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS blame_author TEXT")
         .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS blame_date TIMESTAMPTZ")
+        .await?;
+    sqlx::query("ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS blame_date TIMESTAMPTZ")
         .execute(pool)
-        .await;
+        .await?;
 
     // Indexes for git tables
     let git_indexes = [
@@ -336,17 +400,17 @@ pub async fn run_migrations(
     .await?;
 
     // Migration: add keywords/keyword_scores to code_topics (idempotent)
-    let _ = sqlx::query("ALTER TABLE code_topics ADD COLUMN IF NOT EXISTS keywords TEXT[]")
+    sqlx::query("ALTER TABLE code_topics ADD COLUMN IF NOT EXISTS keywords TEXT[]")
         .execute(pool)
-        .await;
-    let _ = sqlx::query("ALTER TABLE code_topics ADD COLUMN IF NOT EXISTS keyword_scores REAL[]")
+        .await?;
+    sqlx::query("ALTER TABLE code_topics ADD COLUMN IF NOT EXISTS keyword_scores REAL[]")
         .execute(pool)
-        .await;
+        .await?;
 
     // Phase 7: store centroid vector for FCM warm-start across restarts.
-    let _ = sqlx::query("ALTER TABLE code_topics ADD COLUMN IF NOT EXISTS centroid REAL[]")
+    sqlx::query("ALTER TABLE code_topics ADD COLUMN IF NOT EXISTS centroid REAL[]")
         .execute(pool)
-        .await;
+        .await?;
 
     // Phase 9: meta-cluster hierarchy stores parent_topic_ids on scope='hierarchy' rows.
     let _ =
@@ -933,6 +997,20 @@ pub async fn run_migrations(
     // ================================================================
     ensure_memory_unified_views(pool).await?;
 
+    // Record the baseline. From this point on, future migration steps
+    // can call `apply_step(pool, N, ...)`-style logic to land changes
+    // that need transactional, exactly-once semantics. The pre-version-1
+    // body above stays inline because every statement is already
+    // idempotent and the body bundles cross-cutting concerns (HNSW
+    // rebuilds keyed off `pgmcp_metadata`, conditional column adds).
+    if !initial_schema_done {
+        record_version(pool, INITIAL_SCHEMA_VERSION, "initial_schema").await?;
+        info!(
+            version = INITIAL_SCHEMA_VERSION,
+            "initial schema migration recorded"
+        );
+    }
+
     Ok(())
 }
 
@@ -945,12 +1023,12 @@ async fn ensure_memory_unified_views(pool: &PgPool) -> Result<(), sqlx::Error> {
     // the latest column shapes. Order matters: drop the view first
     // (it depends on the matview indirectly through underlying tables
     // only, but explicit drops keep refresh semantics simple).
-    let _ = sqlx::query("DROP VIEW IF EXISTS memory_unified_edges")
+    sqlx::query("DROP VIEW IF EXISTS memory_unified_edges")
         .execute(pool)
-        .await;
-    let _ = sqlx::query("DROP MATERIALIZED VIEW IF EXISTS memory_unified_nodes")
+        .await?;
+    sqlx::query("DROP MATERIALIZED VIEW IF EXISTS memory_unified_nodes")
         .execute(pool)
-        .await;
+        .await?;
 
     sqlx::query(
         "CREATE MATERIALIZED VIEW memory_unified_nodes AS
@@ -988,21 +1066,21 @@ async fn ensure_memory_unified_views(pool: &PgPool) -> Result<(), sqlx::Error> {
     // `embedding` but a matview supports HNSW only if pgvector is
     // recent enough — we keep the cosine index implicit (matview is
     // rebuilt on refresh, not incrementally).
-    let _ = sqlx::query(
+    sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_memory_unified_nodes_type
             ON memory_unified_nodes (node_type)",
     )
     .execute(pool)
-    .await;
+    .await?;
     // HNSW on embedding for vector retrieval. Built only if the matview
     // has rows — empty-table HNSW build is fast but harmless either way.
-    let _ = sqlx::query(
+    sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_memory_unified_nodes_embedding
             ON memory_unified_nodes USING hnsw (embedding vector_cosine_ops)
             WITH (m = 24, ef_construction = 200)",
     )
     .execute(pool)
-    .await;
+    .await?;
 
     sqlx::query(
         "CREATE VIEW memory_unified_edges AS
@@ -1104,14 +1182,27 @@ async fn ensure_memory_phase2_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
     } else {
         "UNIQUE"
     };
-    let _ = sqlx::query(&format!(
-        "ALTER TABLE memory_scope
-            ADD CONSTRAINT memory_scope_tuple_uq
-            {} (user_id, agent_id, session_id, project_id)",
-        unique_clause
-    ))
-    .execute(pool)
-    .await; // ignore — re-running migrations will hit "already exists"
+    // ALTER TABLE ADD CONSTRAINT has no `IF NOT EXISTS` until Postgres 17,
+    // so we pre-check `pg_constraint` and only issue the ALTER on first
+    // run. The constraint name is project-stable, so this is exactly-once.
+    let constraint_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'memory_scope_tuple_uq'
+        )",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !constraint_exists {
+        sqlx::query(&format!(
+            "ALTER TABLE memory_scope
+                ADD CONSTRAINT memory_scope_tuple_uq
+                {} (user_id, agent_id, session_id, project_id)",
+            unique_clause
+        ))
+        .execute(pool)
+        .await?;
+    }
 
     // Entities. Bi-temporal columns are NOT NULL on valid_from with a
     // sentinel default (NOW()); valid_to and superseded_by stay NULL
@@ -1350,15 +1441,15 @@ async fn ensure_memory_phase2_hnsw_index(
     .fetch_optional(pool)
     .await?;
     if stored.as_deref() != Some(&current_params) {
-        let _ = sqlx::query("DROP INDEX IF EXISTS idx_memory_observations_embedding")
+        sqlx::query("DROP INDEX IF EXISTS idx_memory_observations_embedding")
             .execute(pool)
-            .await;
+            .await?;
         let create_sql = format!(
             "CREATE INDEX idx_memory_observations_embedding ON memory_observations \
              USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(&create_sql).execute(pool).await?;
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_observations_hnsw_params', $1)
@@ -1376,16 +1467,16 @@ async fn ensure_memory_phase2_hnsw_index(
     .fetch_optional(pool)
     .await?;
     if stored.as_deref() != Some(&current_params) {
-        let _ = sqlx::query("DROP INDEX IF EXISTS idx_memory_summary_tree_embedding")
+        sqlx::query("DROP INDEX IF EXISTS idx_memory_summary_tree_embedding")
             .execute(pool)
-            .await;
+            .await?;
         let create_sql = format!(
             "CREATE INDEX idx_memory_summary_tree_embedding ON memory_summary_tree \
              USING hnsw (summary_embedding vector_cosine_ops) \
              WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(&create_sql).execute(pool).await?;
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_summary_tree_hnsw_params', $1)
@@ -1437,16 +1528,16 @@ async fn ensure_memory_v2_hnsw_index(
     .fetch_optional(pool)
     .await?;
     if stored.as_deref() != Some(&current_params) {
-        let _ = sqlx::query("DROP INDEX IF EXISTS idx_file_chunks_embedding_v2")
+        sqlx::query("DROP INDEX IF EXISTS idx_file_chunks_embedding_v2")
             .execute(pool)
-            .await;
+            .await?;
         let create_sql = format!(
             "CREATE INDEX idx_file_chunks_embedding_v2 ON file_chunks \
              USING hnsw (embedding_v2 vector_cosine_ops) \
              WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(&create_sql).execute(pool).await?;
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_v2_file_chunks_hnsw_params', $1)
@@ -1464,16 +1555,16 @@ async fn ensure_memory_v2_hnsw_index(
     .fetch_optional(pool)
     .await?;
     if stored.as_deref() != Some(&current_params) {
-        let _ = sqlx::query("DROP INDEX IF EXISTS idx_session_prompts_embedding_v2")
+        sqlx::query("DROP INDEX IF EXISTS idx_session_prompts_embedding_v2")
             .execute(pool)
-            .await;
+            .await?;
         let create_sql = format!(
             "CREATE INDEX idx_session_prompts_embedding_v2 ON session_prompts \
              USING hnsw (embedding_v2 vector_cosine_ops) \
              WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(&create_sql).execute(pool).await?;
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_v2_session_prompts_hnsw_params', $1)
@@ -1491,16 +1582,16 @@ async fn ensure_memory_v2_hnsw_index(
     .fetch_optional(pool)
     .await?;
     if stored.as_deref() != Some(&current_params) {
-        let _ = sqlx::query("DROP INDEX IF EXISTS idx_durable_mandates_embedding")
+        sqlx::query("DROP INDEX IF EXISTS idx_durable_mandates_embedding")
             .execute(pool)
-            .await;
+            .await?;
         let create_sql = format!(
             "CREATE INDEX idx_durable_mandates_embedding ON durable_mandates \
              USING hnsw (embedding vector_cosine_ops) \
              WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(&create_sql).execute(pool).await?;
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_v2_durable_mandates_hnsw_params', $1)
@@ -1558,9 +1649,9 @@ async fn ensure_hnsw_index(pool: &PgPool, config: &VectorConfig) -> Result<(), s
 
     if needs_rebuild {
         // Drop old index if it exists
-        let _ = sqlx::query("DROP INDEX IF EXISTS idx_chunks_embedding")
+        sqlx::query("DROP INDEX IF EXISTS idx_chunks_embedding")
             .execute(pool)
-            .await;
+            .await?;
 
         // Create new HNSW index with configured parameters
         let create_sql = format!(
@@ -1569,7 +1660,7 @@ async fn ensure_hnsw_index(pool: &PgPool, config: &VectorConfig) -> Result<(), s
             config.hnsw_m, config.hnsw_ef_construction
         );
         // Ignore error if table is empty (index creation on empty table is fast)
-        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(&create_sql).execute(pool).await?;
 
         // Store the params we built the index with
         sqlx::query(
@@ -1609,16 +1700,16 @@ async fn ensure_git_commit_hnsw_index(
     let needs_rebuild = stored.as_deref() != Some(&current_params);
 
     if needs_rebuild {
-        let _ = sqlx::query("DROP INDEX IF EXISTS idx_git_commit_chunks_embedding")
+        sqlx::query("DROP INDEX IF EXISTS idx_git_commit_chunks_embedding")
             .execute(pool)
-            .await;
+            .await?;
 
         let create_sql = format!(
             "CREATE INDEX idx_git_commit_chunks_embedding ON git_commit_chunks \
              USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(&create_sql).execute(pool).await?;
 
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value) VALUES ('git_hnsw_params', $1)
@@ -1653,16 +1744,16 @@ async fn ensure_software_pattern_hnsw_index(
     let needs_rebuild = stored.as_deref() != Some(&current_params);
 
     if needs_rebuild {
-        let _ = sqlx::query("DROP INDEX IF EXISTS idx_software_pattern_chunks_embedding")
+        sqlx::query("DROP INDEX IF EXISTS idx_software_pattern_chunks_embedding")
             .execute(pool)
-            .await;
+            .await?;
 
         let create_sql = format!(
             "CREATE INDEX idx_software_pattern_chunks_embedding ON software_pattern_chunks \
              USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(&create_sql).execute(pool).await?;
 
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
@@ -1697,16 +1788,16 @@ async fn ensure_session_prompts_hnsw_index(
     .await?;
 
     if stored.as_deref() != Some(&current_params) {
-        let _ = sqlx::query("DROP INDEX IF EXISTS idx_session_prompts_embedding")
+        sqlx::query("DROP INDEX IF EXISTS idx_session_prompts_embedding")
             .execute(pool)
-            .await;
+            .await?;
 
         let create_sql = format!(
             "CREATE INDEX idx_session_prompts_embedding ON session_prompts \
              USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        let _ = sqlx::query(&create_sql).execute(pool).await;
+        sqlx::query(&create_sql).execute(pool).await?;
 
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
