@@ -159,6 +159,10 @@ pub async fn search(
         .embed_query(req.query.clone())
         .await
         .map_err(|e| {
+            state
+                .stats
+                .rag_search_failures_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Embedding failed: {}", e),
@@ -182,6 +186,10 @@ pub async fn search(
         )
         .await
         .map_err(|e| {
+            state
+                .stats
+                .rag_search_failures_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("Search failed: {}", e),

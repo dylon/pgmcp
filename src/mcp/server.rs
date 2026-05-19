@@ -87,7 +87,13 @@ pub(crate) fn extract_caller(ctx: &RequestContext<RoleServer>) -> CallerInfo {
     CallerInfo {
         client_name: info.client_info.name.to_lowercase(),
         client_version: info.client_info.version.clone(),
-        protocol_version: format!("{:?}", info.protocol_version),
+        // `info.protocol_version` is `rmcp::model::ProtocolVersion`,
+        // a newtype around a `&'static str` / `String`. Use `Display`
+        // for a stable wire-format string ("2024-11-05") instead of
+        // the `Debug` repr — telemetry rows / dashboards would
+        // otherwise silently change shape if rmcp updates its Debug
+        // impl.
+        protocol_version: info.protocol_version.to_string(),
     }
 }
 

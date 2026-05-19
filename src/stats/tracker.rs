@@ -301,6 +301,11 @@ pub struct StatsTracker {
     /// workspace index is now divergent from disk until the daemon
     /// restarts (full automatic re-arm is a follow-up).
     pub inotify_overflows_total: AtomicU64,
+    /// `/api/search` 5xx responses returned to the Claude Code RAG
+    /// hook. Distinct from `mcp_errors` so dashboards can attribute
+    /// "RAG context injection quality" failures separately from
+    /// general MCP tool errors.
+    pub rag_search_failures_total: AtomicU64,
 
     // Work pool lifetime counters
     pub work_pool_tasks_completed: AtomicU64,
@@ -601,6 +606,7 @@ impl StatsTracker {
             embed_worker_permanent_failures: AtomicU64::new(0),
             watcher_errors_total: AtomicU64::new(0),
             inotify_overflows_total: AtomicU64::new(0),
+            rag_search_failures_total: AtomicU64::new(0),
             watcher_events_received: AtomicU64::new(0),
             watcher_events_filtered: AtomicU64::new(0),
             watcher_events_debounced: AtomicU64::new(0),
@@ -808,6 +814,7 @@ impl StatsTracker {
             "embed_worker_permanent_failures": self.embed_worker_permanent_failures.load(Ordering::Acquire),
             "watcher_errors_total": self.watcher_errors_total.load(Ordering::Acquire),
             "inotify_overflows_total": self.inotify_overflows_total.load(Ordering::Acquire),
+            "rag_search_failures_total": self.rag_search_failures_total.load(Ordering::Acquire),
             "embed_errors": self.embed_errors.load(Ordering::Acquire),
             "watcher_events_received": self.watcher_events_received.load(Ordering::Acquire),
             "watcher_events_filtered": self.watcher_events_filtered.load(Ordering::Acquire),
