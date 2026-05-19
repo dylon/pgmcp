@@ -42,6 +42,21 @@ pub const MINILM_SIGNATURE: &str = "minilm-l6-v2";
 /// vectors (model swap, normalization change, instruction-prefix change).
 pub const BGE_M3_SIGNATURE: &str = "bge-m3-v1";
 
+/// Compute the embedding signature that THIS build will stamp on rows it
+/// writes for `model_name` (matching `EmbeddingsConfig::model`). Used by
+/// the daemon startup probe to compare against the signature already
+/// stored in `pgmcp_metadata.active_embedding_signature` and warn the
+/// operator when they diverge — a mismatch usually means either an
+/// incomplete migration cron run or a daemon downgrade against a
+/// newer-signature database, both of which silently degrade recall if
+/// not addressed.
+pub fn signature_for_model_name(model_name: &str) -> Result<&'static str> {
+    Ok(match ModelKind::from_config_name(model_name)? {
+        ModelKind::MiniLm => MINILM_SIGNATURE,
+        ModelKind::Bgem3 => BGE_M3_SIGNATURE,
+    })
+}
+
 /// Direct-candle embedder. Owns one model instance bound to one device.
 ///
 /// Internally an enum over the two supported backbones; callers use the
@@ -428,6 +443,23 @@ mod tests {
             ModelKind::Bgem3
         );
         assert!(ModelKind::from_config_name("unsupported").is_err());
+    }
+
+    #[test]
+    fn signature_for_model_name_matches_kind_constants() {
+        assert_eq!(
+            signature_for_model_name("all-MiniLM-L6-v2").unwrap(),
+            MINILM_SIGNATURE
+        );
+        assert_eq!(
+            signature_for_model_name("bge-m3").unwrap(),
+            BGE_M3_SIGNATURE
+        );
+        assert_eq!(
+            signature_for_model_name("BAAI/bge-m3").unwrap(),
+            BGE_M3_SIGNATURE
+        );
+        assert!(signature_for_model_name("totally-fake-model").is_err());
     }
 
     #[test]

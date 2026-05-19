@@ -173,6 +173,48 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     db::migrations::run_migrations(&db_pool, &config_snapshot.vector).await?;
     info!("Database initialized");
 
+    // 1b. Embedding-signature consistency probe. Compares the bundled
+    // signature for the configured model against whatever this DB last
+    // wrote. A mismatch is not fatal — the embedding migration cron
+    // re-embeds on upgrade — but it's the operator's only chance to
+    // notice a daemon downgrade against a newer-signature database,
+    // which would otherwise silently mix vector spaces in queries.
+    match embed::model::signature_for_model_name(&config_snapshot.embeddings.model) {
+        Ok(bundled) => {
+            match cron::embedding_migration::active_embedding_signature(&db_pool).await {
+                Ok(stored) if stored == bundled => {
+                    info!(
+                        signature = bundled,
+                        "Embedding signature consistent with DB",
+                    );
+                }
+                Ok(stored) => {
+                    warn!(
+                        bundled,
+                        stored = %stored,
+                        model = %config_snapshot.embeddings.model,
+                        "Embedding signature mismatch: daemon writes `{bundled}` but DB has `{stored}` from a previous run. \
+                         Upgrade direction is self-healing once the embedding-migration cron completes; \
+                         downgrade direction silently mixes vector spaces and degrades recall — investigate before relying on semantic queries.",
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Failed to read stored embedding signature; signature consistency unverified",
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                model = %config_snapshot.embeddings.model,
+                "Unknown embedding model in config; signature consistency unverified",
+            );
+        }
+    }
+
     // 2. Initialize stats tracker
     let stats_tracker = Arc::new(stats::tracker::StatsTracker::new());
 

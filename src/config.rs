@@ -1716,8 +1716,33 @@ impl ProjectOverride {
         if !path.exists() {
             return None;
         }
-        let content = std::fs::read_to_string(&path).ok()?;
-        toml::from_str(&content).ok()
+        // Explicit error logging on read / parse failure. The prior
+        // `.ok()?` chain silently dropped both classes of error, so an
+        // operator typo (e.g. `[git] index_history = trueeeee`) would
+        // disable per-project config with no signal — the project
+        // would just not behave the way they configured it.
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "per-project .pgmcp.toml unreadable; ignoring overrides for this project"
+                );
+                return None;
+            }
+        };
+        match toml::from_str(&content) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "per-project .pgmcp.toml is malformed TOML; ignoring overrides for this project"
+                );
+                None
+            }
+        }
     }
 
     /// Default per-project config TOML content.
