@@ -4,10 +4,40 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use arc_swap::ArcSwapOption;
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
 use crate::stats::telemetry_writer::TelemetryRow;
+
+/// Outcome of the most recent run of a named cron job. `Ok` covers both
+/// requeue-true and stop-false return values of the task closure;
+/// `Panicked` covers anything `catch_unwind` caught.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CronJobOutcome {
+    Ok,
+    Panicked,
+}
+
+impl CronJobOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CronJobOutcome::Ok => "ok",
+            CronJobOutcome::Panicked => "panicked",
+        }
+    }
+}
+
+/// Last-known status of one named cron job. Kept in the `last_cron_outcomes`
+/// DashMap on `StatsTracker`; exposed via the JSON snapshot so dashboards
+/// can distinguish "running cleanly", "panicked recently", and "never run"
+/// per job rather than only seeing global `cron_panics`.
+#[derive(Debug, Clone)]
+pub struct CronJobStatus {
+    pub outcome: CronJobOutcome,
+    pub at: DateTime<Utc>,
+    pub duration_ms: u64,
+}
 
 /// Per-tool telemetry: call count, error count, cumulative duration, and
 /// bucketed duration histogram. Used both keyed by `tool_name`
@@ -306,6 +336,13 @@ pub struct StatsTracker {
     /// "RAG context injection quality" failures separately from
     /// general MCP tool errors.
     pub rag_search_failures_total: AtomicU64,
+    /// Most recent outcome per named cron job. Keyed by task name (the
+    /// `TaskMetadata::Named.name` field); un-named (`OneShot` /
+    /// `Recurring`) tasks aren't tracked here because their identity is
+    /// fungible. Updated synchronously inside `execute_inline` so a
+    /// `/api/status` poll always sees the actual last run, not a
+    /// race-window-old value.
+    pub last_cron_outcomes: DashMap<String, CronJobStatus>,
 
     // Work pool lifetime counters
     pub work_pool_tasks_completed: AtomicU64,
@@ -607,6 +644,7 @@ impl StatsTracker {
             watcher_errors_total: AtomicU64::new(0),
             inotify_overflows_total: AtomicU64::new(0),
             rag_search_failures_total: AtomicU64::new(0),
+            last_cron_outcomes: DashMap::new(),
             watcher_events_received: AtomicU64::new(0),
             watcher_events_filtered: AtomicU64::new(0),
             watcher_events_debounced: AtomicU64::new(0),
@@ -724,6 +762,43 @@ impl StatsTracker {
             .record(duration_ns, ok);
     }
 
+    /// Update the last-known status of a named cron job. Called by
+    /// `CronStateMachine::execute_inline` once per task completion or
+    /// panic. Un-named tasks (OneShot / Recurring without a name) are
+    /// skipped — their identity is fungible and aggregating them under
+    /// one key would just be noise.
+    pub fn record_cron_outcome(&self, name: &str, outcome: CronJobOutcome, duration_ms: u64) {
+        if name == "one-shot" || name == "recurring" {
+            return;
+        }
+        self.last_cron_outcomes.insert(
+            name.to_string(),
+            CronJobStatus {
+                outcome,
+                at: Utc::now(),
+                duration_ms,
+            },
+        );
+    }
+
+    /// Serialize `last_cron_outcomes` as a JSON object suitable for the
+    /// top-level snapshot.
+    fn cron_outcomes_snapshot(&self) -> serde_json::Value {
+        let mut map = serde_json::Map::with_capacity(self.last_cron_outcomes.len());
+        for entry in self.last_cron_outcomes.iter() {
+            let v = entry.value();
+            map.insert(
+                entry.key().clone(),
+                serde_json::json!({
+                    "outcome": v.outcome.as_str(),
+                    "at": v.at.to_rfc3339(),
+                    "duration_ms": v.duration_ms,
+                }),
+            );
+        }
+        serde_json::Value::Object(map)
+    }
+
     /// Get a JSON snapshot of all counters.
     pub fn snapshot(&self) -> serde_json::Value {
         serde_json::json!({
@@ -815,6 +890,7 @@ impl StatsTracker {
             "watcher_errors_total": self.watcher_errors_total.load(Ordering::Acquire),
             "inotify_overflows_total": self.inotify_overflows_total.load(Ordering::Acquire),
             "rag_search_failures_total": self.rag_search_failures_total.load(Ordering::Acquire),
+            "last_cron_outcomes": self.cron_outcomes_snapshot(),
             "embed_errors": self.embed_errors.load(Ordering::Acquire),
             "watcher_events_received": self.watcher_events_received.load(Ordering::Acquire),
             "watcher_events_filtered": self.watcher_events_filtered.load(Ordering::Acquire),
@@ -931,6 +1007,46 @@ impl Default for StatsTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn record_cron_outcome_skips_unnamed_tasks() {
+        let stats = StatsTracker::new();
+        stats.record_cron_outcome("one-shot", CronJobOutcome::Ok, 5);
+        stats.record_cron_outcome("recurring", CronJobOutcome::Panicked, 5);
+        assert_eq!(stats.last_cron_outcomes.len(), 0);
+    }
+
+    #[test]
+    fn record_cron_outcome_overwrites_previous_status_per_name() {
+        let stats = StatsTracker::new();
+        stats.record_cron_outcome("graph-analysis", CronJobOutcome::Ok, 100);
+        stats.record_cron_outcome("graph-analysis", CronJobOutcome::Panicked, 50);
+        assert_eq!(stats.last_cron_outcomes.len(), 1);
+        let entry = stats
+            .last_cron_outcomes
+            .get("graph-analysis")
+            .expect("entry present");
+        assert_eq!(entry.value().outcome, CronJobOutcome::Panicked);
+        assert_eq!(entry.value().duration_ms, 50);
+    }
+
+    #[test]
+    fn cron_outcomes_appear_in_snapshot_json() {
+        let stats = StatsTracker::new();
+        stats.record_cron_outcome("topic-clustering", CronJobOutcome::Ok, 42);
+        let snap = stats.snapshot();
+        let outcomes = snap
+            .get("last_cron_outcomes")
+            .and_then(|v| v.as_object())
+            .expect("snapshot has last_cron_outcomes object");
+        let entry = outcomes
+            .get("topic-clustering")
+            .and_then(|v| v.as_object())
+            .expect("topic-clustering entry");
+        assert_eq!(entry.get("outcome").and_then(|v| v.as_str()), Some("ok"));
+        assert_eq!(entry.get("duration_ms").and_then(|v| v.as_u64()), Some(42));
+        assert!(entry.contains_key("at"));
+    }
 
     #[test]
     fn test_snapshot_contains_all_new_counters() {

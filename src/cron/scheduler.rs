@@ -348,24 +348,38 @@ impl CronStateMachine {
         queue: &mut BinaryHeap<ScheduledTask>,
         stats: &Option<Arc<StatsTracker>>,
     ) {
+        let started = Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (task.task)()));
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        let task_name = task.metadata.name().to_string();
 
         if let Some(s) = stats {
             s.cron_executions.fetch_add(1, AtomicOrdering::Relaxed);
         }
 
         match result {
-            Ok(true) => {
-                if let Some(interval) = task.metadata.recurrence_interval() {
+            Ok(should_requeue) => {
+                if let Some(s) = stats {
+                    s.record_cron_outcome(
+                        &task_name,
+                        crate::stats::tracker::CronJobOutcome::Ok,
+                        elapsed_ms,
+                    );
+                }
+                if should_requeue && let Some(interval) = task.metadata.recurrence_interval() {
                     task.scheduled_time_ms = now_ms() + interval;
                     queue.push(task);
                 }
             }
-            Ok(false) => {}
             Err(e) => {
-                error!(task_name = task.metadata.name(), panic = ?e, "Task panicked");
+                error!(task_name = %task_name, panic = ?e, "Task panicked");
                 if let Some(s) = stats {
                     s.cron_panics.fetch_add(1, AtomicOrdering::Relaxed);
+                    s.record_cron_outcome(
+                        &task_name,
+                        crate::stats::tracker::CronJobOutcome::Panicked,
+                        elapsed_ms,
+                    );
                 }
             }
         }
