@@ -1130,7 +1130,6 @@ pub fn schedule_maintenance_jobs(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
-    use std::time::Instant;
 
     #[test]
     fn test_state_transitions() {
@@ -1235,21 +1234,39 @@ mod tests {
         let counter = Arc::new(AtomicU64::new(0));
         let c = Arc::clone(&counter);
 
+        // Synchronous one-shot signal: the normal task pushes through
+        // this channel the instant it runs, and the test thread blocks
+        // on `recv_timeout` until then. This asserts the actual
+        // panic-safety property (the post-panic task runs) without
+        // baking in a tight wall-clock budget — a contested host can
+        // take a few hundred ms longer than a quiet one, and that's
+        // fine; what matters is that the cron *did* recover.
+        //
+        // The `Mutex<Option<Sender>>` is so the closure can stay
+        // `FnMut + 'static` (what `schedule_once` requires) while still
+        // consuming the sender exactly once via `take()`.
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let done_tx = std::sync::Mutex::new(Some(done_tx));
+
         handle.schedule_once(0, "panicking", || {
             panic!("intentional panic");
         });
         handle.schedule_once(50, "normal", move || {
             c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(tx) = done_tx.lock().expect("done_tx mutex").take() {
+                let _ = tx.send(());
+            }
             true
         });
 
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while counter.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-            if Instant::now() > deadline {
-                panic!("Timeout waiting for normal task");
-            }
-            thread::sleep(Duration::from_millis(10));
-        }
+        // 30 s is generous on purpose: the green path completes in
+        // ~50–150 ms; anything approaching 30 s indicates a genuine
+        // panic-safety regression (the cron wedged after the prior
+        // task panicked), not a flake.
+        done_rx.recv_timeout(Duration::from_secs(30)).expect(
+            "Cron thread did not process the post-panic task within 30s — \
+             panic-safety regression: the cron is wedged after the prior task panicked.",
+        );
 
         handle.request_shutdown();
         thread
