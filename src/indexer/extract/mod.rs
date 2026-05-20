@@ -34,7 +34,6 @@
 //! fall through to the existing `std::fs::read_to_string` code path.
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::Duration;
 
 pub mod normalize;
@@ -272,35 +271,20 @@ pub fn requires_external_tool(language: &str) -> bool {
     )
 }
 
-/// Lazy per-tool `which::which` resolution.
+/// Resolve a CLI tool via `which::which` on every call.
 ///
-/// First call performs the lookup; subsequent calls return the cached
-/// result. A missing tool is cached as `None` so we don't repeatedly hit
-/// the filesystem from inside the embed pool's hot loop.
+/// An earlier implementation cached the result in a per-tool
+/// `OnceLock<Option<PathBuf>>`, which meant uninstalling a tool after
+/// the first lookup left a stale absolute path baked in for the rest
+/// of the daemon's lifetime — every subsequent extraction errored
+/// with `Process { status: -1, stderr: "No such file or directory" }`
+/// instead of the cleaner `ToolMissing` that the startup preflight
+/// surfaces. The cache is gone; `which::which` does a handful of
+/// `stat` calls (one per PATH entry until a hit), which is negligible
+/// relative to the actual extraction subprocess time and lets the
+/// system recover from an uninstall/upgrade without a daemon restart.
 pub(crate) fn resolve_tool(tool: &'static str) -> Option<PathBuf> {
-    let cache = tool_cache(tool);
-    cache.get_or_init(|| which::which(tool).ok()).clone()
-}
-
-fn tool_cache(tool: &'static str) -> &'static OnceLock<Option<PathBuf>> {
-    static PDFTOTEXT: OnceLock<Option<PathBuf>> = OnceLock::new();
-    static PDFINFO: OnceLock<Option<PathBuf>> = OnceLock::new();
-    static PDFTOPPM: OnceLock<Option<PathBuf>> = OnceLock::new();
-    static PS2ASCII: OnceLock<Option<PathBuf>> = OnceLock::new();
-    static PANDOC: OnceLock<Option<PathBuf>> = OnceLock::new();
-    static TESSERACT: OnceLock<Option<PathBuf>> = OnceLock::new();
-    match tool {
-        "pdftotext" => &PDFTOTEXT,
-        "pdfinfo" => &PDFINFO,
-        "pdftoppm" => &PDFTOPPM,
-        "ps2ascii" => &PS2ASCII,
-        "pandoc" => &PANDOC,
-        "tesseract" => &TESSERACT,
-        // Defensive: an unknown tool gets a fresh-but-immediately-leaked
-        // OnceLock. This branch is never hit in production because every
-        // call site uses a literal known to this match.
-        _ => Box::leak(Box::new(OnceLock::new())),
-    }
+    which::which(tool).ok()
 }
 
 /// Metadata for daemon startup preflight. Each entry is

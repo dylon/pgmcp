@@ -96,7 +96,21 @@ impl WorkPool {
                 .spawn(move || {
                     worker_loop(i, high_rx, low_rx, park, shutdown, &tasks_completed);
                 })
-                .unwrap_or_else(|e| panic!("Failed to spawn worker thread {}: {}", i, e));
+                .unwrap_or_else(|e| {
+                    // EAGAIN here is almost always RLIMIT_NPROC or the
+                    // systemd unit's `TasksMax=` ceiling. The daemon
+                    // cannot operate with a partial pool, so we abort —
+                    // but with an actionable message so the operator
+                    // doesn't have to reverse-engineer the symptom.
+                    panic!(
+                        "pgmcp: failed to spawn worker thread {i} ({e}). \
+                         This usually indicates the process is at its thread limit: \
+                         check `ulimit -u` (RLIMIT_NPROC), the systemd unit's \
+                         `TasksMax=` directive, and `cat /proc/sys/kernel/threads-max`. \
+                         Raise the relevant ceiling, or lower `[work_pool] max_threads` \
+                         in pgmcp's config.toml."
+                    )
+                });
 
             handles.push(Some(handle));
         }
