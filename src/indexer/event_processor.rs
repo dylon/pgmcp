@@ -57,6 +57,7 @@ pub fn start_indexing(
     shutdown: ShutdownCoordinator,
     project_overrides: Arc<DashMap<PathBuf, config::ProjectOverride>>,
     watcher_cmd_rx: crossbeam_channel::Receiver<WatcherCommand>,
+    watcher_cmd_tx: crossbeam_channel::Sender<WatcherCommand>,
     lifecycle: DaemonLifecycle,
 ) -> Result<IndexerHandle, crate::error::PgmcpError> {
     let config = Arc::clone(ctx.config());
@@ -72,10 +73,12 @@ pub fn start_indexing(
 
     // 1. Start file watcher
     let (event_tx, event_rx) = crossbeam_channel::bounded(4096);
+    let event_tx_for_reinit = event_tx.clone();
     let raw_watcher = watcher::start_watching(
         &config_snapshot.workspace.paths,
         event_tx,
         Arc::clone(&stats),
+        Some(watcher_cmd_tx.clone()),
     )?;
     let watcher_handle = Arc::new(std::sync::Mutex::new(raw_watcher));
 
@@ -402,6 +405,11 @@ pub fn start_indexing(
     let overrides_for_cmd = Arc::clone(&project_overrides);
     let rt_for_cmd = rt_handle;
     let shutdown_for_cmd = shutdown.terminating_flag();
+    // Reinit-arm bindings — passed into the WatcherCommand::Reinit
+    // handler so it can rebuild the watcher with the same plumbing as
+    // the original `start_watching` call.
+    let stats_for_reinit = Arc::clone(&stats);
+    let reinit_cmd_tx = watcher_cmd_tx.clone();
 
     let watcher_cmd_thread = std::thread::Builder::new()
         .name("pgmcp-watcher-cmd".into())
@@ -477,6 +485,57 @@ pub fn start_indexing(
                             &overrides_for_cmd,
                             &rt_for_cmd,
                         );
+                    }
+                    WatcherCommand::Reinit(paths) => {
+                        // Inotify queue overflowed (or another watcher
+                        // failure mode that requires a fresh handle).
+                        // Build a new watcher with the same workspaces,
+                        // swap it into the Mutex, and enqueue a Rescan
+                        // per workspace so the index catches whatever
+                        // events were dropped before the rearm.
+                        let workspace_strs: Vec<String> =
+                            paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                        match watcher::start_watching(
+                            &workspace_strs,
+                            event_tx_for_reinit.clone(),
+                            Arc::clone(&stats_for_reinit),
+                            Some(reinit_cmd_tx.clone()),
+                        ) {
+                            Ok(new_watcher) => {
+                                match watcher_for_cmd.lock() {
+                                    Ok(mut w) => {
+                                        *w = new_watcher;
+                                        info!(
+                                            workspaces = paths.len(),
+                                            "watcher re-armed after inotify overflow"
+                                        );
+                                    }
+                                    Err(poisoned) => {
+                                        // Mutex poisoned by a panicked
+                                        // command handler — recover by
+                                        // overwriting with the fresh
+                                        // watcher anyway, since the
+                                        // poison data is now obsolete.
+                                        let mut w = poisoned.into_inner();
+                                        *w = new_watcher;
+                                        warn!(
+                                            workspaces = paths.len(),
+                                            "watcher re-armed via poisoned mutex recovery"
+                                        );
+                                    }
+                                }
+                                for p in paths {
+                                    let _ = reinit_cmd_tx.send(WatcherCommand::Rescan(p));
+                                }
+                            }
+                            Err(e) => {
+                                error!(
+                                    error = %e,
+                                    "watcher re-arm failed; events will continue to be lost \
+                                     until daemon restart"
+                                );
+                            }
+                        }
                     }
                 }
             }

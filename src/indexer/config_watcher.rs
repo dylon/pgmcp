@@ -27,6 +27,14 @@ pub enum WatcherCommand {
     Unwatch(PathBuf),
     /// Re-scan a workspace path for new/changed files.
     Rescan(PathBuf),
+    /// Rebuild the inotify watcher from scratch and re-watch the given
+    /// workspaces. Issued by the watcher callback when it detects an
+    /// `IN_Q_OVERFLOW` (kernel queue exceeded
+    /// `fs.inotify.max_queued_events`), since after overflow the
+    /// existing watcher silently drops events forever until re-armed.
+    /// The cmd thread also enqueues a `Rescan` per workspace so the
+    /// index catches whatever events were lost.
+    Reinit(Vec<PathBuf>),
 }
 
 /// Handle to the config watcher. Dropping it stops watching.

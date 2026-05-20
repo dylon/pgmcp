@@ -390,6 +390,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         shutdown.clone(),
         Arc::clone(&project_overrides),
         watcher_cmd_rx,
+        watcher_cmd_tx.clone(),
         lifecycle.clone(),
     )?;
 
