@@ -313,6 +313,28 @@ impl DbClient for MockDbClient {
         Ok(())
     }
 
+    async fn insert_chunks_batch(
+        &self,
+        file_id: i64,
+        chunks: &[pgmcp::db::queries::ChunkInsert<'_>],
+    ) -> Result<pgmcp::db::queries::ChunkBatchOutcome, sqlx::Error> {
+        let mut log = self.insert_chunk_calls.lock();
+        for c in chunks {
+            log.push(InsertChunkCall {
+                file_id,
+                chunk_index: c.chunk_index,
+                content: c.content.to_string(),
+                start_line: c.start_line,
+                end_line: c.end_line,
+                embedding: c.embedding.to_vec(),
+            });
+        }
+        Ok(pgmcp::db::queries::ChunkBatchOutcome {
+            fk_violation: false,
+            error: None,
+        })
+    }
+
     async fn delete_file(&self, path: &str) -> Result<(), sqlx::Error> {
         self.deleted_file_paths.lock().push(path.to_string());
         Ok(())

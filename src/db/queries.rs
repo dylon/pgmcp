@@ -501,6 +501,105 @@ pub async fn insert_chunk(
     Ok(())
 }
 
+/// Borrowed chunk row for batch insertion.
+///
+/// The embed-pool worker builds these per-chunk references after the
+/// model forward pass; the lifetime tying everything to the surrounding
+/// `chunks: &[ChunkData]` and `embeddings: &[Vec<f32>]` allocations
+/// keeps the per-batch payload heap-free.
+pub struct ChunkInsert<'a> {
+    pub chunk_index: i32,
+    pub content: &'a str,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub embedding: &'a [f32],
+}
+
+/// Outcome of a batched chunk insert.
+///
+/// The batch runs inside a single transaction so the embed pool holds
+/// one pooled connection across all N inserts instead of N separate
+/// acquisitions. Semantics:
+///
+/// - `Ok` with `fk_violation == false` and empty `error`: every chunk
+///   committed; the caller proceeds to `finalize_file_hash`.
+/// - `Ok` with `fk_violation == true`: the parent row was deleted
+///   mid-batch (PG SQLSTATE 23503); the transaction is rolled back so
+///   no orphan rows land. The caller logs once and increments
+///   `files_aborted_fk` (this matches the prior per-chunk
+///   `AbortedFk` outcome).
+/// - `Ok` with `error == Some`: a non-FK error fired; the transaction
+///   is rolled back to keep the file all-or-nothing rather than leaving
+///   a partial chunk set under a NULL content_hash. The caller logs
+///   the error and counts the file as failed; the next rescan will
+///   re-attempt.
+pub struct ChunkBatchOutcome {
+    pub fk_violation: bool,
+    pub error: Option<sqlx::Error>,
+}
+
+/// Insert N chunks for a file inside a single transaction.
+///
+/// All chunks land or none do — this trades the prior loop's
+/// "commit successful chunks even if one fails" behavior for cleaner
+/// all-or-nothing semantics. An incomplete file is detectable from
+/// outside as a row with `content_hash = NULL` and zero `file_chunks`
+/// rows, the same shape the integrity-check cron already handles, but
+/// without partial chunks wasting storage in the meantime.
+pub async fn insert_chunks_batch(
+    pool: &PgPool,
+    file_id: i64,
+    chunks: &[ChunkInsert<'_>],
+) -> Result<ChunkBatchOutcome, sqlx::Error> {
+    if chunks.is_empty() {
+        return Ok(ChunkBatchOutcome {
+            fk_violation: false,
+            error: None,
+        });
+    }
+    let mut tx = pool.begin().await?;
+    for chunk in chunks {
+        let embedding_vec = pgvector::Vector::from(chunk.embedding.to_vec());
+        match sqlx::query(
+            "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding)
+             VALUES ($1, $2, $3, $4, $5, $6)
+             ON CONFLICT (file_id, chunk_index) DO UPDATE SET
+                content = EXCLUDED.content,
+                start_line = EXCLUDED.start_line,
+                end_line = EXCLUDED.end_line,
+                embedding = EXCLUDED.embedding",
+        )
+        .bind(file_id)
+        .bind(chunk.chunk_index)
+        .bind(chunk.content)
+        .bind(chunk.start_line)
+        .bind(chunk.end_line)
+        .bind(embedding_vec)
+        .execute(&mut *tx)
+        .await
+        {
+            Ok(_) => {}
+            Err(e) => {
+                let fk = matches!(
+                    &e,
+                    sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("23503")
+                );
+                // Dropping the transaction without `commit()` rolls back.
+                drop(tx);
+                return Ok(ChunkBatchOutcome {
+                    fk_violation: fk,
+                    error: if fk { None } else { Some(e) },
+                });
+            }
+        }
+    }
+    tx.commit().await?;
+    Ok(ChunkBatchOutcome {
+        fk_violation: false,
+        error: None,
+    })
+}
+
 /// Delete an indexed file and its chunks.
 pub async fn delete_file(pool: &PgPool, path: &str) -> Result<(), sqlx::Error> {
     sqlx::query("DELETE FROM indexed_files WHERE path = $1")

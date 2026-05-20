@@ -350,6 +350,17 @@ pub struct StatsTracker {
     /// also surfaces in `/api/status` so operators can see why a job
     /// stopped without grepping logs.
     pub disabled_cron_jobs: DashMap<String, String>,
+    /// Cumulative milliseconds the embed-pool workers spent inside
+    /// `pool.begin()` for the chunk-insert transaction. Pairs with
+    /// `embed_chunk_batches_total` (rises by 1 per file with non-zero
+    /// chunks) to give an average per-batch transaction hold time —
+    /// the operator's signal for whether transaction coalescing is
+    /// trading too much pool contention for the reduced acquisition
+    /// count. `Relaxed` everywhere; observability-only data.
+    pub pool_pressure_ms_total: AtomicU64,
+    /// Number of chunk-insert batches the embed-pool committed. One
+    /// increment per file that produced at least one chunk.
+    pub embed_chunk_batches_total: AtomicU64,
 
     // Work pool lifetime counters
     pub work_pool_tasks_completed: AtomicU64,
@@ -653,6 +664,8 @@ impl StatsTracker {
             rag_search_failures_total: AtomicU64::new(0),
             last_cron_outcomes: DashMap::new(),
             disabled_cron_jobs: DashMap::new(),
+            pool_pressure_ms_total: AtomicU64::new(0),
+            embed_chunk_batches_total: AtomicU64::new(0),
             watcher_events_received: AtomicU64::new(0),
             watcher_events_filtered: AtomicU64::new(0),
             watcher_events_debounced: AtomicU64::new(0),
@@ -930,6 +943,8 @@ impl StatsTracker {
             "rag_search_failures_total": self.rag_search_failures_total.load(Ordering::Acquire),
             "last_cron_outcomes": self.cron_outcomes_snapshot(),
             "disabled_cron_jobs": self.disabled_cron_jobs_snapshot(),
+            "pool_pressure_ms_total": self.pool_pressure_ms_total.load(Ordering::Acquire),
+            "embed_chunk_batches_total": self.embed_chunk_batches_total.load(Ordering::Acquire),
             "embed_errors": self.embed_errors.load(Ordering::Acquire),
             "watcher_events_received": self.watcher_events_received.load(Ordering::Acquire),
             "watcher_events_filtered": self.watcher_events_filtered.load(Ordering::Acquire),

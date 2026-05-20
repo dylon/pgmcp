@@ -112,6 +112,15 @@ pub trait DbClient: Send + Sync {
         end_line: i32,
         embedding: &[f32],
     ) -> Result<(), sqlx::Error>;
+    /// Batched chunk insert. Wraps N inserts in one transaction so the
+    /// embed-pool worker holds one pooled connection across the whole
+    /// batch instead of N. Returns a `ChunkBatchOutcome` capturing the
+    /// all-or-nothing result. See `crate::db::queries::insert_chunks_batch`.
+    async fn insert_chunks_batch(
+        &self,
+        file_id: i64,
+        chunks: &[queries::ChunkInsert<'_>],
+    ) -> Result<queries::ChunkBatchOutcome, sqlx::Error>;
     async fn delete_file(&self, path: &str) -> Result<(), sqlx::Error>;
     async fn delete_files_batch(&self, paths: &[String]) -> Result<u64, sqlx::Error>;
     async fn get_file_id_by_path(&self, path: &str) -> Result<Option<i64>, sqlx::Error>;
@@ -503,6 +512,14 @@ impl DbClient for PgPool {
             embedding,
         )
         .await
+    }
+
+    async fn insert_chunks_batch(
+        &self,
+        file_id: i64,
+        chunks: &[queries::ChunkInsert<'_>],
+    ) -> Result<queries::ChunkBatchOutcome, sqlx::Error> {
+        queries::insert_chunks_batch(self, file_id, chunks).await
     }
 
     async fn delete_file(&self, path: &str) -> Result<(), sqlx::Error> {

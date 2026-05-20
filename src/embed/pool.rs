@@ -1116,53 +1116,75 @@ fn process_index_file_task(
     //   - all_ok: every chunk inserted; finalize the hash; count as indexed.
     //   - aborted_fk: parent row deleted underfoot (PG SQLSTATE 23503);
     //     log once at warn!, increment files_aborted_fk, skip finalize.
-    //   - other_err: a non-FK error on at least one chunk; per-chunk
-    //     error! already logged; skip finalize, but DO count as
-    //     indexed-with-errors so the user notices via files_failed.
+    //   - other_err: any non-FK error during the batch; the whole
+    //     transaction rolls back so we don't leave a partial chunk
+    //     set under a NULL content_hash. Counted as failed; the next
+    //     rescan retries.
+    //
+    // The batch runs inside one transaction (`insert_chunks_batch`) so
+    // the embed worker holds one pooled connection for the whole file
+    // instead of N — direct mitigation for the "pool starvation under
+    // indexing storm" fragility in the audit. Wall-clock duration of
+    // the transaction is accumulated in `pool_pressure_ms_total` so
+    // operators can spot the case where coalescing trades too much
+    // pool contention for the reduced acquisition count.
     enum InsertOutcome {
         AllOk,
         AbortedFk,
         OtherErr,
     }
     let total_chunks = chunks.len();
+    let chunk_inserts: Vec<crate::db::queries::ChunkInsert<'_>> = chunks
+        .iter()
+        .zip(embeddings.iter())
+        .map(|(chunk, embedding)| crate::db::queries::ChunkInsert {
+            chunk_index: chunk.chunk_index,
+            content: chunk.content.as_str(),
+            start_line: chunk.start_line,
+            end_line: chunk.end_line,
+            embedding: embedding.as_slice(),
+        })
+        .collect();
+    let batch_started = std::time::Instant::now();
     let outcome = rt.block_on(async {
-        let mut outcome = InsertOutcome::AllOk;
-        for (chunk, embedding) in chunks.iter().zip(embeddings.iter()) {
-            match db
-                .insert_chunk(
+        match db.insert_chunks_batch(file_id, &chunk_inserts).await {
+            Ok(crate::db::queries::ChunkBatchOutcome {
+                fk_violation: true, ..
+            }) => {
+                tracing::warn!(
+                    path = %path_str,
                     file_id,
-                    chunk.chunk_index,
-                    &chunk.content,
-                    chunk.start_line,
-                    chunk.end_line,
-                    embedding,
-                )
-                .await
-            {
-                Ok(()) => {}
-                Err(e) => {
-                    if is_fk_violation(&e) {
-                        // Parent row deleted while we were embedding —
-                        // remaining chunks would all fail the same way.
-                        // Log once per file and break out.
-                        tracing::warn!(
-                            path = %path_str,
-                            file_id,
-                            chunks_total = total_chunks,
-                            worker_id,
-                            reason = "parent row deleted underfoot — likely \
-                                      pgmcp reindex --force or external admin SQL",
-                            "insert_chunk aborted (FK violation)"
-                        );
-                        outcome = InsertOutcome::AbortedFk;
-                        break;
-                    }
-                    error!(file_id, chunk_index = chunk.chunk_index, worker_id, error = %e,
-                           "insert_chunk failed");
-                    outcome = InsertOutcome::OtherErr;
-                }
+                    chunks_total = total_chunks,
+                    worker_id,
+                    reason = "parent row deleted underfoot — likely \
+                              pgmcp reindex --force or external admin SQL",
+                    "insert_chunks_batch aborted (FK violation)"
+                );
+                return InsertOutcome::AbortedFk;
+            }
+            Ok(crate::db::queries::ChunkBatchOutcome { error: Some(e), .. }) => {
+                error!(
+                    file_id,
+                    chunks_total = total_chunks,
+                    worker_id,
+                    error = %e,
+                    "insert_chunks_batch failed; transaction rolled back"
+                );
+                return InsertOutcome::OtherErr;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                error!(
+                    file_id,
+                    chunks_total = total_chunks,
+                    worker_id,
+                    error = %e,
+                    "insert_chunks_batch returned transport-level error"
+                );
+                return InsertOutcome::OtherErr;
             }
         }
+        let mut outcome = InsertOutcome::AllOk;
         if matches!(outcome, InsertOutcome::AllOk)
             && let Err(e) = db.finalize_file_hash(file_id, content_hash).await
         {
@@ -1184,6 +1206,13 @@ fn process_index_file_task(
         }
         outcome
     });
+    let batch_elapsed_ms = batch_started.elapsed().as_millis() as u64;
+    stats
+        .pool_pressure_ms_total
+        .fetch_add(batch_elapsed_ms, Ordering::Relaxed);
+    stats
+        .embed_chunk_batches_total
+        .fetch_add(1, Ordering::Relaxed);
 
     match outcome {
         InsertOutcome::AllOk => {
