@@ -2830,6 +2830,7 @@ dependencies = [
  "dirs",
  "entropy",
  "futures",
+ "globset",
  "half",
  "heed",
  "hf-hub",

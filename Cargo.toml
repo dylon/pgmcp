@@ -151,6 +151,10 @@ strsim = "0.11"
 sqlparser = "0.55"
 # SOTA Phase 11 (commit topic drift): Porter stemming for TF-IDF.
 rust-stemmers = "1.2"
+# Per-call exclude_paths support for documented_tech_debt + any other
+# tool that takes a glob list. Already a transitive dep via `ignore`;
+# promoted to direct so the version is pinned explicitly.
+globset = "0.4"
 cudarc = { version = "0.19.4", features = ["cublas", "cublaslt", "cuda-version-from-build-system", "f16"] }
 half = "2"
 heed = "0.20"

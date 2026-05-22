@@ -224,6 +224,44 @@ pub async fn tool_documented_tech_debt(
     let min_age_days = params.min_age_days;
     let language_filter = params.language.as_deref();
 
+    // Canonical defaults when the caller omits `exclude_paths`: skip the
+    // curated pattern catalog and the marker-detector's own regex test
+    // fixtures, since those are seed prose and self-test inputs rather
+    // than real debt. `Some(vec![])` opts out entirely.
+    const DEFAULT_EXCLUDE_PATHS: &[&str] = &[
+        "src/patterns/**",
+        "src/mcp/tools/tool_technical_debt_analysis.rs",
+        "src/mcp/tools/tool_documented_tech_debt.rs",
+    ];
+    let exclude_glob_patterns: Vec<String> = params.exclude_paths.clone().unwrap_or_else(|| {
+        DEFAULT_EXCLUDE_PATHS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    });
+    let exclude_matcher: Option<globset::GlobSet> =
+        if exclude_glob_patterns.is_empty() {
+            None
+        } else {
+            let mut builder = globset::GlobSetBuilder::new();
+            for pat in &exclude_glob_patterns {
+                match globset::Glob::new(pat) {
+                    Ok(g) => {
+                        builder.add(g);
+                    }
+                    Err(e) => {
+                        return Err(McpError::invalid_params(
+                            format!("Invalid glob pattern {pat:?}: {e}"),
+                            None,
+                        ));
+                    }
+                }
+            }
+            Some(builder.build().map_err(|e| {
+                McpError::internal_error(format!("Glob set build failed: {e}"), None)
+            })?)
+        };
+
     debug!(
         tool = "documented_tech_debt",
         project = %params.project,
@@ -232,7 +270,7 @@ pub async fn tool_documented_tech_debt(
     );
 
     // Fetch project files.
-    let files: Vec<(i64, String, String, Option<String>)> =
+    let mut files: Vec<(i64, String, String, Option<String>)> =
         sqlx::query_as::<_, (i64, String, String, Option<String>)>(
             "SELECT f.id, f.relative_path, f.language, f.content
              FROM indexed_files f
@@ -246,6 +284,12 @@ pub async fn tool_documented_tech_debt(
         .fetch_all(pool)
         .await
         .map_err(|e| McpError::internal_error(format!("File query failed: {}", e), None))?;
+
+    // Apply the glob-based path exclusions client-side (the glob library
+    // gives us full ** / ? / [class] semantics that are awkward in SQL).
+    if let Some(matcher) = &exclude_matcher {
+        files.retain(|(_, relative_path, _, _)| !matcher.is_match(relative_path));
+    }
 
     if files.is_empty() {
         return json_result(&json!({

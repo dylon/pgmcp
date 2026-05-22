@@ -2282,6 +2282,14 @@ pub struct DocumentedTechDebtParams {
     pub limit: Option<i32>,
     #[schemars(description = "Output: \"summary\" (default) or \"full\" (per-occurrence list)")]
     pub format: Option<String>,
+    /// Glob patterns matched against `f.relative_path`. When omitted,
+    /// pgmcp's canonical defaults exclude the curated pattern catalog and
+    /// the marker-detector's own test fixtures (so scanning pgmcp itself
+    /// doesn't drown in seed prose). `Some(vec![])` disables exclusions.
+    #[schemars(
+        description = "Glob patterns (relative_path) to exclude from the scan. e.g. [\"src/patterns/**\", \"src/mcp/tools/tool_technical_debt_analysis.rs\"]. When omitted, pgmcp's canonical defaults apply."
+    )]
+    pub exclude_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
