@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 
 use regex::Regex;
 
-use crate::indexer::chunker::Chunk;
+use super::chunker::Chunk;
 
 /// Tunable parameters for paragraph-aware chunking.
 #[derive(Debug, Clone, Copy)]
