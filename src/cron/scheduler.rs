@@ -16,6 +16,9 @@ use tracing::{error, warn};
 use crate::config::CronConfig;
 use crate::daemon_state::DaemonLifecycle;
 use crate::embed::pool::{EmbedCommitRequest, EmbedIndexRequest};
+mod state;
+pub use state::*;
+
 use crate::stats::tracker::StatsTracker;
 
 // ============================================================================
@@ -128,34 +131,6 @@ pub fn now_ms() -> UnixTimestampMs {
         .duration_since(UNIX_EPOCH)
         .expect("System time went backwards")
         .as_millis() as u64
-}
-
-// ============================================================================
-// CronState
-// ============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CronState {
-    CheckEvents,
-    DrainChannel,
-    ExecutingTask,
-    Sleeping,
-    Terminated,
-}
-
-// ============================================================================
-// CronEvent
-// ============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CronEvent {
-    TaskReceived,
-    TimerExpired,
-    TaskDue,
-    TaskCompleted { success: bool, should_requeue: bool },
-    TerminationRequested,
-    ChannelDisconnected,
-    NoEvents,
 }
 
 // ============================================================================
