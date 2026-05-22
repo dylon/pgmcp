@@ -496,6 +496,118 @@ mod tests {
     }
 
     #[test]
+    fn collect_memberships_dense_returns_all_stored_pairs() {
+        let dir = TempDir::new().unwrap();
+        let store = CentroidStore::open(dir.path().join("memb.lmdb")).unwrap();
+
+        // Store three dense membership rows.
+        store.store_membership_dense(7, &[0.2, 0.5, 0.3]).unwrap();
+        store.store_membership_dense(8, &[0.1, 0.9, 0.0]).unwrap();
+        store.store_membership_dense(9, &[0.4, 0.4, 0.2]).unwrap();
+
+        let mut collected = store.collect_memberships_dense().unwrap();
+        collected.sort_by_key(|(cid, _)| *cid);
+
+        assert_eq!(collected.len(), 3);
+        assert_eq!(collected[0].0, 7);
+        assert_eq!(collected[0].1, vec![0.2, 0.5, 0.3]);
+        assert_eq!(collected[1].0, 8);
+        assert_eq!(collected[1].1, vec![0.1, 0.9, 0.0]);
+        assert_eq!(collected[2].0, 9);
+        assert_eq!(collected[2].1, vec![0.4, 0.4, 0.2]);
+    }
+
+    #[test]
+    fn iter_memberships_dense_visit_short_circuits_on_break() {
+        let dir = TempDir::new().unwrap();
+        let store = CentroidStore::open(dir.path().join("memb2.lmdb")).unwrap();
+        for cid in 1..=5 {
+            store
+                .store_membership_dense(cid, &[cid as f32 * 0.1])
+                .unwrap();
+        }
+        let mut seen = 0usize;
+        store
+            .iter_memberships_dense_visit(|_chunk_id, _mu| {
+                seen += 1;
+                if seen == 2 {
+                    std::ops::ControlFlow::Break(())
+                } else {
+                    std::ops::ControlFlow::Continue(())
+                }
+            })
+            .unwrap();
+        assert_eq!(seen, 2, "visit must stop on Break(()) without finishing");
+    }
+
+    #[test]
+    fn warm_start_centroid_round_trip_recovers_centroids_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let store = CentroidStore::open(dir.path().join("warm.lmdb")).unwrap();
+
+        // Mimic the FCM warm-start payload: K=4, d=8, scope="global".
+        let k = 4usize;
+        let d = 8usize;
+        let now = 1_000_000_i64;
+        let records: Vec<StoredCentroid> = (0..k)
+            .map(|i| StoredCentroid {
+                scope: "global".into(),
+                centroid: (0..d)
+                    .map(|j| ((i as f32) * 10.0 + j as f32) / 100.0)
+                    .collect(),
+                created_at: now + i as i64,
+                d,
+                k_total: k,
+            })
+            .collect();
+        store.store_centroids("global", &records).unwrap();
+
+        let loaded = store.load_centroids("global").unwrap();
+        assert_eq!(loaded.len(), k);
+        for orig in &records {
+            let found = loaded.iter().any(|l| {
+                l.scope == orig.scope
+                    && l.d == orig.d
+                    && l.k_total == orig.k_total
+                    && l.centroid
+                        .iter()
+                        .zip(orig.centroid.iter())
+                        .all(|(a, b)| (a - b).abs() < 1e-6)
+            });
+            assert!(found, "centroid round-trip lost a record");
+        }
+    }
+
+    #[test]
+    fn warm_start_k_mismatch_load_returns_all_records_for_decision_layer() {
+        // The LMDB store itself does not enforce K — it just returns
+        // whatever records exist for the scope. The K-mismatch logic
+        // lives in `load_warm_start_centroids` (src/cron/topic_clustering.rs)
+        // and decides cold-restart based on `records.len() != k`. This
+        // test guards the contract: load_centroids returns the full set,
+        // letting the caller compare counts.
+        let dir = TempDir::new().unwrap();
+        let store = CentroidStore::open(dir.path().join("kmis.lmdb")).unwrap();
+        let records: Vec<StoredCentroid> = (0..3)
+            .map(|i| StoredCentroid {
+                scope: "global".into(),
+                centroid: vec![i as f32; 4],
+                created_at: 0,
+                d: 4,
+                k_total: 3,
+            })
+            .collect();
+        store.store_centroids("global", &records).unwrap();
+        let loaded = store.load_centroids("global").unwrap();
+        assert_eq!(
+            loaded.len(),
+            3,
+            "load_centroids returns every stored record so the warm-start \
+             decision layer can detect K mismatches"
+        );
+    }
+
+    #[test]
     fn test_assignments_roundtrip() {
         let dir = TempDir::new().unwrap();
         let store = CentroidStore::open(dir.path().join("topics.lmdb")).unwrap();
