@@ -2293,6 +2293,15 @@ pub struct DocumentedTechDebtParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TriggerCronParams {
+    /// Cron job to run on demand.
+    #[schemars(
+        description = "Cron job name: \"symbol-extraction\" | \"call-graph\" | \"function-metrics\". Use symbol-extraction first to populate file_symbols (needed by dead_code_reachability and naming_consistency), then call-graph to populate symbol_references edges, then function-metrics for cyclomatic/cognitive/Halstead/NPath/MI. All three jobs are workspace-wide; per-project scoping happens through the project filter on the underlying queries."
+    )]
+    pub job: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CodeOnFireParams {
     /// Project name (required)
     #[schemars(description = "Project name (required)")]
@@ -5242,6 +5251,31 @@ Returns per-kind counts, severity tiers (high/medium/low), GitHub-issue refs (#1
         .await
     }
 
+    #[tool(
+        description = "Trigger a heavy maintenance cron on demand: symbol-extraction (populates file_symbols + symbol_references), \
+call-graph (populates symbol_references call edges), or function-metrics (cyclomatic/cognitive/Halstead/NPath/MI). \
+USE WHEN: dead_code_reachability or naming_consistency returns health.symbols_present:false because the cron hasn't run \
+yet. The same daemon's normal 30-min-after-Ready / 2-h-interval schedule still applies; this just lets the operator skip the wait. \
+Each invocation runs to completion (no background queuing); typical durations are 30-120s on a workspace with ~10k files."
+    )]
+    async fn trigger_cron(
+        &self,
+        Parameters(params): Parameters<TriggerCronParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // Use a long inner timeout (5 min) since these crons can run
+        // longer than the default 30 s tool budget on large workspaces.
+        instrumented_tool_wrap(
+            self.stats(),
+            "trigger_cron",
+            300,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_trigger_cron::tool_trigger_cron(self.ctx(), params),
+        )
+        .await
+    }
+
     // ========================================================================
     // A2A inter-agent IPC bridge — outbound MCP-side tools
     // ========================================================================
@@ -7033,6 +7067,7 @@ impl McpServer {
                 "anomaly_detection"      => anomaly_detection(AnomalyDetectionParams),
                 "code_on_fire"           => code_on_fire(CodeOnFireParams),
                 "documented_tech_debt"   => documented_tech_debt(DocumentedTechDebtParams),
+                "trigger_cron"           => trigger_cron(TriggerCronParams),
                 // A2A inter-agent IPC bridge
                 "a2a_send_task"          => a2a_send_task(A2aSendTaskParams),
                 "a2a_get_task"           => a2a_get_task(A2aGetTaskParams),

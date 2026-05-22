@@ -24,6 +24,41 @@ pub async fn tool_dead_code_reachability(
     let include_tests = params.include_tests.unwrap_or(false);
     let limit = params.limit.unwrap_or(50);
 
+    // Pre-flight: if no symbols have been extracted yet, return a
+    // structured soft-fail mirroring `naming_consistency`'s pattern.
+    // The symbol-extraction cron has a 30-min Ready-relative delay and
+    // a 2-h interval by default, so freshly-started daemons can return
+    // `reached: 0, dead_candidates: []` without this guard — which is
+    // indistinguishable from "everything is reachable". The soft-fail
+    // makes the unready state explicit.
+    let symbol_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM file_symbols fs \
+         JOIN indexed_files f ON fs.file_id = f.id \
+         WHERE f.project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| McpError::internal_error(format!("Symbol pre-flight failed: {e}"), None))?;
+
+    if symbol_count == 0 {
+        return json_result(&json!({
+            "project": params.project,
+            "roots": 0,
+            "reached": 0,
+            "dead_candidates": [],
+            "health": {
+                "symbols_present": false,
+            },
+            "guidance": "No symbols extracted for this project yet. The symbol-extraction \
+                         cron runs 30 min after Ready and every 2 h thereafter; until it has \
+                         populated `file_symbols` + `symbol_references`, dead-code reachability \
+                         cannot distinguish 'no callers' from 'no data'. Trigger an immediate \
+                         run via `trigger_cron job=\"symbol-extraction\"` (and `call-graph` \
+                         afterwards) to populate now."
+        }));
+    }
+
     // Roots: public symbols + main / start / entry-point names.
     let roots: Vec<(i64, String, String)> = sqlx::query_as::<_, (i64, String, String)>(
         "SELECT fs.id, fs.name, COALESCE(fs.visibility, 'private')
@@ -119,6 +154,9 @@ pub async fn tool_dead_code_reachability(
         "roots": roots.len(),
         "reached": reached.len(),
         "dead_candidates": dead,
+        "health": {
+            "symbols_present": true,
+        },
         "guidance": "Symbols unreached from roots (main / public exports / entry points) via call edges. False positives possible when callers go through dynamic dispatch / FFI / reflection — verify before deleting."
     }))
 }

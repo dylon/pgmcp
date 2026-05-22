@@ -178,6 +178,11 @@ pub mod tool_release_api_stability;
 // Documented tech debt (post-SOTA addition)
 pub mod tool_documented_tech_debt;
 
+// Operational: on-demand cron trigger (skips the Ready-delay + interval
+// wait when the operator needs symbol/function-metric/call-graph data
+// for `dead_code_reachability` / `naming_consistency` immediately).
+pub mod tool_trigger_cron;
+
 // A2A inter-agent IPC bridge — outbound MCP-side tools
 pub mod tool_a2a_cancel_task;
 pub mod tool_a2a_find_agents_by_specialty;
