@@ -28,8 +28,6 @@ use crate::config::VectorConfig;
 
 const INITIAL_SCHEMA_VERSION: i32 = 1;
 
-/// Ensure `pgmcp_schema_versions` exists. Run before any
-
 /// Run all migrations to set up the schema.
 pub async fn run_migrations(
     pool: &PgPool,

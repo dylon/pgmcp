@@ -186,7 +186,11 @@ pub fn count_importers(graph: &CodeGraph, target_file_id: i64) -> Vec<(i64, Stri
 ///
 /// Matches `<word-boundary><fn_name>(`. Returns line numbers (1-indexed)
 /// where the pattern occurs. Used when `symbol_references` data is absent;
-/// once Tier 0e is warm, prefer `find_function_callers_via_symbols` (TODO).
+/// once Tier 0e is warm, the preferred path is the symbol-based caller
+/// lookup that lives in `symbol_references` queries (e.g. through the
+/// `trigger_cron` MCP tool's `call-graph` subcommand). The regex
+/// fallback remains as the always-available bootstrap path when the
+/// symbol graph hasn't been populated yet.
 pub fn scan_callsites_regex(content: &str, fn_name: &str) -> Vec<u32> {
     if fn_name.is_empty() {
         return Vec::new();
