@@ -273,6 +273,59 @@ impl CentroidStore {
             .map_err(|e| PgmcpError::Other(format!("heed: get: {}", e)))
     }
 
+    /// Read every (chunk_id, dense_membership) pair currently in the store.
+    /// Used by `run_online_global_topic_scan` so it can convert per-chunk
+    /// LMDB memberships into per-topic `chunk_ids` / `memberships` lists
+    /// before persisting to Postgres `code_topics` / `chunk_topic_assignments`.
+    ///
+    /// Returns a `Vec` rather than an iterator because the read txn has to
+    /// outlive every borrow returned through it, and the membership tables
+    /// fit comfortably in RAM for any K we ship (K ≤ 500, n ≤ ~1.2M → ≤ 2.3
+    /// GB at f32). Callers that need a tighter memory budget should stream
+    /// directly off LMDB using `iter_memberships_dense_visit`.
+    pub fn collect_memberships_dense(&self) -> Result<Vec<(i64, Vec<f32>)>> {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| PgmcpError::Other(format!("heed: read_txn: {}", e)))?;
+        let mut out = Vec::new();
+        for entry in self
+            .memberships_dense
+            .iter(&rtxn)
+            .map_err(|e| PgmcpError::Other(format!("heed: iter memb: {}", e)))?
+        {
+            let (key, value) =
+                entry.map_err(|e| PgmcpError::Other(format!("heed: iter step: {}", e)))?;
+            out.push((key as i64, value));
+        }
+        Ok(out)
+    }
+
+    /// Streaming version: invoke `visit` for each `(chunk_id, membership)`
+    /// pair without materializing the full `Vec`. The closure returns
+    /// `ControlFlow::Break(())` to stop iteration early.
+    pub fn iter_memberships_dense_visit<F>(&self, mut visit: F) -> Result<()>
+    where
+        F: FnMut(i64, Vec<f32>) -> std::ops::ControlFlow<()>,
+    {
+        let rtxn = self
+            .env
+            .read_txn()
+            .map_err(|e| PgmcpError::Other(format!("heed: read_txn: {}", e)))?;
+        for entry in self
+            .memberships_dense
+            .iter(&rtxn)
+            .map_err(|e| PgmcpError::Other(format!("heed: iter memb: {}", e)))?
+        {
+            let (key, value) =
+                entry.map_err(|e| PgmcpError::Other(format!("heed: iter step: {}", e)))?;
+            if let std::ops::ControlFlow::Break(()) = visit(key as i64, value) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Purge all centroids + assignments + dense memberships (used when K or d changes).
     pub fn clear_all(&self) -> Result<()> {
         let mut wtxn = self

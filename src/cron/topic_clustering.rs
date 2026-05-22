@@ -2330,20 +2330,60 @@ async fn run_online_global_topic_scan(
         store_warm_start_centroids(&params, "global", &fcm_result.centroids);
     }
 
-    // Also persist centroids + empty TopicResults into code_topics so the
-    // hierarchy pass below has something to cluster. The online path doesn't
-    // produce per-chunk metadata for stored topics (membership lives in LMDB);
-    // we store lightweight hierarchy-compatible shells with just centroid +
-    // cluster_index.
+    // Persist topics into code_topics with per-chunk metadata sourced
+    // from the LMDB membership store. Pre-B.3(b), this path wrote empty
+    // shells (`chunk_ids: Vec::new()`) so `chunk_topic_assignments` was
+    // never populated and `code_topics.chunk_count` rendered as 0 (or,
+    // worse, the project-wide total) for every topic. Now: read every
+    // stored membership row from LMDB, bucket chunks into the topics
+    // whose membership exceeds `membership_threshold`, and pass the
+    // populated topic list to `db.store_topics` so the per-chunk
+    // assignments land.
     let k = fcm_result.centroids.nrows();
-    let shell_topics: Vec<TopicResult> = (0..k)
+    let mut topic_chunk_ids: Vec<Vec<i64>> = vec![Vec::new(); k];
+    let mut topic_memberships: Vec<Vec<f64>> = vec![Vec::new(); k];
+
+    if params.lmdb_enabled
+        && let Some(store) = open_centroid_store(&params)
+    {
+        let threshold = params.membership_threshold;
+        let memberships = match store.collect_memberships_dense() {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "online FCM: collect_memberships_dense failed; falling back to empty shells");
+                Vec::new()
+            }
+        };
+        let mut chunk_topic_pairs = 0u64;
+        for (chunk_id, mu) in memberships {
+            if mu.len() != k {
+                // Stale LMDB rows from a prior run with a different K.
+                // `clear_all` should have been called on K change, but
+                // be defensive in case the store survived a restart.
+                continue;
+            }
+            for (j, &m) in mu.iter().enumerate() {
+                if (m as f64) >= threshold {
+                    topic_chunk_ids[j].push(chunk_id);
+                    topic_memberships[j].push(m as f64);
+                    chunk_topic_pairs += 1;
+                }
+            }
+        }
+        info!(
+            job = "online-fcm",
+            chunk_topic_pairs, "Bucketed LMDB memberships into per-topic chunk lists"
+        );
+    }
+
+    let topics_built: Vec<TopicResult> = (0..k)
         .map(|i| TopicResult {
             cluster_index: i as i32,
             label: format!("topic_{}", i),
             keywords: Vec::new(),
             keyword_scores: Vec::new(),
-            chunk_ids: Vec::new(),
-            memberships: Vec::new(),
+            chunk_ids: std::mem::take(&mut topic_chunk_ids[i]),
+            memberships: std::mem::take(&mut topic_memberships[i]),
             file_ids: Vec::new(),
             project_names: Vec::new(),
             avg_internal_similarity: 0.0,
@@ -2357,8 +2397,8 @@ async fn run_online_global_topic_scan(
     if let Err(e) = db.clear_topics_for_scope("global").await {
         warn!(error = %e, "online FCM: clear global failed");
     }
-    if let Err(e) = db.store_topics("global", &shell_topics).await {
-        warn!(error = %e, "online FCM: store global shells failed");
+    if let Err(e) = db.store_topics("global", &topics_built).await {
+        warn!(error = %e, "online FCM: store global topics failed");
     }
 
     stats.topic_scans.fetch_add(1, Ordering::Relaxed);
