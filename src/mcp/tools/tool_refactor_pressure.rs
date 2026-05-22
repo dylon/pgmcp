@@ -12,6 +12,32 @@ use crate::context::SystemContext;
 use crate::mcp::server::RefactorPressureParams;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 
+// `git_commits.author_date` (TIMESTAMPTZ) is the canonical commit timestamp;
+// there is no `committed_at` column (see `src/db/migrations.rs`). The SQL
+// here is held in a module-level const so the regression test below can
+// statically assert the column name without re-reading the source file.
+const PRESSURE_SQL: &str = "WITH window_commits AS (
+    SELECT gc.id, gc.author_date, gcf.file_path AS path
+    FROM git_commits gc
+    JOIN git_commit_files gcf ON gcf.commit_id = gc.id
+    WHERE gc.project_id = $1
+      AND gc.author_date > NOW() - ($2::int8 || ' days')::interval
+),
+per_file AS (
+    SELECT path,
+           COUNT(*)::int8 AS commits,
+           SUM(CASE WHEN path ~ '(^|/)(test|tests|spec|specs)(/|_)' OR path ~ '(_test|_spec)\\.[a-z]+$' THEN 0 ELSE 1 END)::int8 AS non_test_commits,
+           SUM(CASE WHEN path ~ '(^|/)(test|tests|spec|specs)(/|_)' OR path ~ '(_test|_spec)\\.[a-z]+$' THEN 1 ELSE 0 END)::int8 AS test_commits
+    FROM window_commits
+    GROUP BY path
+)
+SELECT path, non_test_commits, test_commits,
+       (non_test_commits::float8 / NULLIF(test_commits, 0)) AS pressure
+FROM per_file
+WHERE non_test_commits >= 3
+ORDER BY pressure DESC NULLS LAST
+LIMIT $3";
+
 pub async fn tool_refactor_pressure(
     ctx: &SystemContext,
     params: RefactorPressureParams,
@@ -24,27 +50,7 @@ pub async fn tool_refactor_pressure(
     let limit = params.limit.unwrap_or(30);
 
     let rows: Vec<(String, i64, i64, f64)> = sqlx::query_as::<_, (String, i64, i64, f64)>(
-        "WITH window_commits AS (
-            SELECT gc.id, gc.committed_at, gcf.file_path AS path
-            FROM git_commits gc
-            JOIN git_commit_files gcf ON gcf.commit_id = gc.id
-            WHERE gc.project_id = $1
-              AND gc.committed_at > NOW() - ($2::int8 || ' days')::interval
-        ),
-        per_file AS (
-            SELECT path,
-                   COUNT(*)::int8 AS commits,
-                   SUM(CASE WHEN path ~ '(^|/)(test|tests|spec|specs)(/|_)' OR path ~ '(_test|_spec)\\.[a-z]+$' THEN 0 ELSE 1 END)::int8 AS non_test_commits,
-                   SUM(CASE WHEN path ~ '(^|/)(test|tests|spec|specs)(/|_)' OR path ~ '(_test|_spec)\\.[a-z]+$' THEN 1 ELSE 0 END)::int8 AS test_commits
-            FROM window_commits
-            GROUP BY path
-        )
-        SELECT path, non_test_commits, test_commits,
-               (non_test_commits::float8 / NULLIF(test_commits, 0)) AS pressure
-        FROM per_file
-        WHERE non_test_commits >= 3
-        ORDER BY pressure DESC NULLS LAST
-        LIMIT $3",
+        PRESSURE_SQL,
     )
     .bind(project_id)
     .bind(since_days)
@@ -70,4 +76,31 @@ pub async fn tool_refactor_pressure(
         "files": files,
         "guidance": "Pressure = non_test_commits / test_commits over the window. High values mean changes ship without test coverage churn (refactor risk)."
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PRESSURE_SQL;
+
+    #[test]
+    fn sql_uses_author_date_not_committed_at() {
+        assert!(
+            PRESSURE_SQL.contains("gc.author_date"),
+            "PRESSURE_SQL must reference gc.author_date"
+        );
+        assert!(
+            !PRESSURE_SQL.contains("committed_at"),
+            "git_commits has no committed_at column; use author_date"
+        );
+    }
+
+    #[test]
+    fn sql_binds_three_parameters() {
+        for placeholder in ["$1", "$2", "$3"] {
+            assert!(
+                PRESSURE_SQL.contains(placeholder),
+                "PRESSURE_SQL is missing bind placeholder {placeholder}"
+            );
+        }
+    }
 }
