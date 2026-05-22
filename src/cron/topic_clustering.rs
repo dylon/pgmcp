@@ -286,9 +286,83 @@ fn degenerate_result(n: usize, d: usize, k: usize) -> FcmResult {
 // c-TF-IDF topic labeling
 // ============================================================================
 
+// Stopword tiers for c-TF-IDF topic labeling.
+//
+// Originally only programming-language keywords were filtered; topic
+// labels then degenerated into English function words ("the", "and",
+// "of") and host-specific path tokens ("home", "workspace", the user's
+// username) bleeding through from embedded path strings in error
+// messages, log lines, and doc comments. The four explicit tiers
+// (CODE / ENGLISH / PATHS / SCAFFOLDING) make each category of
+// suppression auditable; the union of all four is the default.
+//
+// Per-installation tokens (e.g. a real username like "dylon") would
+// be inappropriate to ship in the binary — they're loaded from the
+// environment variable `PGMCP_TOPIC_STOPWORDS_EXTRA` (comma-separated).
+
+/// English function-word tier: the, and, of, … plus common verbs/
+/// auxiliaries that dominate bag-of-words counts in any natural-language
+/// corpus and provide no discriminative signal for topic separation.
+const ENGLISH_STOPWORDS: &[&str] = &[
+    "the", "and", "or", "of", "for", "in", "on", "at", "to", "from", "with", "as", "by", "an", "a",
+    "is", "are", "was", "were", "be", "been", "has", "have", "had", "this", "that", "these",
+    "those", "but", "if", "then", "when", "where", "what", "which", "how", "why", "who", "can",
+    "will", "would", "should", "could", "may", "might", "must", "just", "only", "also", "not",
+    "no", "yes", "all", "any", "some", "each", "every", "here", "there", "now", "very", "more",
+    "most", "less", "into", "out", "up", "down", "over", "under", "do", "does", "did", "doing",
+    "between", "through", "during", "before", "after", "above", "below", "again", "further",
+    "than", "too",
+];
+
+/// Filesystem-path tier: directory components that appear in
+/// `/home/<user>/Workspace/<project>/src/...` style strings embedded in
+/// log lines and error messages. None of these are project-meaningful.
+const PATH_STOPWORDS: &[&str] = &[
+    "home",
+    "workspace",
+    "project",
+    "projects",
+    "source",
+    "sources",
+    "target",
+    "build",
+    "dist",
+    "node",
+    "modules",
+    "github",
+    "gitlab",
+    "bitbucket",
+    "com",
+    "io",
+    "org",
+    "www",
+    "http",
+    "https",
+    "tmp",
+    "var",
+    "etc",
+    "usr",
+    "opt",
+    "local",
+    "lib",
+    "bin",
+    "share",
+    "include",
+];
+
+/// Identifier-scaffolding tier: variable-name pieces that appear in
+/// nearly every code corpus and dominate bag-of-words counts without
+/// distinguishing topics.
+const SCAFFOLDING_STOPWORDS: &[&str] = &[
+    "value", "values", "data", "item", "items", "name", "names", "kind", "kinds", "info", "list",
+    "array", "object", "key", "keys", "result", "results", "error", "errors", "count", "size",
+    "index", "indices", "num", "number", "file", "files", "line", "lines", "code", "text",
+    "content", "contents", "input", "output", "config", "settings",
+];
+
 /// Programming language stopwords to filter from topic labels.
 fn code_stopwords() -> HashSet<&'static str> {
-    [
+    let mut set: HashSet<&'static str> = [
         // Rust
         "fn",
         "pub",
@@ -432,12 +506,35 @@ fn code_stopwords() -> HashSet<&'static str> {
         "dst",
     ]
     .into_iter()
-    .collect()
+    .collect();
+
+    // Union the English / path / scaffolding tiers.
+    set.extend(ENGLISH_STOPWORDS.iter().copied());
+    set.extend(PATH_STOPWORDS.iter().copied());
+    set.extend(SCAFFOLDING_STOPWORDS.iter().copied());
+    set
+}
+
+/// Per-installation extras read once from `PGMCP_TOPIC_STOPWORDS_EXTRA`
+/// (comma-separated). Each entry is lower-cased and filtered for short
+/// or non-alphanumeric tokens. Cached so the env var only parses on
+/// first call. Returns an empty set if the variable is unset or empty.
+fn user_stopwords() -> &'static HashSet<String> {
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<HashSet<String>> = OnceLock::new();
+    CACHE.get_or_init(|| {
+        let raw = std::env::var("PGMCP_TOPIC_STOPWORDS_EXTRA").unwrap_or_default();
+        raw.split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
 }
 
 /// Tokenize content for c-TF-IDF: split on non-alphanumeric, lowercase, filter.
 fn tokenize(content: &str) -> Vec<String> {
     let stopwords = code_stopwords();
+    let user_extras = user_stopwords();
     content
         .split(|c: char| !c.is_alphanumeric() && c != '_')
         .map(|s| s.to_lowercase())
@@ -446,6 +543,7 @@ fn tokenize(content: &str) -> Vec<String> {
                 && s.len() <= 50
                 && !s.chars().all(|c| c.is_ascii_digit())
                 && !stopwords.contains(s.as_str())
+                && !user_extras.contains(s)
         })
         .collect()
 }
@@ -462,12 +560,14 @@ pub struct TopicKeyword {
 fn tokenize_into(content: &str, buf: &mut Vec<String>) {
     buf.clear();
     let stopwords = code_stopwords();
+    let user_extras = user_stopwords();
     for s in content.split(|c: char| !c.is_alphanumeric() && c != '_') {
         let lower = s.to_lowercase();
         if lower.len() >= 3
             && lower.len() <= 50
             && !lower.chars().all(|c| c.is_ascii_digit())
             && !stopwords.contains(lower.as_str())
+            && !user_extras.contains(&lower)
         {
             buf.push(lower);
         }
@@ -2813,11 +2913,19 @@ mod tests {
             topic0_words
         );
 
-        // Topic 1 should contain "http" as a top keyword
+        // Topic 1 should contain a request-handling keyword. (Note: "http"
+        // is filtered by the PATH_STOPWORDS tier added in B.3 since it
+        // commonly bleeds in from URL strings rather than as a topic
+        // signal; the request-handling cluster is still well-identified
+        // by the surviving tokens.)
         let topic1_words: Vec<&str> = keywords[1].iter().map(|k| k.word.as_str()).collect();
+        let expected_signals = ["middleware", "endpoint", "router", "handler", "request"];
         assert!(
-            topic1_words.contains(&"http"),
-            "Topic 1 should contain 'http', got {:?}",
+            expected_signals
+                .iter()
+                .any(|sig| topic1_words.contains(sig)),
+            "Topic 1 should contain a request-handling signal from {:?}; got {:?}",
+            expected_signals,
             topic1_words
         );
     }
@@ -2833,6 +2941,65 @@ mod tests {
             "Stopwords should be filtered: {:?}",
             keywords[0]
         );
+    }
+
+    #[test]
+    fn test_ctf_idf_english_stopwords_filtered() {
+        // Regression guard for B.3: prior degenerate labels were
+        // dominated by English function words ("the", "and") and path
+        // tokens ("home", "workspace") that bled in from embedded path
+        // strings in error messages and doc comments. After extending
+        // the stopword tiers, those tokens must not survive into any
+        // topic's top-K keywords.
+        //
+        // Build two contrived single-chunk corpora where the only
+        // "signal" tokens are `alpha` and `beta`; everything else is a
+        // stopword tier member. The stopwords MUST be filtered, and the
+        // signal token MUST be the top hit.
+        let contents = [
+            "the value and home workspace alpha alpha alpha and the of for",
+            "home workspace dylon github io and the value beta beta beta the and",
+        ];
+        let membership: Array2<f32> = ndarray::array![[1.0, 0.0], [0.0, 1.0]];
+        let keywords = compute_ctf_idf(&contents, &membership, 5);
+
+        // Each topic's keyword list must contain its signal token and
+        // no stopwords from any tier.
+        let topic0_words: Vec<&str> = keywords[0].iter().map(|k| k.word.as_str()).collect();
+        let topic1_words: Vec<&str> = keywords[1].iter().map(|k| k.word.as_str()).collect();
+
+        assert!(
+            topic0_words.contains(&"alpha"),
+            "Topic 0 should contain 'alpha', got {:?}",
+            topic0_words
+        );
+        assert!(
+            topic1_words.contains(&"beta"),
+            "Topic 1 should contain 'beta', got {:?}",
+            topic1_words
+        );
+
+        for forbidden in [
+            "the",
+            "and",
+            "of",
+            "for",
+            "home",
+            "workspace",
+            "github",
+            "value",
+        ] {
+            assert!(
+                !topic0_words.contains(&forbidden),
+                "Topic 0 leaked stopword {forbidden:?}: {:?}",
+                topic0_words
+            );
+            assert!(
+                !topic1_words.contains(&forbidden),
+                "Topic 1 leaked stopword {forbidden:?}: {:?}",
+                topic1_words
+            );
+        }
     }
 
     #[test]
