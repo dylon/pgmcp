@@ -31,11 +31,8 @@ pub async fn tool_architecture_violations(
     // call via the `excluded_god_module_prefixes` parameter; the empty
     // vector form `Some(vec![])` disables exclusions entirely so the raw
     // file-count rule applies.
-    const DEFAULT_GOD_MODULE_EXCLUSIONS: &[&str] = &[
-        "src/patterns",
-        "src/mcp/tools",
-        "pgmcp-testing/tests",
-    ];
+    const DEFAULT_GOD_MODULE_EXCLUSIONS: &[&str] =
+        &["src/patterns", "src/mcp/tools", "pgmcp-testing/tests"];
     let god_module_exclusions: Vec<String> = params
         .excluded_god_module_prefixes
         .clone()

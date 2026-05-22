@@ -49,15 +49,14 @@ pub async fn tool_refactor_pressure(
     let since_days = params.since_days.unwrap_or(180) as i64;
     let limit = params.limit.unwrap_or(30);
 
-    let rows: Vec<(String, i64, i64, f64)> = sqlx::query_as::<_, (String, i64, i64, f64)>(
-        PRESSURE_SQL,
-    )
-    .bind(project_id)
-    .bind(since_days)
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| McpError::internal_error(format!("Pressure query failed: {}", e), None))?;
+    let rows: Vec<(String, i64, i64, f64)> =
+        sqlx::query_as::<_, (String, i64, i64, f64)>(PRESSURE_SQL)
+            .bind(project_id)
+            .bind(since_days)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Pressure query failed: {}", e), None))?;
 
     let files: Vec<_> = rows
         .into_iter()

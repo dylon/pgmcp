@@ -66,7 +66,11 @@ fn multiple_messages_with_nul_all_get_stripped() {
     let changed = strip_nul_bytes_from_chunks(&mut chunks);
     assert!(changed);
     for c in &chunks {
-        assert!(!c.content.contains('\0'), "post-strip chunk: {:?}", c.content);
+        assert!(
+            !c.content.contains('\0'),
+            "post-strip chunk: {:?}",
+            c.content
+        );
     }
 }
 
