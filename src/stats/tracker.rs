@@ -1,88 +1,16 @@
 //! Lock-free atomic statistics tracker.
+mod outcomes;
+pub use outcomes::*;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Instant;
 
 use arc_swap::ArcSwapOption;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
 use crate::stats::telemetry_writer::TelemetryRow;
-
-/// Why a heavy-cron closure returned early without entering its work
-/// body. Recorded alongside the closure-level `CronJobOutcome::Skipped`
-/// so an operator tailing `index_stats` can tell *which* of the three
-/// silent-skip paths is currently silencing the job.
-///
-/// - `PhaseGate`: the `is_at_least(DaemonPhase::Ready)` check rejected
-///   the tick. The daemon is still scanning / initializing.
-/// - `Cooldown`: the per-job ready-relative delay
-///   (`ready_<job>_delay_secs`) hasn't elapsed yet. The daemon reached
-///   `Ready` recently but not long enough ago for this cron to fire.
-/// - `LockBusy`: `heavy_cron_lock.try_lock()` lost the race to another
-///   heavy cron. Six of seven heavy crons will skip this way each tick
-///   while one runs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SkipReason {
-    PhaseGate,
-    Cooldown,
-    LockBusy,
-}
-
-impl SkipReason {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SkipReason::PhaseGate => "phase_gate",
-            SkipReason::Cooldown => "cooldown",
-            SkipReason::LockBusy => "lock_busy",
-        }
-    }
-}
-
-/// Outcome of the most recent run of a named cron job.
-///
-/// - `Ok`: closure entered the work body and the body completed
-///   (whether or not it did N units of work — `<job>_runs` counters
-///   track that separately at the top of each body).
-/// - `NoOp`: closure entered the work body but the body's empty-data
-///   path returned immediately (e.g. `max_chunk_id == 0`, no
-///   projects, no embeddings yet). Distinguishes "scan ran, nothing
-///   to do" from "scan never ran".
-/// - `Skipped(reason)`: closure returned at one of the three gates
-///   before entering the body. See [`SkipReason`].
-/// - `Panicked`: anything `catch_unwind` caught.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CronJobOutcome {
-    Ok,
-    NoOp,
-    Skipped(SkipReason),
-    Panicked,
-}
-
-impl CronJobOutcome {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            CronJobOutcome::Ok => "ok",
-            CronJobOutcome::NoOp => "no_op",
-            CronJobOutcome::Skipped(SkipReason::PhaseGate) => "skipped:phase_gate",
-            CronJobOutcome::Skipped(SkipReason::Cooldown) => "skipped:cooldown",
-            CronJobOutcome::Skipped(SkipReason::LockBusy) => "skipped:lock_busy",
-            CronJobOutcome::Panicked => "panicked",
-        }
-    }
-}
-
-/// Last-known status of one named cron job. Kept in the `last_cron_outcomes`
-/// DashMap on `StatsTracker`; exposed via the JSON snapshot so dashboards
-/// can distinguish "running cleanly", "panicked recently", and "never run"
-/// per job rather than only seeing global `cron_panics`.
-#[derive(Debug, Clone)]
-pub struct CronJobStatus {
-    pub outcome: CronJobOutcome,
-    pub at: DateTime<Utc>,
-    pub duration_ms: u64,
-}
 
 /// Per-tool telemetry: call count, error count, cumulative duration, and
 /// bucketed duration histogram. Used both keyed by `tool_name`
