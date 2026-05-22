@@ -27,18 +27,10 @@ use crate::error::{PgmcpError, Result};
 use crate::indexer::{scanner, watcher};
 use crate::stats::tracker::StatsTracker;
 
-/// Remove all NUL (`\0`) bytes from `s` in-place. Returns `true` iff any
-/// bytes were removed. Postgres `TEXT` columns reject NUL bytes even
-/// though Rust `String` allows them; NUL carries no semantic information
-/// in any indexed text format, so stripping is lossless.
-fn strip_nul_bytes(s: &mut String) -> bool {
-    if s.contains('\0') {
-        s.retain(|c| c != '\0');
-        true
-    } else {
-        false
-    }
-}
+// `strip_nul_bytes` lives in `crate::indexer::chunker` so every ingestion
+// path uses one canonical implementation. The embed-pool worker calls it
+// twice (raw content + per-chunk) as defence in depth.
+use crate::indexer::chunker::strip_nul_bytes;
 
 /// Decision branch for cross-path content-hash dedup. Computed in the
 /// embed worker after content extraction & hashing.
@@ -1104,7 +1096,7 @@ fn process_index_file_task(
 
     // Strip NUL bytes from chunk content. Most cases are already covered
     // by the strip on `content` above, but `claude_chunker` parses JSON
-    // strings and can introduce raw `\0` from `" "` escapes in tool
+    // strings and can introduce raw `\0` from `"\u0000"` escapes in tool
     // results — those would otherwise reject at `insert_chunk` time.
     for chunk in chunks.iter_mut() {
         if strip_nul_bytes(&mut chunk.content) {
@@ -1359,49 +1351,11 @@ where
 mod tests {
     use super::*;
 
-    #[test]
-    fn strip_nul_bytes_returns_false_on_clean_input() {
-        let mut s = String::from("no nuls here");
-        assert!(!strip_nul_bytes(&mut s));
-        assert_eq!(s, "no nuls here");
-    }
-
-    #[test]
-    fn strip_nul_bytes_removes_embedded_nul() {
-        let mut s = String::from("before\0after");
-        assert!(strip_nul_bytes(&mut s));
-        assert_eq!(s, "beforeafter");
-    }
-
-    #[test]
-    fn strip_nul_bytes_removes_multiple_nuls() {
-        let mut s = String::from("\0a\0b\0c\0");
-        assert!(strip_nul_bytes(&mut s));
-        assert_eq!(s, "abc");
-    }
-
-    #[test]
-    fn strip_nul_bytes_handles_only_nuls() {
-        let mut s = String::from("\0\0\0");
-        assert!(strip_nul_bytes(&mut s));
-        assert_eq!(s, "");
-    }
-
-    #[test]
-    fn strip_nul_bytes_preserves_unicode() {
-        // Mixed: NUL + multi-byte UTF-8. `retain` operates on `char`s, so
-        // the multi-byte sequences must survive untouched.
-        let mut s = String::from("héllo\0wörld\0\u{1F600}");
-        assert!(strip_nul_bytes(&mut s));
-        assert_eq!(s, "héllowörld\u{1F600}");
-    }
-
-    #[test]
-    fn strip_nul_bytes_preserves_empty_string() {
-        let mut s = String::new();
-        assert!(!strip_nul_bytes(&mut s));
-        assert_eq!(s, "");
-    }
+    // `strip_nul_bytes` is tested in `src/indexer/chunker.rs` where it now
+    // lives. The embed-pool worker still depends on it (two defence-in-
+    // depth call sites at lines 890 and 1102), but the canonical
+    // implementation and tests are co-located with the rest of the
+    // chunking layer.
 
     // --- retry_pool_timeout ------------------------------------------------
     //

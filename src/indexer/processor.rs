@@ -121,8 +121,16 @@ pub async fn process_file(
     }
 
     // Read file content
-    let content =
+    let mut content =
         std::fs::read_to_string(path).map_err(|e| crate::error::PgmcpError::file_io(path, e))?;
+
+    // Strip NUL bytes from the raw content. Postgres TEXT rejects 0x00
+    // (despite UTF-8 allowing it), so unstripped NUL bytes would crash
+    // every INSERT into `indexed_files.content` / `file_chunks.content`.
+    // Track per-file: even if `had_nul` is set from the raw strip, the
+    // post-chunk strip below catches additional NULs introduced by JSON
+    // `\u0000` escapes that survive `serde_json::from_str`.
+    let mut had_nul = chunker::strip_nul_bytes(&mut content);
 
     // Compute xxHash3
     let content_hash = xxh3_64(content.as_bytes()) as i64;
@@ -171,7 +179,8 @@ pub async fn process_file(
     db.delete_file_chunks(file_id).await?;
 
     // Chunk the content, routing to the appropriate chunker
-    let chunks = if &*language == "jsonl" && claude_chunker::is_claude_session_transcript(path) {
+    let mut chunks = if &*language == "jsonl" && claude_chunker::is_claude_session_transcript(path)
+    {
         claude_chunker::chunk_claude_jsonl(&content)
     } else if &*language == "jsonl" && codex_chunker::is_codex_jsonl(path) {
         codex_chunker::chunk_codex_jsonl(&content)
@@ -184,6 +193,18 @@ pub async fn process_file(
             config.embeddings.chunk_overlap_lines,
         )
     };
+
+    // Defence in depth: even if the raw content was NUL-clean, JSON
+    // ` ` escapes inside string values decode to NUL bytes after
+    // `serde_json::from_str`. Strip per-chunk to catch those.
+    if chunker::strip_nul_bytes_from_chunks(&mut chunks) {
+        had_nul = true;
+    }
+    if had_nul {
+        stats
+            .files_with_null_bytes_stripped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
 
     if chunks.is_empty() {
         // No chunks to embed — finalize hash immediately

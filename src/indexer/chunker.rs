@@ -7,6 +7,37 @@
 /// `file_chunks.content`; pre-splitting keeps every chunk insertable.
 pub const TSVECTOR_SAFE_CHUNK_BYTES: usize = 900 * 1024;
 
+/// Remove all NUL (`\0`) bytes from `s` in-place. Returns `true` iff any
+/// bytes were removed. Postgres `TEXT` columns reject NUL bytes even
+/// though Rust `String` allows them; NUL carries no semantic information
+/// in any indexed text format, so stripping is lossless.
+///
+/// Centralized here so every ingestion path (the embed-pool worker AND
+/// the legacy `indexer::processor::process_file` path AND any future
+/// chunker entry point) calls one canonical implementation.
+pub fn strip_nul_bytes(s: &mut String) -> bool {
+    if s.contains('\0') {
+        s.retain(|c| c != '\0');
+        true
+    } else {
+        false
+    }
+}
+
+/// Apply `strip_nul_bytes` to every chunk's content; returns `true` iff
+/// any chunk's content was modified. Used by callers that produce chunks
+/// from JSON-decoded values where `\u0000` JSON escapes can survive even
+/// when the raw input bytes contain no NUL.
+pub fn strip_nul_bytes_from_chunks(chunks: &mut [Chunk]) -> bool {
+    let mut any = false;
+    for chunk in chunks {
+        if strip_nul_bytes(&mut chunk.content) {
+            any = true;
+        }
+    }
+    any
+}
+
 /// Post-process a chunker's output: any chunk whose content exceeds
 /// `TSVECTOR_SAFE_CHUNK_BYTES` is split at the nearest UTF-8 boundary
 /// into multiple sub-chunks of bounded size. All sub-chunks inherit the
@@ -152,6 +183,83 @@ pub fn chunk_jsonl_content(content: &str) -> Vec<Chunk> {
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    #[test]
+    fn strip_nul_bytes_returns_false_on_clean_input() {
+        let mut s = String::from("no nuls here");
+        assert!(!strip_nul_bytes(&mut s));
+        assert_eq!(s, "no nuls here");
+    }
+
+    #[test]
+    fn strip_nul_bytes_removes_embedded_nul() {
+        let mut s = String::from("before\0after");
+        assert!(strip_nul_bytes(&mut s));
+        assert_eq!(s, "beforeafter");
+    }
+
+    #[test]
+    fn strip_nul_bytes_removes_multiple_nuls() {
+        let mut s = String::from("\0a\0b\0c\0");
+        assert!(strip_nul_bytes(&mut s));
+        assert_eq!(s, "abc");
+    }
+
+    #[test]
+    fn strip_nul_bytes_handles_only_nuls() {
+        let mut s = String::from("\0\0\0");
+        assert!(strip_nul_bytes(&mut s));
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn strip_nul_bytes_preserves_unicode() {
+        // Mixed: NUL + multi-byte UTF-8. `retain` operates on `char`s, so
+        // the multi-byte sequences must survive untouched.
+        let mut s = String::from("héllo\0wörld\0\u{1F600}");
+        assert!(strip_nul_bytes(&mut s));
+        assert_eq!(s, "héllowörld\u{1F600}");
+    }
+
+    #[test]
+    fn strip_nul_bytes_preserves_empty_string() {
+        let mut s = String::new();
+        assert!(!strip_nul_bytes(&mut s));
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn strip_nul_bytes_from_chunks_returns_true_when_any_chunk_modified() {
+        let mut chunks = vec![
+            Chunk {
+                chunk_index: 0,
+                content: "clean".into(),
+                start_line: 1,
+                end_line: 1,
+            },
+            Chunk {
+                chunk_index: 1,
+                content: "with\0nul".into(),
+                start_line: 2,
+                end_line: 2,
+            },
+        ];
+        assert!(strip_nul_bytes_from_chunks(&mut chunks));
+        assert_eq!(chunks[0].content, "clean");
+        assert_eq!(chunks[1].content, "withnul");
+    }
+
+    #[test]
+    fn strip_nul_bytes_from_chunks_returns_false_on_clean_input() {
+        let mut chunks = vec![Chunk {
+            chunk_index: 0,
+            content: "no nuls".into(),
+            start_line: 1,
+            end_line: 1,
+        }];
+        assert!(!strip_nul_bytes_from_chunks(&mut chunks));
+        assert_eq!(chunks[0].content, "no nuls");
+    }
 
     #[test]
     fn test_empty_content() {
