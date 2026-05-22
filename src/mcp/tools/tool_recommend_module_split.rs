@@ -44,7 +44,7 @@ pub async fn tool_recommend_module_split(
     let min_communities = params.min_communities.unwrap_or(2).max(2);
     let include_chunks = params.include_chunks.unwrap_or(false);
 
-    info!(
+    debug!(
         tool = "recommend_module_split",
         project = %params.project,
         min_lines,

@@ -12,7 +12,9 @@ use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use rmcp::{tool, tool_handler, tool_router};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use sqlx::PgPool;
+use tracing::{Instrument, info, info_span, warn};
 
 use crate::config::Config;
 use crate::context::SystemContext;
@@ -105,27 +107,113 @@ pub(crate) fn extract_caller(ctx: &RequestContext<RoleServer>) -> CallerInfo {
 /// in one place. Additionally enqueues a durable `TelemetryRow` for the
 /// async writer task (Tier 3); the enqueue is non-blocking and drops on
 /// channel overflow.
+///
+/// Also emits `info!` events at entry (`"invoked"`) and exit (`"completed"`
+/// on success, `warn!("failed", ...)` on error) under the
+/// `pgmcp::mcp::tool` tracing target so every MCP tool call lands in the
+/// daemon log file. `params_summary` is a compact one-line summary of the
+/// parameters (typically `summarize_debug(&params)`); pass `""` for nullary
+/// tools.
 pub(crate) async fn instrumented_tool_wrap<F>(
     stats: &StatsTracker,
     name: &str,
     secs: u64,
     ctx: &RequestContext<RoleServer>,
+    params_summary: &str,
     fut: F,
 ) -> Result<CallToolResult, McpError>
 where
     F: std::future::Future<Output = Result<CallToolResult, McpError>>,
 {
     let caller = extract_caller(ctx);
+    let request_id = Some(format!("{:?}", ctx.id));
+    instrumented_tool_run(
+        stats,
+        name,
+        Some(secs),
+        caller,
+        params_summary,
+        request_id,
+        fut,
+    )
+    .await
+}
+
+/// Inner instrumentation that does not require an rmcp `RequestContext`.
+/// Used by both the MCP transport path (via `instrumented_tool_wrap`) and
+/// the CLI dispatch path (`call_tool_cli`). Pass `timeout_secs = None` for
+/// long-running tools that should not be bounded by `timeout_wrap`
+/// (e.g. `reindex`).
+pub(crate) async fn instrumented_tool_run<F>(
+    stats: &StatsTracker,
+    name: &str,
+    timeout_secs: Option<u64>,
+    caller: CallerInfo,
+    params_summary: &str,
+    request_id: Option<String>,
+    fut: F,
+) -> Result<CallToolResult, McpError>
+where
+    F: std::future::Future<Output = Result<CallToolResult, McpError>>,
+{
+    let span = info_span!(
+        target: "pgmcp::mcp::tool",
+        "mcp_tool",
+        tool = name,
+        client = %caller.client_name,
+    );
+    info!(
+        target: "pgmcp::mcp::tool",
+        tool = name,
+        client = %caller.client_name,
+        params = %params_summary,
+        "invoked",
+    );
     let start = std::time::Instant::now();
-    let result = timeout_wrap(name, secs, fut).await;
+    let result = match timeout_secs {
+        Some(s) => timeout_wrap(name, s, fut).instrument(span).await,
+        None => fut.instrument(span).await,
+    };
     let elapsed = start.elapsed();
+    let elapsed_ms = elapsed.as_millis().min(u64::MAX as u128) as u64;
     let duration_ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
     let ok = result.is_ok();
     stats.record_tool_call(name, &caller.client_name, duration_ns, ok);
-    if !ok {
-        stats.mcp_errors.fetch_add(1, Ordering::Relaxed);
+    match &result {
+        Ok(_) => info!(
+            target: "pgmcp::mcp::tool",
+            tool = name,
+            client = %caller.client_name,
+            duration_ms = elapsed_ms,
+            "completed",
+        ),
+        Err(e) => {
+            stats.mcp_errors.fetch_add(1, Ordering::Relaxed);
+            warn!(
+                target: "pgmcp::mcp::tool",
+                tool = name,
+                client = %caller.client_name,
+                duration_ms = elapsed_ms,
+                error = %e,
+                "failed",
+            );
+        }
     }
-    let (outcome, error_class) = classify_result(&result, secs, elapsed);
+    // `classify_result` needs a concrete timeout budget; for unbounded
+    // calls (None) we use u64::MAX so the elapsed-vs-budget check never
+    // misclassifies a long-running success/error as a timeout.
+    let timeout_for_classify = timeout_secs.unwrap_or(u64::MAX);
+    let (outcome, error_class) = classify_result(&result, timeout_for_classify, elapsed);
+    // Hash the params summary so telemetry rows carry a stable join key
+    // for downstream analyses (deduplicating identical-shape invocations
+    // across clients, agents, and time windows). Empty params hash to
+    // `None` so analyses can distinguish nullary tools from parametrized
+    // tools with truly identical params.
+    let params_sha256 = if params_summary.is_empty() {
+        None
+    } else {
+        Some(format!("{:x}", Sha256::digest(params_summary.as_bytes())))
+    };
     let row = crate::stats::telemetry_writer::TelemetryRow {
         tool: name.to_string(),
         client_name: caller.client_name.clone(),
@@ -137,11 +225,35 @@ where
         duration_ms: (duration_ns / 1_000_000).min(i32::MAX as u64) as i32,
         outcome,
         error_class,
-        request_id: Some(format!("{:?}", ctx.id)),
-        params_sha256: None,
+        request_id,
+        params_sha256,
     };
     crate::stats::telemetry_writer::try_enqueue(stats, row);
     result
+}
+
+/// Compact one-line summary of a tool's typed parameters for logging.
+/// Uses `Debug` (every `*Params` struct in this file derives it). Truncates
+/// to 200 bytes on a valid UTF-8 char boundary with a `…(+NB)` suffix
+/// indicating how many bytes were elided.
+pub(crate) fn summarize_debug<P: std::fmt::Debug + ?Sized>(p: &P) -> String {
+    truncate_for_log(&format!("{:?}", p))
+}
+
+/// Compact one-line summary of a raw JSON params value (used by the CLI
+/// dispatch path which receives `serde_json::Value` rather than a typed
+/// struct). Uses `Value::to_string` for readable JSON shape.
+pub(crate) fn summarize_json(v: &serde_json::Value) -> String {
+    truncate_for_log(&v.to_string())
+}
+
+fn truncate_for_log(s: &str) -> String {
+    if s.len() <= 200 {
+        s.to_string()
+    } else {
+        let end = s.floor_char_boundary(200);
+        format!("{}…(+{}B)", &s[..end], s.len() - end)
+    }
 }
 
 /// Classify a tool result into the `outcome` + `error_class` columns of
@@ -1533,6 +1645,658 @@ pub struct AnomalyDetectionParams {
     pub contamination: Option<f64>,
 }
 
+// SOTA Phase 2 — graph algorithms (Seidman, Cohen, Tong, Brandes, Burt, Milo, Holme)
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KcoreAnalysisParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Minimum coreness to include (default: 0)")]
+    pub min_core: Option<u32>,
+    #[schemars(description = "Max files to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KtrussAnalysisParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Minimum trussness to include (default: 3)")]
+    pub min_truss: Option<u32>,
+    #[schemars(description = "Max edges to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PersonalizedPagerankParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Seed file paths (required, ≥1)")]
+    pub seed_files: Vec<String>,
+    #[schemars(description = "Damping factor (default: 0.85)")]
+    pub damping: Option<f64>,
+    #[schemars(description = "Max files to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EdgeBetweennessParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max edges to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct StructuralHolesParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Sort: \"constraint_asc\" (default, brokers first) or \"constraint_desc\""
+    )]
+    pub sort: Option<String>,
+    #[schemars(description = "Max files to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MotifCensusParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AttackVulnerabilityParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Removal order: \"pagerank\" (default), \"betweenness\", or \"degree\""
+    )]
+    pub removal_order: Option<String>,
+    #[schemars(description = "Max removal steps (default: 50)")]
+    pub max_steps: Option<u32>,
+}
+
+// SOTA Phase 3 — information theory
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CompressionDistanceParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "First file path (required)")]
+    pub file_a: String,
+    #[schemars(description = "Second file path (required)")]
+    pub file_b: String,
+    #[schemars(description = "zstd compression level (default: 3)")]
+    pub level: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CochangeMutualInformationParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Minimum joint commits required to include a pair (default: 3)")]
+    pub min_support: Option<u32>,
+    #[schemars(description = "Max pairs to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ImportEntropyParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Sort: \"entropy_desc\" (default) or \"entropy_asc\"")]
+    pub sort: Option<String>,
+    #[schemars(description = "Max files to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IdentifierEntropyParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Sort: \"entropy_desc\" (default) or \"entropy_asc\"")]
+    pub sort: Option<String>,
+    #[schemars(description = "Max files to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+
+// SOTA Phase 4 — evolution + quality
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BusFactorParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Fraction of lines that must be unmaintained to count (default: 0.5)"
+    )]
+    pub threshold: Option<f64>,
+    #[schemars(description = "Max files to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KnowledgeSilosParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Minimum Herfindahl index to include (default: 0.7 = high concentration)"
+    )]
+    pub min_herfindahl: Option<f64>,
+    #[schemars(description = "Max files to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OwnershipCouplingMismatchParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Minimum Jaccard coupling to include (default: 0.3)")]
+    pub min_coupling: Option<f64>,
+    #[schemars(description = "Minimum joint commits (default: 3)")]
+    pub min_commits: Option<u32>,
+    #[schemars(description = "Max pairs to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocCodeDriftParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Minimum cosine distance to include (default: 0.3)")]
+    pub min_drift: Option<f64>,
+    #[schemars(description = "Max directories to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TestSmellsParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max files to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MutationScoreSurrogateParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max files to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FlakyTestCandidatesParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max test files to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+
+// SOTA Phase 5 — concurrency / safety / performance
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LocksetRacesParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max matches to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UnsafeClustersParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max files to return (default: 25)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PanicPathsParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Entry filter: \"any\" (default), \"pub\", \"module\", \"private\"")]
+    pub entry_filter: Option<String>,
+    #[schemars(description = "Max functions to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeadlockCandidatesParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SendSyncViolationsParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max matches to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct QuadraticLoopsParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max matches to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MissingPreallocationParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max matches to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BlockingInAsyncParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max matches to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CloneDensityParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max files to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct IoHotpathParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max files to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+
+// SOTA Phase 6 — security
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TaintAnalysisParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max findings (default: 30)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SecretDetectionParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Minimum Shannon entropy to flag a literal (default: 4.0)")]
+    pub min_entropy: Option<f64>,
+    #[schemars(description = "Max findings (default: 100)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CryptoMisuseParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max findings (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UnsafeDeserializationParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max matches (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InjectionCandidatesParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "\"sql\" / \"shell\" / \"all\" (default)")]
+    pub kind: Option<String>,
+    #[schemars(description = "Max matches (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UnprotectedRoutesParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max matches (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CveSupplyChainParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max dependencies to return (default: 200)")]
+    pub limit: Option<i32>,
+}
+
+// SOTA Phase 7 — API / contract
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PublicApiSurfaceParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Language filter (e.g. \"rust\"); omit = all")]
+    pub language: Option<String>,
+    #[schemars(description = "\"summary\" (default) or \"full\"")]
+    pub format: Option<String>,
+    #[schemars(description = "Max symbols to return when format=\"full\" (default: 500)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SemverBreakAuditParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "How many recent commits to scan for historical public surface (default: 50)"
+    )]
+    pub window_commits: Option<u32>,
+    #[schemars(description = "Max findings (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeprecatedButUsedParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max symbols to return (default: 30)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ApiStabilityParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "How many recent commits to scan (default: 100)")]
+    pub window_commits: Option<u32>,
+    #[schemars(description = "Max symbols to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+// SOTA Phase 8 — ML / embedding-based
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LshCloneDetectionParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Approximate-cosine threshold (default: 0.85)")]
+    pub min_similarity: Option<f64>,
+    #[schemars(description = "Max pairs (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SemanticDriftParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max files (default: 30)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EmbeddingOutliersParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Number of nearest neighbours (default: 20)")]
+    pub k: Option<u32>,
+    #[schemars(description = "LOF threshold (default: 1.5)")]
+    pub threshold: Option<f64>,
+    #[schemars(description = "Max outliers (default: 30)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MultiResolutionPagerankParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max files (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+// SOTA Phase 9 — data engineering
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MigrationSafetyParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max findings (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeadColumnsParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max columns (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PiiSpreadParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Scope: \"all\" (default), \"logs\", \"network\"")]
+    pub scope: Option<String>,
+    #[schemars(description = "Max findings (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+// SOTA Phase 10 — call-graph downstream
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeadCodeReachabilityParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Include test files as roots (default: false)")]
+    pub include_tests: Option<bool>,
+    #[schemars(description = "Max dead candidates (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FeatureEnvyParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "ATFD threshold (default: 0.6)")]
+    pub threshold: Option<f64>,
+    #[schemars(description = "Max functions (default: 30)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ShotgunSurgeryParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "How many recent commits to scan (default: 50)")]
+    pub since_commits: Option<u32>,
+    #[schemars(description = "Minimum files touched to count as shotgun (default: 4)")]
+    pub min_files: Option<u32>,
+    #[schemars(description = "Max commits (default: 30)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct Lcom4Params {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max containers (default: 30)")]
+    pub limit: Option<i32>,
+}
+
+// SOTA Phase 11 — evolution analytics
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RefactorPressureParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Window length in days (default: 180)")]
+    pub since_days: Option<u32>,
+    #[schemars(description = "Max files (default: 30)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommitChangepointParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max changepoints (default: 20)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CommitTopicDriftParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Window size (default: 20)")]
+    pub window_commits: Option<u32>,
+    #[schemars(description = "Max files (default: 30)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReleaseApiStabilityParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max commits (default: 50)")]
+    pub limit: Option<i32>,
+}
+
+// A2A inter-agent IPC bridge params
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aSendTaskParams {
+    #[schemars(description = "Name of a registered peer agent (see a2a_list_agents)")]
+    pub target_agent: String,
+    #[schemars(description = "Message text to send")]
+    pub message: String,
+    #[schemars(description = "Optional skill_id to invoke on the peer")]
+    pub skill_id: Option<String>,
+    #[schemars(
+        description = "Optional recursion rounds for iterative refinement (1..=10). \
+                       Inspired by Yang et al. 2026 RecursiveMAS Section 5."
+    )]
+    pub recursion_rounds: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aGetTaskParams {
+    #[schemars(description = "Name of a registered peer agent")]
+    pub target_agent: String,
+    #[schemars(description = "Task UUID returned by a2a_send_task")]
+    pub task_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aSubscribeTaskParams {
+    #[schemars(description = "Name of a registered peer agent")]
+    pub target_agent: String,
+    #[schemars(description = "Task UUID to stream events for")]
+    pub task_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aCancelTaskParams {
+    #[schemars(description = "Name of a registered peer agent")]
+    pub target_agent: String,
+    #[schemars(description = "Task UUID to cancel")]
+    pub task_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aRegisterAgentParams {
+    #[schemars(description = "Unique agent name (used as the directory key)")]
+    pub name: String,
+    #[schemars(description = "Agent's JSON-RPC base URL (e.g. http://localhost:3101/a2a/jsonrpc)")]
+    pub url: String,
+    #[schemars(description = "Optional version string")]
+    pub version: Option<String>,
+    #[schemars(description = "Optional description")]
+    pub description: Option<String>,
+    #[schemars(description = "Optional capabilities JSON object")]
+    pub capabilities: Option<serde_json::Value>,
+    #[schemars(description = "Optional skills JSON array")]
+    pub skills: Option<serde_json::Value>,
+    #[schemars(description = "Specialty tags (e.g. [\"search\",\"retrieval\"]). \
+                       Used by a2a_find_agents_by_specialty for routing.")]
+    pub specialty: Option<Vec<String>>,
+    #[schemars(description = "Recommended collaboration role \
+                       (e.g. \"Search Specialist\", \"Summarizer\", \"Critic\"). \
+                       Used by orchestration patterns.")]
+    pub recommended_role: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aListAgentsParams {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aFindAgentsBySpecialtyParams {
+    #[schemars(description = "Specialty tags to match (OR-logic: any match wins)")]
+    pub specialty: Vec<String>,
+    #[schemars(description = "Optional exact-match on recommended_role")]
+    pub recommended_role: Option<String>,
+    #[schemars(description = "Max results (default 10)")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aPatternSequentialParams {
+    #[schemars(description = "Registered peer name for the Planner role")]
+    pub planner_agent: String,
+    #[schemars(description = "Registered peer name for the Critic role")]
+    pub critic_agent: String,
+    #[schemars(description = "Registered peer name for the Solver role")]
+    pub solver_agent: String,
+    #[schemars(description = "User query")]
+    pub message: String,
+    #[schemars(description = "Optional outer-loop recursion over the trio (1..=5)")]
+    pub recursion_rounds: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aPatternMixtureParams {
+    #[schemars(description = "Registered peer names for domain specialists (2..=8)")]
+    pub specialist_agents: Vec<String>,
+    #[schemars(description = "Registered peer name for the Summarizer role")]
+    pub summarizer_agent: String,
+    #[schemars(description = "User query (sent to every specialist in parallel)")]
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aPatternDistillationParams {
+    #[schemars(description = "Registered peer name for the Expert role")]
+    pub expert_agent: String,
+    #[schemars(description = "Registered peer name for the Learner role")]
+    pub learner_agent: String,
+    #[schemars(description = "User query")]
+    pub message: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aPatternDeliberationParams {
+    #[schemars(description = "Registered peer name for the Reflector role")]
+    pub reflector_agent: String,
+    #[schemars(description = "Registered peer name for the Tool-Caller role")]
+    pub tool_caller_agent: String,
+    #[schemars(description = "User query")]
+    pub message: String,
+    #[schemars(description = "Max deliberation rounds (default 3, hard cap 10)")]
+    pub max_rounds: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DocumentedTechDebtParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Filter to a single marker kind (e.g. \"TODO\", \"FIXME\"). Omit for all."
+    )]
+    pub kind: Option<String>,
+    #[schemars(description = "Filter by severity: \"high\", \"medium\", \"low\"")]
+    pub severity: Option<String>,
+    #[schemars(description = "Only markers older than this many days (uses git blame_date)")]
+    pub min_age_days: Option<i32>,
+    #[schemars(description = "Language filter (e.g. \"rust\")")]
+    pub language: Option<String>,
+    #[schemars(
+        description = "Category: \"comments\", \"stub_macros\", \"deprecated\", or \"all\" (default)"
+    )]
+    pub category: Option<String>,
+    #[schemars(description = "Max findings (default: 100)")]
+    pub limit: Option<i32>,
+    #[schemars(description = "Output: \"summary\" (default) or \"full\" (per-occurrence list)")]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CodeOnFireParams {
+    /// Project name (required)
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    /// Max functions to return (default: 30)
+    #[schemars(description = "Max functions to return (default: 30)")]
+    pub limit: Option<i32>,
+    /// Mode: \"intersect\" (default, churn AND complexity), \"union\" (OR), \"max\" (rank by composite, no filter)
+    #[schemars(
+        description = "Mode: \"intersect\" (default), \"union\", or \"max\". intersect = churn AND complexity; union = OR; max = no filter, rank by composite score"
+    )]
+    pub mode: Option<String>,
+    /// Churn percentile threshold (default: 0.75 = top quartile)
+    #[schemars(description = "Churn percentile threshold (default: 0.75 = top quartile)")]
+    pub churn_quartile: Option<f64>,
+    /// Cyclomatic percentile threshold (default: 0.75)
+    #[schemars(description = "Cyclomatic percentile threshold (default: 0.75)")]
+    pub complexity_quartile: Option<f64>,
+}
+
 // === Phase 5: NLP & IR tool parameter types ===
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2088,6 +2852,7 @@ Code session transcripts, memory files, and plans from ~/.claude/.")]
             "semantic_search",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_semantic_search::tool_semantic_search(self.ctx(), params),
         )
         .await
@@ -2109,6 +2874,7 @@ Filter by project; use project: \"claude\" to search Claude Code session transcr
             "text_search",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_text_search::tool_text_search(self.ctx(), params),
         )
         .await
@@ -2132,6 +2898,7 @@ Returns file paths, line numbers, and matching snippets across all indexed proje
             "grep",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_grep::tool_grep(self.ctx(), params),
         )
         .await
@@ -2156,6 +2923,7 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
             "read_file",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_read_file::tool_read_file(self.ctx(), params),
         )
         .await
@@ -2171,6 +2939,7 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
             "list_projects",
             30,
             &_ctx,
+            "",
             super::tools::tool_list_projects::tool_list_projects(self.ctx()),
         )
         .await
@@ -2189,6 +2958,7 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
             "orient",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_orient::tool_orient(self.ctx(), params),
         )
         .await
@@ -2207,6 +2977,7 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
             "mandate_context",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_mandate_context::tool_mandate_context(self.ctx(), params),
         )
         .await
@@ -2230,6 +3001,7 @@ score."
             "recall_prompts",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_recall_prompts::tool_recall_prompts(self.ctx(), params),
         )
         .await
@@ -2252,6 +3024,7 @@ Returns mandates ranked by Postgres full-text relevance, then by promotion recen
             "search_mandates",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_search_mandates::tool_search_mandates(self.ctx(), params),
         )
         .await
@@ -2284,6 +3057,7 @@ tuple — defaults to workspace-wide."
             "memory_create_entities",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_crud::tool_memory_create_entities(self.ctx(), params),
         )
         .await
@@ -2305,6 +3079,7 @@ name; unresolved endpoints return id=-1 in the response."
             "memory_create_relations",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_crud::tool_memory_create_relations(self.ctx(), params),
         )
         .await
@@ -2325,6 +3100,7 @@ Observations are content-deduped per entity (content_sha256 UNIQUE)."
             "memory_add_observations",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_crud::tool_memory_add_observations(self.ctx(), params),
         )
         .await
@@ -2345,6 +3121,7 @@ Drop-in compatible with @modelcontextprotocol/server-memory's `delete_entities`.
             "memory_delete_entities",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_crud::tool_memory_delete_entities(self.ctx(), params),
         )
         .await
@@ -2365,6 +3142,7 @@ entities. Drop-in compatible with @modelcontextprotocol/server-memory's \
             "memory_delete_observations",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_crud::tool_memory_delete_observations(self.ctx(), params),
         )
         .await
@@ -2384,6 +3162,7 @@ Drop-in compatible with @modelcontextprotocol/server-memory's `delete_relations`
             "memory_delete_relations",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_crud::tool_memory_delete_relations(self.ctx(), params),
         )
         .await
@@ -2404,6 +3183,7 @@ Drop-in compatible with @modelcontextprotocol/server-memory's `read_graph`."
             "memory_read_graph",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_crud::tool_memory_read_graph(self.ctx(), params),
         )
         .await
@@ -2425,6 +3205,7 @@ with BGE-M3 cutover) adds vector similarity."
             "memory_search_nodes",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_crud::tool_memory_search_nodes(self.ctx(), params),
         )
         .await
@@ -2445,6 +3226,7 @@ observations and incoming/outgoing relations. Drop-in compatible with \
             "memory_open_nodes",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_crud::tool_memory_open_nodes(self.ctx(), params),
         )
         .await
@@ -2469,6 +3251,7 @@ embeds the query with the active embedder and ranks observations by cosine simil
             "memory_semantic_search",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_ext::tool_memory_semantic_search(self.ctx(), params),
         )
         .await
@@ -2488,6 +3271,7 @@ Postgres FTS and BGE-M3 vector cosine, optionally scope/tier filtered."
             "memory_hybrid_search",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_ext::tool_memory_hybrid_search(self.ctx(), params),
         )
         .await
@@ -2507,6 +3291,7 @@ observations, and relations that were active at `as_of` (RFC3339; defaults to NO
             "memory_facts_at",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_ext::tool_memory_facts_at(self.ctx(), params),
         )
         .await
@@ -2527,6 +3312,7 @@ one or more seed entity ids. Capped by max_depth (1..=6, default 2) and max_node
             "memory_relations_traverse",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_ext::tool_memory_relations_traverse(self.ctx(), params),
         )
         .await
@@ -2547,6 +3333,7 @@ At least one of file_id, chunk_id, topic_id must be provided."
             "memory_anchor_entity",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_ext::tool_memory_anchor_entity(self.ctx(), params),
         )
         .await
@@ -2563,6 +3350,7 @@ At least one of file_id, chunk_id, topic_id must be provided."
             "memory_unanchor_entity",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_ext::tool_memory_unanchor_entity(self.ctx(), params),
         )
         .await
@@ -2582,6 +3370,7 @@ anchor_type."
             "memory_find_code_for_entity",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_ext::tool_memory_find_code_for_entity(self.ctx(), params),
         )
         .await
@@ -2601,6 +3390,7 @@ Pass exactly one of file_id, chunk_id, topic_id."
             "memory_find_entities_for_code",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_ext::tool_memory_find_entities_for_code(self.ctx(), params),
         )
         .await
@@ -2621,6 +3411,7 @@ commit). Optionally filter to a subset of node_types."
             "memory_unified_search",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_graph_rag::tool_memory_unified_search(self.ctx(), params),
         )
         .await
@@ -2641,6 +3432,7 @@ max_nodes ≤ 500."
             "memory_neighbors",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_graph_rag::tool_memory_neighbors(self.ctx(), params),
         )
         .await
@@ -2661,6 +3453,7 @@ paths whose Jaccard overlap with a kept path exceeds prune_jaccard."
             "memory_path_search",
             60,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_graph_rag::tool_memory_path_search(self.ctx(), params),
         )
         .await
@@ -2681,6 +3474,7 @@ memory_relations. Seeds are the top-k entities by best-observation cosine; PPR r
             "memory_ppr_search",
             60,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_graph_rag::tool_memory_ppr_search(self.ctx(), params),
         )
         .await
@@ -2700,6 +3494,7 @@ nodes by cosine over summary_embedding, optionally filtered by tree level."
             "memory_raptor_search",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_graph_rag::tool_memory_raptor_search(self.ctx(), params),
         )
         .await
@@ -2722,6 +3517,7 @@ generic ship with the binary; assets/client_profiles.toml overrides them."
             "pgmcp_client_profile",
             10,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_client_profile::tool_pgmcp_client_profile(self.ctx(), params),
         )
         .await
@@ -2743,6 +3539,7 @@ audit manifest to memory_forget_log."
             "memory_forget",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_forget::tool_memory_forget(self.ctx(), params),
         )
         .await
@@ -2764,6 +3561,7 @@ low-importance, non-superseded memory_* rows. Defaults pulled from \
             "memory_purge_expired",
             60,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_forget::tool_memory_purge_expired(self.ctx(), params),
         )
         .await
@@ -2787,6 +3585,7 @@ extractor is disabled or `[memory.reflection] agent_enabled = false`."
             // wrapper times out. The cron path runs without this wrapper.
             120,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_memory_reflect::tool_memory_reflect(self.ctx(), params),
         )
         .await
@@ -2805,6 +3604,7 @@ extractor is disabled or `[memory.reflection] agent_enabled = false`."
             "session_mandates",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_session_mandates::tool_session_mandates(self.ctx(), params),
         )
         .await
@@ -2823,6 +3623,7 @@ extractor is disabled or `[memory.reflection] agent_enabled = false`."
             "promote_session_mandate",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_session_mandates::tool_promote_session_mandate(self.ctx(), params),
         )
         .await
@@ -2845,6 +3646,7 @@ entry points.")]
             "project_tree",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_project_tree::tool_project_tree(self.ctx(), params),
         )
         .await
@@ -2868,6 +3670,7 @@ use the built-in `Bash: stat` or `Read` instead."
             "file_info",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_file_info::tool_file_info(self.ctx(), params),
         )
         .await
@@ -2885,6 +3688,7 @@ use the built-in `Bash: stat` or `Read` instead."
             "index_stats",
             30,
             &_ctx,
+            "",
             super::tools::tool_index_stats::tool_index_stats(self.ctx()),
         )
         .await
@@ -2907,6 +3711,7 @@ Default lookback is 60 minutes; pass `since_minutes` up to 44640 (31 days) to wi
             "mcp_tool_telemetry",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_mcp_tool_telemetry::tool_mcp_tool_telemetry(self.ctx(), params),
         )
         .await
@@ -2919,17 +3724,20 @@ Default lookback is 60 minutes; pass `since_minutes` up to 44640 (31 days) to wi
         // No timeout: reindex can run for minutes on a large workspace.
         // Progress is reported via the MCP task store, not the immediate
         // response — wrapping in 30s would falsely fail every full reindex.
+        // Routed through `instrumented_tool_run` (not `instrumented_tool_wrap`)
+        // so the central tracing events still fire while skipping `timeout_wrap`.
         let caller = extract_caller(&_ctx);
-        let start = std::time::Instant::now();
-        let result = super::tools::tool_reindex::tool_reindex(self.ctx()).await;
-        let duration_ns = start.elapsed().as_nanos().min(u64::MAX as u128) as u64;
-        let ok = result.is_ok();
-        self.stats()
-            .record_tool_call("reindex", &caller.client_name, duration_ns, ok);
-        if !ok {
-            self.stats().mcp_errors.fetch_add(1, Ordering::Relaxed);
-        }
-        result
+        let request_id = Some(format!("{:?}", _ctx.id));
+        instrumented_tool_run(
+            self.stats(),
+            "reindex",
+            None,
+            caller,
+            "",
+            request_id,
+            super::tools::tool_reindex::tool_reindex(self.ctx()),
+        )
+        .await
     }
 
     #[tool(
@@ -2951,6 +3759,7 @@ overall similarity, chunk alignment, and a human-readable verdict."
             "compare_files",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_compare_files::tool_compare_files(self.ctx(), params),
         )
         .await
@@ -2974,6 +3783,7 @@ chunk similarity to file-level avg/max/matching count."
             "find_similar_modules",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_find_similar_modules::tool_find_similar_modules(self.ctx(), params),
         )
         .await
@@ -2999,6 +3809,7 @@ batch scan to have run at least once."
             "find_duplicates",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_find_duplicates::tool_find_duplicates(self.ctx(), params),
         )
         .await
@@ -3017,6 +3828,7 @@ batch scan to have run at least once."
             "refactoring_report",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_refactoring_report::tool_refactoring_report(self.ctx(), params),
         )
         .await
@@ -3044,6 +3856,7 @@ Reads the materialized similarity table; requires the 6-hour similarity-scan cro
             "chunk_clusters",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_chunk_clusters::tool_chunk_clusters(self.ctx(), params),
         )
         .await
@@ -3070,6 +3883,7 @@ or absolute path."
             "internal_dry",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_internal_dry::tool_internal_dry(self.ctx(), params),
         )
         .await
@@ -3095,6 +3909,7 @@ Reads materialized similarity table; requires the 6-hour similarity-scan cron."
             "extraction_candidates",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_extraction_candidates::tool_extraction_candidates(
                 self.ctx(),
                 params,
@@ -3124,6 +3939,7 @@ proposed method name, abstraction kind by language, and a diversity-rewarded pri
             "pattern_abstraction_candidates",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_pattern_abstraction::tool_pattern_abstraction(self.ctx(), params),
         )
         .await
@@ -3150,6 +3966,7 @@ reported (so you know which identifiers vary across instances). Recommended fix 
             "boilerplate_clusters",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_boilerplate_clusters::tool_boilerplate_clusters(self.ctx(), params),
         )
         .await
@@ -3176,6 +3993,7 @@ is `move_function` (relocate the single referenced symbol into its sole importer
             "stale_zombie_detector",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_stale_zombie::tool_stale_zombie(self.ctx(), params),
         )
         .await
@@ -3202,6 +4020,7 @@ be split."
             "recommend_module_split",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_recommend_module_split::tool_recommend_module_split(
                 self.ctx(),
                 params,
@@ -3231,6 +4050,7 @@ otherwise, propose extracting a new shared interface for the lower-coupling endp
             "fix_circular_dependency",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_fix_circular_dependency::tool_fix_circular_dependency(
                 self.ctx(),
                 params,
@@ -3260,6 +4080,7 @@ PageRank — the most architecturally central place to consolidate the scattered
             "shotgun_surgery_fix",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_shotgun_surgery_fix::tool_shotgun_surgery_fix(self.ctx(), params),
         )
         .await
@@ -3287,6 +4108,7 @@ move_function; upward → invert_dependency."
             "recommend_layering",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_recommend_layering::tool_recommend_layering(self.ctx(), params),
         )
         .await
@@ -3310,6 +4132,7 @@ quality declines (still works on imports + topics)."
             "pr_scope_recommender",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_pr_scope::tool_pr_scope(self.ctx(), params),
         )
         .await
@@ -3334,6 +4157,7 @@ and the result is empty. Each row carries a `priority` (P0/P1/P2) and an action 
             "hot_path_audit",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_hot_path_audit::tool_hot_path_audit(self.ctx(), params),
         )
         .await
@@ -3357,6 +4181,7 @@ Returns critical / warning / healthy buckets and a `bus_factor_estimate` (greedy
             "bus_factor_map",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_bus_factor_map::tool_bus_factor_map(self.ctx(), params),
         )
         .await
@@ -3380,6 +4205,7 @@ Pass the PR author's email in `exclude_authors` to skip self-review."
             "reviewer_recommender",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_reviewer_recommender::tool_reviewer_recommender(self.ctx(), params),
         )
         .await
@@ -3401,6 +4227,7 @@ DO NOT USE WHEN: code_graph_edges has no unresolved-target rows."
             "dependency_health",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_dependency_health::tool_dependency_health(self.ctx(), params),
         )
         .await
@@ -3423,6 +4250,7 @@ DO NOT USE WHEN: you have a known seed file — use `find_similar_modules`."
             "pattern_search",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_pattern_search::tool_pattern_search(self.ctx(), params),
         )
         .await
@@ -3445,6 +4273,7 @@ DO NOT USE WHEN: git history is disabled — soft-fails with `health.git_history
             "merge_conflict_risk",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_merge_conflict_risk::tool_merge_conflict_risk(self.ctx(), params),
         )
         .await
@@ -3468,6 +4297,7 @@ ships, returns `divergences[]` with `recommended_fix(action=move_function)`."
             "naming_consistency",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_naming_consistency::tool_naming_consistency(self.ctx(), params),
         )
         .await
@@ -3491,6 +4321,7 @@ falls back to raw bucket data with no projection."
             "module_growth_trajectory",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_module_growth::tool_module_growth(self.ctx(), params),
         )
         .await
@@ -3513,6 +4344,7 @@ DO NOT USE WHEN: no chunks found for the reference."
             "adoption_lag",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_adoption_lag::tool_adoption_lag(self.ctx(), params),
         )
         .await
@@ -3536,6 +4368,7 @@ dimension instead of running 6 tools separately."
             "tech_debt_burn_down",
             45,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_tech_debt_burn_down::tool_tech_debt_burn_down(self.ctx(), params),
         )
         .await
@@ -3557,6 +4390,7 @@ Requires per-project opt-in via [git] index_history = true in .pgmcp.toml.")]
             "search_commits",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_search_commits::tool_search_commits(self.ctx(), params),
         )
         .await
@@ -3578,6 +4412,7 @@ The pattern index is separate from file_chunks and includes locally imported ful
             "software_pattern_search",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_software_patterns::tool_software_pattern_search(self.ctx(), params),
         )
         .await
@@ -3598,6 +4433,7 @@ Returns structured recommendations with source citations from the separate patte
             "recommend_design_patterns",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_software_patterns::tool_recommend_design_patterns(
                 self.ctx(),
                 params,
@@ -3620,6 +4456,7 @@ USE WHEN: checking a plan for anti-pattern risks and better paradigm-specific al
             "review_design_patterns",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_software_patterns::tool_review_design_patterns(self.ctx(), params),
         )
         .await
@@ -3638,6 +4475,7 @@ USE WHEN: checking a plan for anti-pattern risks and better paradigm-specific al
             "get_software_pattern",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_software_patterns::tool_get_software_pattern(self.ctx(), params),
         )
         .await
@@ -3656,6 +4494,7 @@ USE WHEN: checking a plan for anti-pattern risks and better paradigm-specific al
             "list_software_patterns",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_software_patterns::tool_list_software_patterns(self.ctx(), params),
         )
         .await
@@ -3673,6 +4512,7 @@ USE WHEN: checking a plan for anti-pattern risks and better paradigm-specific al
             "pattern_catalog_stats",
             30,
             &_ctx,
+            "",
             super::tools::tool_software_patterns::tool_pattern_catalog_stats(self.ctx()),
         )
         .await
@@ -3697,6 +4537,7 @@ mode=seed_only embeds bundled cards; mode=source_family imports one source famil
             "refresh_pattern_catalog",
             600,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_software_patterns::tool_refresh_pattern_catalog(self.ctx(), params),
         )
         .await
@@ -3717,6 +4558,7 @@ mode=seed_only embeds bundled cards; mode=source_family imports one source famil
             "upsert_pattern_source",
             300,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_software_patterns::tool_upsert_pattern_source(self.ctx(), params),
         )
         .await
@@ -3742,6 +4584,7 @@ topic clusters with keyword labels, membership scores, and representative chunks
             "discover_topics",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_discover_topics::tool_discover_topics(self.ctx(), params),
         )
         .await
@@ -3760,6 +4603,7 @@ topic clusters with keyword labels, membership scores, and representative chunks
             "topic_hierarchy_fcm",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_topic_hierarchy_fcm::tool_topic_hierarchy_fcm(self.ctx(), params),
         )
         .await
@@ -3783,6 +4627,7 @@ Requires discover_topics first."
             "find_orphans",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_find_orphans::tool_find_orphans(self.ctx(), params),
         )
         .await
@@ -3807,6 +4652,7 @@ discover_topics first."
             "find_misplaced_code",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_find_misplaced_code::tool_find_misplaced_code(self.ctx(), params),
         )
         .await
@@ -3832,6 +4678,7 @@ Requires [git] index_history = true."
             "find_coupled_files",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_find_coupled_files::tool_find_coupled_files(self.ctx(), params),
         )
         .await
@@ -3856,6 +4703,7 @@ Requires discover_topics first."
             "test_coverage_gaps",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_test_coverage_gaps::tool_test_coverage_gaps(self.ctx(), params),
         )
         .await
@@ -3880,6 +4728,7 @@ Sortable by: composite (default), size, chunks, topics, coupling."
             "complexity_hotspots",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_complexity_hotspots::tool_complexity_hotspots(self.ctx(), params),
         )
         .await
@@ -3898,6 +4747,7 @@ Sortable by: composite (default), size, chunks, topics, coupling."
             "topic_hierarchy",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_topic_hierarchy::tool_topic_hierarchy(self.ctx(), params),
         )
         .await
@@ -3923,6 +4773,7 @@ for all languages."
             "suggest_merges",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_suggest_merges::tool_suggest_merges(self.ctx(), params),
         )
         .await
@@ -3946,6 +4797,7 @@ scored. Requires discover_topics first."
             "suggest_splits",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_suggest_splits::tool_suggest_splits(self.ctx(), params),
         )
         .await
@@ -3969,6 +4821,7 @@ Requires discover_topics first."
             "doc_coverage_gaps",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_doc_coverage_gaps::tool_doc_coverage_gaps(self.ctx(), params),
         )
         .await
@@ -3997,6 +4850,7 @@ Output formats: summary (counts), edges (list), DOT (Graphviz). Requires graph-a
             "dependency_graph",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_dependency_graph::tool_dependency_graph(self.ctx(), params),
         )
         .await
@@ -4022,6 +4876,7 @@ PageRank as part of its envelope."
             "centrality_analysis",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_centrality_analysis::tool_centrality_analysis(self.ctx(), params),
         )
         .await
@@ -4040,6 +4895,7 @@ PageRank as part of its envelope."
             "community_detection",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_community_detection::tool_community_detection(self.ctx(), params),
         )
         .await
@@ -4062,6 +4918,7 @@ Requires graph-analysis cron."
             "circular_dependencies",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_circular_dependencies::tool_circular_dependencies(
                 self.ctx(),
                 params,
@@ -4088,6 +4945,7 @@ Requires graph-analysis cron + git history for full coverage."
             "change_impact_analysis",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_change_impact_analysis::tool_change_impact_analysis(
                 self.ctx(),
                 params,
@@ -4119,6 +4977,7 @@ Requires graph-analysis cron."
             "coupling_cohesion_report",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_coupling_cohesion_report::tool_coupling_cohesion_report(
                 self.ctx(),
                 params,
@@ -4146,6 +5005,7 @@ Grouped by severity. Requires graph-analysis cron."
             "architecture_violations",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_architecture_violations::tool_architecture_violations(
                 self.ctx(),
                 params,
@@ -4173,6 +5033,7 @@ Filter to specific smell types via `smells` param. Requires graph-analysis + dis
             "design_smell_detection",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_design_smell_detection::tool_design_smell_detection(
                 self.ctx(),
                 params,
@@ -4201,6 +5062,7 @@ Each dim 0-100%. Requires graph-analysis + discover_topics."
             "architecture_quality",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_architecture_quality::tool_architecture_quality(self.ctx(), params),
         )
         .await
@@ -4225,6 +5087,7 @@ Pure metrics, no interpretation. Useful in scorecards and CI gates."
             "design_metrics",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_design_metrics::tool_design_metrics(self.ctx(), params),
         )
         .await
@@ -4253,6 +5116,7 @@ Heuristic, not ML. Requires graph-analysis cron + git history."
             "bug_prediction",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_bug_prediction::tool_bug_prediction(self.ctx(), params),
         )
         .await
@@ -4277,6 +5141,7 @@ Optionally scans content for TODO/FIXME/HACK markers."
             "technical_debt_analysis",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_technical_debt_analysis::tool_technical_debt_analysis(
                 self.ctx(),
                 params,
@@ -4304,7 +5169,1356 @@ No ML deps — pure statistical distance."
             "anomaly_detection",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_anomaly_detection::tool_anomaly_detection(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Tornhill-style hotspot intersection: functions where high churn meets high \
+complexity (Adam Tornhill, *Your Code as a Crime Scene*). \
+USE WHEN: prioritizing refactoring — combines bug-proneness signals (churn) with \
+maintenance-cost signals (cyclomatic, cognitive, low MI) at function granularity. \
+Returns per-function rows with score, file, language, churn rate, commit count, \
+cyclomatic, cognitive, MI, NPath. \
+Modes: \"intersect\" (default, churn AND complexity), \"union\" (OR), \"max\" (rank by composite, no filter). \
+Requires both `file_metrics` (graph-analysis cron) and `function_metrics` (function-metrics cron) populated."
+    )]
+    async fn code_on_fire(
+        &self,
+        Parameters(params): Parameters<CodeOnFireParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "code_on_fire",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_code_on_fire::tool_code_on_fire(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Unified documented-tech-debt surface across the project: comment markers \
+(TODO/FIXME/HACK/XXX/TEMP/WORKAROUND/NOTE/TBD/REVIEW/KLUDGE/BUG/OPTIMIZE/DEPRECATED/SMELL/REFACTOR/WTF/DEBUG), \
+stub macros (Rust todo!()/unimplemented!()/unreachable!()/panic!(\"not implemented\") + Python raise NotImplementedError + \
+JS/TS throw new Error(\"not implemented\") + Go panic(\"TODO\") + Java UnsupportedOperationException + C/C++ __builtin_unreachable), \
+and deprecation annotations (#[deprecated] / @Deprecated / @deprecated / DeprecationWarning). \
+Returns per-kind counts, severity tiers (high/medium/low), GitHub-issue refs (#1234, owner/repo#42), and git-blame attribution \
+(author + age_days). Modes: \"summary\" (counts only, default), \"full\" (per-occurrence list)."
+    )]
+    async fn documented_tech_debt(
+        &self,
+        Parameters(params): Parameters<DocumentedTechDebtParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "documented_tech_debt",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_documented_tech_debt::tool_documented_tech_debt(self.ctx(), params),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // A2A inter-agent IPC bridge — outbound MCP-side tools
+    // ========================================================================
+    #[tool(
+        description = "Dispatch a Task to a registered A2A peer agent. Returns the final Task with status and artifacts."
+    )]
+    async fn a2a_send_task(
+        &self,
+        Parameters(params): Parameters<A2aSendTaskParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_send_task",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_a2a_send_task::tool_a2a_send_task(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(description = "Poll a Task on a registered A2A peer agent.")]
+    async fn a2a_get_task(
+        &self,
+        Parameters(params): Parameters<A2aGetTaskParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_get_task",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_a2a_get_task::tool_a2a_get_task(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Return the SSE URL for streaming events from a peer's Task. Caller opens the URL with Accept: text/event-stream."
+    )]
+    async fn a2a_subscribe_task(
+        &self,
+        Parameters(params): Parameters<A2aSubscribeTaskParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_subscribe_task",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_a2a_subscribe_task::tool_a2a_subscribe_task(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(description = "Cancel a Task on a registered A2A peer agent.")]
+    async fn a2a_cancel_task(
+        &self,
+        Parameters(params): Parameters<A2aCancelTaskParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_cancel_task",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_a2a_cancel_task::tool_a2a_cancel_task(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(description = "Register a peer A2A agent in the local directory. Upserts by name.")]
+    async fn a2a_register_agent(
+        &self,
+        Parameters(params): Parameters<A2aRegisterAgentParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_register_agent",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_a2a_register_agent::tool_a2a_register_agent(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(description = "List all registered A2A peer agents in the local directory.")]
+    async fn a2a_list_agents(
+        &self,
+        Parameters(params): Parameters<A2aListAgentsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_list_agents",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_a2a_list_agents::tool_a2a_list_agents(self.ctx(), params),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // A2A RecursiveMAS-inspired extensions (Yang et al. 2026 Table 1)
+    // ========================================================================
+
+    #[tool(
+        description = "Find registered A2A peers matching specialty tags / role. \
+Useful before invoking a collaboration pattern so you can pick the right peer for each role."
+    )]
+    async fn a2a_find_agents_by_specialty(
+        &self,
+        Parameters(params): Parameters<A2aFindAgentsBySpecialtyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_find_agents_by_specialty",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_a2a_find_agents_by_specialty::tool_a2a_find_agents_by_specialty(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Sequential collaboration pattern: Planner → Critic → Solver. \
+Threads three peer agents in order; each round's output conditions the next. \
+RecursiveMAS Table 1 Sequential Style."
+    )]
+    async fn a2a_pattern_sequential(
+        &self,
+        Parameters(params): Parameters<A2aPatternSequentialParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_pattern_sequential",
+            300,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_a2a_pattern_sequential::tool_a2a_pattern_sequential(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Mixture collaboration pattern: fan out to N specialist peers in parallel + Summarizer aggregation. \
+RecursiveMAS Table 1 Mixture Style."
+    )]
+    async fn a2a_pattern_mixture(
+        &self,
+        Parameters(params): Parameters<A2aPatternMixtureParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_pattern_mixture",
+            300,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_a2a_pattern_mixture::tool_a2a_pattern_mixture(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Distillation collaboration pattern: Expert → Learner pair with latency / compression comparison. \
+RecursiveMAS Table 1 Distillation Style."
+    )]
+    async fn a2a_pattern_distillation(
+        &self,
+        Parameters(params): Parameters<A2aPatternDistillationParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_pattern_distillation",
+            300,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_a2a_pattern_distillation::tool_a2a_pattern_distillation(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Deliberation collaboration pattern: Reflector ↔ Tool-Caller iterative loop until convergence. \
+RecursiveMAS Table 1 Deliberation Style."
+    )]
+    async fn a2a_pattern_deliberation(
+        &self,
+        Parameters(params): Parameters<A2aPatternDeliberationParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_pattern_deliberation",
+            300,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_a2a_pattern_deliberation::tool_a2a_pattern_deliberation(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // SOTA Phase 2 — Graph algorithms
+    // ========================================================================
+
+    #[tool(
+        description = "K-core decomposition (Seidman 1983, Batagelj-Zaversnik O(m) peeling). \
+USE WHEN: identifying load-bearing structural backbone vs the periphery. \
+Returns each file's coreness (highest k such that the file is in a k-core)."
+    )]
+    async fn kcore_analysis(
+        &self,
+        Parameters(params): Parameters<KcoreAnalysisParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "kcore_analysis",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_kcore_analysis::tool_kcore_analysis(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "K-truss decomposition (Cohen 2008): per-edge trussness via triangle support peeling. \
+USE WHEN: finding cohesive dense regions and fragile single-triangle edges."
+    )]
+    async fn ktruss_analysis(
+        &self,
+        Parameters(params): Parameters<KtrussAnalysisParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "ktruss_analysis",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_ktruss_analysis::tool_ktruss_analysis(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Personalized PageRank with restart (Tong-Faloutsos-Pan ICDM 2006). \
+USE WHEN: computing blast radius from a seed set — how much does each file depend on the seeds? \
+Sharper than vanilla PageRank for targeted impact analysis."
+    )]
+    async fn personalized_pagerank(
+        &self,
+        Parameters(params): Parameters<PersonalizedPagerankParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "personalized_pagerank",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_personalized_pagerank::tool_personalized_pagerank(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Edge betweenness centrality (Brandes 2001 edge variant of Girvan-Newman 2002). \
+USE WHEN: finding bottleneck import edges that route many shortest paths — removing them would split or stretch the dependency graph."
+    )]
+    async fn edge_betweenness(
+        &self,
+        Parameters(params): Parameters<EdgeBetweennessParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "edge_betweenness",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_edge_betweenness::tool_edge_betweenness(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Burt's structural-holes constraint (Burt 1992). \
+USE WHEN: identifying broker files that bridge otherwise-disconnected neighbourhoods (low constraint = high-leverage broker). \
+DO NOT USE: as a betweenness substitute — constraint measures redundancy, not paths.")]
+    async fn structural_holes(
+        &self,
+        Parameters(params): Parameters<StructuralHolesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "structural_holes",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_structural_holes::tool_structural_holes(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Motif / graphlet census (Milo et al. Science 2002, Pržulj GDD 2007). \
+USE WHEN: characterizing architecture-signature — high 030T = clean layering, high 030C = circular deps, high cliques = god-cluster."
+    )]
+    async fn motif_census(
+        &self,
+        Parameters(params): Parameters<MotifCensusParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "motif_census",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_motif_census::tool_motif_census(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Modularity-based attack vulnerability (Holme et al. PRE 2002). \
+Simulates sequential file removal by chosen order (pagerank / betweenness / degree) and tracks the largest connected component. \
+USE WHEN: quantifying architectural resilience against single-file outages."
+    )]
+    async fn attack_vulnerability(
+        &self,
+        Parameters(params): Parameters<AttackVulnerabilityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "attack_vulnerability",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_attack_vulnerability::tool_attack_vulnerability(self.ctx(), params),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // SOTA Phase 3 — Information theory
+    // ========================================================================
+
+    #[tool(
+        description = "Normalized Compression Distance (Cilibrasi-Vitányi 2005). \
+NCD(x,y) ≈ 0 = clones; ≈ 1 = unrelated. Uses zstd as compressor. \
+USE WHEN: clone detection across languages — catches parametric clones embedding-cosine misses."
+    )]
+    async fn compression_distance(
+        &self,
+        Parameters(params): Parameters<CompressionDistanceParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "compression_distance",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_compression_distance::tool_compression_distance(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Mutual information for git co-change. \
+Sharper than Jaccard — penalizes coincidental overlap with high-frequency files. \
+USE WHEN: identifying causally-coupled refactor candidates from history.")]
+    async fn cochange_mutual_information(
+        &self,
+        Parameters(params): Parameters<CochangeMutualInformationParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "cochange_mutual_information",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_cochange_mutual_information::tool_cochange_mutual_information(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(description = "Conditional entropy of imports H(target | source). \
+USE WHEN: spotting broker modules (high entropy → imports spread across many targets) vs focused dependencies.")]
+    async fn import_entropy(
+        &self,
+        Parameters(params): Parameters<ImportEntropyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "import_entropy",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_import_entropy::tool_import_entropy(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Shannon entropy of identifier-token distribution per file (Abebe et al. ICPC 2009). \
+USE WHEN: spotting naming pollution / generated code (low entropy) vs clear domain vocabulary (high)."
+    )]
+    async fn identifier_entropy(
+        &self,
+        Parameters(params): Parameters<IdentifierEntropyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "identifier_entropy",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_identifier_entropy::tool_identifier_entropy(self.ctx(), params),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // SOTA Phase 4 — Evolution + quality
+    // ========================================================================
+
+    #[tool(description = "Bus factor per file (Avelino et al. ICSE 2016). \
+USE WHEN: finding single points of failure in maintainership — files where one or two authors own >= 50% of lines.")]
+    async fn bus_factor(
+        &self,
+        Parameters(params): Parameters<BusFactorParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "bus_factor",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_bus_factor::tool_bus_factor(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Knowledge-silo detection via Gini + Herfindahl on blame distribution. \
+USE WHEN: identifying single-author files / concentration-of-knowledge risks."
+    )]
+    async fn knowledge_silos(
+        &self,
+        Parameters(params): Parameters<KnowledgeSilosParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "knowledge_silos",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_knowledge_silos::tool_knowledge_silos(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Ownership-coupling mismatch: files that co-change frequently but have disjoint author sets. \
+USE WHEN: predicting merge-conflict-prone refactor candidates."
+    )]
+    async fn ownership_coupling_mismatch(
+        &self,
+        Parameters(params): Parameters<OwnershipCouplingMismatchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "ownership_coupling_mismatch",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_ownership_coupling_mismatch::tool_ownership_coupling_mismatch(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Doc-code drift: cosine distance between doc-chunk and code-chunk embedding centroids per directory. \
+USE WHEN: finding stale documentation whose vocabulary has diverged from the code."
+    )]
+    async fn doc_code_drift(
+        &self,
+        Parameters(params): Parameters<DocCodeDriftParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "doc_code_drift",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_doc_code_drift::tool_doc_code_drift(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Test-smell detection (van Deursen et al. XP 2001; Garousi JSS 2018). \
+Detects Assertion Roulette, Mystery Guest, Conditional Logic in Tests, Eager Test."
+    )]
+    async fn test_smells(
+        &self,
+        Parameters(params): Parameters<TestSmellsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "test_smells",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_test_smells::tool_test_smells(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Mutation-testing surrogate (Just et al. FSE 2014): per-file ratio of commits that change source without changing tests."
+    )]
+    async fn mutation_score_surrogate(
+        &self,
+        Parameters(params): Parameters<MutationScoreSurrogateParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "mutation_score_surrogate",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_mutation_score_surrogate::tool_mutation_score_surrogate(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Flaky-test candidates (Luo et al. FSE 2014; Lam et al. ASE 2019). \
+Heuristic over commit messages mentioning flakiness/race/retry/timing near test edits."
+    )]
+    async fn flaky_test_candidates(
+        &self,
+        Parameters(params): Parameters<FlakyTestCandidatesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "flaky_test_candidates",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_flaky_test_candidates::tool_flaky_test_candidates(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // SOTA Phase 5 — Concurrency / safety / performance
+    // ========================================================================
+    #[tool(
+        description = "Detect lock-acquisition sites across Rust/C++/Java/Go/Python. \
+Eraser-style lockset analysis (Savage et al. TOCS 1997) audit aid."
+    )]
+    async fn lockset_races(
+        &self,
+        Parameters(params): Parameters<LocksetRacesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "lockset_races",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_lockset_races::tool_lockset_races(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Per-file `unsafe` block density (Astrauskas OOPSLA 2020). \
+Concentration of unsafe in non-FFI files = review priority."
+    )]
+    async fn unsafe_clusters(
+        &self,
+        Parameters(params): Parameters<UnsafeClustersParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "unsafe_clusters",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_unsafe_clusters::tool_unsafe_clusters(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Per-function panic-leaf count (panic!/unwrap/expect/assert) from `function_metrics`. \
+USE WHEN: hunting Rust library footguns that crash on unexpected input."
+    )]
+    async fn panic_paths(
+        &self,
+        Parameters(params): Parameters<PanicPathsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "panic_paths",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_panic_paths::tool_panic_paths(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Lock-order cycles (Havender 1968) by scanning function bodies for lock(A);lock(B) sequences and computing SCCs."
+    )]
+    async fn deadlock_candidates(
+        &self,
+        Parameters(params): Parameters<DeadlockCandidatesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "deadlock_candidates",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_deadlock_candidates::tool_deadlock_candidates(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Rust Send/Sync violation candidates: Arc<RefCell>, static mut, unsafe Send/Sync impls."
+    )]
+    async fn send_sync_violations(
+        &self,
+        Parameters(params): Parameters<SendSyncViolationsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "send_sync_violations",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_send_sync_violations::tool_send_sync_violations(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Accidentally-quadratic loops (Petrashko ICSE 2017): for/while loops with .contains/.find/.indexOf in the body."
+    )]
+    async fn quadratic_loops(
+        &self,
+        Parameters(params): Parameters<QuadraticLoopsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "quadratic_loops",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_quadratic_loops::tool_quadratic_loops(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Missing-preallocation hotspots: Vec::new/HashMap::new without with_capacity."
+    )]
+    async fn missing_preallocation(
+        &self,
+        Parameters(params): Parameters<MissingPreallocationParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "missing_preallocation",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_missing_preallocation::tool_missing_preallocation(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+    #[tool(
+        description = "Blocking calls inside async fn bodies (std::fs / std::sync::Mutex / time.sleep). \
+Tokio anti-pattern: blocks the executor."
+    )]
+    async fn blocking_in_async(
+        &self,
+        Parameters(params): Parameters<BlockingInAsyncParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "blocking_in_async",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_blocking_in_async::tool_blocking_in_async(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = ".clone() / Arc::clone density per file × PageRank — surfaces allocation hotspots before profiling."
+    )]
+    async fn clone_density(
+        &self,
+        Parameters(params): Parameters<CloneDensityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "clone_density",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_clone_density::tool_clone_density(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "I/O calls weighted by PageRank + betweenness — finds blocking I/O on hot paths."
+    )]
+    async fn io_hotpath(
+        &self,
+        Parameters(params): Parameters<IoHotpathParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "io_hotpath",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_io_hotpath::tool_io_hotpath(self.ctx(), params),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // SOTA Phase 6 — Security
+    // ========================================================================
+    #[tool(
+        description = "Surface co-located taint sources (env/request/stdin) and sinks (exec/eval/SQL) per file. \
+Newsome-Song NDSS 2005 audit aid."
+    )]
+    async fn taint_analysis(
+        &self,
+        Parameters(params): Parameters<TaintAnalysisParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "taint_analysis",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_taint_analysis::tool_taint_analysis(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Hardcoded-secret detection via entropy + known-prefix regex (Meli et al. NDSS 2019)."
+    )]
+    async fn secret_detection(
+        &self,
+        Parameters(params): Parameters<SecretDetectionParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "secret_detection",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_secret_detection::tool_secret_detection(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Crypto-misuse rules (CryptoLint CCS 2013): ECB mode, MD5/SHA-1 in auth, weak RNG for tokens, static IVs, hardcoded keys."
+    )]
+    async fn crypto_misuse(
+        &self,
+        Parameters(params): Parameters<CryptoMisuseParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "crypto_misuse",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_crypto_misuse::tool_crypto_misuse(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "CWE-502 unsafe-deserialization patterns: pickle.loads, yaml.load, ObjectInputStream, etc."
+    )]
+    async fn unsafe_deserialization(
+        &self,
+        Parameters(params): Parameters<UnsafeDeserializationParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "unsafe_deserialization",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_unsafe_deserialization::tool_unsafe_deserialization(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+    #[tool(
+        description = "SQL / shell injection candidates: string concatenation into exec/query calls."
+    )]
+    async fn injection_candidates(
+        &self,
+        Parameters(params): Parameters<InjectionCandidatesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "injection_candidates",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_injection_candidates::tool_injection_candidates(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Mutating HTTP routes (POST/PUT/DELETE/PATCH) in files lacking visible auth middleware."
+    )]
+    async fn unprotected_routes(
+        &self,
+        Parameters(params): Parameters<UnprotectedRoutesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "unprotected_routes",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_unprotected_routes::tool_unprotected_routes(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Parse Cargo.lock / package-lock.json / requirements.txt and surface dependencies for OSV.dev review."
+    )]
+    async fn cve_supply_chain(
+        &self,
+        Parameters(params): Parameters<CveSupplyChainParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "cve_supply_chain",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_cve_supply_chain::tool_cve_supply_chain(self.ctx(), params),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // SOTA Phase 7 — API / contract
+    // ========================================================================
+    #[tool(
+        description = "Enumerate public symbols from `file_symbols.visibility='public'`. Per-kind counts (default) or full list."
+    )]
+    async fn public_api_surface(
+        &self,
+        Parameters(params): Parameters<PublicApiSurfaceParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "public_api_surface",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_public_api_surface::tool_public_api_surface(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Semver-break audit: public symbols seen in recent git history but missing from the current public API. Likely renames flagged by Levenshtein."
+    )]
+    async fn semver_break_audit(
+        &self,
+        Parameters(params): Parameters<SemverBreakAuditParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "semver_break_audit",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_semver_break_audit::tool_semver_break_audit(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Symbols annotated as deprecated but still called from inside the project. Migrate then delete."
+    )]
+    async fn deprecated_but_used(
+        &self,
+        Parameters(params): Parameters<DeprecatedButUsedParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "deprecated_but_used",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_deprecated_but_used::tool_deprecated_but_used(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "API stability score per public symbol (Bogart EMSE 2016) — change-rate over recent commits."
+    )]
+    async fn api_stability(
+        &self,
+        Parameters(params): Parameters<ApiStabilityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "api_stability",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_api_stability::tool_api_stability(self.ctx(), params),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // SOTA Phase 8 — ML / embedding-based
+    // ========================================================================
+    #[tool(
+        description = "LSH clone detection on 384-d embeddings (Indyk-Motwani STOC 1998). SimHash + banded LSH gives O(1) candidate retrieval; rerank by exact cosine."
+    )]
+    async fn lsh_clone_detection(
+        &self,
+        Parameters(params): Parameters<LshCloneDetectionParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "lsh_clone_detection",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_lsh_clone_detection::tool_lsh_clone_detection(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Semantic drift per file: cosine distance between current centroid and 30+-day historical centroid (Hamilton et al. ACL 2016)."
+    )]
+    async fn semantic_drift(
+        &self,
+        Parameters(params): Parameters<SemanticDriftParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "semantic_drift",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_semantic_drift::tool_semantic_drift(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "LOF-style embedding outliers (Breunig et al. SIGMOD 2000): chunks whose mean k-NN cosine distance is unusually high."
+    )]
+    async fn embedding_outliers(
+        &self,
+        Parameters(params): Parameters<EmbeddingOutliersParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "embedding_outliers",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_embedding_outliers::tool_embedding_outliers(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Multi-resolution PageRank: PageRank within each Louvain community + PageRank on the community-supernode graph. Surfaces both module leaders and module importance."
+    )]
+    async fn multi_resolution_pagerank(
+        &self,
+        Parameters(params): Parameters<MultiResolutionPagerankParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "multi_resolution_pagerank",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_multi_resolution_pagerank::tool_multi_resolution_pagerank(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // SOTA Phase 9 — Data engineering
+    // ========================================================================
+    #[tool(
+        description = "Migration-safety audit (Strong-Migrations + Curino VLDB 2008): DROP/ALTER, non-CONCURRENT index, NOT NULL without default."
+    )]
+    async fn migration_safety(
+        &self,
+        Parameters(params): Parameters<MigrationSafetyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "migration_safety",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_migration_safety::tool_migration_safety(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(description = "Columns declared in SQL DDL but never referenced anywhere in source.")]
+    async fn dead_columns(
+        &self,
+        Parameters(params): Parameters<DeadColumnsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "dead_columns",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_dead_columns::tool_dead_columns(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "PII detection: PII-shaped literals + PII-named identifiers co-located with logging or network sinks."
+    )]
+    async fn pii_spread(
+        &self,
+        Parameters(params): Parameters<PiiSpreadParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "pii_spread",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_pii_spread::tool_pii_spread(self.ctx(), params),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // SOTA Phase 10 — Call-graph downstream
+    // ========================================================================
+    #[tool(
+        description = "Forward reachability dead-code: symbols unreached from main / public exports / test entry points."
+    )]
+    async fn dead_code_reachability(
+        &self,
+        Parameters(params): Parameters<DeadCodeReachabilityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "dead_code_reachability",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_dead_code_reachability::tool_dead_code_reachability(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+    #[tool(
+        description = "Feature envy (Lanza-Marinescu 2006): functions whose external-data references dominate own-file references."
+    )]
+    async fn feature_envy(
+        &self,
+        Parameters(params): Parameters<FeatureEnvyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "feature_envy",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_feature_envy::tool_feature_envy(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Shotgun-surgery detection from git history: commits touching many files indicate scattered responsibility."
+    )]
+    async fn shotgun_surgery(
+        &self,
+        Parameters(params): Parameters<ShotgunSurgeryParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "shotgun_surgery",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_shotgun_surgery::tool_shotgun_surgery(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "LCOM4 (Hitz-Montazeri 1995): per-container connected components in the member-method shared-target graph."
+    )]
+    async fn lcom4(
+        &self,
+        Parameters(params): Parameters<Lcom4Params>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "lcom4",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_lcom4::tool_lcom4(self.ctx(), params),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // SOTA Phase 11 — Evolution analytics
+    // ========================================================================
+    #[tool(
+        description = "Refactor pressure (Tufano ICSE 2015): per-file ratio of non-test commits to test commits in the window."
+    )]
+    async fn refactor_pressure(
+        &self,
+        Parameters(params): Parameters<RefactorPressureParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "refactor_pressure",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_refactor_pressure::tool_refactor_pressure(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(description = "Page CUSUM change-points on per-file commit rate (weekly).")]
+    async fn commit_changepoint(
+        &self,
+        Parameters(params): Parameters<CommitChangepointParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "commit_changepoint",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_commit_changepoint::tool_commit_changepoint(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Per-file commit-message vocabulary drift via Porter-stemmed TF cosine across sliding windows."
+    )]
+    async fn commit_topic_drift(
+        &self,
+        Parameters(params): Parameters<CommitTopicDriftParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "commit_topic_drift",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_commit_topic_drift::tool_commit_topic_drift(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "API stability scored over release-marker commits (Bogart EMSE 2016 adapted)."
+    )]
+    async fn release_api_stability(
+        &self,
+        Parameters(params): Parameters<ReleaseApiStabilityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "release_api_stability",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_release_api_stability::tool_release_api_stability(
+                self.ctx(),
+                params,
+            ),
         )
         .await
     }
@@ -4333,6 +6547,7 @@ RRF gives more stable ordering than either branch alone for mixed queries."
             "hybrid_search",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_hybrid_search::tool_hybrid_search(self.ctx(), params),
         )
         .await
@@ -4357,6 +6572,7 @@ project-wide overview without prose."
             "code_summarize",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_code_summarize::tool_code_summarize(self.ctx(), params),
         )
         .await
@@ -4385,6 +6601,7 @@ Aggregates dependency analysis + architecture quality + design smells + test/doc
             "engineering_scorecard",
             30,
             &_ctx,
+            &summarize_debug(&params),
             super::tools::tool_engineering_scorecard::tool_engineering_scorecard(
                 self.ctx(),
                 params,
@@ -4690,138 +6907,235 @@ impl McpServer {
     /// Intentionally `pub` (not `pub(crate)`) so external test crates
     /// (e.g. `pgmcp-testing/tests/`) can drive any MCP tool without
     /// depending on the rmcp transport layer.
+    ///
+    /// Routes through `instrumented_tool_run` so CLI invocations get the
+    /// same per-call tracing events, in-memory `StatsTracker` counters,
+    /// and durable `mcp_tool_calls` telemetry rows as the MCP transport
+    /// path. Caller is identified as `client = "cli"`. No timeout is
+    /// applied — the interactive user can cancel with Ctrl-C if needed.
     #[allow(dead_code)] // Used by the bin crate (src/main.rs); lib's external test consumers reach it through this.
     pub async fn call_tool_cli(
         &self,
         name: &str,
         args: serde_json::Value,
     ) -> Result<CallToolResult, McpError> {
-        dispatch_tool!(self, name, args, {
-            // Search
-            "semantic_search"        => semantic_search(SemanticSearchParams),
-            "text_search"            => text_search(TextSearchParams),
-            "grep"                   => grep(GrepParams),
-            "hybrid_search"          => hybrid_search(HybridSearchParams),
-            "search_commits"         => search_commits(SearchCommitsParams),
-            // Pattern knowledge — all share the `tool_software_patterns` module.
-            "software_pattern_search"    => software_pattern_search(SoftwarePatternSearchParams) in tool_software_patterns,
-            "recommend_design_patterns"  => recommend_design_patterns(RecommendDesignPatternsParams) in tool_software_patterns,
-            "review_design_patterns"     => review_design_patterns(ReviewDesignPatternsParams) in tool_software_patterns,
-            "get_software_pattern"       => get_software_pattern(GetSoftwarePatternParams) in tool_software_patterns,
-            "list_software_patterns"     => list_software_patterns(ListSoftwarePatternsParams) in tool_software_patterns,
-            "refresh_pattern_catalog"    => refresh_pattern_catalog(RefreshPatternCatalogParams) in tool_software_patterns,
-            "upsert_pattern_source"      => upsert_pattern_source(UpsertPatternSourceParams) in tool_software_patterns,
-            // Session-level mandates — `promote_session_mandate` shares the `tool_session_mandates` module.
-            "session_mandates"           => session_mandates(SessionMandatesParams),
-            "promote_session_mandate"    => promote_session_mandate(PromoteSessionMandateParams) in tool_session_mandates,
-            // Memory-server Phase 0 quick wins.
-            "recall_prompts"             => recall_prompts(RecallPromptsParams),
-            "search_mandates"            => search_mandates(SearchMandatesParams),
-            // Memory-server Phase 3.1 official-compat CRUD (9 tools share the `tool_memory_crud` module).
-            "memory_create_entities"     => memory_create_entities(MemoryCreateEntitiesParams) in tool_memory_crud,
-            "memory_create_relations"    => memory_create_relations(MemoryCreateRelationsParams) in tool_memory_crud,
-            "memory_add_observations"    => memory_add_observations(MemoryAddObservationsParams) in tool_memory_crud,
-            "memory_delete_entities"     => memory_delete_entities(MemoryDeleteEntitiesParams) in tool_memory_crud,
-            "memory_delete_observations" => memory_delete_observations(MemoryDeleteObservationsParams) in tool_memory_crud,
-            "memory_delete_relations"    => memory_delete_relations(MemoryDeleteRelationsParams) in tool_memory_crud,
-            "memory_read_graph"          => memory_read_graph(MemoryReadGraphParams) in tool_memory_crud,
-            "memory_search_nodes"        => memory_search_nodes(MemorySearchNodesParams) in tool_memory_crud,
-            "memory_open_nodes"          => memory_open_nodes(MemoryOpenNodesParams) in tool_memory_crud,
-            // Memory-server Phase 3.2 extensions (share the tool_memory_ext module).
-            "memory_semantic_search"        => memory_semantic_search(MemorySemanticSearchParams) in tool_memory_ext,
-            "memory_hybrid_search"          => memory_hybrid_search(MemoryHybridSearchParams) in tool_memory_ext,
-            "memory_facts_at"               => memory_facts_at(MemoryFactsAtParams) in tool_memory_ext,
-            "memory_relations_traverse"     => memory_relations_traverse(MemoryRelationsTraverseParams) in tool_memory_ext,
-            "memory_anchor_entity"          => memory_anchor_entity(MemoryAnchorEntityParams) in tool_memory_ext,
-            "memory_unanchor_entity"        => memory_unanchor_entity(MemoryUnanchorEntityParams) in tool_memory_ext,
-            "memory_find_code_for_entity"   => memory_find_code_for_entity(MemoryFindCodeForEntityParams) in tool_memory_ext,
-            "memory_find_entities_for_code" => memory_find_entities_for_code(MemoryFindEntitiesForCodeParams) in tool_memory_ext,
-            "memory_reflect"                => memory_reflect(MemoryReflectParams) in tool_memory_reflect,
-            // Memory-server Phase 6 graph-enhanced retrieval.
-            "memory_unified_search"         => memory_unified_search(MemoryUnifiedSearchParams) in tool_memory_graph_rag,
-            "memory_neighbors"              => memory_neighbors(MemoryNeighborsParams) in tool_memory_graph_rag,
-            "memory_path_search"            => memory_path_search(MemoryPathSearchParams) in tool_memory_graph_rag,
-            "memory_ppr_search"             => memory_ppr_search(MemoryPprSearchParams) in tool_memory_graph_rag,
-            "memory_raptor_search"          => memory_raptor_search(MemoryRaptorSearchParams) in tool_memory_graph_rag,
-            // Memory-server Phase 8: forget + retention.
-            "memory_forget"                 => memory_forget(MemoryForgetParams) in tool_memory_forget,
-            "memory_purge_expired"          => memory_purge_expired(MemoryPurgeExpiredParams) in tool_memory_forget,
-            // Memory-server Phase 10: client-profile introspection.
-            "pgmcp_client_profile"          => pgmcp_client_profile(PgmcpClientProfileParams) in tool_client_profile,
-            // File info
-            "read_file"              => read_file(ReadFileParams),
-            "mandate_context"        => mandate_context(MandateContextParams),
-            "project_tree"           => project_tree(ProjectTreeParams),
-            "file_info"              => file_info(FileInfoParams),
-            // Similarity
-            "compare_files"          => compare_files(CompareFilesParams),
-            "find_similar_modules"   => find_similar_modules(FindSimilarModulesParams),
-            "find_duplicates"        => find_duplicates(FindDuplicatesParams),
-            "refactoring_report"     => refactoring_report(RefactoringReportParams),
-            // Topics
-            "discover_topics"        => discover_topics(DiscoverTopicsParams),
-            "find_orphans"           => find_orphans(FindOrphansParams),
-            "find_misplaced_code"    => find_misplaced_code(FindMisplacedCodeParams),
-            "find_coupled_files"     => find_coupled_files(FindCoupledFilesParams),
-            "test_coverage_gaps"     => test_coverage_gaps(TestCoverageGapsParams),
-            "complexity_hotspots"    => complexity_hotspots(ComplexityHotspotsParams),
-            "topic_hierarchy"        => topic_hierarchy(TopicHierarchyParams),
-            "suggest_merges"         => suggest_merges(SuggestMergesParams),
-            "suggest_splits"         => suggest_splits(SuggestSplitsParams),
-            "doc_coverage_gaps"      => doc_coverage_gaps(DocCoverageGapsParams),
-            // Graph
-            "dependency_graph"       => dependency_graph(DependencyGraphParams),
-            "centrality_analysis"    => centrality_analysis(CentralityAnalysisParams),
-            "community_detection"    => community_detection(CommunityDetectionParams),
-            "circular_dependencies"  => circular_dependencies(CircularDependenciesParams),
-            "change_impact_analysis" => change_impact_analysis(ChangeImpactAnalysisParams),
-            // Architecture
-            "coupling_cohesion_report"  => coupling_cohesion_report(CouplingCohesionReportParams),
-            "architecture_violations"   => architecture_violations(ArchitectureViolationsParams),
-            "design_smell_detection"    => design_smell_detection(DesignSmellDetectionParams),
-            "architecture_quality"      => architecture_quality(ArchitectureQualityParams),
-            "design_metrics"            => design_metrics(DesignMetricsParams),
-            // Prediction
-            "bug_prediction"         => bug_prediction(BugPredictionParams),
-            "technical_debt_analysis" => technical_debt_analysis(TechnicalDebtAnalysisParams),
-            "anomaly_detection"      => anomaly_detection(AnomalyDetectionParams),
-            // Advanced
-            "code_summarize"         => code_summarize(CodeSummarizeParams),
-            "engineering_scorecard"  => engineering_scorecard(EngineeringScorecardParams),
-            // Telemetry
-            "mcp_tool_telemetry"     => mcp_tool_telemetry(McpToolTelemetryParams),
-            // Orientation / multi-axis tools previously omitted from the
-            // dispatch — added so `call_tool_cli` can drive every #[tool]
-            // method from harness tests. See `query_smoke_mcp_tools.rs`.
-            "orient"                         => orient(OrientParams),
-            "topic_hierarchy_fcm"            => topic_hierarchy_fcm(TopicHierarchyFcmParams),
-            "dependency_health"              => dependency_health(DependencyHealthParams),
-            "shotgun_surgery_fix"            => shotgun_surgery_fix(ShotgunSurgeryFixParams),
-            "pr_scope_recommender"           => pr_scope(PrScopeRecommenderParams) in tool_pr_scope,
-            "naming_consistency"             => naming_consistency(NamingConsistencyParams),
-            "adoption_lag"                   => adoption_lag(AdoptionLagParams),
-            "merge_conflict_risk"            => merge_conflict_risk(MergeConflictRiskParams),
-            "hot_path_audit"                 => hot_path_audit(HotPathAuditParams),
-            "bus_factor_map"                 => bus_factor_map(BusFactorMapParams),
-            "module_growth_trajectory"       => module_growth(ModuleGrowthParams) in tool_module_growth,
-            "stale_zombie_detector"          => stale_zombie(StaleZombieParams) in tool_stale_zombie,
-            "tech_debt_burn_down"            => tech_debt_burn_down(TechDebtBurnDownParams),
-            "internal_dry"                   => internal_dry(InternalDryParams),
-            "extraction_candidates"          => extraction_candidates(ExtractionCandidatesParams),
-            "boilerplate_clusters"           => boilerplate_clusters(BoilerplateClustersParams),
-            "chunk_clusters"                 => chunk_clusters(ChunkClustersParams),
-            "pattern_abstraction_candidates" => pattern_abstraction(PatternAbstractionParams) in tool_pattern_abstraction,
-            "pattern_search"                 => pattern_search(PatternSearchParams),
-            "recommend_layering"             => recommend_layering(RecommendLayeringParams),
-            "recommend_module_split"         => recommend_module_split(RecommendModuleSplitParams),
-            "reviewer_recommender"           => reviewer_recommender(ReviewerRecommenderParams),
-            "fix_circular_dependency"        => fix_circular_dependency(FixCircularDependencyParams),
-        }, no_params: {
-            "list_projects" => list_projects,
-            "index_stats"   => index_stats,
-            "reindex"       => reindex,
-            "pattern_catalog_stats" => pattern_catalog_stats in tool_software_patterns,
-        })
+        let caller = CallerInfo {
+            client_name: "cli".to_string(),
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: "n/a".to_string(),
+        };
+        let params_summary = summarize_json(&args);
+        let fut = async move {
+            dispatch_tool!(self, name, args, {
+                // Search
+                "semantic_search"        => semantic_search(SemanticSearchParams),
+                "text_search"            => text_search(TextSearchParams),
+                "grep"                   => grep(GrepParams),
+                "hybrid_search"          => hybrid_search(HybridSearchParams),
+                "search_commits"         => search_commits(SearchCommitsParams),
+                // Pattern knowledge — all share the `tool_software_patterns` module.
+                "software_pattern_search"    => software_pattern_search(SoftwarePatternSearchParams) in tool_software_patterns,
+                "recommend_design_patterns"  => recommend_design_patterns(RecommendDesignPatternsParams) in tool_software_patterns,
+                "review_design_patterns"     => review_design_patterns(ReviewDesignPatternsParams) in tool_software_patterns,
+                "get_software_pattern"       => get_software_pattern(GetSoftwarePatternParams) in tool_software_patterns,
+                "list_software_patterns"     => list_software_patterns(ListSoftwarePatternsParams) in tool_software_patterns,
+                "refresh_pattern_catalog"    => refresh_pattern_catalog(RefreshPatternCatalogParams) in tool_software_patterns,
+                "upsert_pattern_source"      => upsert_pattern_source(UpsertPatternSourceParams) in tool_software_patterns,
+                // Session-level mandates — `promote_session_mandate` shares the `tool_session_mandates` module.
+                "session_mandates"           => session_mandates(SessionMandatesParams),
+                "promote_session_mandate"    => promote_session_mandate(PromoteSessionMandateParams) in tool_session_mandates,
+                // Memory-server Phase 0 quick wins.
+                "recall_prompts"             => recall_prompts(RecallPromptsParams),
+                "search_mandates"            => search_mandates(SearchMandatesParams),
+                // Memory-server Phase 3.1 official-compat CRUD (9 tools share the `tool_memory_crud` module).
+                "memory_create_entities"     => memory_create_entities(MemoryCreateEntitiesParams) in tool_memory_crud,
+                "memory_create_relations"    => memory_create_relations(MemoryCreateRelationsParams) in tool_memory_crud,
+                "memory_add_observations"    => memory_add_observations(MemoryAddObservationsParams) in tool_memory_crud,
+                "memory_delete_entities"     => memory_delete_entities(MemoryDeleteEntitiesParams) in tool_memory_crud,
+                "memory_delete_observations" => memory_delete_observations(MemoryDeleteObservationsParams) in tool_memory_crud,
+                "memory_delete_relations"    => memory_delete_relations(MemoryDeleteRelationsParams) in tool_memory_crud,
+                "memory_read_graph"          => memory_read_graph(MemoryReadGraphParams) in tool_memory_crud,
+                "memory_search_nodes"        => memory_search_nodes(MemorySearchNodesParams) in tool_memory_crud,
+                "memory_open_nodes"          => memory_open_nodes(MemoryOpenNodesParams) in tool_memory_crud,
+                // Memory-server Phase 3.2 extensions (share the tool_memory_ext module).
+                "memory_semantic_search"        => memory_semantic_search(MemorySemanticSearchParams) in tool_memory_ext,
+                "memory_hybrid_search"          => memory_hybrid_search(MemoryHybridSearchParams) in tool_memory_ext,
+                "memory_facts_at"               => memory_facts_at(MemoryFactsAtParams) in tool_memory_ext,
+                "memory_relations_traverse"     => memory_relations_traverse(MemoryRelationsTraverseParams) in tool_memory_ext,
+                "memory_anchor_entity"          => memory_anchor_entity(MemoryAnchorEntityParams) in tool_memory_ext,
+                "memory_unanchor_entity"        => memory_unanchor_entity(MemoryUnanchorEntityParams) in tool_memory_ext,
+                "memory_find_code_for_entity"   => memory_find_code_for_entity(MemoryFindCodeForEntityParams) in tool_memory_ext,
+                "memory_find_entities_for_code" => memory_find_entities_for_code(MemoryFindEntitiesForCodeParams) in tool_memory_ext,
+                "memory_reflect"                => memory_reflect(MemoryReflectParams) in tool_memory_reflect,
+                // Memory-server Phase 6 graph-enhanced retrieval.
+                "memory_unified_search"         => memory_unified_search(MemoryUnifiedSearchParams) in tool_memory_graph_rag,
+                "memory_neighbors"              => memory_neighbors(MemoryNeighborsParams) in tool_memory_graph_rag,
+                "memory_path_search"            => memory_path_search(MemoryPathSearchParams) in tool_memory_graph_rag,
+                "memory_ppr_search"             => memory_ppr_search(MemoryPprSearchParams) in tool_memory_graph_rag,
+                "memory_raptor_search"          => memory_raptor_search(MemoryRaptorSearchParams) in tool_memory_graph_rag,
+                // Memory-server Phase 8: forget + retention.
+                "memory_forget"                 => memory_forget(MemoryForgetParams) in tool_memory_forget,
+                "memory_purge_expired"          => memory_purge_expired(MemoryPurgeExpiredParams) in tool_memory_forget,
+                // Memory-server Phase 10: client-profile introspection.
+                "pgmcp_client_profile"          => pgmcp_client_profile(PgmcpClientProfileParams) in tool_client_profile,
+                // File info
+                "read_file"              => read_file(ReadFileParams),
+                "mandate_context"        => mandate_context(MandateContextParams),
+                "project_tree"           => project_tree(ProjectTreeParams),
+                "file_info"              => file_info(FileInfoParams),
+                // Similarity
+                "compare_files"          => compare_files(CompareFilesParams),
+                "find_similar_modules"   => find_similar_modules(FindSimilarModulesParams),
+                "find_duplicates"        => find_duplicates(FindDuplicatesParams),
+                "refactoring_report"     => refactoring_report(RefactoringReportParams),
+                // Topics
+                "discover_topics"        => discover_topics(DiscoverTopicsParams),
+                "find_orphans"           => find_orphans(FindOrphansParams),
+                "find_misplaced_code"    => find_misplaced_code(FindMisplacedCodeParams),
+                "find_coupled_files"     => find_coupled_files(FindCoupledFilesParams),
+                "test_coverage_gaps"     => test_coverage_gaps(TestCoverageGapsParams),
+                "complexity_hotspots"    => complexity_hotspots(ComplexityHotspotsParams),
+                "topic_hierarchy"        => topic_hierarchy(TopicHierarchyParams),
+                "suggest_merges"         => suggest_merges(SuggestMergesParams),
+                "suggest_splits"         => suggest_splits(SuggestSplitsParams),
+                "doc_coverage_gaps"      => doc_coverage_gaps(DocCoverageGapsParams),
+                // Graph
+                "dependency_graph"       => dependency_graph(DependencyGraphParams),
+                "centrality_analysis"    => centrality_analysis(CentralityAnalysisParams),
+                "community_detection"    => community_detection(CommunityDetectionParams),
+                "circular_dependencies"  => circular_dependencies(CircularDependenciesParams),
+                "change_impact_analysis" => change_impact_analysis(ChangeImpactAnalysisParams),
+                // Architecture
+                "coupling_cohesion_report"  => coupling_cohesion_report(CouplingCohesionReportParams),
+                "architecture_violations"   => architecture_violations(ArchitectureViolationsParams),
+                "design_smell_detection"    => design_smell_detection(DesignSmellDetectionParams),
+                "architecture_quality"      => architecture_quality(ArchitectureQualityParams),
+                "design_metrics"            => design_metrics(DesignMetricsParams),
+                // Prediction
+                "bug_prediction"         => bug_prediction(BugPredictionParams),
+                "technical_debt_analysis" => technical_debt_analysis(TechnicalDebtAnalysisParams),
+                "anomaly_detection"      => anomaly_detection(AnomalyDetectionParams),
+                "code_on_fire"           => code_on_fire(CodeOnFireParams),
+                "documented_tech_debt"   => documented_tech_debt(DocumentedTechDebtParams),
+                // A2A inter-agent IPC bridge
+                "a2a_send_task"          => a2a_send_task(A2aSendTaskParams),
+                "a2a_get_task"           => a2a_get_task(A2aGetTaskParams),
+                "a2a_subscribe_task"     => a2a_subscribe_task(A2aSubscribeTaskParams),
+                "a2a_cancel_task"        => a2a_cancel_task(A2aCancelTaskParams),
+                "a2a_register_agent"     => a2a_register_agent(A2aRegisterAgentParams),
+                "a2a_list_agents"        => a2a_list_agents(A2aListAgentsParams),
+                // A2A RecursiveMAS-inspired extensions
+                "a2a_find_agents_by_specialty"
+                    => a2a_find_agents_by_specialty(A2aFindAgentsBySpecialtyParams),
+                "a2a_pattern_sequential" => a2a_pattern_sequential(A2aPatternSequentialParams),
+                "a2a_pattern_mixture"    => a2a_pattern_mixture(A2aPatternMixtureParams),
+                "a2a_pattern_distillation"
+                    => a2a_pattern_distillation(A2aPatternDistillationParams),
+                "a2a_pattern_deliberation"
+                    => a2a_pattern_deliberation(A2aPatternDeliberationParams),
+                // SOTA Phase 2 — graph algorithms
+                "kcore_analysis"         => kcore_analysis(KcoreAnalysisParams),
+                "ktruss_analysis"        => ktruss_analysis(KtrussAnalysisParams),
+                "personalized_pagerank"  => personalized_pagerank(PersonalizedPagerankParams),
+                "edge_betweenness"       => edge_betweenness(EdgeBetweennessParams),
+                "structural_holes"       => structural_holes(StructuralHolesParams),
+                "motif_census"           => motif_census(MotifCensusParams),
+                "attack_vulnerability"   => attack_vulnerability(AttackVulnerabilityParams),
+                // SOTA Phase 3 — information theory
+                "compression_distance"   => compression_distance(CompressionDistanceParams),
+                "cochange_mutual_information" => cochange_mutual_information(CochangeMutualInformationParams),
+                "import_entropy"         => import_entropy(ImportEntropyParams),
+                "identifier_entropy"     => identifier_entropy(IdentifierEntropyParams),
+                // SOTA Phase 4 — evolution + quality
+                "bus_factor"             => bus_factor(BusFactorParams),
+                "knowledge_silos"        => knowledge_silos(KnowledgeSilosParams),
+                "ownership_coupling_mismatch" => ownership_coupling_mismatch(OwnershipCouplingMismatchParams),
+                "doc_code_drift"         => doc_code_drift(DocCodeDriftParams),
+                "test_smells"            => test_smells(TestSmellsParams),
+                "mutation_score_surrogate" => mutation_score_surrogate(MutationScoreSurrogateParams),
+                "flaky_test_candidates"  => flaky_test_candidates(FlakyTestCandidatesParams),
+                // SOTA Phase 5 — concurrency / safety / performance
+                "lockset_races"          => lockset_races(LocksetRacesParams),
+                "unsafe_clusters"        => unsafe_clusters(UnsafeClustersParams),
+                "panic_paths"            => panic_paths(PanicPathsParams),
+                "deadlock_candidates"    => deadlock_candidates(DeadlockCandidatesParams),
+                "send_sync_violations"   => send_sync_violations(SendSyncViolationsParams),
+                "quadratic_loops"        => quadratic_loops(QuadraticLoopsParams),
+                "missing_preallocation"  => missing_preallocation(MissingPreallocationParams),
+                "blocking_in_async"      => blocking_in_async(BlockingInAsyncParams),
+                "clone_density"          => clone_density(CloneDensityParams),
+                "io_hotpath"             => io_hotpath(IoHotpathParams),
+                // SOTA Phase 6 — security
+                "taint_analysis"         => taint_analysis(TaintAnalysisParams),
+                "secret_detection"       => secret_detection(SecretDetectionParams),
+                "crypto_misuse"          => crypto_misuse(CryptoMisuseParams),
+                "unsafe_deserialization" => unsafe_deserialization(UnsafeDeserializationParams),
+                "injection_candidates"   => injection_candidates(InjectionCandidatesParams),
+                "unprotected_routes"     => unprotected_routes(UnprotectedRoutesParams),
+                "cve_supply_chain"       => cve_supply_chain(CveSupplyChainParams),
+                // SOTA Phase 7 — API / contract
+                "public_api_surface"     => public_api_surface(PublicApiSurfaceParams),
+                "semver_break_audit"     => semver_break_audit(SemverBreakAuditParams),
+                "deprecated_but_used"    => deprecated_but_used(DeprecatedButUsedParams),
+                "api_stability"          => api_stability(ApiStabilityParams),
+                // SOTA Phase 8 — ML / embedding-based
+                "lsh_clone_detection"    => lsh_clone_detection(LshCloneDetectionParams),
+                "semantic_drift"         => semantic_drift(SemanticDriftParams),
+                "embedding_outliers"     => embedding_outliers(EmbeddingOutliersParams),
+                "multi_resolution_pagerank" => multi_resolution_pagerank(MultiResolutionPagerankParams),
+                // SOTA Phase 9 — data engineering
+                "migration_safety"       => migration_safety(MigrationSafetyParams),
+                "dead_columns"           => dead_columns(DeadColumnsParams),
+                "pii_spread"             => pii_spread(PiiSpreadParams),
+                // SOTA Phase 10 — call-graph downstream
+                "dead_code_reachability" => dead_code_reachability(DeadCodeReachabilityParams),
+                "feature_envy"           => feature_envy(FeatureEnvyParams),
+                "shotgun_surgery"        => shotgun_surgery(ShotgunSurgeryParams),
+                "lcom4"                  => lcom4(Lcom4Params),
+                // SOTA Phase 11 — evolution analytics
+                "refactor_pressure"      => refactor_pressure(RefactorPressureParams),
+                "commit_changepoint"     => commit_changepoint(CommitChangepointParams),
+                "commit_topic_drift"     => commit_topic_drift(CommitTopicDriftParams),
+                "release_api_stability"  => release_api_stability(ReleaseApiStabilityParams),
+                // Advanced
+                "code_summarize"         => code_summarize(CodeSummarizeParams),
+                "engineering_scorecard"  => engineering_scorecard(EngineeringScorecardParams),
+                // Telemetry
+                "mcp_tool_telemetry"     => mcp_tool_telemetry(McpToolTelemetryParams),
+                // Orientation / multi-axis tools previously omitted from the
+                // dispatch — added so `call_tool_cli` can drive every #[tool]
+                // method from harness tests. See `query_smoke_mcp_tools.rs`.
+                "orient"                         => orient(OrientParams),
+                "topic_hierarchy_fcm"            => topic_hierarchy_fcm(TopicHierarchyFcmParams),
+                "dependency_health"              => dependency_health(DependencyHealthParams),
+                "shotgun_surgery_fix"            => shotgun_surgery_fix(ShotgunSurgeryFixParams),
+                "pr_scope_recommender"           => pr_scope(PrScopeRecommenderParams) in tool_pr_scope,
+                "naming_consistency"             => naming_consistency(NamingConsistencyParams),
+                "adoption_lag"                   => adoption_lag(AdoptionLagParams),
+                "merge_conflict_risk"            => merge_conflict_risk(MergeConflictRiskParams),
+                "hot_path_audit"                 => hot_path_audit(HotPathAuditParams),
+                "bus_factor_map"                 => bus_factor_map(BusFactorMapParams),
+                "module_growth_trajectory"       => module_growth(ModuleGrowthParams) in tool_module_growth,
+                "stale_zombie_detector"          => stale_zombie(StaleZombieParams) in tool_stale_zombie,
+                "tech_debt_burn_down"            => tech_debt_burn_down(TechDebtBurnDownParams),
+                "internal_dry"                   => internal_dry(InternalDryParams),
+                "extraction_candidates"          => extraction_candidates(ExtractionCandidatesParams),
+                "boilerplate_clusters"           => boilerplate_clusters(BoilerplateClustersParams),
+                "chunk_clusters"                 => chunk_clusters(ChunkClustersParams),
+                "pattern_abstraction_candidates" => pattern_abstraction(PatternAbstractionParams) in tool_pattern_abstraction,
+                "pattern_search"                 => pattern_search(PatternSearchParams),
+                "recommend_layering"             => recommend_layering(RecommendLayeringParams),
+                "recommend_module_split"         => recommend_module_split(RecommendModuleSplitParams),
+                "reviewer_recommender"           => reviewer_recommender(ReviewerRecommenderParams),
+                "fix_circular_dependency"        => fix_circular_dependency(FixCircularDependencyParams),
+            }, no_params: {
+                "list_projects" => list_projects,
+                "index_stats"   => index_stats,
+                "reindex"       => reindex,
+                "pattern_catalog_stats" => pattern_catalog_stats in tool_software_patterns,
+            })
+        };
+        instrumented_tool_run(self.stats(), name, None, caller, &params_summary, None, fut).await
     }
 }
 

@@ -47,7 +47,7 @@ pub async fn tool_extraction_candidates(
     let main_only = matches!(worktree_filter, "main");
     let risk_threshold = params.risk_threshold.as_deref().unwrap_or("any");
 
-    info!(
+    debug!(
         tool = "extraction_candidates",
         min_similarity = min_sim,
         min_projects,

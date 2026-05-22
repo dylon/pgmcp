@@ -11,8 +11,8 @@ pub async fn run(
     cwd: Option<PathBuf>,
     depth: i32,
 ) -> anyhow::Result<()> {
-    crate::logging::init_cli();
     let config = Config::load(config_override)?;
+    crate::logging::init_cli_with_config(Some(&config));
     let pool = db::pool::create_pool(&config.database).await?;
     run_context_command(&pool, &config, cwd, depth).await
 }

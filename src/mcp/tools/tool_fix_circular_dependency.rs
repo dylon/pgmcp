@@ -45,7 +45,7 @@ pub async fn tool_fix_circular_dependency(
     let limit = params.limit.unwrap_or(20).max(1) as usize;
     let prefer_strategy = params.prefer_strategy.as_deref().unwrap_or("auto");
 
-    info!(
+    debug!(
         tool = "fix_circular_dependency",
         project = %params.project,
         max_cycle_length,

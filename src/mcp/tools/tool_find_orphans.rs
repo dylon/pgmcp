@@ -26,7 +26,7 @@ pub async fn tool_find_orphans(
     let limit = params.limit.unwrap_or(50);
     let detail = params.detail.as_deref().unwrap_or("files");
 
-    info!(
+    debug!(
         tool = "find_orphans",
         project = params.project.as_deref().unwrap_or("*"),
         language = params.language.as_deref().unwrap_or("*"),

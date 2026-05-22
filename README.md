@@ -972,7 +972,7 @@ name = "pgmcp"
 user = "pgmcp"
 # password via PGMCP_DB_PASSWORD env var or:
 # password = "secret"
-max_connections = 20
+max_connections = 40
 
 [embeddings]
 model = "all-MiniLM-L6-v2"
@@ -1008,6 +1008,19 @@ file = "~/.local/share/pgmcp/pgmcp.log"
 level = "info"
 rotation = "daily"
 max_log_files = 7
+# Output format for the daemon log file: "json" (default), "compact", or "pretty".
+# Stderr always uses the compact human-readable form regardless.
+format = "json"
+# Optional separate file capturing only MCP-tool-call events (`invoked` /
+# `completed` / `failed` from `instrumented_tool_run`). Filtered to the
+# `pgmcp::mcp::tool` tracing target. Uses the same rotation policy as `file`.
+# access_log = "~/.local/share/pgmcp/mcp-access.log"
+# Per-target log-level overrides composed with the global `level`. RUST_LOG
+# (when set) still wins. Example:
+#   [logging.targets]
+#   "pgmcp::mcp::tool"  = "debug"   # MCP tool entry/exit events
+#   "pgmcp::mcp::tools" = "debug"   # per-tool body-start events
+#   "sqlx::query"       = "warn"    # quiet sqlx query logs
 
 [cron]
 stale_cleanup_interval_secs = 3600
@@ -1038,7 +1051,7 @@ graph_analysis_interval_secs = 7200
 | `database`   | `name`                            | `pgmcp`                             | Database name                                  |
 | `database`   | `user`                            | `pgmcp`                             | Database user                                  |
 | `database`   | `password`                        | `None`                              | Database password (prefer `PGMCP_DB_PASSWORD`) |
-| `database`   | `max_connections`                 | `20`                                | Connection pool size                           |
+| `database`   | `max_connections`                 | `40`                                | Connection pool size                           |
 | `embeddings` | `model`                           | `all-MiniLM-L6-v2`                  | Sentence-transformer model name                |
 | `embeddings` | `dimensions`                      | `384`                               | Embedding vector dimensions                    |
 | `embeddings` | `chunk_size_lines`                | `50`                                | Lines per chunk                                |
@@ -1057,8 +1070,13 @@ graph_analysis_interval_secs = 7200
 | `work_pool`  | `initial_threads`                 | `0` (min_threads)                   | Workers at startup                             |
 | `metrics`    | `http_enabled`                    | `true`                              | Enable Prometheus endpoint                     |
 | `metrics`    | `http_port`                       | `9464`                              | Metrics port                                   |
-| `logging`    | `level`                           | `info`                              | Log level                                      |
-| `logging`    | `rotation`                        | `daily`                             | Log rotation period                            |
+| `logging`    | `file`                            | `~/.local/share/pgmcp/pgmcp.log`    | Daemon log file path                           |
+| `logging`    | `level`                           | `info`                              | Log level (composes with `RUST_LOG`)           |
+| `logging`    | `rotation`                        | `daily`                             | Log rotation period (`daily`/`hourly`/`never`) |
+| `logging`    | `max_log_files`                   | `7`                                 | Rotated-file retention                         |
+| `logging`    | `format`                          | `json`                              | File output: `json` / `compact` / `pretty`     |
+| `logging`    | `access_log`                      | `None`                              | Optional separate MCP-tool-call access log     |
+| `logging.targets` | `<target> = <level>`         | `{}`                                | Per-target level overrides (e.g. `pgmcp::mcp::tool = debug`) |
 | `cron`       | `stale_cleanup_interval_secs`     | `3600`                              | Stale file cleanup interval                    |
 | `cron`       | `integrity_check_interval_secs`   | `86400`                             | Integrity check interval                       |
 | `cron`       | `stats_aggregation_interval_secs` | `60`                                | Stats refresh interval                         |

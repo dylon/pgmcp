@@ -27,7 +27,7 @@ pub async fn tool_find_coupled_files(
     let min_commits = params.min_commits.unwrap_or(3);
     let limit = params.limit.unwrap_or(50);
 
-    info!(
+    debug!(
         tool = "find_coupled_files",
         project = %params.project,
         min_coupling,

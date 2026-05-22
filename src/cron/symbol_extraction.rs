@@ -46,6 +46,11 @@ const BACKEND_LANGUAGES: &[&str] = &[
     "rholang",
     "clojure",
     "clojurescript",
+    // Formal-verification backends (post-SOTA addition).
+    "coq",
+    "tlaplus",
+    "lean",
+    "sage",
 ];
 
 /// Run the full symbol-extraction pipeline across all projects.
@@ -56,6 +61,10 @@ pub async fn run_symbol_extraction(db: &dyn DbClient, stats: &Arc<StatsTracker>)
 
     info!("Starting symbol-extraction cron job");
     let start = std::time::Instant::now();
+
+    // Promoted to top-of-body: pairs with `symbol_extraction_noop_returns`
+    // to distinguish "ran, no projects" from "never ran".
+    stats.symbol_extraction_runs.fetch_add(1, Ordering::Relaxed);
 
     let projects: Vec<(i32, String)> =
         match sqlx::query_as::<_, (i32, String)>("SELECT id, name FROM projects ORDER BY id")
@@ -68,6 +77,14 @@ pub async fn run_symbol_extraction(db: &dyn DbClient, stats: &Arc<StatsTracker>)
                 return;
             }
         };
+
+    if projects.is_empty() {
+        stats
+            .symbol_extraction_noop_returns
+            .fetch_add(1, Ordering::Relaxed);
+        info!("Symbol extraction cron: no projects to scan");
+        return;
+    }
 
     let mut total_files: u64 = 0;
     let mut total_symbols: u64 = 0;
@@ -90,7 +107,7 @@ pub async fn run_symbol_extraction(db: &dyn DbClient, stats: &Arc<StatsTracker>)
         }
     }
 
-    stats.symbol_extraction_runs.fetch_add(1, Ordering::Relaxed);
+    // `symbol_extraction_runs` was promoted to top-of-body above.
     info!(
         elapsed_ms = start.elapsed().as_millis() as u64,
         projects = projects.len(),

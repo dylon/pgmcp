@@ -23,8 +23,8 @@ pub async fn run(
     model: Option<String>,
     json: bool,
 ) -> anyhow::Result<()> {
-    crate::logging::init_cli();
     let config = Config::load(config_override)?;
+    crate::logging::init_cli_with_config(Some(&config));
     // /api/* routes are mounted on the MCP Streamable HTTP server
     // (config.mcp.host:port), NOT on the Prometheus metrics server.
     let url = format!("http://{}:{}/api/status", config.mcp.host, config.mcp.port);

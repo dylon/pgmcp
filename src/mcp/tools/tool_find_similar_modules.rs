@@ -23,7 +23,7 @@ pub async fn tool_find_similar_modules(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let min_sim = params.min_similarity.unwrap_or(0.80);
     let limit = params.limit.unwrap_or(20);
-    info!(
+    debug!(
         tool = "find_similar_modules",
         project = %params.project,
         module_path = %params.module_path,

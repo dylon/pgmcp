@@ -305,9 +305,18 @@ pub const REQUIRED_TOOLS: &[(&str, &[&str], &str)] = &[
     ),
     (
         "pandoc",
-        &["docx", "doc", "rtf", "odt", "epub", "latex", "org"],
+        // `doc` removed: pandoc does not support legacy DOC. The catdoc/antiword
+        // entries below cover that format.
+        &["docx", "rtf", "odt", "epub", "latex", "org"],
         "install pandoc (Arch: pacman -S pandoc-cli; \
          Debian: apt install pandoc; macOS: brew install pandoc)",
+    ),
+    (
+        "catdoc",
+        &["doc"],
+        "install catdoc (Arch: pacman -S catdoc; \
+         Debian: apt install catdoc; macOS: brew install catdoc). \
+         Required for legacy Word DOC files; antiword is an alternative.",
     ),
     (
         "pdftoppm",

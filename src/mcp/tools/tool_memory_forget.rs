@@ -35,6 +35,7 @@ pub async fn tool_memory_forget(
     ctx: &SystemContext,
     params: MemoryForgetParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_forget", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     let target_type = ForgetTargetType::parse(&params.target_type)

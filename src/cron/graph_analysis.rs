@@ -63,6 +63,11 @@ pub async fn run_graph_analysis(
     info!("Starting graph analysis cron job");
     let start = std::time::Instant::now();
 
+    // Promoted to top-of-body: this counter means "the body reached its
+    // work-eligible state" — pairs with `graph_build_noop_returns` to
+    // distinguish "ran, no work" from "never ran".
+    stats.graph_build_runs.fetch_add(1, Ordering::Relaxed);
+
     // Get all projects
     let projects: Vec<(i32, String)> =
         match sqlx::query_as::<_, (i32, String)>("SELECT id, name FROM projects ORDER BY id")
@@ -76,6 +81,14 @@ pub async fn run_graph_analysis(
             }
         };
 
+    if projects.is_empty() {
+        stats
+            .graph_build_noop_returns
+            .fetch_add(1, Ordering::Relaxed);
+        info!("Graph analysis cron job: no projects to analyze");
+        return;
+    }
+
     for (project_id, project_name) in &projects {
         if let Err(e) = analyze_project(pool, *project_id, project_name, work_pool.as_ref()).await {
             error!(
@@ -86,7 +99,6 @@ pub async fn run_graph_analysis(
         }
     }
 
-    stats.graph_build_runs.fetch_add(1, Ordering::Relaxed);
     info!(
         elapsed_ms = start.elapsed().as_millis() as u64,
         projects = projects.len(),

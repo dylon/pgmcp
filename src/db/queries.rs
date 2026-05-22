@@ -23,14 +23,20 @@ pub async fn upsert_project(
     git_common_dir: Option<&str>,
     git_root_commits: Option<&str>,
 ) -> Result<i32, sqlx::Error> {
+    // `last_scanned_at = NOW()` is set on both INSERT and ON CONFLICT so
+    // any file processed for a project bumps its freshness signal. The
+    // `update_projects_scanned_by_workspace` helper catches the
+    // no-file-change case (rescan finds nothing new) by issuing a bulk
+    // UPDATE keyed on `workspace_path`.
     let row = sqlx::query_scalar::<_, i32>(
-        "INSERT INTO projects (workspace_path, path, name, git_common_dir, git_root_commits)
-         VALUES ($1, $2, $3, $4, $5)
+        "INSERT INTO projects (workspace_path, path, name, git_common_dir, git_root_commits, last_scanned_at)
+         VALUES ($1, $2, $3, $4, $5, NOW())
          ON CONFLICT (path) DO UPDATE SET
             workspace_path = EXCLUDED.workspace_path,
             name = EXCLUDED.name,
             git_common_dir = EXCLUDED.git_common_dir,
-            git_root_commits = EXCLUDED.git_root_commits
+            git_root_commits = EXCLUDED.git_root_commits,
+            last_scanned_at = NOW()
          RETURNING id",
     )
     .bind(workspace_path)
@@ -345,6 +351,25 @@ pub async fn update_project_scanned(pool: &PgPool, project_id: i32) -> Result<()
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Bulk-update `last_scanned_at = NOW()` for every project whose
+/// `workspace_path` matches the given string. Used by the scanner +
+/// rescan paths to mark "this workspace was fully walked at NOW()",
+/// even when no files changed (so no `upsert_project` was called and
+/// the per-file `last_scanned_at` update never fired).
+///
+/// Returns the number of rows updated.
+pub async fn update_projects_scanned_by_workspace(
+    pool: &PgPool,
+    workspace_path: &str,
+) -> Result<u64, sqlx::Error> {
+    let result =
+        sqlx::query("UPDATE projects SET last_scanned_at = NOW() WHERE workspace_path = $1")
+            .bind(workspace_path)
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected())
 }
 
 // ============================================================================
@@ -7282,4 +7307,402 @@ pub async fn get_naming_distribution(
     .bind(language)
     .fetch_all(pool)
     .await
+}
+
+// ============================================================================
+// SOTA Phase 1 — function_metrics + call-graph queries
+// ============================================================================
+
+/// One row identifying a function symbol in a file. Returned by
+/// `lookup_function_symbol_ids` so the function-metrics cron can map
+/// (name, start_line) → file_symbols.id.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FunctionSymbolRow {
+    pub symbol_id: i64,
+    pub name: String,
+    pub start_line: i32,
+}
+
+/// Look up `file_symbols.id` for every function in a file. Returned ordered
+/// by `(name, start_line)` for deterministic matching by callers.
+pub async fn lookup_function_symbol_ids(
+    pool: &PgPool,
+    file_id: i64,
+) -> Result<Vec<FunctionSymbolRow>, sqlx::Error> {
+    sqlx::query_as::<_, FunctionSymbolRow>(
+        "SELECT id as symbol_id, name, start_line
+         FROM file_symbols
+         WHERE file_id = $1 AND kind = 'function'",
+    )
+    .bind(file_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// One row consumed by `upsert_function_metrics_batch`. Mirrors the table
+/// columns 1:1.
+#[derive(Debug, Clone)]
+pub struct FunctionMetricsRow {
+    pub function_id: i64,
+    pub file_id: i64,
+    pub project_id: i32,
+    pub cyclomatic: i32,
+    pub cognitive: i32,
+    pub halstead_n1: i32,
+    pub halstead_n2: i32,
+    pub halstead_big_n1: i32,
+    pub halstead_big_n2: i32,
+    pub halstead_volume: f64,
+    pub halstead_difficulty: f64,
+    pub halstead_effort: f64,
+    pub halstead_bugs: f64,
+    pub npath: i64,
+    pub npath_overflow: bool,
+    pub loc: i32,
+    pub comment_lines: i32,
+    pub maintainability_index: f64,
+    pub panic_paths: i32,
+    pub unsafe_blocks: i32,
+}
+
+/// UNNEST-style bulk upsert into `function_metrics`. ON CONFLICT (function_id)
+/// DO UPDATE refreshes every column except `fan_in`/`fan_out` (those are owned
+/// by the call-graph cron).
+pub async fn upsert_function_metrics_batch(
+    pool: &PgPool,
+    rows: &[FunctionMetricsRow],
+) -> Result<u64, sqlx::Error> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let function_ids: Vec<i64> = rows.iter().map(|r| r.function_id).collect();
+    let file_ids: Vec<i64> = rows.iter().map(|r| r.file_id).collect();
+    let project_ids: Vec<i32> = rows.iter().map(|r| r.project_id).collect();
+    let cyclo: Vec<i32> = rows.iter().map(|r| r.cyclomatic).collect();
+    let cogn: Vec<i32> = rows.iter().map(|r| r.cognitive).collect();
+    let h_n1: Vec<i32> = rows.iter().map(|r| r.halstead_n1).collect();
+    let h_n2: Vec<i32> = rows.iter().map(|r| r.halstead_n2).collect();
+    let h_bn1: Vec<i32> = rows.iter().map(|r| r.halstead_big_n1).collect();
+    let h_bn2: Vec<i32> = rows.iter().map(|r| r.halstead_big_n2).collect();
+    let h_v: Vec<f64> = rows.iter().map(|r| r.halstead_volume).collect();
+    let h_d: Vec<f64> = rows.iter().map(|r| r.halstead_difficulty).collect();
+    let h_e: Vec<f64> = rows.iter().map(|r| r.halstead_effort).collect();
+    let h_b: Vec<f64> = rows.iter().map(|r| r.halstead_bugs).collect();
+    let np: Vec<i64> = rows.iter().map(|r| r.npath).collect();
+    let np_ovf: Vec<bool> = rows.iter().map(|r| r.npath_overflow).collect();
+    let loc: Vec<i32> = rows.iter().map(|r| r.loc).collect();
+    let cl: Vec<i32> = rows.iter().map(|r| r.comment_lines).collect();
+    let mi: Vec<f64> = rows.iter().map(|r| r.maintainability_index).collect();
+    let panic_p: Vec<i32> = rows.iter().map(|r| r.panic_paths).collect();
+    let uns: Vec<i32> = rows.iter().map(|r| r.unsafe_blocks).collect();
+
+    let res = sqlx::query(
+        "INSERT INTO function_metrics (
+            function_id, file_id, project_id,
+            cyclomatic, cognitive,
+            halstead_n1, halstead_n2, halstead_big_n1, halstead_big_n2,
+            halstead_volume, halstead_difficulty, halstead_effort, halstead_bugs,
+            npath, npath_overflow,
+            loc, comment_lines,
+            maintainability_index,
+            panic_paths, unsafe_blocks,
+            computed_at
+        )
+        SELECT * FROM UNNEST(
+            $1::int8[], $2::int8[], $3::int4[],
+            $4::int4[], $5::int4[],
+            $6::int4[], $7::int4[], $8::int4[], $9::int4[],
+            $10::float8[], $11::float8[], $12::float8[], $13::float8[],
+            $14::int8[], $15::bool[],
+            $16::int4[], $17::int4[],
+            $18::float8[],
+            $19::int4[], $20::int4[]
+        ) AS u(
+            function_id, file_id, project_id,
+            cyclomatic, cognitive,
+            halstead_n1, halstead_n2, halstead_big_n1, halstead_big_n2,
+            halstead_volume, halstead_difficulty, halstead_effort, halstead_bugs,
+            npath, npath_overflow,
+            loc, comment_lines,
+            maintainability_index,
+            panic_paths, unsafe_blocks
+        ), (SELECT NOW())
+        ON CONFLICT (function_id) DO UPDATE SET
+            file_id = EXCLUDED.file_id,
+            project_id = EXCLUDED.project_id,
+            cyclomatic = EXCLUDED.cyclomatic,
+            cognitive = EXCLUDED.cognitive,
+            halstead_n1 = EXCLUDED.halstead_n1,
+            halstead_n2 = EXCLUDED.halstead_n2,
+            halstead_big_n1 = EXCLUDED.halstead_big_n1,
+            halstead_big_n2 = EXCLUDED.halstead_big_n2,
+            halstead_volume = EXCLUDED.halstead_volume,
+            halstead_difficulty = EXCLUDED.halstead_difficulty,
+            halstead_effort = EXCLUDED.halstead_effort,
+            halstead_bugs = EXCLUDED.halstead_bugs,
+            npath = EXCLUDED.npath,
+            npath_overflow = EXCLUDED.npath_overflow,
+            loc = EXCLUDED.loc,
+            comment_lines = EXCLUDED.comment_lines,
+            maintainability_index = EXCLUDED.maintainability_index,
+            panic_paths = EXCLUDED.panic_paths,
+            unsafe_blocks = EXCLUDED.unsafe_blocks,
+            computed_at = NOW()",
+    )
+    .bind(&function_ids)
+    .bind(&file_ids)
+    .bind(&project_ids)
+    .bind(&cyclo)
+    .bind(&cogn)
+    .bind(&h_n1)
+    .bind(&h_n2)
+    .bind(&h_bn1)
+    .bind(&h_bn2)
+    .bind(&h_v)
+    .bind(&h_d)
+    .bind(&h_e)
+    .bind(&h_b)
+    .bind(&np)
+    .bind(&np_ovf)
+    .bind(&loc)
+    .bind(&cl)
+    .bind(&mi)
+    .bind(&panic_p)
+    .bind(&uns)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Read the function-metrics watermark for a project.
+pub async fn get_function_metrics_watermark(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    let key = format!("function_metrics_last_run:{}", project_id);
+    let val: Option<String> = sqlx::query_scalar("SELECT value FROM pgmcp_metadata WHERE key = $1")
+        .bind(&key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(val.and_then(|s| {
+        DateTime::parse_from_rfc3339(&s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    }))
+}
+
+/// Set the function-metrics watermark for a project.
+pub async fn set_function_metrics_watermark(
+    pool: &PgPool,
+    project_id: i32,
+    ts: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let key = format!("function_metrics_last_run:{}", project_id);
+    sqlx::query(
+        "INSERT INTO pgmcp_metadata (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(&key)
+    .bind(ts.to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// ----------------------------------------------------------------------------
+// Call-graph cron support
+// ----------------------------------------------------------------------------
+
+/// One node in the in-process call graph (one row per function symbol in a
+/// project). Returned by `list_function_nodes_for_project`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FunctionNodeRow {
+    pub symbol_id: i64,
+    pub file_id: i64,
+    pub name: String,
+    pub relative_path: String,
+    pub language: String,
+    pub parent_id: Option<i64>,
+}
+
+/// Fetch every function symbol in a project, with the file path/language and
+/// its parent_id (so the call-graph builder can decide `is_method`).
+pub async fn list_function_nodes_for_project(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Vec<FunctionNodeRow>, sqlx::Error> {
+    sqlx::query_as::<_, FunctionNodeRow>(
+        "SELECT fs.id as symbol_id,
+                fs.file_id,
+                fs.name,
+                f.relative_path,
+                f.language,
+                fs.parent_id
+         FROM file_symbols fs
+         JOIN indexed_files f ON fs.file_id = f.id
+         WHERE f.project_id = $1 AND fs.kind = 'function'",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// One raw call edge for the call-graph cron — sourced from `symbol_references`
+/// rows where `ref_kind='call'` and the source is inside a known function.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RawCallEdgeRow {
+    pub source_file_id: i64,
+    pub source_symbol_id: Option<i64>,
+    pub target_file_id: Option<i64>,
+    pub target_symbol_id: Option<i64>,
+    pub target_raw: String,
+}
+
+/// Read all call-kind symbol_references for a project.
+pub async fn list_call_edges_for_project(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Vec<RawCallEdgeRow>, sqlx::Error> {
+    sqlx::query_as::<_, RawCallEdgeRow>(
+        "SELECT sr.source_file_id,
+                sr.source_symbol_id,
+                sr.target_file_id,
+                sr.target_symbol_id,
+                sr.target_raw
+         FROM symbol_references sr
+         JOIN indexed_files f ON sr.source_file_id = f.id
+         WHERE f.project_id = $1
+           AND sr.ref_kind = 'call'
+           AND sr.source_symbol_id IS NOT NULL",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Delete existing call edges for a project before re-populating.
+pub async fn delete_call_edges_for_project(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<u64, sqlx::Error> {
+    let res =
+        sqlx::query("DELETE FROM code_graph_edges WHERE project_id = $1 AND edge_type = 'call'")
+            .bind(project_id)
+            .execute(pool)
+            .await?;
+    Ok(res.rows_affected())
+}
+
+/// Bulk-insert call edges into `code_graph_edges` with `edge_type='call'`.
+/// Skips rows whose source_symbol_id is NULL (would violate CHECK constraint).
+pub async fn bulk_insert_call_edges(
+    pool: &PgPool,
+    project_id: i32,
+    edges: &[RawCallEdgeRow],
+) -> Result<u64, sqlx::Error> {
+    if edges.is_empty() {
+        return Ok(0);
+    }
+    let valid: Vec<&RawCallEdgeRow> = edges
+        .iter()
+        .filter(|e| e.source_symbol_id.is_some())
+        .collect();
+    if valid.is_empty() {
+        return Ok(0);
+    }
+    let project_ids: Vec<i32> = vec![project_id; valid.len()];
+    let source_files: Vec<i64> = valid.iter().map(|e| e.source_file_id).collect();
+    let target_files: Vec<Option<i64>> = valid.iter().map(|e| e.target_file_id).collect();
+    let source_symbols: Vec<i64> = valid
+        .iter()
+        .map(|e| e.source_symbol_id.expect("filtered above"))
+        .collect();
+    let target_symbols: Vec<Option<i64>> = valid.iter().map(|e| e.target_symbol_id).collect();
+    let target_raws: Vec<String> = valid.iter().map(|e| e.target_raw.clone()).collect();
+
+    let res = sqlx::query(
+        "INSERT INTO code_graph_edges
+            (project_id, source_file_id, target_file_id, source_symbol_id,
+             target_symbol_id, edge_type, target_raw, weight, computed_at)
+         SELECT u.project_id, u.source_file_id, u.target_file_id, u.source_symbol_id,
+                u.target_symbol_id, 'call', u.target_raw, 1.0, NOW()
+         FROM UNNEST(
+             $1::int4[], $2::int8[], $3::int8[], $4::int8[],
+             $5::int8[], $6::text[]
+         ) AS u(project_id, source_file_id, target_file_id, source_symbol_id,
+                target_symbol_id, target_raw)
+         ON CONFLICT (source_file_id, COALESCE(target_file_id, -1::BIGINT), edge_type, COALESCE(target_raw, '')) DO NOTHING",
+    )
+    .bind(&project_ids)
+    .bind(&source_files)
+    .bind(&target_files)
+    .bind(&source_symbols)
+    .bind(&target_symbols)
+    .bind(&target_raws)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Update `function_metrics.fan_in` / `fan_out` for a batch of function IDs.
+/// Rows whose function_id has no row in `function_metrics` are silently
+/// ignored (their metrics row hasn't been computed yet; the next
+/// function-metrics cron pass will populate it).
+pub async fn update_function_fan_io(
+    pool: &PgPool,
+    triples: &[(i64, i32, i32)], // (function_id, fan_in, fan_out)
+) -> Result<u64, sqlx::Error> {
+    if triples.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<i64> = triples.iter().map(|(i, _, _)| *i).collect();
+    let fis: Vec<i32> = triples.iter().map(|(_, fi, _)| *fi).collect();
+    let fos: Vec<i32> = triples.iter().map(|(_, _, fo)| *fo).collect();
+    let res = sqlx::query(
+        "UPDATE function_metrics
+         SET fan_in = u.fan_in, fan_out = u.fan_out
+         FROM UNNEST($1::int8[], $2::int4[], $3::int4[]) AS u(function_id, fan_in, fan_out)
+         WHERE function_metrics.function_id = u.function_id",
+    )
+    .bind(&ids)
+    .bind(&fis)
+    .bind(&fos)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Read the call-graph watermark for a project.
+pub async fn get_call_graph_watermark(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    let key = format!("call_graph_last_run:{}", project_id);
+    let val: Option<String> = sqlx::query_scalar("SELECT value FROM pgmcp_metadata WHERE key = $1")
+        .bind(&key)
+        .fetch_optional(pool)
+        .await?;
+    Ok(val.and_then(|s| {
+        DateTime::parse_from_rfc3339(&s)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    }))
+}
+
+/// Set the call-graph watermark for a project.
+pub async fn set_call_graph_watermark(
+    pool: &PgPool,
+    project_id: i32,
+    ts: DateTime<Utc>,
+) -> Result<(), sqlx::Error> {
+    let key = format!("call_graph_last_run:{}", project_id);
+    sqlx::query(
+        "INSERT INTO pgmcp_metadata (key, value) VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(&key)
+    .bind(ts.to_rfc3339())
+    .execute(pool)
+    .await?;
+    Ok(())
 }

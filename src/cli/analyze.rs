@@ -33,8 +33,8 @@ pub async fn run(
     num_clusters: Option<usize>,
     fuzziness: Option<f64>,
 ) -> anyhow::Result<()> {
-    crate::logging::init_cli();
     let config = Config::load(config_override)?;
+    crate::logging::init_cli_with_config(Some(&config));
     let pool = db::pool::create_pool(&config.database).await?;
     db::migrations::run_migrations(&pool, &config.vector).await?;
 

@@ -57,7 +57,7 @@ pub async fn tool_pattern_abstraction(
         ));
     }
 
-    info!(
+    debug!(
         tool = "pattern_abstraction_candidates",
         min_sim, max_sim, min_membership, min_cluster_size, worktree_filter, "MCP tool invoked",
     );

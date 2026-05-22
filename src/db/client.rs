@@ -79,6 +79,15 @@ pub trait DbClient: Send + Sync {
     async fn language_summary(&self, project_name: &str)
     -> Result<Vec<LanguageCount>, sqlx::Error>;
     async fn update_project_scanned(&self, project_id: i32) -> Result<(), sqlx::Error>;
+    /// Bulk-bump `last_scanned_at` for every project whose
+    /// `workspace_path` matches the given string. Called by the scanner
+    /// / rescan paths after a full walk completes — catches the
+    /// "scan happened, nothing changed" case that the per-file
+    /// `upsert_project` path misses.
+    async fn update_projects_scanned_by_workspace(
+        &self,
+        workspace_path: &str,
+    ) -> Result<u64, sqlx::Error>;
     async fn delete_projects_by_workspace(&self, workspace_path: &str) -> Result<u64, sqlx::Error>;
     async fn cleanup_orphaned_projects(&self) -> Result<u64, sqlx::Error>;
     async fn list_project_names(&self) -> Result<Vec<String>, sqlx::Error>;
@@ -432,6 +441,13 @@ impl DbClient for PgPool {
 
     async fn update_project_scanned(&self, project_id: i32) -> Result<(), sqlx::Error> {
         queries::update_project_scanned(self, project_id).await
+    }
+
+    async fn update_projects_scanned_by_workspace(
+        &self,
+        workspace_path: &str,
+    ) -> Result<u64, sqlx::Error> {
+        queries::update_projects_scanned_by_workspace(self, workspace_path).await
     }
 
     async fn delete_projects_by_workspace(&self, workspace_path: &str) -> Result<u64, sqlx::Error> {

@@ -70,7 +70,7 @@ pub async fn tool_search_mandates(
         ));
     }
 
-    info!(
+    debug!(
         tool = "search_mandates",
         query = %truncate(&params.query, 200),
         polarity = params.polarity.as_deref().unwrap_or("*"),

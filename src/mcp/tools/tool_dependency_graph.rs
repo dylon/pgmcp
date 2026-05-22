@@ -33,7 +33,7 @@ pub async fn tool_dependency_graph(
         .map(|v| v.iter().map(|s| s.as_str()).collect::<Vec<_>>())
         .unwrap_or_else(|| vec!["import"]);
 
-    info!(
+    debug!(
         tool = "dependency_graph",
         project = %params.project,
         focus_file = params.focus_file.as_deref().unwrap_or("*"),

@@ -46,7 +46,7 @@ pub async fn tool_reviewer_recommender(
         .into_iter()
         .collect();
 
-    info!(
+    debug!(
         tool = "reviewer_recommender",
         project = %params.project,
         file_count = params.files.len(),

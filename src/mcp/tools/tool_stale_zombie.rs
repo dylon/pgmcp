@@ -42,7 +42,7 @@ pub async fn tool_stale_zombie(
     let max_pagerank_pct = params.max_pagerank_pct.unwrap_or(0.25).clamp(0.0, 1.0);
     let limit = params.limit.unwrap_or(30).max(1);
 
-    info!(
+    debug!(
         tool = "stale_zombie_detector",
         project = %params.project,
         min_days_idle,

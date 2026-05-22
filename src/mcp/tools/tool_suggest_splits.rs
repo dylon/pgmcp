@@ -33,7 +33,7 @@ pub async fn tool_suggest_splits(
     let min_topics = params.min_topics.unwrap_or(3) as usize;
     let limit = params.limit.unwrap_or(20);
 
-    info!(
+    debug!(
         tool = "suggest_splits",
         project = %params.project,
         language = language_param,

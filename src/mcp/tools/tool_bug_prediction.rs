@@ -25,7 +25,7 @@ pub async fn tool_bug_prediction(
 
     let limit = params.limit.unwrap_or(20);
 
-    info!(
+    debug!(
         tool = "bug_prediction",
         project = %params.project,
         limit,

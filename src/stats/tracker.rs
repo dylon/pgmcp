@@ -10,12 +10,53 @@ use tokio::sync::mpsc;
 
 use crate::stats::telemetry_writer::TelemetryRow;
 
-/// Outcome of the most recent run of a named cron job. `Ok` covers both
-/// requeue-true and stop-false return values of the task closure;
-/// `Panicked` covers anything `catch_unwind` caught.
+/// Why a heavy-cron closure returned early without entering its work
+/// body. Recorded alongside the closure-level `CronJobOutcome::Skipped`
+/// so an operator tailing `index_stats` can tell *which* of the three
+/// silent-skip paths is currently silencing the job.
+///
+/// - `PhaseGate`: the `is_at_least(DaemonPhase::Ready)` check rejected
+///   the tick. The daemon is still scanning / initializing.
+/// - `Cooldown`: the per-job ready-relative delay
+///   (`ready_<job>_delay_secs`) hasn't elapsed yet. The daemon reached
+///   `Ready` recently but not long enough ago for this cron to fire.
+/// - `LockBusy`: `heavy_cron_lock.try_lock()` lost the race to another
+///   heavy cron. Six of seven heavy crons will skip this way each tick
+///   while one runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    PhaseGate,
+    Cooldown,
+    LockBusy,
+}
+
+impl SkipReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SkipReason::PhaseGate => "phase_gate",
+            SkipReason::Cooldown => "cooldown",
+            SkipReason::LockBusy => "lock_busy",
+        }
+    }
+}
+
+/// Outcome of the most recent run of a named cron job.
+///
+/// - `Ok`: closure entered the work body and the body completed
+///   (whether or not it did N units of work — `<job>_runs` counters
+///   track that separately at the top of each body).
+/// - `NoOp`: closure entered the work body but the body's empty-data
+///   path returned immediately (e.g. `max_chunk_id == 0`, no
+///   projects, no embeddings yet). Distinguishes "scan ran, nothing
+///   to do" from "scan never ran".
+/// - `Skipped(reason)`: closure returned at one of the three gates
+///   before entering the body. See [`SkipReason`].
+/// - `Panicked`: anything `catch_unwind` caught.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CronJobOutcome {
     Ok,
+    NoOp,
+    Skipped(SkipReason),
     Panicked,
 }
 
@@ -23,6 +64,10 @@ impl CronJobOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
             CronJobOutcome::Ok => "ok",
+            CronJobOutcome::NoOp => "no_op",
+            CronJobOutcome::Skipped(SkipReason::PhaseGate) => "skipped:phase_gate",
+            CronJobOutcome::Skipped(SkipReason::Cooldown) => "skipped:cooldown",
+            CronJobOutcome::Skipped(SkipReason::LockBusy) => "skipped:lock_busy",
             CronJobOutcome::Panicked => "panicked",
         }
     }
@@ -272,6 +317,11 @@ pub struct StatsTracker {
     pub files_scanned: AtomicU64,
     pub files_skipped: AtomicU64,
     pub files_stale_removed: AtomicU64,
+    /// Rows updated by `update_projects_scanned_by_workspace` calls — one
+    /// per successful workspace walk completion (initial scan + every
+    /// rescan command). A reliable "did the scanner actually run" signal
+    /// for external freshness comparators.
+    pub last_scanned_writes: AtomicU64,
 
     // Pool state
     pub active_work_pool_threads: AtomicU64,
@@ -284,6 +334,32 @@ pub struct StatsTracker {
     // Git history counters
     pub git_commits_indexed: AtomicU64,
     pub git_commits_failed: AtomicU64,
+    /// Number of `git-history-index` cron body invocations that reached
+    /// their work-eligible state (counter promoted to top-of-body). A
+    /// reliable "did this cron run?" signal regardless of whether new
+    /// commits were found. Pairs with `git_history_noop_returns`.
+    pub git_history_runs: AtomicU64,
+    /// Number of `git-history-index` cron body invocations that
+    /// returned early because there were no new commits to index.
+    pub git_history_noop_returns: AtomicU64,
+    /// Number of `graph-analysis` cron body invocations that returned
+    /// early because there were no eligible projects.
+    pub graph_build_noop_returns: AtomicU64,
+    /// Number of `symbol-extraction` cron body invocations that returned
+    /// early because there were no eligible projects.
+    pub symbol_extraction_noop_returns: AtomicU64,
+    /// Number of `function-metrics` cron body invocations that returned
+    /// early because there were no eligible projects.
+    pub function_metrics_noop_returns: AtomicU64,
+    /// Number of `call-graph` cron body invocations that returned early
+    /// because there were no eligible projects.
+    pub call_graph_noop_returns: AtomicU64,
+    /// Number of `similarity-scan` cron body invocations that returned
+    /// early because there were no chunks with embeddings.
+    pub similarity_noop_returns: AtomicU64,
+    /// Number of `topic-clustering` cron body invocations that returned
+    /// early because there were no chunks with embeddings.
+    pub topic_clustering_noop_returns: AtomicU64,
 
     // Config watcher counters
     pub config_reloads: AtomicU64,
@@ -513,6 +589,37 @@ pub struct StatsTracker {
     pub symbols_extracted: AtomicU64,
     pub symbol_references_inserted: AtomicU64,
 
+    // SOTA Phase 1 — per-function metrics + call graph.
+    /// Number of `function-metrics` cron passes completed.
+    pub function_metrics_runs: AtomicU64,
+    /// Total functions scored across all runs since daemon start.
+    pub functions_scored: AtomicU64,
+    /// Number of `call-graph` cron passes completed.
+    pub call_graph_runs: AtomicU64,
+    /// Tornhill `code_on_fire` MCP tool invocations.
+    pub code_on_fire_scans: AtomicU64,
+    /// `documented_tech_debt` MCP tool invocations.
+    pub documented_debt_scans: AtomicU64,
+
+    // A2A protocol counters (incoming-task lifecycle + SSE).
+    pub a2a_tasks_created: AtomicU64,
+    pub a2a_tasks_completed: AtomicU64,
+    pub a2a_tasks_canceled: AtomicU64,
+    pub a2a_tasks_failed: AtomicU64,
+    pub a2a_events_emitted: AtomicU64,
+    pub a2a_sse_connections: AtomicU64,
+
+    // A2A RecursiveMAS-inspired extensions: recursion rounds + collaboration
+    // patterns + specialty discovery. See plan
+    // `~/.claude/plans/what-state-of-the-art-sota-software-glistening-shore.md`.
+    pub a2a_recursive_rounds_executed: AtomicU64,
+    pub a2a_pattern_sequential_invocations: AtomicU64,
+    pub a2a_pattern_mixture_invocations: AtomicU64,
+    pub a2a_pattern_distillation_invocations: AtomicU64,
+    pub a2a_pattern_deliberation_invocations: AtomicU64,
+    pub a2a_peer_fanout_calls: AtomicU64,
+    pub a2a_specialty_lookups: AtomicU64,
+
     /// Currently-connected Streamable HTTP MCP sessions. Incremented when
     /// a peer issues an `initialize` and a session is created in the
     /// `LocalSessionManager` wrapper; decremented on session close /
@@ -639,12 +746,21 @@ impl StatsTracker {
             files_scanned: AtomicU64::new(0),
             files_skipped: AtomicU64::new(0),
             files_stale_removed: AtomicU64::new(0),
+            last_scanned_writes: AtomicU64::new(0),
             active_work_pool_threads: AtomicU64::new(0),
             work_pool_queue_depth: AtomicU64::new(0),
             cron_executions: AtomicU64::new(0),
             cron_panics: AtomicU64::new(0),
             git_commits_indexed: AtomicU64::new(0),
             git_commits_failed: AtomicU64::new(0),
+            git_history_runs: AtomicU64::new(0),
+            git_history_noop_returns: AtomicU64::new(0),
+            graph_build_noop_returns: AtomicU64::new(0),
+            symbol_extraction_noop_returns: AtomicU64::new(0),
+            function_metrics_noop_returns: AtomicU64::new(0),
+            call_graph_noop_returns: AtomicU64::new(0),
+            similarity_noop_returns: AtomicU64::new(0),
+            topic_clustering_noop_returns: AtomicU64::new(0),
             config_reloads: AtomicU64::new(0),
             config_reload_errors: AtomicU64::new(0),
             similarity_scans: AtomicU64::new(0),
@@ -739,6 +855,24 @@ impl StatsTracker {
             symbol_extraction_runs: AtomicU64::new(0),
             symbols_extracted: AtomicU64::new(0),
             symbol_references_inserted: AtomicU64::new(0),
+            function_metrics_runs: AtomicU64::new(0),
+            functions_scored: AtomicU64::new(0),
+            call_graph_runs: AtomicU64::new(0),
+            code_on_fire_scans: AtomicU64::new(0),
+            documented_debt_scans: AtomicU64::new(0),
+            a2a_tasks_created: AtomicU64::new(0),
+            a2a_tasks_completed: AtomicU64::new(0),
+            a2a_tasks_canceled: AtomicU64::new(0),
+            a2a_tasks_failed: AtomicU64::new(0),
+            a2a_events_emitted: AtomicU64::new(0),
+            a2a_sse_connections: AtomicU64::new(0),
+            a2a_recursive_rounds_executed: AtomicU64::new(0),
+            a2a_pattern_sequential_invocations: AtomicU64::new(0),
+            a2a_pattern_mixture_invocations: AtomicU64::new(0),
+            a2a_pattern_distillation_invocations: AtomicU64::new(0),
+            a2a_pattern_deliberation_invocations: AtomicU64::new(0),
+            a2a_peer_fanout_calls: AtomicU64::new(0),
+            a2a_specialty_lookups: AtomicU64::new(0),
             http_mcp_sessions: AtomicU64::new(0),
             peak_rss_bytes: AtomicU64::new(0),
             current_rss_bytes: AtomicU64::new(0),
@@ -919,11 +1053,20 @@ impl StatsTracker {
             "files_scanned": self.files_scanned.load(Ordering::Acquire),
             "files_skipped": self.files_skipped.load(Ordering::Acquire),
             "files_stale_removed": self.files_stale_removed.load(Ordering::Acquire),
+            "last_scanned_writes": self.last_scanned_writes.load(Ordering::Acquire),
             "active_work_pool_threads": self.active_work_pool_threads.load(Ordering::Acquire),
             "work_pool_queue_depth": self.work_pool_queue_depth.load(Ordering::Acquire),
             "cron_executions": self.cron_executions.load(Ordering::Acquire),
             "cron_panics": self.cron_panics.load(Ordering::Acquire),
             "git_commits_indexed": self.git_commits_indexed.load(Ordering::Acquire),
+            "git_history_runs": self.git_history_runs.load(Ordering::Acquire),
+            "git_history_noop_returns": self.git_history_noop_returns.load(Ordering::Acquire),
+            "graph_build_noop_returns": self.graph_build_noop_returns.load(Ordering::Acquire),
+            "symbol_extraction_noop_returns": self.symbol_extraction_noop_returns.load(Ordering::Acquire),
+            "function_metrics_noop_returns": self.function_metrics_noop_returns.load(Ordering::Acquire),
+            "call_graph_noop_returns": self.call_graph_noop_returns.load(Ordering::Acquire),
+            "similarity_noop_returns": self.similarity_noop_returns.load(Ordering::Acquire),
+            "topic_clustering_noop_returns": self.topic_clustering_noop_returns.load(Ordering::Acquire),
             "git_commits_failed": self.git_commits_failed.load(Ordering::Acquire),
             "config_reloads": self.config_reloads.load(Ordering::Acquire),
             "config_reload_errors": self.config_reload_errors.load(Ordering::Acquire),
@@ -1019,6 +1162,29 @@ impl StatsTracker {
             "symbol_extraction_runs": self.symbol_extraction_runs.load(Ordering::Acquire),
             "symbols_extracted": self.symbols_extracted.load(Ordering::Acquire),
             "symbol_references_inserted": self.symbol_references_inserted.load(Ordering::Acquire),
+            "function_metrics_runs": self.function_metrics_runs.load(Ordering::Acquire),
+            "functions_scored": self.functions_scored.load(Ordering::Acquire),
+            "call_graph_runs": self.call_graph_runs.load(Ordering::Acquire),
+            "code_on_fire_scans": self.code_on_fire_scans.load(Ordering::Acquire),
+            "documented_debt_scans": self.documented_debt_scans.load(Ordering::Acquire),
+            "a2a_tasks_created": self.a2a_tasks_created.load(Ordering::Acquire),
+            "a2a_tasks_completed": self.a2a_tasks_completed.load(Ordering::Acquire),
+            "a2a_tasks_canceled": self.a2a_tasks_canceled.load(Ordering::Acquire),
+            "a2a_tasks_failed": self.a2a_tasks_failed.load(Ordering::Acquire),
+            "a2a_events_emitted": self.a2a_events_emitted.load(Ordering::Acquire),
+            "a2a_sse_connections": self.a2a_sse_connections.load(Ordering::Acquire),
+            "a2a_recursive_rounds_executed":
+                self.a2a_recursive_rounds_executed.load(Ordering::Acquire),
+            "a2a_pattern_sequential_invocations":
+                self.a2a_pattern_sequential_invocations.load(Ordering::Acquire),
+            "a2a_pattern_mixture_invocations":
+                self.a2a_pattern_mixture_invocations.load(Ordering::Acquire),
+            "a2a_pattern_distillation_invocations":
+                self.a2a_pattern_distillation_invocations.load(Ordering::Acquire),
+            "a2a_pattern_deliberation_invocations":
+                self.a2a_pattern_deliberation_invocations.load(Ordering::Acquire),
+            "a2a_peer_fanout_calls": self.a2a_peer_fanout_calls.load(Ordering::Acquire),
+            "a2a_specialty_lookups": self.a2a_specialty_lookups.load(Ordering::Acquire),
             "http_mcp_sessions": self.http_mcp_sessions.load(Ordering::Acquire),
             "telemetry_rows_written": self.telemetry_rows_written.load(Ordering::Acquire),
             "telemetry_writes_dropped": self.telemetry_writes_dropped.load(Ordering::Acquire),

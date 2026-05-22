@@ -1737,6 +1737,22 @@ pub(super) fn descriptors() -> Vec<SourceDescriptor> {
             ],
             tags: &["ml", "llm", "agent"],
         },
+        SourceDescriptor {
+            source_family: "recursive_mas",
+            title: "Yang et al. 2026 — Recursive Multi-Agent Systems",
+            url: "https://arxiv.org/abs/2604.25917",
+            mirrors: &[],
+            license_label: "arXiv preprint",
+            source_type: "paper",
+            ingest_policy: "local_opt_in",
+            pattern_slugs: &[
+                "multi_agent_sequential_collaboration",
+                "multi_agent_mixture_collaboration",
+                "multi_agent_distillation_collaboration",
+                "multi_agent_deliberation_collaboration",
+            ],
+            tags: &["ml", "llm", "agent", "collaboration"],
+        },
         // ============================================================
         //              Round 2: Distributed data primitives
         // ============================================================

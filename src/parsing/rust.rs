@@ -20,6 +20,10 @@ use syn::{
 };
 
 use crate::parsing::backend::LanguageBackend;
+use crate::parsing::complexity;
+use crate::parsing::function_metrics::{
+    CognitiveIncrement, CognitiveKind, FunctionMetrics, ScoringInput,
+};
 use crate::parsing::symbols::{Import, Symbol, SymbolKind, SymbolRefKind, SymbolReference};
 
 /// Static instance returned by `LanguageRegistry::for_language("rust")`.
@@ -92,6 +96,16 @@ impl LanguageBackend for RustBackend {
         let mut v = RefVisitor::default();
         v.visit_file(&file);
         v.out
+    }
+
+    fn extract_function_metrics(&self, content: &str) -> Vec<FunctionMetrics> {
+        let file = match syn::parse_file(content) {
+            Ok(f) => f,
+            Err(_) => return Vec::new(),
+        };
+        let mut v = ComplexityVisitor::default();
+        v.visit_file(&file);
+        v.into_metrics()
     }
 }
 
@@ -426,6 +440,461 @@ impl<'ast> Visit<'ast> for RefVisitor {
     }
 }
 
+// ============================================================================
+// extract_function_metrics — ComplexityVisitor (CC / Cognitive / Halstead /
+// NPath / panic-paths / unsafe-blocks)
+// ============================================================================
+
+use proc_macro2::{Delimiter, TokenStream, TokenTree};
+use std::collections::HashMap;
+
+/// Static set of Rust operator/punctuation/keyword tokens (η1 universe).
+/// Anything not in this set is classified as an operand.
+const RUST_OPERATOR_TOKENS: &[&str] = &[
+    // Arithmetic
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    // Comparison
+    "==",
+    "!=",
+    "<",
+    ">",
+    "<=",
+    ">=",
+    // Logical
+    "&&",
+    "||",
+    "!",
+    // Bitwise
+    "&",
+    "|",
+    "^",
+    "<<",
+    ">>",
+    "~",
+    // Assignment
+    "=",
+    "+=",
+    "-=",
+    "*=",
+    "/=",
+    "%=",
+    "&=",
+    "|=",
+    "^=",
+    "<<=",
+    ">>=",
+    // Path / member
+    "::",
+    ".",
+    "->",
+    "=>",
+    // Range
+    "..",
+    "..=",
+    "...",
+    // Try
+    "?",
+    // Brackets (each pair counted as two operators)
+    "(",
+    ")",
+    "{",
+    "}",
+    "[",
+    "]",
+    // Punctuation
+    ",",
+    ";",
+    ":",
+    "@",
+    "#",
+    "$",
+    // Reserved keywords classified as operators (control-flow + binding)
+    "if",
+    "else",
+    "match",
+    "while",
+    "loop",
+    "for",
+    "in",
+    "return",
+    "break",
+    "continue",
+    "let",
+    "mut",
+    "ref",
+    "fn",
+    "impl",
+    "trait",
+    "struct",
+    "enum",
+    "type",
+    "const",
+    "static",
+    "use",
+    "mod",
+    "pub",
+    "as",
+    "self",
+    "Self",
+    "super",
+    "crate",
+    "where",
+    "move",
+    "async",
+    "await",
+    "dyn",
+    "unsafe",
+    "extern",
+    "macro_rules",
+    "yield",
+];
+
+#[derive(Default)]
+struct ComplexityVisitor {
+    /// Stack of function scopes. Nested `fn` items push/pop their own scope so
+    /// each gets its own metrics row.
+    scopes: Vec<FunctionScope>,
+    /// Emitted rows (one per function).
+    out: Vec<FunctionMetrics>,
+}
+
+struct FunctionScope {
+    name: String,
+    start_line: u32,
+    end_line: u32,
+    decision_points: u32,
+    cognitive_increments: Vec<CognitiveIncrement>,
+    operators: HashMap<&'static str, u32>,
+    operands: HashMap<String, u32>,
+    npath_factors: Vec<u64>,
+    source_lines: u32,
+    comment_lines: u32,
+    panic_paths: u32,
+    unsafe_blocks: u32,
+    /// Current nesting depth (0 = function body top level).
+    depth: u8,
+}
+
+impl ComplexityVisitor {
+    fn enter_fn(
+        &mut self,
+        name: &Ident,
+        body_open: Span,
+        body_close: Span,
+        body_tokens: TokenStream,
+    ) {
+        let mut scope = FunctionScope {
+            name: name.to_string(),
+            start_line: span_line(name.span()),
+            end_line: span_line(body_close).max(span_line(body_open)),
+            decision_points: 0,
+            cognitive_increments: Vec::new(),
+            operators: HashMap::new(),
+            operands: HashMap::new(),
+            npath_factors: Vec::new(),
+            source_lines: span_line(body_close).saturating_sub(span_line(body_open)) + 1,
+            comment_lines: 0,
+            panic_paths: 0,
+            unsafe_blocks: 0,
+            depth: 0,
+        };
+        classify_tokens(body_tokens, &mut scope.operators, &mut scope.operands);
+        self.scopes.push(scope);
+    }
+
+    fn exit_fn(&mut self) {
+        if let Some(scope) = self.scopes.pop() {
+            let input = ScoringInput {
+                name: &scope.name,
+                start_line: scope.start_line,
+                end_line: scope.end_line,
+                decision_points: scope.decision_points,
+                cognitive_increments: scope.cognitive_increments,
+                operators: scope.operators,
+                operands: scope.operands,
+                npath_factors: scope.npath_factors,
+                source_lines: scope.source_lines,
+                comment_lines: scope.comment_lines,
+                panic_paths: scope.panic_paths,
+                unsafe_blocks: scope.unsafe_blocks,
+            };
+            self.out.push(complexity::score(&input));
+        }
+    }
+
+    /// Mutate the current scope (top of stack). No-op if not inside a function.
+    fn cur(&mut self) -> Option<&mut FunctionScope> {
+        self.scopes.last_mut()
+    }
+
+    fn into_metrics(self) -> Vec<FunctionMetrics> {
+        self.out
+    }
+}
+
+/// Classify a token stream into Halstead operator/operand buckets. Recurses
+/// into delimiter groups so nested expressions contribute their tokens.
+fn classify_tokens(
+    stream: TokenStream,
+    operators: &mut HashMap<&'static str, u32>,
+    operands: &mut HashMap<String, u32>,
+) {
+    for tt in stream {
+        match tt {
+            TokenTree::Punct(p) => {
+                let s = p.as_char().to_string();
+                if let Some(op) = match_operator(&s) {
+                    *operators.entry(op).or_insert(0) += 1;
+                }
+            }
+            TokenTree::Ident(id) => {
+                let name = id.to_string();
+                if let Some(op) = match_operator(&name) {
+                    *operators.entry(op).or_insert(0) += 1;
+                } else {
+                    *operands.entry(name).or_insert(0) += 1;
+                }
+            }
+            TokenTree::Literal(lit) => {
+                *operands.entry(lit.to_string()).or_insert(0) += 1;
+            }
+            TokenTree::Group(g) => {
+                // Count the delimiter pair as two operator occurrences if
+                // it's a recognized bracket; then recurse.
+                let (open, close) = match g.delimiter() {
+                    Delimiter::Parenthesis => (Some("("), Some(")")),
+                    Delimiter::Brace => (Some("{"), Some("}")),
+                    Delimiter::Bracket => (Some("["), Some("]")),
+                    Delimiter::None => (None, None),
+                };
+                if let (Some(o), Some(c)) = (open, close) {
+                    *operators.entry(o).or_insert(0) += 1;
+                    *operators.entry(c).or_insert(0) += 1;
+                }
+                classify_tokens(g.stream(), operators, operands);
+            }
+        }
+    }
+}
+
+/// Return the static-string equivalent of an operator token, or None if the
+/// token is not a recognized operator/keyword.
+fn match_operator(s: &str) -> Option<&'static str> {
+    RUST_OPERATOR_TOKENS.iter().copied().find(|t| *t == s)
+}
+
+/// Recognize Rust's panic-leaf macro names.
+fn is_panic_macro(name: &str) -> bool {
+    matches!(
+        name,
+        "panic" | "assert" | "assert_eq" | "assert_ne" | "unreachable" | "todo" | "unimplemented"
+    )
+}
+
+impl<'ast> Visit<'ast> for ComplexityVisitor {
+    fn visit_item_fn(&mut self, node: &'ast ItemFn) {
+        let body_tokens = node.block.to_token_stream();
+        self.enter_fn(
+            &node.sig.ident,
+            node.block.brace_token.span.open().span(),
+            node.block.brace_token.span.close().span(),
+            body_tokens,
+        );
+        visit::visit_item_fn(self, node);
+        self.exit_fn();
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        let body_tokens = node.block.to_token_stream();
+        self.enter_fn(
+            &node.sig.ident,
+            node.block.brace_token.span.open().span(),
+            node.block.brace_token.span.close().span(),
+            body_tokens,
+        );
+        visit::visit_impl_item_fn(self, node);
+        self.exit_fn();
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        // Only score trait methods that have a default body.
+        if let Some(block) = &node.default {
+            let body_tokens = block.to_token_stream();
+            self.enter_fn(
+                &node.sig.ident,
+                block.brace_token.span.open().span(),
+                block.brace_token.span.close().span(),
+                body_tokens,
+            );
+            visit::visit_trait_item_fn(self, node);
+            self.exit_fn();
+        } else {
+            visit::visit_trait_item_fn(self, node);
+        }
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        if let Some(s) = self.cur() {
+            s.decision_points = s.decision_points.saturating_add(1);
+            s.cognitive_increments.push(CognitiveIncrement {
+                depth: s.depth,
+                kind: CognitiveKind::NestedCondition,
+            });
+            s.npath_factors
+                .push(if node.else_branch.is_some() { 2 } else { 1 });
+            s.depth = s.depth.saturating_add(1);
+        }
+        visit::visit_expr_if(self, node);
+        if let Some(s) = self.cur() {
+            s.depth = s.depth.saturating_sub(1);
+        }
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        if let Some(s) = self.cur() {
+            // Each arm beyond the first is a decision point.
+            let arms = node.arms.len() as u32;
+            s.decision_points = s.decision_points.saturating_add(arms.saturating_sub(1));
+            s.cognitive_increments.push(CognitiveIncrement {
+                depth: s.depth,
+                kind: CognitiveKind::NestedCondition,
+            });
+            s.npath_factors.push(arms.max(1) as u64);
+            s.depth = s.depth.saturating_add(1);
+        }
+        visit::visit_expr_match(self, node);
+        if let Some(s) = self.cur() {
+            s.depth = s.depth.saturating_sub(1);
+        }
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        self.bump_loop();
+        visit::visit_expr_while(self, node);
+        if let Some(s) = self.cur() {
+            s.depth = s.depth.saturating_sub(1);
+        }
+    }
+
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        self.bump_loop();
+        visit::visit_expr_for_loop(self, node);
+        if let Some(s) = self.cur() {
+            s.depth = s.depth.saturating_sub(1);
+        }
+    }
+
+    fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+        self.bump_loop();
+        visit::visit_expr_loop(self, node);
+        if let Some(s) = self.cur() {
+            s.depth = s.depth.saturating_sub(1);
+        }
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        if matches!(node.op, syn::BinOp::And(_) | syn::BinOp::Or(_))
+            && let Some(s) = self.cur()
+        {
+            s.decision_points = s.decision_points.saturating_add(1);
+            s.cognitive_increments.push(CognitiveIncrement {
+                depth: s.depth,
+                kind: CognitiveKind::LogicalSequence,
+            });
+            s.npath_factors.push(2);
+        }
+        visit::visit_expr_binary(self, node);
+    }
+
+    fn visit_expr_try(&mut self, node: &'ast syn::ExprTry) {
+        if let Some(s) = self.cur() {
+            s.decision_points = s.decision_points.saturating_add(1);
+            s.npath_factors.push(2);
+        }
+        visit::visit_expr_try(self, node);
+    }
+
+    fn visit_expr_unsafe(&mut self, node: &'ast syn::ExprUnsafe) {
+        if let Some(s) = self.cur() {
+            s.unsafe_blocks = s.unsafe_blocks.saturating_add(1);
+        }
+        visit::visit_expr_unsafe(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        let name = node.method.to_string();
+        if matches!(name.as_str(), "unwrap" | "expect")
+            && let Some(s) = self.cur()
+        {
+            s.panic_paths = s.panic_paths.saturating_add(1);
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_macro(&mut self, node: &'ast syn::ExprMacro) {
+        if let Some(seg) = node.mac.path.segments.last() {
+            let name = seg.ident.to_string();
+            if is_panic_macro(&name)
+                && let Some(s) = self.cur()
+            {
+                s.panic_paths = s.panic_paths.saturating_add(1);
+            }
+        }
+        visit::visit_expr_macro(self, node);
+    }
+
+    fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+        if let Some(seg) = node.mac.path.segments.last() {
+            let name = seg.ident.to_string();
+            if is_panic_macro(&name)
+                && let Some(s) = self.cur()
+            {
+                s.panic_paths = s.panic_paths.saturating_add(1);
+            }
+        }
+        visit::visit_stmt_macro(self, node);
+    }
+
+    // Break and continue contribute cognitive +1 each (BreakInFlow).
+    fn visit_expr_break(&mut self, node: &'ast syn::ExprBreak) {
+        if let Some(s) = self.cur() {
+            s.cognitive_increments.push(CognitiveIncrement {
+                depth: s.depth,
+                kind: CognitiveKind::BreakInFlow,
+            });
+        }
+        visit::visit_expr_break(self, node);
+    }
+
+    fn visit_expr_continue(&mut self, node: &'ast syn::ExprContinue) {
+        if let Some(s) = self.cur() {
+            s.cognitive_increments.push(CognitiveIncrement {
+                depth: s.depth,
+                kind: CognitiveKind::BreakInFlow,
+            });
+        }
+        visit::visit_expr_continue(self, node);
+    }
+}
+
+impl ComplexityVisitor {
+    fn bump_loop(&mut self) {
+        if let Some(s) = self.cur() {
+            s.decision_points = s.decision_points.saturating_add(1);
+            s.cognitive_increments.push(CognitiveIncrement {
+                depth: s.depth,
+                kind: CognitiveKind::NestedCondition,
+            });
+            s.npath_factors.push(2);
+            s.depth = s.depth.saturating_add(1);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -616,5 +1085,202 @@ extern crate proc_macro2 as pm2;
     #[test]
     fn language_name_is_rust() {
         assert_eq!(RUST_BACKEND.language_name(), "rust");
+    }
+
+    // ========================================================================
+    // ComplexityVisitor tests (SOTA Phase 1, A1)
+    // ========================================================================
+
+    #[test]
+    fn cc_for_empty_fn_is_one() {
+        let src = "fn empty() {}";
+        let metrics = RUST_BACKEND.extract_function_metrics(src);
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].name, "empty");
+        assert_eq!(metrics[0].cyclomatic, 1);
+    }
+
+    #[test]
+    fn cc_for_if_else_match() {
+        let src = r#"
+fn branchy(x: i32) -> i32 {
+    if x > 0 {
+        1
+    } else {
+        match x {
+            -1 => -1,
+            -2 => -2,
+            _ => 0,
+        }
+    }
+}
+"#;
+        let metrics = RUST_BACKEND.extract_function_metrics(src);
+        assert_eq!(metrics.len(), 1);
+        // 1 if + 2 extra match arms = 3 decision points → CC = 4
+        assert_eq!(metrics[0].cyclomatic, 4);
+    }
+
+    #[test]
+    fn cognitive_increments_with_nesting() {
+        let src = r#"
+fn deep(x: i32) -> i32 {
+    if x > 0 {
+        if x > 1 {
+            return 2;
+        }
+    }
+    0
+}
+"#;
+        let metrics = RUST_BACKEND.extract_function_metrics(src);
+        // outer if: +1, inner if: +1+1=2 → total cognitive=3
+        assert!(
+            metrics[0].cognitive >= 3,
+            "got cognitive = {}",
+            metrics[0].cognitive
+        );
+    }
+
+    #[test]
+    fn halstead_counts_operators_in_simple_fn() {
+        let src = "fn add(a: i32, b: i32) -> i32 { a + b }";
+        let metrics = RUST_BACKEND.extract_function_metrics(src);
+        assert_eq!(metrics.len(), 1);
+        // The body is `{ a + b }`. Operators include `{`, `}`, `+`. Operands
+        // include `a` and `b`. Both η1 and η2 must be > 0.
+        assert!(metrics[0].halstead.n1 > 0);
+        assert!(metrics[0].halstead.n2 > 0);
+    }
+
+    #[test]
+    fn unsafe_blocks_counted() {
+        let src = r#"
+fn dangerous() {
+    unsafe {
+        let _x: *const i32 = std::ptr::null();
+    }
+    unsafe {
+        let _y: *const i32 = std::ptr::null();
+    }
+}
+"#;
+        let metrics = RUST_BACKEND.extract_function_metrics(src);
+        assert_eq!(metrics[0].unsafe_blocks, 2);
+    }
+
+    #[test]
+    fn panic_paths_counted_for_unwrap_and_macros() {
+        let src = r#"
+fn risky(x: Option<i32>) -> i32 {
+    let v = x.unwrap();
+    if v < 0 {
+        panic!("negative");
+    }
+    assert!(v > 0);
+    v
+}
+"#;
+        let metrics = RUST_BACKEND.extract_function_metrics(src);
+        // unwrap + panic + assert = 3 panic-leaves
+        assert_eq!(metrics[0].panic_paths, 3);
+    }
+
+    #[test]
+    fn impl_methods_score_independently() {
+        let src = r#"
+struct S;
+impl S {
+    fn method_a(&self) -> i32 {
+        if true { 1 } else { 0 }
+    }
+    fn method_b(&self) {}
+}
+"#;
+        let metrics = RUST_BACKEND.extract_function_metrics(src);
+        let names: Vec<&str> = metrics.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"method_a"));
+        assert!(names.contains(&"method_b"));
+        let a = metrics
+            .iter()
+            .find(|m| m.name == "method_a")
+            .expect("method_a");
+        let b = metrics
+            .iter()
+            .find(|m| m.name == "method_b")
+            .expect("method_b");
+        assert_eq!(a.cyclomatic, 2); // one if
+        assert_eq!(b.cyclomatic, 1); // empty
+    }
+
+    #[test]
+    fn try_operator_counts_as_decision() {
+        let src = r#"
+fn parse(s: &str) -> Result<i32, String> {
+    let v = s.parse::<i32>().map_err(|e| e.to_string())?;
+    Ok(v)
+}
+"#;
+        let metrics = RUST_BACKEND.extract_function_metrics(src);
+        assert!(
+            metrics[0].cyclomatic >= 2,
+            "got CC = {}",
+            metrics[0].cyclomatic
+        );
+    }
+
+    #[test]
+    fn loop_counts_as_decision() {
+        let src = r#"
+fn sum(xs: &[i32]) -> i32 {
+    let mut s = 0;
+    for x in xs {
+        s += x;
+    }
+    s
+}
+"#;
+        let metrics = RUST_BACKEND.extract_function_metrics(src);
+        assert_eq!(metrics[0].cyclomatic, 2);
+    }
+
+    #[test]
+    fn parse_error_yields_empty_fn_metrics() {
+        let bogus = "this is not valid Rust { syntax";
+        assert!(RUST_BACKEND.extract_function_metrics(bogus).is_empty());
+    }
+
+    #[test]
+    fn boolean_and_or_count_as_decisions() {
+        let src = r#"
+fn check(a: bool, b: bool, c: bool) -> bool {
+    a && b || c
+}
+"#;
+        let metrics = RUST_BACKEND.extract_function_metrics(src);
+        // a && b = +1, ... || c = +1 → CC = 3
+        assert!(
+            metrics[0].cyclomatic >= 3,
+            "got CC = {}",
+            metrics[0].cyclomatic
+        );
+    }
+
+    #[test]
+    fn npath_non_overflow_for_typical_fn() {
+        let src = r#"
+fn typical(x: i32) -> i32 {
+    if x > 0 {
+        x * 2
+    } else {
+        -x
+    }
+}
+"#;
+        let metrics = RUST_BACKEND.extract_function_metrics(src);
+        assert!(matches!(
+            metrics[0].npath,
+            crate::parsing::function_metrics::NPathValue::Counted(2)
+        ));
     }
 }

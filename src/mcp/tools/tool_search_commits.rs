@@ -24,7 +24,7 @@ pub async fn tool_search_commits(
     ctx.stats().commit_searches.fetch_add(1, Ordering::Relaxed);
 
     let limit = params.limit.unwrap_or(10);
-    info!(
+    debug!(
         tool = "search_commits",
         query = %truncate(&params.query, 200),
         limit,

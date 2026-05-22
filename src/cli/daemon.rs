@@ -522,6 +522,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             lifecycle: lifecycle.clone(),
             llm_extractor: api_llm_extractor,
             extractor_debounce,
+            system_ctx: system_ctx.clone(),
         };
 
         let router = axum::Router::new()
@@ -540,6 +541,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
                 "/api/session/observe",
                 axum::routing::post(api::handlers::session_observe),
             )
+            .merge(crate::a2a::a2a_router())
             .with_state(api_state);
         let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)
             .await

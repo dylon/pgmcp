@@ -286,7 +286,8 @@ fn worker_loop(
                 // Execute with catch_unwind for resilience
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
                 if let Err(e) = result {
-                    tracing::error!(worker_id = id, panic = ?e, "Worker task panicked");
+                    let msg = panic_payload_message(&e);
+                    tracing::error!(worker_id = id, panic = %msg, "Worker task panicked");
                 }
                 tasks_completed.fetch_add(1, Ordering::Relaxed);
             }
@@ -301,7 +302,8 @@ fn worker_loop(
                     Ok(task) => {
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
                         if let Err(e) = result {
-                            tracing::error!(worker_id = id, panic = ?e, "Worker task panicked");
+                            let msg = panic_payload_message(&e);
+                            tracing::error!(worker_id = id, panic = %msg, "Worker task panicked");
                         }
                         tasks_completed.fetch_add(1, Ordering::Relaxed);
                     }
@@ -316,10 +318,61 @@ fn worker_loop(
     debug!(worker_id = id, "Worker exiting");
 }
 
+/// Extract a human-readable message from a `catch_unwind` payload.
+/// `Box<dyn Any>` formatted with `?` produces only the unhelpful
+/// `Any { .. }`; downcasting to the standard `panic!("...")` payload
+/// types recovers the actual message.
+fn panic_payload_message(payload: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        return (*s).to_string();
+    }
+    if let Some(s) = payload.downcast_ref::<String>() {
+        return s.clone();
+    }
+    "<non-string panic payload>".to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn panic_payload_recovers_static_str_message() {
+        // `panic!("static")` puts a `&'static str` in the Any payload —
+        // the most common shape from manual panics and `.expect(...)`.
+        let payload =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panic!("boom"))).unwrap_err();
+        assert_eq!(panic_payload_message(&payload), "boom");
+    }
+
+    #[test]
+    fn panic_payload_recovers_owned_string_message() {
+        // `panic!("{}", fmt)` puts a `String` in the payload — what
+        // formatted panics and most third-party `bail!` macros produce.
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let n: u32 = 42;
+            panic!("formatted={n}");
+        }))
+        .unwrap_err();
+        assert_eq!(panic_payload_message(&payload), "formatted=42");
+    }
+
+    #[test]
+    fn panic_payload_describes_non_string_payload() {
+        // Some panics carry arbitrary `dyn Any + Send` (e.g. user code
+        // calling `std::panic::panic_any(SomeStruct {..})`). The helper
+        // must not crash; it returns a sentinel so operators see *something*
+        // useful instead of the previous `Any { .. }` debug-print.
+        let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::panic::panic_any(42_i64);
+        }))
+        .unwrap_err();
+        assert_eq!(
+            panic_payload_message(&payload),
+            "<non-string panic payload>"
+        );
+    }
 
     #[test]
     fn test_work_pool_basic() {

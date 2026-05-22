@@ -26,7 +26,7 @@ pub async fn tool_code_summarize(
     let scope = params.scope.as_deref().unwrap_or("project");
     let detail = params.detail.as_deref().unwrap_or("standard");
 
-    info!(
+    debug!(
         tool = "code_summarize",
         project = %params.project,
         scope,

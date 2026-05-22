@@ -25,7 +25,7 @@ pub async fn tool_circular_dependencies(
 
     let max_cycle_length = params.max_cycle_length.unwrap_or(10) as usize;
 
-    info!(
+    debug!(
         tool = "circular_dependencies",
         project = %params.project,
         max_cycle_length,

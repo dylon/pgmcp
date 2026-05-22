@@ -5,6 +5,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 
 use crate::config::Config;
+use crate::context::SystemContext;
 use crate::daemon_state::DaemonLifecycle;
 use crate::db::DbClient;
 use crate::embed::pool::QueryEmbedder;
@@ -33,4 +34,7 @@ pub struct ApiState {
     /// Per-session debounce ledger for the Stage-B worker. Empty until
     /// the first observation; `extractor_worker` populates it.
     pub extractor_debounce: DebounceMap,
+    /// SystemContext used by the A2A dispatcher to invoke MCP tools.
+    /// Cheaply cloned (Arc-clone-per-field).
+    pub system_ctx: SystemContext,
 }

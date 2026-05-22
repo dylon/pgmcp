@@ -24,7 +24,11 @@ pub async fn run(
     json: bool,
     schema: bool,
 ) -> anyhow::Result<()> {
-    crate::logging::init_cli();
+    // Load config first so logging can tee CLI events to the daemon log
+    // file. `Config::load` returns `Config::default()` when the file is
+    // missing, so this also works for fresh installs.
+    let config = Config::load(config_override)?;
+    crate::logging::init_cli_with_config(Some(&config));
     // Tier 1: list / --schema — no DB, no embed model
     let catalog = mcp::server::McpServer::static_tool_catalog();
     match name {
@@ -38,7 +42,6 @@ pub async fn run(
         }
         Some(ref tool_name) => {
             // Tier 2+3: tool execution — DB required, embed model lazy
-            let config = Config::load(config_override)?;
             let pool = db::pool::create_pool(&config.database).await?;
             db::migrations::run_migrations(&pool, &config.vector).await?;
             let stats = Arc::new(stats::tracker::StatsTracker::new());

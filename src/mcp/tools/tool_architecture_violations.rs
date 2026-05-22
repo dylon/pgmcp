@@ -26,7 +26,7 @@ pub async fn tool_architecture_violations(
     let severity_threshold = params.severity_threshold.as_deref().unwrap_or("medium");
     let include_fixes = params.include_fixes.unwrap_or(true);
 
-    info!(
+    debug!(
         tool = "architecture_violations",
         project = %params.project,
         severity_threshold,

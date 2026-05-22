@@ -27,7 +27,7 @@ pub async fn tool_discover_topics(
     let limit = params.limit.unwrap_or(30);
     let refresh = params.refresh.unwrap_or(false);
 
-    info!(
+    debug!(
         tool = "discover_topics",
         project = params.project.as_deref().unwrap_or("*"),
         min_cluster_size,

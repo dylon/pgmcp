@@ -29,7 +29,7 @@ pub async fn tool_topic_hierarchy(
         .map(|p| format!("project:{}", p))
         .unwrap_or_else(|| "global".to_string());
 
-    info!(
+    debug!(
         tool = "topic_hierarchy",
         scope = %scope,
         num_groups = params.num_groups,

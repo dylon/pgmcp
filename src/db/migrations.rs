@@ -588,6 +588,308 @@ pub async fn run_migrations(
     }
 
     // ================================================================
+    // SOTA Phase 1 — Per-function metrics (G1)
+    //
+    // One row per `file_symbols` row of kind='function'. Populated by the
+    // `function-metrics` cron (src/cron/function_metrics.rs) after each
+    // symbol-extraction pass. CASCADE delete with file_symbols, so reindex
+    // invalidates derived metrics automatically.
+    //
+    // CC = McCabe cyclomatic complexity; cognitive = Sonar cognitive
+    // complexity; halstead_* = vocabulary/length counts feeding Volume,
+    // Difficulty, Effort, Bugs; NPath product of decision branches (capped
+    // at i64::MAX with overflow flag); MI = Maintainability Index
+    // clamped to [0, 100]; fan_in/fan_out filled by call-graph cron.
+    // ================================================================
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS function_metrics (
+            function_id BIGINT PRIMARY KEY REFERENCES file_symbols(id) ON DELETE CASCADE,
+            file_id BIGINT NOT NULL REFERENCES indexed_files(id) ON DELETE CASCADE,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            cyclomatic INTEGER NOT NULL DEFAULT 0,
+            cognitive INTEGER NOT NULL DEFAULT 0,
+            halstead_n1 INTEGER NOT NULL DEFAULT 0,
+            halstead_n2 INTEGER NOT NULL DEFAULT 0,
+            halstead_big_n1 INTEGER NOT NULL DEFAULT 0,
+            halstead_big_n2 INTEGER NOT NULL DEFAULT 0,
+            halstead_volume DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            halstead_difficulty DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            halstead_effort DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            halstead_bugs DOUBLE PRECISION NOT NULL DEFAULT 0.0,
+            npath BIGINT NOT NULL DEFAULT 1,
+            npath_overflow BOOLEAN NOT NULL DEFAULT FALSE,
+            loc INTEGER NOT NULL DEFAULT 0,
+            comment_lines INTEGER NOT NULL DEFAULT 0,
+            maintainability_index DOUBLE PRECISION NOT NULL DEFAULT 100.0,
+            fan_in INTEGER NOT NULL DEFAULT 0,
+            fan_out INTEGER NOT NULL DEFAULT 0,
+            panic_paths INTEGER NOT NULL DEFAULT 0,
+            unsafe_blocks INTEGER NOT NULL DEFAULT 0,
+            computed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    let function_metrics_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_function_metrics_file ON function_metrics(file_id)",
+        "CREATE INDEX IF NOT EXISTS idx_function_metrics_project ON function_metrics(project_id)",
+        "CREATE INDEX IF NOT EXISTS idx_function_metrics_cyclomatic_desc ON function_metrics(project_id, cyclomatic DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_function_metrics_cognitive_desc ON function_metrics(project_id, cognitive DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_function_metrics_mi_asc ON function_metrics(project_id, maintainability_index ASC)",
+    ];
+    for idx_sql in &function_metrics_indexes {
+        sqlx::query(idx_sql).execute(pool).await?;
+    }
+
+    // ================================================================
+    // SOTA Phase 1 — Symbol-resolved call graph (G2)
+    //
+    // Extends `code_graph_edges` with symbol-level endpoints. Rows with
+    // edge_type='call' MUST have source_symbol_id set; target_symbol_id
+    // may be NULL (unresolved external call, in which case target_raw
+    // holds the unresolved identifier).
+    //
+    // Decision (vs. parallel call_edges table): keep edges polymorphic so
+    // existing PageRank / betweenness / community-detection tools that
+    // filter on edge_type get call-graph variants for free.
+    // ================================================================
+    sqlx::query(
+        "ALTER TABLE code_graph_edges ADD COLUMN IF NOT EXISTS source_symbol_id BIGINT REFERENCES file_symbols(id) ON DELETE SET NULL",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE code_graph_edges ADD COLUMN IF NOT EXISTS target_symbol_id BIGINT REFERENCES file_symbols(id) ON DELETE SET NULL",
+    )
+    .execute(pool)
+    .await?;
+
+    let cge_symbol_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_cge_source_symbol ON code_graph_edges(source_symbol_id) WHERE source_symbol_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_cge_target_symbol ON code_graph_edges(target_symbol_id) WHERE target_symbol_id IS NOT NULL",
+    ];
+    for idx_sql in &cge_symbol_indexes {
+        sqlx::query(idx_sql).execute(pool).await?;
+    }
+
+    // Idempotent CHECK install — Postgres has no `ADD CONSTRAINT IF NOT EXISTS`
+    // so we DROP-then-ADD inside a single transaction to make re-runs cheap.
+    sqlx::query(
+        "ALTER TABLE code_graph_edges DROP CONSTRAINT IF EXISTS cge_call_needs_source_symbol",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE code_graph_edges ADD CONSTRAINT cge_call_needs_source_symbol CHECK (edge_type <> 'call' OR source_symbol_id IS NOT NULL)",
+    )
+    .execute(pool)
+    .await?;
+
+    // Re-tighten the source_symbol_id FK from ON DELETE SET NULL to ON DELETE
+    // CASCADE. The original SET NULL semantics conflict with the CHECK above:
+    // when a `file_symbols` row is deleted, the cascade tries to NULL out
+    // `source_symbol_id` on any call-edge that referenced it, which the CHECK
+    // immediately rejects — failing the parent DELETE transaction. This was
+    // observed in production as ~180/day "Symbol extraction failed for file
+    // (skipping)" warnings from `pgmcp::cron::symbol_extraction`. The
+    // semantically correct response is CASCADE: a call edge whose source
+    // symbol no longer exists is meaningless and should be removed too. The
+    // `target_symbol_id` FK keeps SET NULL because calls to external /
+    // unresolved symbols still carry useful information via `target_raw`.
+    //
+    // We look up the FK name and current ON DELETE action dynamically from
+    // `pg_constraint` rather than relying on the auto-generated
+    // `<table>_<col>_fkey` form, because some installs may have renamed
+    // it. The DO block is idempotent: it only rewrites the FK when the
+    // current action is NOT `c` (CASCADE), so re-running a daemon with an
+    // already-fixed DB is a no-op.
+    //
+    // `confdeltype` values per Postgres docs:
+    //   a = no action, r = restrict, c = cascade, n = set null, d = set default
+    sqlx::query(
+        "DO $$
+         DECLARE
+            con_name      TEXT;
+            con_deltype   CHAR(1);
+         BEGIN
+            SELECT conname, confdeltype INTO con_name, con_deltype
+              FROM pg_constraint c
+              JOIN pg_class t   ON t.oid = c.conrelid
+              JOIN pg_attribute a
+                ON a.attrelid = c.conrelid
+               AND a.attnum   = ANY (c.conkey)
+             WHERE t.relname = 'code_graph_edges'
+               AND a.attname = 'source_symbol_id'
+               AND c.contype = 'f'
+             LIMIT 1;
+            IF con_name IS NOT NULL AND con_deltype <> 'c' THEN
+                EXECUTE format('ALTER TABLE code_graph_edges DROP CONSTRAINT %I', con_name);
+                ALTER TABLE code_graph_edges
+                    ADD CONSTRAINT code_graph_edges_source_symbol_id_fkey
+                    FOREIGN KEY (source_symbol_id)
+                    REFERENCES file_symbols(id)
+                    ON DELETE CASCADE;
+            END IF;
+         END $$;",
+    )
+    .execute(pool)
+    .await?;
+
+    // ================================================================
+    // A2A (Agent-to-Agent) protocol tables
+    //
+    // Implements a substantive subset of Google's A2A spec
+    // (https://google.github.io/A2A/) so external agents (Claude Code,
+    // Codex CLI, etc.) can discover pgmcp's capabilities, submit Tasks,
+    // and receive streamed events.
+    // ================================================================
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS a2a_agents (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT NOT NULL UNIQUE,
+            version TEXT NOT NULL,
+            description TEXT,
+            url TEXT NOT NULL,
+            capabilities JSONB NOT NULL DEFAULT '{}'::jsonb,
+            skills JSONB NOT NULL DEFAULT '[]'::jsonb,
+            auth_schemes JSONB NOT NULL DEFAULT '[]'::jsonb,
+            registered_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            last_seen_at TIMESTAMPTZ,
+            specialty TEXT[] NOT NULL DEFAULT '{}',
+            recommended_role TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+    // Upgrade-path for existing installs that pre-date specialty / role.
+    sqlx::query(
+        "ALTER TABLE a2a_agents
+            ADD COLUMN IF NOT EXISTS specialty TEXT[] NOT NULL DEFAULT '{}'",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE a2a_agents
+            ADD COLUMN IF NOT EXISTS recommended_role TEXT",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_a2a_agents_specialty
+            ON a2a_agents USING GIN (specialty)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS a2a_tasks (
+            id UUID PRIMARY KEY,
+            session_id UUID,
+            requester_agent_id BIGINT REFERENCES a2a_agents(id) ON DELETE SET NULL,
+            skill_id TEXT,
+            status TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            completed_at TIMESTAMPTZ,
+            error TEXT,
+            push_notification_url TEXT,
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            recursion_rounds INTEGER NOT NULL DEFAULT 1,
+            current_round INTEGER NOT NULL DEFAULT 0,
+            parent_task_id UUID REFERENCES a2a_tasks(id) ON DELETE SET NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    // Upgrade-path for existing installs.
+    sqlx::query(
+        "ALTER TABLE a2a_tasks
+            ADD COLUMN IF NOT EXISTS recursion_rounds INTEGER NOT NULL DEFAULT 1",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE a2a_tasks
+            ADD COLUMN IF NOT EXISTS current_round INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE a2a_tasks
+            ADD COLUMN IF NOT EXISTS parent_task_id UUID
+                REFERENCES a2a_tasks(id) ON DELETE SET NULL",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_a2a_tasks_status ON a2a_tasks(status)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_a2a_tasks_session ON a2a_tasks(session_id)")
+        .execute(pool)
+        .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_a2a_tasks_parent ON a2a_tasks(parent_task_id)")
+        .execute(pool)
+        .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS a2a_messages (
+            id BIGSERIAL PRIMARY KEY,
+            task_id UUID NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            parts JSONB NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            sequence INTEGER NOT NULL
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_a2a_messages_task ON a2a_messages(task_id, sequence)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS a2a_artifacts (
+            id BIGSERIAL PRIMARY KEY,
+            task_id UUID NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
+            name TEXT,
+            parts JSONB NOT NULL,
+            artifact_index INTEGER NOT NULL DEFAULT 0,
+            append BOOLEAN NOT NULL DEFAULT FALSE,
+            last_chunk BOOLEAN NOT NULL DEFAULT FALSE,
+            metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            recursion_round INTEGER NOT NULL DEFAULT 0
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "ALTER TABLE a2a_artifacts
+            ADD COLUMN IF NOT EXISTS recursion_round INTEGER NOT NULL DEFAULT 0",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS a2a_events (
+            id BIGSERIAL PRIMARY KEY,
+            task_id UUID NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            payload JSONB NOT NULL,
+            sequence INTEGER NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_a2a_events_task ON a2a_events(task_id, sequence)")
+        .execute(pool)
+        .await?;
+
+    // ================================================================
     // Software pattern / anti-pattern knowledge index
     // ================================================================
 

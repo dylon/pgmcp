@@ -25,7 +25,7 @@ const REINDEX_DELETE_BATCH: i64 = 10_000;
 pub async fn tool_reindex(ctx: &SystemContext) -> Result<CallToolResult, McpError> {
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    info!(tool = "reindex", "MCP tool invoked");
+    debug!(tool = "reindex", "MCP tool invoked");
 
     // Refuse to run while another reindex is in flight. Two concurrent
     // reindexes race the embed pool's FK invariants and double the

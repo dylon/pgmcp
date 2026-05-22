@@ -23,7 +23,7 @@ pub async fn tool_project_tree(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
 
     let depth = params.depth.unwrap_or(5);
-    info!(
+    debug!(
         tool = "project_tree",
         project = %params.project,
         depth,

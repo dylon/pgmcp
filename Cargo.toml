@@ -123,6 +123,11 @@ tree-sitter-cpp = "0.23"
 # Migration path: switch to a published crate once available.
 tree-sitter-rholang = { package = "rholang-tree-sitter", path = "/home/dylon/Workspace/f1r3fly.io/rholang-rs/rholang-tree-sitter" }
 tree-sitter-clojure = "0.1"
+# Formal-verification grammars (post-SOTA addition). Coq has no published
+# tree-sitter crate yet — Coq's symbol/import extraction uses regex
+# patterns in `src/parsing/coq.rs` (still implements LanguageBackend).
+tree-sitter-tlaplus = "1.5"
+tree-sitter-lean4 = "0.3"
 # Rust backend uses the native `syn` parser instead of tree-sitter — replicates
 # the proven pattern from MeTTa-Compiler's `tools/gc-root-audit/` static
 # analysis. `proc-macro2 = { version = "1", features = ["span-locations"] }`
@@ -133,6 +138,19 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 memmap2 = "0.9"
 futures = "0.3"
 tempfile = "3"
+# SOTA Phase 3 (NCD clone detection): zstd compressor for the
+# Cilibrasi-Vitányi 2005 Normalized Compression Distance metric.
+zstd = { version = "0.13", default-features = false }
+# SOTA Phase 6 (CVE supply chain): Cargo.lock + Python requirements parsing.
+cargo-lock = "10"
+# SOTA Phase 6 (secret detection): Shannon-entropy scoring.
+entropy = "0.4"
+# SOTA Phase 7 (semver-break audit): rename detection via Levenshtein.
+strsim = "0.11"
+# SOTA Phase 9 (data engineering): SQL migration parsing.
+sqlparser = "0.55"
+# SOTA Phase 11 (commit topic drift): Porter stemming for TF-IDF.
+rust-stemmers = "1.2"
 cudarc = { version = "0.19.4", features = ["cublas", "cublaslt", "cuda-version-from-build-system", "f16"] }
 half = "2"
 heed = "0.20"

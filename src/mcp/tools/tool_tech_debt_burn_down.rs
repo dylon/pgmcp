@@ -51,7 +51,7 @@ pub async fn tool_tech_debt_burn_down(
         _ => 20.0,
     } * engineer_count as f64;
 
-    info!(
+    debug!(
         tool = "tech_debt_burn_down",
         project = %params.project,
         time_horizon,

@@ -40,7 +40,7 @@ pub async fn tool_recall_prompts(
             None => None,
         };
 
-    info!(
+    debug!(
         tool = "recall_prompts",
         query = %truncate(&params.query, 200),
         limit,

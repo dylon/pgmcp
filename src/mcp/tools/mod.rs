@@ -21,6 +21,8 @@
 // tool_architecture_violations.rs and tool_circular_dependencies.rs).
 pub mod fix_actions;
 pub mod fix_helpers;
+pub mod sota_helpers;
+pub mod sota_regex_scan;
 
 pub mod tool_adoption_lag;
 pub mod tool_anomaly_detection;
@@ -34,6 +36,7 @@ pub mod tool_change_impact_analysis;
 pub mod tool_chunk_clusters;
 pub mod tool_circular_dependencies;
 pub mod tool_client_profile;
+pub mod tool_code_on_fire;
 pub mod tool_code_summarize;
 pub mod tool_community_detection;
 pub mod tool_compare_files;
@@ -97,6 +100,96 @@ pub mod tool_test_coverage_gaps;
 pub mod tool_text_search;
 pub mod tool_topic_hierarchy;
 pub mod tool_topic_hierarchy_fcm;
+
+// SOTA Phase 2 — graph algorithms
+pub mod tool_attack_vulnerability;
+pub mod tool_edge_betweenness;
+pub mod tool_kcore_analysis;
+pub mod tool_ktruss_analysis;
+pub mod tool_motif_census;
+pub mod tool_personalized_pagerank;
+pub mod tool_structural_holes;
+
+// SOTA Phase 3 — information theory
+pub mod tool_cochange_mutual_information;
+pub mod tool_compression_distance;
+pub mod tool_identifier_entropy;
+pub mod tool_import_entropy;
+
+// SOTA Phase 4 — evolution + quality
+pub mod tool_bus_factor;
+pub mod tool_doc_code_drift;
+pub mod tool_flaky_test_candidates;
+pub mod tool_knowledge_silos;
+pub mod tool_mutation_score_surrogate;
+pub mod tool_ownership_coupling_mismatch;
+pub mod tool_test_smells;
+
+// SOTA Phase 5 — concurrency / safety / performance
+pub mod tool_blocking_in_async;
+pub mod tool_clone_density;
+pub mod tool_deadlock_candidates;
+pub mod tool_io_hotpath;
+pub mod tool_lockset_races;
+pub mod tool_missing_preallocation;
+pub mod tool_panic_paths;
+pub mod tool_quadratic_loops;
+pub mod tool_send_sync_violations;
+pub mod tool_unsafe_clusters;
+
+// SOTA Phase 6 — security
+pub mod tool_crypto_misuse;
+pub mod tool_cve_supply_chain;
+pub mod tool_injection_candidates;
+pub mod tool_secret_detection;
+pub mod tool_taint_analysis;
+pub mod tool_unprotected_routes;
+pub mod tool_unsafe_deserialization;
+
+// SOTA Phase 7 — API / contract
+pub mod tool_api_stability;
+pub mod tool_deprecated_but_used;
+pub mod tool_public_api_surface;
+pub mod tool_semver_break_audit;
+
+// SOTA Phase 8 — ML / embedding-based
+pub mod tool_embedding_outliers;
+pub mod tool_lsh_clone_detection;
+pub mod tool_multi_resolution_pagerank;
+pub mod tool_semantic_drift;
+
+// SOTA Phase 9 — data engineering
+pub mod tool_dead_columns;
+pub mod tool_migration_safety;
+pub mod tool_pii_spread;
+
+// SOTA Phase 10 — call-graph downstream
+pub mod tool_dead_code_reachability;
+pub mod tool_feature_envy;
+pub mod tool_lcom4;
+pub mod tool_shotgun_surgery;
+
+// SOTA Phase 11 — evolution analytics
+pub mod tool_commit_changepoint;
+pub mod tool_commit_topic_drift;
+pub mod tool_refactor_pressure;
+pub mod tool_release_api_stability;
+
+// Documented tech debt (post-SOTA addition)
+pub mod tool_documented_tech_debt;
+
+// A2A inter-agent IPC bridge — outbound MCP-side tools
+pub mod tool_a2a_cancel_task;
+pub mod tool_a2a_find_agents_by_specialty;
+pub mod tool_a2a_get_task;
+pub mod tool_a2a_list_agents;
+pub mod tool_a2a_pattern_deliberation;
+pub mod tool_a2a_pattern_distillation;
+pub mod tool_a2a_pattern_mixture;
+pub mod tool_a2a_pattern_sequential;
+pub mod tool_a2a_register_agent;
+pub mod tool_a2a_send_task;
+pub mod tool_a2a_subscribe_task;
 
 pub use tool_adoption_lag::tool_adoption_lag;
 pub use tool_anomaly_detection::tool_anomaly_detection;

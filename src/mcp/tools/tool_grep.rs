@@ -49,7 +49,7 @@ pub async fn tool_grep(
     let after = params.after_context.unwrap_or(0).max(0);
     let case_insensitive = params.case_insensitive.unwrap_or(false);
 
-    info!(
+    debug!(
         tool = "grep",
         pattern = %truncate(&params.pattern, 200),
         glob = params.glob.as_deref().unwrap_or("*"),

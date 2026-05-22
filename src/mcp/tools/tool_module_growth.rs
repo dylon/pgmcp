@@ -38,7 +38,7 @@ pub async fn tool_module_growth(
     };
     let lookback_buckets = params.lookback_buckets.unwrap_or(12).max(1);
 
-    info!(
+    debug!(
         tool = "module_growth_trajectory",
         project = %params.project,
         file = params.file.as_deref().unwrap_or("*"),

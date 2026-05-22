@@ -24,6 +24,32 @@ use crate::stats::tracker::StatsTracker;
 
 pub type UnixTimestampMs = u64;
 
+/// Compute a per-job initial-delay offset that scatters heavy crons
+/// across their interval window. Without this, every cron with
+/// `initial_delay_ms = 1_000` fires together at `T+1s` on startup AND
+/// at every multiple of its interval thereafter — producing collision
+/// windows at LCM(interval₁, interval₂, …) for which the 20-slot DB
+/// pool starved (observed 2026-05-21 between 19:11 and 19:25 when
+/// similarity-scan @6h, graph-analysis @2h, symbol-extraction @2h,
+/// and call-graph @2h all converged near a multiple of 2h).
+///
+/// The offset is `base_ms + (hash(job_name) % cap_ms)` where the cap
+/// is `min(interval_ms / 2, 600_000)` — at most 10 minutes of jitter,
+/// or half the interval for very fast crons. Hash is FxHash-style
+/// (multiplicative + rotate), deterministic across runs so a given
+/// job always starts at the same offset relative to daemon start.
+fn staggered_initial_delay_ms(job_name: &str, interval_ms: u64) -> u64 {
+    const BASE_MS: u64 = 1_000;
+    const MAX_JITTER_MS: u64 = 600_000; // 10 minutes
+    let cap = MAX_JITTER_MS.min(interval_ms / 2).max(1);
+    let mut h: u64 = 0xcbf29ce484222325; // FNV-1a offset basis
+    for b in job_name.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3); // FNV-1a prime
+    }
+    BASE_MS + (h % cap)
+}
+
 /// RAII guard that flips `stats.heavy_cron_running` → true on construction
 /// and back to false on drop. Used by the four heavy cron bodies so the
 /// Prometheus `pgmcp_heavy_cron_running` gauge reflects live state regardless
@@ -47,6 +73,53 @@ impl Drop for HeavyCronFlag {
             .heavy_cron_running
             .store(false, AtomicOrdering::Release);
     }
+}
+
+/// Heavy-cron skip-gate macro. Returns either a held `MutexGuard` (work
+/// can proceed) or causes the enclosing closure to `return;` after
+/// recording the exact `SkipReason` into `stats.last_cron_outcomes` so
+/// an operator can tell which gate is silencing each cron.
+///
+/// Without this, the seven heavy-cron closures silently `return;` at
+/// each gate and the scheduler records `CronJobOutcome::Ok` (because
+/// the *closure* returned cleanly). Bug C in the 2026-05-21 staleness
+/// investigation: 363 cron_executions with zero work-counters because
+/// every tick hit one of these three gates.
+macro_rules! heavy_gate_or_skip {
+    (
+        job = $job:literal,
+        lc = $lc:expr,
+        ready = $ready:expr,
+        cooldown = $cooldown:expr,
+        lock = $lock:expr,
+        stats = $stats:expr,
+    ) => {{
+        use crate::stats::tracker::{CronJobOutcome, SkipReason};
+        if !$lc.is_at_least(crate::daemon_state::DaemonPhase::Ready) {
+            $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::PhaseGate), 0);
+            return;
+        }
+        let first_seen = $ready.get_or_init(Instant::now);
+        if first_seen.elapsed() < $cooldown {
+            tracing::debug!(
+                job = $job,
+                elapsed_ms = first_seen.elapsed().as_millis() as u64,
+                cooldown_ms = $cooldown.as_millis() as u64,
+                phase_ms = $lc.ms_in_current_phase(),
+                "heavy cron in ready-relative cooldown"
+            );
+            $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::Cooldown), 0);
+            return;
+        }
+        match $lock.try_lock() {
+            Some(g) => g,
+            None => {
+                tracing::info!(concat!("heavy cron busy, deferring ", $job));
+                $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::LockBusy), 0);
+                return;
+            }
+        }
+    }};
 }
 
 #[inline]
@@ -724,7 +797,13 @@ pub fn schedule_maintenance_jobs(
     let commit_tx_for_git = commit_tx.clone();
     let rt_for_git = rt_clone.clone();
     handle.schedule_recurring(
-        1_000, // 1s base delay — the real wait happens on Ready-relative check below
+        // 1s base delay + per-job hash jitter so this heavy cron doesn't
+        // collide with the others at startup. The real wait still
+        // happens on Ready-relative check below.
+        staggered_initial_delay_ms(
+            "git-history-index",
+            config.git_history_index_interval_secs * 1000,
+        ),
         config.git_history_index_interval_secs * 1000,
         "git-history-index",
         move || {
@@ -743,22 +822,23 @@ pub fn schedule_maintenance_jobs(
             let rt = rt_for_git.clone();
             cron_pool_git.submit(
                 move || {
-                    if !lc.is_at_least(crate::daemon_state::DaemonPhase::Ready) {
-                        return;
-                    }
-                    let first_seen = ready_git.get_or_init(Instant::now);
-                    if first_seen.elapsed() < git_ready_delay {
-                        return; // still within post-Ready cooldown
-                    }
-                    let _guard = match lock.try_lock() {
-                        Some(g) => g,
-                        None => {
-                            tracing::info!("heavy cron busy, deferring git-history-index");
-                            return;
-                        }
-                    };
+                    let _guard = heavy_gate_or_skip!(
+                        job = "git-history-index",
+                        lc = lc,
+                        ready = ready_git,
+                        cooldown = git_ready_delay,
+                        lock = lock,
+                        stats = stats_for_git,
+                    );
                     let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_git));
                     let stats = Arc::clone(&stats_for_git);
+
+                    // Counter is at top-of-body: a reliable "this cron's
+                    // body ran" signal regardless of whether any project
+                    // had new commits. Pairs with
+                    // `git_history_noop_returns` to distinguish the
+                    // empty-data case from "never ran".
+                    stats.git_history_runs.fetch_add(1, AtomicOrdering::Relaxed);
 
                     // Once-per-tick `git` binary preflight. A missing `git`
                     // is a permanent fault for this cron — keep retrying
@@ -784,6 +864,14 @@ pub fn schedule_maintenance_jobs(
                     let t0 = Instant::now();
                     rt.block_on(async {
                         match db.get_git_enabled_projects().await {
+                            Ok(projects) if projects.is_empty() => {
+                                stats
+                                    .git_history_noop_returns
+                                    .fetch_add(1, AtomicOrdering::Relaxed);
+                                tracing::info!(
+                                    "git-history-index: no git-enabled projects, nothing to do"
+                                );
+                            }
                             Ok(projects) => {
                                 for (project_id, project_path) in &projects {
                                     let project_root = std::path::Path::new(project_path);
@@ -855,62 +943,61 @@ pub fn schedule_maintenance_jobs(
     let ready_sim: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
     let sim_ready_delay = Duration::from_secs(config.ready_delay_similarity_secs);
     let cron_pool_sim = Arc::clone(&cron_pool);
-    handle.schedule_recurring(1_000, sim_interval * 1000, "similarity-scan", move || {
-        if lc.is_stopping() {
-            return false;
-        }
-        let lc = lc.clone();
-        let lock = Arc::clone(&lock);
-        let ready_sim = Arc::clone(&ready_sim);
-        let stats_for_sim = Arc::clone(&stats_for_sim);
-        let db = db_clone_sim.clone();
-        let cfg = sim_cron_config.clone();
-        let rt = rt_clone_sim.clone();
-        cron_pool_sim.submit(
-            move || {
-                if !lc.is_at_least(crate::daemon_state::DaemonPhase::Ready) {
-                    return;
-                }
-                let first_seen = ready_sim.get_or_init(Instant::now);
-                if first_seen.elapsed() < sim_ready_delay {
-                    return;
-                }
-                let _guard = match lock.try_lock() {
-                    Some(g) => g,
-                    None => {
-                        tracing::info!("heavy cron busy, deferring similarity-scan");
-                        return;
-                    }
-                };
-                let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_sim));
-                let stats = Arc::clone(&stats_for_sim);
-                let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                let t0 = Instant::now();
-                let lc_inner = lc.clone();
-                rt.block_on(async {
-                    crate::cron::similarity::run_similarity_scan(
-                        db.as_ref(),
-                        &cfg,
-                        sim_ef_search,
-                        &stats,
-                        &lc_inner,
-                    )
-                    .await;
-                });
-                let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                tracing::info!(
-                    job = "similarity-scan",
-                    rss_mb_start = rss_start >> 20,
-                    rss_mb_end = rss_end >> 20,
-                    rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
-                    elapsed_s = t0.elapsed().as_secs_f64(),
-                    "heavy cron complete"
-                );
-            },
-            crate::work_pool::pool::Priority::Low,
-        );
-        true
-    });
+    handle.schedule_recurring(
+        staggered_initial_delay_ms("similarity-scan", sim_interval * 1000),
+        sim_interval * 1000,
+        "similarity-scan",
+        move || {
+            if lc.is_stopping() {
+                return false;
+            }
+            let lc = lc.clone();
+            let lock = Arc::clone(&lock);
+            let ready_sim = Arc::clone(&ready_sim);
+            let stats_for_sim = Arc::clone(&stats_for_sim);
+            let db = db_clone_sim.clone();
+            let cfg = sim_cron_config.clone();
+            let rt = rt_clone_sim.clone();
+            cron_pool_sim.submit(
+                move || {
+                    let _guard = heavy_gate_or_skip!(
+                        job = "similarity-scan",
+                        lc = lc,
+                        ready = ready_sim,
+                        cooldown = sim_ready_delay,
+                        lock = lock,
+                        stats = stats_for_sim,
+                    );
+                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_sim));
+                    let stats = Arc::clone(&stats_for_sim);
+                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    let t0 = Instant::now();
+                    let lc_inner = lc.clone();
+                    rt.block_on(async {
+                        crate::cron::similarity::run_similarity_scan(
+                            db.as_ref(),
+                            &cfg,
+                            sim_ef_search,
+                            &stats,
+                            &lc_inner,
+                        )
+                        .await;
+                    });
+                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    tracing::info!(
+                        job = "similarity-scan",
+                        rss_mb_start = rss_start >> 20,
+                        rss_mb_end = rss_end >> 20,
+                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
+                        elapsed_s = t0.elapsed().as_secs_f64(),
+                        "heavy cron complete"
+                    );
+                },
+                crate::work_pool::pool::Priority::Low,
+            );
+            true
+        },
+    );
 
     // Graph analysis (import extraction, PageRank, betweenness, coupling)
     let db_clone_graph = Arc::clone(&db);
@@ -923,54 +1010,54 @@ pub fn schedule_maintenance_jobs(
     let graph_ready_delay = Duration::from_secs(config.ready_delay_graph_secs);
     let graph_general_pool = general_pool.clone();
     let cron_pool_graph = Arc::clone(&cron_pool);
-    handle.schedule_recurring(1_000, graph_interval * 1000, "graph-analysis", move || {
-        if lc.is_stopping() {
-            return false;
-        }
-        let lc = lc.clone();
-        let lock = Arc::clone(&lock);
-        let ready_graph = Arc::clone(&ready_graph);
-        let stats_for_graph = Arc::clone(&stats_for_graph);
-        let db = db_clone_graph.clone();
-        let wp = graph_general_pool.clone();
-        let rt = rt_clone_graph.clone();
-        cron_pool_graph.submit(
-            move || {
-                if !lc.is_at_least(crate::daemon_state::DaemonPhase::Ready) {
-                    return;
-                }
-                let first_seen = ready_graph.get_or_init(Instant::now);
-                if first_seen.elapsed() < graph_ready_delay {
-                    return;
-                }
-                let _guard = match lock.try_lock() {
-                    Some(g) => g,
-                    None => {
-                        tracing::info!("heavy cron busy, deferring graph-analysis");
-                        return;
-                    }
-                };
-                let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_graph));
-                let stats = Arc::clone(&stats_for_graph);
-                let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                let t0 = Instant::now();
-                rt.block_on(async {
-                    crate::cron::graph_analysis::run_graph_analysis(db.as_ref(), &stats, wp).await;
-                });
-                let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                tracing::info!(
-                    job = "graph-analysis",
-                    rss_mb_start = rss_start >> 20,
-                    rss_mb_end = rss_end >> 20,
-                    rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
-                    elapsed_s = t0.elapsed().as_secs_f64(),
-                    "heavy cron complete"
-                );
-            },
-            crate::work_pool::pool::Priority::Low,
-        );
-        true
-    });
+    handle.schedule_recurring(
+        staggered_initial_delay_ms("graph-analysis", graph_interval * 1000),
+        graph_interval * 1000,
+        "graph-analysis",
+        move || {
+            if lc.is_stopping() {
+                return false;
+            }
+            let lc = lc.clone();
+            let lock = Arc::clone(&lock);
+            let ready_graph = Arc::clone(&ready_graph);
+            let stats_for_graph = Arc::clone(&stats_for_graph);
+            let db = db_clone_graph.clone();
+            let wp = graph_general_pool.clone();
+            let rt = rt_clone_graph.clone();
+            cron_pool_graph.submit(
+                move || {
+                    let _guard = heavy_gate_or_skip!(
+                        job = "graph-analysis",
+                        lc = lc,
+                        ready = ready_graph,
+                        cooldown = graph_ready_delay,
+                        lock = lock,
+                        stats = stats_for_graph,
+                    );
+                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_graph));
+                    let stats = Arc::clone(&stats_for_graph);
+                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    let t0 = Instant::now();
+                    rt.block_on(async {
+                        crate::cron::graph_analysis::run_graph_analysis(db.as_ref(), &stats, wp)
+                            .await;
+                    });
+                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    tracing::info!(
+                        job = "graph-analysis",
+                        rss_mb_start = rss_start >> 20,
+                        rss_mb_end = rss_end >> 20,
+                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
+                        elapsed_s = t0.elapsed().as_secs_f64(),
+                        "heavy cron complete"
+                    );
+                },
+                crate::work_pool::pool::Priority::Low,
+            );
+            true
+        },
+    );
 
     // Symbol extraction (Tier-0e tree-sitter pass — populates file_symbols + symbol_references)
     let db_clone_symbol = Arc::clone(&db);
@@ -984,7 +1071,7 @@ pub fn schedule_maintenance_jobs(
         Duration::from_secs(config.ready_delay_symbol_extraction_secs);
     let cron_pool_symbol = Arc::clone(&cron_pool);
     handle.schedule_recurring(
-        1_000,
+        staggered_initial_delay_ms("symbol-extraction", symbol_extraction_interval * 1000),
         symbol_extraction_interval * 1000,
         "symbol-extraction",
         move || {
@@ -999,20 +1086,14 @@ pub fn schedule_maintenance_jobs(
             let rt = rt_clone_symbol.clone();
             cron_pool_symbol.submit(
                 move || {
-                    if !lc.is_at_least(crate::daemon_state::DaemonPhase::Ready) {
-                        return;
-                    }
-                    let first_seen = ready_symbol_extraction.get_or_init(Instant::now);
-                    if first_seen.elapsed() < symbol_extraction_ready_delay {
-                        return;
-                    }
-                    let _guard = match lock.try_lock() {
-                        Some(g) => g,
-                        None => {
-                            tracing::info!("heavy cron busy, deferring symbol-extraction");
-                            return;
-                        }
-                    };
+                    let _guard = heavy_gate_or_skip!(
+                        job = "symbol-extraction",
+                        lc = lc,
+                        ready = ready_symbol_extraction,
+                        cooldown = symbol_extraction_ready_delay,
+                        lock = lock,
+                        stats = stats_for_symbol,
+                    );
                     let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_symbol));
                     let stats = Arc::clone(&stats_for_symbol);
                     let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
@@ -1024,6 +1105,125 @@ pub fn schedule_maintenance_jobs(
                     let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
                     tracing::info!(
                         job = "symbol-extraction",
+                        rss_mb_start = rss_start >> 20,
+                        rss_mb_end = rss_end >> 20,
+                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
+                        elapsed_s = t0.elapsed().as_secs_f64(),
+                        "heavy cron complete"
+                    );
+                },
+                crate::work_pool::pool::Priority::Low,
+            );
+            true
+        },
+    );
+
+    // SOTA Phase 1 — Function metrics cron (CC / Cognitive / Halstead / NPath / MI per function).
+    // Sequenced after symbol-extraction (depends on file_symbols rows).
+    let db_clone_fnmet = Arc::clone(&db);
+    let rt_clone_fnmet = rt.clone();
+    let stats_for_fnmet = Arc::clone(&stats);
+    let function_metrics_interval = config.function_metrics_interval_secs;
+    let lc = lifecycle.clone();
+    let lock = Arc::clone(&heavy_cron_lock);
+    let ready_fnmet: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+    let fnmet_ready_delay = Duration::from_secs(config.ready_delay_function_metrics_secs);
+    let cron_pool_fnmet = Arc::clone(&cron_pool);
+    handle.schedule_recurring(
+        staggered_initial_delay_ms("function-metrics", function_metrics_interval * 1000),
+        function_metrics_interval * 1000,
+        "function-metrics",
+        move || {
+            if lc.is_stopping() {
+                return false;
+            }
+            let lc = lc.clone();
+            let lock = Arc::clone(&lock);
+            let ready_fnmet = Arc::clone(&ready_fnmet);
+            let stats_for_fnmet = Arc::clone(&stats_for_fnmet);
+            let db = db_clone_fnmet.clone();
+            let rt = rt_clone_fnmet.clone();
+            cron_pool_fnmet.submit(
+                move || {
+                    let _guard = heavy_gate_or_skip!(
+                        job = "function-metrics",
+                        lc = lc,
+                        ready = ready_fnmet,
+                        cooldown = fnmet_ready_delay,
+                        lock = lock,
+                        stats = stats_for_fnmet,
+                    );
+                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_fnmet));
+                    let stats = Arc::clone(&stats_for_fnmet);
+                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    let t0 = Instant::now();
+                    rt.block_on(async {
+                        crate::cron::function_metrics::run_function_metrics(db.as_ref(), &stats)
+                            .await;
+                    });
+                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    tracing::info!(
+                        job = "function-metrics",
+                        rss_mb_start = rss_start >> 20,
+                        rss_mb_end = rss_end >> 20,
+                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
+                        elapsed_s = t0.elapsed().as_secs_f64(),
+                        "heavy cron complete"
+                    );
+                },
+                crate::work_pool::pool::Priority::Low,
+            );
+            true
+        },
+    );
+
+    // SOTA Phase 1 — Call-graph cron (symbol-resolved edges + fan_in/fan_out).
+    // Sequenced after function-metrics (which depends on symbol-extraction's
+    // file_symbols rows and seeds function_metrics rows for the fan_in/fan_out
+    // UPDATE this cron issues).
+    let db_clone_cg = Arc::clone(&db);
+    let rt_clone_cg = rt.clone();
+    let stats_for_cg = Arc::clone(&stats);
+    let call_graph_interval = config.call_graph_interval_secs;
+    let lc = lifecycle.clone();
+    let lock = Arc::clone(&heavy_cron_lock);
+    let ready_cg: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+    let cg_ready_delay = Duration::from_secs(config.ready_delay_call_graph_secs);
+    let cron_pool_cg = Arc::clone(&cron_pool);
+    handle.schedule_recurring(
+        staggered_initial_delay_ms("call-graph", call_graph_interval * 1000),
+        call_graph_interval * 1000,
+        "call-graph",
+        move || {
+            if lc.is_stopping() {
+                return false;
+            }
+            let lc = lc.clone();
+            let lock = Arc::clone(&lock);
+            let ready_cg = Arc::clone(&ready_cg);
+            let stats_for_cg = Arc::clone(&stats_for_cg);
+            let db = db_clone_cg.clone();
+            let rt = rt_clone_cg.clone();
+            cron_pool_cg.submit(
+                move || {
+                    let _guard = heavy_gate_or_skip!(
+                        job = "call-graph",
+                        lc = lc,
+                        ready = ready_cg,
+                        cooldown = cg_ready_delay,
+                        lock = lock,
+                        stats = stats_for_cg,
+                    );
+                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_cg));
+                    let stats = Arc::clone(&stats_for_cg);
+                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    let t0 = Instant::now();
+                    rt.block_on(async {
+                        crate::cron::call_graph::run_call_graph(db.as_ref(), &stats).await;
+                    });
+                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    tracing::info!(
+                        job = "call-graph",
                         rss_mb_start = rss_start >> 20,
                         rss_mb_end = rss_end >> 20,
                         rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
@@ -1061,7 +1261,7 @@ pub fn schedule_maintenance_jobs(
     };
     let cron_pool_topic = Arc::clone(&cron_pool);
     handle.schedule_recurring(
-        1_000,
+        staggered_initial_delay_ms("topic-clustering", topic_interval * 1000),
         topic_interval * 1000,
         "topic-clustering",
         move || {
@@ -1077,20 +1277,14 @@ pub fn schedule_maintenance_jobs(
             let rt = rt_clone_topic.clone();
             cron_pool_topic.submit(
                 move || {
-                    if !lc.is_at_least(crate::daemon_state::DaemonPhase::Ready) {
-                        return;
-                    }
-                    let first_seen = ready_topic.get_or_init(Instant::now);
-                    if first_seen.elapsed() < topic_ready_delay {
-                        return;
-                    }
-                    let _guard = match lock.try_lock() {
-                        Some(g) => g,
-                        None => {
-                            tracing::info!("heavy cron busy, deferring topic-clustering");
-                            return;
-                        }
-                    };
+                    let _guard = heavy_gate_or_skip!(
+                        job = "topic-clustering",
+                        lc = lc,
+                        ready = ready_topic,
+                        cooldown = topic_ready_delay,
+                        lock = lock,
+                        stats = stats_for_topic,
+                    );
                     let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_topic));
                     let stats = Arc::clone(&stats_for_topic);
                     let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
@@ -1130,6 +1324,60 @@ pub fn schedule_maintenance_jobs(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn stagger_is_deterministic_per_job_name() {
+        // The same job name must produce the same offset across calls so
+        // a daemon restart doesn't re-shuffle every cron's schedule on each
+        // restart. Operators rely on stable cadence for capacity planning.
+        let one = staggered_initial_delay_ms("similarity-scan", 21_600_000);
+        let two = staggered_initial_delay_ms("similarity-scan", 21_600_000);
+        assert_eq!(one, two);
+    }
+
+    #[test]
+    fn stagger_distinct_names_yield_distinct_offsets() {
+        // The whole point of the stagger is breaking the synchronized-tick
+        // collision that caused the 19:11–19:25 pool starvation in the
+        // 2026-05-21 pgmcp.log. If two heavy crons hashed to the same
+        // offset, they'd re-collide at every interval boundary.
+        let a = staggered_initial_delay_ms("similarity-scan", 21_600_000);
+        let b = staggered_initial_delay_ms("graph-analysis", 7_200_000);
+        let c = staggered_initial_delay_ms("symbol-extraction", 7_200_000);
+        let d = staggered_initial_delay_ms("call-graph", 7_200_000);
+        let e = staggered_initial_delay_ms("topic-clustering", 43_200_000);
+        let f = staggered_initial_delay_ms("function-metrics", 7_200_000);
+        let g = staggered_initial_delay_ms("git-history-index", 3_600_000);
+        let mut all = [a, b, c, d, e, f, g];
+        all.sort_unstable();
+        for pair in all.windows(2) {
+            assert_ne!(pair[0], pair[1], "offsets collided: {all:?}");
+        }
+    }
+
+    #[test]
+    fn stagger_respects_jitter_cap_and_base() {
+        // For very fast crons (60s interval) the cap is interval/2 = 30_000ms.
+        // For long crons (≥ 20 min interval) the cap is the 10-min ceiling.
+        // In both cases the offset must be ≥ BASE_MS (1s) so we still
+        // give the daemon a startup grace period.
+        for name in ["job-a", "job-b", "job-c", "another-name", "z"] {
+            let fast = staggered_initial_delay_ms(name, 60_000);
+            assert!((1_000..=31_000).contains(&fast), "fast={fast}");
+            let slow = staggered_initial_delay_ms(name, 21_600_000);
+            assert!((1_000..=601_000).contains(&slow), "slow={slow}");
+        }
+    }
+
+    #[test]
+    fn stagger_handles_zero_and_one_interval() {
+        // Edge case: interval_ms = 0 would divide by zero without the
+        // `.max(1)` clamp in the helper. interval_ms = 1 stresses the
+        // floor of the cap. Both must return BASE_MS exactly because the
+        // hash modulo 1 is always 0.
+        assert_eq!(staggered_initial_delay_ms("x", 0), 1_000);
+        assert_eq!(staggered_initial_delay_ms("x", 1), 1_000);
+    }
 
     #[test]
     fn test_state_transitions() {

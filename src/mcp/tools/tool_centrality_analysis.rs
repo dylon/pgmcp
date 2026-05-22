@@ -26,7 +26,7 @@ pub async fn tool_centrality_analysis(
     let metric = params.metric.as_deref().unwrap_or("all");
     let limit = params.limit.unwrap_or(20);
 
-    info!(
+    debug!(
         tool = "centrality_analysis",
         project = %params.project,
         metric,

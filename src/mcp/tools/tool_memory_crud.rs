@@ -74,6 +74,7 @@ pub async fn tool_memory_create_entities(
     ctx: &SystemContext,
     params: MemoryCreateEntitiesParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_create_entities", "MCP tool invoked");
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
@@ -135,6 +136,7 @@ pub async fn tool_memory_create_relations(
     ctx: &SystemContext,
     params: MemoryCreateRelationsParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_create_relations", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     if params.relations.is_empty() {
@@ -175,6 +177,7 @@ pub async fn tool_memory_add_observations(
     ctx: &SystemContext,
     params: MemoryAddObservationsParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_add_observations", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     if params.observations.is_empty() {
@@ -211,6 +214,7 @@ pub async fn tool_memory_delete_entities(
     ctx: &SystemContext,
     params: MemoryDeleteEntitiesParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_delete_entities", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     if params.names.is_empty() {
@@ -237,6 +241,7 @@ pub async fn tool_memory_delete_observations(
     ctx: &SystemContext,
     params: MemoryDeleteObservationsParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_delete_observations", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     if params.deletions.is_empty() {
@@ -273,6 +278,7 @@ pub async fn tool_memory_delete_relations(
     ctx: &SystemContext,
     params: MemoryDeleteRelationsParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_delete_relations", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     if params.relations.is_empty() {
@@ -310,6 +316,7 @@ pub async fn tool_memory_read_graph(
     ctx: &SystemContext,
     params: MemoryReadGraphParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_read_graph", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats()
         .memory_read_graph_calls
@@ -341,6 +348,7 @@ pub async fn tool_memory_search_nodes(
     ctx: &SystemContext,
     params: MemorySearchNodesParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_search_nodes", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats()
         .memory_search_nodes_calls
@@ -378,6 +386,7 @@ pub async fn tool_memory_open_nodes(
     ctx: &SystemContext,
     params: MemoryOpenNodesParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_open_nodes", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats()
         .memory_open_nodes_calls

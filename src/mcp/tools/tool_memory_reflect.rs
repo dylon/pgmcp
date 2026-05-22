@@ -46,6 +46,7 @@ pub async fn tool_memory_reflect(
     ctx: &SystemContext,
     params: MemoryReflectParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_reflect", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
 
     // Refuse cleanly if the operator hasn't enabled agent-driven reflection.

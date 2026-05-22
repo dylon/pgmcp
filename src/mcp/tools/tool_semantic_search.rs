@@ -26,7 +26,7 @@ pub async fn tool_semantic_search(
         .fetch_add(1, Ordering::Relaxed);
 
     let limit = params.limit.unwrap_or(10);
-    info!(
+    debug!(
         tool = "semantic_search",
         query = %truncate(&params.query, 200),
         limit,

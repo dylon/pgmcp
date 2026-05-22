@@ -22,7 +22,7 @@ use crate::patterns::{self as pattern_catalog, SourceDescriptor};
 const DEFAULT_SEARCH_LIMIT: i32 = 10;
 const DEFAULT_LIST_LIMIT: i32 = 50;
 const DEFAULT_EXCERPT_CHARS: usize = 700;
-const PATTERN_EMBEDDING_SCHEMA_VERSION: &str = "pgmcp-pattern-embedding-v4";
+const PATTERN_EMBEDDING_SCHEMA_VERSION: &str = "pgmcp-pattern-embedding-v5";
 
 #[derive(Debug, Default)]
 struct ImportSummary {
@@ -42,7 +42,7 @@ pub async fn tool_software_pattern_search(
     ensure_seeded_if_empty(ctx, pool).await?;
 
     let limit = params.limit.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, 50);
-    info!(
+    debug!(
         tool = "software_pattern_search",
         query = %truncate(&params.query, 200),
         limit,

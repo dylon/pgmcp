@@ -40,7 +40,7 @@ pub async fn tool_pr_scope(
     let impact_depth = params.impact_depth.unwrap_or(2).max(1) as usize;
     let include_topic_neighbors = params.include_topic_neighbors.unwrap_or(true);
 
-    info!(
+    debug!(
         tool = "pr_scope_recommender",
         project = %params.project,
         file = %params.file,

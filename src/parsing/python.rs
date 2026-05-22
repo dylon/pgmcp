@@ -11,6 +11,10 @@ use std::sync::OnceLock;
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 use crate::parsing::backend::LanguageBackend;
+use crate::parsing::complexity;
+use crate::parsing::function_metrics::{
+    CognitiveIncrement, CognitiveKind, FunctionMetrics, ScoringInput,
+};
 use crate::parsing::symbols::{Import, Symbol, SymbolKind, SymbolRefKind, SymbolReference};
 
 pub static PYTHON_BACKEND: PythonBackend = PythonBackend;
@@ -251,6 +255,231 @@ impl LanguageBackend for PythonBackend {
         collect_type_references(tree.root_node(), content, &mut out);
         out
     }
+
+    fn extract_function_metrics(&self, content: &str) -> Vec<FunctionMetrics> {
+        let Some(tree) = parse(content) else {
+            return Vec::new();
+        };
+        let mut out: Vec<FunctionMetrics> = Vec::new();
+        collect_function_metrics(tree.root_node(), content, &mut out);
+        out
+    }
+}
+
+/// Walk every `function_definition` in the tree and score it.
+fn collect_function_metrics(node: Node<'_>, src: &str, out: &mut Vec<FunctionMetrics>) {
+    if node.kind() == "function_definition"
+        && let Some(name_node) = node.child_by_field_name("name")
+        && let Some(body) = node.child_by_field_name("body")
+    {
+        let name = node_text(name_node, src).to_string();
+        out.push(score_python_function(
+            &name,
+            line_of(node),
+            end_line_of(body),
+            body,
+            src,
+            &name,
+        ));
+    }
+    let mut walker = node.walk();
+    for child in node.named_children(&mut walker) {
+        collect_function_metrics(child, src, out);
+    }
+}
+
+/// Score one Python function body.
+fn score_python_function(
+    name: &str,
+    start_line: u32,
+    end_line: u32,
+    body: Node<'_>,
+    src: &str,
+    fn_name: &str,
+) -> FunctionMetrics {
+    use std::collections::HashMap;
+    let mut decision_points: u32 = 0;
+    let mut cognitive_increments: Vec<CognitiveIncrement> = Vec::new();
+    let mut operators: HashMap<&'static str, u32> = HashMap::new();
+    let mut operands: HashMap<String, u32> = HashMap::new();
+    let mut npath_factors: Vec<u64> = Vec::new();
+    let mut panic_paths: u32 = 0;
+
+    walk_python_body(
+        body,
+        src,
+        0,
+        &mut decision_points,
+        &mut cognitive_increments,
+        &mut operators,
+        &mut operands,
+        &mut npath_factors,
+        &mut panic_paths,
+        fn_name,
+    );
+
+    let source_lines = end_line.saturating_sub(start_line) + 1;
+    let input = ScoringInput {
+        name,
+        start_line,
+        end_line,
+        decision_points,
+        cognitive_increments,
+        operators,
+        operands,
+        npath_factors,
+        source_lines,
+        comment_lines: 0, // not counted in tree-sitter pass
+        panic_paths,
+        unsafe_blocks: 0,
+    };
+    complexity::score(&input)
+}
+
+/// Static set of Python operator/keyword tokens (η1 universe).
+const PYTHON_OPERATOR_KINDS: &[&str] = &[
+    // Punctuation kinds tree-sitter emits as their literal text:
+    "+", "-", "*", "/", "%", "//", "**", "==", "!=", "<", ">", "<=", ">=", "=", "+=", "-=", "*=",
+    "/=", "//=", "**=", "%=", "&", "|", "^", "<<", ">>", "~", ".", ",", ":", ";", "(", ")", "[",
+    "]", "{", "}", "@", "->", "and", "or", "not", "if", "elif", "else", "while", "for", "in", "is",
+    "lambda", "def", "class", "return", "yield", "raise", "try", "except", "finally", "with", "as",
+    "import", "from", "pass", "break", "continue", "global", "nonlocal", "assert", "del",
+];
+
+#[allow(clippy::too_many_arguments)]
+fn walk_python_body(
+    node: Node<'_>,
+    src: &str,
+    depth: u8,
+    decision_points: &mut u32,
+    cognitive_increments: &mut Vec<CognitiveIncrement>,
+    operators: &mut std::collections::HashMap<&'static str, u32>,
+    operands: &mut std::collections::HashMap<String, u32>,
+    npath_factors: &mut Vec<u64>,
+    panic_paths: &mut u32,
+    fn_name: &str,
+) {
+    let kind = node.kind();
+
+    // Classify leaf tokens for Halstead.
+    if node.child_count() == 0 {
+        let text = node_text(node, src);
+        if !text.is_empty() {
+            if let Some(op) = match_python_operator(text) {
+                *operators.entry(op).or_insert(0) += 1;
+            } else if matches!(
+                kind,
+                "identifier" | "integer" | "float" | "string" | "true" | "false" | "none"
+            ) {
+                *operands.entry(text.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Decision points & cognitive increments.
+    let mut new_depth = depth;
+    let mut entered_nest = false;
+    match kind {
+        "if_statement" | "elif_clause" => {
+            *decision_points = decision_points.saturating_add(1);
+            cognitive_increments.push(CognitiveIncrement {
+                depth,
+                kind: CognitiveKind::NestedCondition,
+            });
+            npath_factors.push(2);
+            new_depth = depth.saturating_add(1);
+            entered_nest = true;
+        }
+        "while_statement" | "for_statement" => {
+            *decision_points = decision_points.saturating_add(1);
+            cognitive_increments.push(CognitiveIncrement {
+                depth,
+                kind: CognitiveKind::NestedCondition,
+            });
+            npath_factors.push(2);
+            new_depth = depth.saturating_add(1);
+            entered_nest = true;
+        }
+        "except_clause" => {
+            *decision_points = decision_points.saturating_add(1);
+            cognitive_increments.push(CognitiveIncrement {
+                depth,
+                kind: CognitiveKind::NestedCondition,
+            });
+            npath_factors.push(2);
+        }
+        "conditional_expression" => {
+            *decision_points = decision_points.saturating_add(1);
+            npath_factors.push(2);
+        }
+        "boolean_operator" => {
+            *decision_points = decision_points.saturating_add(1);
+            cognitive_increments.push(CognitiveIncrement {
+                depth,
+                kind: CognitiveKind::LogicalSequence,
+            });
+            npath_factors.push(2);
+        }
+        "case_clause" => {
+            *decision_points = decision_points.saturating_add(1);
+            npath_factors.push(2);
+        }
+        "raise_statement" => {
+            *panic_paths = panic_paths.saturating_add(1);
+        }
+        "assert_statement" => {
+            *panic_paths = panic_paths.saturating_add(1);
+        }
+        "break_statement" | "continue_statement" => {
+            cognitive_increments.push(CognitiveIncrement {
+                depth,
+                kind: CognitiveKind::BreakInFlow,
+            });
+        }
+        "call" => {
+            // Recursion detection: call expression whose function is an
+            // identifier matching the enclosing function name.
+            if let Some(func) = node.child_by_field_name("function") {
+                let name = node_text(func, src);
+                if name == fn_name {
+                    cognitive_increments.push(CognitiveIncrement {
+                        depth,
+                        kind: CognitiveKind::Recursion,
+                    });
+                }
+            }
+        }
+        // Don't recurse into nested function bodies — they get their own
+        // metrics row from `collect_function_metrics`. Same for class bodies
+        // since methods are also `function_definition` nodes.
+        "function_definition" => {
+            return;
+        }
+        _ => {}
+    }
+
+    let mut walker = node.walk();
+    for child in node.children(&mut walker) {
+        walk_python_body(
+            child,
+            src,
+            new_depth,
+            decision_points,
+            cognitive_increments,
+            operators,
+            operands,
+            npath_factors,
+            panic_paths,
+            fn_name,
+        );
+    }
+    if entered_nest {
+        // depth restoration handled by caller's local copy; no-op
+    }
+}
+
+fn match_python_operator(s: &str) -> Option<&'static str> {
+    PYTHON_OPERATOR_KINDS.iter().copied().find(|t| *t == s)
 }
 
 /// Slice the first line of a node from `content`.
@@ -552,5 +781,116 @@ def helper():\n\
     #[test]
     fn language_name_is_python() {
         assert_eq!(PYTHON_BACKEND.language_name(), "python");
+    }
+
+    // ========================================================================
+    // extract_function_metrics tests (SOTA Phase 1, A1)
+    // ========================================================================
+
+    #[test]
+    fn py_empty_function_has_cc_one() {
+        let src = "def empty():\n    pass\n";
+        let m = PYTHON_BACKEND.extract_function_metrics(src);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].name, "empty");
+        assert_eq!(m[0].cyclomatic, 1);
+    }
+
+    #[test]
+    fn py_if_elif_else_counts_branches() {
+        let src = r#"
+def classify(x):
+    if x > 0:
+        return 1
+    elif x < 0:
+        return -1
+    else:
+        return 0
+"#;
+        let m = PYTHON_BACKEND.extract_function_metrics(src);
+        // if (+1) + elif (+1) = 2 decisions → CC = 3
+        assert_eq!(m[0].cyclomatic, 3);
+    }
+
+    #[test]
+    fn py_for_loop_counts() {
+        let src = r#"
+def total(xs):
+    s = 0
+    for x in xs:
+        s += x
+    return s
+"#;
+        let m = PYTHON_BACKEND.extract_function_metrics(src);
+        assert_eq!(m[0].cyclomatic, 2);
+    }
+
+    #[test]
+    fn py_try_except() {
+        let src = r#"
+def parse(s):
+    try:
+        return int(s)
+    except ValueError:
+        return None
+    except TypeError:
+        return None
+"#;
+        let m = PYTHON_BACKEND.extract_function_metrics(src);
+        // 2 except clauses = 2 decisions → CC = 3
+        assert_eq!(m[0].cyclomatic, 3);
+    }
+
+    #[test]
+    fn py_ternary_counts_as_decision() {
+        let src = r#"
+def abs_val(x):
+    return x if x >= 0 else -x
+"#;
+        let m = PYTHON_BACKEND.extract_function_metrics(src);
+        assert!(m[0].cyclomatic >= 2);
+    }
+
+    #[test]
+    fn py_raise_counts_as_panic_path() {
+        let src = r#"
+def must_be_positive(x):
+    if x <= 0:
+        raise ValueError("must be positive")
+    return x
+"#;
+        let m = PYTHON_BACKEND.extract_function_metrics(src);
+        assert_eq!(m[0].panic_paths, 1);
+    }
+
+    #[test]
+    fn py_method_in_class_extracted() {
+        let src = r#"
+class C:
+    def method(self, x):
+        if x > 0:
+            return 1
+        return 0
+"#;
+        let m = PYTHON_BACKEND.extract_function_metrics(src);
+        let names: Vec<&str> = m.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"method"));
+        let method = m.iter().find(|f| f.name == "method").expect("method");
+        assert_eq!(method.cyclomatic, 2);
+    }
+
+    #[test]
+    fn py_invalid_source_yields_empty_metrics() {
+        // tree-sitter is tolerant — try a minimal invalid form
+        let m = PYTHON_BACKEND.extract_function_metrics("def\n  oops");
+        // The tree-sitter parser may produce a partial tree; either we get
+        // 0 functions or the partial ones have safe (low) metrics.
+        for fm in &m {
+            assert!(
+                fm.cyclomatic <= 5,
+                "spurious metrics in invalid source: {:?}",
+                fm
+            );
+        }
     }
 }

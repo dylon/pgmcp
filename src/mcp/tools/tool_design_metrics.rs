@@ -29,7 +29,7 @@ pub async fn tool_design_metrics(
     let limit = params.limit.unwrap_or(30);
     let sort_by = params.sort_by.as_deref().unwrap_or("system_complexity");
 
-    info!(
+    debug!(
         tool = "design_metrics",
         project = %params.project,
         scope,

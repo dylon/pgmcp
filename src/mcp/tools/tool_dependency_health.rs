@@ -45,7 +45,7 @@ pub async fn tool_dependency_health(
         None
     };
 
-    info!(
+    debug!(
         tool = "dependency_health",
         project = params.project.as_deref().unwrap_or("*"),
         limit,

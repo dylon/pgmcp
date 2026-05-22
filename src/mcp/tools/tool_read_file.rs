@@ -61,7 +61,7 @@ pub async fn tool_read_file(
 ) -> Result<CallToolResult, McpError> {
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    info!(
+    debug!(
         tool = "read_file",
         path = %params.path,
         start_line = ?params.start_line,

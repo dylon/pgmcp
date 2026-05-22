@@ -11,7 +11,17 @@
 //! lifecycle events with their own work channels.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Unix epoch milliseconds via the system clock. `0` on the (impossible
+/// in production) case where `SystemTime::now()` is before the epoch.
+fn now_unix_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 
 use crossbeam_channel::Receiver;
 
@@ -72,6 +82,11 @@ impl std::fmt::Display for DaemonPhase {
 pub struct DaemonLifecycle {
     /// Atomic state register — always reflects current phase.
     phase: Arc<AtomicU8>,
+    /// Unix epoch millis when the current phase was first entered.
+    /// Used by heavy-cron `Cooldown` logs so an operator can see
+    /// "in Ready for X seconds, waiting for Y" without consulting
+    /// process start time externally. `0` until the first transition.
+    phase_started_at_ms: Arc<AtomicI64>,
     /// Reactive event channel — broadcasts phase transitions.
     subject: Arc<Subject<DaemonPhase>>,
 }
@@ -86,6 +101,7 @@ impl DaemonLifecycle {
     pub fn new() -> Self {
         Self {
             phase: Arc::new(AtomicU8::new(DaemonPhase::Initializing as u8)),
+            phase_started_at_ms: Arc::new(AtomicI64::new(now_unix_ms())),
             subject: Arc::new(Subject::new(16)),
         }
     }
@@ -101,6 +117,8 @@ impl DaemonLifecycle {
         let prev = self.phase.fetch_max(to as u8, Ordering::AcqRel);
         let prev_phase = DaemonPhase::from_u8(prev);
         if prev_phase != to && prev < to as u8 {
+            self.phase_started_at_ms
+                .store(now_unix_ms(), Ordering::Release);
             tracing::info!(
                 from = %prev_phase,
                 to = %to,
@@ -109,6 +127,24 @@ impl DaemonLifecycle {
             self.subject.next(to);
         }
         prev_phase
+    }
+
+    /// Unix epoch milliseconds when the current phase was first entered.
+    /// `0` if no transition has happened yet (unlikely — the
+    /// constructor records the initialization moment).
+    pub fn phase_started_at_ms(&self) -> i64 {
+        self.phase_started_at_ms.load(Ordering::Acquire)
+    }
+
+    /// Milliseconds since the daemon entered its current phase. Useful
+    /// for "in Ready for X ms, waiting for Y" diagnostic logs in
+    /// heavy-cron cooldown skips.
+    pub fn ms_in_current_phase(&self) -> i64 {
+        let started = self.phase_started_at_ms();
+        if started == 0 {
+            return 0;
+        }
+        (now_unix_ms() - started).max(0)
     }
 
     /// Current phase (lock-free atomic read).

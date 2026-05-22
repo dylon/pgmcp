@@ -41,7 +41,7 @@ pub async fn tool_shotgun_surgery_fix(
     let min_coupling = params.min_coupling.unwrap_or(0.2).clamp(0.0, 1.0);
     let limit = params.limit.unwrap_or(15).max(1);
 
-    info!(
+    debug!(
         tool = "shotgun_surgery_fix",
         project = %params.project,
         min_partners,

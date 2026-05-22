@@ -23,7 +23,7 @@ pub async fn tool_test_coverage_gaps(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().coverage_scans.fetch_add(1, Ordering::Relaxed);
 
-    info!(
+    debug!(
         tool = "test_coverage_gaps",
         project = %params.project,
         "MCP tool invoked",

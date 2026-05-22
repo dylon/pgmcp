@@ -113,6 +113,17 @@ pub fn extract_with_cache(
                 error = %e,
                 "OCR failed; falling back to sparse pdftotext output",
             );
+            // Cache the negative outcome (empty text) so subsequent
+            // rescans short-circuit at Phase 3 instead of re-attempting
+            // OCR on a structurally unreadable PDF. Without this, the
+            // same poisoned PDFs (corrupt headers, encrypted, etc.)
+            // produced 50× "expected PNG missing" warns *per rescan*,
+            // observed as 150 warns/day from 3 PDFs. Cache invalidation
+            // is automatic: any byte-level change to the PDF flips
+            // `content_hash`, invalidating this entry.
+            if let (Some(cache), Some(hash)) = (cache, content_hash) {
+                cache.store(hash, "", 0, opts.ocr.dpi, &opts.ocr.languages);
+            }
             return Ok(Some(Extracted {
                 text: pdftotext_text,
                 truncated,
@@ -126,6 +137,12 @@ pub fn extract_with_cache(
             path = %path.display(),
             "OCR produced no text; returning sparse pdftotext output",
         );
+        // Same negative-result caching as the error branch — tesseract
+        // succeeded but the document is genuinely unreadable (image-only
+        // PDF that OCR can't crack), so don't bother retrying next time.
+        if let (Some(cache), Some(hash)) = (cache, content_hash) {
+            cache.store(hash, "", 0, opts.ocr.dpi, &opts.ocr.languages);
+        }
         return Ok(Some(Extracted {
             text: pdftotext_text,
             truncated,

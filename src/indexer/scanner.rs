@@ -5,6 +5,7 @@
 //! Auto-discovers agent homes such as `~/.claude/` and `~/.codex/` as
 //! synthetic projects.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crossbeam_channel::Sender;
@@ -13,6 +14,39 @@ use ignore::WalkBuilder;
 use tracing::{debug, info};
 
 use crate::config::{self, Config};
+
+/// Read the set of file extensions present in `dir`. Used to apply
+/// contextual extension rules (currently `.cfg` → `tlaplus` when a
+/// sibling `.tla` exists in the same directory). Returns an empty set
+/// when `dir` cannot be read.
+fn sibling_extensions(dir: &Path) -> HashSet<String> {
+    let mut out = HashSet::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if let Some(ext) = entry.path().extension().and_then(|e| e.to_str()) {
+                out.insert(ext.to_string());
+            }
+        }
+    }
+    out
+}
+
+/// Inclusion gate that honours both the path-based extension allowlist
+/// and the directory-aware contextual rules. For every extension other
+/// than `.cfg` the gate uses the path-only fast path (no `readdir` cost);
+/// `.cfg` triggers a sibling-extension scan to decide whether the file is
+/// a TLA+ TLC config in a `.tla` project directory.
+fn is_configured_path(config: &Config, path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if ext != "cfg" {
+        return config.indexer.is_configured_extension(path);
+    }
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let siblings = sibling_extensions(parent);
+    config
+        .indexer
+        .is_configured_extension_in_context(path, &siblings)
+}
 
 /// Directories inside `~/.claude/` that should be excluded from indexing
 /// (noise: telemetry, debug logs, cache, binary snapshots, etc.).
@@ -113,6 +147,46 @@ impl SyntheticRoots {
     pub fn empty() -> Self {
         Self::default()
     }
+
+    /// Iterate the synthetic-root paths that exist on disk, as
+    /// `(name, path)` pairs. Used by `effective_workspace_paths` and
+    /// by callers that need to log which roots were discovered.
+    pub fn present(&self) -> impl Iterator<Item = (&'static str, &PathBuf)> {
+        [
+            ("claude", self.claude.as_ref()),
+            ("codex", self.codex.as_ref()),
+            ("papers", self.papers.as_ref()),
+            ("documents", self.documents.as_ref()),
+        ]
+        .into_iter()
+        .filter_map(|(name, opt)| opt.filter(|p| p.is_dir()).map(|p| (name, p)))
+    }
+}
+
+/// Union of `config.workspace.paths` and any existing synthetic roots
+/// (`~/.claude`, `~/.codex`, `~/Papers`, `~/Documents` — whichever are
+/// present on disk). This is the canonical set of "directories pgmcp
+/// cares about" and is consumed by BOTH the initial scanner
+/// (`scan_workspaces`) and the inotify watcher (`start_watching`).
+///
+/// Without this unification, synthetic roots are populated by the
+/// initial scan but receive no live watch — every edit to a Claude
+/// memory file or Papers/PDF goes uncaught until the next daemon
+/// restart. Live coverage for synthetic roots was Bug B in the
+/// 2026-05-21 staleness investigation.
+///
+/// Duplicates are removed (a synthetic-root path that also appears in
+/// `config.workspace.paths` is only emitted once).
+pub fn effective_workspace_paths(config: &Config, roots: &SyntheticRoots) -> Vec<String> {
+    let mut paths: Vec<String> = config.workspace.paths.clone();
+    let mut seen: std::collections::HashSet<String> = paths.iter().cloned().collect();
+    for (_name, path) in roots.present() {
+        let s = path.to_string_lossy().into_owned();
+        if seen.insert(s.clone()) {
+            paths.push(s);
+        }
+    }
+    paths
 }
 
 /// Scan all configured workspace paths and submit files for indexing.
@@ -341,7 +415,7 @@ pub(crate) fn scan_single_workspace(
         }
 
         // Check if this file type is configured
-        if !config.indexer.is_configured_extension(path) {
+        if !is_configured_path(config, path) {
             continue;
         }
 
@@ -421,7 +495,7 @@ fn scan_claude_dir(
         }
 
         // Check configured extensions
-        if !config.indexer.is_configured_extension(path) {
+        if !is_configured_path(config, path) {
             continue;
         }
 
@@ -498,7 +572,7 @@ fn should_index_codex_file(codex_dir: &Path, path: &Path, config: &Config) -> bo
         return false;
     }
 
-    if !config.indexer.is_configured_extension(path) {
+    if !is_configured_path(config, path) {
         return false;
     }
 
@@ -593,7 +667,7 @@ fn scan_synthetic_doc_dir(
             continue;
         }
 
-        if !config.indexer.is_configured_extension(path) {
+        if !is_configured_path(config, path) {
             continue;
         }
 

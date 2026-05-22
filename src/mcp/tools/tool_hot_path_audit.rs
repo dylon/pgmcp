@@ -32,7 +32,7 @@ pub async fn tool_hot_path_audit(
     let percentile_threshold = params.percentile_threshold.unwrap_or(0.9).clamp(0.0, 1.0);
     let limit = params.limit.unwrap_or(20).max(1);
 
-    info!(
+    debug!(
         tool = "hot_path_audit",
         project = %params.project,
         percentile_threshold,

@@ -28,7 +28,7 @@ pub async fn tool_technical_debt_analysis(
     let limit = params.limit.unwrap_or(30);
     let include_todos = params.include_todos.unwrap_or(true);
 
-    info!(
+    debug!(
         tool = "technical_debt_analysis",
         project = %params.project,
         limit,

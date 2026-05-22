@@ -26,7 +26,7 @@ pub async fn tool_change_impact_analysis(
     let depth = params.depth.unwrap_or(3);
     let include_semantic = params.include_semantic.unwrap_or(true);
 
-    info!(
+    debug!(
         tool = "change_impact_analysis",
         project = %params.project,
         file = %params.file,

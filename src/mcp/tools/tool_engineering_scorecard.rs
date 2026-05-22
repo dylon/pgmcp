@@ -25,7 +25,7 @@ pub async fn tool_engineering_scorecard(
 
     let format = params.format.as_deref().unwrap_or("full");
 
-    info!(
+    debug!(
         tool = "engineering_scorecard",
         project = %params.project,
         format,

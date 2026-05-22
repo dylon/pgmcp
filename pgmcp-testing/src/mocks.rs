@@ -223,6 +223,13 @@ impl DbClient for MockDbClient {
         Ok(())
     }
 
+    async fn update_projects_scanned_by_workspace(
+        &self,
+        _workspace_path: &str,
+    ) -> Result<u64, sqlx::Error> {
+        Ok(0)
+    }
+
     async fn delete_projects_by_workspace(
         &self,
         _workspace_path: &str,

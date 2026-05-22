@@ -1233,6 +1233,20 @@ pub async fn run_global_topic_scan(
 
     let chunk_count_opt = count_chunks(db).await;
 
+    // NoOp detection: if there are no chunks (or count failed), record
+    // the no-op outcome so an operator can tell "the cron ran, nothing
+    // to cluster" apart from "the cron never ran".
+    match chunk_count_opt {
+        Some(0) | None => {
+            stats
+                .topic_clustering_noop_returns
+                .fetch_add(1, Ordering::Relaxed);
+            info!("Topic clustering cron: no chunks to scan");
+            return;
+        }
+        Some(_) => {}
+    }
+
     // Strategy dispatch: online (huge) → mmap (medium) → in-memory (small).
     if let Some(chunk_count) = chunk_count_opt {
         match select_scan_strategy(chunk_count, config) {

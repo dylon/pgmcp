@@ -1,0 +1,94 @@
+//! `tool_blocking_in_async` — Detect sync I/O / std::sync::Mutex / thread::sleep
+//! inside `async fn` bodies (SOTA Phase 5.8).
+
+#![allow(unused_imports)]
+
+use regex::Regex;
+use rmcp::ErrorData as McpError;
+use rmcp::model::CallToolResult;
+use serde_json::json;
+use std::sync::atomic::Ordering;
+
+use crate::context::SystemContext;
+use crate::mcp::server::BlockingInAsyncParams;
+use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
+
+pub async fn tool_blocking_in_async(
+    ctx: &SystemContext,
+    params: BlockingInAsyncParams,
+) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "blocking_in_async", "MCP tool invoked");
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let pool = pool_or_err(ctx)?;
+    let limit = params.limit.unwrap_or(50);
+
+    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT relative_path, language, content
+         FROM indexed_files
+         WHERE project_id = $1 AND content IS NOT NULL AND language IN ('rust','javascript','typescript','python')"
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| McpError::internal_error(format!("Scan failed: {}", e), None))?;
+
+    let async_fn_re =
+        Regex::new(r"(?m)\b(async\s+fn|async\s+function|async\s+def)\b").expect("async fn regex");
+    let blocking_re = Regex::new(
+        r"(?m)\b(std::fs::|std::sync::Mutex::lock|std::thread::sleep|reqwest::blocking|fs\.readFileSync|fs\.writeFileSync|time\.sleep|requests\.get|requests\.post)\b"
+    ).expect("blocking regex");
+
+    let mut findings: Vec<serde_json::Value> = Vec::new();
+    for (path, lang, content) in rows {
+        let Some(c) = content else { continue };
+        // For each async fn body, count blocking calls.
+        let mut anchors: Vec<usize> = async_fn_re.find_iter(&c).map(|m| m.end()).collect();
+        anchors.push(c.len());
+        for w in anchors.windows(2) {
+            let start = w[0];
+            // Walk until matching brace closes.
+            let mut depth = 0i32;
+            let mut seen_open = false;
+            let mut end = w[1];
+            for (i, ch) in c[start..].char_indices() {
+                if ch == '{' {
+                    depth += 1;
+                    seen_open = true;
+                } else if ch == '}' && seen_open {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i;
+                        break;
+                    }
+                }
+            }
+            let body = &c[start..end];
+            for m in blocking_re.find_iter(body) {
+                let line = c[..start + m.start()]
+                    .bytes()
+                    .filter(|b| *b == b'\n')
+                    .count()
+                    + 1;
+                findings.push(json!({
+                    "file": path,
+                    "language": lang,
+                    "line": line,
+                    "blocking_call": m.as_str(),
+                }));
+                if findings.len() >= limit.max(0) as usize {
+                    return done(&params.project, findings);
+                }
+            }
+        }
+    }
+    done(&params.project, findings)
+}
+
+fn done(project: &str, findings: Vec<serde_json::Value>) -> Result<CallToolResult, McpError> {
+    json_result(&json!({
+        "project": project,
+        "matches": findings,
+        "guidance": "Sync I/O / Mutex / sleep inside async functions blocks the runtime executor. Replace with tokio::fs, tokio::sync::Mutex, tokio::time::sleep, or a spawn_blocking shim."
+    }))
+}

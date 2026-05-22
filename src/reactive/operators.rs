@@ -210,22 +210,63 @@ mod tests {
 
     #[test]
     fn test_throttle_first() {
+        // Window must be >> the negative-recv timeout so 2 and 3 stay
+        // suppressed even when the worker thread is descheduled under
+        // heavy parallel test load (verify.sh runs all 763 tests at once).
+        // Original (100ms window vs 50ms wait) was a fragile 2:1 ratio;
+        // 2s vs 100ms gives a 20:1 safety margin.
+        let throttle_window = Duration::from_millis(2_000);
         let (tx, rx) = unbounded();
-        let throttled = throttle_first(rx, Duration::from_millis(100));
+        let throttled = throttle_first(rx, throttle_window);
 
         tx.send(1).expect("send failed");
         tx.send(2).expect("send failed");
         tx.send(3).expect("send failed");
 
+        // Generous positive timeout: the first emission must arrive,
+        // but the worker thread can be stalled tens of ms under load.
+        // Only consumed in full if throttle_first is broken.
         let first = throttled
-            .recv_timeout(Duration::from_millis(50))
+            .recv_timeout(Duration::from_secs(2))
             .expect("recv failed");
         assert_eq!(first, 1);
 
-        // 2 and 3 should be suppressed
-        assert!(throttled.recv_timeout(Duration::from_millis(50)).is_err());
+        // 2 and 3 must be suppressed. 100ms is comfortably inside the
+        // 2s window even with scheduler jitter.
+        assert!(
+            throttled.recv_timeout(Duration::from_millis(100)).is_err(),
+            "throttle_first leaked a second emission inside the window"
+        );
 
         drop(tx);
+    }
+
+    /// Stress-loop the fix for test_throttle_first to catch regressions
+    /// where someone tightens the timing budget. Runs 50 iterations of
+    /// the same scenario; any flake fails the build deterministically.
+    #[test]
+    fn test_throttle_first_is_deterministic_under_load() {
+        let throttle_window = Duration::from_millis(2_000);
+        for iter in 0..50 {
+            let (tx, rx) = unbounded();
+            let throttled = throttle_first(rx, throttle_window);
+
+            tx.send(1).expect("send failed");
+            tx.send(2).expect("send failed");
+            tx.send(3).expect("send failed");
+
+            let first = throttled
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|e| panic!("iter {iter}: positive recv failed: {e:?}"));
+            assert_eq!(first, 1, "iter {iter}: first emission must be 1");
+
+            assert!(
+                throttled.recv_timeout(Duration::from_millis(100)).is_err(),
+                "iter {iter}: throttle leaked second emission inside window"
+            );
+
+            drop(tx);
+        }
     }
 
     #[test]

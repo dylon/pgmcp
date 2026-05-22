@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -543,6 +543,46 @@ impl IndexerConfig {
                 .map(|ft| ft.language.clone())
         })
     }
+
+    /// Language lookup with directory context. Used by the scanner so we
+    /// can apply contextual extension rules — currently:
+    ///
+    /// - `.cfg` files map to `tlaplus` when a sibling `.tla` file exists in
+    ///   the same directory (TLA+ TLC config files travel beside their spec
+    ///   files). Outside a TLA+ project directory, `.cfg` is too ambiguous
+    ///   (nginx/git/postgres/makefile fragments) and is silently dropped,
+    ///   matching the pre-existing behaviour.
+    ///
+    /// `sibling_extensions` is the set of extensions present in the file's
+    /// directory (built once per directory by the scanner). Pass an empty
+    /// set to disable contextual rules.
+    pub fn language_for_path_in_context(
+        &self,
+        path: &Path,
+        sibling_extensions: &HashSet<String>,
+    ) -> Option<String> {
+        // First try the path-based lookup.
+        if let Some(lang) = self.language_for_path(path) {
+            return Some(lang);
+        }
+        // Contextual rule: `.cfg` in a TLA+ project directory.
+        let ext = path.extension().and_then(|e| e.to_str())?;
+        if ext == "cfg" && sibling_extensions.contains("tla") {
+            return Some("tlaplus".into());
+        }
+        None
+    }
+
+    /// Check inclusion with directory context — paired with
+    /// `language_for_path_in_context`.
+    pub fn is_configured_extension_in_context(
+        &self,
+        path: &Path,
+        sibling_extensions: &HashSet<String>,
+    ) -> bool {
+        self.language_for_path_in_context(path, sibling_extensions)
+            .is_some()
+    }
 }
 
 fn default_file_types() -> Vec<FileTypeMapping> {
@@ -729,6 +769,120 @@ fn default_file_types() -> Vec<FileTypeMapping> {
             extension: "txt".into(),
             language: "text".into(),
         },
+        // ====================================================================
+        // Formal-verification source files (post-SOTA addition).
+        //
+        // Tier-1 search/embedding/FTS support for every entry below; Tier-2
+        // tree-sitter symbol extraction lands separately for coq, tlaplus,
+        // lean (dedicated backends) and sage (dispatches to PythonBackend).
+        // Note: `.cfg` → `tlaplus` is implemented in
+        // `language_for_path_in_context` (only when a sibling `.tla` exists)
+        // because `.cfg` is too ambiguous for a global mapping.
+        // ====================================================================
+        FileTypeMapping {
+            extension: "v".into(),
+            language: "coq".into(),
+        }, // Coq / Rocq
+        FileTypeMapping {
+            extension: "tla".into(),
+            language: "tlaplus".into(),
+        }, // TLA+ spec
+        FileTypeMapping {
+            extension: "smt2".into(),
+            language: "smt2".into(),
+        }, // Z3 / SMT-LIB 2
+        FileTypeMapping {
+            extension: "smt".into(),
+            language: "smt2".into(),
+        }, // Z3 / SMT-LIB 2 (legacy)
+        FileTypeMapping {
+            extension: "lean".into(),
+            language: "lean".into(),
+        }, // Lean 4
+        FileTypeMapping {
+            extension: "sage".into(),
+            language: "sage".into(),
+        }, // Sage Math
+        FileTypeMapping {
+            extension: "thy".into(),
+            language: "isabelle".into(),
+        }, // Isabelle/HOL
+        FileTypeMapping {
+            extension: "agda".into(),
+            language: "agda".into(),
+        }, // Agda
+        FileTypeMapping {
+            extension: "lagda".into(),
+            language: "agda".into(),
+        }, // Literate Agda
+        FileTypeMapping {
+            extension: "idr".into(),
+            language: "idris".into(),
+        }, // Idris 2
+        FileTypeMapping {
+            extension: "lidr".into(),
+            language: "idris".into(),
+        }, // Literate Idris
+        FileTypeMapping {
+            extension: "ipkg".into(),
+            language: "idris".into(),
+        }, // Idris package
+        FileTypeMapping {
+            extension: "dfy".into(),
+            language: "dafny".into(),
+        }, // Dafny
+        FileTypeMapping {
+            extension: "fst".into(),
+            language: "fstar".into(),
+        }, // F*
+        FileTypeMapping {
+            extension: "fsti".into(),
+            language: "fstar".into(),
+        }, // F* interface
+        FileTypeMapping {
+            extension: "mlw".into(),
+            language: "why3".into(),
+        }, // Why3
+        FileTypeMapping {
+            extension: "als".into(),
+            language: "alloy".into(),
+        }, // Alloy
+        FileTypeMapping {
+            extension: "pml".into(),
+            language: "promela".into(),
+        }, // Spin / Promela
+        FileTypeMapping {
+            extension: "ec".into(),
+            language: "easycrypt".into(),
+        }, // EasyCrypt
+        FileTypeMapping {
+            extension: "eca".into(),
+            language: "easycrypt".into(),
+        }, // EasyCrypt abstract
+        FileTypeMapping {
+            extension: "spthy".into(),
+            language: "tamarin".into(),
+        }, // Tamarin Prover
+        FileTypeMapping {
+            extension: "pvs".into(),
+            language: "pvs".into(),
+        }, // PVS
+        FileTypeMapping {
+            extension: "acl2".into(),
+            language: "acl2".into(),
+        }, // ACL2
+        FileTypeMapping {
+            extension: "mm".into(),
+            language: "metamath".into(),
+        }, // Metamath
+        FileTypeMapping {
+            extension: "cv".into(),
+            language: "cryptoverif".into(),
+        }, // CryptoVerif
+        FileTypeMapping {
+            extension: "ocv".into(),
+            language: "cryptoverif".into(),
+        }, // CryptoVerif oracle
     ]
 }
 
@@ -747,6 +901,25 @@ fn default_exclude_patterns() -> Vec<String> {
         ".git".into(),
         "__pycache__".into(),
         "*.lock".into(),
+        // Formal-verification build artifacts.
+        "_build".into(),        // Dune / Coq Makefile output
+        ".lake".into(),         // Lean 4 / Lake metadata
+        "lake-packages".into(), // Lean 4 / Lake package cache
+        "*.vo".into(),          // Coq compiled
+        "*.vok".into(),
+        "*.vos".into(),
+        "*.glob".into(),         // Coq globals dump
+        "*.agdai".into(),        // Agda interface files
+        ".tlaplus-cache".into(), // TLA+ Toolbox cache
+        // macOS / Windows filesystem detritus. `__MACOSX` catches both the
+        // top-level `__MACOSX/` directories that unzip from macOS-created
+        // archives (and contain AppleDouble `._<name>` siblings) and any
+        // nested copies. The AppleDouble forks are not valid UTF-8 — they
+        // are HFS+ resource-fork metadata in binary form — and were
+        // generating 90+ "stream did not contain valid UTF-8" errors per
+        // rescan against `.java` and `.py` paths inside them.
+        "__MACOSX".into(),
+        "Thumbs.db".into(),
     ]
 }
 
@@ -927,7 +1100,7 @@ fn default_db_user() -> String {
     "pgmcp".into()
 }
 fn default_max_connections() -> u32 {
-    20
+    40
 }
 fn default_statement_timeout_ms() -> u32 {
     30_000
@@ -1173,6 +1346,25 @@ pub struct LoggingConfig {
     pub rotation: String,
     #[serde(default = "default_max_log_files")]
     pub max_log_files: u32,
+    /// Output format for the file sink: `"json"` (default), `"compact"`, or `"pretty"`.
+    /// Stderr always uses the compact human-readable form regardless of this setting.
+    #[serde(default = "default_log_format")]
+    pub format: String,
+    /// Optional per-target log-level overrides composed into the
+    /// `EnvFilter`. `RUST_LOG` (if set) still wins. Example:
+    /// `targets = { "pgmcp::mcp::tool" = "debug", "sqlx::query" = "warn" }`.
+    #[serde(default)]
+    pub targets: std::collections::BTreeMap<String, String>,
+    /// Optional separate file path for an MCP-tool-call-only access log.
+    /// When set, the daemon writes a second log file containing only
+    /// events from the `pgmcp::mcp::tool` tracing target (the
+    /// `invoked` / `completed` / `failed` events from
+    /// `instrumented_tool_run`). Useful for keeping an nginx-style
+    /// access log of tool traffic separate from general daemon logs.
+    /// Uses the same rotation policy and `max_log_files` budget as the
+    /// main log file. Tilde-expanded.
+    #[serde(default)]
+    pub access_log: Option<String>,
 }
 
 impl Default for LoggingConfig {
@@ -1182,6 +1374,9 @@ impl Default for LoggingConfig {
             level: default_log_level(),
             rotation: default_rotation(),
             max_log_files: default_max_log_files(),
+            format: default_log_format(),
+            targets: std::collections::BTreeMap::new(),
+            access_log: None,
         }
     }
 }
@@ -1197,6 +1392,9 @@ fn default_rotation() -> String {
 }
 fn default_max_log_files() -> u32 {
     7
+}
+fn default_log_format() -> String {
+    "json".into()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1336,6 +1534,28 @@ pub struct CronConfig {
     #[serde(default = "default_ready_delay_symbol_extraction_secs")]
     pub ready_delay_symbol_extraction_secs: u64,
 
+    /// Interval between function-metrics (SOTA Phase 1) runs in seconds
+    /// (default: 7200 = 2 hours). Runs after symbol-extraction; computes
+    /// cyclomatic / cognitive / Halstead / NPath / MI per function.
+    #[serde(default = "default_function_metrics_interval")]
+    pub function_metrics_interval_secs: u64,
+
+    /// Ready-relative initial delay for function-metrics cron (seconds).
+    /// Default 2100 = 35 minutes (sequenced after symbol-extraction's 30m).
+    #[serde(default = "default_ready_delay_function_metrics_secs")]
+    pub ready_delay_function_metrics_secs: u64,
+
+    /// Interval between call-graph (SOTA Phase 1) runs in seconds
+    /// (default: 7200 = 2 hours). Materializes symbol-resolved call edges
+    /// into `code_graph_edges` and updates `function_metrics.fan_in/fan_out`.
+    #[serde(default = "default_call_graph_interval")]
+    pub call_graph_interval_secs: u64,
+
+    /// Ready-relative initial delay for call-graph cron (seconds).
+    /// Default 2400 = 40 minutes (sequenced after function-metrics's 35m).
+    #[serde(default = "default_ready_delay_call_graph_secs")]
+    pub ready_delay_call_graph_secs: u64,
+
     /// GPU FCM precision selector (cuda feature only). Valid values: "fp32",
     /// "fp16", "bf16". Default: "fp16" — mixed precision with fp32 accumulator,
     /// Tensor Cores enabled on Ada Lovelace / Hopper GPUs. Falls back to fp32
@@ -1419,6 +1639,10 @@ impl Default for CronConfig {
             ready_delay_graph_secs: default_ready_delay_graph_secs(),
             ready_delay_topic_secs: default_ready_delay_topic_secs(),
             ready_delay_symbol_extraction_secs: default_ready_delay_symbol_extraction_secs(),
+            function_metrics_interval_secs: default_function_metrics_interval(),
+            ready_delay_function_metrics_secs: default_ready_delay_function_metrics_secs(),
+            call_graph_interval_secs: default_call_graph_interval(),
+            ready_delay_call_graph_secs: default_ready_delay_call_graph_secs(),
             gpu_fcm_precision: default_gpu_fcm_precision(),
             topic_k_selector: default_topic_k_selector(),
             topic_k_candidates: Vec::new(),
@@ -1451,6 +1675,18 @@ fn default_ready_delay_topic_secs() -> u64 {
 fn default_ready_delay_symbol_extraction_secs() -> u64 {
     1800
 }
+fn default_function_metrics_interval() -> u64 {
+    7200
+} // 2 hours
+fn default_ready_delay_function_metrics_secs() -> u64 {
+    2100
+} // 35 minutes — sequenced after symbol-extraction's 30m
+fn default_call_graph_interval() -> u64 {
+    7200
+} // 2 hours
+fn default_ready_delay_call_graph_secs() -> u64 {
+    2400
+} // 40 minutes — sequenced after function-metrics's 35m
 fn default_gpu_fcm_precision() -> String {
     "fp16".into()
 }
@@ -2008,6 +2244,123 @@ mod tests {
                 ext
             );
         }
+    }
+
+    #[test]
+    fn test_default_file_types_includes_formal_verification_languages() {
+        let config = IndexerConfig::default();
+        for (ext, expected_lang) in [
+            ("v", "coq"),
+            ("tla", "tlaplus"),
+            ("smt2", "smt2"),
+            ("smt", "smt2"),
+            ("lean", "lean"),
+            ("sage", "sage"),
+            ("thy", "isabelle"),
+            ("agda", "agda"),
+            ("lagda", "agda"),
+            ("idr", "idris"),
+            ("lidr", "idris"),
+            ("ipkg", "idris"),
+            ("dfy", "dafny"),
+            ("fst", "fstar"),
+            ("fsti", "fstar"),
+            ("mlw", "why3"),
+            ("als", "alloy"),
+            ("pml", "promela"),
+            ("ec", "easycrypt"),
+            ("eca", "easycrypt"),
+            ("spthy", "tamarin"),
+            ("pvs", "pvs"),
+            ("acl2", "acl2"),
+            ("mm", "metamath"),
+            ("cv", "cryptoverif"),
+            ("ocv", "cryptoverif"),
+        ] {
+            let path_str = format!("file.{}", ext);
+            let path = Path::new(&path_str);
+            assert!(
+                config.is_configured_extension(path),
+                "missing FV mapping for .{}",
+                ext
+            );
+            assert_eq!(
+                config.language_for_path(path),
+                Some(expected_lang.to_string()),
+                "wrong language for .{}",
+                ext
+            );
+        }
+    }
+
+    #[test]
+    fn test_default_exclude_patterns_includes_fv_build_artifacts() {
+        let config = IndexerConfig::default();
+        for pattern in [
+            "_build",
+            ".lake",
+            "lake-packages",
+            "*.vo",
+            "*.vok",
+            "*.vos",
+            "*.glob",
+            "*.agdai",
+            ".tlaplus-cache",
+        ] {
+            assert!(
+                config.exclude_patterns.iter().any(|p| p == pattern),
+                "missing FV exclude pattern: {}",
+                pattern
+            );
+        }
+    }
+
+    #[test]
+    fn test_cfg_in_tlaplus_project_maps_to_tlaplus() {
+        let config = IndexerConfig::default();
+        let mut siblings = HashSet::new();
+        siblings.insert("tla".to_string());
+        siblings.insert("cfg".to_string());
+        assert_eq!(
+            config.language_for_path_in_context(Path::new("MC.cfg"), &siblings),
+            Some("tlaplus".to_string()),
+            "`.cfg` should map to tlaplus when a sibling `.tla` exists"
+        );
+        assert!(
+            config.is_configured_extension_in_context(Path::new("MC.cfg"), &siblings),
+            "`.cfg` should be included when a sibling `.tla` exists"
+        );
+    }
+
+    #[test]
+    fn test_cfg_outside_tlaplus_project_is_dropped() {
+        let config = IndexerConfig::default();
+        let mut siblings = HashSet::new();
+        siblings.insert("conf".to_string());
+        siblings.insert("yaml".to_string());
+        assert_eq!(
+            config.language_for_path_in_context(Path::new("nginx.cfg"), &siblings),
+            None,
+            "`.cfg` without sibling `.tla` should be dropped"
+        );
+        assert!(
+            !config.is_configured_extension_in_context(Path::new("nginx.cfg"), &siblings),
+            "`.cfg` without sibling `.tla` should not be included"
+        );
+    }
+
+    #[test]
+    fn test_language_for_path_in_context_falls_back_to_path_lookup() {
+        let config = IndexerConfig::default();
+        let empty: HashSet<String> = HashSet::new();
+        assert_eq!(
+            config.language_for_path_in_context(Path::new("foo.rs"), &empty),
+            Some("rust".to_string()),
+        );
+        assert_eq!(
+            config.language_for_path_in_context(Path::new("foo.tla"), &empty),
+            Some("tlaplus".to_string()),
+        );
     }
 
     #[test]

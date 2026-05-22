@@ -50,7 +50,7 @@ pub async fn tool_boilerplate_clusters(
     let worktree_filter = params.worktree_filter.as_deref().unwrap_or("main");
     let main_only = matches!(worktree_filter, "main");
 
-    info!(
+    debug!(
         tool = "boilerplate_clusters",
         min_similarity, min_cluster_size, min_normalized_match, worktree_filter, "MCP tool invoked",
     );

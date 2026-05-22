@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -11,11 +12,30 @@ use tracing_subscriber::prelude::*;
 
 use crate::config::Config;
 
+/// Compose an `EnvFilter` from the configured global level + optional
+/// per-target overrides. `RUST_LOG` (when set) takes precedence over both;
+/// per-target overrides extend whichever filter was chosen.
+fn build_env_filter(level: &str, targets: &BTreeMap<String, String>) -> EnvFilter {
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    for (target, lvl) in targets {
+        let directive_str = format!("{}={}", target, lvl);
+        match directive_str.parse() {
+            Ok(d) => filter = filter.add_directive(d),
+            Err(e) => eprintln!(
+                "pgmcp: ignoring invalid [logging] targets directive `{}`: {}",
+                directive_str, e,
+            ),
+        }
+    }
+    filter
+}
+
 // ---------------------------------------------------------------------------
 // RotatingFileAppender
 // ---------------------------------------------------------------------------
 
 /// Rotation period for log files.
+#[derive(Clone, Copy)]
 enum RotationPeriod {
     Daily,
     Hourly,
@@ -206,15 +226,63 @@ impl<'a> io::Write for AppenderGuard<'a> {
 /// of work, with the actual error invisible). See
 /// `~/.claude/plans/thoroughly-examine-home-dylon-workspace-melodic-cake.md`.
 ///
-/// - Writes to stderr (stdout is reserved for the CLI's structured
-///   `println!` output, e.g. JSON tool results).
-/// - Default level `info`; overridable via `RUST_LOG`.
-/// - `try_init` so it's safe to call multiple times in tests / re-entrant
-///   harness paths.
-/// - ANSI colours only when stderr is a TTY.
-pub fn init_cli() {
+/// Two layers when called with `Some(&config)`:
+///
+/// - Stderr (always): human-readable, ANSI when a TTY, level from
+///   `RUST_LOG` else `config.logging.level` else `info`. Stdout is
+///   reserved for structured CLI output (JSON, tables), so log lines
+///   stay on stderr.
+/// - File (only when `config` is `Some` and the file is writable):
+///   JSON, no ANSI, no rotation. The daemon owns rotation; the CLI just
+///   appends to the current file. If the daemon rotates mid-CLI, this
+///   CLI's events continue landing in the now-rotated file for the rest
+///   of the CLI's lifetime — acceptable for short-lived invocations.
+///
+/// Subcommands that load `Config::load()` should call this with
+/// `Some(&config)` after the load succeeds so `pgmcp tool foo` lands
+/// in `~/.local/share/pgmcp/pgmcp.log` and is visible to `tail -f`.
+/// `try_init` so it's safe to call multiple times in tests.
+pub fn init_cli_with_config(config: Option<&Config>) {
     use std::io::IsTerminal;
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    use std::sync::Mutex;
+
+    // The CLI has no config in the no-args case; default to `info` with no
+    // per-target overrides. With a config, honor `level` + `targets`.
+    let empty_targets: BTreeMap<String, String> = BTreeMap::new();
+    let (level, targets) = match config {
+        Some(c) => (c.logging.level.as_str(), &c.logging.targets),
+        None => ("info", &empty_targets),
+    };
+
+    let try_with_file = || -> Option<()> {
+        let cfg = config?;
+        let log_path = expand_tilde(&cfg.logging.file);
+        let parent = Path::new(&log_path).parent()?;
+        let _ = fs::create_dir_all(parent);
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .ok()?;
+        let filter = build_env_filter(level, targets);
+        let stderr_layer = fmt::layer()
+            .with_writer(std::io::stderr)
+            .with_ansi(std::io::stderr().is_terminal())
+            .with_target(false)
+            .with_thread_ids(false);
+        let file_layer = make_format_layer(&cfg.logging.format, Mutex::new(file));
+        let _ = tracing_subscriber::registry()
+            .with(filter)
+            .with(stderr_layer)
+            .with(file_layer)
+            .try_init();
+        Some(())
+    };
+    if try_with_file().is_some() {
+        return;
+    }
+
+    let filter = build_env_filter(level, targets);
     let _ = tracing_subscriber::registry()
         .with(filter)
         .with(
@@ -230,8 +298,7 @@ pub fn init_cli() {
 /// Initialize tracing for foreground (serve) mode.
 /// Logs to stderr so stdout remains clean for MCP stdio transport.
 pub fn init_foreground(config: &Config) {
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
+    let filter = build_env_filter(&config.logging.level, &config.logging.targets);
 
     tracing_subscriber::registry()
         .with(filter)
@@ -245,12 +312,26 @@ pub fn init_foreground(config: &Config) {
         .init();
 }
 
-/// Initialize tracing for daemon mode.
-/// Logs to a rotating file appender that always writes to `{dir}/{filename}`.
-/// On rotation, the current file is renamed with a date suffix and a fresh
-/// file is opened.
-pub fn init_daemon(config: &Config) {
-    let log_path = expand_tilde(&config.logging.file);
+/// Build the configured file-writer rotation policy from
+/// `[logging] rotation = "daily" | "hourly" | "never"`. Unknown values
+/// fall through to `Daily`.
+fn parse_rotation(rotation: &str) -> RotationPeriod {
+    match rotation {
+        "daily" => RotationPeriod::Daily,
+        "hourly" => RotationPeriod::Hourly,
+        "never" => RotationPeriod::Never,
+        _ => RotationPeriod::Daily,
+    }
+}
+
+/// Open a rotating file appender for the given path, creating any
+/// missing parent directories.
+fn make_rotating_appender(
+    path: &str,
+    rotation: RotationPeriod,
+    max_files: u32,
+) -> RotatingFileAppender {
+    let log_path = expand_tilde(path);
     let log_dir = Path::new(&log_path)
         .parent()
         .expect("Log file path must have a parent directory");
@@ -259,39 +340,76 @@ pub fn init_daemon(config: &Config) {
         .expect("Log file path must have a filename")
         .to_str()
         .expect("Log filename must be valid UTF-8");
-
-    // Ensure log directory exists
     std::fs::create_dir_all(log_dir).expect("Failed to create log directory");
-
-    let rotation = match config.logging.rotation.as_str() {
-        "daily" => RotationPeriod::Daily,
-        "hourly" => RotationPeriod::Hourly,
-        "never" => RotationPeriod::Never,
-        _ => RotationPeriod::Daily,
-    };
-
-    let file_appender = RotatingFileAppender::new(
+    RotatingFileAppender::new(
         log_dir.to_path_buf(),
         log_filename.to_string(),
         rotation,
-        config.logging.max_log_files,
+        max_files,
     )
-    .expect("Failed to create log file appender");
+    .expect("Failed to create log file appender")
+}
 
-    let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
+/// Build a fmt layer for the main log file with the configured output
+/// format. Returns a boxed layer so the three format branches share a
+/// uniform type. The layer always writes to a file appender (no ANSI,
+/// with target and thread ids).
+fn make_format_layer<S, W>(
+    format: &str,
+    writer: W,
+) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync + 'static>
+where
+    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+    W: for<'a> MakeWriter<'a> + Send + Sync + 'static,
+{
+    let base = fmt::layer()
+        .with_writer(writer)
+        .with_ansi(false)
+        .with_target(true)
+        .with_thread_ids(true);
+    match format {
+        "compact" => base.compact().boxed(),
+        "pretty" => base.pretty().boxed(),
+        // Default — and explicitly chosen `json` — both pick JSON output.
+        _ => base.json().boxed(),
+    }
+}
 
-    tracing_subscriber::registry()
-        .with(filter)
-        .with(
-            fmt::layer()
-                .with_writer(file_appender)
-                .with_ansi(false)
-                .with_target(true)
-                .with_thread_ids(true)
-                .json(),
-        )
-        .init();
+/// Initialize tracing for daemon mode.
+///
+/// Always writes to a rotating file appender at `config.logging.file`.
+/// Output format follows `config.logging.format` (`json` | `compact` |
+/// `pretty`). If `config.logging.access_log` is set, a second layer
+/// filtered to events from the `pgmcp::mcp::tool` target (i.e. the
+/// `invoked` / `completed` / `failed` events from
+/// `instrumented_tool_run`) writes to that path with the same rotation
+/// policy — an nginx-style access log of MCP tool traffic, separate
+/// from general daemon logs.
+pub fn init_daemon(config: &Config) {
+    let rotation = parse_rotation(&config.logging.rotation);
+    let main_appender =
+        make_rotating_appender(&config.logging.file, rotation, config.logging.max_log_files);
+    let filter = build_env_filter(&config.logging.level, &config.logging.targets);
+    let main_layer = make_format_layer(&config.logging.format, main_appender);
+
+    let registry = tracing_subscriber::registry().with(filter).with(main_layer);
+
+    if let Some(access_path) = config.logging.access_log.as_deref() {
+        let access_appender =
+            make_rotating_appender(access_path, rotation, config.logging.max_log_files);
+        let access_layer = fmt::layer()
+            .with_writer(access_appender)
+            .with_ansi(false)
+            .with_target(true)
+            .with_thread_ids(true)
+            .json()
+            .with_filter(tracing_subscriber::filter::filter_fn(|m| {
+                m.target() == "pgmcp::mcp::tool"
+            }));
+        registry.with(access_layer).init();
+    } else {
+        registry.init();
+    }
 }
 
 fn expand_tilde(path: &str) -> String {

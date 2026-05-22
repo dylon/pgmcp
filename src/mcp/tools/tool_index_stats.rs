@@ -18,7 +18,7 @@ use crate::mcp::server::*;
 pub async fn tool_index_stats(ctx: &SystemContext) -> Result<CallToolResult, McpError> {
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    info!(tool = "index_stats", "MCP tool invoked");
+    debug!(tool = "index_stats", "MCP tool invoked");
 
     let snapshot = ctx.stats().snapshot();
     let json = serde_json::to_string_pretty(&snapshot)

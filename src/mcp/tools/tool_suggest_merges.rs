@@ -32,7 +32,7 @@ pub async fn tool_suggest_merges(
     let min_overlap = params.min_overlap.unwrap_or(0.4);
     let limit = params.limit.unwrap_or(20);
 
-    info!(
+    debug!(
         tool = "suggest_merges",
         project = %params.project,
         language = language_param,

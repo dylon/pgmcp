@@ -40,7 +40,7 @@ pub async fn tool_bus_factor_map(
         .unwrap_or(0.5)
         .clamp(0.0, 1.0);
 
-    info!(
+    debug!(
         tool = "bus_factor_map",
         project = %params.project,
         min_pagerank_pct,

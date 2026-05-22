@@ -42,7 +42,7 @@ pub async fn tool_internal_dry(
     let min_similarity = params.min_similarity.unwrap_or(0.80).clamp(0.0, 1.0);
     let min_pairs_per_helper = params.min_pairs_per_helper.unwrap_or(2).max(2);
 
-    info!(
+    debug!(
         tool = "internal_dry",
         file = %params.file,
         min_similarity,

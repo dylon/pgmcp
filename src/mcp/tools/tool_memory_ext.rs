@@ -99,6 +99,7 @@ pub async fn tool_memory_semantic_search(
     ctx: &SystemContext,
     params: MemorySemanticSearchParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_semantic_search", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     let scope_id = resolve_optional_scope_id(ctx, pool, params.scope.as_ref()).await?;
@@ -132,6 +133,7 @@ pub async fn tool_memory_hybrid_search(
     ctx: &SystemContext,
     params: MemoryHybridSearchParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_hybrid_search", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     let scope_id = resolve_optional_scope_id(ctx, pool, params.scope.as_ref()).await?;
@@ -167,6 +169,7 @@ pub async fn tool_memory_facts_at(
     ctx: &SystemContext,
     params: MemoryFactsAtParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_facts_at", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     let scope_id = resolve_optional_scope_id(ctx, pool, params.scope.as_ref()).await?;
@@ -197,6 +200,7 @@ pub async fn tool_memory_relations_traverse(
     ctx: &SystemContext,
     params: MemoryRelationsTraverseParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_relations_traverse", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     if params.seed_entity_ids.is_empty() {
@@ -223,6 +227,7 @@ pub async fn tool_memory_anchor_entity(
     ctx: &SystemContext,
     params: MemoryAnchorEntityParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_anchor_entity", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     if params.anchor_type.trim().is_empty() {
@@ -255,6 +260,7 @@ pub async fn tool_memory_unanchor_entity(
     ctx: &SystemContext,
     params: MemoryUnanchorEntityParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_unanchor_entity", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     let removed = queries::memory_unanchor_entity(pool, params.anchor_id)
@@ -270,6 +276,7 @@ pub async fn tool_memory_find_code_for_entity(
     ctx: &SystemContext,
     params: MemoryFindCodeForEntityParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_find_code_for_entity", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     let rows =
@@ -286,6 +293,7 @@ pub async fn tool_memory_find_entities_for_code(
     ctx: &SystemContext,
     params: MemoryFindEntitiesForCodeParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_find_entities_for_code", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     let rows = queries::memory_find_entities_for_code(

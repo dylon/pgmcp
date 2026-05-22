@@ -24,7 +24,7 @@ pub async fn tool_find_duplicates(
     let min_sim = params.min_similarity.unwrap_or(0.90);
     let min_projects = params.min_projects.unwrap_or(2);
     let limit = params.limit.unwrap_or(20);
-    info!(
+    debug!(
         tool = "find_duplicates",
         min_similarity = min_sim,
         min_projects,

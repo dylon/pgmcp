@@ -27,7 +27,7 @@ pub async fn tool_architecture_quality(
 
     let detail = params.detail.as_deref().unwrap_or("summary");
 
-    info!(
+    debug!(
         tool = "architecture_quality",
         project = %params.project,
         detail,

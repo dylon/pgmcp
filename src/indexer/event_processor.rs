@@ -26,6 +26,7 @@ use crate::embed::pool::EmbedIndexRequest;
 use crate::indexer::{config_watcher::WatcherCommand, scanner, watcher};
 use crate::reactive::operators;
 use crate::shutdown::ShutdownCoordinator;
+use crate::stats::tracker::StatsTracker;
 
 /// Handle returned from start_indexing. Dropping it stops the file watcher.
 #[allow(dead_code)]
@@ -71,11 +72,21 @@ pub fn start_indexing(
     // since start_indexing is called from run_server inside #[tokio::main]).
     let rt_handle = tokio::runtime::Handle::current();
 
-    // 1. Start file watcher
+    // 1. Start file watcher.
+    //
+    // The watch set is the union of `config.workspace.paths` and any
+    // synthetic roots that exist on disk (`~/.claude`, `~/.codex`,
+    // `~/Papers`, `~/Documents`). Without including synthetic roots
+    // here, edits to those directories drift until daemon restart —
+    // the initial scan picks them up once, but no live inotify
+    // events fire afterwards. See `effective_workspace_paths` in
+    // `src/indexer/scanner.rs`.
+    let watch_synthetic_roots = scanner::SyntheticRoots::from_home();
+    let watch_paths = scanner::effective_workspace_paths(&config_snapshot, &watch_synthetic_roots);
     let (event_tx, event_rx) = crossbeam_channel::bounded(4096);
     let event_tx_for_reinit = event_tx.clone();
     let raw_watcher = watcher::start_watching(
-        &config_snapshot.workspace.paths,
+        &watch_paths,
         event_tx,
         Arc::clone(&stats),
         Some(watcher_cmd_tx.clone()),
@@ -277,12 +288,13 @@ pub fn start_indexing(
             let scan_roots = Arc::clone(&project_roots_for_scan);
             let scan_overrides = Arc::clone(&project_overrides_for_scan);
             let synthetic_roots = scanner::SyntheticRoots::from_home();
+            let synthetic_roots_for_walk = synthetic_roots.clone();
             let scan_handle = std::thread::Builder::new()
                 .name("pgmcp-scan-walk".into())
                 .spawn(move || {
                     scanner::scan_workspaces(
                         &scan_config,
-                        &synthetic_roots,
+                        &synthetic_roots_for_walk,
                         file_tx,
                         &scan_roots,
                         &scan_overrides,
@@ -383,6 +395,47 @@ pub fn start_indexing(
                 .files_skipped
                 .fetch_add(skipped, Ordering::Relaxed);
 
+            // Mark every project under each scanned workspace as freshly
+            // scanned. The per-file `upsert_project` path bumps
+            // `last_scanned_at` whenever a file is processed, but a
+            // workspace whose files are all unchanged would never trigger
+            // an upsert and the column would never advance — defeating
+            // the freshness signal external tools rely on. This bulk
+            // UPDATE catches that case in one cheap query per workspace.
+            //
+            // Synthetic-root projects share `workspace_path` with their
+            // resolved canonical path (e.g. `/home/dylon/.claude`), so a
+            // single UPDATE keyed on that string covers them too.
+            let mut workspace_paths: Vec<String> = config_snapshot.workspace.paths.clone();
+            if let Some(p) = synthetic_roots.claude.as_ref() {
+                workspace_paths.push(p.to_string_lossy().into_owned());
+            }
+            if let Some(p) = synthetic_roots.codex.as_ref() {
+                workspace_paths.push(p.to_string_lossy().into_owned());
+            }
+            if let Some(p) = synthetic_roots.papers.as_ref() {
+                workspace_paths.push(p.to_string_lossy().into_owned());
+            }
+            if let Some(p) = synthetic_roots.documents.as_ref() {
+                workspace_paths.push(p.to_string_lossy().into_owned());
+            }
+            for ws in &workspace_paths {
+                match rt_for_scan.block_on(db_for_scan.update_projects_scanned_by_workspace(ws)) {
+                    Ok(rows) => {
+                        stats_for_scan
+                            .last_scanned_writes
+                            .fetch_add(rows, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            workspace = %ws,
+                            error = %e,
+                            "Failed to update last_scanned_at after initial scan"
+                        );
+                    }
+                }
+            }
+
             info!(
                 total = total_scanned,
                 unchanged = skipped,
@@ -405,6 +458,7 @@ pub fn start_indexing(
     let overrides_for_cmd = Arc::clone(&project_overrides);
     let rt_for_cmd = rt_handle;
     let shutdown_for_cmd = shutdown.terminating_flag();
+    let stats_for_cmd = Arc::clone(&stats);
     // Reinit-arm bindings — passed into the WatcherCommand::Reinit
     // handler so it can rebuild the watcher with the same plumbing as
     // the original `start_watching` call.
@@ -484,6 +538,7 @@ pub fn start_indexing(
                             &roots_for_cmd,
                             &overrides_for_cmd,
                             &rt_for_cmd,
+                            &stats_for_cmd,
                         );
                     }
                     WatcherCommand::Reinit(paths) => {
@@ -570,6 +625,7 @@ fn rescan_workspace(
     project_roots: &Arc<DashMap<PathBuf, scanner::ProjectRoot>>,
     project_overrides: &Arc<DashMap<PathBuf, config::ProjectOverride>>,
     rt_handle: &tokio::runtime::Handle,
+    stats: &Arc<StatsTracker>,
 ) {
     let workspace_path_str = workspace_path.to_string_lossy().into_owned();
     info!(path = %workspace_path_str, "Re-scanning workspace");
@@ -663,6 +719,24 @@ fn rescan_workspace(
     }
 
     let _ = walk_handle.join();
+
+    // Bump `last_scanned_at` for every project under this workspace —
+    // catches the "rescan walked the tree, no files changed" case where
+    // no per-file `upsert_project` would otherwise fire and the
+    // freshness signal would stay stale forever.
+    match rt_handle.block_on(db.update_projects_scanned_by_workspace(&workspace_path_str)) {
+        Ok(rows) => {
+            stats.last_scanned_writes.fetch_add(rows, Ordering::Relaxed);
+        }
+        Err(e) => {
+            tracing::warn!(
+                workspace = %workspace_path_str,
+                error = %e,
+                "Failed to update last_scanned_at after rescan"
+            );
+        }
+    }
+
     info!(
         path = %workspace_path_str,
         total = total_scanned,

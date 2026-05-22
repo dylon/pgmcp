@@ -48,3 +48,19 @@ async fn anomaly_detection_runs_against_real_db() {
         .expect("tool call");
     assert!(result.is_error != Some(true));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn code_on_fire_runs_against_real_db() {
+    // SOTA Phase 1, A2: Tornhill hotspot intersection. The tool should
+    // succeed even when no function_metrics rows exist (returns a helpful
+    // message), so we don't need to pre-seed function_metrics here.
+    let db = require_test_db!();
+    let p = seed_project(db.pool(), "cof-p", "/ws/cof-p").await;
+    seed_file(db.pool(), p, "/ws/cof-p/a.rs", "a.rs").await;
+    let server = server_with_pool(db.pool().clone());
+    let result = server
+        .call_tool_cli("code_on_fire", serde_json::json!({"project": "cof-p"}))
+        .await
+        .expect("tool call");
+    assert!(result.is_error != Some(true));
+}

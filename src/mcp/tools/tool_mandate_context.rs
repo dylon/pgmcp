@@ -21,7 +21,7 @@ pub async fn tool_mandate_context(
 ) -> Result<CallToolResult, McpError> {
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    info!(
+    debug!(
         tool = "mandate_context",
         project = ?params.project,
         cwd = ?params.cwd,

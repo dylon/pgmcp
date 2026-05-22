@@ -143,14 +143,58 @@ fn rasterize(
         .saturating_duration_since(Instant::now())
         .max(Duration::from_secs(1));
     // pdftoppm writes files, not stdout — a 64 KiB stdout cap is generous.
-    let _captured = run_bounded(
+    let captured = run_bounded(
         cmd,
         "pdftoppm",
         timeout,
         64 * 1024,
         opts.max_subprocess_rss_bytes,
     )?;
+
+    // Verify pdftoppm actually produced PNGs. Poppler frequently exits 0
+    // on corrupt/encrypted PDFs ("Syntax Error: Couldn't find trailer
+    // dictionary" on stderr) without emitting any output. Without this
+    // check, the per-page loop above this function reports
+    // `pages_target` × "expected PNG missing" warnings for what is in
+    // reality a single, structural pdftoppm failure. We surface that
+    // upstream as an explicit error so pdf.rs can cache the negative
+    // result and skip OCR on subsequent rescans.
+    let parent = out_prefix.parent().unwrap_or(out_prefix);
+    let png_count = count_pngs_in(parent);
+    if png_count == 0 {
+        let stderr_tail = String::from_utf8_lossy(&captured.stderr);
+        let stderr_tail = stderr_tail.trim();
+        warn!(
+            pdf = %pdf.display(),
+            stderr = %stderr_tail,
+            "pdftoppm produced no PNGs; marking PDF as un-OCR-able",
+        );
+        return Err(ExtractError::OcrFailed(Box::new(ExtractError::Process {
+            tool: "pdftoppm",
+            status: 0,
+            stderr: format!("zero PNGs written; stderr: {stderr_tail}"),
+        })));
+    }
     Ok(())
+}
+
+/// Count `*.png` files in `dir`. Returns 0 on read-dir errors (the
+/// caller already has a clear signal that the rasterize failed). This
+/// is a directory listing, not a stat per page — pdftoppm-emitted PNGs
+/// are the only contents of the tempdir so the count is exact.
+fn count_pngs_in(dir: &Path) -> usize {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    read.filter_map(|e| e.ok())
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("png"))
+        })
+        .count()
 }
 
 fn ocr_one_page(
@@ -219,6 +263,7 @@ fn digit_width(n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
 
     #[test]
     fn digit_width_matches_pdftoppm_padding() {
@@ -231,5 +276,42 @@ mod tests {
         assert_eq!(digit_width(1000), 4);
         assert_eq!(digit_width(9999), 4);
         assert_eq!(digit_width(10_000), 5);
+    }
+
+    #[test]
+    fn count_pngs_in_empty_dir_returns_zero() {
+        // The zero-PNG case is precisely the signal we use to detect
+        // pdftoppm's silent failure on corrupt/encrypted PDFs.
+        let tmp = TempDir::new().expect("tempdir");
+        assert_eq!(count_pngs_in(tmp.path()), 0);
+    }
+
+    #[test]
+    fn count_pngs_in_counts_only_png_extension() {
+        // pdftoppm emits page-N.png; the tempdir is exclusive to one
+        // rasterize() call so we don't expect other artifacts, but the
+        // helper must still ignore unrelated entries (e.g. an editor's
+        // backup file, or a tempdir-level marker file).
+        let tmp = TempDir::new().expect("tempdir");
+        for name in [
+            "page-1.png",
+            "page-02.png",
+            "page-3.PNG", // case-insensitive: ascii-eq covers this
+            "notes.txt",
+            "scratch.jpg",
+        ] {
+            File::create(tmp.path().join(name)).expect("create");
+        }
+        assert_eq!(count_pngs_in(tmp.path()), 3);
+    }
+
+    #[test]
+    fn count_pngs_in_returns_zero_for_missing_dir() {
+        // Defensive: a missing parent (race with cleanup) yields 0 so
+        // the rasterize() failure path treats it the same as "no PNGs
+        // written" — which is the right semantics.
+        let tmp = TempDir::new().expect("tempdir");
+        let path = tmp.path().join("does-not-exist");
+        assert_eq!(count_pngs_in(&path), 0);
     }
 }

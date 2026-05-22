@@ -48,7 +48,7 @@ pub async fn tool_hybrid_search(
     let bm25_weight = params.bm25_weight.unwrap_or(0.5);
     let semantic_weight = params.semantic_weight.unwrap_or(0.5);
 
-    info!(
+    debug!(
         tool = "hybrid_search",
         query = %truncate(&params.query, 200),
         project = params.project.as_deref().unwrap_or("*"),

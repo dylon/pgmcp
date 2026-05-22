@@ -33,7 +33,7 @@ pub async fn tool_orient(
 ) -> Result<CallToolResult, McpError> {
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    info!(tool = "orient", project = %params.project, "MCP tool invoked");
+    debug!(tool = "orient", project = %params.project, "MCP tool invoked");
 
     let pool = ctx
         .db()

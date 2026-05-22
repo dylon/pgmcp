@@ -37,7 +37,7 @@ pub async fn tool_merge_conflict_risk(
     let window_days = params.window_days.unwrap_or(14).max(1);
     let limit = params.limit.unwrap_or(50).max(1) as usize;
 
-    info!(
+    debug!(
         tool = "merge_conflict_risk",
         project = %params.project,
         files = params.branch_files.len(),

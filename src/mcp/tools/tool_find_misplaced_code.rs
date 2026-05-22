@@ -25,7 +25,7 @@ pub async fn tool_find_misplaced_code(
 
     let min_mismatch = params.min_mismatch.unwrap_or(0.5);
 
-    info!(
+    debug!(
         tool = "find_misplaced_code",
         project = %params.project,
         min_mismatch,

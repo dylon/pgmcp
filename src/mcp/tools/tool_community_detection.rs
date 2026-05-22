@@ -26,7 +26,7 @@ pub async fn tool_community_detection(
     let graph_type = params.graph_type.as_deref().unwrap_or("import");
     let resolution = params.resolution.unwrap_or(1.0);
 
-    info!(
+    debug!(
         tool = "community_detection",
         project = %params.project,
         graph_type,

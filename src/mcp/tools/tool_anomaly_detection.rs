@@ -26,7 +26,7 @@ pub async fn tool_anomaly_detection(
     let limit = params.limit.unwrap_or(20);
     let contamination = params.contamination.unwrap_or(0.05);
 
-    info!(
+    debug!(
         tool = "anomaly_detection",
         project = %params.project,
         limit,

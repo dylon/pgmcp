@@ -1,3 +1,4 @@
+use super::function_metrics::FunctionMetrics;
 use super::symbols::{Import, Symbol, SymbolReference};
 
 /// One language's tree-sitter-driven extraction.
@@ -23,4 +24,17 @@ pub trait LanguageBackend: Send + Sync {
     /// source/target placeholders; the cron job resolves targets after symbol
     /// persistence.
     fn extract_references(&self, content: &str) -> Vec<SymbolReference>;
+
+    /// Extract per-function complexity metrics (cyclomatic, cognitive,
+    /// Halstead, NPath, panic-paths, unsafe-blocks). Returned rows have
+    /// `function_id = 0` / `file_id = 0` placeholders; the function-metrics
+    /// cron resolves them via `file_symbols` lookup keyed on
+    /// `(file_id, kind='function', name, start_line)`.
+    ///
+    /// Default implementation returns `Vec::new()` so backends roll out
+    /// incrementally — until a language's CFG/operator-vocabulary pass
+    /// lands, that language simply has no per-function metrics.
+    fn extract_function_metrics(&self, _content: &str) -> Vec<FunctionMetrics> {
+        Vec::new()
+    }
 }

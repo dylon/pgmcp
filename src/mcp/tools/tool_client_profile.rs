@@ -30,6 +30,7 @@ pub async fn tool_pgmcp_client_profile(
     ctx: &SystemContext,
     params: PgmcpClientProfileParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "pgmcp_client_profile", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
 
     let registry = ClientProfileRegistry::load_or_builtin(&profiles_path());

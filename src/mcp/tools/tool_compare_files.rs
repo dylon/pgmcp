@@ -21,7 +21,7 @@ pub async fn tool_compare_files(
 ) -> Result<CallToolResult, McpError> {
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    info!(
+    debug!(
         tool = "compare_files",
         file_a = %truncate(&params.file_a, 200),
         file_b = %truncate(&params.file_b, 200),

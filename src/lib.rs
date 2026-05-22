@@ -16,6 +16,7 @@
 // linker pulls AOCL-BLIS (libblis-mt.so.5) into the lib and bin targets.
 // No `extern crate blas_src;` — there is no stub-provider crate involved.
 
+pub mod a2a;
 pub mod api;
 pub mod cli;
 pub mod config;

@@ -26,7 +26,7 @@ pub async fn tool_coupling_cohesion_report(
     let module_depth = params.module_depth.unwrap_or(2) as usize;
     let sort_by = params.sort_by.as_deref().unwrap_or("distance");
 
-    info!(
+    debug!(
         tool = "coupling_cohesion_report",
         project = %params.project,
         module_depth,

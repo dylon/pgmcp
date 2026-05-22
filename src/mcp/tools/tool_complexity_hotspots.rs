@@ -26,7 +26,7 @@ pub async fn tool_complexity_hotspots(
     let limit = params.limit.unwrap_or(20);
     let sort_by = params.sort_by.as_deref().unwrap_or("composite");
 
-    info!(
+    debug!(
         tool = "complexity_hotspots",
         project = %params.project,
         limit,

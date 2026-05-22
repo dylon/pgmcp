@@ -22,14 +22,19 @@
 pub mod backend;
 pub mod c_cpp;
 pub mod clojure;
+pub mod complexity;
+pub mod coq;
+pub mod function_metrics;
 pub mod java;
 pub mod javascript;
+pub mod lean;
 pub mod python;
 pub mod registry;
 pub mod rholang;
 pub mod rust;
 pub mod scala;
 pub mod symbols;
+pub mod tlaplus;
 
 // Public surface for the trait + future backends. The `unused_imports`
 // allow is needed because backends land incrementally — until the first
@@ -38,6 +43,10 @@ pub mod symbols;
 // downstream callers via `crate::parsing::SymbolKind` once any backend lands.
 #[allow(unused_imports)]
 pub use backend::LanguageBackend;
+#[allow(unused_imports)]
+pub use function_metrics::{
+    CognitiveIncrement, CognitiveKind, FunctionMetrics, HalsteadCounts, NPathValue, ScoringInput,
+};
 #[allow(unused_imports)]
 pub use registry::LanguageRegistry;
 #[allow(unused_imports)]
@@ -61,6 +70,12 @@ mod tests {
         assert!(LanguageRegistry::for_language("rholang").is_some());
         assert!(LanguageRegistry::for_language("clojure").is_some());
         assert!(LanguageRegistry::for_language("clojurescript").is_some());
+        // Formal-verification backends.
+        assert!(LanguageRegistry::for_language("coq").is_some());
+        assert!(LanguageRegistry::for_language("tlaplus").is_some());
+        assert!(LanguageRegistry::for_language("lean").is_some());
+        // Sage Math dispatches to the Python backend.
+        assert!(LanguageRegistry::for_language("sage").is_some());
         // Backends not yet landed:
         assert!(LanguageRegistry::for_language("unknown_lang").is_none());
         assert!(LanguageRegistry::any_backend_available());

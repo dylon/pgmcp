@@ -18,7 +18,7 @@ use crate::mcp::server::*;
 pub async fn tool_list_projects(ctx: &SystemContext) -> Result<CallToolResult, McpError> {
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    info!(tool = "list_projects", "MCP tool invoked");
+    debug!(tool = "list_projects", "MCP tool invoked");
 
     let projects = ctx.db().list_projects().await.map_err(|e| {
         error!(tool = "list_projects", error = %e, "MCP tool failed");

@@ -49,7 +49,7 @@ pub async fn tool_recommend_layering(
     let severity_threshold = params.severity_threshold.as_deref().unwrap_or("medium");
     let limit = params.limit.unwrap_or(50).max(1) as usize;
 
-    info!(
+    debug!(
         tool = "recommend_layering",
         project = %params.project,
         num_layers,

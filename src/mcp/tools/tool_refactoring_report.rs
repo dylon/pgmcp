@@ -24,7 +24,7 @@ pub async fn tool_refactoring_report(
     let min_sim = params.min_similarity.unwrap_or(0.85);
     let min_projects = params.min_projects.unwrap_or(2);
     let limit = params.limit.unwrap_or(20);
-    info!(
+    debug!(
         tool = "refactoring_report",
         min_similarity = min_sim,
         min_projects,

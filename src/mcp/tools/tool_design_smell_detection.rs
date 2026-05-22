@@ -30,7 +30,7 @@ pub async fn tool_design_smell_detection(
     let smells = params.smells.unwrap_or_default();
     let include_fixes = params.include_fixes.unwrap_or(true);
 
-    info!(
+    debug!(
         tool = "design_smell_detection",
         project = %params.project,
         limit,

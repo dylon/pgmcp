@@ -43,7 +43,7 @@ pub async fn tool_file_info(
 ) -> Result<CallToolResult, McpError> {
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    info!(tool = "file_info", path = %params.path, "MCP tool invoked");
+    debug!(tool = "file_info", path = %params.path, "MCP tool invoked");
 
     let info = ctx.db().file_info(&params.path).await.map_err(|e| {
         error!(tool = "file_info", error = %e, "MCP tool failed");

@@ -27,7 +27,7 @@ pub async fn tool_mcp_tool_telemetry(
 ) -> Result<CallToolResult, McpError> {
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    info!(
+    debug!(
         tool = "mcp_tool_telemetry",
         aggregation = ?params.aggregation,
         since_minutes = params.since_minutes,

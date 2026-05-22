@@ -62,6 +62,7 @@ pub async fn tool_memory_unified_search(
     ctx: &SystemContext,
     params: MemoryUnifiedSearchParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_unified_search", "MCP tool invoked");
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
@@ -90,6 +91,7 @@ pub async fn tool_memory_neighbors(
     ctx: &SystemContext,
     params: MemoryNeighborsParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_neighbors", "MCP tool invoked");
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
@@ -112,6 +114,7 @@ pub async fn tool_memory_path_search(
     ctx: &SystemContext,
     params: MemoryPathSearchParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_path_search", "MCP tool invoked");
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
@@ -153,6 +156,7 @@ pub async fn tool_memory_ppr_search(
     ctx: &SystemContext,
     params: MemoryPprSearchParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_ppr_search", "MCP tool invoked");
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
@@ -179,6 +183,7 @@ pub async fn tool_memory_raptor_search(
     ctx: &SystemContext,
     params: MemoryRaptorSearchParams,
 ) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "memory_raptor_search", "MCP tool invoked");
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;

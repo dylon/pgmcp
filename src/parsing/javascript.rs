@@ -116,7 +116,7 @@ const REF_QUERY_JS: &str = r#"
 (call_expression
   function: (member_expression
               property: (property_identifier) @ref.mcall)) @ref.mcall.node
-(extends_clause (identifier) @ref.inherit)
+(class_heritage (identifier) @ref.inherit)
 "#;
 
 const REF_QUERY_TS: &str = r#"
@@ -642,11 +642,36 @@ export class HelloGreeter implements Greeter {
     }
 
     #[test]
-    fn parse_garbage_yields_no_panic() {
-        for s in ["", "   ", "import {", "function ("] {
-            let _ = TS_BACKEND.extract_symbols(s);
-            let _ = JS_BACKEND.extract_imports(s);
-            let _ = TSX_BACKEND.extract_references(s);
+    fn js_extract_references_finds_inherit_and_call() {
+        let src = "class A extends B { f() { g(); } }";
+        let refs = JS_BACKEND.extract_references(src);
+        let calls: Vec<&str> = refs
+            .iter()
+            .filter(|r| r.ref_kind == SymbolRefKind::Call)
+            .map(|r| r.target_raw.as_str())
+            .collect();
+        assert!(calls.contains(&"g"), "calls: {:?}", calls);
+        let inherits: Vec<&str> = refs
+            .iter()
+            .filter(|r| r.ref_kind == SymbolRefKind::Inherit)
+            .map(|r| r.target_raw.as_str())
+            .collect();
+        assert!(inherits.contains(&"B"), "inherits: {:?}", inherits);
+    }
+
+    // Forces every (backend, extract_*) pair through OnceLock::get_or_init so
+    // a malformed query string fails CI instead of crashing a worker in prod
+    // (the JS-Reference path was the only uncovered combination and shipped
+    // a NodeType("extends_clause") panic — see plan snoopy-kahn).
+    #[test]
+    fn all_backends_compile_queries_and_handle_garbage() {
+        let backends: [&JsTsBackend; 3] = [&JS_BACKEND, &TS_BACKEND, &TSX_BACKEND];
+        for s in ["", "   ", "import {", "function (", "class A extends B {}"] {
+            for b in backends {
+                let _ = b.extract_symbols(s);
+                let _ = b.extract_imports(s);
+                let _ = b.extract_references(s);
+            }
         }
     }
 

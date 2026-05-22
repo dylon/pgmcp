@@ -40,7 +40,7 @@ pub async fn tool_adoption_lag(
     let limit = params.limit.unwrap_or(30).max(1);
     let _worktree_filter = params.worktree_filter.as_deref().unwrap_or("main");
 
-    info!(
+    debug!(
         tool = "adoption_lag",
         new_file = %params.new_file,
         min_similarity,

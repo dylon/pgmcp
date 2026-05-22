@@ -24,7 +24,7 @@ pub async fn tool_text_search(
     ctx.stats().text_searches.fetch_add(1, Ordering::Relaxed);
 
     let limit = params.limit.unwrap_or(10);
-    info!(
+    debug!(
         tool = "text_search",
         query = %truncate(&params.query, 200),
         limit,

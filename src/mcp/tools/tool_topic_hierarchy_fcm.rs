@@ -25,7 +25,7 @@ pub async fn tool_topic_hierarchy_fcm(
 
     let limit = params.limit.unwrap_or(50);
 
-    info!(tool = "topic_hierarchy_fcm", limit, "MCP tool invoked",);
+    debug!(tool = "topic_hierarchy_fcm", limit, "MCP tool invoked",);
 
     #[derive(sqlx::FromRow, serde::Serialize)]
     struct HierarchyRow {

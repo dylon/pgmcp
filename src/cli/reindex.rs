@@ -17,8 +17,8 @@ use crate::db;
 const DAEMON_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 
 pub async fn run(config_override: Option<&Path>, force: bool) -> anyhow::Result<()> {
-    crate::logging::init_cli();
     let config = Config::load(config_override)?;
+    crate::logging::init_cli_with_config(Some(&config));
 
     if !force && let Some(addr) = daemon_listening(&config) {
         anyhow::bail!(

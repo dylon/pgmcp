@@ -202,7 +202,7 @@ pub async fn tool_naming_consistency(
     let limit = params.limit.unwrap_or(50).max(1) as usize;
     let include_fixes = params.include_fixes.unwrap_or(true);
 
-    info!(
+    debug!(
         tool = "naming_consistency",
         project = %params.project,
         min_dominance,

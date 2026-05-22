@@ -43,7 +43,7 @@ pub async fn tool_pattern_search(
     let limit = params.limit.unwrap_or(15).max(1);
     let _worktree_filter = params.worktree_filter.as_deref().unwrap_or("main");
 
-    info!(
+    debug!(
         tool = "pattern_search",
         snippet_chars = snippet.len(),
         language = params.language.as_deref().unwrap_or("*"),

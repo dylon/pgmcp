@@ -18,7 +18,7 @@ use std::thread::{self, JoinHandle};
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use dashmap::DashMap;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::model::Embedder;
 use crate::config::{Config, EmbeddingsConfig, ProjectOverride};
@@ -560,6 +560,22 @@ fn process_index_file_task(
     // Stat the file (sync: fs metadata).
     let metadata = match std::fs::metadata(&path) {
         Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Race: the path was queued by the scanner but deleted before
+            // this worker reached it. Common when worktrees are torn down
+            // mid-rescan or when an editor's temp file vanishes. Demote
+            // the noise AND clean up the orphan `indexed_files` row so
+            // the next scan doesn't requeue it. `delete_file` cascades
+            // through `file_chunks` and other dependent tables.
+            debug!(
+                path = %path_str,
+                worker_id,
+                "fs::metadata: file disappeared (concurrent delete)"
+            );
+            let _ = rt.block_on(db.delete_file(&path_str));
+            stats.files_failed.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         Err(e) => {
             error!(path = %path_str, worker_id, error = %e, "fs::metadata failed");
             stats.files_failed.fetch_add(1, Ordering::Relaxed);
@@ -581,15 +597,15 @@ fn process_index_file_task(
                 let git_common_dir = crate::indexer::git_indexer::detect_git_common_dir(&root_path);
                 let git_root_commits =
                     crate::indexer::git_indexer::detect_git_root_commits(&root_path);
-                let id = db
-                    .upsert_project(
-                        &info.workspace_path,
-                        &root_path.to_string_lossy(),
-                        &info.name,
-                        git_common_dir.as_deref(),
-                        git_root_commits.as_deref(),
-                    )
-                    .await?;
+                let id = upsert_project_with_retry(
+                    db.as_ref(),
+                    &info.workspace_path,
+                    &root_path.to_string_lossy(),
+                    &info.name,
+                    git_common_dir.as_deref(),
+                    git_root_commits.as_deref(),
+                )
+                .await?;
                 Ok::<_, sqlx::Error>((
                     id,
                     root_path.to_string_lossy().into_owned(),
@@ -600,9 +616,15 @@ fn process_index_file_task(
                 let workspace = cfg.workspace.paths.first().cloned().unwrap_or_default();
                 // The synthetic "default" project has no project_root, so
                 // can't run `git rev-parse` — pass NULL for both signals.
-                let id = db
-                    .upsert_project(&workspace, &workspace, "default", None, None)
-                    .await?;
+                let id = upsert_project_with_retry(
+                    db.as_ref(),
+                    &workspace,
+                    &workspace,
+                    "default",
+                    None,
+                    None,
+                )
+                .await?;
                 Ok((id, workspace, None))
             }
         }
@@ -849,7 +871,16 @@ fn process_index_file_task(
         match std::fs::read_to_string(&path) {
             Ok(c) => c,
             Err(e) => {
-                error!(path = %path_str, worker_id, error = %e, "fs::read_to_string failed");
+                // UTF-8 validation failure isn't a system error — it's a
+                // content-shape mismatch (the file's extension lied; common
+                // for `__MACOSX/._*` AppleDouble forks, binary `.java`/`.py`
+                // fixtures, etc.). Demote so it doesn't drown real I/O
+                // failures in the log. The file is still skipped.
+                if e.kind() == std::io::ErrorKind::InvalidData {
+                    warn!(path = %path_str, worker_id, error = %e, "fs::read_to_string: not valid UTF-8 (skipping)");
+                } else {
+                    error!(path = %path_str, worker_id, error = %e, "fs::read_to_string failed");
+                }
                 stats.files_failed.fetch_add(1, Ordering::Relaxed);
                 return;
             }
@@ -1246,6 +1277,84 @@ fn is_fk_violation(e: &sqlx::Error) -> bool {
     false
 }
 
+/// Retry `db.upsert_project` on `sqlx::Error::PoolTimedOut`. Bounded
+/// exponential backoff (1s, 2s, 4s; ~7s total worst-case sleep) so a
+/// short cron-driven contention burst doesn't cause the indexer to
+/// silently drop files. Non-pool errors bubble immediately so genuine
+/// problems aren't masked by retries.
+///
+/// Why this lives in the embed pool instead of the DbClient impl: the
+/// retry semantics are caller-specific — short bursty contention from
+/// the embed pool is fine to absorb here, but synchronous CLI commands
+/// that wrap `upsert_project` (e.g. `pgmcp init-project`) want the
+/// error to surface immediately rather than block for ~7s.
+async fn upsert_project_with_retry(
+    db: &dyn DbClient,
+    workspace_path: &str,
+    project_path: &str,
+    name: &str,
+    git_common_dir: Option<&str>,
+    git_root_commits: Option<&str>,
+) -> std::result::Result<i32, sqlx::Error> {
+    retry_pool_timeout(&[1_000, 2_000, 4_000], workspace_path, name, || async {
+        db.upsert_project(
+            workspace_path,
+            project_path,
+            name,
+            git_common_dir,
+            git_root_commits,
+        )
+        .await
+    })
+    .await
+}
+
+/// Generic exponential-backoff retry over a fallible async operation.
+/// Retries while the result is `Err(sqlx::Error::PoolTimedOut)`; bubbles
+/// any other error immediately. The `backoffs_ms` slice defines the
+/// sleeps between successive retries — its length sets the retry budget
+/// (`len() + 1` total attempts). Empty slice ⇒ single attempt, no retry.
+///
+/// Extracted from `upsert_project_with_retry` so it can be exercised by
+/// a unit test without standing up a full `DbClient` mock.
+async fn retry_pool_timeout<F, Fut, T>(
+    backoffs_ms: &[u64],
+    workspace_path: &str,
+    name: &str,
+    mut op: F,
+) -> std::result::Result<T, sqlx::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<T, sqlx::Error>>,
+{
+    let mut last_err: Option<sqlx::Error> = None;
+    let schedule = std::iter::once(None).chain(backoffs_ms.iter().copied().map(Some));
+    for (attempt, backoff_ms) in schedule.enumerate() {
+        if let Some(ms) = backoff_ms {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            if let Some(ref e) = last_err {
+                warn!(
+                    workspace_path,
+                    name,
+                    attempt,
+                    backoff_ms = ms,
+                    error = %e,
+                    "upsert_project: retrying after PoolTimedOut"
+                );
+            }
+        }
+        match op().await {
+            Ok(v) => return Ok(v),
+            Err(sqlx::Error::PoolTimedOut) => {
+                last_err = Some(sqlx::Error::PoolTimedOut);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or(sqlx::Error::PoolTimedOut))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1292,5 +1401,94 @@ mod tests {
         let mut s = String::new();
         assert!(!strip_nul_bytes(&mut s));
         assert_eq!(s, "");
+    }
+
+    // --- retry_pool_timeout ------------------------------------------------
+    //
+    // We pause tokio time so the 1s/2s/4s sleeps don't actually slow down
+    // the test suite. `tokio::test(start_paused = true)` + `advance` lets
+    // us assert on the retry schedule deterministically.
+
+    use std::cell::Cell;
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_returns_immediately_on_success() {
+        let calls = Cell::new(0u32);
+        let result: std::result::Result<i32, sqlx::Error> =
+            retry_pool_timeout(&[1_000, 2_000, 4_000], "/ws", "p", || {
+                calls.set(calls.get() + 1);
+                async { Ok(42) }
+            })
+            .await;
+        assert_eq!(result.expect("ok"), 42);
+        assert_eq!(calls.get(), 1, "no retries on success");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_recovers_after_transient_pool_timeout() {
+        let calls = Cell::new(0u32);
+        let result: std::result::Result<i32, sqlx::Error> =
+            retry_pool_timeout(&[1_000, 2_000, 4_000], "/ws", "p", || {
+                let n = calls.get() + 1;
+                calls.set(n);
+                async move {
+                    if n < 3 {
+                        Err(sqlx::Error::PoolTimedOut)
+                    } else {
+                        Ok(7)
+                    }
+                }
+            })
+            .await;
+        assert_eq!(result.expect("ok"), 7);
+        assert_eq!(calls.get(), 3, "succeeded on 3rd attempt after 2 retries");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_exhausts_budget_then_returns_pool_timed_out() {
+        // 3 backoffs ⇒ 4 attempts total; if all PoolTimedOut, surface the
+        // last seen error (PoolTimedOut). Without this exhaustion path the
+        // helper would either loop forever or silently swallow the error.
+        let calls = Cell::new(0u32);
+        let result: std::result::Result<i32, sqlx::Error> =
+            retry_pool_timeout(&[1_000, 2_000, 4_000], "/ws", "p", || {
+                calls.set(calls.get() + 1);
+                async { Err(sqlx::Error::PoolTimedOut) }
+            })
+            .await;
+        assert!(matches!(result, Err(sqlx::Error::PoolTimedOut)));
+        assert_eq!(calls.get(), 4, "1 initial + 3 retries = 4 attempts");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_bubbles_non_pool_errors_immediately() {
+        // The whole point of retrying *only* PoolTimedOut is that other
+        // errors (FK violation, constraint check, syntax error, etc.)
+        // would not be fixed by waiting — they'd just waste 7 seconds.
+        let calls = Cell::new(0u32);
+        let result: std::result::Result<i32, sqlx::Error> =
+            retry_pool_timeout(&[1_000, 2_000, 4_000], "/ws", "p", || {
+                calls.set(calls.get() + 1);
+                async { Err(sqlx::Error::RowNotFound) }
+            })
+            .await;
+        assert!(matches!(result, Err(sqlx::Error::RowNotFound)));
+        assert_eq!(calls.get(), 1, "non-PoolTimedOut bubbles on first attempt");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_empty_backoff_schedule_is_single_attempt() {
+        // Edge case: backoffs_ms = &[] degrades to a single try, no retries.
+        // Useful for callers that want the helper's error-type discrimination
+        // without the wait-and-retry behavior.
+        let calls = Cell::new(0u32);
+        let result: std::result::Result<i32, sqlx::Error> =
+            retry_pool_timeout(&[], "/ws", "p", || {
+                calls.set(calls.get() + 1);
+                async { Err(sqlx::Error::PoolTimedOut) }
+            })
+            .await;
+        assert!(matches!(result, Err(sqlx::Error::PoolTimedOut)));
+        assert_eq!(calls.get(), 1);
     }
 }

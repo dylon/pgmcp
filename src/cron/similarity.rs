@@ -39,6 +39,11 @@ pub async fn run_similarity_scan(
         top_k, batch_size, "Starting cross-project similarity scan"
     );
 
+    // Promoted to top-of-body: this counter means "the body reached its
+    // work-eligible state" — pairs with `similarity_noop_returns` to
+    // distinguish "ran, no chunks" from "never ran".
+    stats.similarity_scans.fetch_add(1, Ordering::Relaxed);
+
     // Truncate the table for a fresh scan
     if let Err(e) = db.clear_similarity_table().await {
         error!(error = %e, "Failed to clear similarity table");
@@ -54,6 +59,9 @@ pub async fn run_similarity_scan(
     };
 
     if max_id == 0 {
+        stats
+            .similarity_noop_returns
+            .fetch_add(1, Ordering::Relaxed);
         info!("No chunks to scan for similarity");
         return;
     }
@@ -135,7 +143,7 @@ pub async fn run_similarity_scan(
         }
     }
 
-    stats.similarity_scans.fetch_add(1, Ordering::Relaxed);
+    // `similarity_scans` was promoted to top-of-body above.
     stats
         .similarity_pairs_found
         .store(total_pairs, Ordering::Relaxed);
