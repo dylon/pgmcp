@@ -53,11 +53,45 @@ and end of an indexing run; divide delta by elapsed wall time.
 For tool-call latency: `time curl -X POST .../mcp -d '{...}'` against a
 warm daemon, repeated 100 times, take p50/p99.
 
+## Harness
+
+`scripts/measure_recovery_times.sh` runs all five scenarios end-to-end:
+
+- emits one markdown row per scenario to stdout (drop-in for the
+  Observations table below);
+- captures raw stdout to a sibling `.raw.log` for reproducibility;
+- self-skips rows whose preconditions aren't met on the local host
+  (no `sudo -n` → no `cold-daemon-ready` cache flush; no running
+  daemon on `:3100` → no `health-probe-latency`; etc.) with a
+  diagnostic line on stderr.
+
+Hardware stamp comes from the first H1 of
+`/home/dylon/.claude/hardware-specifications.md`.
+
+In-process `tool-call-latency` is measured via a criterion benchmark
+at `benches/mcp_tool_latency.rs` (registered in `Cargo.toml`). The
+bench self-skips when the in-memory pgmcp-testing server fixture
+isn't available, falling back to a dispatcher-overhead lower-bound
+sample so the suite still produces a row on every host.
+
+`embed-pool-warmup` is sourced from the structured-log span
+`embed_pool_warmup` added in `src/embed/pool.rs::embedding_worker`
+— the worker emits `phase="ready"` with the elapsed seconds the
+first time `Embedder::new` succeeds. The harness greps the log file
+for the most recent entry.
+
 ## Observations
 
 | date       | scenario                  | workspace_size_files | observed | hardware_notes | notes |
 |------------|---------------------------|----------------------|----------|----------------|-------|
-| _pending_  | cold-daemon-ready         |                      |          |                | First baseline goes here once Stage 1 hooks are deployed and we want to know what 503 vs 200 looks like in practice. |
+| 2026-05-22 | tool-call-latency-dispatcher-baseline | n/a | 232 ps median | (host varies) | criterion `mcp_tool_dispatch_overhead_skipped_no_fixture`, 20 samples; a lower bound on tool-call overhead. The full in-process call_tool_cli path becomes measurable once `pgmcp-testing::server_with_pool` is reachable from criterion (i.e., a TestDatabase URL is exported). |
+| _pending_  | cold-daemon-ready         |                      |          |                | Run `scripts/measure_recovery_times.sh` with `sudo -n` available. |
+| _pending_  | warm-daemon-ready         |                      |          |                | Same harness, daemon already started so `drop_caches` is skipped. |
+| _pending_  | embed-pool-warmup         |                      |          |                | Grepped from `~/.local/share/pgmcp/pgmcp.log` for `phase="ready"`. |
+| _pending_  | cold-reindex-throughput   |                      |          |                | `pgmcp reindex` from a cold cache; harness times wall-clock + reads `indexed_files` row count. |
+| _pending_  | warm-reindex-throughput   |                      |          |                | Same harness, pages cached. |
+| _pending_  | health-probe-latency      |                      |          |                | curl `/health` x 100 reps; harness reports p50, p99. |
+| _pending_  | tool-call-latency (full)  |                      |          |                | Criterion bench once `pgmcp-testing::server_with_pool` is fixtured. |
 
 ## Why this matters
 

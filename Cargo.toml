@@ -169,6 +169,12 @@ tokio-test = "0.4"
 tempfile = "3"
 assert_cmd = "2"
 predicates = "3"
+criterion = { version = "0.7", features = ["async_tokio"] }
+
+[[bench]]
+name = "mcp_tool_latency"
+path = "benches/mcp_tool_latency.rs"
+harness = false
 # Note: `pgmcp-testing` is intentionally NOT a dev-dependency of this crate.
 # Cargo cannot resolve the cycle pgmcp ↔ pgmcp-testing without two separate
 # compilations of `pgmcp`. Cross-crate tests that exercise pgmcp's public API

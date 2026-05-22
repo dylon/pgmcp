@@ -267,6 +267,10 @@ fn embedding_worker(
 ) {
     let mut consecutive_failures: u32 = 0;
     let mut backoff = std::time::Duration::from_secs(1);
+    // Phase C.10: time-to-first-model-ready (embed pool warmup).
+    // The recovery-times harness greps `phase="ready"` from the
+    // structured log to derive the embed-pool warmup row.
+    let worker_start = std::time::Instant::now();
 
     while !shutdown.load(Ordering::Acquire) {
         let model = match Embedder::new(config) {
@@ -279,6 +283,14 @@ fn embedding_worker(
                     );
                     stats.embed_worker_restarts.fetch_add(1, Ordering::Relaxed);
                 }
+                let elapsed = worker_start.elapsed().as_secs_f64();
+                info!(
+                    target: "pgmcp::recovery_times",
+                    worker_id = id,
+                    phase = "ready",
+                    elapsed = elapsed,
+                    "embed_pool_warmup"
+                );
                 m
             }
             Err(e) => {
