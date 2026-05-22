@@ -288,19 +288,36 @@ Materialized view refresh on the same cadence as the existing
 
 ---
 
-## 12.4 Phase 0 — mandate-embedding promotion (deferred to Phase 2 cutover)
+## 12.4 Phase 1 — mandate-embedding promotion (shipped in M1, commit `7385761`)
+
+The Phase 1 cutover brought BGE-M3 online and added the embedding +
+HNSW columns to both mandate tables in the same change. The DDL below
+is now the **as-built record**, not a forward plan; the columns exist,
+the HNSW indices are populated, and `search_mandates` hits the
+embedding path via the same `MemoryEmbedder` indirection as
+`semantic_search`. See `09-milestones-and-as-built.md` §M1 sub-step 3
+for the migration sequence.
 
 ```sql
--- Once BGE-M3 is live (post-Phase 1 cutover):
-ALTER TABLE durable_mandates ADD COLUMN embedding VECTOR(1024);
+-- As-built DDL applied in commit 7385761:
+ALTER TABLE durable_mandates ADD COLUMN embedding vector(1024);
 ALTER TABLE durable_mandates ADD COLUMN embedding_signature TEXT;
 CREATE INDEX idx_durable_mandates_embedding
   ON durable_mandates USING hnsw (embedding vector_cosine_ops)
   WITH (m=24, ef_construction=200);
 
--- Same for session_mandates (so search_mandates can hit either layer).
-ALTER TABLE session_mandates ADD COLUMN embedding VECTOR(1024);
+-- Same for session_mandates (search_mandates hits either layer).
+ALTER TABLE session_mandates ADD COLUMN embedding vector(1024);
+ALTER TABLE session_mandates ADD COLUMN embedding_signature TEXT;
+CREATE INDEX idx_session_mandates_embedding
+  ON session_mandates USING hnsw (embedding vector_cosine_ops)
+  WITH (m=24, ef_construction=200);
 ```
+
+HNSW parameters (m=24, ef_construction=200) match the existing
+`file_chunks` HNSW per ADR-001
+(`docs/decisions/001-no-pgvectorscale-migration.md`). `ef_search` is
+set per-transaction via `SET LOCAL hnsw.ef_search = 100`.
 
 ---
 
@@ -321,7 +338,7 @@ ALTER TABLE session_mandates ADD COLUMN embedding VECTOR(1024);
 ## See also
 
 - [`02-phases.md`](02-phases.md) Phases 1 (12.1), 2 (12.2), 6.3
-  (12.3), 0 (12.4) — when each batch of SQL lands.
+  (12.3), 1 (12.4) — when each batch of SQL landed.
 - [`01-decisions.md`](01-decisions.md) — decisions 1, 3, 8, 9
   motivate the bi-temporal columns, scope tuple, and code anchor.
 - [`07-risks-and-verification.md`](07-risks-and-verification.md) —

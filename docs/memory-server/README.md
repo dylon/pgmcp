@@ -115,11 +115,23 @@ rather than duplicating content.
 
 ## Status
 
-- **Initial doc seed:** ✅ shipped (this directory exists).
-- **M1 — Foundations:** in progress
-  ([`09-milestones-and-as-built.md`](09-milestones-and-as-built.md)
-  tracks the live state).
-- **M2–M7:** pending; no fixed dates, paced by the user.
+All seven milestones (M1–M7) and the preceding doc seed have shipped.
+[`09-milestones-and-as-built.md`](09-milestones-and-as-built.md) is the
+authoritative as-built log — see each milestone's section for the
+deviations from the original plan and the per-phase eval scorecards.
 
-Implementation work starts from
-[`02-phases.md`](02-phases.md) Phase 0.
+| Milestone | Status | Commit | What landed |
+|---|---|---|---|
+| Initial doc seed | shipped | `9bf5624` | This directory + ADR-002 |
+| M1 — Foundations (Phase 0 + Phase 1) | shipped | `92b6185`, `7385761` | recall_prompts + search_mandates + BGE-M3 + Matryoshka + parallel embedding columns + migration cron |
+| M2 — Memory graph live (Phase 2 + Phase 3.1) | shipped | `9cbdb00` | Memory tables + official-compat CRUD (9 tools) |
+| M3 — Memory graph SOTA-shaped (Phase 3.2) | shipped | `ac54524` | pgmcp retrieval extensions (8 tools) |
+| M4 — Intelligent writes (Phase 4 + Phase 5) | shipped | `4abecaf` | LLM extractor + reflection cron |
+| M5 — SOTA retrieval (Phase 6 + Phase 7) | shipped | `3dcf9cc` | Graph-enhanced retrieval + reranker |
+| M6 — Production-ready (Phase 8 + Phase 9 + Phase 10) | shipped | `d2d24ae` | Forget + eval + client profiles |
+| M7 — Latent pipeline (Phase 11) | shipped | `82261c4` | RecursiveLink opt-in |
+
+Subsequent feature work continues to be tracked in
+[`09-milestones-and-as-built.md`](09-milestones-and-as-built.md) — new
+phases or sub-features get a new "Shipped" entry there rather than a
+status flip in this README.
