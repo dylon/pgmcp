@@ -9,6 +9,8 @@ pub mod gpu_fcm;
 #[allow(dead_code)]
 pub mod graph_analysis;
 #[allow(dead_code)]
+pub mod job;
+#[allow(dead_code)]
 pub mod k_selector;
 #[allow(dead_code)]
 pub mod latent_pipeline_quality;
