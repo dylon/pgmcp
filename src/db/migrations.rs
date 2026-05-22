@@ -18,6 +18,10 @@
 //! cheap going forward.
 
 use sqlx::PgPool;
+
+mod versioning;
+use versioning::*;
+
 use tracing::info;
 
 use crate::config::VectorConfig;
@@ -25,43 +29,6 @@ use crate::config::VectorConfig;
 const INITIAL_SCHEMA_VERSION: i32 = 1;
 
 /// Ensure `pgmcp_schema_versions` exists. Run before any
-/// `version_applied` / `record_version` call.
-async fn ensure_schema_versions_table(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS pgmcp_schema_versions (
-            version INT PRIMARY KEY,
-            name TEXT NOT NULL,
-            applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        )",
-    )
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Has the numbered migration step `version` been recorded?
-async fn version_applied(pool: &PgPool, version: i32) -> Result<bool, sqlx::Error> {
-    let count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM pgmcp_schema_versions WHERE version = $1")
-            .bind(version)
-            .fetch_one(pool)
-            .await?;
-    Ok(count > 0)
-}
-
-/// Record successful completion of a numbered migration step. Idempotent
-/// via `ON CONFLICT DO NOTHING`.
-async fn record_version(pool: &PgPool, version: i32, name: &str) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO pgmcp_schema_versions (version, name) VALUES ($1, $2)
-         ON CONFLICT (version) DO NOTHING",
-    )
-    .bind(version)
-    .bind(name)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
 
 /// Run all migrations to set up the schema.
 pub async fn run_migrations(
