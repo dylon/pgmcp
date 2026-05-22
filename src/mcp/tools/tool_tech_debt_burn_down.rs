@@ -73,6 +73,7 @@ pub async fn tool_tech_debt_burn_down(
             layer_config: None,
             severity_threshold: Some("medium".to_string()),
             include_fixes: Some(true),
+            excluded_god_module_prefixes: None,
         },
     )
     .await

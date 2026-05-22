@@ -26,6 +26,26 @@ pub async fn tool_architecture_violations(
     let severity_threshold = params.severity_threshold.as_deref().unwrap_or("medium");
     let include_fixes = params.include_fixes.unwrap_or(true);
 
+    // Default exclusions for intentional organization patterns that look
+    // like god modules to a per-directory file-count rule. Override per-
+    // call via the `excluded_god_module_prefixes` parameter; the empty
+    // vector form `Some(vec![])` disables exclusions entirely so the raw
+    // file-count rule applies.
+    const DEFAULT_GOD_MODULE_EXCLUSIONS: &[&str] = &[
+        "src/patterns",
+        "src/mcp/tools",
+        "pgmcp-testing/tests",
+    ];
+    let god_module_exclusions: Vec<String> = params
+        .excluded_god_module_prefixes
+        .clone()
+        .unwrap_or_else(|| {
+            DEFAULT_GOD_MODULE_EXCLUSIONS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        });
+
     debug!(
         tool = "architecture_violations",
         project = %params.project,
@@ -168,6 +188,15 @@ pub async fn tool_architecture_violations(
     }
     for (module, files) in &module_files {
         if files.len() > 15 {
+            // Skip intentionally-large directory patterns (one-file-per-tool
+            // catalogs, per-family pattern files, integration-test suites).
+            // Match on prefix to catch both top-level and nested forms.
+            if god_module_exclusions
+                .iter()
+                .any(|p| module == p || module.starts_with(&format!("{}/", p)))
+            {
+                continue;
+            }
             violations.push(serde_json::json!({
                 "type": "god_module",
                 "severity": "high",

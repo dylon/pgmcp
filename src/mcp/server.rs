@@ -1547,6 +1547,14 @@ pub struct ArchitectureViolationsParams {
                        Set false to reproduce the pre-2026-04-30 diagnostic-only shape."
     )]
     pub include_fixes: Option<bool>,
+    /// Module path prefixes (relative to project root) to exempt from the
+    /// god-module rule. Intentional one-file-per-tool / one-file-per-pattern
+    /// catalogs would otherwise be mis-flagged. When omitted, pgmcp's
+    /// canonical defaults apply (see `tool_architecture_violations` body).
+    #[schemars(
+        description = "Module path prefixes to exempt from the god-module rule (e.g. [\"src/patterns\", \"src/mcp/tools\", \"pgmcp-testing/tests\"]). When omitted, pgmcp's canonical defaults apply."
+    )]
+    pub excluded_god_module_prefixes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
