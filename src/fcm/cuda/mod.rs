@@ -61,6 +61,13 @@ struct MixedState<T: DeviceElem> {
     dev_dist_sq: CudaSlice<f32>,
     dev_u_pow_m: CudaSlice<T>,
     dev_numerator: CudaSlice<T>,
+    /// Phase 10: on-device col-sums buffer used by `update_centroids` to
+    /// fold `Σᵢ uᵢⱼᵐ` without a D2H of `dev_u_pow_m`.
+    dev_col_sums: CudaSlice<f32>,
+    /// Phase 10: on-device fp32 centroids buffer written by the per-(j, dim)
+    /// divide kernel. Only this buffer is D2H'd per iteration — the
+    /// T-precision `dev_numerator` stays on the device.
+    dev_centroids_fp32: CudaSlice<f32>,
     n: usize,
     d: usize,
     k: usize,
@@ -81,24 +88,22 @@ trait DeviceElem:
     /// Host-side f32 → Self conversion.
     fn from_f32(v: f32) -> Self;
 
-    /// Host-side Self → f32 conversion (used only in update_centroids where
-    /// we still download the numerator — post-GEMM reduction that would fuse
-    /// into a second kernel is Phase-D-full territory and out of scope).
-    fn to_f32(self) -> f32;
-
     /// Select the distance-reduction kernel for this storage type.
     fn distance_kernel(k: &FcmKernels) -> &cudarc::driver::CudaFunction;
 
     /// Select the c_norms kernel for this storage type.
     fn c_norms_kernel(k: &FcmKernels) -> &cudarc::driver::CudaFunction;
+
+    /// Select the col-sums reduction kernel (Phase 10).
+    fn reduce_col_sums_kernel(k: &FcmKernels) -> &cudarc::driver::CudaFunction;
+
+    /// Select the numerator-divide kernel (Phase 10).
+    fn divide_numerator_kernel(k: &FcmKernels) -> &cudarc::driver::CudaFunction;
 }
 
 impl DeviceElem for f16 {
     fn from_f32(v: f32) -> Self {
         f16::from_f32(v)
-    }
-    fn to_f32(self) -> f32 {
-        self.to_f32()
     }
     fn distance_kernel(k: &FcmKernels) -> &cudarc::driver::CudaFunction {
         &k.fused_distance_reduce_fp16
@@ -106,20 +111,29 @@ impl DeviceElem for f16 {
     fn c_norms_kernel(k: &FcmKernels) -> &cudarc::driver::CudaFunction {
         &k.compute_c_norms_fp16
     }
+    fn reduce_col_sums_kernel(k: &FcmKernels) -> &cudarc::driver::CudaFunction {
+        &k.reduce_col_sums_fp16
+    }
+    fn divide_numerator_kernel(k: &FcmKernels) -> &cudarc::driver::CudaFunction {
+        &k.divide_numerator_by_col_sums_fp16
+    }
 }
 
 impl DeviceElem for bf16 {
     fn from_f32(v: f32) -> Self {
         bf16::from_f32(v)
     }
-    fn to_f32(self) -> f32 {
-        self.to_f32()
-    }
     fn distance_kernel(k: &FcmKernels) -> &cudarc::driver::CudaFunction {
         &k.fused_distance_reduce_bf16
     }
     fn c_norms_kernel(k: &FcmKernels) -> &cudarc::driver::CudaFunction {
         &k.compute_c_norms_bf16
+    }
+    fn reduce_col_sums_kernel(k: &FcmKernels) -> &cudarc::driver::CudaFunction {
+        &k.reduce_col_sums_bf16
+    }
+    fn divide_numerator_kernel(k: &FcmKernels) -> &cudarc::driver::CudaFunction {
+        &k.divide_numerator_by_col_sums_bf16
     }
 }
 
@@ -175,6 +189,13 @@ where
         let dev_numerator = stream
             .alloc_zeros::<T>(k * d)
             .map_err(|e| FcmError::CudaInit(e.to_string()))?;
+        // Phase 10: on-device col_sums + fp32 centroids buffers.
+        let dev_col_sums = stream
+            .alloc_zeros::<f32>(k)
+            .map_err(|e| FcmError::CudaInit(e.to_string()))?;
+        let dev_centroids_fp32 = stream
+            .alloc_zeros::<f32>(k * d)
+            .map_err(|e| FcmError::CudaInit(e.to_string()))?;
 
         Ok(Self {
             _ctx: ctx,
@@ -189,6 +210,8 @@ where
             dev_dist_sq,
             dev_u_pow_m,
             dev_numerator,
+            dev_col_sums,
+            dev_centroids_fp32,
             n,
             d,
             k,
@@ -297,9 +320,11 @@ where
 
     /// Upload Uᵐ, run (Uᵐ)ᵀ·X GEMM, D2H the numerator, divide by col_sums on
     /// host. Col-sums reduction stays on host because the numerator download
-    /// is modest (K·d) and the col-sums pass over Uᵐ is cheap host-side
-    /// elementwise. This mirrors the legacy path; a future Phase-D-full
-    /// extension would move col_sums on-device too.
+    /// Phase 10: on-device fused col-sums + numerator-divide path. The
+    /// previous implementation downloaded `dev_numerator` (K·d in
+    /// T-precision) plus walked `u_pow_m` host-side for col-sums; now both
+    /// stay on the device and only the final fp32 K·d centroids cross the
+    /// PCIe boundary per iteration.
     fn update_centroids(
         &mut self,
         u_pow_m: &Array2<f32>,
@@ -336,21 +361,65 @@ where
                 .map_err(|e| FcmError::CudaLaunch(format!("GEMM (Uᵐ)ᵀ·X: {e}")))?;
         }
 
-        let num_host = self
-            .stream
-            .clone_dtoh(&self.dev_numerator)
-            .map_err(|e| FcmError::CudaLaunch(format!("numerator dtoh: {e}")))?;
-
-        // Column sums of Uᵐ on host (f32 accumulator).
-        let col_sums: Vec<f32> = (0..k)
-            .map(|j| (0..n).map(|i| u_pow_m[[i, j]]).sum::<f32>())
-            .collect();
-
+        let n_i32 = n as i32;
+        let k_i32 = k as i32;
+        let d_i32 = d as i32;
         let eps: f32 = 1e-6;
+
+        // Step 1: col_sums[j] = Σᵢ uᵢⱼᵐ on device. One block per j, 128
+        // threads, block-stride sum into shared memory, single-thread
+        // reduce-write at the end (same shape as compute_c_norms).
+        {
+            let cfg = LaunchConfig {
+                grid_dim: (k as u32, 1, 1),
+                block_dim: (128, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = self
+                .stream
+                .launch_builder(T::reduce_col_sums_kernel(&self.kernels));
+            b.arg(&self.dev_u_pow_m);
+            b.arg(&mut self.dev_col_sums);
+            b.arg(&n_i32);
+            b.arg(&k_i32);
+            unsafe { b.launch(cfg) }
+                .map_err(|e| FcmError::CudaLaunch(format!("reduce_col_sums kernel: {e}")))?;
+        }
+
+        // Step 2: dev_centroids_fp32[j*d + dim] = numerator[j*d + dim]
+        //                                          / max(col_sums[j], eps).
+        // One thread per (j, dim) — total K·d threads, 256-thread blocks.
+        {
+            let total = (k * d) as u32;
+            let block = 256u32;
+            let grid = total.div_ceil(block);
+            let cfg = LaunchConfig {
+                grid_dim: (grid, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let mut b = self
+                .stream
+                .launch_builder(T::divide_numerator_kernel(&self.kernels));
+            b.arg(&self.dev_numerator);
+            b.arg(&self.dev_col_sums);
+            b.arg(&mut self.dev_centroids_fp32);
+            b.arg(&k_i32);
+            b.arg(&d_i32);
+            b.arg(&eps);
+            unsafe { b.launch(cfg) }
+                .map_err(|e| FcmError::CudaLaunch(format!("divide_numerator kernel: {e}")))?;
+        }
+
+        // Step 3: single D2H of fp32 K·d centroids — the only PCIe traffic
+        // in this iteration of update_centroids.
+        let centroids_host = self
+            .stream
+            .clone_dtoh(&self.dev_centroids_fp32)
+            .map_err(|e| FcmError::CudaLaunch(format!("centroids_fp32 dtoh: {e}")))?;
         for j in 0..k {
-            let denom = col_sums[j].max(eps);
             for dim in 0..d {
-                centroids_out[[j, dim]] = num_host[j * d + dim].to_f32() / denom;
+                centroids_out[[j, dim]] = centroids_host[j * d + dim];
             }
         }
         Ok(())

@@ -13,16 +13,26 @@ use cudarc::nvrtc::Ptx;
 
 const FCM_KERNELS_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fcm_kernels.ptx"));
 
-/// The four functions exported by `kernels.cu`, loaded once per FCM backend.
+/// The eight functions exported by `kernels.cu`, loaded once per FCM backend.
+///
+/// The first four (distance reduction + on-device c_norms) are Phase 5–11
+/// kernels. The last four (col-sums reduction + numerator divide) are
+/// Phase 10 — they replace `MixedState::update_centroids`'s host-side
+/// col-sums sweep and per-element divide with on-device kernels, leaving
+/// only one D2H per iteration (the fp32 K·d centroids).
 pub struct FcmKernels {
     pub fused_distance_reduce_fp16: CudaFunction,
     pub fused_distance_reduce_bf16: CudaFunction,
     pub compute_c_norms_fp16: CudaFunction,
     pub compute_c_norms_bf16: CudaFunction,
+    pub reduce_col_sums_fp16: CudaFunction,
+    pub reduce_col_sums_bf16: CudaFunction,
+    pub divide_numerator_by_col_sums_fp16: CudaFunction,
+    pub divide_numerator_by_col_sums_bf16: CudaFunction,
 }
 
 impl FcmKernels {
-    /// Load all four kernels into the given CUDA context. The underlying
+    /// Load all kernels into the given CUDA context. The underlying
     /// `CudaModule` is shared across loads via a process-wide cache so
     /// subsequent FCM runs don't re-parse the PTX.
     pub fn load(ctx: &Arc<CudaContext>) -> Result<Self, cudarc::driver::DriverError> {
@@ -32,6 +42,12 @@ impl FcmKernels {
             fused_distance_reduce_bf16: module.load_function("fused_distance_reduce_bf16")?,
             compute_c_norms_fp16: module.load_function("compute_c_norms_fp16")?,
             compute_c_norms_bf16: module.load_function("compute_c_norms_bf16")?,
+            reduce_col_sums_fp16: module.load_function("reduce_col_sums_fp16")?,
+            reduce_col_sums_bf16: module.load_function("reduce_col_sums_bf16")?,
+            divide_numerator_by_col_sums_fp16: module
+                .load_function("divide_numerator_by_col_sums_fp16")?,
+            divide_numerator_by_col_sums_bf16: module
+                .load_function("divide_numerator_by_col_sums_bf16")?,
         })
     }
 }
