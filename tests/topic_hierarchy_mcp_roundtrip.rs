@@ -18,7 +18,7 @@ fn build_synthetic_centroids() -> Vec<TopicCentroid> {
 
     let mut centroids = Vec::with_capacity(n_meta * per_meta);
 
-    let mut s: u64 = 0xBADC0FFEE_DEADu64;
+    let mut s: u64 = 0x000B_ADC0_FFEE_DEADu64;
     let mut next_f = || {
         s = s
             .wrapping_mul(6364136223846793005)
@@ -34,9 +34,10 @@ fn build_synthetic_centroids() -> Vec<TopicCentroid> {
         for t in 0..per_meta {
             let mut centroid = base.clone();
             // Tiny within-meta jitter so the topics aren't identical.
-            for j in 0..d {
-                centroid[j] += 0.05 * next_f();
+            for slot in centroid.iter_mut() {
+                *slot += 0.05 * next_f();
             }
+            let _ = d; // length already encoded in centroid; keep d for caller context
             // L2-normalize.
             let norm: f32 = centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
             if norm > 1e-12 {
