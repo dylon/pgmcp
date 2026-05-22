@@ -16,8 +16,12 @@ use syn::visit::{
 };
 use syn::{
     Ident, ImplItem, Item, ItemConst, ItemEnum, ItemFn, ItemImpl, ItemMod, ItemStatic, ItemStruct,
-    ItemTrait, ItemType, UseTree, Visibility,
+    ItemTrait, ItemType, UseTree,
 };
+
+#[path = "rust/helpers.rs"]
+mod helpers;
+use helpers::*;
 
 use crate::parsing::backend::LanguageBackend;
 use crate::parsing::complexity;
@@ -107,37 +111,6 @@ impl LanguageBackend for RustBackend {
         v.visit_file(&file);
         v.into_metrics()
     }
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/// 1-based source line for a `proc_macro2::Span`. Requires the `span-locations`
-/// feature on `proc-macro2` (set in `Cargo.toml`).
-fn span_line(span: Span) -> u32 {
-    span.start().line as u32
-}
-
-/// Render a `syn::Type` (or any token stream) as a string.
-fn type_to_string<T: ToTokens>(ty: &T) -> String {
-    ty.to_token_stream().to_string()
-}
-
-/// Map `syn::Visibility` to the canonical visibility strings used in
-/// `file_symbols.visibility` (`public` / `module` / `private`).
-fn vis_str(v: &Visibility) -> Option<String> {
-    Some(
-        match v {
-            Visibility::Public(_) => "public",
-            // `pub(crate)`, `pub(super)`, `pub(in path::to::module)` — all
-            // collapse to "module" since pgmcp's vocabulary does not yet
-            // distinguish them.
-            Visibility::Restricted(_) => "module",
-            Visibility::Inherited => "private",
-        }
-        .to_string(),
-    )
 }
 
 // ============================================================================

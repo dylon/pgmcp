@@ -4,6 +4,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use arc_swap::ArcSwap;
+
+#[path = "server/error_classify.rs"]
+mod error_classify;
+use error_classify::*;
+
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
@@ -275,23 +280,6 @@ fn classify_result(
                 ("error", Some(classify_error_kind(&msg)))
             }
         }
-    }
-}
-
-/// Coarse error classification for telemetry. Matches a handful of
-/// common message prefixes the rmcp `McpError` helpers produce. Anything
-/// else falls into `"internal"`.
-fn classify_error_kind(msg: &str) -> String {
-    if msg.contains("invalid_params") || msg.contains("Invalid parameters") {
-        "invalid_params".to_string()
-    } else if msg.contains("not found") {
-        "not_found".to_string()
-    } else if msg.contains("requires") || msg.contains("Requires") {
-        "precondition".to_string()
-    } else if msg.contains("database") || msg.contains("sql") {
-        "db_error".to_string()
-    } else {
-        "internal".to_string()
     }
 }
 
