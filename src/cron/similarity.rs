@@ -90,10 +90,17 @@ pub async fn run_similarity_scan(
             Ok(rows) => rows,
             Err(e) => {
                 if classify_db_error(&e) == CronAction::AbortRun {
-                    warn!(
+                    // Shutdown-time termination through the DB pool is expected
+                    // behaviour, not a warning. The polite `is_stopping()` check
+                    // at the top of the loop catches the cooperative path; this
+                    // arm only fires when the pool closes mid-batch (i.e., the
+                    // SIGTERM arrived between iterations). Either way: stop, no
+                    // noise, one line in the log so the operator can correlate.
+                    info!(
                         error = %e,
                         last_id,
-                        "similarity-scan: DB pool closed or runtime shutting down, aborting scan"
+                        batches_processed,
+                        "similarity-scan: shutdown detected via pool error, exiting cleanly"
                     );
                     break;
                 }

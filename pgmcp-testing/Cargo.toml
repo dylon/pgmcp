@@ -42,6 +42,8 @@ arc-swap = "1"
 rmcp = { version = "1.1", features = ["server"] }
 postcard = { version = "1", features = ["use-std"] }
 petgraph = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 
 [dev-dependencies]
 arc-swap = "1"

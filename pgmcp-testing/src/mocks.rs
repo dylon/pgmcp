@@ -18,7 +18,7 @@
 //! tests can assert what was written. `Mutex` is `parking_lot` to keep the
 //! mock cheap.
 
-use std::sync::atomic::{AtomicI32, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicI64, AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -125,6 +125,10 @@ pub struct MockDbClient {
     pub git_last_commit: Option<String>,
     pub compare_two_files_result: Vec<ChunkPairSimilarity>,
     pub batch_neighbors: Vec<SimilarityNeighborRow>,
+    /// If set, `batch_find_cross_project_neighbors` returns
+    /// `Err(sqlx::Error::PoolClosed)` once the per-mock call counter reaches
+    /// this threshold. Used to exercise the similarity-scan SIGTERM path.
+    pub batch_neighbors_pool_closed_after: Option<usize>,
     pub top_similar_file_pairs_result: Vec<FileSimilarityPair>,
     pub similar_files_result: Vec<FileSimilarityPair>,
     pub duplicate_file_pairs_result: Vec<DuplicateFilePair>,
@@ -156,6 +160,9 @@ pub struct MockDbClient {
     next_project_id: AtomicI32,
     next_file_id: AtomicI64,
     next_commit_id: AtomicI64,
+    /// Counts calls into `batch_find_cross_project_neighbors`. Used together
+    /// with `batch_neighbors_pool_closed_after` to simulate SIGTERM mid-scan.
+    batch_neighbors_call_count: AtomicUsize,
 
     // Write-side: recorded calls.
     pub upsert_project_calls: Mutex<Vec<UpsertProjectCall>>,
@@ -669,6 +676,14 @@ impl DbClient for MockDbClient {
         _threshold: f64,
         _ef_search: i32,
     ) -> Result<Vec<SimilarityNeighborRow>, sqlx::Error> {
+        let calls = self
+            .batch_neighbors_call_count
+            .fetch_add(1, Ordering::SeqCst);
+        if let Some(threshold) = self.batch_neighbors_pool_closed_after {
+            if calls >= threshold {
+                return Err(sqlx::Error::PoolClosed);
+            }
+        }
         Ok(self.batch_neighbors.clone())
     }
 
