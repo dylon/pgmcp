@@ -1266,13 +1266,28 @@ pub async fn recall_prompts_semantic(
     // BGE-M3 `embedding_v2`. Other dims are rejected here so an
     // accidental mid-cutover misconfiguration surfaces as a clear error
     // instead of as wrong-shape vector arithmetic at the pgvector layer.
+    //
+    // Phase 5 C6 invariant: under the daemon-startup truth-table refusal
+    // (`src/cli/daemon.rs::1b`), the configured `[embeddings].model`
+    // and the persisted `active_embedding_signature` are guaranteed to
+    // agree on dim (modulo the explicit mid-migration combination,
+    // where the daemon is configured for BGE-M3 and the cron drains
+    // backlog with the same model). Therefore `embedding.len()` (the
+    // dim the daemon's `Embedder` produced) is provably equal to
+    // `embed::signature::ActiveSignatureCache::current(pool).await?.dim()`
+    // for every well-aligned daemon. The dispatch-on-len here and the
+    // cache-based dispatch in C7/C8 inline-SQL tools are two sides of
+    // the same invariant; the C2 cache is the single source of truth
+    // for the *write* side (C3) and for tools that don't have a
+    // query-vector to dispatch on (C7's centroid-aggregating tools).
     let column = match embedding.len() {
         384 => "embedding",
         1024 => "embedding_v2",
         other => {
             return Err(sqlx::Error::Protocol(format!(
                 "recall_prompts: unsupported query-embedding dim {} \
-                 (expected 384 for MiniLM or 1024 for BGE-M3)",
+                 (expected 384 for MiniLM or 1024 for BGE-M3). Run \
+                 `pgmcp embed-cutover --check` to inspect.",
                 other
             )));
         }
