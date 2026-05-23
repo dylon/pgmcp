@@ -309,6 +309,11 @@ pub struct StatsTracker {
     pub fuzzy_sync_runs: AtomicU64,
     pub fuzzy_sync_rows_synced: AtomicU64,
 
+    // Phase 7 — topic-dendrogram cron (libgrammstein
+    // hierarchical-agglomerative + c-TF-IDF).
+    pub topic_dendrogram_runs: AtomicU64,
+    pub topic_dendrogram_topics_generated: AtomicU64,
+
     // Embedding pool counters
     pub embed_file_batches: AtomicU64,
     pub embed_commit_batches: AtomicU64,
@@ -706,6 +711,8 @@ impl StatsTracker {
             topic_noise_chunks: AtomicU64::new(0),
             fuzzy_sync_runs: AtomicU64::new(0),
             fuzzy_sync_rows_synced: AtomicU64::new(0),
+            topic_dendrogram_runs: AtomicU64::new(0),
+            topic_dendrogram_topics_generated: AtomicU64::new(0),
             embed_file_batches: AtomicU64::new(0),
             embed_commit_batches: AtomicU64::new(0),
             embed_query_count: AtomicU64::new(0),

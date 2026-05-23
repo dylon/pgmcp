@@ -1243,6 +1243,19 @@ pub async fn run_migrations(
     ensure_memory_v2_columns(pool).await?;
     ensure_memory_v2_hnsw_index(pool, vector_config).await?;
     ensure_active_embedding_signature(pool).await?;
+    // Phase 7: topic_dendrograms table for the hierarchical-
+    // agglomerative + c-TF-IDF cron output. One row per project;
+    // upserted by `cron::topic_dendrogram::run_project`.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS topic_dendrograms (
+            project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+            dendrogram_blob BYTEA NOT NULL,
+            ctfidf_keywords JSONB NOT NULL,
+            generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
 
     // ================================================================
     // Memory-server Phase 2: knowledge-graph tables.

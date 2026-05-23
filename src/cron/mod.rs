@@ -40,4 +40,6 @@ pub mod topic_clustering;
 #[allow(dead_code)]
 pub mod topic_clustering_online;
 #[allow(dead_code)]
+pub mod topic_dendrogram;
+#[allow(dead_code)]
 pub mod topic_hierarchy;
