@@ -826,6 +826,22 @@ pub async fn semantic_search(
 ) -> Result<Vec<SearchResult>, sqlx::Error> {
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
 
+    // Phase 5 C8: dispatch the query against the column whose dim
+    // matches the incoming embedding. 384 → legacy `embedding`,
+    // 1024 → `embedding_v2`. Mismatched dims surface a clear
+    // protocol error pointing at `pgmcp embed-cutover --check`.
+    let col = match embedding.len() {
+        384 => "embedding",
+        1024 => "embedding_v2",
+        other => {
+            return Err(sqlx::Error::Protocol(format!(
+                "semantic_search: unsupported query-embedding dim {other} \
+                 (expected 384 for MiniLM or 1024 for BGE-M3). \
+                 Run `pgmcp embed-cutover --check` to inspect."
+            )));
+        }
+    };
+
     // Acquire a dedicated connection so ef_search applies to our query.
     // Using SET LOCAL within a transaction keeps it scoped to this operation.
     let mut tx = pool.begin().await?;
@@ -843,16 +859,18 @@ pub async fn semantic_search(
             sqlx::query_as::<_, SearchResult>(&format!(
                 "SELECT f.path, f.relative_path, f.language,
                         c.content as chunk_content, c.start_line, c.end_line,
-                        1 - (c.embedding <=> $1) as score,
+                        1 - (c.{col} <=> $1) as score,
                         p.name as project_name
                  FROM file_chunks c
                  JOIN indexed_files f ON f.id = c.file_id
                  JOIN projects p ON p.id = f.project_id
                  WHERE f.language = $3 AND p.name = $4
-                   AND {}
-                 ORDER BY c.embedding <=> $1
+                   AND c.{col} IS NOT NULL
+                   AND {dedup}
+                 ORDER BY c.{col} <=> $1
                  LIMIT $2",
-                worktree_dedup_clause(5)
+                col = col,
+                dedup = worktree_dedup_clause(5)
             ))
             .bind(&embedding_vec)
             .bind(limit)
@@ -867,16 +885,18 @@ pub async fn semantic_search(
             sqlx::query_as::<_, SearchResult>(&format!(
                 "SELECT f.path, f.relative_path, f.language,
                         c.content as chunk_content, c.start_line, c.end_line,
-                        1 - (c.embedding <=> $1) as score,
+                        1 - (c.{col} <=> $1) as score,
                         p.name as project_name
                  FROM file_chunks c
                  JOIN indexed_files f ON f.id = c.file_id
                  JOIN projects p ON p.id = f.project_id
                  WHERE f.language = $3
-                   AND {}
-                 ORDER BY c.embedding <=> $1
+                   AND c.{col} IS NOT NULL
+                   AND {dedup}
+                 ORDER BY c.{col} <=> $1
                  LIMIT $2",
-                worktree_dedup_clause(4)
+                col = col,
+                dedup = worktree_dedup_clause(4)
             ))
             .bind(&embedding_vec)
             .bind(limit)
@@ -890,16 +910,18 @@ pub async fn semantic_search(
             sqlx::query_as::<_, SearchResult>(&format!(
                 "SELECT f.path, f.relative_path, f.language,
                         c.content as chunk_content, c.start_line, c.end_line,
-                        1 - (c.embedding <=> $1) as score,
+                        1 - (c.{col} <=> $1) as score,
                         p.name as project_name
                  FROM file_chunks c
                  JOIN indexed_files f ON f.id = c.file_id
                  JOIN projects p ON p.id = f.project_id
                  WHERE p.name = $3
-                   AND {}
-                 ORDER BY c.embedding <=> $1
+                   AND c.{col} IS NOT NULL
+                   AND {dedup}
+                 ORDER BY c.{col} <=> $1
                  LIMIT $2",
-                worktree_dedup_clause(4)
+                col = col,
+                dedup = worktree_dedup_clause(4)
             ))
             .bind(&embedding_vec)
             .bind(limit)
@@ -913,15 +935,17 @@ pub async fn semantic_search(
             sqlx::query_as::<_, SearchResult>(&format!(
                 "SELECT f.path, f.relative_path, f.language,
                         c.content as chunk_content, c.start_line, c.end_line,
-                        1 - (c.embedding <=> $1) as score,
+                        1 - (c.{col} <=> $1) as score,
                         p.name as project_name
                  FROM file_chunks c
                  JOIN indexed_files f ON f.id = c.file_id
                  JOIN projects p ON p.id = f.project_id
-                 WHERE {}
-                 ORDER BY c.embedding <=> $1
+                 WHERE c.{col} IS NOT NULL
+                   AND {dedup}
+                 ORDER BY c.{col} <=> $1
                  LIMIT $2",
-                worktree_dedup_clause(3)
+                col = col,
+                dedup = worktree_dedup_clause(3)
             ))
             .bind(&embedding_vec)
             .bind(limit)
@@ -3772,7 +3796,10 @@ pub async fn update_blame_for_file(
     Ok(())
 }
 
-/// Semantic search across git commit chunks.
+/// Semantic search across git commit chunks. Phase 5 C8: signature-
+/// aware column dispatch. `git_commit_chunks` gained an `embedding_v2`
+/// column in C1; this function picks it based on the incoming
+/// embedding's dim.
 pub async fn semantic_search_commits(
     pool: &PgPool,
     embedding: &[f32],
@@ -3782,41 +3809,54 @@ pub async fn semantic_search_commits(
 ) -> Result<Vec<CommitSearchResult>, sqlx::Error> {
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
 
+    let col = match embedding.len() {
+        384 => "embedding",
+        1024 => "embedding_v2",
+        other => {
+            return Err(sqlx::Error::Protocol(format!(
+                "semantic_search_commits: unsupported query-embedding dim {other} \
+                 (expected 384 for MiniLM or 1024 for BGE-M3). \
+                 Run `pgmcp embed-cutover --check` to inspect."
+            )));
+        }
+    };
+
     let mut tx = pool.begin().await?;
     sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
         .execute(&mut *tx)
         .await?;
 
     let results = if let Some(proj) = project {
-        sqlx::query_as::<_, CommitSearchResult>(
+        sqlx::query_as::<_, CommitSearchResult>(&format!(
             "SELECT g.commit_hash, g.author, g.author_date, g.subject,
                     cc.content as chunk_content,
-                    1 - (cc.embedding <=> $1) as score,
+                    1 - (cc.{col} <=> $1) as score,
                     p.name as project_name
              FROM git_commit_chunks cc
              JOIN git_commits g ON g.id = cc.commit_id
              JOIN projects p ON p.id = g.project_id
-             WHERE p.name = $3
-             ORDER BY cc.embedding <=> $1
-             LIMIT $2",
-        )
+             WHERE p.name = $3 AND cc.{col} IS NOT NULL
+             ORDER BY cc.{col} <=> $1
+             LIMIT $2"
+        ))
         .bind(&embedding_vec)
         .bind(limit)
         .bind(proj)
         .fetch_all(&mut *tx)
         .await?
     } else {
-        sqlx::query_as::<_, CommitSearchResult>(
+        sqlx::query_as::<_, CommitSearchResult>(&format!(
             "SELECT g.commit_hash, g.author, g.author_date, g.subject,
                     cc.content as chunk_content,
-                    1 - (cc.embedding <=> $1) as score,
+                    1 - (cc.{col} <=> $1) as score,
                     p.name as project_name
              FROM git_commit_chunks cc
              JOIN git_commits g ON g.id = cc.commit_id
              JOIN projects p ON p.id = g.project_id
-             ORDER BY cc.embedding <=> $1
-             LIMIT $2",
-        )
+             WHERE cc.{col} IS NOT NULL
+             ORDER BY cc.{col} <=> $1
+             LIMIT $2"
+        ))
         .bind(&embedding_vec)
         .bind(limit)
         .fetch_all(&mut *tx)
@@ -5652,6 +5692,12 @@ pub async fn bulk_extract_embeddings(
     pool: &PgPool,
     language: Option<&str>,
 ) -> Result<Vec<ChunkEmbeddingRow>, sqlx::Error> {
+    // Phase 5 C8: dispatch on active embedding signature. Topic
+    // clustering's centroids are dim-agnostic (stored as untyped
+    // REAL[]) so the only thing this affects is which column we
+    // SELECT from.
+    let active = crate::embed::signature::read_active_signature(pool).await?;
+    let col = active.read_column();
     let canonical_filter = "NOT EXISTS (
         SELECT 1 FROM projects p_dup
         WHERE p_dup.id < p.id
@@ -5668,11 +5714,12 @@ pub async fn bulk_extract_embeddings(
     if let Some(lang) = language {
         let rows = sqlx::query_as::<_, BulkChunkRow>(&format!(
             "SELECT c.id as chunk_id, c.file_id, f.project_id, p.name as project_name,
-                    f.path, f.language, c.content, c.embedding::real[] as embedding
+                    f.path, f.language, c.content, c.{col}::real[] as embedding
              FROM file_chunks c
              JOIN indexed_files f ON f.id = c.file_id
              JOIN projects p ON p.id = f.project_id
              WHERE f.language = $1
+               AND c.{col} IS NOT NULL
                AND {canonical_filter}
              ORDER BY c.id",
         ))
@@ -5683,11 +5730,12 @@ pub async fn bulk_extract_embeddings(
     } else {
         let rows = sqlx::query_as::<_, BulkChunkRow>(&format!(
             "SELECT c.id as chunk_id, c.file_id, f.project_id, p.name as project_name,
-                    f.path, f.language, c.content, c.embedding::real[] as embedding
+                    f.path, f.language, c.content, c.{col}::real[] as embedding
              FROM file_chunks c
              JOIN indexed_files f ON f.id = c.file_id
              JOIN projects p ON p.id = f.project_id
-             WHERE {canonical_filter}
+             WHERE c.{col} IS NOT NULL
+               AND {canonical_filter}
              ORDER BY c.id",
         ))
         .fetch_all(pool)
@@ -5702,31 +5750,36 @@ pub async fn bulk_extract_project_embeddings(
     project_name: &str,
     language: Option<&str>,
 ) -> Result<Vec<ChunkEmbeddingRow>, sqlx::Error> {
+    // Phase 5 C8: signature-aware column.
+    let active = crate::embed::signature::read_active_signature(pool).await?;
+    let col = active.read_column();
     if let Some(lang) = language {
-        let rows = sqlx::query_as::<_, BulkChunkRow>(
+        let rows = sqlx::query_as::<_, BulkChunkRow>(&format!(
             "SELECT c.id as chunk_id, c.file_id, f.project_id, p.name as project_name,
-                    f.path, f.language, c.content, c.embedding::real[] as embedding
+                    f.path, f.language, c.content, c.{col}::real[] as embedding
              FROM file_chunks c
              JOIN indexed_files f ON f.id = c.file_id
              JOIN projects p ON p.id = f.project_id
              WHERE p.name = $1 AND f.language = $2
-             ORDER BY c.id",
-        )
+               AND c.{col} IS NOT NULL
+             ORDER BY c.id"
+        ))
         .bind(project_name)
         .bind(lang)
         .fetch_all(pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     } else {
-        let rows = sqlx::query_as::<_, BulkChunkRow>(
+        let rows = sqlx::query_as::<_, BulkChunkRow>(&format!(
             "SELECT c.id as chunk_id, c.file_id, f.project_id, p.name as project_name,
-                    f.path, f.language, c.content, c.embedding::real[] as embedding
+                    f.path, f.language, c.content, c.{col}::real[] as embedding
              FROM file_chunks c
              JOIN indexed_files f ON f.id = c.file_id
              JOIN projects p ON p.id = f.project_id
              WHERE p.name = $1
-             ORDER BY c.id",
-        )
+               AND c.{col} IS NOT NULL
+             ORDER BY c.id"
+        ))
         .bind(project_name)
         .fetch_all(pool)
         .await?;

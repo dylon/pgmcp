@@ -458,18 +458,33 @@ pub async fn semantic_search_patterns(
     let embedding_vec = Vector::from(embedding.to_vec());
     let paradigms = options.paradigms;
 
+    // Phase 5 C8: signature-aware column dispatch. The
+    // software_pattern_chunks table gained an `embedding_v2` column in
+    // C1; pick the right one based on the incoming query's dim.
+    let col = match embedding.len() {
+        384 => "embedding",
+        1024 => "embedding_v2",
+        other => {
+            return Err(sqlx::Error::Protocol(format!(
+                "semantic_search_patterns: unsupported query-embedding dim {other} \
+                 (expected 384 for MiniLM or 1024 for BGE-M3). \
+                 Run `pgmcp embed-cutover --check` to inspect."
+            )));
+        }
+    };
+
     let mut tx = pool.begin().await?;
     sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
         .execute(&mut *tx)
         .await?;
 
-    let rows = sqlx::query_as::<_, PatternSearchRow>(
+    let rows = sqlx::query_as::<_, PatternSearchRow>(&format!(
         "SELECT p.id AS pattern_id,
                 p.slug, p.name, p.kind, p.category, p.summary, p.intent, p.canonical_url,
                 s.id AS source_id, s.source_family, s.title AS source_title,
                 s.url AS source_url, s.license_label,
                 c.content AS chunk_content,
-                1 - (c.embedding <=> $1) AS score
+                1 - (c.{col} <=> $1) AS score
          FROM software_pattern_chunks c
          JOIN software_pattern_sources s ON s.id = c.source_id
          JOIN software_pattern_source_patterns sp ON sp.source_id = s.id
@@ -485,9 +500,10 @@ pub async fn semantic_search_patterns(
            AND ($5::text IS NULL OR p.category = $5)
            AND ($6::text IS NULL OR s.source_family = $6)
            AND ($7::text IS NULL OR s.source_type = $7)
-         ORDER BY c.embedding <=> $1
-         LIMIT $2",
-    )
+           AND c.{col} IS NOT NULL
+         ORDER BY c.{col} <=> $1
+         LIMIT $2"
+    ))
     .bind(&embedding_vec)
     .bind(limit)
     .bind(options.kind)
