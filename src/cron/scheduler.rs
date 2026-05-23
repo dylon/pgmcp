@@ -605,6 +605,7 @@ pub fn schedule_maintenance_jobs(
     db: Arc<dyn crate::db::DbClient>,
     stats: Arc<StatsTracker>,
     config: &CronConfig,
+    fuzzy_config: &crate::config::FuzzyConfig,
     rt: tokio::runtime::Handle,
     embed_tx: crossbeam_channel::Sender<EmbedIndexRequest>,
     lifecycle: DaemonLifecycle,
@@ -1205,6 +1206,79 @@ pub fn schedule_maintenance_jobs(
                         elapsed_s = t0.elapsed().as_secs_f64(),
                         "heavy cron complete"
                     );
+                },
+                crate::work_pool::pool::Priority::Low,
+            );
+            true
+        },
+    );
+
+    // Fuzzy-index sync — clone db / rt / stats BEFORE topic-clustering
+    // claims the final-move ownership of each.
+    let db_clone_fuzzy = Arc::clone(&db);
+    let rt_clone_fuzzy = rt.clone();
+    let stats_for_fuzzy = Arc::clone(&stats);
+    let fuzzy_data_dir = fuzzy_config.data_dir.clone();
+    let fuzzy_interval = config.fuzzy_sync_interval_secs;
+    let cron_pool_fuzzy = Arc::clone(&cron_pool);
+    let lc_fuzzy = lifecycle.clone();
+    let lock_fuzzy = Arc::clone(&heavy_cron_lock);
+    let ready_fuzzy: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+    let fuzzy_ready_delay = Duration::from_secs(config.ready_delay_topic_secs);
+    handle.schedule_recurring(
+        staggered_initial_delay_ms("fuzzy-sync", fuzzy_interval * 1000),
+        fuzzy_interval * 1000,
+        "fuzzy-sync",
+        move || {
+            if lc_fuzzy.is_stopping() {
+                return false;
+            }
+            let lc = lc_fuzzy.clone();
+            let lock = Arc::clone(&lock_fuzzy);
+            let ready = Arc::clone(&ready_fuzzy);
+            let stats = Arc::clone(&stats_for_fuzzy);
+            let db = db_clone_fuzzy.clone();
+            let rt = rt_clone_fuzzy.clone();
+            let data_dir = fuzzy_data_dir.clone();
+            cron_pool_fuzzy.submit(
+                move || {
+                    let _guard = heavy_gate_or_skip!(
+                        job = "fuzzy-sync",
+                        lc = lc,
+                        ready = ready,
+                        cooldown = fuzzy_ready_delay,
+                        lock = lock,
+                        stats = stats,
+                    );
+                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
+                    let t0 = Instant::now();
+                    if let Some(pool) = db.pool().cloned() {
+                        let stats_ref = Arc::clone(&stats);
+                        rt.block_on(async move {
+                            match crate::cron::fuzzy_sync::run_fuzzy_sync(
+                                &pool, &data_dir, stats_ref,
+                            )
+                            .await
+                            {
+                                Ok(report) => tracing::info!(
+                                    job = "fuzzy-sync",
+                                    symbols = report.symbols_synced,
+                                    paths = report.paths_synced,
+                                    commits = report.commits_synced,
+                                    durable_mandates = report.durable_mandates_synced,
+                                    elapsed_s = t0.elapsed().as_secs_f64(),
+                                    "fuzzy-sync run complete"
+                                ),
+                                Err(e) => tracing::error!(
+                                    job = "fuzzy-sync",
+                                    error = %e,
+                                    "fuzzy-sync run failed"
+                                ),
+                            }
+                        });
+                    } else {
+                        tracing::warn!(job = "fuzzy-sync", "skipping run: DbClient has no pool");
+                    }
                 },
                 crate::work_pool::pool::Priority::Low,
             );

@@ -37,6 +37,55 @@ pub struct Config {
     pub system: SystemConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// `[fuzzy]` — disk-backed PersistentARTrieChar fuzzy-index layout.
+    /// Populated in Phase 4 of the integration plan
+    /// `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`.
+    #[serde(default)]
+    pub fuzzy: FuzzyConfig,
+}
+
+/// Disk-backed PersistentARTrieChar fuzzy-index configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FuzzyConfig {
+    /// Directory under which the per-project trie files live.
+    /// Default: `$XDG_STATE_HOME/pgmcp/` (falls back to `~/.local/state/pgmcp/`
+    /// when XDG is unset). Per-kind trie files land at
+    /// `$data_dir/fuzzy/{kind}/{project_slug}/{kind}.artrie`.
+    #[serde(default = "default_fuzzy_data_dir")]
+    pub data_dir: std::path::PathBuf,
+    /// Soft cap on total trie disk usage in bytes (default 5 GiB).
+    /// The MemoryPressure decorator triggers eviction above this cap;
+    /// the cap is advisory, not enforced — the underlying
+    /// PersistentARTrieChar happily exceeds it if there's free disk.
+    #[serde(default = "default_fuzzy_max_disk_bytes")]
+    pub max_disk_bytes: u64,
+}
+
+impl Default for FuzzyConfig {
+    fn default() -> Self {
+        Self {
+            data_dir: default_fuzzy_data_dir(),
+            max_disk_bytes: default_fuzzy_max_disk_bytes(),
+        }
+    }
+}
+
+fn default_fuzzy_data_dir() -> std::path::PathBuf {
+    if let Some(xdg) = std::env::var_os("XDG_STATE_HOME") {
+        let mut p = std::path::PathBuf::from(xdg);
+        p.push("pgmcp");
+        return p;
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let mut p = std::path::PathBuf::from(home);
+        p.push(".local/state/pgmcp");
+        return p;
+    }
+    std::path::PathBuf::from("/var/state/pgmcp")
+}
+
+fn default_fuzzy_max_disk_bytes() -> u64 {
+    5 * 1024 * 1024 * 1024
 }
 
 /// Memory-server configuration. Holds Phase 4+ knobs grouped under
@@ -1423,6 +1472,34 @@ pub struct CronConfig {
     #[serde(default = "default_symbol_extraction_interval")]
     pub symbol_extraction_interval_secs: u64,
 
+    /// Interval between fuzzy-index refreshes in seconds (default:
+    /// 1800 = 30 min). The `cron::fuzzy_sync` job rebuilds the
+    /// `PersistentARTrieChar` indexes (symbols, paths, commits,
+    /// durable mandates) from PG so the fuzzy MCP tools (Phase 8)
+    /// stay current. Plan reference:
+    /// `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`
+    /// Phase 4.
+    #[serde(default = "default_fuzzy_sync_interval")]
+    pub fuzzy_sync_interval_secs: u64,
+
+    /// Interval between per-project HybridLanguageModel re-training
+    /// runs in seconds (default: 43200 = 12 h). Backs Phase 9's third
+    /// RRF leg in `tool_hybrid_search`.
+    #[serde(default = "default_ngram_lm_train_interval")]
+    pub ngram_lm_train_interval_secs: u64,
+
+    /// Interval between hierarchical-agglomerative topic-dendrogram
+    /// rebuilds in seconds (default: 43200 = 12 h). Backs Phase 7's
+    /// `dendrogram_topic_hierarchy` MCP tool.
+    #[serde(default = "default_topic_dendrogram_interval")]
+    pub topic_dendrogram_interval_secs: u64,
+
+    /// Interval between TreeminerD subtree-pattern mining runs in
+    /// seconds (default: 43200 = 12 h). Backs Phase 6's
+    /// `subtree_mining` MCP tool.
+    #[serde(default = "default_subtree_mining_interval")]
+    pub subtree_mining_interval_secs: u64,
+
     // -----------------------------------------------------------------------
     // OOM-fix additions (Phase 1)
     // -----------------------------------------------------------------------
@@ -1561,6 +1638,10 @@ impl Default for CronConfig {
             topic_label_top_k: default_topic_label_top_k(),
             graph_analysis_interval_secs: default_graph_analysis_interval(),
             symbol_extraction_interval_secs: default_symbol_extraction_interval(),
+            fuzzy_sync_interval_secs: default_fuzzy_sync_interval(),
+            ngram_lm_train_interval_secs: default_ngram_lm_train_interval(),
+            topic_dendrogram_interval_secs: default_topic_dendrogram_interval(),
+            subtree_mining_interval_secs: default_subtree_mining_interval(),
             topic_max_mem_fraction: default_topic_max_mem_fraction(),
             topic_scratch_dir: None,
             ready_delay_git_secs: default_ready_delay_git_secs(),
@@ -1692,6 +1773,18 @@ fn default_graph_analysis_interval() -> u64 {
 fn default_symbol_extraction_interval() -> u64 {
     7200
 } // 2 hours — matches graph-analysis cadence
+fn default_fuzzy_sync_interval() -> u64 {
+    1800
+} // 30 min
+fn default_ngram_lm_train_interval() -> u64 {
+    43200
+} // 12 h
+fn default_topic_dendrogram_interval() -> u64 {
+    43200
+} // 12 h
+fn default_subtree_mining_interval() -> u64 {
+    43200
+} // 12 h
 
 impl Config {
     /// Load configuration from the default path or the specified path.
