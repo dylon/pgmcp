@@ -170,6 +170,25 @@ impl Default for ActiveSignatureCache {
     }
 }
 
+/// One-shot resolver for callers that don't have access to a cached
+/// `ActiveSignatureCache` (currently: the C7 inline-SQL MCP tools that
+/// `format!` the column name into an `AVG(c.<col>)::vector(<dim>)`
+/// expression). Reads `pgmcp_metadata.active_embedding_signature`
+/// directly per call. The 30 s cache TTL is bypassed; this is fine for
+/// occasional MCP tool calls (relative cost: <1 ms of metadata SELECT
+/// vs the multi-second SQL aggregate that follows).
+pub async fn read_active_signature(pool: &PgPool) -> Result<EmbeddingSignature, sqlx::Error> {
+    let raw: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'active_embedding_signature'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(raw
+        .as_deref()
+        .and_then(EmbeddingSignature::from_str_signature)
+        .unwrap_or(EmbeddingSignature::MiniLmV1))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

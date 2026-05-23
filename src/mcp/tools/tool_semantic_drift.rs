@@ -26,26 +26,37 @@ pub async fn tool_semantic_drift(
     let pool = pool_or_err(ctx)?;
     let limit = params.limit.unwrap_or(30);
 
+    // Phase 5 C7: signature-aware column resolution. Both file_chunks
+    // and git_commit_chunks have parallel embedding/embedding_v2
+    // columns after C1; this tool reads from whichever the active
+    // signature names.
+    let active = crate::embed::signature::read_active_signature(pool)
+        .await
+        .map_err(|e| {
+            McpError::internal_error(format!("active embedding signature: {}", e), None)
+        })?;
+    let col = active.read_column();
+
     // Per file: current centroid vs centroid of oldest commit chunks touching it.
-    let rows: Vec<(String, f64, i32)> = sqlx::query_as::<_, (String, f64, i32)>(
+    let sql = format!(
         "WITH cur AS (
             SELECT f.id AS file_id, f.relative_path AS path,
-                   AVG(fc.embedding) AS centroid
+                   AVG(fc.{col}) AS centroid
             FROM indexed_files f
             JOIN file_chunks fc ON fc.file_id = f.id
-            WHERE f.project_id = $1 AND fc.embedding IS NOT NULL
+            WHERE f.project_id = $1 AND fc.{col} IS NOT NULL
             GROUP BY f.id, f.relative_path
         ),
         hist AS (
             SELECT f.id AS file_id,
-                   AVG(gcc.embedding) AS centroid,
+                   AVG(gcc.{col}) AS centroid,
                    COUNT(*)::int AS n
             FROM indexed_files f
             JOIN git_commit_files gcf ON gcf.file_path = f.relative_path
             JOIN git_commits gc ON gc.id = gcf.commit_id
             JOIN git_commit_chunks gcc ON gcc.commit_id = gc.id
             WHERE f.project_id = $1 AND gc.project_id = $1
-              AND gcc.embedding IS NOT NULL
+              AND gcc.{col} IS NOT NULL
               AND gc.committed_at < NOW() - INTERVAL '30 days'
             GROUP BY f.id
             HAVING COUNT(*) >= 2
@@ -53,13 +64,14 @@ pub async fn tool_semantic_drift(
         SELECT cur.path, (cur.centroid <=> hist.centroid)::float8 AS dist, hist.n
         FROM cur JOIN hist ON cur.file_id = hist.file_id
         ORDER BY dist DESC
-        LIMIT $2",
-    )
-    .bind(project_id)
-    .bind(limit as i64)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| McpError::internal_error(format!("Drift query failed: {}", e), None))?;
+        LIMIT $2"
+    );
+    let rows: Vec<(String, f64, i32)> = sqlx::query_as::<_, (String, f64, i32)>(&sql)
+        .bind(project_id)
+        .bind(limit as i64)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| McpError::internal_error(format!("Drift query failed: {}", e), None))?;
 
     let files: Vec<_> = rows
         .into_iter()

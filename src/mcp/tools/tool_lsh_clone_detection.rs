@@ -1,7 +1,9 @@
 //! `tool_lsh_clone_detection` — SimHash LSH on chunk embeddings (SOTA Phase 8.1,
 //! Indyk-Motwani STOC 1998; Datar et al. SoCG 2004).
 //!
-//! Random-hyperplane LSH: each chunk's 384-d embedding is projected onto 64
+//! Random-hyperplane LSH: each chunk's embedding (384-d MiniLM or
+//! 1024-d BGE-M3 — selected by the active embedding signature at
+//! query time, Phase 5 C7) is projected onto 64
 //! signed hyperplanes producing a 64-bit signature. Banded LSH (4 bands of
 //! 16 bits) finds candidate pairs in O(1). Re-rank by exact cosine.
 
@@ -69,18 +71,29 @@ pub async fn tool_lsh_clone_detection(
     let min_similarity = params.min_similarity.unwrap_or(0.85);
     let limit = params.limit.unwrap_or(50);
 
-    let rows: Vec<(i64, String, i32, i32, Option<pgvector::Vector>)> =
-        sqlx::query_as::<_, (i64, String, i32, i32, Option<pgvector::Vector>)>(
-            "SELECT fc.id, f.relative_path, fc.start_line, fc.end_line, fc.embedding
-             FROM file_chunks fc
-             JOIN indexed_files f ON fc.file_id = f.id
-             WHERE f.project_id = $1 AND fc.embedding IS NOT NULL
-             LIMIT 5000",
-        )
-        .bind(project_id)
-        .fetch_all(pool)
+    // Phase 5 C7: signature-aware column resolution.
+    let active = crate::embed::signature::read_active_signature(pool)
         .await
-        .map_err(|e| McpError::internal_error(format!("Embedding query failed: {}", e), None))?;
+        .map_err(|e| {
+            McpError::internal_error(format!("active embedding signature: {}", e), None)
+        })?;
+    let col = active.read_column();
+
+    let sql = format!(
+        "SELECT fc.id, f.relative_path, fc.start_line, fc.end_line, fc.{col}
+         FROM file_chunks fc
+         JOIN indexed_files f ON fc.file_id = f.id
+         WHERE f.project_id = $1 AND fc.{col} IS NOT NULL
+         LIMIT 5000"
+    );
+    let rows: Vec<(i64, String, i32, i32, Option<pgvector::Vector>)> = sqlx::query_as::<
+        _,
+        (i64, String, i32, i32, Option<pgvector::Vector>),
+    >(&sql)
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| McpError::internal_error(format!("Embedding query failed: {}", e), None))?;
 
     if rows.is_empty() {
         return json_result(&json!({
@@ -93,7 +106,7 @@ pub async fn tool_lsh_clone_detection(
         .first()
         .and_then(|r| r.4.as_ref())
         .map(|v| v.as_slice().len())
-        .unwrap_or(384);
+        .unwrap_or_else(|| active.dim());
     let hyper = make_hyperplanes(64, dim, 42);
     let sigs: Vec<(i64, String, i32, i32, Vec<f32>, u64)> = rows
         .into_iter()
@@ -191,7 +204,7 @@ pub async fn tool_lsh_clone_detection(
         "project": params.project,
         "min_similarity": min_similarity,
         "pairs": pairs,
-        "guidance": "SimHash on 384-d embeddings → 64-bit signatures → banded LSH buckets. Use approx_cosine as a screen; verify exact pgvector cosine for top candidates."
+        "guidance": format!("SimHash on {}-d embeddings ({}) → 64-bit signatures → banded LSH buckets. Use approx_cosine as a screen; verify exact pgvector cosine for top candidates.", active.dim(), active.model_name())
     }))
 }
 

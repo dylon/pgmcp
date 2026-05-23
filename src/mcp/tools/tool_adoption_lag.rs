@@ -60,18 +60,29 @@ pub async fn tool_adoption_lag(
             )
         })?;
 
+    // Phase 5 C7: signature-aware column resolution.
+    let active = crate::embed::signature::read_active_signature(pool)
+        .await
+        .map_err(|e| {
+            McpError::internal_error(format!("active embedding signature: {}", e), None)
+        })?;
+    let col = active.read_column();
+
     // Pull all chunks of the reference file. We use those chunks as the kNN seeds.
     #[derive(sqlx::FromRow)]
     struct ChunkRow {
         embedding: pgvector::Vector,
     }
-    let chunks: Vec<ChunkRow> = sqlx::query_as::<_, ChunkRow>(
-        "SELECT embedding FROM file_chunks WHERE file_id = $1 ORDER BY chunk_index ASC",
-    )
-    .bind(new_file.file_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| McpError::internal_error(format!("Chunk fetch failed: {}", e), None))?;
+    let sql = format!(
+        "SELECT {col} AS embedding FROM file_chunks
+         WHERE file_id = $1 AND {col} IS NOT NULL
+         ORDER BY chunk_index ASC"
+    );
+    let chunks: Vec<ChunkRow> = sqlx::query_as::<_, ChunkRow>(&sql)
+        .bind(new_file.file_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| McpError::internal_error(format!("Chunk fetch failed: {}", e), None))?;
 
     if chunks.is_empty() {
         return Err(McpError::invalid_params(

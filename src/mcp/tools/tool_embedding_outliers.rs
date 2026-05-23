@@ -25,37 +25,46 @@ pub async fn tool_embedding_outliers(
     let threshold = params.threshold.unwrap_or(1.5);
     let limit = params.limit.unwrap_or(30);
 
+    // Phase 5 C7: signature-aware column resolution.
+    let active = crate::embed::signature::read_active_signature(pool)
+        .await
+        .map_err(|e| {
+            McpError::internal_error(format!("active embedding signature: {}", e), None)
+        })?;
+    let col = active.read_column();
+
     // For each chunk, find its k nearest neighbours and compute a simplified
     // LOF: local_reach_density approximated as 1 / mean k-NN cosine distance.
     // Pure-SQL with pgvector keeps the heavy lifting in Postgres.
-    let rows: Vec<(i64, String, i32, i32, f64)> =
-        sqlx::query_as::<_, (i64, String, i32, i32, f64)>(
-            "WITH project_chunks AS (
-            SELECT fc.id, f.relative_path, fc.start_line, fc.end_line, fc.embedding
+    let sql = format!(
+        "WITH project_chunks AS (
+            SELECT fc.id, f.relative_path, fc.start_line, fc.end_line, fc.{col} AS emb
             FROM file_chunks fc
             JOIN indexed_files f ON fc.file_id = f.id
-            WHERE f.project_id = $1 AND fc.embedding IS NOT NULL
+            WHERE f.project_id = $1 AND fc.{col} IS NOT NULL
         ),
         nn AS (
             SELECT a.id AS chunk_id, a.relative_path, a.start_line, a.end_line,
-                   AVG((a.embedding <=> b.embedding)::float8) AS mean_dist
+                   AVG((a.emb <=> b.emb)::float8) AS mean_dist
             FROM project_chunks a
             JOIN LATERAL (
-                SELECT b.id, b.embedding
+                SELECT b.id, b.emb
                 FROM project_chunks b
                 WHERE b.id <> a.id
-                ORDER BY a.embedding <=> b.embedding
+                ORDER BY a.emb <=> b.emb
                 LIMIT $2
             ) b ON true
             GROUP BY a.id, a.relative_path, a.start_line, a.end_line
         )
-        SELECT chunk_id, relative_path, start_line, end_line, mean_dist FROM nn",
-        )
-        .bind(project_id)
-        .bind(k)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| McpError::internal_error(format!("LOF query failed: {}", e), None))?;
+        SELECT chunk_id, relative_path, start_line, end_line, mean_dist FROM nn"
+    );
+    let rows: Vec<(i64, String, i32, i32, f64)> =
+        sqlx::query_as::<_, (i64, String, i32, i32, f64)>(&sql)
+            .bind(project_id)
+            .bind(k)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| McpError::internal_error(format!("LOF query failed: {}", e), None))?;
 
     let mut scored: Vec<(i64, String, i32, i32, f64)> = rows;
     let global_mean: f64 = if scored.is_empty() {

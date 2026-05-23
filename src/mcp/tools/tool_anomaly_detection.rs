@@ -48,6 +48,23 @@ pub async fn tool_anomaly_detection(
         McpError::internal_error(format!("Project not found: {}", params.project), None)
     })?;
 
+    // Phase 5 C7: resolve active embedding signature so the centroid
+    // aggregate runs against the right column with the right dim cast.
+    // Read-side dispatch via the closed-set helper; column + dim come
+    // from the EmbeddingSignature enum (no user input → safe to
+    // `format!` into the SQL). Plan reference:
+    // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
+    // Phase 5 C7.
+    let active = crate::embed::signature::read_active_signature(
+        ctx.db()
+            .pool()
+            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
+    )
+    .await
+    .map_err(|e| McpError::internal_error(format!("active embedding signature: {}", e), None))?;
+    let col = active.read_column();
+    let dim = active.dim();
+
     // Compute per-file average embedding distance from project centroid
     // Using SQL: avg cosine distance from average embedding
     #[derive(sqlx::FromRow)]
@@ -59,12 +76,12 @@ pub async fn tool_anomaly_detection(
         avg_distance: f64,
     }
 
-    let rows: Vec<AnomalyRow> = sqlx::query_as::<_, AnomalyRow>(
+    let sql = format!(
         "WITH project_centroid AS (
-            SELECT AVG(fc.embedding)::vector(384) as centroid
+            SELECT AVG(fc.{col})::vector({dim}) as centroid
             FROM file_chunks fc
             JOIN indexed_files f ON fc.file_id = f.id
-            WHERE f.project_id = $1
+            WHERE f.project_id = $1 AND fc.{col} IS NOT NULL
         ),
         file_distances AS (
             SELECT
@@ -72,25 +89,25 @@ pub async fn tool_anomaly_detection(
                 f.relative_path,
                 f.language,
                 f.line_count,
-                AVG(fc.embedding <=> pc.centroid) as avg_distance
+                AVG(fc.{col} <=> pc.centroid) as avg_distance
             FROM file_chunks fc
             JOIN indexed_files f ON fc.file_id = f.id
             CROSS JOIN project_centroid pc
-            WHERE f.project_id = $1
+            WHERE f.project_id = $1 AND fc.{col} IS NOT NULL
             GROUP BY f.id, f.relative_path, f.language, f.line_count
         )
         SELECT file_id, relative_path, language, line_count, avg_distance
         FROM file_distances
-        ORDER BY avg_distance DESC",
-    )
-    .bind(project_id)
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
-    .await
-    .map_err(|e| McpError::internal_error(format!("Anomaly query failed: {}", e), None))?;
+        ORDER BY avg_distance DESC"
+    );
+    let rows: Vec<AnomalyRow> =
+        sqlx::query_as::<_, AnomalyRow>(&sql)
+            .bind(project_id)
+            .fetch_all(ctx.db().pool().expect(
+                "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
+            ))
+            .await
+            .map_err(|e| McpError::internal_error(format!("Anomaly query failed: {}", e), None))?;
 
     if rows.is_empty() {
         return Ok(CallToolResult::success(vec![Content::text(
