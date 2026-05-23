@@ -96,12 +96,39 @@ pub async fn tool_semver_break_audit(
     let mut removed: Vec<(String, String, Option<String>)> = Vec::new();
     for (kind, name) in &historical {
         if !now_names.contains(name) {
-            // Possible rename: query the dictionary for terms within
-            // Damerau-Levenshtein 2 of `name`, keep the closest one.
-            let best = now_transducer
-                .query_with_distance(name, 2)
-                .min_by_key(|c| c.distance);
-            let likely_rename = best.map(|c| c.term);
+            // Phase 10 re-rank: collect every Damerau-Levenshtein
+            // candidate within distance 2, then pick the one with the
+            // lowest articulatory_edit_distance from the original name.
+            // `articulatory_edit_distance` (liblevenshtein phonetic
+            // framework) charges per-character substitution at the
+            // IPA articulatory-feature distance — `recieve`/`receive`
+            // (voicing-preserving) ranks above `reciver`/`receive`
+            // (consonant-cluster change). Plan reference:
+            // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
+            // Phase 10.
+            let candidates: Vec<liblevenshtein::transducer::Candidate> =
+                now_transducer.query_with_distance(name, 2).collect();
+            let likely_rename = match candidates.len() {
+                0 => None,
+                1 => Some(candidates.into_iter().next().expect("len 1").term),
+                _ => {
+                    // Pick the candidate with the smallest articulatory
+                    // distance to `name`. Tied articulatory distances
+                    // fall back to the smaller Damerau-Levenshtein.
+                    candidates
+                        .into_iter()
+                        .min_by(|a, b| {
+                            let aad =
+                                crate::fuzzy::phonetic::articulatory_distance_score(name, &a.term);
+                            let bad =
+                                crate::fuzzy::phonetic::articulatory_distance_score(name, &b.term);
+                            aad.partial_cmp(&bad)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                                .then_with(|| a.distance.cmp(&b.distance))
+                        })
+                        .map(|c| c.term)
+                }
+            };
             removed.push((kind.clone(), name.clone(), likely_rename));
         }
     }
