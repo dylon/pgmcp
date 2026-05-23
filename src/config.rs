@@ -1500,6 +1500,25 @@ pub struct CronConfig {
     #[serde(default = "default_subtree_mining_interval")]
     pub subtree_mining_interval_secs: u64,
 
+    /// Interval between BGE-M3 embedding-migration cron passes in
+    /// seconds (default: 0 = disabled). When non-zero, the daemon
+    /// drains `file_chunks` and `session_prompts` rows whose
+    /// `embedding_v2` column is NULL each tick. See
+    /// `docs/memory-server/02-phases.md` Phase 1 and Phase 5 of
+    /// `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`.
+    /// Setting > 0 ALONG with `[embeddings] model = "bge-m3"` enables
+    /// migration; cutover is manual via `pgmcp embed-cutover --force`.
+    #[serde(default = "default_embedding_migration_interval")]
+    pub embedding_migration_interval_secs: u64,
+
+    /// Batch size for the embedding-migration cron (default 64).
+    #[serde(default = "default_embedding_migration_batch_size")]
+    pub embedding_migration_batch_size: usize,
+
+    /// Cap on batches per cron tick (default 32).
+    #[serde(default = "default_embedding_migration_max_batches")]
+    pub embedding_migration_max_batches: usize,
+
     // -----------------------------------------------------------------------
     // OOM-fix additions (Phase 1)
     // -----------------------------------------------------------------------
@@ -1642,6 +1661,9 @@ impl Default for CronConfig {
             ngram_lm_train_interval_secs: default_ngram_lm_train_interval(),
             topic_dendrogram_interval_secs: default_topic_dendrogram_interval(),
             subtree_mining_interval_secs: default_subtree_mining_interval(),
+            embedding_migration_interval_secs: default_embedding_migration_interval(),
+            embedding_migration_batch_size: default_embedding_migration_batch_size(),
+            embedding_migration_max_batches: default_embedding_migration_max_batches(),
             topic_max_mem_fraction: default_topic_max_mem_fraction(),
             topic_scratch_dir: None,
             ready_delay_git_secs: default_ready_delay_git_secs(),
@@ -1785,6 +1807,15 @@ fn default_topic_dendrogram_interval() -> u64 {
 fn default_subtree_mining_interval() -> u64 {
     43200
 } // 12 h
+fn default_embedding_migration_interval() -> u64 {
+    0
+} // disabled by default; operator enables via config when ready to migrate
+fn default_embedding_migration_batch_size() -> usize {
+    64
+}
+fn default_embedding_migration_max_batches() -> usize {
+    32
+}
 
 impl Config {
     /// Load configuration from the default path or the specified path.

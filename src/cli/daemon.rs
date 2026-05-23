@@ -325,6 +325,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         Arc::clone(&stats_tracker),
         &config_snapshot.cron,
         &config_snapshot.fuzzy,
+        &config_snapshot.embeddings,
         tokio::runtime::Handle::current(),
         embed_sender.clone(),
         lifecycle.clone(),

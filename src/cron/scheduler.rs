@@ -606,6 +606,7 @@ pub fn schedule_maintenance_jobs(
     stats: Arc<StatsTracker>,
     config: &CronConfig,
     fuzzy_config: &crate::config::FuzzyConfig,
+    embeddings_config: &crate::config::EmbeddingsConfig,
     rt: tokio::runtime::Handle,
     embed_tx: crossbeam_channel::Sender<EmbedIndexRequest>,
     lifecycle: DaemonLifecycle,
@@ -1285,6 +1286,78 @@ pub fn schedule_maintenance_jobs(
             true
         },
     );
+
+    // BGE-M3 embedding migration (off when interval = 0). The cron
+    // drains `file_chunks` + `session_prompts` rows whose
+    // `embedding_v2` (1024d) column is NULL, embeds the source text
+    // with BGE-M3, and writes back the new column plus
+    // `embedding_signature = 'bge-m3-v1'`. Cutover (flipping
+    // `pgmcp_metadata.active_embedding_signature`) remains manual via
+    // `pgmcp embed-cutover --force`.
+    if config.embedding_migration_interval_secs > 0 {
+        let db_clone_mig = Arc::clone(&db);
+        let rt_clone_mig = rt.clone();
+        let stats_for_mig = Arc::clone(&stats);
+        let mig_interval = config.embedding_migration_interval_secs;
+        let mig_cfg = crate::cron::embedding_migration::EmbeddingMigrationConfig::new(
+            embeddings_config.clone(),
+            config.embedding_migration_batch_size,
+            config.embedding_migration_max_batches,
+        );
+        let cron_pool_mig = Arc::clone(&cron_pool);
+        let lc_mig = lifecycle.clone();
+        let lock_mig = Arc::clone(&heavy_cron_lock);
+        let ready_mig: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+        let mig_ready_delay = Duration::from_secs(config.ready_delay_topic_secs);
+        handle.schedule_recurring(
+            staggered_initial_delay_ms("embedding-migration", mig_interval * 1000),
+            mig_interval * 1000,
+            "embedding-migration",
+            move || {
+                if lc_mig.is_stopping() {
+                    return false;
+                }
+                let lc = lc_mig.clone();
+                let lock = Arc::clone(&lock_mig);
+                let ready = Arc::clone(&ready_mig);
+                let stats = Arc::clone(&stats_for_mig);
+                let db = db_clone_mig.clone();
+                let rt = rt_clone_mig.clone();
+                let mig_cfg = mig_cfg.clone();
+                cron_pool_mig.submit(
+                    move || {
+                        let _guard = heavy_gate_or_skip!(
+                            job = "embedding-migration",
+                            lc = lc,
+                            ready = ready,
+                            cooldown = mig_ready_delay,
+                            lock = lock,
+                            stats = stats,
+                        );
+                        let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
+                        if let Some(pool) = db.pool().cloned() {
+                            let stats_ref = Arc::clone(&stats);
+                            rt.block_on(async move {
+                                crate::cron::embedding_migration::run_or_log(
+                                    Arc::new(pool),
+                                    stats_ref,
+                                    mig_cfg,
+                                )
+                                .await;
+                            });
+                        } else {
+                            tracing::warn!(
+                                job = "embedding-migration",
+                                "skipping run: DbClient has no pool"
+                            );
+                        }
+                    },
+                    crate::work_pool::pool::Priority::Low,
+                );
+                true
+            },
+        );
+    }
 
     // Topic clustering (global full-chunk — always produces scope = "global")
     let db_clone_topic = db; // final move // final move
