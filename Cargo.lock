@@ -2970,6 +2970,7 @@ dependencies = [
  "tree-sitter-java",
  "tree-sitter-javascript",
  "tree-sitter-lean4",
+ "tree-sitter-metta",
  "tree-sitter-python",
  "tree-sitter-scala",
  "tree-sitter-tlaplus",
@@ -4992,6 +4993,14 @@ name = "tree-sitter-lean4"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e4754e1403ae141b9e66c49c0374f09f87122f6b03c41c624c84ab890966d8a"
+dependencies = [
+ "cc",
+ "tree-sitter",
+]
+
+[[package]]
+name = "tree-sitter-metta"
+version = "0.1.0"
 dependencies = [
  "cc",
  "tree-sitter",

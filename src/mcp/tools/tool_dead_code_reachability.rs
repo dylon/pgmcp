@@ -75,13 +75,32 @@ pub async fn tool_dead_code_reachability(
     .await
     .map_err(|e| McpError::internal_error(format!("Roots query failed: {}", e), None))?;
 
-    // Edges: source_symbol_id → target_symbol_id (call edges).
-    let edges: Vec<(Option<i64>, Option<i64>)> = sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
-        "SELECT sr.source_symbol_id, sr.target_symbol_id
-         FROM symbol_references sr
-         JOIN indexed_files f ON sr.source_file_id = f.id
-         WHERE f.project_id = $1 AND sr.ref_kind = 'call'",
-    )
+    // Edges: source_symbol_id → target_symbol_id, restricted to
+    // high-confidence resolutions (exact_in_file / exact_via_import).
+    // Pattern C (resolved-edge consumers) per the shadow-ASR plan: the
+    // BFS uses target_path-resolved edges so cross-file dispatch is
+    // modeled correctly. Bare-name-resolved edges are admitted only
+    // when explicitly opted in via params.include_bare_name (default
+    // false) — keeps the dead-code report's false-positive rate low.
+    let include_bare_name = params.include_bare_name.unwrap_or(false);
+    let edges: Vec<(Option<i64>, Option<i64>)> = if include_bare_name {
+        sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+            "SELECT sr.source_symbol_id, sr.target_symbol_id
+             FROM symbol_references sr
+             JOIN indexed_files f ON sr.source_file_id = f.id
+             WHERE f.project_id = $1 AND sr.ref_kind = 'call'
+               AND sr.target_symbol_id IS NOT NULL",
+        )
+    } else {
+        sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
+            "SELECT sr.source_symbol_id, sr.target_symbol_id
+             FROM symbol_references sr
+             JOIN indexed_files f ON sr.source_file_id = f.id
+             WHERE f.project_id = $1 AND sr.ref_kind = 'call'
+               AND sr.target_symbol_id IS NOT NULL
+               AND sr.resolution_kind IN ('exact_in_file', 'exact_via_import')",
+        )
+    }
     .bind(project_id)
     .fetch_all(pool)
     .await
@@ -149,7 +168,35 @@ pub async fn tool_dead_code_reachability(
             break;
         }
     }
+    // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown
+    // for the project. Universal enrichment — every tool benefits from
+    // surfacing the effect distribution alongside its primary output.
+    // Gracefully degrades to empty when the project lookup or
+    // shadow-ASR data isn't populated.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let project_id_opt: Option<i32> =
+            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
+                .bind(&params.project)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+        match project_id_opt {
+            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+                .collect(),
+            None => Vec::new(),
+        }
+    })
+    .await;
+
     json_result(&json!({
+        "effect_breakdown": effect_breakdown,
         "project": params.project,
         "roots": roots.len(),
         "reached": reached.len(),

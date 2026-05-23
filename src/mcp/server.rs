@@ -587,6 +587,24 @@ pub struct SemanticSearchParams {
                        all hits are returned, including the same code on different branches."
     )]
     pub dedupe_worktrees: Option<bool>,
+    // Shadow-ASR filter params (Pattern D): restrict to chunks whose
+    // enclosing symbol carries the given return_type_tags / effects /
+    // scope_kind. Optional; omitting them preserves legacy behavior.
+    #[schemars(
+        description = "Restrict hits to chunks whose enclosing symbol's return_type_tags contains \
+                       ALL of these tags (subset semantics). Optional."
+    )]
+    pub return_type_tags: Option<Vec<String>>,
+    #[schemars(
+        description = "Restrict hits to chunks whose enclosing symbol carries at least one of \
+                       these effects. Optional."
+    )]
+    pub effects: Option<Vec<String>>,
+    #[schemars(
+        description = "Restrict hits to chunks whose enclosing symbol kind matches (e.g. \
+                       \"function\", \"trait\", \"class\"). Optional."
+    )]
+    pub scope_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -602,6 +620,21 @@ pub struct TextSearchParams {
                        Default false."
     )]
     pub dedupe_worktrees: Option<bool>,
+    #[schemars(
+        description = "Shadow-ASR filter: restrict hits to chunks whose enclosing symbol's \
+                       return_type_tags contains ALL of these tags. Optional."
+    )]
+    pub return_type_tags: Option<Vec<String>>,
+    #[schemars(
+        description = "Shadow-ASR filter: restrict hits to chunks whose enclosing symbol carries \
+                       at least one of these effects. Optional."
+    )]
+    pub effects: Option<Vec<String>>,
+    #[schemars(
+        description = "Shadow-ASR filter: restrict hits to chunks whose enclosing symbol kind \
+                       matches. Optional."
+    )]
+    pub scope_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -635,6 +668,21 @@ pub struct GrepParams {
     pub after_context: Option<i32>,
     #[schemars(description = "If true, ignore case (`~*` regex op). Default false.")]
     pub case_insensitive: Option<bool>,
+    #[schemars(
+        description = "Shadow-ASR filter: restrict hits to chunks whose enclosing symbol's \
+                       return_type_tags contains ALL of these tags. Optional."
+    )]
+    pub return_type_tags: Option<Vec<String>>,
+    #[schemars(
+        description = "Shadow-ASR filter: restrict hits to chunks whose enclosing symbol carries \
+                       at least one of these effects. Optional."
+    )]
+    pub effects: Option<Vec<String>>,
+    #[schemars(
+        description = "Shadow-ASR filter: restrict hits to chunks whose enclosing symbol kind \
+                       matches. Optional."
+    )]
+    pub scope_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -647,6 +695,13 @@ pub struct SearchCommitsParams {
     pub limit: Option<i32>,
     #[schemars(description = "Filter by project name")]
     pub project: Option<String>,
+    #[schemars(
+        description = "Shadow-ASR filter: restrict to commits that touched files containing \
+                       at least one symbol carrying any of these effects (e.g. ['unsafe', \
+                       'crypto'] surfaces commits that introduced unsafe-or-crypto code). \
+                       Optional."
+    )]
+    pub touched_effects: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2063,6 +2118,14 @@ pub struct DeadCodeReachabilityParams {
     pub include_tests: Option<bool>,
     #[schemars(description = "Max dead candidates (default: 50)")]
     pub limit: Option<i32>,
+    #[schemars(
+        description = "Include bare-name-resolved call edges (resolution_kind = 'bare_name_in_project') \
+                       in the reachability walk. Default false: only high-confidence \
+                       (exact_in_file / exact_via_import) edges are used, which produces a more \
+                       precise dead-code report. Set true to inflate the reachable set with \
+                       ambiguous-name matches (reduces dead candidates but accepts more noise)."
+    )]
+    pub include_bare_name: Option<bool>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FeatureEnvyParams {
@@ -2813,6 +2876,77 @@ pub struct SearchMandatesParams {
     )]
     pub project_id: Option<i32>,
     #[schemars(description = "Max rows (1..=200, default 20).")]
+    pub limit: Option<i32>,
+}
+
+// ============================================================================
+// Phase D2b — new tool params (6 new MCP tools)
+// ============================================================================
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CrossLanguageApiEquivalentsParams {
+    #[schemars(description = "Minimum similarity (0.0..=1.0, default 0.7).")]
+    pub min_similarity: Option<f32>,
+    #[schemars(description = "Maximum number of pairs to return (default 50).")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TypeShapeSearchParams {
+    #[schemars(description = "Project name.")]
+    pub project: String,
+    #[schemars(description = "Required tags in return_type_tags (subset semantics).")]
+    pub return_type_tags: Option<Vec<String>>,
+    #[schemars(description = "Required tags in any parameter's type_tags (subset semantics).")]
+    pub parameter_type_tags: Option<Vec<String>>,
+    #[schemars(description = "Required effects (any of).")]
+    pub effects: Option<Vec<String>>,
+    #[schemars(description = "Maximum matches to return (default 50).")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FindCallersBySignatureParams {
+    #[schemars(description = "Project name.")]
+    pub project: String,
+    #[schemars(description = "Resolved target path (e.g. crate::auth::validate).")]
+    pub target_path: String,
+    #[schemars(description = "Filter callers by parameter type-tag intersection.")]
+    pub parameter_type_tags: Option<Vec<String>>,
+    #[schemars(description = "Restrict the type-tag filter to a specific parameter position.")]
+    pub parameter_position: Option<i32>,
+    #[schemars(description = "Filter callers by their own effects (any of).")]
+    pub caller_effects: Option<Vec<String>>,
+    #[schemars(description = "Maximum callers to return (default 50).")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EffectPropagationParams {
+    #[schemars(description = "Project name.")]
+    pub project: String,
+    #[schemars(description = "Forward mode: BFS reachability from this seed symbol_id.")]
+    pub seed_symbol_id: Option<i64>,
+    #[schemars(description = "Reverse mode: find symbols that reach any of these effects.")]
+    pub target_effects: Vec<String>,
+    #[schemars(description = "Maximum BFS depth (1..=32, default 8).")]
+    pub max_depth: Option<u32>,
+    #[schemars(description = "Maximum results to return (default 50).")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TypeTagDictionaryParams {
+    // No filter parameters — this tool is a self-documenting introspection
+    // surface for the vocabulary catalogs. The empty struct keeps the
+    // JSON-schema shape uniform across tool params.
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SignatureLintParams {
+    #[schemars(description = "Project name.")]
+    pub project: String,
+    #[schemars(description = "Maximum results per finding category (default 50).")]
     pub limit: Option<i32>,
 }
 
@@ -6644,6 +6778,149 @@ Aggregates dependency analysis + architecture quality + design smells + test/doc
                 self.ctx(),
                 params,
             ),
+        )
+        .await
+    }
+
+    // ========================================================================
+    // Phase D2b — new shadow-ASR-native tools (6)
+    // ========================================================================
+
+    #[tool(
+        description = "Find functions in different languages with matching signature shape. \
+USE WHEN: validating cross-language ports (MeTTa→Rholang→Rust), auditing whether a compiler \
+preserved semantics, or harmonizing APIs across language SDKs. \
+Reads from the materialized `cross_language_signature_clones` table — call `trigger_cron` \
+with `cross_language_signatures` to refresh."
+    )]
+    async fn cross_language_api_equivalents(
+        &self,
+        Parameters(params): Parameters<CrossLanguageApiEquivalentsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "cross_language_api_equivalents",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_cross_language_api_equivalents::tool_cross_language_api_equivalents(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Search for functions by structural type shape: return type tags, \
+parameter type tags, effects. USE WHEN: 'find async functions returning Result<T,_>', \
+'all handlers taking Request<_>', 'database-touching functions in module foo'. \
+Backed by GIN-indexed `return_type_tags` and `symbol_parameters.type_tags`."
+    )]
+    async fn type_shape_search(
+        &self,
+        Parameters(params): Parameters<TypeShapeSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "type_shape_search",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_type_shape_search::tool_type_shape_search(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Find call sites of a target path, filtered by the caller's signature \
+shape (e.g. 'callers whose parameter N has type-tag Mutex'). USE WHEN: scoping \
+a refactor that touches all callers carrying a specific type, or locating \
+callers in a specific effect-set context."
+    )]
+    async fn find_callers_by_signature(
+        &self,
+        Parameters(params): Parameters<FindCallersBySignatureParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "find_callers_by_signature",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_find_callers_by_signature::tool_find_callers_by_signature(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Forward or reverse effect closure along resolved call edges. \
+Forward (seed_symbol_id): which effects are reached from this symbol? \
+Reverse (target_effects): which symbols reach any of these effects? \
+USE WHEN: tracing 'what touches network?', 'who could reach gpu_kernel?', \
+or 'what does this entry point ultimately do?'."
+    )]
+    async fn effect_propagation(
+        &self,
+        Parameters(params): Parameters<EffectPropagationParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "effect_propagation",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_effect_propagation::tool_effect_propagation(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List the type-tag and effect vocabularies with per-tag usage counts \
+and descriptions. USE WHEN: orienting to the tag schema before formulating \
+queries, or auditing which tags actually appear in this project's code."
+    )]
+    async fn type_tag_dictionary(
+        &self,
+        Parameters(params): Parameters<TypeTagDictionaryParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "type_tag_dictionary",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_type_tag_dictionary::tool_type_tag_dictionary(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Lint same-shape APIs for signature smells: long parameter lists, \
+primitive obsession, boolean-flag explosion, inconsistent parameter naming across \
+functions sharing the same shape. Returns categorized findings; consumers can act \
+on each category independently."
+    )]
+    async fn signature_lint(
+        &self,
+        Parameters(params): Parameters<SignatureLintParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "signature_lint",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_signature_lint::tool_signature_lint(self.ctx(), params),
         )
         .await
     }

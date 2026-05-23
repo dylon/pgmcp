@@ -18,6 +18,7 @@ use serde_json::json;
 use crate::context::SystemContext;
 use crate::mcp::server::DeadlockCandidatesParams;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
+use crate::parsing::type_tags::vocabulary::TAG_MUTEX;
 
 pub async fn tool_deadlock_candidates(
     ctx: &SystemContext,
@@ -101,10 +102,55 @@ pub async fn tool_deadlock_candidates(
                 .collect()
         })
         .collect();
+    // Shadow-ASR channel: symbols whose parameters carry the mutex type tag.
+    let mutex_typed_symbols: Vec<serde_json::Value> =
+        sqlx::query_as::<_, (i64, i64, String, Option<String>)>(
+            "SELECT DISTINCT fs.id, fs.file_id, fs.name, fs.scope_path
+             FROM file_symbols fs
+             JOIN indexed_files f ON f.id = fs.file_id
+             JOIN symbol_parameters p ON p.symbol_id = fs.id
+             WHERE f.project_id = $1
+               AND p.type_tags @> ARRAY[$2]::text[]
+             ORDER BY fs.file_id",
+        )
+        .bind(project_id)
+        .bind(TAG_MUTEX)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(symbol_id, file_id, name, scope_path)| {
+            serde_json::json!({
+                "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
+            })
+        })
+        .collect();
+    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT se.effect, COUNT(*)::int8
+             FROM symbol_effects se
+             GROUP BY se.effect
+             ORDER BY se.effect",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
+    })
+    .await;
+
     json_result(&json!({
+        "effect_breakdown": effect_breakdown,
         "project": params.project,
         "cycles": cycles,
         "edges": order_pairs.iter().map(|((a, b), w)| json!({"from": a, "to": b, "weight": w})).collect::<Vec<_>>(),
+        "mutex_typed_symbols": mutex_typed_symbols,
         "guidance": "Cycles in the lock-order graph indicate that two code paths acquire the same locks in reverse order — a textbook Havender 1968 deadlock recipe."
     }))
 }

@@ -1,5 +1,17 @@
 //! Coq / Rocq language backend.
 //!
+//! Shadow-ASR contract: Coq's regex-only extraction yields names + kinds
+//! but no structured parameter types or return-type expressions. Symbols
+//! emitted from this backend leave the shadow-ASR fields (`parameters`,
+//! `return_type`, `generic_params`, `effects`, `type_tags`) at their
+//! `Default::default()` values — empty lists / `None`. This is the
+//! intentional design contract per the plan
+//! (`~/.claude/plans/would-translating-the-asts-cosmic-quill.md` § Phase
+//! C — "Coq/TLA+/Lean cannot produce meaningful parameter type tags
+//! without real inference; they populate type_raw and leave type_tags =
+//! '{}'"). Downstream tools JOIN the shadow-ASR tables with LEFT JOIN
+//! + COALESCE so Coq rows degrade gracefully into the empty-shape case.
+//!
 //! There is no published `tree-sitter-coq` crate on crates.io as of
 //! 2026-05-20, so this backend extracts symbols, imports, and references
 //! via regex patterns instead of an AST. The patterns are tight enough for
@@ -152,6 +164,7 @@ impl LanguageBackend for CoqBackend {
                 parent_id: None,
                 visibility: Some("public".into()),
                 signature: None,
+                ..Default::default()
             });
         };
 

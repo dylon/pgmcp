@@ -10,8 +10,10 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::CryptoMisuseParams;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::mcp::tools::sota_regex_scan::scan_files_for_pattern;
+use crate::parsing::type_tags::vocabulary::{EFFECT_CRYPTO, EFFECT_CRYPTO_WEAK};
 
 pub async fn tool_crypto_misuse(
     ctx: &SystemContext,
@@ -64,9 +66,25 @@ pub async fn tool_crypto_misuse(
             break;
         }
     }
+    // Shadow-ASR channel: symbols carrying crypto-related effects.
+    let effect_symbols = symbols_with_any_effect(
+        pool,
+        project_id,
+        &[EFFECT_CRYPTO.to_string(), EFFECT_CRYPTO_WEAK.to_string()],
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(symbol_id, file_id, name, scope_path)| {
+        serde_json::json!({
+            "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
+        })
+    })
+    .collect::<Vec<_>>();
     json_result(&json!({
         "project": params.project,
         "findings": findings,
+        "effect_symbols": effect_symbols,
         "guidance": "CryptoLint CCS 2013 + CryptoGuard ICSE 2019 surface common crypto-misuse patterns: ECB mode, MD5/SHA-1 in auth, non-secure RNG for tokens, static IVs, hardcoded keys."
     }))
 }

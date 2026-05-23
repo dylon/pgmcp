@@ -28,6 +28,7 @@ pub mod function_metrics;
 pub mod java;
 pub mod javascript;
 pub mod lean;
+pub mod metta;
 pub mod python;
 pub mod registry;
 pub mod rholang;
@@ -35,6 +36,7 @@ pub mod rust;
 pub mod scala;
 pub mod symbols;
 pub mod tlaplus;
+pub mod type_tags;
 
 // Public surface for the trait + future backends. The `unused_imports`
 // allow is needed because backends land incrementally — until the first
@@ -68,6 +70,7 @@ mod tests {
         assert!(LanguageRegistry::for_language("c").is_some());
         assert!(LanguageRegistry::for_language("cpp").is_some());
         assert!(LanguageRegistry::for_language("rholang").is_some());
+        assert!(LanguageRegistry::for_language("metta").is_some());
         assert!(LanguageRegistry::for_language("clojure").is_some());
         assert!(LanguageRegistry::for_language("clojurescript").is_some());
         // Formal-verification backends.

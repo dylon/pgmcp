@@ -10,8 +10,10 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::UnsafeDeserializationParams;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::mcp::tools::sota_regex_scan::scan_files_for_pattern;
+use crate::parsing::type_tags::vocabulary::EFFECT_UNSAFE;
 
 pub async fn tool_unsafe_deserialization(
     ctx: &SystemContext,
@@ -33,9 +35,23 @@ pub async fn tool_unsafe_deserialization(
         .into_iter()
         .map(|h| json!({"file": h.relative_path, "language": h.language, "line": h.line, "snippet": h.snippet}))
         .collect();
+    // Shadow-ASR channel: symbols flagged with the `unsafe` effect.
+    // Deserialization frameworks that the extractor surfaces as unsafe
+    // are direct candidates. This complements the regex below.
+    let effect_symbols = symbols_with_effect(pool, project_id, EFFECT_UNSAFE)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(symbol_id, file_id, name, scope_path)| {
+            serde_json::json!({
+                "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
+            })
+        })
+        .collect::<Vec<_>>();
     json_result(&json!({
         "project": params.project,
         "matches": rows,
+        "effect_symbols": effect_symbols,
         "guidance": "Unsafe deserialization (pickle/yaml-load/ObjectInputStream/marshal) executes arbitrary code from attacker-controlled bytes. Replace with safe parsers (json, yaml.safe_load, typed Serde)."
     }))
 }

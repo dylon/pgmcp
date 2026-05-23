@@ -41,7 +41,10 @@ language = "rust"
 extension = "py"
 language = "python"
 
-# ... 17 file types configured by default
+# ... 50+ file types configured by default (rust, python, typescript, javascript,
+# java, scala, c, cpp, clojure, clojurescript, rholang, metta, coq, tlaplus, lean,
+# sage, prolog, shell, jsonl, markdown, toml, json, yaml, and document/formal
+# verification languages — see src/config.rs default_file_types())
 
 [database]
 host = "localhost"

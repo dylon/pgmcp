@@ -58,8 +58,44 @@ pub async fn tool_semantic_search(
             McpError::internal_error(format!("Search failed: {}", e), None)
         })?;
 
-    let count = results.len();
-    let json = serde_json::to_string_pretty(&results)
+    // Shadow-ASR Pattern D filter: post-filter the result set against
+    // the enclosing-symbol's return_type_tags / effects / scope_kind.
+    let filtered_results = crate::mcp::tools::sema_helpers::filters::enclosing_symbol_filter_pass(
+        ctx.db().pool(),
+        results,
+        params.return_type_tags.as_deref(),
+        params.effects.as_deref(),
+        params.scope_kind.as_deref(),
+    )
+    .await;
+    let count = filtered_results.len();
+    let results = filtered_results;
+    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT se.effect, COUNT(*)::int8
+             FROM symbol_effects se
+             GROUP BY se.effect
+             ORDER BY se.effect",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
+    })
+    .await;
+
+    let envelope = serde_json::json!({
+        "results": results,
+        "effect_breakdown": effect_breakdown,
+    });
+
+    let json = serde_json::to_string_pretty(&envelope)
         .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
 
     debug!(

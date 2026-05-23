@@ -1,4 +1,10 @@
 //! `tool_unsafe_clusters` — Rust unsafe-block density (SOTA Phase 5.2, Astrauskas OOPSLA 2020).
+//!
+//! Returns two channels for cross-checking:
+//! - `regex_scan`: legacy regex hit counts per file (Rust only). Stable
+//!   even when the symbol-extraction cron hasn't run.
+//! - `effect_symbols`: shadow-ASR symbols carrying the `unsafe` effect
+//!   (Phase D2b). Populated by `sema_helpers::effects::symbols_with_effect`.
 
 #![allow(unused_imports)]
 
@@ -11,8 +17,10 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::UnsafeClustersParams;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::mcp::tools::sota_regex_scan::scan_files_for_pattern;
+use crate::parsing::type_tags::vocabulary::EFFECT_UNSAFE;
 
 pub async fn tool_unsafe_clusters(
     ctx: &SystemContext,
@@ -43,10 +51,29 @@ pub async fn tool_unsafe_clusters(
         .iter()
         .map(|(p, c)| json!({"file": p, "unsafe_blocks": c}))
         .collect();
+
+    // Shadow-ASR channel: symbols with the `unsafe` effect, populated by
+    // the Rust backend's `effects_for_sig`. Surfaces a precise list keyed
+    // by symbol rather than by line-position.
+    let effect_symbols = symbols_with_effect(pool, project_id, EFFECT_UNSAFE)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(symbol_id, file_id, name, scope_path)| {
+            json!({
+                "symbol_id": symbol_id,
+                "file_id": file_id,
+                "name": name,
+                "scope_path": scope_path,
+            })
+        })
+        .collect::<Vec<_>>();
+
     json_result(&json!({
         "project": params.project,
         "files": files,
         "total_unsafe_blocks": hits.len(),
-        "guidance": "Files with dense unsafe blocks merit review priority. Astrauskas et al. OOPSLA 2020 found that unsafe density is concentrated in a small fraction of crates — outliers are review targets."
+        "effect_symbols": effect_symbols,
+        "guidance": "Files with dense unsafe blocks merit review priority. Astrauskas et al. OOPSLA 2020 found that unsafe density is concentrated in a small fraction of crates — outliers are review targets. The `effect_symbols` channel lists every symbol whose extractor flagged it as `unsafe` (more precise than the regex-derived file-level counts)."
     }))
 }

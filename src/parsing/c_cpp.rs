@@ -10,6 +10,9 @@ use std::sync::OnceLock;
 
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
+#[path = "c_cpp/type_mapper.rs"]
+mod type_mapper;
+
 use crate::parsing::backend::LanguageBackend;
 use crate::parsing::symbols::{Import, Symbol, SymbolKind, SymbolRefKind, SymbolReference};
 
@@ -252,6 +255,24 @@ impl LanguageBackend for CCppBackend {
                     continue;
                 }
                 let signature = first_line(content, node);
+                // Shadow-ASR: only function-shaped captures populate the new
+                // fields. The function_declarator carries the parameter list
+                // via `declarator: (function_declarator parameters:)`.
+                let (parameters, return_type, generic_params, effects) =
+                    if matches!(cap_name, "sym.func" | "sym.proto") {
+                        let decl = node.child_by_field_name("declarator");
+                        let params = decl
+                            .and_then(|d| d.child_by_field_name("parameters"))
+                            .map(|p| type_mapper::parameters_from_node(p, content))
+                            .unwrap_or_default();
+                        let return_type =
+                            Some(type_mapper::return_type_from_function(node, content));
+                        let generics = type_mapper::generics_for_function(node, content);
+                        let effects = type_mapper::effects_for_function(node, content);
+                        (params, return_type, generics, effects)
+                    } else {
+                        (Vec::new(), None, Vec::new(), Vec::new())
+                    };
                 out.push(Symbol {
                     file_id: 0,
                     kind,
@@ -261,6 +282,12 @@ impl LanguageBackend for CCppBackend {
                     visibility: Some("public".into()),
                     signature: Some(signature),
                     name,
+                    parameters,
+                    return_type,
+                    generic_params,
+                    effects,
+                    scope_depth: Some(0),
+                    ..Default::default()
                 });
             }
         }

@@ -14,6 +14,9 @@ use std::sync::OnceLock;
 
 use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
+#[path = "javascript/type_mapper.rs"]
+mod type_mapper;
+
 use crate::parsing::backend::LanguageBackend;
 use crate::parsing::symbols::{Import, Symbol, SymbolKind, SymbolRefKind, SymbolReference};
 
@@ -288,6 +291,7 @@ impl LanguageBackend for JsTsBackend {
                                 visibility,
                                 signature: Some(name.clone()),
                                 name,
+                                ..Default::default()
                             });
                         }
                     }
@@ -303,6 +307,7 @@ impl LanguageBackend for JsTsBackend {
                                 visibility: Some("public".into()),
                                 signature: Some(name.clone()),
                                 name,
+                                ..Default::default()
                             });
                         }
                     }
@@ -437,6 +442,33 @@ fn push_named(
     out: &mut Vec<Symbol>,
 ) {
     let name = node_text(name_node, src).to_string();
+    // Shadow-ASR: when this is a function-shaped node, pull parameters /
+    // return type / generics / effects via the type_mapper. For
+    // class/interface/enum/alias nodes the function-only fields stay empty.
+    let (parameters, return_type, generic_params, effects) = if matches!(
+        node.kind(),
+        "function_declaration"
+            | "function_expression"
+            | "arrow_function"
+            | "generator_function_declaration"
+            | "method_definition"
+    ) {
+        let params = node
+            .child_by_field_name("parameters")
+            .map(|p| type_mapper::parameters_from_node(p, src))
+            .unwrap_or_default();
+        let rt = node.child_by_field_name("return_type");
+        let return_type = if rt.is_some() {
+            Some(type_mapper::return_type_from_node(rt, src))
+        } else {
+            None
+        };
+        let generics = type_mapper::generics_for_function(node, src);
+        let effects = type_mapper::effects_for_function(node, src);
+        (params, return_type, generics, effects)
+    } else {
+        (Vec::new(), None, Vec::new(), Vec::new())
+    };
     out.push(Symbol {
         file_id: 0,
         kind,
@@ -446,6 +478,12 @@ fn push_named(
         visibility: Some("public".into()),
         signature: Some(name.clone()),
         name,
+        parameters,
+        return_type,
+        generic_params,
+        effects,
+        scope_depth: Some(0),
+        ..Default::default()
     });
 }
 

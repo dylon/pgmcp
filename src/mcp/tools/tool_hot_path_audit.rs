@@ -19,7 +19,11 @@ use tracing::{debug, info};
 use crate::context::SystemContext;
 use crate::db::queries;
 use crate::mcp::server::*;
-use crate::mcp::tools::fix_helpers::pool_or_err;
+use crate::mcp::tools::fix_helpers::{lookup_project_id, pool_or_err};
+use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect;
+use crate::parsing::type_tags::vocabulary::{
+    EFFECT_BLOCKING_IO, EFFECT_DATABASE, EFFECT_FILESYSTEM, EFFECT_IO, EFFECT_NETWORK,
+};
 
 pub async fn tool_hot_path_audit(
     ctx: &SystemContext,
@@ -127,6 +131,31 @@ pub async fn tool_hot_path_audit(
         }));
     }
 
+    // Shadow-ASR channel: symbols on (or near) the hot path that carry
+    // effects worth flagging — I/O, network, database, blocking_io.
+    let hot_path_effect_symbols = match lookup_project_id(ctx, &params.project).await {
+        Ok(Some(project_id)) => symbols_with_any_effect(
+            pool,
+            project_id,
+            &[
+                EFFECT_IO.to_string(),
+                EFFECT_NETWORK.to_string(),
+                EFFECT_FILESYSTEM.to_string(),
+                EFFECT_DATABASE.to_string(),
+                EFFECT_BLOCKING_IO.to_string(),
+            ],
+        )
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(symbol_id, file_id, name, scope_path)| {
+            serde_json::json!({
+                "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
+            })
+        })
+        .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    };
     let result = json!({
         "hot_paths": hot_paths,
         "summary": {
@@ -139,6 +168,7 @@ pub async fn tool_hot_path_audit(
             "percentile_threshold": percentile_threshold,
             "limit": limit,
         },
+        "hot_path_effect_symbols": hot_path_effect_symbols,
         "guidance": format!(
             "Files in the top {:.0}% by all of (pagerank, churn, fix_ratio). \
              P0 (composite >= 2.85) = invest immediately; P1 (>= 2.70) = next sprint; \

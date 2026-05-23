@@ -12,7 +12,9 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::DeprecatedButUsedParams;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
+use crate::parsing::type_tags::vocabulary::EFFECT_DEPRECATED;
 
 pub async fn tool_deprecated_but_used(
     ctx: &SystemContext,
@@ -49,6 +51,18 @@ pub async fn tool_deprecated_but_used(
                 deprecated_symbols.insert(n.as_str().to_string());
             }
         }
+    }
+
+    // Shadow-ASR channel: symbols carrying the `deprecated` effect from
+    // their extractor (`#[deprecated]` in Rust, `@Deprecated` in Java,
+    // `@deprecated` in Scala, `#[deprecated] JSDoc` in TS, etc.). Adds
+    // every name surfaced by the extractor to the candidate set so we
+    // catch annotations the regex missed.
+    let effect_deprecated = symbols_with_effect(pool, project_id, EFFECT_DEPRECATED)
+        .await
+        .unwrap_or_default();
+    for (_, _, name, _) in &effect_deprecated {
+        deprecated_symbols.insert(name.clone());
     }
     if deprecated_symbols.is_empty() {
         return json_result(&json!({

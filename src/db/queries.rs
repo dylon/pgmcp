@@ -6998,25 +6998,93 @@ pub async fn bulk_insert_file_symbols(
     let visibilities: Vec<Option<String>> = symbols.iter().map(|s| s.visibility.clone()).collect();
     let signatures: Vec<Option<String>> = symbols.iter().map(|s| s.signature.clone()).collect();
 
+    // Shadow-ASR fields. Defaulted to None / empty arrays so backends that
+    // haven't been upgraded yet still produce well-typed inputs.
+    let return_type_raws: Vec<Option<String>> = symbols
+        .iter()
+        .map(|s| s.return_type.as_ref().and_then(|rt| rt.type_raw.clone()))
+        .collect();
+    // Per-symbol return_type_tags as JSON arrays. Postgres `text[][]` would
+    // require ragged-array support that sqlx doesn't ship, so we wrap each
+    // symbol's tag list in a JSONB scalar and expand it server-side.
+    let return_type_tags_json: Vec<serde_json::Value> = symbols
+        .iter()
+        .map(|s| {
+            let tags = s
+                .return_type
+                .as_ref()
+                .map(|rt| rt.type_tags.clone())
+                .unwrap_or_default();
+            serde_json::Value::Array(tags.into_iter().map(serde_json::Value::String).collect())
+        })
+        .collect();
+    let return_type_shapes: Vec<Option<serde_json::Value>> = symbols
+        .iter()
+        .map(|s| {
+            s.return_type
+                .as_ref()
+                .and_then(|rt| rt.type_shape.as_ref())
+                .and_then(|sh| serde_json::to_value(sh).ok())
+        })
+        .collect();
+    let generic_params: Vec<Option<serde_json::Value>> = symbols
+        .iter()
+        .map(|s| {
+            if s.generic_params.is_empty() {
+                None
+            } else {
+                serde_json::to_value(&s.generic_params).ok()
+            }
+        })
+        .collect();
+    let scope_paths: Vec<Option<String>> = symbols.iter().map(|s| s.scope_path.clone()).collect();
+    let scope_depths: Vec<Option<i32>> = symbols
+        .iter()
+        .map(|s| s.scope_depth.map(|d| d as i32))
+        .collect();
+
     // Generate a per-batch ordinal so RETURNING comes back in input order
     // even when ON CONFLICT DO UPDATE fires.
     let ordinals: Vec<i32> = (0..symbols.len() as i32).collect();
 
     let rows: Vec<(i32, i64)> = sqlx::query_as::<_, (i32, i64)>(
         "WITH input AS (
-             SELECT * FROM UNNEST(
+             SELECT u.*,
+                    COALESCE(
+                        ARRAY(SELECT jsonb_array_elements_text(u.return_type_tags_json)),
+                        '{}'::text[]
+                    ) AS return_type_tags
+             FROM UNNEST(
                  $1::int4[], $2::int8[], $3::text[], $4::text[],
-                 $5::int4[], $6::int4[], $7::text[], $8::text[]
-             ) AS u(ord, file_id, name, kind, start_line, end_line, visibility, signature)
+                 $5::int4[], $6::int4[], $7::text[], $8::text[],
+                 $9::text[], $10::jsonb[], $11::jsonb[], $12::jsonb[],
+                 $13::text[], $14::int4[]
+             ) AS u(
+                 ord, file_id, name, kind, start_line, end_line, visibility, signature,
+                 return_type_raw, return_type_tags_json, return_type_shape, generic_params,
+                 scope_path, scope_depth
+             )
          ),
          inserted AS (
-             INSERT INTO file_symbols (file_id, name, kind, start_line, end_line, visibility, signature)
-             SELECT file_id, name, kind, start_line, end_line, visibility, signature
+             INSERT INTO file_symbols (
+                 file_id, name, kind, start_line, end_line, visibility, signature,
+                 return_type_raw, return_type_tags, return_type_shape, generic_params,
+                 scope_path, scope_depth
+             )
+             SELECT file_id, name, kind, start_line, end_line, visibility, signature,
+                    return_type_raw, return_type_tags, return_type_shape, generic_params,
+                    scope_path, scope_depth
              FROM input
              ON CONFLICT (file_id, kind, name, start_line) DO UPDATE SET
                  end_line = EXCLUDED.end_line,
                  visibility = EXCLUDED.visibility,
-                 signature = EXCLUDED.signature
+                 signature = EXCLUDED.signature,
+                 return_type_raw = EXCLUDED.return_type_raw,
+                 return_type_tags = EXCLUDED.return_type_tags,
+                 return_type_shape = EXCLUDED.return_type_shape,
+                 generic_params = EXCLUDED.generic_params,
+                 scope_path = EXCLUDED.scope_path,
+                 scope_depth = EXCLUDED.scope_depth
              RETURNING id, file_id, kind, name, start_line
          )
          SELECT input.ord, inserted.id
@@ -7032,6 +7100,12 @@ pub async fn bulk_insert_file_symbols(
     .bind(&end_lines)
     .bind(&visibilities)
     .bind(&signatures)
+    .bind(&return_type_raws)
+    .bind(&return_type_tags_json)
+    .bind(&return_type_shapes)
+    .bind(&generic_params)
+    .bind(&scope_paths)
+    .bind(&scope_depths)
     .fetch_all(pool)
     .await?;
 
@@ -7042,6 +7116,220 @@ pub async fn bulk_insert_file_symbols(
         }
     }
     Ok(ids)
+}
+
+/// Bulk-insert the structured parameter rows that go with each symbol.
+/// `symbol_ids` must align 1:1 with `symbols` (typically what
+/// `bulk_insert_file_symbols` returned). Existing rows for a given
+/// `symbol_id` are deleted first so re-runs replace the parameter set
+/// rather than accumulating duplicates.
+pub async fn bulk_insert_symbol_parameters(
+    pool: &PgPool,
+    symbol_ids: &[i64],
+    symbols: &[crate::parsing::symbols::Symbol],
+) -> Result<u64, sqlx::Error> {
+    debug_assert_eq!(symbol_ids.len(), symbols.len());
+    if symbols.is_empty() {
+        return Ok(0);
+    }
+
+    // Flatten (symbol_id, parameter) pairs into column-oriented vecs.
+    // type_tags is the only ragged column — encode as JSONB and expand
+    // server-side via `jsonb_array_elements_text`.
+    let mut sids: Vec<i64> = Vec::new();
+    let mut positions: Vec<i32> = Vec::new();
+    let mut names: Vec<Option<String>> = Vec::new();
+    let mut type_raws: Vec<Option<String>> = Vec::new();
+    let mut type_tags_json: Vec<serde_json::Value> = Vec::new();
+    let mut type_shapes: Vec<Option<serde_json::Value>> = Vec::new();
+    let mut default_values: Vec<Option<String>> = Vec::new();
+    let mut modifiers: Vec<Option<String>> = Vec::new();
+    let mut is_variadics: Vec<bool> = Vec::new();
+    let mut is_selfs: Vec<bool> = Vec::new();
+    let mut affected_sids: Vec<i64> = Vec::new();
+
+    for (sid, sym) in symbol_ids.iter().zip(symbols.iter()) {
+        if !sym.parameters.is_empty() {
+            affected_sids.push(*sid);
+        }
+        for p in &sym.parameters {
+            sids.push(*sid);
+            positions.push(p.position as i32);
+            names.push(p.name.clone());
+            type_raws.push(p.type_raw.clone());
+            type_tags_json.push(serde_json::Value::Array(
+                p.type_tags
+                    .iter()
+                    .cloned()
+                    .map(serde_json::Value::String)
+                    .collect(),
+            ));
+            type_shapes.push(
+                p.type_shape
+                    .as_ref()
+                    .and_then(|sh| serde_json::to_value(sh).ok()),
+            );
+            default_values.push(p.default_value.clone());
+            modifiers.push(p.modifier.map(|m| m.as_db_str().to_string()));
+            is_variadics.push(p.is_variadic);
+            is_selfs.push(p.is_self);
+        }
+    }
+
+    let mut tx = pool.begin().await?;
+
+    // Replace semantics: clear out the existing parameters for the symbols
+    // we're about to write, so a backend re-run that produces a different
+    // signature shape doesn't leave orphan rows from the previous run.
+    if !affected_sids.is_empty() {
+        sqlx::query("DELETE FROM symbol_parameters WHERE symbol_id = ANY($1::int8[])")
+            .bind(&affected_sids)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    if !sids.is_empty() {
+        sqlx::query(
+            "INSERT INTO symbol_parameters (
+                 symbol_id, position, name, type_raw, type_tags, type_shape,
+                 default_value, modifier, is_variadic, is_self
+             )
+             SELECT
+                 symbol_id, position, name, type_raw,
+                 COALESCE(
+                     ARRAY(SELECT jsonb_array_elements_text(type_tags_json)),
+                     '{}'::text[]
+                 ) AS type_tags,
+                 type_shape,
+                 default_value, modifier, is_variadic, is_self
+             FROM UNNEST(
+                 $1::int8[], $2::int4[], $3::text[], $4::text[],
+                 $5::jsonb[], $6::jsonb[],
+                 $7::text[], $8::text[], $9::bool[], $10::bool[]
+             ) AS u(
+                 symbol_id, position, name, type_raw,
+                 type_tags_json, type_shape,
+                 default_value, modifier, is_variadic, is_self
+             )",
+        )
+        .bind(&sids)
+        .bind(&positions)
+        .bind(&names)
+        .bind(&type_raws)
+        .bind(&type_tags_json)
+        .bind(&type_shapes)
+        .bind(&default_values)
+        .bind(&modifiers)
+        .bind(&is_variadics)
+        .bind(&is_selfs)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(sids.len() as u64)
+}
+
+/// Bulk-insert the effect membership rows for each symbol. Replace
+/// semantics, same as `bulk_insert_symbol_parameters`: existing rows for
+/// each `symbol_id` are deleted before insert. The effect names must
+/// exist in `effect_catalog` (enforced by the FK).
+pub async fn bulk_insert_symbol_effects(
+    pool: &PgPool,
+    symbol_ids: &[i64],
+    symbols: &[crate::parsing::symbols::Symbol],
+) -> Result<u64, sqlx::Error> {
+    debug_assert_eq!(symbol_ids.len(), symbols.len());
+    if symbols.is_empty() {
+        return Ok(0);
+    }
+
+    let mut sids: Vec<i64> = Vec::new();
+    let mut effects: Vec<String> = Vec::new();
+    let mut affected_sids: Vec<i64> = Vec::new();
+
+    for (sid, sym) in symbol_ids.iter().zip(symbols.iter()) {
+        if !sym.effects.is_empty() {
+            affected_sids.push(*sid);
+        }
+        for eff in &sym.effects {
+            sids.push(*sid);
+            effects.push(eff.clone());
+        }
+    }
+
+    let mut tx = pool.begin().await?;
+
+    if !affected_sids.is_empty() {
+        sqlx::query("DELETE FROM symbol_effects WHERE symbol_id = ANY($1::int8[])")
+            .bind(&affected_sids)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    if !sids.is_empty() {
+        sqlx::query(
+            "INSERT INTO symbol_effects (symbol_id, effect)
+             SELECT * FROM UNNEST($1::int8[], $2::text[])
+             ON CONFLICT (symbol_id, effect) DO NOTHING",
+        )
+        .bind(&sids)
+        .bind(&effects)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok(sids.len() as u64)
+}
+
+/// Apply resolution metadata to existing `symbol_references` rows. Pairs
+/// align with rows by `(source_file_id, source_line, target_raw,
+/// ref_kind)` — the same composite key the cron uses to identify them.
+///
+/// Each entry is `(source_file_id, source_line, target_raw, ref_kind,
+/// target_path, resolution_kind, resolution_confidence)`. Rows that don't
+/// match silently no-op (typical when reindex deleted them mid-run).
+#[allow(clippy::type_complexity)]
+pub async fn update_symbol_reference_resolutions(
+    pool: &PgPool,
+    rows: &[(i64, u32, String, String, Option<String>, String, f32)],
+) -> Result<u64, sqlx::Error> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let source_files: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    let source_lines: Vec<i32> = rows.iter().map(|r| r.1 as i32).collect();
+    let target_raws: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
+    let ref_kinds: Vec<String> = rows.iter().map(|r| r.3.clone()).collect();
+    let target_paths: Vec<Option<String>> = rows.iter().map(|r| r.4.clone()).collect();
+    let resolution_kinds: Vec<String> = rows.iter().map(|r| r.5.clone()).collect();
+    let confidences: Vec<f32> = rows.iter().map(|r| r.6).collect();
+    let res = sqlx::query(
+        "UPDATE symbol_references sr
+         SET target_path = u.target_path,
+             resolution_kind = u.resolution_kind,
+             resolution_confidence = u.resolution_confidence
+         FROM UNNEST(
+             $1::int8[], $2::int4[], $3::text[], $4::text[],
+             $5::text[], $6::text[], $7::real[]
+         ) AS u(source_file_id, source_line, target_raw, ref_kind,
+                target_path, resolution_kind, resolution_confidence)
+         WHERE sr.source_file_id = u.source_file_id
+           AND sr.source_line = u.source_line
+           AND sr.target_raw = u.target_raw
+           AND sr.ref_kind = u.ref_kind",
+    )
+    .bind(&source_files)
+    .bind(&source_lines)
+    .bind(&target_raws)
+    .bind(&ref_kinds)
+    .bind(&target_paths)
+    .bind(&resolution_kinds)
+    .bind(&confidences)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
 }
 
 /// Apply resolved `parent_id` values for a file's symbols. The cron computes
@@ -7123,21 +7411,118 @@ pub async fn resolve_symbol_reference_targets(
     pool: &PgPool,
     project_id: i32,
 ) -> Result<u64, sqlx::Error> {
-    let res = sqlx::query(
+    // Resolution pass v2: three-phase walk that populates not only
+    // `target_symbol_id` (legacy) but also `target_path`,
+    // `resolution_kind`, and `resolution_confidence`. The phases are
+    // ordered by precision so each phase only touches rows the earlier
+    // ones couldn't resolve.
+    //
+    //   1. exact_in_file        — name matches a symbol in the same file
+    //                            (confidence 1.0).
+    //   2. exact_via_import     — name matches a symbol whose `scope_path`
+    //                            corresponds to an import's `target_raw`
+    //                            within the same project (confidence 0.95).
+    //   3. bare_name_in_project — name matches some symbol elsewhere in the
+    //                            project (confidence 0.5).
+    //   4. unresolved           — final mark for everything else
+    //                            (confidence 0.0, target_symbol_id NULL).
+    //
+    // Each UPDATE is gated by `resolution_kind IS NULL` so the earlier-tier
+    // assignments stick even when a later phase would also match.
+
+    // Phase 1: exact_in_file. Same source file, same name.
+    let phase1 = sqlx::query(
         "UPDATE symbol_references sr
-         SET target_symbol_id = fs.id, target_file_id = fs.file_id
+         SET target_symbol_id = fs.id,
+             target_file_id = fs.file_id,
+             target_path = fs.scope_path,
+             resolution_kind = 'exact_in_file',
+             resolution_confidence = 1.0
+         FROM file_symbols fs
+         WHERE fs.file_id = sr.source_file_id
+           AND sr.target_raw = fs.name
+           AND sr.resolution_kind IS NULL
+           AND EXISTS (
+               SELECT 1 FROM indexed_files f
+                WHERE f.id = sr.source_file_id AND f.project_id = $1
+           )",
+    )
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+
+    // Phase 2: exact_via_import. The reference's source file imports a
+    // module/symbol whose `target_raw` ends with `::<name>` (or `.<name>`
+    // for languages using dot-notation). Match against `scope_path` so the
+    // resolution is namespace-aware.
+    let phase2 = sqlx::query(
+        "UPDATE symbol_references sr
+         SET target_symbol_id = fs.id,
+             target_file_id = fs.file_id,
+             target_path = fs.scope_path,
+             resolution_kind = 'exact_via_import',
+             resolution_confidence = 0.95
+         FROM file_symbols fs
+         JOIN indexed_files tgt_f ON tgt_f.id = fs.file_id
+         JOIN code_graph_edges e
+           ON e.source_file_id = sr.source_file_id
+          AND e.target_file_id = fs.file_id
+          AND e.edge_type = 'import'
+         WHERE sr.target_raw = fs.name
+           AND sr.resolution_kind IS NULL
+           AND tgt_f.project_id = $1
+           AND EXISTS (
+               SELECT 1 FROM indexed_files f
+                WHERE f.id = sr.source_file_id AND f.project_id = $1
+           )",
+    )
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+
+    // Phase 3: bare_name_in_project. Match name within the project (legacy
+    // behavior, kept for parity). When multiple matches exist, the database
+    // picks one deterministically; downstream tools that need precision can
+    // filter on `resolution_confidence >= 0.95`.
+    let phase3 = sqlx::query(
+        "UPDATE symbol_references sr
+         SET target_symbol_id = fs.id,
+             target_file_id = fs.file_id,
+             target_path = fs.scope_path,
+             resolution_kind = 'bare_name_in_project',
+             resolution_confidence = 0.5
          FROM file_symbols fs
          JOIN indexed_files src_f ON src_f.id = sr.source_file_id
          JOIN indexed_files tgt_f ON tgt_f.id = fs.file_id
          WHERE src_f.project_id = $1
            AND tgt_f.project_id = $1
-           AND sr.target_symbol_id IS NULL
-           AND sr.target_raw = fs.name",
+           AND sr.target_raw = fs.name
+           AND sr.resolution_kind IS NULL",
     )
     .bind(project_id)
     .execute(pool)
     .await?;
-    Ok(res.rows_affected())
+
+    // Phase 4: anything still unresolved within the project's references is
+    // marked `unresolved` so tools can distinguish "we tried" from "not yet
+    // processed".
+    let phase4 = sqlx::query(
+        "UPDATE symbol_references sr
+         SET resolution_kind = 'unresolved',
+             resolution_confidence = 0.0
+         FROM indexed_files f
+         WHERE sr.source_file_id = f.id
+           AND f.project_id = $1
+           AND sr.resolution_kind IS NULL",
+    )
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+
+    Ok(phase1.rows_affected()
+        + phase2.rows_affected()
+        + phase3.rows_affected()
+        + phase4.rows_affected())
 }
 
 /// Read the symbol-extraction watermark for a project.

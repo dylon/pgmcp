@@ -189,6 +189,20 @@ pub async fn tool_anomaly_detection(
     });
     anomalies.truncate(limit as usize);
 
+    // Shadow-ASR channel: per-effect symbol-count distribution. Files in
+    // anomalous portions of the codebase often correlate with concentrated
+    // effects (e.g. all the project's `unsafe` lives in one anomalous file).
+    let effect_distribution = if let Some(pool) = ctx.db().pool() {
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
     let result = serde_json::json!({
         "project": params.project,
         "contamination": contamination,
@@ -196,6 +210,7 @@ pub async fn tool_anomaly_detection(
         "std_distance": format!("{:.4}", std_dev),
         "anomaly_count": anomalies.len(),
         "anomalies": anomalies,
+        "effect_distribution": effect_distribution,
         "guidance": "High anomaly_score files are statistically unusual in their semantic content, \
                      size, or change patterns. They may be: abandoned experiments, copied from \
                      another project, auto-generated code, or architectural outliers. \

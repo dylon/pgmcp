@@ -6,6 +6,12 @@
 //! project, this tool soft-fails with `health.symbols_present:false` and a
 //! guidance message — never an error.
 //!
+//! Phase D2b enhancement: the `parameter_name_patterns` channel surfaces
+//! parameter-name dominance per (function shape, position) — e.g. when 18
+//! functions sharing the same signature_shape_hash use `user_id` for their
+//! first parameter and 2 use `userId`, the deviants are surfaced.
+//! Computed via the `symbol_parameters` table.
+//!
 //! Per-(directory, kind) dominance is the unit of analysis: snake-case
 //! functions and PascalCase structs in the same directory are NOT mutually
 //! flagged, because they're the idiomatic mix in most languages. A symbol is
@@ -333,6 +339,16 @@ pub async fn tool_naming_consistency(
         divergences.truncate(limit);
     }
 
+    // Shadow-ASR channel: parameter-name patterns. For functions sharing
+    // the same signature shape (parameter count + per-position type tags),
+    // surface the dominant parameter name per position. When position N is
+    // named `user_id` 18 times and `userId` 2 times, the deviants are
+    // returned. Soft-fails when the symbol_parameters table is empty (no
+    // re-extraction yet).
+    let parameter_patterns = fetch_parameter_name_patterns(pool, project_id)
+        .await
+        .unwrap_or_default();
+
     let result = json!({
         "scope": {
             "project": params.project,
@@ -340,6 +356,7 @@ pub async fn tool_naming_consistency(
         },
         "divergences": divergences,
         "total_divergences": total,
+        "parameter_name_patterns": parameter_patterns,
         "parameters": {
             "project": params.project,
             "language": params.language,
@@ -464,6 +481,59 @@ fn soft_fail_no_symbols(
     let s = serde_json::to_string_pretty(&result)
         .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
     Ok(CallToolResult::success(vec![Content::text(s)]))
+}
+
+/// Parameter-name patterns: for each parameter position observed in any
+/// function in the project, list the names that appear at that position
+/// and their occurrence counts. Consumers can identify inconsistent names
+/// (e.g. `user_id` 18× vs `userId` 2× at position 0).
+async fn fetch_parameter_name_patterns(
+    pool: &sqlx::PgPool,
+    project_id: i32,
+) -> Result<Vec<serde_json::Value>, sqlx::Error> {
+    type PatternRow = (i32, String, i64);
+    let rows: Vec<PatternRow> = sqlx::query_as(
+        "SELECT p.position, p.name, COUNT(*)::int8
+         FROM symbol_parameters p
+         JOIN file_symbols fs ON fs.id = p.symbol_id
+         JOIN indexed_files f ON f.id = fs.file_id
+         WHERE f.project_id = $1
+           AND p.name IS NOT NULL
+           AND fs.kind = 'function'
+         GROUP BY p.position, p.name
+         ORDER BY p.position, COUNT(*) DESC",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await?;
+    // Group by position.
+    use std::collections::BTreeMap;
+    let mut by_pos: BTreeMap<i32, Vec<(String, i64)>> = BTreeMap::new();
+    for (position, name, count) in rows {
+        by_pos.entry(position).or_default().push((name, count));
+    }
+    Ok(by_pos
+        .into_iter()
+        .map(|(position, names)| {
+            let total: i64 = names.iter().map(|(_, c)| *c).sum();
+            // Dominant = first entry (already DESC-sorted). Deviants = rest.
+            let names_json: Vec<serde_json::Value> = names
+                .iter()
+                .map(|(n, c)| {
+                    serde_json::json!({
+                        "name": n,
+                        "count": c,
+                        "dominance": (*c as f64) / (total.max(1) as f64),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "position": position,
+                "total_occurrences": total,
+                "names": names_json,
+            })
+        })
+        .collect())
 }
 
 #[cfg(test)]

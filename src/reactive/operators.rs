@@ -281,8 +281,11 @@ mod tests {
         tx.send(3).expect("send failed");
         drop(tx);
 
+        // Drain via blocking recv() — the worker thread exits after its
+        // input disconnects, deterministically closing this channel.
+        // Using recv_timeout here would risk a false negative under load.
         let mut results = Vec::new();
-        while let Ok(v) = distinct.recv_timeout(Duration::from_millis(100)) {
+        while let Ok(v) = distinct.recv() {
             results.push(v);
         }
         assert_eq!(results, vec![1, 2, 3]);
@@ -413,6 +416,18 @@ mod tests {
         /// buffer_time flushes items it has accumulated when the window
         /// elapses. Every item sent before the deadline is present in the
         /// concatenated output.
+        ///
+        /// Determinism fix (2026-05-22): the consumer uses blocking
+        /// `recv()` rather than `recv_timeout()`. The semantics this test
+        /// is verifying — "every item sent before tx-drop reaches the
+        /// output" — do not actually depend on wall-clock timing once tx
+        /// is closed: the buffer_time worker thread sees Disconnected,
+        /// flushes its remaining buffer, and exits, which closes the
+        /// output channel. `recv()` then returns Err on close, exiting
+        /// the loop. The previous `recv_timeout(500ms)` produced a flaky
+        /// "got [] expected [...]" failure under heavy parallel proptest
+        /// load when the worker thread didn't get scheduled inside the
+        /// timeout — a scheduler artifact, not a real semantics bug.
         #[test]
         fn prop_buffer_time_delivers_all_items(
             items in prop::collection::vec(any::<i32>(), 1..30usize),
@@ -423,8 +438,11 @@ mod tests {
                 tx.send(item).expect("send");
             }
             drop(tx);
+            // Block on the output channel until the worker thread closes
+            // it (after flushing on Disconnected). No wall-clock timeout
+            // — the worker is guaranteed to terminate once `tx` is gone.
             let mut out: Vec<i32> = Vec::new();
-            while let Ok(batch) = buffered.recv_timeout(Duration::from_millis(500)) {
+            while let Ok(batch) = buffered.recv() {
                 out.extend(batch);
             }
             prop_assert_eq!(out.len(), items.len(),
@@ -434,6 +452,16 @@ mod tests {
         /// debounce_by_key coalesces repeated sends on the same key within
         /// a window into one emission. For distinct keys, every key is
         /// represented at least once in the output.
+        ///
+        /// Determinism fix (2026-05-22): same fix as
+        /// `prop_buffer_time_delivers_all_items` — use blocking `recv()`
+        /// on the output channel. The debounce worker thread terminates
+        /// after its input channel disconnects (drains pending into the
+        /// output, then breaks). The output channel then closes
+        /// deterministically, returning Err to `recv()`. The previous
+        /// `recv_timeout(500ms)` produced false negatives under heavy
+        /// parallel proptest load when the worker thread didn't get
+        /// scheduled inside the wall-clock window.
         #[test]
         fn prop_debounce_by_key_emits_at_least_one_per_key(
             keys in prop::collection::vec(0u32..5, 1..30usize),
@@ -445,7 +473,7 @@ mod tests {
             }
             drop(tx);
             let mut out = Vec::new();
-            while let Ok(v) = debounced.recv_timeout(Duration::from_millis(500)) {
+            while let Ok(v) = debounced.recv() {
                 out.push(v);
             }
             let in_keys: std::collections::HashSet<u32> = keys.iter().copied().collect();

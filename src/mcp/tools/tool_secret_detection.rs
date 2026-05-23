@@ -11,7 +11,9 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::SecretDetectionParams;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
+use crate::parsing::type_tags::vocabulary::{EFFECT_CRYPTO, EFFECT_CRYPTO_WEAK};
 
 /// Shannon entropy of a byte string (uses base-2 log; max for 64 distinct
 /// chars ≈ 6.0). Hardcoded keys typically score above 4.0.
@@ -98,10 +100,28 @@ pub async fn tool_secret_detection(
             }
         }
     }
+    // Shadow-ASR channel: symbols flagged with crypto effects — these are
+    // priority targets for secret-detection review (the symbol's body or
+    // arguments likely touch crypto material).
+    let crypto_symbols = symbols_with_any_effect(
+        pool,
+        project_id,
+        &[EFFECT_CRYPTO.to_string(), EFFECT_CRYPTO_WEAK.to_string()],
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(symbol_id, file_id, name, scope_path)| {
+        serde_json::json!({
+            "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
+        })
+    })
+    .collect::<Vec<_>>();
     json_result(&json!({
         "project": params.project,
         "min_entropy": min_entropy,
         "findings": findings,
+        "crypto_symbols": crypto_symbols,
         "guidance": "Combines regex prefix-matching (AWS keys, GitHub PATs, OpenAI keys, Slack tokens, PEM headers) with Shannon entropy ≥ threshold on string literals. Review preview bytes carefully — false positives are possible on base64 test data."
     }))
 }

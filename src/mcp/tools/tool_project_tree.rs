@@ -1,4 +1,12 @@
 //! `tool_project_tree` — MCP tool body, extracted from `super::super::server`.
+//!
+//! Phase D2b shadow-ASR contract (Pattern J): this tool returns a
+//! newline-joined plain-text tree of file paths. Mixing a JSON
+//! `effect_breakdown` channel into a plain-text response would corrupt
+//! the format, so the workspace effect distribution is intentionally
+//! NOT included here. Clients that need the effect_breakdown alongside
+//! a project tree should call `tool_orient` (Pattern F enrichment),
+//! which returns a JSON envelope with both tree and effect_breakdown.
 
 #![allow(unused_imports)]
 

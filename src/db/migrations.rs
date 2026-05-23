@@ -19,6 +19,8 @@
 
 use sqlx::PgPool;
 
+mod v2_shadow_asr;
+mod v3_cross_language_signatures;
 mod versioning;
 use versioning::*;
 
@@ -1275,6 +1277,51 @@ pub async fn run_migrations(
         info!(
             version = INITIAL_SCHEMA_VERSION,
             "initial schema migration recorded"
+        );
+    }
+
+    // ================================================================
+    // Migration step 2 — shadow_asr_v1
+    // Unified semantic representation: type_tag_catalog, effect_catalog,
+    // symbol_parameters, symbol_effects, additive columns on file_symbols
+    // and symbol_references. See ADR-003 and `src/db/migrations/v2_shadow_asr.rs`.
+    // ================================================================
+    if !version_applied(pool, v2_shadow_asr::SHADOW_ASR_V1).await? {
+        v2_shadow_asr::apply(pool).await?;
+        record_version(
+            pool,
+            v2_shadow_asr::SHADOW_ASR_V1,
+            v2_shadow_asr::SHADOW_ASR_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v2_shadow_asr::SHADOW_ASR_V1,
+            "shadow_asr_v1 migration applied"
+        );
+    }
+
+    // ================================================================
+    // Migration step 3 — cross_language_signatures_v1
+    // Materialized cross-language clone table powering
+    // `mcp__pgmcp__cross_language_api_equivalents` and downstream
+    // similarity tools.
+    // ================================================================
+    if !version_applied(
+        pool,
+        v3_cross_language_signatures::CROSS_LANGUAGE_SIGNATURES_V1,
+    )
+    .await?
+    {
+        v3_cross_language_signatures::apply(pool).await?;
+        record_version(
+            pool,
+            v3_cross_language_signatures::CROSS_LANGUAGE_SIGNATURES_V1,
+            v3_cross_language_signatures::CROSS_LANGUAGE_SIGNATURES_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v3_cross_language_signatures::CROSS_LANGUAGE_SIGNATURES_V1,
+            "cross_language_signatures_v1 migration applied"
         );
     }
 

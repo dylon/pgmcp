@@ -21,6 +21,8 @@ use syn::{
 
 #[path = "rust/helpers.rs"]
 mod helpers;
+#[path = "rust/type_mapper.rs"]
+mod type_mapper;
 use helpers::*;
 
 use crate::parsing::backend::LanguageBackend;
@@ -127,6 +129,9 @@ struct SymbolVisitor {
     /// Methods emitted inside that block stash this so the cron can resolve
     /// `parent_id` by joining `parent_self_ty == file_symbols.name`.
     current_impl_self: Option<String>,
+    /// When inside a `trait Foo { ... }` block, the trait's name. Trait methods
+    /// inherit the trait name as their scope parent.
+    current_trait: Option<String>,
 }
 
 impl SymbolVisitor {
@@ -141,27 +146,141 @@ impl SymbolVisitor {
     ) {
         self.out.push(Symbol {
             file_id: 0,
-            name,
+            name: name.clone(),
             kind,
             start_line: span_line(ident_span),
             end_line: span_line(end_span).max(span_line(ident_span)),
             parent_id: None,
             visibility,
             signature,
+            scope_path: Some(self.compute_scope_path(&name)),
+            scope_depth: Some(self.scope_depth()),
+            ..Default::default()
         });
     }
+
+    /// Build a fully-populated function-shaped `Symbol`. Used by
+    /// `visit_item_fn` / `visit_impl_item_fn` / `visit_trait_item_fn` so the
+    /// shadow-ASR fields (`parameters`, `return_type`, `generic_params`,
+    /// `effects`, `scope_path`, `scope_depth`) land at the same time as the
+    /// basic symbol row.
+    #[allow(clippy::too_many_arguments)]
+    fn push_function_symbol(
+        &mut self,
+        name: String,
+        sig: &syn::Signature,
+        attrs: &[syn::Attribute],
+        body_tokens: Option<proc_macro2::TokenStream>,
+        ident_span: Span,
+        end_span: Span,
+        visibility: Option<String>,
+    ) {
+        let parameters: Vec<crate::parsing::symbols::Parameter> = sig
+            .inputs
+            .iter()
+            .enumerate()
+            .map(|(i, arg)| type_mapper::fnarg_to_parameter(arg, i as u32))
+            .collect();
+        let return_type = Some(type_mapper::return_type_for(&sig.output));
+        let generic_params = type_mapper::generics_for(&sig.generics);
+        let panic_count = body_tokens
+            .as_ref()
+            .map(type_mapper::count_body_panics)
+            .unwrap_or(0);
+        let unsafe_blocks = body_tokens
+            .as_ref()
+            .map(count_body_unsafe_blocks)
+            .unwrap_or(0);
+        let effects = type_mapper::effects_for_sig(sig, attrs, panic_count, unsafe_blocks);
+        let signature = Some(type_to_string(sig));
+
+        self.out.push(Symbol {
+            file_id: 0,
+            name: name.clone(),
+            kind: SymbolKind::Function,
+            start_line: span_line(ident_span),
+            end_line: span_line(end_span).max(span_line(ident_span)),
+            parent_id: None,
+            visibility,
+            signature,
+            parameters,
+            return_type,
+            generic_params,
+            effects,
+            scope_path: Some(self.compute_scope_path(&name)),
+            scope_depth: Some(self.scope_depth()),
+        });
+    }
+
+    /// Build `crate::a::b::name` from the current `mod_stack`, `current_impl_self`,
+    /// and `current_trait`. Roots at `crate` because that's the canonical Rust
+    /// path prefix and matches what `use` statements expect.
+    fn compute_scope_path(&self, name: &str) -> String {
+        let mut parts: Vec<String> = Vec::with_capacity(self.mod_stack.len() + 3);
+        parts.push("crate".to_string());
+        for m in &self.mod_stack {
+            parts.push(m.clone());
+        }
+        if let Some(self_ty) = &self.current_impl_self {
+            parts.push(self_ty.clone());
+        }
+        if let Some(trait_name) = &self.current_trait {
+            parts.push(trait_name.clone());
+        }
+        parts.push(name.to_string());
+        parts.join("::")
+    }
+
+    /// Depth = number of containing scopes (0 = top-level under the crate root).
+    fn scope_depth(&self) -> u32 {
+        let mut d = self.mod_stack.len() as u32;
+        if self.current_impl_self.is_some() {
+            d += 1;
+        }
+        if self.current_trait.is_some() {
+            d += 1;
+        }
+        d
+    }
+}
+
+/// Walk a function body's token stream counting `unsafe { ... }` blocks.
+/// Mirrors `ComplexityVisitor::visit_expr_unsafe`'s logic but operates on
+/// raw tokens so we can derive the count outside of the complexity pass.
+fn count_body_unsafe_blocks(stream: &proc_macro2::TokenStream) -> u32 {
+    use proc_macro2::{Delimiter, TokenTree};
+    let mut count = 0u32;
+    let mut prev_was_unsafe = false;
+    for tt in stream.clone() {
+        match tt {
+            TokenTree::Ident(id) if id == "unsafe" => {
+                prev_was_unsafe = true;
+            }
+            TokenTree::Group(g) => {
+                if prev_was_unsafe && matches!(g.delimiter(), Delimiter::Brace) {
+                    count = count.saturating_add(1);
+                }
+                prev_was_unsafe = false;
+                count = count.saturating_add(count_body_unsafe_blocks(&g.stream()));
+            }
+            _ => {
+                prev_was_unsafe = false;
+            }
+        }
+    }
+    count
 }
 
 impl<'ast> Visit<'ast> for SymbolVisitor {
     fn visit_item_fn(&mut self, node: &'ast ItemFn) {
-        let signature = Some(type_to_string(&node.sig));
-        self.push_symbol(
+        self.push_function_symbol(
             node.sig.ident.to_string(),
-            SymbolKind::Function,
+            &node.sig,
+            &node.attrs,
+            Some(node.block.to_token_stream()),
             node.sig.ident.span(),
             node.block.brace_token.span.close().span(),
             vis_str(&node.vis),
-            signature,
         );
         visit::visit_item_fn(self, node);
     }
@@ -194,15 +313,43 @@ impl<'ast> Visit<'ast> for SymbolVisitor {
 
     fn visit_item_trait(&mut self, node: &'ast ItemTrait) {
         let header = type_to_string(&node.ident);
+        let name = node.ident.to_string();
         self.push_symbol(
-            node.ident.to_string(),
+            name.clone(),
             SymbolKind::Trait,
             node.ident.span(),
             node.brace_token.span.close().span(),
             vis_str(&node.vis),
             Some(header),
         );
+        // Stash trait context so method symbols emitted via the recursive
+        // visit get the trait's scope path. Trait methods without a default
+        // body have `default = None`; we still emit them as Function rows
+        // because they're part of the trait's surface (consumed by
+        // public_api_surface, semver_break_audit, etc.).
+        let saved_trait = self.current_trait.take();
+        self.current_trait = Some(name);
+        for item in &node.items {
+            if let syn::TraitItem::Fn(method) = item {
+                let end_span = method
+                    .default
+                    .as_ref()
+                    .map(|b| b.brace_token.span.close().span())
+                    .unwrap_or_else(|| method.sig.ident.span());
+                let body_tokens = method.default.as_ref().map(|b| b.to_token_stream());
+                self.push_function_symbol(
+                    method.sig.ident.to_string(),
+                    &method.sig,
+                    &method.attrs,
+                    body_tokens,
+                    method.sig.ident.span(),
+                    end_span,
+                    None,
+                );
+            }
+        }
         visit::visit_item_trait(self, node);
+        self.current_trait = saved_trait;
     }
 
     fn visit_item_impl(&mut self, node: &'ast ItemImpl) {
@@ -216,14 +363,14 @@ impl<'ast> Visit<'ast> for SymbolVisitor {
         // method's visibility (defaulted to inherited if absent).
         for item in &node.items {
             if let ImplItem::Fn(method) = item {
-                let signature = Some(type_to_string(&method.sig));
-                self.push_symbol(
+                self.push_function_symbol(
                     method.sig.ident.to_string(),
-                    SymbolKind::Function,
+                    &method.sig,
+                    &method.attrs,
+                    Some(method.block.to_token_stream()),
                     method.sig.ident.span(),
                     method.block.brace_token.span.close().span(),
                     vis_str(&method.vis),
-                    signature,
                 );
             }
         }
@@ -1053,6 +1200,220 @@ extern crate proc_macro2 as pm2;
         assert!(RUST_BACKEND.extract_symbols(bogus).is_empty());
         assert!(RUST_BACKEND.extract_imports(bogus).is_empty());
         assert!(RUST_BACKEND.extract_references(bogus).is_empty());
+    }
+
+    // ========================================================================
+    // Shadow-ASR integration tests (Phase B)
+    //
+    // These exercise the type_mapper through the SymbolVisitor end-to-end,
+    // asserting that parameters / return_type / generic_params / effects /
+    // scope_path / scope_depth land on the right symbols.
+    // ========================================================================
+
+    #[test]
+    fn shadow_asr_fields_populate_for_free_fn() {
+        let src = r#"
+pub async fn authenticate(user: &User, password: &str) -> Result<Token, AuthError> {
+    todo!()
+}
+"#;
+        let syms = RUST_BACKEND.extract_symbols(src);
+        let f = syms
+            .iter()
+            .find(|s| s.name == "authenticate")
+            .expect("authenticate symbol");
+        assert_eq!(f.kind, SymbolKind::Function);
+        assert_eq!(f.parameters.len(), 2);
+        assert_eq!(f.parameters[0].name.as_deref(), Some("user"));
+        assert_eq!(
+            f.parameters[0].modifier,
+            Some(crate::parsing::symbols::ParamModifier::Ref)
+        );
+        assert_eq!(f.parameters[1].name.as_deref(), Some("password"));
+
+        let rt = f.return_type.as_ref().expect("return type");
+        assert!(
+            rt.type_tags
+                .contains(&crate::parsing::type_tags::vocabulary::TAG_RESULT.to_string())
+        );
+        let shape = rt.type_shape.as_ref().expect("return shape");
+        assert_eq!(shape.constructor, "Result");
+
+        assert!(
+            f.effects
+                .contains(&crate::parsing::type_tags::vocabulary::EFFECT_ASYNC.to_string())
+        );
+        assert!(
+            f.effects
+                .contains(&crate::parsing::type_tags::vocabulary::EFFECT_MAY_PANIC.to_string())
+        );
+
+        assert_eq!(f.scope_path.as_deref(), Some("crate::authenticate"));
+        assert_eq!(f.scope_depth, Some(0));
+    }
+
+    #[test]
+    fn shadow_asr_fields_populate_for_impl_method() {
+        let src = r#"
+struct Service;
+impl Service {
+    pub fn handle(&self, req: Request) -> Response {
+        Response::default()
+    }
+}
+"#;
+        let syms = RUST_BACKEND.extract_symbols(src);
+        let m = syms
+            .iter()
+            .find(|s| s.name == "handle")
+            .expect("handle method");
+        // Receiver + req = 2 params
+        assert_eq!(m.parameters.len(), 2);
+        assert!(m.parameters[0].is_self, "receiver should be is_self");
+        assert_eq!(m.parameters[0].name.as_deref(), Some("self"));
+        assert_eq!(m.parameters[1].name.as_deref(), Some("req"));
+        assert_eq!(m.scope_path.as_deref(), Some("crate::Service::handle"));
+        assert_eq!(m.scope_depth, Some(1));
+    }
+
+    #[test]
+    fn shadow_asr_fields_populate_for_trait_method_with_default() {
+        let src = r#"
+pub trait Processor {
+    fn process(&self, input: &str) -> String {
+        String::from(input)
+    }
+    fn count(&self) -> usize;
+}
+"#;
+        let syms = RUST_BACKEND.extract_symbols(src);
+        let process = syms
+            .iter()
+            .find(|s| {
+                s.name == "process"
+                    && s.scope_path
+                        .as_deref()
+                        .is_some_and(|p| p.contains("Processor"))
+            })
+            .expect("trait process method");
+        assert_eq!(
+            process.scope_path.as_deref(),
+            Some("crate::Processor::process")
+        );
+        assert_eq!(process.parameters.len(), 2);
+        assert!(process.parameters[0].is_self);
+        let count = syms
+            .iter()
+            .find(|s| {
+                s.name == "count"
+                    && s.scope_path
+                        .as_deref()
+                        .is_some_and(|p| p.contains("Processor"))
+            })
+            .expect("trait count method (no body)");
+        assert_eq!(count.scope_path.as_deref(), Some("crate::Processor::count"));
+        // Method without a body still surfaces parameters and return type.
+        assert_eq!(count.parameters.len(), 1);
+        let rt = count.return_type.as_ref().expect("return type");
+        assert!(
+            rt.type_tags
+                .contains(&crate::parsing::type_tags::vocabulary::TAG_UINT.to_string())
+        );
+    }
+
+    #[test]
+    fn shadow_asr_effects_for_unsafe_fn() {
+        let src = "unsafe fn read_raw(p: *const u8) -> u8 { unsafe { *p } }";
+        let syms = RUST_BACKEND.extract_symbols(src);
+        let f = syms
+            .iter()
+            .find(|s| s.name == "read_raw")
+            .expect("read_raw");
+        assert!(
+            f.effects
+                .contains(&crate::parsing::type_tags::vocabulary::EFFECT_UNSAFE.to_string())
+        );
+        // Deduped — even though both `unsafe fn` and an `unsafe { }` block
+        // are present, only one effect entry remains.
+        let unsafe_count = f
+            .effects
+            .iter()
+            .filter(|e| e.as_str() == crate::parsing::type_tags::vocabulary::EFFECT_UNSAFE)
+            .count();
+        assert_eq!(unsafe_count, 1);
+    }
+
+    #[test]
+    fn shadow_asr_generic_params_extracted() {
+        let src = r#"
+pub fn pick<T: Clone + Send, U>(a: T, b: U) -> T { a }
+"#;
+        let syms = RUST_BACKEND.extract_symbols(src);
+        let f = syms.iter().find(|s| s.name == "pick").expect("pick");
+        assert_eq!(f.generic_params.len(), 2);
+        assert_eq!(f.generic_params[0].name, "T");
+        assert!(
+            f.generic_params[0]
+                .bounds
+                .iter()
+                .any(|b| b.contains("Clone"))
+        );
+        assert!(
+            f.generic_params[0]
+                .bounds
+                .iter()
+                .any(|b| b.contains("Send"))
+        );
+        assert_eq!(f.generic_params[1].name, "U");
+    }
+
+    #[test]
+    fn shadow_asr_scope_path_nests_through_mod() {
+        let src = r#"
+mod outer {
+    pub mod inner {
+        pub fn deep() {}
+    }
+}
+"#;
+        let syms = RUST_BACKEND.extract_symbols(src);
+        let deep = syms.iter().find(|s| s.name == "deep").expect("deep fn");
+        assert_eq!(
+            deep.scope_path.as_deref(),
+            Some("crate::outer::inner::deep")
+        );
+        assert_eq!(deep.scope_depth, Some(2));
+    }
+
+    #[test]
+    fn shadow_asr_test_attr_marks_effect() {
+        let src = r#"
+#[test]
+fn it_works() { assert!(true); }
+"#;
+        let syms = RUST_BACKEND.extract_symbols(src);
+        let f = syms
+            .iter()
+            .find(|s| s.name == "it_works")
+            .expect("it_works");
+        assert!(
+            f.effects
+                .contains(&crate::parsing::type_tags::vocabulary::EFFECT_TEST.to_string())
+        );
+    }
+
+    #[test]
+    fn shadow_asr_deprecated_attr_marks_effect() {
+        let src = r#"
+#[deprecated]
+pub fn old_api() {}
+"#;
+        let syms = RUST_BACKEND.extract_symbols(src);
+        let f = syms.iter().find(|s| s.name == "old_api").expect("old_api");
+        assert!(
+            f.effects
+                .contains(&crate::parsing::type_tags::vocabulary::EFFECT_DEPRECATED.to_string())
+        );
     }
 
     #[test]

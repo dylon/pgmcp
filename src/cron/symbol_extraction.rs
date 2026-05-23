@@ -44,6 +44,7 @@ const BACKEND_LANGUAGES: &[&str] = &[
     "c",
     "cpp",
     "rholang",
+    "metta",
     "clojure",
     "clojurescript",
     // Formal-verification backends (post-SOTA addition).
@@ -290,6 +291,23 @@ async fn extract_and_persist_file(
     let symbol_ids = queries::bulk_insert_file_symbols(pool, file_id, &symbols).await?;
     debug_assert_eq!(symbol_ids.len(), symbols.len());
 
+    // Persist the shadow-ASR rows (`symbol_parameters`, `symbol_effects`).
+    // Both functions delete-then-insert per symbol_id so re-runs replace the
+    // previous extraction's parameter/effect set without leaving orphans.
+    // Symbols with zero IDs (the ON CONFLICT-no-row case) are filtered out.
+    let mut nonzero_ids: Vec<i64> = Vec::with_capacity(symbol_ids.len());
+    let mut nonzero_syms: Vec<Symbol> = Vec::with_capacity(symbols.len());
+    for (sid, sym) in symbol_ids.iter().zip(symbols.iter()) {
+        if *sid != 0 {
+            nonzero_ids.push(*sid);
+            nonzero_syms.push(sym.clone());
+        }
+    }
+    if !nonzero_ids.is_empty() {
+        queries::bulk_insert_symbol_parameters(pool, &nonzero_ids, &nonzero_syms).await?;
+        queries::bulk_insert_symbol_effects(pool, &nonzero_ids, &nonzero_syms).await?;
+    }
+
     // In-Rust parent_id resolution — for each Function whose start_line falls
     // inside a Struct/Class/Trait/Interface's [start_line, end_line], set
     // parent_id to that container.
@@ -409,6 +427,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
             Symbol {
                 file_id: 0,
@@ -419,6 +438,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
             Symbol {
                 file_id: 0,
@@ -429,6 +449,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
         ];
         let ids = vec![10i64, 11, 12];
@@ -448,6 +469,7 @@ mod tests {
             parent_id: None,
             visibility: None,
             signature: None,
+            ..Default::default()
         }];
         let ids = vec![1];
         let pairs = compute_parent_pairs(&symbols, &ids);
@@ -466,6 +488,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
             Symbol {
                 file_id: 0,
@@ -476,6 +499,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
         ];
         let ids = vec![10i64, 11];
@@ -510,6 +534,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
             Symbol {
                 file_id: 0,
@@ -520,6 +545,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
         ];
         let ids = vec![0i64, 11]; // container's id is 0 — bad slot
@@ -541,6 +567,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
             Symbol {
                 file_id: 0,
@@ -551,6 +578,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
             Symbol {
                 file_id: 0,
@@ -561,6 +589,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
         ];
         let ids = vec![10, 11, 12];
@@ -584,6 +613,7 @@ mod tests {
             parent_id: None,
             visibility: None,
             signature: None,
+            ..Default::default()
         }];
         let ids = vec![1i64];
         let mut refs = vec![SymbolReference {
@@ -611,6 +641,7 @@ mod tests {
             parent_id: None,
             visibility: None,
             signature: None,
+            ..Default::default()
         }];
         let ids = vec![42i64];
         let mut refs = vec![SymbolReference {
@@ -640,6 +671,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
             Symbol {
                 file_id: 0,
@@ -650,6 +682,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
         ];
         let ids = vec![1i64, 2];
@@ -679,6 +712,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
             Symbol {
                 file_id: 0,
@@ -689,6 +723,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
             Symbol {
                 file_id: 0,
@@ -699,6 +734,7 @@ mod tests {
                 parent_id: None,
                 visibility: None,
                 signature: None,
+                ..Default::default()
             },
         ];
         let mut seen: HashSet<(SymbolKind, String, u32)> = HashSet::new();
@@ -777,6 +813,7 @@ mod tests {
                     parent_id: None,
                     visibility: None,
                     signature: None,
+                    ..Default::default()
                 },
                 Symbol {
                     file_id: 0,
@@ -787,6 +824,7 @@ mod tests {
                     parent_id: None,
                     visibility: None,
                     signature: None,
+                    ..Default::default()
                 },
             ];
             let ids = vec![container_id, child_id];
@@ -819,6 +857,7 @@ mod tests {
                     parent_id: None,
                     visibility: None,
                     signature: None,
+                    ..Default::default()
                 },
                 Symbol {
                     file_id: 0,
@@ -829,6 +868,7 @@ mod tests {
                     parent_id: None,
                     visibility: None,
                     signature: None,
+                    ..Default::default()
                 },
             ];
             let ids = vec![other_id, target_id];

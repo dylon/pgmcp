@@ -146,7 +146,8 @@ High-level project understanding and engineering quality assessment.
 - **Incremental indexing** -- xxHash3 content hashing skips unchanged files
 - **Streamable HTTP transport** -- multi-client daemon mode for shared team indexing
 - **systemd integration** -- `sd-notify` ready/stopping protocol
-- **17 file types** -- Rust, Python, TypeScript, JavaScript, Go, Rholang, MeTTa, Prolog, Shell, JSONL, Markdown, and more
+- **50+ file types** -- Rust, Python, TypeScript, JavaScript, Java, Scala, C/C++, Clojure/ClojureScript, Rholang, MeTTa, Coq, TLA+, Lean, Sage, Prolog, Shell, JSONL, Markdown, and more
+- **17 tree-sitter symbol-extraction backends** -- Rust (via `syn`), Python, JavaScript, TypeScript (incl. TSX), Java, Scala, C, C++, Rholang (full process-calculus coverage incl. let bindings + local channels + per-contract complexity metrics), MeTTa (head-driven S-expression dispatch: `=`/`:=` rule defs, `:` type annotations, `import!` modules), Clojure, ClojureScript, Coq, TLA+, Lean, Sage
 - **Per-project overrides** -- `.pgmcp.toml` in project roots for custom exclusions and file types
 - **CUDA acceleration** -- mandatory GPU-accelerated embedding and FCM paths via Candle/cudarc
 - **Cross-agent memory search** -- synthetic `claude` and `codex` projects make both clients' config, prompt history, and sessions queryable through the same MCP tools

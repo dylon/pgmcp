@@ -10,6 +10,9 @@ use std::sync::OnceLock;
 
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
+#[path = "scala/type_mapper.rs"]
+mod type_mapper;
+
 use crate::parsing::backend::LanguageBackend;
 use crate::parsing::symbols::{Import, Symbol, SymbolKind, SymbolRefKind, SymbolReference};
 
@@ -142,6 +145,7 @@ impl LanguageBackend for ScalaBackend {
                                 visibility: Some("public".into()),
                                 signature: Some(name.clone()),
                                 name,
+                                ..Default::default()
                             });
                         }
                     }
@@ -162,12 +166,21 @@ impl LanguageBackend for ScalaBackend {
                                 visibility: Some("public".into()),
                                 signature: Some(first_line(content, node)),
                                 name,
+                                ..Default::default()
                             });
                         }
                     }
                     "fn.def" => {
                         if let Some(name_node) = node.child_by_field_name("name") {
                             let name = node_text(name_node, content).to_string();
+                            let parameters = node
+                                .child_by_field_name("parameters")
+                                .map(|p| type_mapper::parameters_from_node(p, content))
+                                .unwrap_or_default();
+                            let return_type =
+                                Some(type_mapper::return_type_from_function(node, content));
+                            let generic_params = type_mapper::generics_for_function(node, content);
+                            let effects = type_mapper::effects_for_function(node, content);
                             out.push(Symbol {
                                 file_id: 0,
                                 kind: SymbolKind::Function,
@@ -177,6 +190,12 @@ impl LanguageBackend for ScalaBackend {
                                 visibility: Some("public".into()),
                                 signature: Some(first_line(content, node)),
                                 name,
+                                parameters,
+                                return_type,
+                                generic_params,
+                                effects,
+                                scope_depth: Some(0),
+                                ..Default::default()
                             });
                         }
                     }
@@ -198,6 +217,7 @@ impl LanguageBackend for ScalaBackend {
                                 visibility: Some("public".into()),
                                 signature: Some(name.clone()),
                                 name,
+                                ..Default::default()
                             });
                         }
                     }

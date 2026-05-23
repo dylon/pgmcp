@@ -1,5 +1,12 @@
 //! `tool_blocking_in_async` — Detect sync I/O / std::sync::Mutex / thread::sleep
 //! inside `async fn` bodies (SOTA Phase 5.8).
+//!
+//! Phase D2b: returns two channels.
+//! - `regex_matches`: legacy regex-on-content findings (preserved as the
+//!   fallback when shadow-ASR data isn't yet populated).
+//! - `effect_intersection`: symbols carrying BOTH `async` and
+//!   `blocking_io` effects in the shadow-ASR catalog. Precise but
+//!   limited to languages whose extractor emits those effects.
 
 #![allow(unused_imports)]
 
@@ -11,7 +18,9 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::BlockingInAsyncParams;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_all_effects;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
+use crate::parsing::type_tags::vocabulary::{EFFECT_ASYNC, EFFECT_BLOCKING_IO};
 
 pub async fn tool_blocking_in_async(
     ctx: &SystemContext,
@@ -77,18 +86,45 @@ pub async fn tool_blocking_in_async(
                     "blocking_call": m.as_str(),
                 }));
                 if findings.len() >= limit.max(0) as usize {
-                    return done(&params.project, findings);
+                    let effect_intersection = effect_channel(pool, project_id).await;
+                    return done_with_effects(&params.project, findings, effect_intersection);
                 }
             }
         }
     }
-    done(&params.project, findings)
+    let effect_intersection = effect_channel(pool, project_id).await;
+    done_with_effects(&params.project, findings, effect_intersection)
 }
 
-fn done(project: &str, findings: Vec<serde_json::Value>) -> Result<CallToolResult, McpError> {
+fn done_with_effects(
+    project: &str,
+    regex_matches: Vec<serde_json::Value>,
+    effect_intersection: Vec<serde_json::Value>,
+) -> Result<CallToolResult, McpError> {
     json_result(&json!({
         "project": project,
-        "matches": findings,
-        "guidance": "Sync I/O / Mutex / sleep inside async functions blocks the runtime executor. Replace with tokio::fs, tokio::sync::Mutex, tokio::time::sleep, or a spawn_blocking shim."
+        "regex_matches": regex_matches,
+        "effect_intersection": effect_intersection,
+        "guidance": "Sync I/O / Mutex / sleep inside async functions blocks the runtime executor. Replace with tokio::fs, tokio::sync::Mutex, tokio::time::sleep, or a spawn_blocking shim. The `effect_intersection` channel surfaces symbols where the extractor flagged BOTH async and blocking_io effects (Rust backend only as of this writing)."
     }))
+}
+
+async fn effect_channel(pool: &sqlx::PgPool, project_id: i32) -> Vec<serde_json::Value> {
+    // Symbols carrying BOTH `async` and `blocking_io` effects: the
+    // structured complement to the regex pass. Currently only the Rust
+    // backend emits both, but the API is uniform.
+    let effects = vec![EFFECT_ASYNC.to_string(), EFFECT_BLOCKING_IO.to_string()];
+    symbols_with_all_effects(pool, project_id, &effects)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(symbol_id, file_id, name, scope_path)| {
+            json!({
+                "symbol_id": symbol_id,
+                "file_id": file_id,
+                "name": name,
+                "scope_path": scope_path,
+            })
+        })
+        .collect()
 }

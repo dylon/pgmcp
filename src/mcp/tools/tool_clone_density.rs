@@ -12,8 +12,10 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::CloneDensityParams;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::mcp::tools::sota_regex_scan::scan_files_for_pattern;
+use crate::parsing::type_tags::vocabulary::EFFECT_CLONE_CALL;
 
 pub async fn tool_clone_density(
     ctx: &SystemContext,
@@ -65,9 +67,21 @@ pub async fn tool_clone_density(
         .iter()
         .map(|(p, c, r, w)| json!({"file": p, "clones": c, "pagerank": r, "weighted_score": w}))
         .collect();
+    // Shadow-ASR channel: symbols flagged with the `clone_call` effect.
+    let effect_symbols = symbols_with_effect(pool, project_id, EFFECT_CLONE_CALL)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(symbol_id, file_id, name, scope_path)| {
+            serde_json::json!({
+                "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
+            })
+        })
+        .collect::<Vec<_>>();
     json_result(&json!({
         "project": params.project,
         "files": files,
+        "effect_symbols": effect_symbols,
         "guidance": "Clone density × PageRank surfaces allocation hotspots before profiling. High-centrality + many `.clone()` calls = likely refactor target."
     }))
 }

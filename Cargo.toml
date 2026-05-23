@@ -122,6 +122,12 @@ tree-sitter-cpp = "0.23"
 # `tree-sitter-rholang` style); aliased here so usage matches the convention.
 # Migration path: switch to a published crate once available.
 tree-sitter-rholang = { package = "rholang-tree-sitter", path = "/home/dylon/Workspace/f1r3fly.io/rholang-rs/rholang-tree-sitter" }
+# MeTTa grammar lives in the user's local MeTTa-Compiler workspace; depend by
+# path. The crate exports `language()` (function), not a `LANGUAGE` constant,
+# so backend init calls `tree_sitter_metta::language()` and converts via
+# `Into<tree_sitter::Language>`. Migration path: switch to a published crate
+# once available.
+tree-sitter-metta = { package = "tree-sitter-metta", path = "/home/dylon/Workspace/f1r3fly.io/MeTTa-Compiler/tree-sitter-metta" }
 tree-sitter-clojure = "0.1"
 # Formal-verification grammars (post-SOTA addition). Coq has no published
 # tree-sitter crate yet — Coq's symbol/import extraction uses regex

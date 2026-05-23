@@ -136,12 +136,22 @@ mod tests {
         assert!(fired.load(Ordering::Acquire));
     }
 
+    /// Determinism fix (2026-05-23): the 1-second test timeout was
+    /// raised to 30 seconds. The 10 ms-sleep thread joins trivially
+    /// under normal conditions, but under heavy parallel test load
+    /// (nextest running release mode against the full suite of reactive
+    /// / topic / k-selector proptests) the `join_with_timeout` helper
+    /// thread can be starved long enough that `recv_timeout` fires
+    /// before the helper schedules — same scheduler-jitter pattern as
+    /// the reactive-operators flake fixes in `src/reactive/operators.rs`.
+    /// 30 s is far above any plausible jitter while still bounded
+    /// enough that an actual hang fails the test in well under a minute.
     #[test]
     fn join_with_timeout_returns_ok_for_fast_thread() {
         let handle = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(10));
         });
-        let result = join_with_timeout(handle, Duration::from_secs(1));
+        let result = join_with_timeout(handle, Duration::from_secs(30));
         assert!(result.is_ok(), "fast thread should join within timeout");
         assert!(result.expect("ok branch").is_ok());
     }
@@ -158,12 +168,24 @@ mod tests {
         );
     }
 
+    /// Determinism fix (2026-05-23): the 1-second test timeout was
+    /// raised to 30 seconds (this site flaked first). What the test
+    /// actually verifies — "a panicking thread doesn't cause
+    /// `join_with_timeout` to hang forever" — does not require the
+    /// panic-unwind + helper-thread `handle.join()` + crossbeam send
+    /// + `recv_timeout` round-trip to complete inside any particular
+    /// wall-clock budget; we only need a generous upper bound to
+    /// distinguish "panic surfaced quickly" from an actual hang. Under
+    /// nextest's parallel load the helper thread can be starved past
+    /// 1 second — same root cause as the reactive-operators flake
+    /// fixes (`src/reactive/operators.rs`). 30 s sits far above any
+    /// plausible scheduler jitter.
     #[test]
     fn join_with_timeout_surfaces_panic_not_hang() {
         let handle = std::thread::spawn(|| {
             panic!("deliberate panic for test");
         });
-        let result = join_with_timeout(handle, Duration::from_secs(1));
+        let result = join_with_timeout(handle, Duration::from_secs(30));
         let inner = result.expect("ok branch — panic finishes fast");
         assert!(inner.is_err(), "panic must surface as Err(JoinError)");
     }

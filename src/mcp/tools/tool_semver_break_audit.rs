@@ -14,6 +14,9 @@ use strsim::levenshtein;
 
 use crate::context::SystemContext;
 use crate::mcp::server::SemverBreakAuditParams;
+use crate::mcp::tools::sema_helpers::signatures::{
+    SignatureDescriptor, fetch_signature_descriptor, signature_shape_hash,
+};
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 
 pub async fn tool_semver_break_audit(
@@ -25,18 +28,23 @@ pub async fn tool_semver_break_audit(
     let project_id = project_id_or_err(ctx, &params.project).await?;
     let pool = pool_or_err(ctx)?;
 
-    // Current public API snapshot.
-    let now: Vec<(String, String, String)> = sqlx::query_as::<_, (String, String, String)>(
-        "SELECT f.relative_path, fs.name, fs.kind
-         FROM file_symbols fs
-         JOIN indexed_files f ON fs.file_id = f.id
-         WHERE f.project_id = $1 AND fs.visibility = 'public'",
-    )
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| McpError::internal_error(format!("API query failed: {}", e), None))?;
-    let now_set: HashSet<(String, String, String)> = now.into_iter().collect();
+    // Current public API snapshot. Carry symbol_id so we can fetch
+    // the shadow-ASR signature for each present-day public symbol.
+    let now: Vec<(i64, String, String, String)> =
+        sqlx::query_as::<_, (i64, String, String, String)>(
+            "SELECT fs.id, f.relative_path, fs.name, fs.kind
+             FROM file_symbols fs
+             JOIN indexed_files f ON fs.file_id = f.id
+             WHERE f.project_id = $1 AND fs.visibility = 'public'",
+        )
+        .bind(project_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| McpError::internal_error(format!("API query failed: {}", e), None))?;
+    let now_set: HashSet<(String, String, String)> = now
+        .iter()
+        .map(|(_, path, name, kind)| (path.clone(), name.clone(), kind.clone()))
+        .collect();
 
     // Build a "previous public API" candidate set by scanning the commit-chunk
     // text from the last N commits for public-marker patterns (Rust `pub fn` /
@@ -101,10 +109,38 @@ pub async fn tool_semver_break_audit(
             })
         })
         .collect();
+    // Shadow-ASR channel: for each present-day public function, surface
+    // its structured SignatureDescriptor (parameters, return_type,
+    // effects, signature_shape_hash). Consumers compare against their
+    // own stored historical descriptors to compute exact signature_diff
+    // via `sema_helpers::signatures::signature_diff`.
+    let mut current_signatures: Vec<serde_json::Value> = Vec::new();
+    for (id, _path, _name, kind) in &now {
+        if kind != "function" {
+            continue;
+        }
+        if let Ok(Some(desc)) = fetch_signature_descriptor(pool, *id).await {
+            let hash = signature_shape_hash(&desc);
+            current_signatures.push(json!({
+                "symbol_id": desc.symbol_id,
+                "name": desc.name,
+                "scope_path": desc.scope_path,
+                "signature_shape_hash": hash,
+                "parameters": desc.parameters,
+                "return_type": {
+                    "type_raw": desc.return_type_raw,
+                    "type_tags": desc.return_type_tags,
+                },
+                "effects": desc.effects,
+            }));
+        }
+    }
+
     json_result(&json!({
         "project": params.project,
         "window_commits": window,
         "removed_or_renamed": rows_json,
-        "guidance": "Removed/renamed public symbols are major-version breakages under semver. Rename candidates within Levenshtein <= 2 are flagged for clarification."
+        "current_public_signatures": current_signatures,
+        "guidance": "Removed/renamed public symbols are major-version breakages under semver. Rename candidates within Levenshtein <= 2 are flagged for clarification. The `current_public_signatures` channel carries structured signature descriptors (with `signature_shape_hash`) for every present-day public function — consumers can persist these per-release and diff via the canonical sema_helpers::signatures::signature_diff for precise breaking-change classification."
     }))
 }

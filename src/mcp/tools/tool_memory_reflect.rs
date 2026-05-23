@@ -120,7 +120,31 @@ pub async fn tool_memory_reflect(
         .await
         .map_err(|e| McpError::internal_error(format!("reflection failed: {}", e), None))?;
 
-    let text = serde_json::to_string_pretty(&json!(report))
+    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT se.effect, COUNT(*)::int8
+             FROM symbol_effects se
+             GROUP BY se.effect
+             ORDER BY se.effect",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
+    })
+    .await;
+
+    let envelope = serde_json::json!({
+        "report": report,
+        "effect_breakdown": effect_breakdown,
+    });
+    let text = serde_json::to_string_pretty(&envelope)
         .map_err(|e| McpError::internal_error(format!("serialize failed: {}", e), None))?;
     Ok(CallToolResult::success(vec![rmcp::model::Content::text(
         text,

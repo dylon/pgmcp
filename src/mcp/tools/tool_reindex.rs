@@ -1,4 +1,13 @@
 //! `tool_reindex` — MCP tool body, extracted from `super::super::server`.
+//!
+//! Phase D2b shadow-ASR contract (Pattern J): this is an admin tool that
+//! returns a `format!`-built status string. It does not carry a JSON
+//! envelope and is fire-and-forget at the API surface. The
+//! `effect_breakdown` channel is intentionally NOT included here.
+//! Clients can call `tool_index_stats` immediately after a reindex
+//! completes to see the post-reindex effect distribution; that tool
+//! returns the same statistics inside a JSON envelope with
+//! `effect_breakdown` populated.
 
 #![allow(unused_imports)]
 

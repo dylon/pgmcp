@@ -29,7 +29,7 @@ const CONTENT_BATCH_SIZE: usize = 256;
 
 /// Languages whose backend has a non-default `extract_function_metrics`. As
 /// new backends grow the impl, append to this list.
-const FUNCTION_METRICS_LANGUAGES: &[&str] = &["rust", "python"];
+const FUNCTION_METRICS_LANGUAGES: &[&str] = &["rust", "python", "rholang"];
 
 /// Run the full function-metrics pipeline across all projects.
 pub async fn run_function_metrics(db: &dyn DbClient, stats: &Arc<StatsTracker>) {

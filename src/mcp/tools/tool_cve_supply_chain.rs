@@ -10,7 +10,9 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::CveSupplyChainParams;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
+use crate::parsing::type_tags::vocabulary::{EFFECT_CRYPTO_WEAK, EFFECT_NETWORK, EFFECT_UNSAFE};
 use std::str::FromStr;
 
 pub async fn tool_cve_supply_chain(
@@ -102,9 +104,30 @@ pub async fn tool_cve_supply_chain(
     }
     let limit = params.limit.unwrap_or(200);
     dependencies.truncate(limit.max(0) as usize);
+    // Shadow-ASR channel: symbols carrying effects that amplify CVE
+    // blast-radius (unsafe / network / weak-crypto).
+    let risky_effect_symbols = symbols_with_any_effect(
+        pool,
+        project_id,
+        &[
+            EFFECT_UNSAFE.to_string(),
+            EFFECT_NETWORK.to_string(),
+            EFFECT_CRYPTO_WEAK.to_string(),
+        ],
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(symbol_id, file_id, name, scope_path)| {
+        serde_json::json!({
+            "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
+        })
+    })
+    .collect::<Vec<_>>();
     json_result(&json!({
         "project": params.project,
         "dependencies": dependencies,
+        "risky_effect_symbols": risky_effect_symbols,
         "guidance": "Lists every dependency parsed from lockfiles. Cross-reference with https://api.osv.dev/v1/querybatch (network access required) — pgmcp surfaces the inventory only, leaving the live CVE lookup to the operator's audit workflow."
     }))
 }

@@ -216,6 +216,80 @@ pub async fn tool_change_impact_analysis(
         }
     }
 
+    // Shadow-ASR Pattern C: add symbol-level reverse-reachability via
+    // resolved call edges. For each symbol declared in the target file,
+    // walk the reverse-edge subgraph (callers → callers-of-callers …)
+    // for `depth` hops. Files containing any reached symbol are added
+    // as additional impacted files with source "resolved_caller".
+    {
+        type SymIdRow = (i64,);
+        let target_syms: Vec<SymIdRow> =
+            sqlx::query_as("SELECT id FROM file_symbols WHERE file_id = $1")
+                .bind(target_file_id)
+                .fetch_all(ctx.db().pool().expect(
+                    "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
+                ))
+                .await
+                .unwrap_or_default();
+        let seed_ids: Vec<i64> = target_syms.iter().map(|(id,)| *id).collect();
+        if !seed_ids.is_empty() {
+            // BFS over reversed resolved edges.
+            use std::collections::{HashSet, VecDeque};
+            let mut visited: HashSet<i64> = seed_ids.iter().copied().collect();
+            let mut frontier: VecDeque<(i64, u32)> =
+                seed_ids.iter().map(|&id| (id, 0u32)).collect();
+            let max_depth = depth as u32;
+            while let Some((sid, d)) = frontier.pop_front() {
+                if d >= max_depth {
+                    continue;
+                }
+                let callers: Vec<i64> = sqlx::query_scalar(
+                    "SELECT DISTINCT sr.source_symbol_id
+                     FROM symbol_references sr
+                     WHERE sr.target_symbol_id = $1
+                       AND sr.source_symbol_id IS NOT NULL
+                       AND sr.resolution_kind IN ('exact_in_file', 'exact_via_import')",
+                )
+                .bind(sid)
+                .fetch_all(ctx.db().pool().expect(
+                    "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
+                ))
+                .await
+                .unwrap_or_default();
+                for c in callers {
+                    if visited.insert(c) {
+                        frontier.push_back((c, d + 1));
+                    }
+                }
+            }
+            // Resolve visited symbol ids to (file_id, path).
+            if !visited.is_empty() {
+                let visited_vec: Vec<i64> = visited.into_iter().collect();
+                type FileRow = (i64, String);
+                let reached_files: Vec<FileRow> = sqlx::query_as(
+                    "SELECT DISTINCT fs.file_id, f.relative_path
+                     FROM file_symbols fs
+                     JOIN indexed_files f ON f.id = fs.file_id
+                     WHERE fs.id = ANY($1::int8[])",
+                )
+                .bind(&visited_vec)
+                .fetch_all(ctx.db().pool().expect(
+                    "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
+                ))
+                .await
+                .unwrap_or_default();
+                for (fid, path) in reached_files {
+                    if fid == target_file_id {
+                        continue;
+                    }
+                    impacted
+                        .entry(fid)
+                        .or_insert((path, 0.75, "resolved_caller".to_string()));
+                }
+            }
+        }
+    }
+
     // Build result
     let mut impact_list: Vec<serde_json::Value> = impacted
         .iter()
@@ -242,7 +316,35 @@ pub async fn tool_change_impact_analysis(
         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown
+    // for the project. Universal enrichment — every tool benefits from
+    // surfacing the effect distribution alongside its primary output.
+    // Gracefully degrades to empty when the project lookup or
+    // shadow-ASR data isn't populated.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let project_id_opt: Option<i32> =
+            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
+                .bind(&params.project)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+        match project_id_opt {
+            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+                .collect(),
+            None => Vec::new(),
+        }
+    })
+    .await;
+
     let result = serde_json::json!({
+        "effect_breakdown": effect_breakdown,
         "project": params.project,
         "target_file": params.file,
         "depth": depth,

@@ -217,6 +217,29 @@ pub async fn tool_code_summarize(
         })
         .collect();
 
+    // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let project_id_opt: Option<i32> =
+            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
+                .bind(&params.project)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+        match project_id_opt {
+            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+                .collect(),
+            None => Vec::new(),
+        }
+    })
+    .await;
+
     let mut result = serde_json::json!({
         "project": params.project,
         "scope": scope,
@@ -225,6 +248,7 @@ pub async fn tool_code_summarize(
         "language_breakdown": lang_json,
         "directories": dir_json,
         "key_files": key_files,
+        "effect_breakdown": effect_breakdown,
     });
 
     if detail != "brief"

@@ -117,13 +117,47 @@ pub async fn tool_bug_prediction(
     });
     scored.truncate(limit as usize);
 
+    // Shadow-ASR channel: bug-prone-effect symbols (unsafe / may_panic /
+    // blocking_io). Composite bug-prediction can weigh these as features.
+    let bug_prone_effect_symbols = if let Some(pool) = ctx.db().pool() {
+        let project_id: Option<i32> = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
+            .bind(&params.project)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+        match project_id {
+            Some(pid) => crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect(
+                pool,
+                pid,
+                &[
+                    crate::parsing::type_tags::vocabulary::EFFECT_UNSAFE.to_string(),
+                    crate::parsing::type_tags::vocabulary::EFFECT_MAY_PANIC.to_string(),
+                    crate::parsing::type_tags::vocabulary::EFFECT_BLOCKING_IO.to_string(),
+                ],
+            )
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(symbol_id, file_id, name, scope_path)| {
+                serde_json::json!({
+                    "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
+                })
+            })
+            .collect::<Vec<_>>(),
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+
     let result = serde_json::json!({
         "project": params.project,
         "file_count": scored.len(),
         "files": scored,
+        "bug_prone_effect_symbols": bug_prone_effect_symbols,
         "guidance": "Files with high bug_score combine high churn, fix ratios, size, and coupling. \
                      Prioritize code review and testing for these files. \
-                     High fix_ratio (>0.3) means >30% of commits are bug fixes.",
+                     High fix_ratio (>0.3) means >30% of commits are bug fixes. The `bug_prone_effect_symbols` channel surfaces symbols carrying unsafe / may_panic / blocking_io effects — orthogonal to the file-level metric and useful as additional review priorities.",
     });
 
     let json = serde_json::to_string_pretty(&result)

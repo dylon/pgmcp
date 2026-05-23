@@ -1,5 +1,14 @@
 //! Lean 4 language backend using `tree-sitter-lean4`.
 //!
+//! Shadow-ASR contract: Lean has a powerful dependent type system, but
+//! extracting that requires real elaboration — well outside the scope of
+//! a tree-sitter-based pass. Symbols emitted here leave the shadow-ASR
+//! fields (`parameters`, `return_type`, `generic_params`, `effects`,
+//! `type_tags`) at their `Default::default()` values per the plan
+//! (`~/.claude/plans/would-translating-the-asts-cosmic-quill.md` § Phase
+//! C). A future revision could add lightweight extraction of explicit
+//! `(x : T)` binders without attempting elaboration.
+//!
 //! Symbol queries cover definition (def/theorem/lemma/abbrev) /
 //! inductive / structure / opaque / axiom / class_inductive / namespace.
 //! Import queries handle `import Foo.Bar` statements. The grammar's `name`
@@ -139,6 +148,7 @@ impl LanguageBackend for LeanBackend {
                     visibility: Some("public".into()),
                     signature: None,
                     name,
+                    ..Default::default()
                 });
             }
         }

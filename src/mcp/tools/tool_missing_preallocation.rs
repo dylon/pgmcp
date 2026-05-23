@@ -13,6 +13,7 @@ use crate::context::SystemContext;
 use crate::mcp::server::MissingPreallocationParams;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::mcp::tools::sota_regex_scan::scan_files_for_pattern;
+use crate::parsing::type_tags::vocabulary::{TAG_CONTAINER, TAG_DYNAMIC};
 
 pub async fn tool_missing_preallocation(
     ctx: &SystemContext,
@@ -34,9 +35,55 @@ pub async fn tool_missing_preallocation(
         .into_iter()
         .map(|h| json!({"file": h.relative_path, "language": h.language, "line": h.line, "snippet": h.snippet}))
         .collect();
+    // Shadow-ASR channel: symbols whose parameters are dynamic containers.
+    let dynamic_container_symbols: Vec<serde_json::Value> =
+        sqlx::query_as::<_, (i64, i64, String, Option<String>)>(
+            "SELECT DISTINCT fs.id, fs.file_id, fs.name, fs.scope_path
+         FROM file_symbols fs
+         JOIN indexed_files f ON f.id = fs.file_id
+         JOIN symbol_parameters p ON p.symbol_id = fs.id
+         WHERE f.project_id = $1
+           AND p.type_tags @> ARRAY[$2, $3]::text[]
+         ORDER BY fs.file_id",
+        )
+        .bind(project_id)
+        .bind(TAG_CONTAINER)
+        .bind(TAG_DYNAMIC)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(symbol_id, file_id, name, scope_path)| {
+            serde_json::json!({
+                "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
+            })
+        })
+        .collect();
+    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT se.effect, COUNT(*)::int8
+             FROM symbol_effects se
+             GROUP BY se.effect
+             ORDER BY se.effect",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
+    })
+    .await;
+
     json_result(&json!({
+        "effect_breakdown": effect_breakdown,
         "project": params.project,
         "matches": rows,
+        "dynamic_container_symbols": dynamic_container_symbols,
         "guidance": "Default empty constructors followed by loops can be preallocated when the bound is known (Vec::with_capacity, HashMap::with_capacity). Inspect surrounding code for a known size hint."
     }))
 }

@@ -326,6 +326,20 @@ pub async fn tool_engineering_scorecard(
         dim_json
     };
 
+    // Shadow-ASR channel: per-effect symbol-count breakdown feeds the
+    // scorecard's "effect hygiene" view (consumers can build an effect-
+    // health letter grade from this).
+    let effect_breakdown = if let Some(pool) = ctx.db().pool() {
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
     let result = serde_json::json!({
         "project": params.project,
         "gpa": format!("{:.2}", gpa),
@@ -333,6 +347,7 @@ pub async fn tool_engineering_scorecard(
         "dimensions": filtered_dims,
         "orr_checklist": orr,
         "orr_pass": orr_pass,
+        "effect_breakdown": effect_breakdown,
         "project_stats": {
             "files": stats.file_count,
             "lines": stats.total_lines,

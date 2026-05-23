@@ -84,8 +84,41 @@ pub async fn tool_grep(
         .map(|m| build_hit(m, &params.pattern, before, after, case_insensitive))
         .collect();
 
+    // Shadow-ASR Pattern D filter — restrict hits to enclosing-symbol facets.
+    let hits = crate::mcp::tools::sema_helpers::filters::enclosing_symbol_filter_pass(
+        ctx.db().pool(),
+        hits,
+        params.return_type_tags.as_deref(),
+        params.effects.as_deref(),
+        params.scope_kind.as_deref(),
+    )
+    .await;
     let count = hits.len();
-    let json = serde_json::to_string_pretty(&hits)
+    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT se.effect, COUNT(*)::int8
+             FROM symbol_effects se
+             GROUP BY se.effect
+             ORDER BY se.effect",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
+    })
+    .await;
+
+    let envelope = serde_json::json!({
+        "hits": hits,
+        "effect_breakdown": effect_breakdown,
+    });
+    let json = serde_json::to_string_pretty(&envelope)
         .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
 
     debug!(

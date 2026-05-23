@@ -95,18 +95,69 @@ pub async fn tool_compare_files(
         "different"
     };
 
+    // Shadow-ASR channel (Phase D2b): per-file effect distribution. For
+    // each file, list the effects carried by symbols in that file.
+    // Useful for confirming that two files which look similar by content
+    // also carry similar effect surfaces.
+    type EffectRow = (String, i64);
+    let per_file_effects = |file_id: i64| async move {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::<serde_json::Value>::new();
+        };
+        let rows: Vec<EffectRow> = sqlx::query_as(
+            "SELECT se.effect, COUNT(*)::int8
+             FROM symbol_effects se
+             JOIN file_symbols fs ON fs.id = se.symbol_id
+             WHERE fs.file_id = $1
+             GROUP BY se.effect
+             ORDER BY se.effect",
+        )
+        .bind(file_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
+    };
+    let effects_a = per_file_effects(ref_a.file_id).await;
+    let effects_b = per_file_effects(ref_b.file_id).await;
+
+    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT se.effect, COUNT(*)::int8
+             FROM symbol_effects se
+             GROUP BY se.effect
+             ORDER BY se.effect",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
+    })
+    .await;
+
     let result = serde_json::json!({
+        "effect_breakdown": effect_breakdown,
         "file_a": {
             "path": ref_a.path,
             "project": ref_a.project_name,
             "language": ref_a.language,
             "line_count": ref_a.line_count,
+            "effects": effects_a,
         },
         "file_b": {
             "path": ref_b.path,
             "project": ref_b.project_name,
             "language": ref_b.language,
             "line_count": ref_b.line_count,
+            "effects": effects_b,
         },
         "overall_similarity": format!("{:.4}", overall_similarity),
         "verdict": verdict,

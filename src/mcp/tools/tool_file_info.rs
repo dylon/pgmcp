@@ -86,7 +86,32 @@ pub async fn tool_file_info(
         last_chunk_line: summary.last_chunk_line,
     };
 
-    let json = serde_json::to_string_pretty(&enriched)
+    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT se.effect, COUNT(*)::int8
+             FROM symbol_effects se
+             GROUP BY se.effect
+             ORDER BY se.effect",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
+    })
+    .await;
+
+    let envelope = serde_json::json!({
+        "enriched": enriched,
+        "effect_breakdown": effect_breakdown,
+    });
+
+    let json = serde_json::to_string_pretty(&envelope)
         .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
     debug!(
         tool = "file_info",

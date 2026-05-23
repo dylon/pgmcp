@@ -10,6 +10,9 @@ use std::sync::OnceLock;
 
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
+#[path = "python/type_mapper.rs"]
+mod type_mapper;
+
 use crate::parsing::backend::LanguageBackend;
 use crate::parsing::complexity;
 use crate::parsing::function_metrics::{
@@ -104,6 +107,37 @@ fn python_visibility(name: &str) -> Option<String> {
     Some("public".into())
 }
 
+/// Build a dotted Python scope path for a symbol — walks up `class_definition`
+/// ancestors, prepending their names. Top-level symbols get just their own name.
+fn python_scope_path(node: Node<'_>, src: &str, name: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cursor = node.parent();
+    while let Some(p) = cursor {
+        if (p.kind() == "class_definition" || p.kind() == "function_definition")
+            && let Some(n) = p.child_by_field_name("name")
+        {
+            parts.push(node_text(n, src).to_string());
+        }
+        cursor = p.parent();
+    }
+    parts.reverse();
+    parts.push(name.to_string());
+    parts.join(".")
+}
+
+/// Depth = number of enclosing class/function scopes.
+fn python_scope_depth(node: Node<'_>) -> u32 {
+    let mut depth: u32 = 0;
+    let mut cursor = node.parent();
+    while let Some(p) = cursor {
+        if p.kind() == "class_definition" || p.kind() == "function_definition" {
+            depth = depth.saturating_add(1);
+        }
+        cursor = p.parent();
+    }
+    depth
+}
+
 fn is_screaming_snake(name: &str) -> bool {
     if name.is_empty() {
         return false;
@@ -143,6 +177,9 @@ impl LanguageBackend for PythonBackend {
                         if let Some(name_node) = node.child_by_field_name("name") {
                             let name = node_text(name_node, content).to_string();
                             let signature = first_line(content, node);
+                            let generic_params = type_mapper::generics_for_class(node, content);
+                            let scope_path = python_scope_path(node, content, &name);
+                            let scope_depth = python_scope_depth(node);
                             out.push(Symbol {
                                 file_id: 0,
                                 kind: SymbolKind::Class,
@@ -152,6 +189,10 @@ impl LanguageBackend for PythonBackend {
                                 visibility: python_visibility(&name),
                                 signature: Some(signature),
                                 name,
+                                generic_params,
+                                scope_path: Some(scope_path),
+                                scope_depth: Some(scope_depth),
+                                ..Default::default()
                             });
                         }
                     }
@@ -159,6 +200,17 @@ impl LanguageBackend for PythonBackend {
                         if let Some(name_node) = node.child_by_field_name("name") {
                             let name = node_text(name_node, content).to_string();
                             let signature = first_line(content, node);
+                            let parameters = node
+                                .child_by_field_name("parameters")
+                                .map(|p| type_mapper::parameters_from_node(p, content))
+                                .unwrap_or_default();
+                            let return_type = Some(type_mapper::return_type_from_node(
+                                node.child_by_field_name("return_type"),
+                                content,
+                            ));
+                            let effects = type_mapper::effects_for_function(node, content);
+                            let scope_path = python_scope_path(node, content, &name);
+                            let scope_depth = python_scope_depth(node);
                             out.push(Symbol {
                                 file_id: 0,
                                 kind: SymbolKind::Function,
@@ -168,6 +220,12 @@ impl LanguageBackend for PythonBackend {
                                 visibility: python_visibility(&name),
                                 signature: Some(signature),
                                 name,
+                                parameters,
+                                return_type,
+                                effects,
+                                scope_path: Some(scope_path),
+                                scope_depth: Some(scope_depth),
+                                ..Default::default()
                             });
                         }
                     }
@@ -183,6 +241,7 @@ impl LanguageBackend for PythonBackend {
                                 visibility: python_visibility(&name),
                                 signature: Some(name.clone()),
                                 name,
+                                ..Default::default()
                             });
                         }
                     }

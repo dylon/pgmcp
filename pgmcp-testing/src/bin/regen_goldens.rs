@@ -101,6 +101,25 @@ const GENERATORS: &[(&str, Generator)] = &[
     ),
     // FCM (float)
     ("fcm/two_blobs_seed_42", regen_fcm_two_blobs_seed_42),
+    // Shadow-ASR semantic extraction goldens (Phase D2b verification).
+    // Each fixture pairs a small canonical source snippet with the
+    // expected Symbol vector emitted by the language backend. Captures
+    // signature shape, parameter type tags, effects, and scope_path —
+    // the per-language contract the unified-semantic-representation
+    // plan calls out.
+    ("semantic_extraction/rust_basic", regen_semantic_rust_basic),
+    (
+        "semantic_extraction/python_basic",
+        regen_semantic_python_basic,
+    ),
+    (
+        "semantic_extraction/metta_typed_rule",
+        regen_semantic_metta_typed_rule,
+    ),
+    (
+        "semantic_extraction/rholang_contract",
+        regen_semantic_rholang_contract,
+    ),
 ];
 
 // ============================================================================
@@ -531,4 +550,105 @@ fn regen_fcm_two_blobs_seed_42(name: &str) -> RegenStatus {
     };
     let output = run_fcm(&input);
     regen_golden(name, input, output, Some(1e-5))
+}
+
+// ============================================================================
+// Shadow-ASR semantic-extraction goldens
+// ============================================================================
+//
+// Tiny canonical source snippets per language; each fixture pairs an
+// input `(content, language)` with the symbol vector emitted by the
+// per-language backend. Captures the shadow-ASR contract: structured
+// parameters, return type tags, effects, scope_path.
+//
+// Schema is the `Symbol` struct from `src/parsing/symbols.rs`. The
+// Golden envelope round-trips it via postcard exactly like any other
+// fixture.
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SemanticExtractionInput {
+    pub content: String,
+    pub language: String,
+}
+
+fn run_semantic_extraction(
+    input: &SemanticExtractionInput,
+) -> Vec<pgmcp::parsing::symbols::Symbol> {
+    use pgmcp::parsing::registry::LanguageRegistry;
+    let Some(backend) = LanguageRegistry::for_language(&input.language) else {
+        return Vec::new();
+    };
+    backend.extract_symbols(&input.content)
+}
+
+fn regen_semantic_rust_basic(name: &str) -> RegenStatus {
+    let input = SemanticExtractionInput {
+        content: concat!(
+            "use std::collections::HashMap;\n",
+            "\n",
+            "pub async fn authenticate(user_id: u64, token: &str) -> Result<bool, String> {\n",
+            "    Ok(true)\n",
+            "}\n",
+            "\n",
+            "pub fn build_map() -> HashMap<String, u64> {\n",
+            "    HashMap::new()\n",
+            "}\n",
+        )
+        .to_string(),
+        language: "rust".into(),
+    };
+    let output = run_semantic_extraction(&input);
+    regen_golden(name, input, output, None)
+}
+
+fn regen_semantic_python_basic(name: &str) -> RegenStatus {
+    let input = SemanticExtractionInput {
+        content: concat!(
+            "from typing import Optional\n",
+            "\n",
+            "async def authenticate(user_id: int, token: str) -> Optional[bool]:\n",
+            "    return True\n",
+            "\n",
+            "def build_dict() -> dict[str, int]:\n",
+            "    return {}\n",
+        )
+        .to_string(),
+        language: "python".into(),
+    };
+    let output = run_semantic_extraction(&input);
+    regen_golden(name, input, output, None)
+}
+
+fn regen_semantic_metta_typed_rule(name: &str) -> RegenStatus {
+    let input = SemanticExtractionInput {
+        content: concat!(
+            "(: identity (-> $a $a))\n",
+            "(= (identity $x) $x)\n",
+            "(: pair (-> $a $b (Pair $a $b)))\n",
+            "(= (pair $x $y) (Pair $x $y))\n",
+        )
+        .to_string(),
+        language: "metta".into(),
+    };
+    let output = run_semantic_extraction(&input);
+    regen_golden(name, input, output, None)
+}
+
+fn regen_semantic_rholang_contract(name: &str) -> RegenStatus {
+    let input = SemanticExtractionInput {
+        content: concat!(
+            "new auth, store in {\n",
+            "  contract auth(@user_id, @token, ret) = {\n",
+            "    store!(*user_id) |\n",
+            "    for(@_ <- store) {\n",
+            "      ret!(true)\n",
+            "    }\n",
+            "  }\n",
+            "}\n",
+        )
+        .to_string(),
+        language: "rholang".into(),
+    };
+    let output = run_semantic_extraction(&input);
+    regen_golden(name, input, output, None)
 }

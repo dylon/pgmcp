@@ -2,7 +2,10 @@
 //!
 //! Reads `function_metrics.panic_paths` produced by the function-metrics cron
 //! (which already counts `panic!`/`unwrap`/`expect`/`assert!` etc. per
-//! function). Joins with `file_symbols` to surface paths.
+//! function). Joins with `file_symbols` to surface paths. Phase D2b adds a
+//! `effect_marked` channel listing symbols whose extractor flagged them
+//! with the `may_panic` effect — a precise complement to the metric-based
+//! count.
 
 #![allow(unused_imports)]
 
@@ -13,7 +16,9 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::PanicPathsParams;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
+use crate::parsing::type_tags::vocabulary::EFFECT_MAY_PANIC;
 
 pub async fn tool_panic_paths(
     ctx: &SystemContext,
@@ -64,10 +69,28 @@ pub async fn tool_panic_paths(
             })
         })
         .collect();
+    // Shadow-ASR channel: symbols flagged with `may_panic` effect by
+    // the per-language extractor. Complements `function_metrics.panic_paths`
+    // (which is a count) with a yes/no boolean per symbol.
+    let effect_marked = symbols_with_effect(pool, project_id, EFFECT_MAY_PANIC)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(symbol_id, file_id, name, scope_path)| {
+            json!({
+                "symbol_id": symbol_id,
+                "file_id": file_id,
+                "name": name,
+                "scope_path": scope_path,
+            })
+        })
+        .collect::<Vec<_>>();
+
     json_result(&json!({
         "project": params.project,
         "entry_filter": entry_filter,
         "functions": funcs,
-        "guidance": "Functions with high panic-leaf counts crash on unexpected input. Public functions are worst because they have no caller-controllable input validation upstream."
+        "effect_marked": effect_marked,
+        "guidance": "Functions with high panic-leaf counts crash on unexpected input. Public functions are worst because they have no caller-controllable input validation upstream. The `effect_marked` channel surfaces every symbol the extractor tagged with `may_panic` — useful when you want a binary `panics?` answer rather than the count-based metric."
     }))
 }

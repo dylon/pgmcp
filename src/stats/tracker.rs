@@ -296,6 +296,8 @@ pub struct StatsTracker {
     // Similarity analysis counters
     pub similarity_scans: AtomicU64,
     pub similarity_pairs_found: AtomicU64,
+    /// Cross-language signature-clone pairs inserted in the latest pass.
+    pub cross_language_pairs_found: AtomicU64,
 
     // Topic clustering counters
     pub topic_scans: AtomicU64,
@@ -693,6 +695,7 @@ impl StatsTracker {
             config_reload_errors: AtomicU64::new(0),
             similarity_scans: AtomicU64::new(0),
             similarity_pairs_found: AtomicU64::new(0),
+            cross_language_pairs_found: AtomicU64::new(0),
             topic_scans: AtomicU64::new(0),
             topics_discovered: AtomicU64::new(0),
             topic_noise_chunks: AtomicU64::new(0),

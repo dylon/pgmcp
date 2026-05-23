@@ -21,6 +21,10 @@
 // tool_architecture_violations.rs and tool_circular_dependencies.rs).
 pub mod fix_actions;
 pub mod fix_helpers;
+// `sema_helpers` is the home for shadow-ASR-aware JOIN patterns shared
+// across the Phase D2b tool upgrades (signatures, effects, resolved
+// edges, type-tag filters, cross-language equivalence reads).
+pub mod sema_helpers;
 pub mod sota_helpers;
 pub mod sota_regex_scan;
 
@@ -42,15 +46,18 @@ pub mod tool_community_detection;
 pub mod tool_compare_files;
 pub mod tool_complexity_hotspots;
 pub mod tool_coupling_cohesion_report;
+pub mod tool_cross_language_api_equivalents;
 pub mod tool_dependency_graph;
 pub mod tool_dependency_health;
 pub mod tool_design_metrics;
 pub mod tool_design_smell_detection;
 pub mod tool_discover_topics;
 pub mod tool_doc_coverage_gaps;
+pub mod tool_effect_propagation;
 pub mod tool_engineering_scorecard;
 pub mod tool_extraction_candidates;
 pub mod tool_file_info;
+pub mod tool_find_callers_by_signature;
 pub mod tool_find_coupled_files;
 pub mod tool_find_duplicates;
 pub mod tool_find_misplaced_code;
@@ -90,6 +97,7 @@ pub mod tool_search_mandates;
 pub mod tool_semantic_search;
 pub mod tool_session_mandates;
 pub mod tool_shotgun_surgery_fix;
+pub mod tool_signature_lint;
 pub mod tool_software_patterns;
 pub mod tool_stale_zombie;
 pub mod tool_suggest_merges;
@@ -100,6 +108,8 @@ pub mod tool_test_coverage_gaps;
 pub mod tool_text_search;
 pub mod tool_topic_hierarchy;
 pub mod tool_topic_hierarchy_fcm;
+pub mod tool_type_shape_search;
+pub mod tool_type_tag_dictionary;
 
 // SOTA Phase 2 — graph algorithms
 pub mod tool_attack_vulnerability;
@@ -212,15 +222,18 @@ pub use tool_community_detection::tool_community_detection;
 pub use tool_compare_files::tool_compare_files;
 pub use tool_complexity_hotspots::tool_complexity_hotspots;
 pub use tool_coupling_cohesion_report::tool_coupling_cohesion_report;
+pub use tool_cross_language_api_equivalents::tool_cross_language_api_equivalents;
 pub use tool_dependency_graph::tool_dependency_graph;
 pub use tool_dependency_health::tool_dependency_health;
 pub use tool_design_metrics::tool_design_metrics;
 pub use tool_design_smell_detection::tool_design_smell_detection;
 pub use tool_discover_topics::tool_discover_topics;
 pub use tool_doc_coverage_gaps::tool_doc_coverage_gaps;
+pub use tool_effect_propagation::tool_effect_propagation;
 pub use tool_engineering_scorecard::tool_engineering_scorecard;
 pub use tool_extraction_candidates::tool_extraction_candidates;
 pub use tool_file_info::tool_file_info;
+pub use tool_find_callers_by_signature::tool_find_callers_by_signature;
 pub use tool_find_coupled_files::tool_find_coupled_files;
 pub use tool_find_duplicates::tool_find_duplicates;
 pub use tool_find_misplaced_code::tool_find_misplaced_code;
@@ -253,6 +266,7 @@ pub use tool_search_commits::tool_search_commits;
 pub use tool_search_mandates::tool_search_mandates;
 pub use tool_semantic_search::tool_semantic_search;
 pub use tool_shotgun_surgery_fix::tool_shotgun_surgery_fix;
+pub use tool_signature_lint::tool_signature_lint;
 pub use tool_software_patterns::{
     tool_get_software_pattern, tool_list_software_patterns, tool_pattern_catalog_stats,
     tool_recommend_design_patterns, tool_refresh_pattern_catalog, tool_review_design_patterns,
@@ -267,3 +281,5 @@ pub use tool_test_coverage_gaps::tool_test_coverage_gaps;
 pub use tool_text_search::tool_text_search;
 pub use tool_topic_hierarchy::tool_topic_hierarchy;
 pub use tool_topic_hierarchy_fcm::tool_topic_hierarchy_fcm;
+pub use tool_type_shape_search::tool_type_shape_search;
+pub use tool_type_tag_dictionary::tool_type_tag_dictionary;

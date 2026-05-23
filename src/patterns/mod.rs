@@ -26,9 +26,11 @@ mod functional;
 mod gof;
 mod idioms;
 mod kubernetes;
+mod metaprogramming;
 mod ml_ai;
 mod observability;
 mod principles;
+mod process_calculus;
 mod security;
 mod solid_grasp;
 mod sources;
@@ -199,6 +201,18 @@ pub fn paradigm_seeds() -> Vec<ParadigmSeed> {
             description: "Theory and practice of recognizers, generators, transducers, parsers, lexers, and string-index automata; covers finite/pushdown/tree/ω-automata, parser families, string-index data structures, edit-distance and approximate-matching automata, phonetic encoders, abstract machines, term rewriting, and probabilistic grammars.",
             wikipedia_url: "https://en.wikipedia.org/wiki/Automata_theory",
         },
+        ParadigmSeed {
+            slug: "process_calculus",
+            name: "Process calculus",
+            description: "Formal models of concurrent systems built from message-passing processes, channels, and structural composition — π-calculus, ambient calculus, join calculus, CSP, CCS, and the reflective π-calculus underlying Rholang.",
+            wikipedia_url: "https://en.wikipedia.org/wiki/Process_calculus",
+        },
+        ParadigmSeed {
+            slug: "metaprogramming",
+            name: "Metaprogramming",
+            description: "Programs that manipulate, transform, or generate other programs as data — term rewriting, macro systems, code generation, reflective evaluation, partial evaluation, staged compilation, and hyperedge graph rewriting (MeTTa, Hyperon, Scheme macros, Lisp DSLs).",
+            wikipedia_url: "https://en.wikipedia.org/wiki/Metaprogramming",
+        },
     ]
 }
 
@@ -225,6 +239,8 @@ pub fn pattern_seeds() -> Vec<PatternSeed> {
     v.extend(distributed_data::seeds());
     v.extend(kubernetes::seeds());
     v.extend(automata::seeds());
+    v.extend(process_calculus::seeds());
+    v.extend(metaprogramming::seeds());
     v
 }
 

@@ -54,11 +54,32 @@ pub async fn tool_trigger_cron(
         }
         "function-metrics" => {
             crate::cron::function_metrics::run_function_metrics(db.as_ref(), stats).await;
+            // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
+            let effect_breakdown: Vec<serde_json::Value> = (async {
+                let Some(pool) = ctx.db().pool() else {
+                    return Vec::new();
+                };
+                let rows: Vec<(String, i64)> = sqlx::query_as(
+                    "SELECT se.effect, COUNT(*)::int8
+             FROM symbol_effects se
+             GROUP BY se.effect
+             ORDER BY se.effect",
+                )
+                .fetch_all(pool)
+                .await
+                .unwrap_or_default();
+                rows.into_iter()
+                    .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+                    .collect()
+            })
+            .await;
+
             json_result(&json!({
-                "job": params.job,
-                "status": "completed",
-                "guidance": "Function metrics populated (cyclomatic, cognitive, Halstead, NPath, MI).",
-            }))
+            "effect_breakdown": effect_breakdown,
+                    "job": params.job,
+                    "status": "completed",
+                    "guidance": "Function metrics populated (cyclomatic, cognitive, Halstead, NPath, MI).",
+                }))
         }
         other => Err(McpError::invalid_params(
             format!(

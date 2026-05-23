@@ -1,5 +1,7 @@
 use super::backend::LanguageBackend;
-use super::{c_cpp, clojure, coq, java, javascript, lean, python, rholang, rust, scala, tlaplus};
+use super::{
+    c_cpp, clojure, coq, java, javascript, lean, metta, python, rholang, rust, scala, tlaplus,
+};
 
 /// Registry: dispatches a language string to the matching backend, or `None`
 /// when no backend has been wired yet.
@@ -22,6 +24,7 @@ impl LanguageRegistry {
             "c" => Some(&c_cpp::C_BACKEND),
             "cpp" => Some(&c_cpp::CPP_BACKEND),
             "rholang" => Some(&rholang::RHOLANG_BACKEND),
+            "metta" => Some(&metta::METTA_BACKEND),
             "clojure" => Some(&clojure::CLOJURE_BACKEND),
             "clojurescript" => Some(&clojure::CLOJURESCRIPT_BACKEND),
             // Formal-verification backends.

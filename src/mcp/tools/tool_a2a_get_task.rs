@@ -41,5 +41,26 @@ pub async fn tool_a2a_get_task(
         .get_task(task_id)
         .await
         .map_err(|e| McpError::internal_error(format!("A2A get failed: {}", e), None))?;
-    json_result(&json!({"target_agent": params.target_agent, "task": task}))
+    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT se.effect, COUNT(*)::int8
+             FROM symbol_effects se
+             GROUP BY se.effect
+             ORDER BY se.effect",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
+    })
+    .await;
+
+    json_result(&json!({
+        "effect_breakdown": effect_breakdown,"target_agent": params.target_agent, "task": task}))
 }

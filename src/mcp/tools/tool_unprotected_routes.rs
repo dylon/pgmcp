@@ -11,7 +11,9 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::UnprotectedRoutesParams;
+use crate::mcp::tools::sema_helpers::effects::{symbols_with_all_effects, symbols_with_effect};
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
+use crate::parsing::type_tags::vocabulary::{EFFECT_AUTH_REQUIRED, EFFECT_HTTP_HANDLER};
 
 pub async fn tool_unprotected_routes(
     ctx: &SystemContext,
@@ -63,9 +65,37 @@ pub async fn tool_unprotected_routes(
             break;
         }
     }
+    // Shadow-ASR channel: route handler symbols flagged with `http_handler`
+    // but NOT carrying `auth_required`. Requires the extractor to emit
+    // both effects; degrades to empty when absent.
+    let http_handler_symbols = symbols_with_effect(pool, project_id, EFFECT_HTTP_HANDLER)
+        .await
+        .unwrap_or_default();
+    let with_auth = symbols_with_all_effects(
+        pool,
+        project_id,
+        &[
+            EFFECT_HTTP_HANDLER.to_string(),
+            EFFECT_AUTH_REQUIRED.to_string(),
+        ],
+    )
+    .await
+    .unwrap_or_default();
+    let auth_set: std::collections::HashSet<i64> =
+        with_auth.iter().map(|(id, _, _, _)| *id).collect();
+    let http_handler_symbols: Vec<serde_json::Value> = http_handler_symbols
+        .into_iter()
+        .filter(|(id, _, _, _)| !auth_set.contains(id))
+        .map(|(symbol_id, file_id, name, scope_path)| {
+            serde_json::json!({
+                "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
+            })
+        })
+        .collect();
     json_result(&json!({
         "project": params.project,
         "matches": findings,
+        "http_handler_symbols": http_handler_symbols,
         "guidance": "Routes with mutating verbs (POST/PUT/DELETE/PATCH) in files lacking visible auth middleware are review candidates. A complete check requires per-route middleware-stack inspection beyond regex."
     }))
 }

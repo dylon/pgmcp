@@ -258,7 +258,44 @@ pub async fn tool_dependency_graph(
         }
     };
 
-    let json = serde_json::to_string_pretty(&result)
+    // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown for
+    // the project. Lets consumers correlate dependency-graph topology with
+    // effect concentration (e.g., is the most-imported file the one
+    // carrying all the `unsafe` effects?).
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let project_id_opt: Option<i32> =
+            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
+                .bind(&params.project)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+        match project_id_opt {
+            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+                .collect(),
+            None => Vec::new(),
+        }
+    })
+    .await;
+
+    let result_with_effects = match result {
+        serde_json::Value::Object(mut m) => {
+            m.insert(
+                "effect_breakdown".to_string(),
+                serde_json::json!(effect_breakdown),
+            );
+            serde_json::Value::Object(m)
+        }
+        other => other,
+    };
+
+    let json = serde_json::to_string_pretty(&result_with_effects)
         .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
 
     debug!(

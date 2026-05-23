@@ -16,7 +16,11 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::TaintAnalysisParams;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
+use crate::parsing::type_tags::vocabulary::{
+    EFFECT_CRYPTO, EFFECT_DATABASE, EFFECT_FILESYSTEM, EFFECT_NETWORK,
+};
 
 pub async fn tool_taint_analysis(
     ctx: &SystemContext,
@@ -72,9 +76,35 @@ pub async fn tool_taint_analysis(
             break;
         }
     }
+    // Shadow-ASR channel: symbols carrying any of the I/O-shaped effects
+    // (`network`, `filesystem`, `database`, `crypto`). These are
+    // candidates for taint sinks even when the regex didn't match —
+    // useful for cross-checking the regex findings or when the regex
+    // misses a sink that the extractor caught structurally.
+    let io_effects = vec![
+        EFFECT_NETWORK.to_string(),
+        EFFECT_FILESYSTEM.to_string(),
+        EFFECT_DATABASE.to_string(),
+        EFFECT_CRYPTO.to_string(),
+    ];
+    let io_symbols = symbols_with_any_effect(pool, project_id, &io_effects)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(symbol_id, file_id, name, scope_path)| {
+            json!({
+                "symbol_id": symbol_id,
+                "file_id": file_id,
+                "name": name,
+                "scope_path": scope_path,
+            })
+        })
+        .collect::<Vec<_>>();
+
     json_result(&json!({
         "project": params.project,
         "findings": findings,
-        "guidance": "Files where both sources (request/env/stdin) and sinks (exec/eval/SQL) appear are taint candidates. Manual review needed to confirm flow."
+        "io_effect_symbols": io_symbols,
+        "guidance": "Files where both sources (request/env/stdin) and sinks (exec/eval/SQL) appear are taint candidates. Manual review needed to confirm flow. The `io_effect_symbols` channel surfaces symbols carrying network/filesystem/database/crypto effects — candidates for sinks beyond the regex's matching surface."
     }))
 }

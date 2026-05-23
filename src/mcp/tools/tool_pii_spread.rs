@@ -14,7 +14,9 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::PiiSpreadParams;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
+use crate::parsing::type_tags::vocabulary::{EFFECT_DATABASE, EFFECT_IO, EFFECT_NETWORK};
 
 const PII_TOKENS: &[&str] = &[
     "ssn",
@@ -168,10 +170,31 @@ pub async fn tool_pii_spread(
             break;
         }
     }
+    // Shadow-ASR channel: symbols touching network/database/IO effects —
+    // candidate sinks where PII might leak after flowing through.
+    let sink_effect_symbols = symbols_with_any_effect(
+        pool,
+        project_id,
+        &[
+            EFFECT_NETWORK.to_string(),
+            EFFECT_DATABASE.to_string(),
+            EFFECT_IO.to_string(),
+        ],
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(symbol_id, file_id, name, scope_path)| {
+        serde_json::json!({
+            "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
+        })
+    })
+    .collect::<Vec<_>>();
     json_result(&json!({
         "project": params.project,
         "scope": scope,
         "findings": findings,
+        "sink_effect_symbols": sink_effect_symbols,
         "guidance": "Surfaces (1) PII-shaped literals (SSN, email, IP) and (2) PII-named identifiers co-located with logging/network sinks. Curated PII_TOKENS list — no external NER required."
     }))
 }

@@ -14,6 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
+use crate::mcp::tools::sema_helpers::equivalence::materialized_available;
 
 pub async fn tool_find_similar_modules(
     ctx: &SystemContext,
@@ -92,11 +93,48 @@ pub async fn tool_find_similar_modules(
     });
     all_results.truncate(limit as usize);
 
+    // Shadow-ASR channel: for each source file, surface cross-language
+    // symbol-pair matches keyed off the materialized
+    // `cross_language_signature_clones` table. Adds a precise
+    // shape-matched complement to the embedding-derived `all_results`.
+    let mut cross_language_pairs: Vec<serde_json::Value> = Vec::new();
+    if let Some(pool) = ctx.db().pool()
+        && materialized_available(pool).await.unwrap_or(false)
+    {
+        let source_file_ids: Vec<i64> = source_files.iter().map(|f| f.file_id).collect();
+        if !source_file_ids.is_empty() {
+            type ClonePair = (i64, i64, String, String, f32);
+            let rows: Vec<ClonePair> = sqlx::query_as::<_, ClonePair>(
+                "SELECT c.symbol_id_a, c.symbol_id_b, c.language_a, c.language_b, c.similarity
+                 FROM cross_language_signature_clones c
+                 JOIN file_symbols fs ON fs.id = c.symbol_id_a OR fs.id = c.symbol_id_b
+                 WHERE fs.file_id = ANY($1::int8[])
+                 ORDER BY c.similarity DESC
+                 LIMIT $2",
+            )
+            .bind(&source_file_ids)
+            .bind(limit as i64 * 5)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            for (a, b, lang_a, lang_b, sim) in rows {
+                cross_language_pairs.push(serde_json::json!({
+                    "symbol_id_a": a,
+                    "symbol_id_b": b,
+                    "language_a": lang_a,
+                    "language_b": lang_b,
+                    "similarity": sim,
+                }));
+            }
+        }
+    }
+
     let result = serde_json::json!({
         "source_files": source_files.iter().map(|f| &f.relative_path).collect::<Vec<_>>(),
         "source_project": params.project,
         "similar_modules": all_results,
         "result_count": all_results.len(),
+        "cross_language_symbol_pairs": cross_language_pairs,
     });
 
     let json = serde_json::to_string_pretty(&result)

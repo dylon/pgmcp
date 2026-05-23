@@ -81,13 +81,26 @@ pub async fn tool_dependency_health(
         }));
     }
 
+    // Shadow-ASR channel: per-effect counts (project-scoped if a project
+    // was given, otherwise skipped — `effect_counts` is per-project).
+    let effect_breakdown = match project_id {
+        Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect::<Vec<serde_json::Value>>(),
+        None => Vec::new(),
+    };
+
     let result = json!({
         "scope": if project_id.is_some() { "project" } else { "workspace" },
         "project_filter": params.project,
         "deps": deps,
+        "effect_breakdown": effect_breakdown,
         "guidance": "Per-dep recommendations: prune (single importer, idle, low centrality), \
                      upgrade (high centrality + idle), consolidate (multiple importers — fuzzy \
-                     consolidation is a follow-up), or keep.",
+                     consolidation is a follow-up), or keep. The `effect_breakdown` channel surfaces project-wide effect counts so reviewers can see what effects are concentrated in the dependency graph.",
         "health": json!({
             "edges_present": !rows.is_empty(),
         }),

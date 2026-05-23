@@ -1,5 +1,13 @@
 //! TLA+ language backend using `tree-sitter-tlaplus`.
 //!
+//! Shadow-ASR contract: TLA+ is untyped — operators take arbitrary
+//! expressions and produce values without static type annotations.
+//! Symbols emitted here leave the shadow-ASR fields (`parameters`,
+//! `return_type`, `generic_params`, `effects`, `type_tags`) at their
+//! `Default::default()` values per the plan's per-language contract
+//! (`~/.claude/plans/would-translating-the-asts-cosmic-quill.md` § Phase
+//! C). Downstream tools degrade gracefully via LEFT JOIN + COALESCE.
+//!
 //! Symbol queries cover MODULE / operator-definitions / THEOREM / LEMMA /
 //! VARIABLE(S) / CONSTANT(S). Import queries handle EXTENDS clauses.
 
@@ -110,6 +118,7 @@ impl LanguageBackend for TlaPlusBackend {
                                 visibility: Some("public".into()),
                                 signature: None,
                                 name,
+                                ..Default::default()
                             });
                         }
                     }
@@ -125,6 +134,7 @@ impl LanguageBackend for TlaPlusBackend {
                                 visibility: Some("public".into()),
                                 signature: None,
                                 name,
+                                ..Default::default()
                             });
                         }
                     }
@@ -140,6 +150,7 @@ impl LanguageBackend for TlaPlusBackend {
                                 visibility: Some("public".into()),
                                 signature: None,
                                 name,
+                                ..Default::default()
                             });
                         }
                     }
@@ -154,6 +165,7 @@ impl LanguageBackend for TlaPlusBackend {
                             visibility: Some("public".into()),
                             signature: None,
                             name,
+                            ..Default::default()
                         });
                     }
                     _ => {}

@@ -2,6 +2,15 @@
 //! `tree-sitter-clojure` grammar; CLJS-specific quirks (string-module
 //! requires, etc.) are handled in the import walker.
 //!
+//! Shadow-ASR contract: Clojure is dynamically typed; arguments are
+//! symbols without static type annotations. Symbols emitted here leave
+//! the shadow-ASR fields (`parameters`, `return_type`, `generic_params`,
+//! `effects`, `type_tags`) at their `Default::default()` values per the
+//! plan (`~/.claude/plans/would-translating-the-asts-cosmic-quill.md`
+//! § Phase C). A future revision could mine `^:foo` metadata (e.g.
+//! `^:deprecated`, `^:dynamic`, `^:test`) for effect tags without
+//! attempting type inference.
+//!
 //! Strategy: tree-sitter `#eq?` / `#any-of?` predicates dispatch on the
 //! head symbol of each `list_lit` form. The deny-list filters special forms
 //! out of `extract_references`.
@@ -273,6 +282,7 @@ impl LanguageBackend for ClojureBackend {
                 visibility,
                 signature: Some(first_line(content, def.node)),
                 name,
+                ..Default::default()
             });
         }
         out

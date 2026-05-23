@@ -3,6 +3,15 @@
 //! Lets the agent ask "what profile am I being served under?" or
 //! "show me every profile pgmcp knows about". Pure-read tool; no
 //! side effects.
+//!
+//! Phase D2b shadow-ASR contract: this tool serializes the client profile
+//! using `format.serialize_value` (TOML / YAML / JSON depending on the
+//! profile's `output_format`). The output shape is wholly defined by that
+//! enum and is not a generic JSON envelope, so the workspace-wide
+//! `effect_breakdown` channel is intentionally NOT mixed in here.
+//! Clients that want effect-distribution data should call
+//! `tool_index_stats` (Pattern F enrichment) or any of the project-scoped
+//! analysis tools, which all surface the effect_breakdown channel.
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;

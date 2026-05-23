@@ -11,8 +11,10 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::IoHotpathParams;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::mcp::tools::sota_regex_scan::scan_files_for_pattern;
+use crate::parsing::type_tags::vocabulary::{EFFECT_FILESYSTEM, EFFECT_IO, EFFECT_NETWORK};
 
 pub async fn tool_io_hotpath(
     ctx: &SystemContext,
@@ -73,9 +75,29 @@ pub async fn tool_io_hotpath(
             })
         })
         .collect();
+    // Shadow-ASR channel: symbols carrying I/O-family effects (io / network / filesystem).
+    let io_effect_symbols = symbols_with_any_effect(
+        pool,
+        project_id,
+        &[
+            EFFECT_IO.to_string(),
+            EFFECT_NETWORK.to_string(),
+            EFFECT_FILESYSTEM.to_string(),
+        ],
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(symbol_id, file_id, name, scope_path)| {
+        serde_json::json!({
+            "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
+        })
+    })
+    .collect::<Vec<_>>();
     json_result(&json!({
         "project": params.project,
         "files": files,
+        "io_effect_symbols": io_effect_symbols,
         "guidance": "I/O × centrality finds hot paths that block on disk/network in critical routing spots. Cache, pool, or move off the synchronous path."
     }))
 }

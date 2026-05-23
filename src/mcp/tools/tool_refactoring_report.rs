@@ -94,7 +94,30 @@ pub async fn tool_refactoring_report(
         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
 
+    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution
+    // (sum across all projects). Gives consumers a baseline against which
+    // their tool-specific output's effect concentration can be compared.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT se.effect, COUNT(*)::int8
+             FROM symbol_effects se
+             GROUP BY se.effect
+             ORDER BY se.effect",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
+    })
+    .await;
+
     let result = serde_json::json!({
+        "effect_breakdown": effect_breakdown,
         "candidates": candidates,
         "total_candidates": candidates.len(),
         "parameters": {

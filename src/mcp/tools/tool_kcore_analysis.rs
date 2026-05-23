@@ -46,7 +46,35 @@ pub async fn tool_kcore_analysis(
         .iter()
         .map(|(p, c)| json!({"path": p, "coreness": c}))
         .collect();
+    // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown
+    // for the project. Universal enrichment — every tool benefits from
+    // surfacing the effect distribution alongside its primary output.
+    // Gracefully degrades to empty when the project lookup or
+    // shadow-ASR data isn't populated.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let project_id_opt: Option<i32> =
+            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
+                .bind(&params.project)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+        match project_id_opt {
+            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+                .collect(),
+            None => Vec::new(),
+        }
+    })
+    .await;
+
     json_result(&json!({
+        "effect_breakdown": effect_breakdown,
         "project": params.project,
         "max_core": result.max_core,
         "min_core_filter": min_core,

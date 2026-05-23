@@ -26,7 +26,7 @@ use text_processing::*;
 const DEFAULT_SEARCH_LIMIT: i32 = 10;
 const DEFAULT_LIST_LIMIT: i32 = 50;
 const DEFAULT_EXCERPT_CHARS: usize = 700;
-const PATTERN_EMBEDDING_SCHEMA_VERSION: &str = "pgmcp-pattern-embedding-v5";
+const PATTERN_EMBEDDING_SCHEMA_VERSION: &str = "pgmcp-pattern-embedding-v6";
 
 #[derive(Debug, Default)]
 struct ImportSummary {
@@ -520,7 +520,28 @@ pub async fn tool_upsert_pattern_source(
         0
     };
 
+    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
+    let effect_breakdown: Vec<serde_json::Value> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return Vec::new();
+        };
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT se.effect, COUNT(*)::int8
+             FROM symbol_effects se
+             GROUP BY se.effect
+             ORDER BY se.effect",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+        rows.into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
+    })
+    .await;
+
     json_result(json!({
+        "effect_breakdown": effect_breakdown,
         "pattern_slug": params.pattern_slug,
         "source_id": source_id,
         "chunks_embedded": chunks_embedded,
