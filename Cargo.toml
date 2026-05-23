@@ -211,16 +211,16 @@ async-trait = "0.1"
 libdictenstein = { path = "../libdictenstein", features = ["pathmap-backend", "persistent-artrie"] }
 liblevenshtein = { path = "../liblevenshtein-rust", features = ["phonetic-rules", "embedded-rules", "serialization", "parallel-grep"] }
 lling-llang = { path = "../lling-llang", features = ["levenshtein", "lm-rerank", "phonetic-rescore", "serde", "bincode-ser"] }
-# `code-neural` is NOT enabled: it pulls `ort 2.x` which uses
-# `ndarray 0.17`, but libgrammstein top-level pins `ndarray 0.16` —
-# `cargo tree -p pgmcp -i ndarray@0.17.2` confirms the two versions
-# coexist in the dep graph, and the type mismatch breaks the build
-# (libgrammstein's `code/embeddings.rs` passes 0.16 arrays to ort's
-# 0.17 API). The `gnn_semantic_issues` MCP tool planned in Phase 8
-# depends on this feature; landing that tool requires a coordinated
-# upstream ndarray bump in libgrammstein. Tracked as a blocker on
-# the Phase 8 GNN tool only — the other 19 Phase-8 tools and all of
-# Phase 6's CPG / paradigm / subtree paths land regardless.
+# `code-neural` is NOT enabled because it pulls `ort 2.x` (needs
+# `ndarray 0.17`) while libgrammstein top-level pins `ndarray 0.16`.
+# pgmcp's `gnn_semantic_issues` MCP tool (Phase 8, 20 of 20)
+# ships ANYWAY: libgrammstein's `GnnSemanticScorer::detect_issues`
+# is a heuristic CPG walk under the plain `code` feature — the
+# `code-neural` flag gates a placeholder inference path that the
+# current upstream detector does not actually consume. Enabling
+# `code-neural` therefore only adds version-skew exposure without
+# adding capability. Re-evaluate when libgrammstein bumps to
+# ndarray 0.17 or the ort-side detector ships.
 libgrammstein = { path = "../libgrammstein", features = ["mimalloc-alloc", "lling-llang-integration", "wfst-export", "serde-extras", "rag", "rag-hnsw", "neural-rescore", "candle-model", "subword", "code", "code-python", "code-rust", "code-javascript", "code-rholang", "code-metta"] }
 llammer-pipeline = { path = "../llammer-pipeline", features = ["phonetic-rescore"] }
 

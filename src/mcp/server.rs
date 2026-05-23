@@ -3133,6 +3133,14 @@ pub struct RenameOracleParams {
     pub current_names: Vec<String>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GnnSemanticIssuesParams {
+    #[schemars(description = "Source code to scan for semantic issues.")]
+    pub code: String,
+    #[schemars(description = "Language identifier (currently: python).")]
+    pub language: String,
+}
+
 #[tool_router]
 impl McpServer {
     /// Create a new MCP server from a `SystemContext` bundle.
@@ -7438,6 +7446,29 @@ review. Pure code analysis — no DB access."
             &_ctx,
             &summarize_debug(&params),
             super::tools::tool_rename_oracle::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Semantic-issue scan over a Code Property Graph via libgrammstein's \
+GnnSemanticScorer. Returns SemanticIssue records (unused bindings, suspicious DFG \
+patterns, etc.) detected by the GNN's heuristic-edge-walk detection — no neural \
+inference dependency required (the `code-neural` feature gates a placeholder \
+inference path that the current upstream heuristic detector doesn't use)."
+    )]
+    async fn gnn_semantic_issues(
+        &self,
+        Parameters(params): Parameters<GnnSemanticIssuesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "gnn_semantic_issues",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_gnn_semantic_issues::run(self.ctx(), params),
         )
         .await
     }

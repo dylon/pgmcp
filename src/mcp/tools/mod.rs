@@ -121,6 +121,7 @@ pub mod tool_expand_query_to_phonetic_pattern;
 pub mod tool_fuzzy_grep;
 pub mod tool_fuzzy_path_search;
 pub mod tool_fuzzy_symbol_search;
+pub mod tool_gnn_semantic_issues;
 pub mod tool_mandate_dedup_v2;
 pub mod tool_paradigm_profile;
 pub mod tool_phonetic_grep_comments;
