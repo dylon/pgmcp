@@ -821,19 +821,68 @@ pub async fn insert_prompt(
     sha256: &str,
     embedding: Option<&[f32]>,
 ) -> Result<i64, sqlx::Error> {
-    let vector = embedding.map(|v| Vector::from(v.to_vec()));
-    let id: i64 = sqlx::query_scalar(
-        "INSERT INTO session_prompts (session_id, prompt_text, prompt_sha256, embedding)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (session_id, prompt_sha256) DO UPDATE SET ts = NOW()
-         RETURNING id",
-    )
-    .bind(session_id)
-    .bind(text)
-    .bind(sha256)
-    .bind(vector)
-    .fetch_one(pool)
-    .await?;
+    // Phase 5 C3: dispatch on embedding dim. NULL embeddings stay
+    // NULL on the legacy column (the cron will pick them up to fill
+    // embedding_v2 once the model is configured for BGE-M3). Plan
+    // reference:
+    // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
+    // Phase 5 C3.
+    let id: i64 = match embedding.map(<[f32]>::len) {
+        Some(384) => {
+            let vector = Vector::from(embedding.unwrap().to_vec());
+            sqlx::query_scalar(
+                "INSERT INTO session_prompts
+                    (session_id, prompt_text, prompt_sha256,
+                     embedding, embedding_signature)
+                 VALUES ($1, $2, $3, $4, 'minilm-l6-v2')
+                 ON CONFLICT (session_id, prompt_sha256) DO UPDATE SET ts = NOW()
+                 RETURNING id",
+            )
+            .bind(session_id)
+            .bind(text)
+            .bind(sha256)
+            .bind(vector)
+            .fetch_one(pool)
+            .await?
+        }
+        Some(1024) => {
+            let vector = Vector::from(embedding.unwrap().to_vec());
+            sqlx::query_scalar(
+                "INSERT INTO session_prompts
+                    (session_id, prompt_text, prompt_sha256,
+                     embedding_v2, embedding_signature)
+                 VALUES ($1, $2, $3, $4, 'bge-m3-v1')
+                 ON CONFLICT (session_id, prompt_sha256) DO UPDATE SET ts = NOW()
+                 RETURNING id",
+            )
+            .bind(session_id)
+            .bind(text)
+            .bind(sha256)
+            .bind(vector)
+            .fetch_one(pool)
+            .await?
+        }
+        Some(other) => {
+            return Err(sqlx::Error::Protocol(format!(
+                "insert_prompt: unsupported embedding dim {other} \
+                 (expected 384 for MiniLM-L6-v2 or 1024 for BGE-M3); \
+                 run `pgmcp embed-cutover --check`"
+            )));
+        }
+        None => {
+            sqlx::query_scalar(
+                "INSERT INTO session_prompts (session_id, prompt_text, prompt_sha256)
+                 VALUES ($1, $2, $3)
+                 ON CONFLICT (session_id, prompt_sha256) DO UPDATE SET ts = NOW()
+                 RETURNING id",
+            )
+            .bind(session_id)
+            .bind(text)
+            .bind(sha256)
+            .fetch_one(pool)
+            .await?
+        }
+    };
     Ok(id)
 }
 

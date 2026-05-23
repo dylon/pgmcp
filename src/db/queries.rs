@@ -509,24 +509,67 @@ pub async fn insert_chunk(
     end_line: i32,
     embedding: &[f32],
 ) -> Result<(), sqlx::Error> {
+    // Phase 5 C3: dispatch on embedding dim. 384 → legacy `embedding`
+    // column with MiniLM signature; 1024 → `embedding_v2` with
+    // BGE-M3 signature. Any other dim is a configuration error
+    // (model and DB out of sync) — refuse rather than silently
+    // misroute. Plan reference:
+    // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
+    // Phase 5 C3.
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
-    sqlx::query(
-        "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (file_id, chunk_index) DO UPDATE SET
-            content = EXCLUDED.content,
-            start_line = EXCLUDED.start_line,
-            end_line = EXCLUDED.end_line,
-            embedding = EXCLUDED.embedding",
-    )
-    .bind(file_id)
-    .bind(chunk_index)
-    .bind(content)
-    .bind(start_line)
-    .bind(end_line)
-    .bind(embedding_vec)
-    .execute(pool)
-    .await?;
+    match embedding.len() {
+        384 => {
+            sqlx::query(
+                "INSERT INTO file_chunks
+                    (file_id, chunk_index, content, start_line, end_line,
+                     embedding, embedding_signature)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'minilm-l6-v2')
+                 ON CONFLICT (file_id, chunk_index) DO UPDATE SET
+                    content = EXCLUDED.content,
+                    start_line = EXCLUDED.start_line,
+                    end_line = EXCLUDED.end_line,
+                    embedding = EXCLUDED.embedding,
+                    embedding_signature = EXCLUDED.embedding_signature",
+            )
+            .bind(file_id)
+            .bind(chunk_index)
+            .bind(content)
+            .bind(start_line)
+            .bind(end_line)
+            .bind(embedding_vec)
+            .execute(pool)
+            .await?;
+        }
+        1024 => {
+            sqlx::query(
+                "INSERT INTO file_chunks
+                    (file_id, chunk_index, content, start_line, end_line,
+                     embedding_v2, embedding_signature)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1')
+                 ON CONFLICT (file_id, chunk_index) DO UPDATE SET
+                    content = EXCLUDED.content,
+                    start_line = EXCLUDED.start_line,
+                    end_line = EXCLUDED.end_line,
+                    embedding_v2 = EXCLUDED.embedding_v2,
+                    embedding_signature = EXCLUDED.embedding_signature",
+            )
+            .bind(file_id)
+            .bind(chunk_index)
+            .bind(content)
+            .bind(start_line)
+            .bind(end_line)
+            .bind(embedding_vec)
+            .execute(pool)
+            .await?;
+        }
+        other => {
+            return Err(sqlx::Error::Protocol(format!(
+                "insert_chunk: unsupported embedding dim {other} (expected 384 \
+                 for MiniLM-L6-v2 or 1024 for BGE-M3); daemon model and database \
+                 schema are out of sync — run `pgmcp embed-cutover --check`"
+            )));
+        }
+    }
     Ok(())
 }
 
@@ -588,24 +631,54 @@ pub async fn insert_chunks_batch(
     }
     let mut tx = pool.begin().await?;
     for chunk in chunks {
+        // Phase 5 C3: dispatch on dim. Same shape as insert_chunk.
         let embedding_vec = pgvector::Vector::from(chunk.embedding.to_vec());
-        match sqlx::query(
-            "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (file_id, chunk_index) DO UPDATE SET
-                content = EXCLUDED.content,
-                start_line = EXCLUDED.start_line,
-                end_line = EXCLUDED.end_line,
-                embedding = EXCLUDED.embedding",
-        )
-        .bind(file_id)
-        .bind(chunk.chunk_index)
-        .bind(chunk.content)
-        .bind(chunk.start_line)
-        .bind(chunk.end_line)
-        .bind(embedding_vec)
-        .execute(&mut *tx)
-        .await
+        let sql = match chunk.embedding.len() {
+            384 => {
+                "INSERT INTO file_chunks
+                    (file_id, chunk_index, content, start_line, end_line,
+                     embedding, embedding_signature)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'minilm-l6-v2')
+                 ON CONFLICT (file_id, chunk_index) DO UPDATE SET
+                    content = EXCLUDED.content,
+                    start_line = EXCLUDED.start_line,
+                    end_line = EXCLUDED.end_line,
+                    embedding = EXCLUDED.embedding,
+                    embedding_signature = EXCLUDED.embedding_signature"
+            }
+            1024 => {
+                "INSERT INTO file_chunks
+                    (file_id, chunk_index, content, start_line, end_line,
+                     embedding_v2, embedding_signature)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1')
+                 ON CONFLICT (file_id, chunk_index) DO UPDATE SET
+                    content = EXCLUDED.content,
+                    start_line = EXCLUDED.start_line,
+                    end_line = EXCLUDED.end_line,
+                    embedding_v2 = EXCLUDED.embedding_v2,
+                    embedding_signature = EXCLUDED.embedding_signature"
+            }
+            other => {
+                drop(tx);
+                return Ok(ChunkBatchOutcome {
+                    fk_violation: false,
+                    error: Some(sqlx::Error::Protocol(format!(
+                        "insert_chunks_batch: unsupported embedding dim {other} \
+                         (expected 384 for MiniLM-L6-v2 or 1024 for BGE-M3); \
+                         run `pgmcp embed-cutover --check`"
+                    ))),
+                });
+            }
+        };
+        match sqlx::query(sql)
+            .bind(file_id)
+            .bind(chunk.chunk_index)
+            .bind(chunk.content)
+            .bind(chunk.start_line)
+            .bind(chunk.end_line)
+            .bind(embedding_vec)
+            .execute(&mut *tx)
+            .await
         {
             Ok(_) => {}
             Err(e) => {
@@ -3570,7 +3643,11 @@ pub async fn upsert_git_commit(
     Ok(row)
 }
 
-/// Insert a git commit chunk with its embedding.
+/// Insert a git commit chunk with its embedding. Phase 5 C3:
+/// dispatch by embedding dim to legacy `embedding` (384d) or new
+/// `embedding_v2` (1024d, post-C1 schema), stamping the matching
+/// `embedding_signature`. Unsupported dims surface a clear
+/// configuration-error message pointing at `pgmcp embed-cutover --check`.
 pub async fn insert_git_commit_chunk(
     pool: &PgPool,
     commit_id: i64,
@@ -3579,19 +3656,49 @@ pub async fn insert_git_commit_chunk(
     embedding: &[f32],
 ) -> Result<(), sqlx::Error> {
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
-    sqlx::query(
-        "INSERT INTO git_commit_chunks (commit_id, chunk_index, content, embedding)
-         VALUES ($1, $2, $3, $4)
-         ON CONFLICT (commit_id, chunk_index) DO UPDATE SET
-            content = EXCLUDED.content,
-            embedding = EXCLUDED.embedding",
-    )
-    .bind(commit_id)
-    .bind(chunk_index)
-    .bind(content)
-    .bind(embedding_vec)
-    .execute(pool)
-    .await?;
+    match embedding.len() {
+        384 => {
+            sqlx::query(
+                "INSERT INTO git_commit_chunks
+                    (commit_id, chunk_index, content, embedding, embedding_signature)
+                 VALUES ($1, $2, $3, $4, 'minilm-l6-v2')
+                 ON CONFLICT (commit_id, chunk_index) DO UPDATE SET
+                    content = EXCLUDED.content,
+                    embedding = EXCLUDED.embedding,
+                    embedding_signature = EXCLUDED.embedding_signature",
+            )
+            .bind(commit_id)
+            .bind(chunk_index)
+            .bind(content)
+            .bind(embedding_vec)
+            .execute(pool)
+            .await?;
+        }
+        1024 => {
+            sqlx::query(
+                "INSERT INTO git_commit_chunks
+                    (commit_id, chunk_index, content, embedding_v2, embedding_signature)
+                 VALUES ($1, $2, $3, $4, 'bge-m3-v1')
+                 ON CONFLICT (commit_id, chunk_index) DO UPDATE SET
+                    content = EXCLUDED.content,
+                    embedding_v2 = EXCLUDED.embedding_v2,
+                    embedding_signature = EXCLUDED.embedding_signature",
+            )
+            .bind(commit_id)
+            .bind(chunk_index)
+            .bind(content)
+            .bind(embedding_vec)
+            .execute(pool)
+            .await?;
+        }
+        other => {
+            return Err(sqlx::Error::Protocol(format!(
+                "insert_git_commit_chunk: unsupported embedding dim {other} \
+                 (expected 384 for MiniLM-L6-v2 or 1024 for BGE-M3); \
+                 run `pgmcp embed-cutover --check`"
+            )));
+        }
+    }
     Ok(())
 }
 
