@@ -151,8 +151,12 @@ zstd = { version = "0.13", default-features = false }
 cargo-lock = "10"
 # SOTA Phase 6 (secret detection): Shannon-entropy scoring.
 entropy = "0.4"
-# SOTA Phase 7 (semver-break audit): rename detection via Levenshtein.
-strsim = "0.11"
+# NOTE: `strsim` was removed (2026-05-23, Phase 3 of the integration
+# plan `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`).
+# Rename detection in `tool_semver_break_audit.rs` now goes through
+# `liblevenshtein::Transducer::with_transposition` over a
+# `libdictenstein::DynamicDawgChar` — the automaton is asymptotically
+# faster than the strsim O(N×L²) brute-force scan.
 # SOTA Phase 9 (data engineering): SQL migration parsing.
 sqlparser = "0.55"
 # SOTA Phase 11 (commit topic drift): Porter stemming for TF-IDF.
@@ -168,6 +172,57 @@ bincode = "1"
 # Already a transitive dep via sqlx; promoted to direct so the DbClient trait
 # can use #[async_trait] on its method signatures.
 async-trait = "0.1"
+
+# ── Sibling-crate path deps (integration plan
+#    `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`) ──
+#
+# These five crates live next to pgmcp under `/home/dylon/Workspace/f1r3fly.io/`.
+# All deps are non-feature-gated per pgmcp's `[features]`-free policy
+# (CLAUDE.md: "no cargo features on pgmcp"). The sibling crates' own
+# features are selected here at the dep site so future swaps stay surgical.
+#
+# - `libdictenstein`: dictionary backends — DynamicDawg{Char,U64},
+#   DoubleArrayTrie{Char}, SuffixAutomaton{Char}, PathMapDictionary{Char},
+#   **PersistentARTrieChar** (disk-backed mmap+WAL ACID), PersistentVocabARTrie.
+# - `liblevenshtein`: Transducer (Standard / Transposition / MergeAndSplit),
+#   the full phonetic framework (Phone<U> IPA algebra, articulatory
+#   features, articulatory_edit_distance, .llev DSL, ~125 BCP-47 language
+#   packs, PhoneticNormalizedDictionary, PhoneticPipelineBuilder,
+#   PhoneticGrepOnline, TokenGrep, IPA + orthographic syllabification),
+#   time-series MSM, WallBreaker, 8 cache decorators.
+#   `parallel-grep` enables Rayon-parallel verification in PhoneticGrepOnline
+#   (Phase 10).
+# - `lling-llang`: WFST framework — 9 semirings, LatticeBuilder<W,B>,
+#   composition (eager + lazy), determinize / minimize / connect /
+#   ε-removal / weight pushing, Viterbi / n-best / beam-search, GPU paths.
+# - `libgrammstein`: HybridLanguageModel (MKN n-gram + subword embeddings,
+#   4 interpolation strategies), ModernBertEmbedder (768-dim, 8K context),
+#   ModernBertRescorer, extractive Summarizer (MMR diversity), hierarchical-
+#   agglomerative + c-TF-IDF + dendrogram topic extraction (crash-resume),
+#   ParadigmDetector, Code Property Graph, TreeminerD subtree mining, GNN
+#   semantic scorer, mimalloc allocator, AtomicVocabulary, LEB128 varint
+#   n-gram keys, PrefetchingReader / corpus dedup pipeline. `mimalloc-alloc`
+#   sets pgmcp's `#[global_allocator]` to mimalloc (Phase 11; the existing
+#   `mallopt(M_ARENA_MAX, 2)` stays in main.rs per
+#   `feedback_glibc_arena_cap.md`).
+# - `llammer-pipeline`: extracted library form of llammer's WFST
+#   correction pipeline. Imports flow into `src/wfst/lattice.rs` (Phase 9)
+#   and the `correct_query` MCP tool (Phase 8).
+libdictenstein = { path = "../libdictenstein", features = ["pathmap-backend", "persistent-artrie"] }
+liblevenshtein = { path = "../liblevenshtein-rust", features = ["phonetic-rules", "embedded-rules", "serialization", "parallel-grep"] }
+lling-llang = { path = "../lling-llang", features = ["levenshtein", "lm-rerank", "phonetic-rescore", "serde", "bincode-ser"] }
+# `code-neural` is NOT enabled: it pulls `ort 2.x` which uses
+# `ndarray 0.17`, but libgrammstein top-level pins `ndarray 0.16` —
+# `cargo tree -p pgmcp -i ndarray@0.17.2` confirms the two versions
+# coexist in the dep graph, and the type mismatch breaks the build
+# (libgrammstein's `code/embeddings.rs` passes 0.16 arrays to ort's
+# 0.17 API). The `gnn_semantic_issues` MCP tool planned in Phase 8
+# depends on this feature; landing that tool requires a coordinated
+# upstream ndarray bump in libgrammstein. Tracked as a blocker on
+# the Phase 8 GNN tool only — the other 19 Phase-8 tools and all of
+# Phase 6's CPG / paradigm / subtree paths land regardless.
+libgrammstein = { path = "../libgrammstein", features = ["mimalloc-alloc", "lling-llang-integration", "wfst-export", "serde-extras", "rag", "rag-hnsw", "neural-rescore", "candle-model", "subword", "code", "code-python", "code-rust", "code-javascript", "code-rholang", "code-metta"] }
+llammer-pipeline = { path = "../llammer-pipeline", features = ["phonetic-rescore"] }
 
 [dev-dependencies]
 proptest = "1"

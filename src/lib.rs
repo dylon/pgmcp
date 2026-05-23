@@ -19,6 +19,8 @@
 pub mod a2a;
 pub mod api;
 pub mod cli;
+#[allow(dead_code)]
+pub mod code_analysis;
 pub mod config;
 pub mod context;
 pub mod cron;
@@ -28,6 +30,8 @@ pub mod db;
 pub mod embed;
 pub mod error;
 pub mod fcm;
+#[allow(dead_code)]
+pub mod fuzzy;
 pub mod graph;
 pub mod indexer;
 pub mod llm;
@@ -36,6 +40,8 @@ pub mod mandates;
 pub mod mcp;
 #[allow(dead_code)]
 pub mod mmap_array;
+#[allow(dead_code)]
+pub mod neural;
 pub mod parsing;
 pub mod patterns;
 pub mod reactive;
@@ -45,4 +51,6 @@ pub mod shutdown;
 pub mod stats;
 #[allow(dead_code)]
 pub mod topic_store;
+#[allow(dead_code)]
+pub mod wfst;
 pub mod work_pool;

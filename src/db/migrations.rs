@@ -47,12 +47,14 @@ pub async fn run_migrations(
     sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_trgm")
         .execute(pool)
         .await?;
-    // `fuzzystrmatch` ships `levenshtein_less_equal(a, b, max)` which is the
-    // O(|a|·max)-bounded edit-distance probe used by the Phase 0 mandate
-    // near-duplicate dedupe in `src/sessions.rs::mark_near_duplicate_superseded`.
-    sqlx::query("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch")
-        .execute(pool)
-        .await?;
+    // `fuzzystrmatch` is no longer requested. Phase 3 of the integration
+    // plan `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`
+    // moved the near-duplicate mandate dedupe in
+    // `src/sessions.rs::mark_near_duplicate_superseded` from SQL-side
+    // `levenshtein_less_equal` to an in-process
+    // `liblevenshtein::Transducer` over `DynamicDawgChar`. Existing installs
+    // that already have the extension keep it (no DROP EXTENSION here);
+    // new installs simply no longer request it.
 
     // Create projects table.
     //

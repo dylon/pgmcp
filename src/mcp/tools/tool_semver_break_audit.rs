@@ -4,13 +4,14 @@
 
 #![allow(unused_imports)]
 
+use libdictenstein::dynamic_dawg_char::DynamicDawgChar;
+use liblevenshtein::transducer::Transducer;
 use regex::Regex;
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
 use serde_json::json;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
-use strsim::levenshtein;
 
 use crate::context::SystemContext;
 use crate::mcp::server::SemverBreakAuditParams;
@@ -80,19 +81,27 @@ pub async fn tool_semver_break_audit(
         }
     }
     // Removed = in historical but not in now.
-    let mut removed: Vec<(String, String, Option<String>)> = Vec::new();
+    //
+    // For each removed name, find the nearest present-day name by
+    // Damerau-Levenshtein distance ≤ 2 (transposition treated as one edit,
+    // so `teh`/`the` is distance 1). We build a `DynamicDawgChar` once
+    // over `now_names` and query via liblevenshtein's `Transducer`. The
+    // automaton-based query is O(automaton-state-traversal) per probe,
+    // vs the previous brute-force O(|now_names| × L²) per removed symbol.
     let now_names: HashSet<String> = now_set.iter().map(|(_, n, _)| n.clone()).collect();
+    let now_terms: Vec<&str> = now_names.iter().map(|s| s.as_str()).collect();
+    let now_dict: DynamicDawgChar<()> = DynamicDawgChar::from_terms(now_terms);
+    let now_transducer = Transducer::with_transposition(now_dict);
+
+    let mut removed: Vec<(String, String, Option<String>)> = Vec::new();
     for (kind, name) in &historical {
         if !now_names.contains(name) {
-            // Possible rename: nearest name in now_names by Levenshtein.
-            let mut best: Option<(String, usize)> = None;
-            for n in &now_names {
-                let d = levenshtein(name, n);
-                if best.as_ref().map(|(_, bd)| d < *bd).unwrap_or(true) {
-                    best = Some((n.clone(), d));
-                }
-            }
-            let likely_rename = best.filter(|(_, d)| *d <= 2).map(|(n, _)| n);
+            // Possible rename: query the dictionary for terms within
+            // Damerau-Levenshtein 2 of `name`, keep the closest one.
+            let best = now_transducer
+                .query_with_distance(name, 2)
+                .min_by_key(|c| c.distance);
+            let likely_rename = best.map(|c| c.term);
             removed.push((kind.clone(), name.clone(), likely_rename));
         }
     }

@@ -13,6 +13,12 @@ publish = false
 [dependencies]
 pgmcp = { path = ".." }
 
+# Sibling-crate path deps used by Phase 3+ tests (integration plan
+# `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`).
+# Mirror pgmcp's dep choices so the test crate links the same versions.
+libdictenstein = { path = "../../libdictenstein", features = ["pathmap-backend", "persistent-artrie"] }
+liblevenshtein = { path = "../../liblevenshtein-rust", features = ["phonetic-rules", "embedded-rules", "serialization", "parallel-grep"] }
+
 # Mock state needs the same async + serde shapes as the production code.
 async-trait = "0.1"
 parking_lot = "0.12"

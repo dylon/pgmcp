@@ -170,16 +170,16 @@ mod tests {
 
     /// Determinism fix (2026-05-23): the 1-second test timeout was
     /// raised to 30 seconds (this site flaked first). What the test
-    /// actually verifies — "a panicking thread doesn't cause
-    /// `join_with_timeout` to hang forever" — does not require the
-    /// panic-unwind + helper-thread `handle.join()` + crossbeam send
-    /// + `recv_timeout` round-trip to complete inside any particular
-    /// wall-clock budget; we only need a generous upper bound to
-    /// distinguish "panic surfaced quickly" from an actual hang. Under
-    /// nextest's parallel load the helper thread can be starved past
-    /// 1 second — same root cause as the reactive-operators flake
-    /// fixes (`src/reactive/operators.rs`). 30 s sits far above any
-    /// plausible scheduler jitter.
+    /// actually verifies is "a panicking thread doesn't cause
+    /// `join_with_timeout` to hang forever". That does not require the
+    /// panic-unwind plus helper-thread `handle.join()` plus crossbeam
+    /// send plus `recv_timeout` round-trip to complete inside any
+    /// particular wall-clock budget; we only need a generous upper
+    /// bound to distinguish "panic surfaced quickly" from an actual
+    /// hang. Under nextest's parallel load the helper thread can be
+    /// starved past 1 second (same root cause as the reactive-operators
+    /// flake fixes in `src/reactive/operators.rs`). 30 s sits far above
+    /// any plausible scheduler jitter.
     #[test]
     fn join_with_timeout_surfaces_panic_not_hang() {
         let handle = std::thread::spawn(|| {

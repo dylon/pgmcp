@@ -3,6 +3,8 @@
 mod a2a;
 mod api;
 mod cli;
+#[allow(dead_code)]
+mod code_analysis;
 mod config;
 mod context;
 mod cron;
@@ -12,6 +14,8 @@ mod db;
 mod embed;
 mod error;
 mod fcm;
+#[allow(dead_code)]
+mod fuzzy;
 mod graph;
 mod indexer;
 mod llm;
@@ -20,6 +24,8 @@ mod mandates;
 mod mcp;
 #[allow(dead_code)]
 mod mmap_array;
+#[allow(dead_code)]
+mod neural;
 mod parsing;
 mod patterns;
 mod reactive;
@@ -29,6 +35,8 @@ mod shutdown;
 mod stats;
 #[allow(dead_code)]
 mod topic_store;
+#[allow(dead_code)]
+mod wfst;
 mod work_pool;
 
 use std::path::PathBuf;

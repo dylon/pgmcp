@@ -878,10 +878,12 @@ pub async fn upsert_mandate(
 ///
 /// Near-duplicate = same `session_id` and `polarity`, different `lower(imperative)`
 /// (the exact match path is already handled by the UNIQUE constraint in
-/// `upsert_mandate`), with `levenshtein_less_equal(lower(a), lower(b), max)`
-/// returning a value ≤ `max`. We use `levenshtein_less_equal` (from
-/// `fuzzystrmatch`) so Postgres bails out as soon as the edit distance is
-/// known to exceed `max` — the function is O(|s|·max), not O(|s|²).
+/// `upsert_mandate`), with Damerau-Levenshtein distance ≤ `max_distance` on
+/// the lowercased imperatives. The dedup runs in-process via a
+/// `liblevenshtein::Transducer` over a `DynamicDawgChar` built from the
+/// session's current active imperatives — no Postgres extension required
+/// (the legacy `fuzzystrmatch` path is gone, see the integration plan
+/// `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md` Phase 3).
 ///
 /// `max_distance` should be small (default 3): we are de-duplicating
 /// near-identical phrasings ("use rust" vs "use Rust", "use_rust"), not
@@ -899,21 +901,65 @@ pub async fn mark_near_duplicate_superseded(
     imperative: &str,
     max_distance: i32,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query(
-        "UPDATE session_mandates
-            SET status = 'superseded'
+    use libdictenstein::dynamic_dawg_char::DynamicDawgChar;
+    use liblevenshtein::transducer::Transducer;
+
+    // 1. Pull candidate active mandates for the same session + polarity.
+    //    Exact-case-insensitive duplicates are excluded server-side
+    //    (`lower(imperative) <> lower($4)`); approximate matches are
+    //    selected in-process via the Levenshtein transducer.
+    let rows: Vec<(i64, String)> = sqlx::query_as::<_, (i64, String)>(
+        "SELECT id, imperative FROM session_mandates
           WHERE session_id = $1
             AND status = 'active'
             AND id <> $2
             AND polarity = $3
-            AND lower(imperative) <> lower($4)
-            AND levenshtein_less_equal(lower(imperative), lower($4), $5) <= $5",
+            AND lower(imperative) <> lower($4)",
     )
     .bind(session_id)
     .bind(keeper_id)
     .bind(polarity)
     .bind(imperative)
-    .bind(max_distance)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    // 2. Build a `DynamicDawgChar` keyed by lowercase imperative; remember
+    //    each term's row ids so the transducer match can be mapped back.
+    let mut id_index: std::collections::HashMap<String, Vec<i64>> =
+        std::collections::HashMap::with_capacity(rows.len());
+    for (id, imp) in &rows {
+        id_index.entry(imp.to_lowercase()).or_default().push(*id);
+    }
+    let terms: Vec<&str> = id_index.keys().map(|s| s.as_str()).collect();
+    let dict: DynamicDawgChar<()> = DynamicDawgChar::from_terms(terms);
+    let transducer = Transducer::with_transposition(dict);
+
+    // 3. Query the transducer for terms within `max_distance` of the new
+    //    imperative; collect the row ids of all near-duplicate mandates.
+    let new_lower = imperative.to_lowercase();
+    let max = max_distance.max(0) as usize;
+    let mut superseded_ids: Vec<i64> = Vec::new();
+    for candidate in transducer.query_with_distance(&new_lower, max) {
+        if let Some(ids) = id_index.get(&candidate.term) {
+            superseded_ids.extend(ids.iter().copied());
+        }
+    }
+
+    if superseded_ids.is_empty() {
+        return Ok(0);
+    }
+
+    // 4. Single bulk UPDATE.
+    let result = sqlx::query(
+        "UPDATE session_mandates
+            SET status = 'superseded'
+          WHERE id = ANY($1)",
+    )
+    .bind(&superseded_ids)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())

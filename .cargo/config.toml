@@ -16,6 +16,17 @@
 NVCC_CCBIN = { value = "g++-14", force = true }
 CUDA_COMPUTE_CAP = { value = "89", force = true }
 
+# libgrammstein (transitive: `gxhash 3.x`) compile-errors out without
+# AES-NI and SSE2 intrinsics — the crate has no software fallback. The
+# user's hardware is x86_64 with AES-NI; setting `+aes,+sse2` here
+# avoids `RUSTFLAGS=...` ceremony at every build site. `+aes,+sse2` is
+# preferred over `target-cpu=native` because it locks down only what is
+# strictly required and avoids baking host-CPU-specific tuning into the
+# build (which could surprise on a CI runner with different
+# microarchitecture).
+[build]
+rustflags = ["-C", "target-feature=+aes,+sse2"]
+
 [alias]
 # Convenience wrappers for individual verification gates. The full verify
 # sequence (including formatting, CPU-only build, and GPU smokes) lives in
