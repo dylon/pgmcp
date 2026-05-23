@@ -63,11 +63,17 @@ impl EmbeddingMigrationConfig {
     }
 }
 
-/// Outcome of one cron pass.
+/// Outcome of one cron pass. Phase 5 C5: extended with four new
+/// counters covering the additional tables that the full BGE-M3
+/// migration drains beyond Phase 1's file_chunks + session_prompts.
 #[derive(Debug, Default)]
 pub struct MigrationPassReport {
     pub file_chunks_migrated: u64,
     pub session_prompts_migrated: u64,
+    pub git_commit_chunks_migrated: u64,
+    pub software_pattern_chunks_migrated: u64,
+    pub durable_mandates_migrated: u64,
+    pub session_mandates_migrated: u64,
     pub batches_completed: u64,
     /// Number of batches that errored (and are retried on the next tick
     /// because the WHERE clause picks them back up).
@@ -151,10 +157,94 @@ pub async fn run_embedding_migration_pass(
         }
     }
 
-    if report.file_chunks_migrated > 0 || report.session_prompts_migrated > 0 {
+    // Phase 5 C5: drain the four additional tables that the Phase 1
+    // milestone didn't cover. Each follows the same SKIP LOCKED batch
+    // pattern as file_chunks / session_prompts so multiple daemon
+    // instances or a manual `pgmcp` CLI invocation can run concurrently
+    // without double-embedding.
+    for _ in 0..config.max_batches {
+        match migrate_git_commit_chunks_batch(pool, &embedder, config.batch_size).await {
+            Ok(n) if n > 0 => {
+                report.git_commit_chunks_migrated += n;
+                report.batches_completed += 1;
+            }
+            Ok(_) => break,
+            Err(e) => {
+                warn!(error = %e, "git_commit_chunks migration batch failed");
+                report.errors += 1;
+                stats
+                    .embeddings_migration_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+    for _ in 0..config.max_batches {
+        match migrate_software_pattern_chunks_batch(pool, &embedder, config.batch_size).await {
+            Ok(n) if n > 0 => {
+                report.software_pattern_chunks_migrated += n;
+                report.batches_completed += 1;
+            }
+            Ok(_) => break,
+            Err(e) => {
+                warn!(error = %e, "software_pattern_chunks migration batch failed");
+                report.errors += 1;
+                stats
+                    .embeddings_migration_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+    for _ in 0..config.max_batches {
+        match migrate_durable_mandates_batch(pool, &embedder, config.batch_size).await {
+            Ok(n) if n > 0 => {
+                report.durable_mandates_migrated += n;
+                report.batches_completed += 1;
+            }
+            Ok(_) => break,
+            Err(e) => {
+                warn!(error = %e, "durable_mandates migration batch failed");
+                report.errors += 1;
+                stats
+                    .embeddings_migration_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+    for _ in 0..config.max_batches {
+        match migrate_session_mandates_batch(pool, &embedder, config.batch_size).await {
+            Ok(n) if n > 0 => {
+                report.session_mandates_migrated += n;
+                report.batches_completed += 1;
+            }
+            Ok(_) => break,
+            Err(e) => {
+                warn!(error = %e, "session_mandates migration batch failed");
+                report.errors += 1;
+                stats
+                    .embeddings_migration_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+
+    if report.file_chunks_migrated > 0
+        || report.session_prompts_migrated > 0
+        || report.git_commit_chunks_migrated > 0
+        || report.software_pattern_chunks_migrated > 0
+        || report.durable_mandates_migrated > 0
+        || report.session_mandates_migrated > 0
+    {
         info!(
             file_chunks = report.file_chunks_migrated,
             session_prompts = report.session_prompts_migrated,
+            git_commit_chunks = report.git_commit_chunks_migrated,
+            software_pattern_chunks = report.software_pattern_chunks_migrated,
+            durable_mandates = report.durable_mandates_migrated,
+            session_mandates = report.session_mandates_migrated,
             batches = report.batches_completed,
             errors = report.errors,
             "embedding-migration pass complete",
@@ -273,6 +363,208 @@ async fn migrate_session_prompts_batch(
     Ok(count)
 }
 
+/// Phase 5 C5: drain `git_commit_chunks`. Writes 1024d BGE-M3
+/// embeddings into the new `embedding_v2` column with
+/// `embedding_signature = 'bge-m3-v1'`.
+async fn migrate_git_commit_chunks_batch(
+    pool: &PgPool,
+    embedder: &Arc<Embedder>,
+    batch_size: usize,
+) -> Result<u64, sqlx::Error> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, content FROM git_commit_chunks
+         WHERE embedding_v2 IS NULL
+         ORDER BY id
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(batch_size as i64)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let texts: Vec<&str> = rows.iter().map(|(_, c)| c.as_str()).collect();
+    let vectors = match embedder.embed(&texts) {
+        Ok(v) => v,
+        Err(e) => return Err(sqlx::Error::Configuration(e.to_string().into())),
+    };
+    if vectors.len() != rows.len() {
+        return Err(sqlx::Error::Protocol(format!(
+            "embedder returned {} vectors for {} inputs",
+            vectors.len(),
+            rows.len()
+        )));
+    }
+
+    let mut tx = pool.begin().await?;
+    let mut count = 0_u64;
+    for ((id, _), vec) in rows.into_iter().zip(vectors) {
+        let v = Vector::from(vec);
+        sqlx::query(
+            "UPDATE git_commit_chunks
+             SET embedding_v2 = $1, embedding_signature = $2
+             WHERE id = $3",
+        )
+        .bind(&v)
+        .bind(BGE_M3_SIGNATURE)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        count += 1;
+    }
+    tx.commit().await?;
+    Ok(count)
+}
+
+/// Phase 5 C5: drain `software_pattern_chunks` (~600 rows; usually
+/// finishes in a single tick).
+async fn migrate_software_pattern_chunks_batch(
+    pool: &PgPool,
+    embedder: &Arc<Embedder>,
+    batch_size: usize,
+) -> Result<u64, sqlx::Error> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, content FROM software_pattern_chunks
+         WHERE embedding_v2 IS NULL
+         ORDER BY id
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(batch_size as i64)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let texts: Vec<&str> = rows.iter().map(|(_, c)| c.as_str()).collect();
+    let vectors = match embedder.embed(&texts) {
+        Ok(v) => v,
+        Err(e) => return Err(sqlx::Error::Configuration(e.to_string().into())),
+    };
+
+    let mut tx = pool.begin().await?;
+    let mut count = 0_u64;
+    for ((id, _), vec) in rows.into_iter().zip(vectors) {
+        let v = Vector::from(vec);
+        sqlx::query(
+            "UPDATE software_pattern_chunks
+             SET embedding_v2 = $1, embedding_signature = $2
+             WHERE id = $3",
+        )
+        .bind(&v)
+        .bind(BGE_M3_SIGNATURE)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        count += 1;
+    }
+    tx.commit().await?;
+    Ok(count)
+}
+
+/// Phase 5 C5: populate `durable_mandates.embedding` (already 1024d-
+/// shaped per the Phase 1 schema; no `_v2` column needed). The mandate
+/// tables were created with the target shape directly but never had a
+/// writer; this batch helper closes that gap.
+async fn migrate_durable_mandates_batch(
+    pool: &PgPool,
+    embedder: &Arc<Embedder>,
+    batch_size: usize,
+) -> Result<u64, sqlx::Error> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, imperative FROM durable_mandates
+         WHERE embedding IS NULL
+         ORDER BY id
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(batch_size as i64)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let texts: Vec<&str> = rows.iter().map(|(_, c)| c.as_str()).collect();
+    let vectors = match embedder.embed(&texts) {
+        Ok(v) => v,
+        Err(e) => return Err(sqlx::Error::Configuration(e.to_string().into())),
+    };
+
+    let mut tx = pool.begin().await?;
+    let mut count = 0_u64;
+    for ((id, _), vec) in rows.into_iter().zip(vectors) {
+        let v = Vector::from(vec);
+        sqlx::query(
+            "UPDATE durable_mandates
+             SET embedding = $1, embedding_signature = $2
+             WHERE id = $3",
+        )
+        .bind(&v)
+        .bind(BGE_M3_SIGNATURE)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        count += 1;
+    }
+    tx.commit().await?;
+    Ok(count)
+}
+
+/// Phase 5 C5: populate `session_mandates.embedding`. Same shape as
+/// `migrate_durable_mandates_batch`. The session mandate dedupe in
+/// `sessions::mark_near_duplicate_superseded` does NOT consume this
+/// embedding (it runs the in-process DynamicDawgChar dedup from
+/// Phase 3), but the memory-server reranker and PPR helpers do once
+/// `pgmcp embed-cutover --to bge-m3` flips the active signature.
+async fn migrate_session_mandates_batch(
+    pool: &PgPool,
+    embedder: &Arc<Embedder>,
+    batch_size: usize,
+) -> Result<u64, sqlx::Error> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, imperative FROM session_mandates
+         WHERE embedding IS NULL
+         ORDER BY id
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(batch_size as i64)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let texts: Vec<&str> = rows.iter().map(|(_, c)| c.as_str()).collect();
+    let vectors = match embedder.embed(&texts) {
+        Ok(v) => v,
+        Err(e) => return Err(sqlx::Error::Configuration(e.to_string().into())),
+    };
+
+    let mut tx = pool.begin().await?;
+    let mut count = 0_u64;
+    for ((id, _), vec) in rows.into_iter().zip(vectors) {
+        let v = Vector::from(vec);
+        sqlx::query(
+            "UPDATE session_mandates
+             SET embedding = $1, embedding_signature = $2
+             WHERE id = $3",
+        )
+        .bind(&v)
+        .bind(BGE_M3_SIGNATURE)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        count += 1;
+    }
+    tx.commit().await?;
+    Ok(count)
+}
+
 /// Daemon-facing entry point. Logs and swallows errors so a single bad
 /// tick doesn't kill the cron thread.
 pub async fn run_or_log(
@@ -289,22 +581,71 @@ pub async fn run_or_log(
 // Operator helpers
 // ============================================================================
 
-/// Returns true once both `file_chunks` and `session_prompts` are fully
-/// migrated (zero rows with `embedding_v2 IS NULL`). Operators use this
-/// before flipping `pgmcp_metadata.active_embedding_signature` to
-/// `bge-m3-v1` — flipping before the drain leaves cold rows that hash
-/// against the wrong column.
+/// Returns true once every BGE-M3-migration-bearing table is fully
+/// drained (zero rows with `embedding_v2 IS NULL`, or for the mandate
+/// tables which were authored 1024d-direct, zero rows with
+/// `embedding IS NULL`).
+///
+/// Phase 5 C5 extends the Phase 1 check from 2 tables to the full 6:
+/// file_chunks, session_prompts, git_commit_chunks,
+/// software_pattern_chunks, durable_mandates, session_mandates.
+/// Operators use this before flipping
+/// `pgmcp_metadata.active_embedding_signature` to `bge-m3-v1` — flipping
+/// before the drain leaves cold rows that hash against the wrong column.
 ///
 /// Cheap to call: counts NULLs over partial indices.
 pub async fn migration_complete(pool: &PgPool) -> Result<bool, sqlx::Error> {
-    let pending: (i64, i64) = sqlx::query_as(
+    let counts = full_backlog_counts(pool).await?;
+    Ok(counts.total() == 0)
+}
+
+/// Per-table backlog counts. Used by `pgmcp embed-cutover --check`
+/// (lands in C9) to give the operator a row-level picture before the
+/// flip; `migration_complete` is the cheap boolean wrapper around
+/// `total() == 0`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct BacklogCounts {
+    pub file_chunks: i64,
+    pub session_prompts: i64,
+    pub git_commit_chunks: i64,
+    pub software_pattern_chunks: i64,
+    pub durable_mandates: i64,
+    pub session_mandates: i64,
+}
+
+impl BacklogCounts {
+    pub fn total(&self) -> i64 {
+        self.file_chunks
+            + self.session_prompts
+            + self.git_commit_chunks
+            + self.software_pattern_chunks
+            + self.durable_mandates
+            + self.session_mandates
+    }
+}
+
+/// Read the per-table backlog. One round trip via UNION ALL of six
+/// COUNT(*) probes.
+pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::Error> {
+    let row: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
-            (SELECT COUNT(*) FROM file_chunks WHERE embedding_v2 IS NULL),
-            (SELECT COUNT(*) FROM session_prompts WHERE embedding_v2 IS NULL)",
+            (SELECT COUNT(*) FROM file_chunks            WHERE embedding_v2 IS NULL),
+            (SELECT COUNT(*) FROM session_prompts        WHERE embedding_v2 IS NULL),
+            (SELECT COUNT(*) FROM git_commit_chunks      WHERE embedding_v2 IS NULL),
+            (SELECT COUNT(*) FROM software_pattern_chunks WHERE embedding_v2 IS NULL),
+            (SELECT COUNT(*) FROM durable_mandates       WHERE embedding    IS NULL),
+            (SELECT COUNT(*) FROM session_mandates       WHERE embedding    IS NULL)",
     )
     .fetch_one(pool)
     .await?;
-    Ok(pending.0 == 0 && pending.1 == 0)
+    Ok(BacklogCounts {
+        file_chunks: row.0,
+        session_prompts: row.1,
+        git_commit_chunks: row.2,
+        software_pattern_chunks: row.3,
+        durable_mandates: row.4,
+        session_mandates: row.5,
+    })
 }
 
 /// Flip the cutover flag in `pgmcp_metadata`. Validates `migration_complete`
