@@ -1,8 +1,11 @@
 pub mod backend;
 pub mod model;
 pub mod pool;
+pub mod signature;
 
 pub use backend::EmbeddingBackend;
+#[allow(unused_imports)]
+pub use signature::{ActiveSignatureCache, EmbeddingSignature};
 // CandleBackend re-exported for callers (incl. tests) wanting to plug
 // the real model into EmbedSource::Backend(...). Not yet used by the
 // daemon's primary embed path (which goes through EmbedSource::Pool).
