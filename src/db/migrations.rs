@@ -1808,6 +1808,13 @@ async fn ensure_memory_phase2_hnsw_index(
 
 /// Phase 1: add `embedding_v2 VECTOR(1024)` and `embedding_signature TEXT`
 /// to `file_chunks` and `session_prompts`. Idempotent.
+///
+/// Phase 5 C1 extension: add the same parallel columns to
+/// `git_commit_chunks` and `software_pattern_chunks` so the full BGE-M3
+/// migration covers every code-side embedding table. Also drop the
+/// `NOT NULL` constraint on the legacy `embedding` columns so the
+/// indexer's mid-cutover dual-write (legacy zero-placeholder + real
+/// v2 vector) can succeed.
 async fn ensure_memory_v2_columns(pool: &PgPool) -> Result<(), sqlx::Error> {
     let stmts = [
         "ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS embedding_v2 vector(1024)",
@@ -1818,6 +1825,23 @@ async fn ensure_memory_v2_columns(pool: &PgPool) -> Result<(), sqlx::Error> {
         "ALTER TABLE durable_mandates ADD COLUMN IF NOT EXISTS embedding_signature TEXT",
         "ALTER TABLE session_mandates ADD COLUMN IF NOT EXISTS embedding vector(1024)",
         "ALTER TABLE session_mandates ADD COLUMN IF NOT EXISTS embedding_signature TEXT",
+        // Phase 5 C1: parallel columns on the two remaining code-side
+        // tables. Plan reference:
+        // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
+        // Phase 5 C1.
+        "ALTER TABLE git_commit_chunks ADD COLUMN IF NOT EXISTS embedding_v2 vector(1024)",
+        "ALTER TABLE git_commit_chunks ADD COLUMN IF NOT EXISTS embedding_signature TEXT",
+        "ALTER TABLE software_pattern_chunks ADD COLUMN IF NOT EXISTS embedding_v2 vector(1024)",
+        "ALTER TABLE software_pattern_chunks ADD COLUMN IF NOT EXISTS embedding_signature TEXT",
+        // Phase 5 C1: drop NOT NULL on every legacy 384d embedding column
+        // so the indexer dual-write (zero placeholder into legacy +
+        // real 1024d into embedding_v2) succeeds during the migration
+        // window. The legacy column itself is dropped in C12
+        // (post-soak operator action via `pgmcp embed-cutover --drop-legacy`).
+        "ALTER TABLE file_chunks ALTER COLUMN embedding DROP NOT NULL",
+        "ALTER TABLE session_prompts ALTER COLUMN embedding DROP NOT NULL",
+        "ALTER TABLE git_commit_chunks ALTER COLUMN embedding DROP NOT NULL",
+        "ALTER TABLE software_pattern_chunks ALTER COLUMN embedding DROP NOT NULL",
     ];
     for s in stmts {
         sqlx::query(s).execute(pool).await?;
@@ -1911,6 +1935,60 @@ async fn ensure_memory_v2_hnsw_index(
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_v2_durable_mandates_hnsw_params', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+    }
+
+    // Phase 5 C1: git_commit_chunks.embedding_v2
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'memory_v2_git_commit_chunks_hnsw_params'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if stored.as_deref() != Some(&current_params) {
+        sqlx::query("DROP INDEX IF EXISTS idx_git_commit_chunks_embedding_v2")
+            .execute(pool)
+            .await?;
+        let create_sql = format!(
+            "CREATE INDEX idx_git_commit_chunks_embedding_v2 ON git_commit_chunks \
+             USING hnsw (embedding_v2 vector_cosine_ops) \
+             WITH (m = {}, ef_construction = {})",
+            config.hnsw_m, config.hnsw_ef_construction
+        );
+        sqlx::query(&create_sql).execute(pool).await?;
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value)
+             VALUES ('memory_v2_git_commit_chunks_hnsw_params', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+    }
+
+    // Phase 5 C1: software_pattern_chunks.embedding_v2
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'memory_v2_software_pattern_chunks_hnsw_params'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if stored.as_deref() != Some(&current_params) {
+        sqlx::query("DROP INDEX IF EXISTS idx_software_pattern_chunks_embedding_v2")
+            .execute(pool)
+            .await?;
+        let create_sql = format!(
+            "CREATE INDEX idx_software_pattern_chunks_embedding_v2 ON software_pattern_chunks \
+             USING hnsw (embedding_v2 vector_cosine_ops) \
+             WITH (m = {}, ef_construction = {})",
+            config.hnsw_m, config.hnsw_ef_construction
+        );
+        sqlx::query(&create_sql).execute(pool).await?;
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value)
+             VALUES ('memory_v2_software_pattern_chunks_hnsw_params', $1)
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         )
         .bind(&current_params)
