@@ -3924,6 +3924,7 @@ dependencies = [
  "llammer-pipeline",
  "lling-llang",
  "memmap2",
+ "mimalloc",
  "ndarray",
  "notify",
  "num_cpus",

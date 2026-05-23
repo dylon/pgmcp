@@ -224,6 +224,16 @@ lling-llang = { path = "../lling-llang", features = ["levenshtein", "lm-rerank",
 libgrammstein = { path = "../libgrammstein", features = ["mimalloc-alloc", "lling-llang-integration", "wfst-export", "serde-extras", "rag", "rag-hnsw", "neural-rescore", "candle-model", "subword", "code", "code-python", "code-rust", "code-javascript", "code-rholang", "code-metta"] }
 llammer-pipeline = { path = "../llammer-pipeline", features = ["phonetic-rescore"] }
 
+# Phase 11: install mimalloc as the global allocator (set in main.rs
+# via `#[global_allocator]`). libgrammstein already pulls this
+# transitively via its `mimalloc-alloc` feature; pgmcp's Cargo.toml
+# adds it as a direct dep so the `mimalloc::MiMalloc` type is
+# resolvable from `main.rs` without leaning on the transitive
+# resolution path. Plan reference:
+# ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
+# Phase 11.
+mimalloc = "0.1"
+
 [dev-dependencies]
 proptest = "1"
 tokio-test = "0.4"

@@ -1,5 +1,17 @@
 #![recursion_limit = "1024"]
 
+// Phase 11: install mimalloc as the global allocator. Eliminates
+// glibc's mmap/munmap per-allocation `__mprotect` syscall pattern
+// that consumed ~45% CPU during large imports under the prior
+// allocator. The existing `mallopt(M_ARENA_MAX, 2)` in
+// `cap_malloc_arenas()` stays as belt-and-suspenders — it becomes a
+// no-op while mimalloc is the active allocator but kicks back in if
+// mimalloc is ever disabled. Plan reference:
+// ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
+// Phase 11.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod a2a;
 mod api;
 mod cli;
