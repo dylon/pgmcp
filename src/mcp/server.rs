@@ -2950,6 +2950,15 @@ pub struct SignatureLintParams {
     pub limit: Option<i32>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ParadigmProfileParams {
+    #[schemars(
+        description = "Source code to analyze (raw string). For per-file analysis, the caller \
+                       should read the file first and pass its content."
+    )]
+    pub code: String,
+}
+
 #[tool_router]
 impl McpServer {
     /// Create a new MCP server from a `SystemContext` bundle.
@@ -6899,6 +6908,29 @@ queries, or auditing which tags actually appear in this project's code."
             &_ctx,
             &summarize_debug(&params),
             super::tools::tool_type_tag_dictionary::tool_type_tag_dictionary(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Programming-paradigm profile of source code. Runs libgrammstein's \
+ParadigmDetector (regex-heuristic) and returns OOP / FP / Reactive / Procedural \
+weights plus the dominant paradigm. USE WHEN: characterizing a file's style, \
+detecting paradigm drift across a project, or sanity-checking an architectural \
+review. Pure code analysis — no DB access."
+    )]
+    async fn paradigm_profile(
+        &self,
+        Parameters(params): Parameters<ParadigmProfileParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "paradigm_profile",
+            10,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_paradigm_profile::tool_paradigm_profile(self.ctx(), params),
         )
         .await
     }

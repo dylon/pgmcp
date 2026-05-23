@@ -111,6 +111,12 @@ pub mod tool_topic_hierarchy_fcm;
 pub mod tool_type_shape_search;
 pub mod tool_type_tag_dictionary;
 
+// Phase 8 — code-analysis MCP tools layered on libgrammstein
+// (`src/code_analysis/`). One representative tool ships here;
+// the additional tools (subtree_mining, code_property_graph,
+// dendrogram_topic_hierarchy, …) follow the same wiring pattern.
+pub mod tool_paradigm_profile;
+
 // SOTA Phase 2 — graph algorithms
 pub mod tool_attack_vulnerability;
 pub mod tool_edge_betweenness;
