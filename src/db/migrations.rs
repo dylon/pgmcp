@@ -1346,6 +1346,13 @@ async fn ensure_memory_unified_views(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
+    // Phase 5 C10 — extend the matview to cover every embedding-
+    // bearing table populated by the full BGE-M3 migration. Adds:
+    // - `commit_chunk` arm (git_commit_chunks.embedding_v2)
+    // - `pattern_chunk` arm (software_pattern_chunks.embedding_v2)
+    // - `session_mandate` arm (session_mandates.embedding, 1024d-direct)
+    // The pre-Phase-5 `commit` arm (git_commits, no embedding) stays;
+    // it surfaces commit subjects as labels for graph traversal.
     sqlx::query(
         "CREATE MATERIALIZED VIEW memory_unified_nodes AS
             SELECT 'memory_entity:' || id::TEXT AS node_id,
@@ -1362,6 +1369,7 @@ async fn ensure_memory_unified_views(pool: &PgPool) -> Result<(), sqlx::Error> {
             SELECT 'chunk:' || id::TEXT, 'chunk',
                    LEFT(content, 200), embedding_v2, 0.5
               FROM file_chunks
+              WHERE embedding_v2 IS NOT NULL
             UNION ALL
             SELECT 'topic:' || id::TEXT, 'topic',
                    label, NULL::VECTOR(1024), 0.5
@@ -1371,9 +1379,24 @@ async fn ensure_memory_unified_views(pool: &PgPool) -> Result<(), sqlx::Error> {
                    imperative, embedding, 0.7
               FROM durable_mandates
             UNION ALL
+            SELECT 'session_mandate:' || id::TEXT, 'session_mandate',
+                   imperative, embedding, 0.5
+              FROM session_mandates
+              WHERE embedding IS NOT NULL
+            UNION ALL
             SELECT 'commit:' || id::TEXT, 'commit',
                    subject, NULL::VECTOR(1024), 0.5
-              FROM git_commits",
+              FROM git_commits
+            UNION ALL
+            SELECT 'commit_chunk:' || id::TEXT, 'commit_chunk',
+                   LEFT(content, 200), embedding_v2, 0.4
+              FROM git_commit_chunks
+              WHERE embedding_v2 IS NOT NULL
+            UNION ALL
+            SELECT 'pattern_chunk:' || id::TEXT, 'pattern_chunk',
+                   LEFT(content, 200), embedding_v2, 0.6
+              FROM software_pattern_chunks
+              WHERE embedding_v2 IS NOT NULL",
     )
     .execute(pool)
     .await?;
