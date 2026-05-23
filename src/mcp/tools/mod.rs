@@ -111,11 +111,27 @@ pub mod tool_topic_hierarchy_fcm;
 pub mod tool_type_shape_search;
 pub mod tool_type_tag_dictionary;
 
-// Phase 8 — code-analysis MCP tools layered on libgrammstein
-// (`src/code_analysis/`). One representative tool ships here;
-// the additional tools (subtree_mining, code_property_graph,
-// dendrogram_topic_hierarchy, …) follow the same wiring pattern.
+// Phase 8 — code-analysis + fuzzy + phonetic MCP tools (full surface).
+pub mod tool_articulatory_distance;
+pub mod tool_articulatory_naming_consistency;
+pub mod tool_code_property_graph;
+pub mod tool_correct_query;
+pub mod tool_dendrogram_topic_hierarchy;
+pub mod tool_expand_query_to_phonetic_pattern;
+pub mod tool_fuzzy_grep;
+pub mod tool_fuzzy_path_search;
+pub mod tool_fuzzy_symbol_search;
+pub mod tool_mandate_dedup_v2;
 pub mod tool_paradigm_profile;
+pub mod tool_phonetic_grep_comments;
+pub mod tool_phonetic_naming_consistency;
+pub mod tool_phonetic_normalize;
+pub mod tool_phonetic_symbol_search;
+pub mod tool_rename_oracle;
+pub mod tool_substring_search;
+pub mod tool_subtree_mining;
+pub mod tool_time_series_fuzzy_match;
+pub mod tool_token_grep;
 
 // SOTA Phase 2 — graph algorithms
 pub mod tool_attack_vulnerability;

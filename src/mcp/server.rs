@@ -2959,6 +2959,180 @@ pub struct ParadigmProfileParams {
     pub code: String,
 }
 
+// ─────────────────────────────────────────────────────────────────
+// Phase 8 — additional MCP tool params (fuzzy + phonetic +
+// code-analysis). Each is a thin wrapper over the Phase 4/6/9/10
+// helper layers; the tool bodies live in src/mcp/tools/tool_*.rs.
+// ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CodePropertyGraphParams {
+    #[schemars(description = "Source code to build a CPG for.")]
+    pub code: String,
+    #[schemars(description = "Language identifier (currently: python).")]
+    pub language: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SubtreeMiningParams {
+    #[schemars(description = "Source-code strings to mine across (same language).")]
+    pub sources: Vec<String>,
+    #[schemars(description = "Language identifier (python).")]
+    pub language: String,
+    #[schemars(description = "Min support fraction (0..1, default 0.1).")]
+    pub min_support: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PhoneticNormalizeParams {
+    #[schemars(description = "String to normalize via liblevenshtein's articulatory framework.")]
+    pub term: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExpandQueryToPhoneticPatternParams {
+    #[schemars(description = "Query term to reverse-expand into a regex.")]
+    pub term: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ArticulatoryDistanceParams {
+    #[schemars(description = "First string.")]
+    pub a: String,
+    #[schemars(description = "Second string.")]
+    pub b: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DendrogramTopicHierarchyParams {
+    #[schemars(description = "Project name.")]
+    pub project: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FuzzySymbolSearchParams {
+    #[schemars(description = "Query symbol (approximate match).")]
+    pub query: String,
+    #[schemars(description = "Max edit distance (default 2).")]
+    pub max_distance: Option<u32>,
+    #[schemars(description = "Result limit (default 20).")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FuzzyPathSearchParams {
+    #[schemars(description = "Query path fragment (approximate match).")]
+    pub query: String,
+    #[schemars(description = "Max edit distance (default 2).")]
+    pub max_distance: Option<u32>,
+    #[schemars(description = "Result limit (default 20).")]
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SubstringSearchParams {
+    #[schemars(description = "Substring to search for (exact, case-sensitive).")]
+    pub needle: String,
+    #[schemars(description = "Haystack — list of strings to search within (in-memory)")]
+    pub haystack: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TokenGrepParams {
+    #[schemars(description = "Query token (matched fuzzily against each haystack token).")]
+    pub query: String,
+    #[schemars(description = "Haystack tokens.")]
+    pub haystack: Vec<String>,
+    #[schemars(description = "Max edit distance per token (default 2).")]
+    pub max_distance: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TimeSeriesFuzzyMatchParams {
+    #[schemars(description = "Probe series (commits per week / similar cadence vector).")]
+    pub probe: Vec<f64>,
+    #[schemars(description = "Library of candidate series (each with an opaque id).")]
+    pub library: Vec<TimeSeriesEntry>,
+    #[schemars(description = "K nearest to return (default 5).")]
+    pub k: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TimeSeriesEntry {
+    pub id: i64,
+    pub series: Vec<f64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CorrectQueryParams {
+    #[schemars(description = "User query to correct.")]
+    pub query: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MandateDedupV2Params {
+    #[schemars(description = "Imperative to compare against the candidate set.")]
+    pub new_imperative: String,
+    #[schemars(description = "Existing mandates as `[id, imperative]` pairs.")]
+    pub active: Vec<MandateEntry>,
+    #[schemars(description = "Max Damerau-Levenshtein edit distance (default 3).")]
+    pub max_distance: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MandateEntry {
+    pub id: i64,
+    pub imperative: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FuzzyGrepParams {
+    #[schemars(description = "Query substring (approximate-match candidate).")]
+    pub query: String,
+    #[schemars(description = "Haystack strings.")]
+    pub haystack: Vec<String>,
+    #[schemars(description = "Max edit distance for verification (default 2).")]
+    pub max_distance: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PhoneticGrepCommentsParams {
+    #[schemars(description = "Query (phonetic-fuzzy match).")]
+    pub query: String,
+    #[schemars(description = "Haystack lines.")]
+    pub haystack: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PhoneticSymbolSearchParams {
+    #[schemars(description = "Query symbol (phonetic-normalized match).")]
+    pub query: String,
+    #[schemars(description = "Candidate symbol set.")]
+    pub candidates: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PhoneticNamingConsistencyParams {
+    #[schemars(description = "Identifiers in a directory / class scope to check.")]
+    pub identifiers: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ArticulatoryNamingConsistencyParams {
+    #[schemars(description = "Identifiers to compare via articulatory edit distance.")]
+    pub identifiers: Vec<String>,
+    #[schemars(description = "Max articulatory distance to flag as similar (default 0.5).")]
+    pub max_distance: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RenameOracleParams {
+    #[schemars(description = "Removed/old symbol name.")]
+    pub removed_name: String,
+    #[schemars(description = "Candidate current-day names.")]
+    pub current_names: Vec<String>,
+}
+
 #[tool_router]
 impl McpServer {
     /// Create a new MCP server from a `SystemContext` bundle.
@@ -6931,6 +7105,339 @@ review. Pure code analysis — no DB access."
             &_ctx,
             &summarize_debug(&params),
             super::tools::tool_paradigm_profile::tool_paradigm_profile(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Build a Code Property Graph (AST ∪ CFG ∪ DFG) for source code.")]
+    async fn code_property_graph(
+        &self,
+        Parameters(params): Parameters<CodePropertyGraphParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "code_property_graph",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_code_property_graph::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Frequent-subtree mining (TreeminerD) across a list of source strings.")]
+    async fn subtree_mining(
+        &self,
+        Parameters(params): Parameters<SubtreeMiningParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "subtree_mining",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_subtree_mining::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Normalize a term via liblevenshtein's phonetic framework.")]
+    async fn phonetic_normalize(
+        &self,
+        Parameters(params): Parameters<PhoneticNormalizeParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "phonetic_normalize",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_phonetic_normalize::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Reverse-expand a query into a phonetic regex (e.g. nite → (n|kn)i(t|te|ght))."
+    )]
+    async fn expand_query_to_phonetic_pattern(
+        &self,
+        Parameters(params): Parameters<ExpandQueryToPhoneticPatternParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "expand_query_to_phonetic_pattern",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_expand_query_to_phonetic_pattern::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Articulatory edit distance between two strings (IPA-feature weighted).")]
+    async fn articulatory_distance(
+        &self,
+        Parameters(params): Parameters<ArticulatoryDistanceParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "articulatory_distance",
+            2,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_articulatory_distance::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Read the persisted dendrogram-topic-hierarchy for a project (Phase 7).")]
+    async fn dendrogram_topic_hierarchy(
+        &self,
+        Parameters(params): Parameters<DendrogramTopicHierarchyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "dendrogram_topic_hierarchy",
+            10,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_dendrogram_topic_hierarchy::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Fuzzy symbol search via Damerau-Levenshtein over a candidate set.")]
+    async fn fuzzy_symbol_search(
+        &self,
+        Parameters(params): Parameters<FuzzySymbolSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "fuzzy_symbol_search",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_fuzzy_symbol_search::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Fuzzy path search via Damerau-Levenshtein over indexed file paths.")]
+    async fn fuzzy_path_search(
+        &self,
+        Parameters(params): Parameters<FuzzyPathSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "fuzzy_path_search",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_fuzzy_path_search::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Substring search via suffix automaton (exact, fast).")]
+    async fn substring_search(
+        &self,
+        Parameters(params): Parameters<SubstringSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "substring_search",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_substring_search::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Per-token fuzzy grep via liblevenshtein's TokenGrep semantics.")]
+    async fn token_grep(
+        &self,
+        Parameters(params): Parameters<TokenGrepParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "token_grep",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_token_grep::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Time-series fuzzy match via MSM distance (commit-cadence patterns).")]
+    async fn time_series_fuzzy_match(
+        &self,
+        Parameters(params): Parameters<TimeSeriesFuzzyMatchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "time_series_fuzzy_match",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_time_series_fuzzy_match::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Correct a user query via llammer-pipeline's lattice correction.")]
+    async fn correct_query(
+        &self,
+        Parameters(params): Parameters<CorrectQueryParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "correct_query",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_correct_query::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "In-process mandate dedup via Damerau-Levenshtein over an active set.")]
+    async fn mandate_dedup_v2(
+        &self,
+        Parameters(params): Parameters<MandateDedupV2Params>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "mandate_dedup_v2",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_mandate_dedup_v2::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Fuzzy grep: SuffixAutomaton substring containment + Damerau-Levenshtein verification."
+    )]
+    async fn fuzzy_grep(
+        &self,
+        Parameters(params): Parameters<FuzzyGrepParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "fuzzy_grep",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_fuzzy_grep::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Phonetic grep over comment/string lines (PhoneticGrepOnline).")]
+    async fn phonetic_grep_comments(
+        &self,
+        Parameters(params): Parameters<PhoneticGrepCommentsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "phonetic_grep_comments",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_phonetic_grep_comments::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Phonetic symbol search via PhoneticNormalizedDictionary.")]
+    async fn phonetic_symbol_search(
+        &self,
+        Parameters(params): Parameters<PhoneticSymbolSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "phonetic_symbol_search",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_phonetic_symbol_search::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Phonetic naming consistency: identifiers that share a phonetic class but differ in spelling."
+    )]
+    async fn phonetic_naming_consistency(
+        &self,
+        Parameters(params): Parameters<PhoneticNamingConsistencyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "phonetic_naming_consistency",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_phonetic_naming_consistency::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Articulatory naming consistency: identifiers within an articulatory-distance threshold."
+    )]
+    async fn articulatory_naming_consistency(
+        &self,
+        Parameters(params): Parameters<ArticulatoryNamingConsistencyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "articulatory_naming_consistency",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_articulatory_naming_consistency::run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Rename oracle: pick the most-likely current-day rename for a removed symbol."
+    )]
+    async fn rename_oracle(
+        &self,
+        Parameters(params): Parameters<RenameOracleParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "rename_oracle",
+            5,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_rename_oracle::run(self.ctx(), params),
         )
         .await
     }
