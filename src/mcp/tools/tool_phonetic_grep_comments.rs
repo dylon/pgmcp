@@ -31,10 +31,7 @@ pub async fn run(
 
     let phon = PgmcpPhonetics::default_english();
     let rules = phon.rules();
-    // Default to distance 1: tolerates a single character drift on
-    // top of phonetic normalization. Caller-tunable via the future
-    // max_distance param landing in P13.4 follow-up.
-    let max_distance: u8 = 1;
+    let max_distance: u8 = u8::try_from(params.max_distance.unwrap_or(1)).unwrap_or(u8::MAX);
     let scanner = PhoneticGrepOnline::with_rules(&params.query, (*rules).clone(), max_distance)
         .case_insensitive(true);
 

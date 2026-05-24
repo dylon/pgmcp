@@ -62,6 +62,7 @@ async fn phonetic_grep_finds_ph_to_f_via_english_rules() {
             "completely unrelated text".to_string(),
             "another line referencing a phonE call".to_string(),
         ],
+        max_distance: None,
     };
     let result = tool_phonetic_grep_comments::run(&ctx, params)
         .await
@@ -100,6 +101,7 @@ async fn empty_haystack_returns_zero_matches() {
     let params = PhoneticGrepCommentsParams {
         query: "anything".to_string(),
         haystack: vec![],
+        max_distance: None,
     };
     let result = tool_phonetic_grep_comments::run(&ctx, params)
         .await
@@ -111,4 +113,67 @@ async fn empty_haystack_returns_zero_matches() {
         .expect("text");
     let val: serde_json::Value = serde_json::from_str(&text).expect("json");
     assert_eq!(val["match_count"], 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn max_distance_param_tightens_and_widens_matches() {
+    // P14.2 — the tool's max_distance MUST be caller-tunable.
+    // A query 2 chars off from the haystack should miss at default
+    // (= 1) and hit when widened. Catches regression to a hardcoded
+    // constant.
+    let testdb = require_test_db!();
+    let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
+    let ctx = build_ctx(db);
+
+    let haystack = vec!["call the phone today".to_string()];
+    // "fonr" is 2 edits from "phone" after normalization (ph→f
+    // covers one; the trailing `r` vs `e` is the second). At
+    // max_distance = 1 this should not match; at = 3 it should.
+    let tight = tool_phonetic_grep_comments::run(
+        &ctx,
+        PhoneticGrepCommentsParams {
+            query: "fonr".to_string(),
+            haystack: haystack.clone(),
+            max_distance: None, // default = 1
+        },
+    )
+    .await
+    .expect("tight call");
+    let tight_text = tight
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .expect("tight text");
+    let tight_val: serde_json::Value = serde_json::from_str(&tight_text).expect("tight json");
+    let tight_count = tight_val["match_count"].as_u64().unwrap_or(u64::MAX);
+
+    let loose = tool_phonetic_grep_comments::run(
+        &ctx,
+        PhoneticGrepCommentsParams {
+            query: "fonr".to_string(),
+            haystack: haystack.clone(),
+            max_distance: Some(3),
+        },
+    )
+    .await
+    .expect("loose call");
+    let loose_text = loose
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .expect("loose text");
+    let loose_val: serde_json::Value = serde_json::from_str(&loose_text).expect("loose json");
+    let loose_count = loose_val["match_count"].as_u64().unwrap_or(0);
+
+    assert!(
+        loose_count > tight_count,
+        "loose ({loose_count}) must produce strictly more matches than tight ({tight_count}) — \
+         a regression that hardcodes max_distance = 1 fails this assertion. \
+         tight: {tight_val:#}\nloose: {loose_val:#}"
+    );
+
+    // Confirm the response surface includes the actual max_distance
+    // used so callers can verify their param was honored.
+    assert_eq!(loose_val["max_distance"], 3);
+    assert_eq!(tight_val["max_distance"], 1);
 }

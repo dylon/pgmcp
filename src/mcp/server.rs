@@ -3124,6 +3124,13 @@ pub struct PhoneticGrepCommentsParams {
     pub query: String,
     #[schemars(description = "Haystack lines.")]
     pub haystack: Vec<String>,
+    /// Max edit distance allowed on top of phonetic normalization.
+    /// Default 1 — tolerates a single character drift after the
+    /// rule-set has normalized both sides. Increase to widen the
+    /// match envelope; 0 means "exact normalized-form match only".
+    #[schemars(description = "Max edit distance on top of phonetic normalization. \
+                       Default 1; set 0 for exact normalized match, higher to widen.")]
+    pub max_distance: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
