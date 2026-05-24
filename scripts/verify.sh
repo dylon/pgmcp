@@ -80,4 +80,42 @@ run_gate "Gate 7/8: cargo smoke (GPU smoke scenarios)" \
 run_gate "Gate 8/8: cargo test --release --tests" \
     cargo test --release --tests
 
+# P13.5 advisory gates: re-run the formal-verification artefacts so
+# that drift between the spec text and the proof / model state is
+# caught at verify-time. Skipped (explicitly logged, never silent)
+# when the respective tool is not installed — see
+# feedback_feature_gated_build_verification.md for the no-silent-skip
+# rule.
+formal_rocq_dir="docs/formal/rocq"
+formal_tla_dir="docs/formal/tla"
+
+if command -v coqc >/dev/null 2>&1; then
+    if [ -d "${formal_rocq_dir}" ]; then
+        # shellcheck disable=SC2044
+        for v in $(find "${formal_rocq_dir}" -maxdepth 1 -name '*.v' -print | sort); do
+            run_gate "Formal gate: coqc ${v}" \
+                coqc "${v}"
+        done
+    fi
+else
+    echo "=== Formal gate: SKIP: coqc not found on PATH (Rocq proofs not re-checked) ==="
+    echo
+fi
+
+if command -v tlc >/dev/null 2>&1; then
+    if [ -d "${formal_tla_dir}" ]; then
+        # shellcheck disable=SC2044
+        for spec in $(find "${formal_tla_dir}" -maxdepth 1 -name '*.tla' -print | sort); do
+            # `tlc` resolves the sibling .cfg by basename; cd into the
+            # tla dir so relative paths Just Work.
+            spec_base=$(basename "${spec}" .tla)
+            run_gate "Formal gate: tlc ${spec_base}" \
+                bash -c "cd ${formal_tla_dir} && tlc -workers auto ${spec_base}.tla"
+        done
+    fi
+else
+    echo "=== Formal gate: SKIP: tlc not found on PATH (TLA+ specs not re-checked) ==="
+    echo
+fi
+
 echo "verify.sh: all gates passed"

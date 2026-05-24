@@ -48,11 +48,16 @@ StartScan ==
     /\ UNCHANGED <<file_chunks, similarities>>
 
 (* The indexer deletes a chunk during the scan. file_chunks shrinks
- * but cron_cache still holds the deleted id.                      *)
+ * but cron_cache still holds the deleted id. Postgres's
+ * ON DELETE CASCADE removes any similarities involving the deleted
+ * chunk, which is what keeps `NoOrphanFkInsert` an inductive
+ * invariant — without the cascade the inserted pair would dangle.  *)
 DeleteChunk(c) ==
     /\ c \in file_chunks
     /\ file_chunks' = file_chunks \ {c}
-    /\ UNCHANGED <<cron_cache, similarities>>
+    /\ similarities' = { pair \in similarities :
+                            pair[1] # c /\ pair[2] # c }
+    /\ UNCHANGED cron_cache
 
 (* The cron inserts a similarity pair, guarded by WHERE EXISTS so
  * stale ids are filtered out at INSERT time. This is the

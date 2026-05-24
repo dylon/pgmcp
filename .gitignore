@@ -2,3 +2,13 @@
 /.fastembed_cache/
 **/.fastembed_cache/
 /.claude/
+
+# Rocq compilation artifacts (P13.5). The proof source
+# (`docs/formal/rocq/*.v`) is committed; `coqc` outputs (`*.vo`,
+# `*.vos`, `*.vok`, `*.glob`, `.*.aux`) are reproducible from
+# source and are produced by the verify.sh advisory gate.
+docs/formal/rocq/*.vo
+docs/formal/rocq/*.vos
+docs/formal/rocq/*.vok
+docs/formal/rocq/*.glob
+docs/formal/rocq/.*.aux

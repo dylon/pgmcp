@@ -126,10 +126,7 @@ async fn symbol_search_with_project_excludes_other_projects_symbols() {
         .find_map(|c| c.as_text().map(|t| t.text.clone()))
         .expect("text");
     let val: serde_json::Value = serde_json::from_str(&text).expect("json");
-    let hits = val
-        .get("hits")
-        .and_then(|h| h.as_array())
-        .expect("hits");
+    let hits = val.get("hits").and_then(|h| h.as_array()).expect("hits");
     let terms: Vec<&str> = hits
         .iter()
         .filter_map(|h| h.get("term").and_then(|v| v.as_str()))
@@ -180,10 +177,7 @@ async fn path_search_with_project_excludes_other_projects_paths() {
         .find_map(|c| c.as_text().map(|t| t.text.clone()))
         .expect("text");
     let val: serde_json::Value = serde_json::from_str(&text).expect("json");
-    let hits = val
-        .get("hits")
-        .and_then(|h| h.as_array())
-        .expect("hits");
+    let hits = val.get("hits").and_then(|h| h.as_array()).expect("hits");
     let paths: Vec<&str> = hits
         .iter()
         .filter_map(|h| h.get("path").and_then(|v| v.as_str()))

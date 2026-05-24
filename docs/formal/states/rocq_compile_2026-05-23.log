@@ -1,0 +1,4 @@
+Running as unit: run-p2999167-i107711193.scope; invocation ID: 6cf676c397ca42ab97ba0aa03e2e30ef
+File "./TransducerMandateDedup.v", line 52, characters 0-31:
+Warning: Trying to mask the absolute name "TransducerMandateDedup"!
+[masking-absolute-name,deprecated-since-8.8,deprecated,default]

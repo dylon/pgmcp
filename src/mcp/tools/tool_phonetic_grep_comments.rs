@@ -35,12 +35,8 @@ pub async fn run(
     // top of phonetic normalization. Caller-tunable via the future
     // max_distance param landing in P13.4 follow-up.
     let max_distance: u8 = 1;
-    let scanner = PhoneticGrepOnline::with_rules(
-        &params.query,
-        (*rules).clone(),
-        max_distance,
-    )
-    .case_insensitive(true);
+    let scanner = PhoneticGrepOnline::with_rules(&params.query, (*rules).clone(), max_distance)
+        .case_insensitive(true);
 
     // Scan each haystack line. PhoneticGrepOnline owns the
     // single-document scan path; for a Vec<String> we run it

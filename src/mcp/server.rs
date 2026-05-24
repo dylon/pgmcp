@@ -3028,7 +3028,9 @@ pub struct DendrogramTopicHierarchyParams {
 pub struct FuzzySymbolSearchParams {
     #[schemars(description = "Query symbol (approximate match).")]
     pub query: String,
-    #[schemars(description = "Filter by project name (recommended — otherwise the symbol set spans every indexed project).")]
+    #[schemars(
+        description = "Filter by project name (recommended — otherwise the symbol set spans every indexed project)."
+    )]
     pub project: Option<String>,
     #[schemars(description = "Max edit distance (default 2).")]
     pub max_distance: Option<u32>,
@@ -3040,7 +3042,9 @@ pub struct FuzzySymbolSearchParams {
 pub struct FuzzyPathSearchParams {
     #[schemars(description = "Query path fragment (approximate match).")]
     pub query: String,
-    #[schemars(description = "Filter by project name (recommended — otherwise the path set spans every indexed project).")]
+    #[schemars(
+        description = "Filter by project name (recommended — otherwise the path set spans every indexed project)."
+    )]
     pub project: Option<String>,
     #[schemars(description = "Max edit distance (default 2).")]
     pub max_distance: Option<u32>,

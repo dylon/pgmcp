@@ -1,0 +1,63 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Warning: Please run the Java VM which executes TLC with a throughput optimized garbage collector by passing the "-XX:+UseParallelGC" property.
+(Use the -nowarning option to disable this warning.)
+Running breadth-first search Model-Checking with fp 98 and seed 8711410851164394209 with 32 workers on 32 cores with 30688MB heap and 64MB offheap memory [pid: 3001218] (Linux 7.0.7-arch1-1 amd64, Arch Linux 26.0.1 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /home/dylon/Workspace/f1r3fly.io/pgmcp/docs/formal/tla/CronStateMachine.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module CronStateMachine
+Starting... (2026-05-23 23:15:45)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-05-23 23:15:45.
+Error: Deadlock reached.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ pending = {t1, t2, t3}
+/\ completed = {}
+/\ running = {}
+/\ lock_held = FALSE
+
+State 2: <Next line 77, col 8 to line 77, col 38 of module CronStateMachine>
+/\ pending = {t2, t3}
+/\ completed = {}
+/\ running = {t1}
+/\ lock_held = TRUE
+
+State 3: <Next line 78, col 8 to line 78, col 41 of module CronStateMachine>
+/\ pending = {t2, t3}
+/\ completed = {t1}
+/\ running = {}
+/\ lock_held = FALSE
+
+State 4: <Next line 77, col 8 to line 77, col 38 of module CronStateMachine>
+/\ pending = {t3}
+/\ completed = {t1}
+/\ running = {t2}
+/\ lock_held = TRUE
+
+State 5: <Next line 78, col 8 to line 78, col 41 of module CronStateMachine>
+/\ pending = {t3}
+/\ completed = {t1, t2}
+/\ running = {}
+/\ lock_held = FALSE
+
+State 6: <Next line 77, col 8 to line 77, col 38 of module CronStateMachine>
+/\ pending = {}
+/\ completed = {t1, t2}
+/\ running = {t3}
+/\ lock_held = TRUE
+
+State 7: <Next line 78, col 8 to line 78, col 41 of module CronStateMachine>
+/\ pending = {}
+/\ completed = {t1, t2, t3}
+/\ running = {}
+/\ lock_held = FALSE
+
+37 states generated, 20 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 7.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 3 and the 95th percentile is 3).
+Finished in 00s at (2026-05-23 23:15:45)
