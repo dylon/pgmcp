@@ -59,6 +59,39 @@ pub struct FuzzyConfig {
     /// PersistentARTrieChar happily exceeds it if there's free disk.
     #[serde(default = "default_fuzzy_max_disk_bytes")]
     pub max_disk_bytes: u64,
+
+    /// P13.3 cost-model knobs. Tunable per-deployment but defaults
+    /// reflect liblevenshtein's published articulatory-feature
+    /// weights and pgmcp's empirical "fold near-name symbols
+    /// together" threshold.
+    /// Articulatory voicing-swap cost (`p`↔`b`). Default 0.1.
+    #[serde(default = "default_articulatory_voicing_weight")]
+    pub articulatory_voicing_weight: f64,
+    /// Articulatory place-change step (`p`→`t`→`k`). Default 0.15.
+    #[serde(default = "default_articulatory_place_step")]
+    pub articulatory_place_step: f64,
+    /// Articulatory manner-change default cost. Default 0.5.
+    #[serde(default = "default_articulatory_manner_default")]
+    pub articulatory_manner_default: f64,
+    /// Multiplier on `PhoneticCandidate.phonetic_cost` in WFST
+    /// lattice scoring. Default 1.0.
+    #[serde(default = "default_phonetic_cost_weight")]
+    pub phonetic_cost_weight: f64,
+    /// Cap on `edit_distance + phonetic_cost` for candidate
+    /// acceptance. Default 3.0.
+    #[serde(default = "default_phonetic_max_total_cost")]
+    pub phonetic_max_total_cost: f64,
+    /// Max allowed syllable-count delta before
+    /// `phonetic_naming_consistency` flags drift. Default 1.
+    #[serde(default = "default_syllable_drift_max_delta")]
+    pub syllable_drift_max_delta: u32,
+    /// `tool_find_similar_modules` / `tool_find_duplicates` fold
+    /// near-name symbols whose articulatory distance ≤ this value
+    /// before computing module similarity. Default 2.0 — empirically
+    /// covers typical rename / typo cases ("receive" ↔ "recieve",
+    /// snake_case ↔ camelCase) while excluding unrelated names.
+    #[serde(default = "default_phonetic_merge_threshold")]
+    pub phonetic_merge_threshold: f64,
 }
 
 impl Default for FuzzyConfig {
@@ -66,8 +99,37 @@ impl Default for FuzzyConfig {
         Self {
             data_dir: default_fuzzy_data_dir(),
             max_disk_bytes: default_fuzzy_max_disk_bytes(),
+            articulatory_voicing_weight: default_articulatory_voicing_weight(),
+            articulatory_place_step: default_articulatory_place_step(),
+            articulatory_manner_default: default_articulatory_manner_default(),
+            phonetic_cost_weight: default_phonetic_cost_weight(),
+            phonetic_max_total_cost: default_phonetic_max_total_cost(),
+            syllable_drift_max_delta: default_syllable_drift_max_delta(),
+            phonetic_merge_threshold: default_phonetic_merge_threshold(),
         }
     }
+}
+
+fn default_articulatory_voicing_weight() -> f64 {
+    0.1
+}
+fn default_articulatory_place_step() -> f64 {
+    0.15
+}
+fn default_articulatory_manner_default() -> f64 {
+    0.5
+}
+fn default_phonetic_cost_weight() -> f64 {
+    1.0
+}
+fn default_phonetic_max_total_cost() -> f64 {
+    3.0
+}
+fn default_syllable_drift_max_delta() -> u32 {
+    1
+}
+fn default_phonetic_merge_threshold() -> f64 {
+    2.0
 }
 
 fn default_fuzzy_data_dir() -> std::path::PathBuf {

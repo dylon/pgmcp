@@ -273,6 +273,16 @@ pub async fn tool_naming_consistency(
                 continue;
             }
             let suggested = convert_to_convention(&m.symbol_name, *dominant);
+            // P13.3: articulatory distance between the divergent
+            // identifier and the convention-corrected form. Surfaces
+            // a phonetic-similarity score alongside the existing
+            // case-classifier dominance — pairs like
+            // (`receive_request`, `recieveRequest`) score lower than
+            // (`foo_bar`, `quuxQuux`).
+            let severity_articulatory = crate::fuzzy::phonetic::articulatory_distance_score(
+                &m.symbol_name.to_lowercase(),
+                &suggested.to_lowercase(),
+            );
             let mut entry = json!({
                 "symbol": m.symbol_name,
                 "file": m.relative_path,
@@ -284,6 +294,7 @@ pub async fn tool_naming_consistency(
                 "module_dominance": dominance,
                 "module_path": module_path,
                 "module_kind_total": total,
+                "severity_articulatory": severity_articulatory,
                 "recommendation": format!(
                     "Rename `{}` to `{}` to match the dominant {} convention in {} ({:.0}% {} for {}s).",
                     m.symbol_name,

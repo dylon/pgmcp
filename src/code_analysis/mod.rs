@@ -13,5 +13,6 @@
 //! Phase 6.
 
 pub mod cpg;
+pub mod language_detect;
 pub mod paradigm;
 pub mod subtree;

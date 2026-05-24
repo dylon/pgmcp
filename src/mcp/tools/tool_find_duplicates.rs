@@ -56,10 +56,17 @@ pub async fn tool_find_duplicates(
     if let Some(pool) = ctx.db().pool()
         && materialized_available(pool).await.unwrap_or(false)
     {
-        type ClonePair = (i64, i64, String, String, f32);
+        // P13.3: same articulatory_distance enrichment as
+        // tool_find_similar_modules — bring back symbol names so
+        // duplicate-pair ranking accounts for phonetic similarity
+        // alongside type-signature similarity.
+        type ClonePair = (i64, i64, String, String, f32, String, String);
         let rows: Vec<ClonePair> = sqlx::query_as::<_, ClonePair>(
-            "SELECT c.symbol_id_a, c.symbol_id_b, c.language_a, c.language_b, c.similarity
+            "SELECT c.symbol_id_a, c.symbol_id_b, c.language_a, c.language_b, c.similarity,
+                    fs_a.name AS name_a, fs_b.name AS name_b
              FROM cross_language_signature_clones c
+             JOIN file_symbols fs_a ON fs_a.id = c.symbol_id_a
+             JOIN file_symbols fs_b ON fs_b.id = c.symbol_id_b
              ORDER BY c.similarity DESC
              LIMIT $1",
         )
@@ -67,13 +74,28 @@ pub async fn tool_find_duplicates(
         .fetch_all(pool)
         .await
         .unwrap_or_default();
-        for (a, b, lang_a, lang_b, sim) in rows {
+        let merge_threshold = ctx.config().load().fuzzy.phonetic_merge_threshold;
+        for (a, b, lang_a, lang_b, sim, name_a, name_b) in rows {
+            let art_dist = crate::fuzzy::phonetic::articulatory_distance_score(
+                &name_a.to_lowercase(),
+                &name_b.to_lowercase(),
+            );
+            // Mark pairs that the [fuzzy] cost model would
+            // consider "near-name" duplicates (articulatory
+            // distance ≤ phonetic_merge_threshold). Consumers can
+            // filter on this to find the strongest cross-language
+            // duplicate evidence.
+            let near_name = art_dist <= merge_threshold;
             cross_language_pairs.push(json!({
                 "symbol_id_a": a,
                 "symbol_id_b": b,
                 "language_a": lang_a,
                 "language_b": lang_b,
                 "similarity": sim,
+                "symbol_name_a": name_a,
+                "symbol_name_b": name_b,
+                "articulatory_distance": art_dist,
+                "near_name_match": near_name,
             }));
         }
     }

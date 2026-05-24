@@ -224,6 +224,12 @@ lling-llang = { path = "../lling-llang", features = ["levenshtein", "lm-rerank",
 libgrammstein = { path = "../libgrammstein", features = ["mimalloc-alloc", "lling-llang-integration", "wfst-export", "serde-extras", "rag", "rag-hnsw", "neural-rescore", "candle-model", "subword", "code", "code-python", "code-rust", "code-javascript", "code-rholang", "code-metta"] }
 llammer-pipeline = { path = "../llammer-pipeline", features = ["phonetic-rescore"] }
 
+# P13.3: BCP-47 language detection for per-project phonetic-rule
+# dispatch. Pinned to a direct dep so we don't depend on a version
+# transitively pulled by libgrammstein's optional `language-full`
+# feature (which we don't enable).
+whatlang = "0.16"
+
 # Phase 11: install mimalloc as the global allocator (set in main.rs
 # via `#[global_allocator]`). libgrammstein already pulls this
 # transitively via its `mimalloc-alloc` feature; pgmcp's Cargo.toml
