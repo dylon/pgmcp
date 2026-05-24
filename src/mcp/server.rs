@@ -3028,10 +3028,14 @@ pub struct DendrogramTopicHierarchyParams {
 pub struct FuzzySymbolSearchParams {
     #[schemars(description = "Query symbol (approximate match).")]
     pub query: String,
+    /// Project name (REQUIRED). The persistent symbol trie is
+    /// per-project — there is no global view. Callers wanting a
+    /// global search should iterate `list_projects` client-side
+    /// and merge results.
     #[schemars(
-        description = "Filter by project name (recommended — otherwise the symbol set spans every indexed project)."
+        description = "Project name (required — the persistent symbol trie is per-project)."
     )]
-    pub project: Option<String>,
+    pub project: String,
     #[schemars(description = "Max edit distance (default 2).")]
     pub max_distance: Option<u32>,
     #[schemars(description = "Result limit (default 20).")]
@@ -3042,10 +3046,12 @@ pub struct FuzzySymbolSearchParams {
 pub struct FuzzyPathSearchParams {
     #[schemars(description = "Query path fragment (approximate match).")]
     pub query: String,
-    #[schemars(
-        description = "Filter by project name (recommended — otherwise the path set spans every indexed project)."
-    )]
-    pub project: Option<String>,
+    /// Project name (REQUIRED). The persistent path trie is
+    /// per-project — there is no global view. Callers wanting a
+    /// global search should iterate `list_projects` client-side
+    /// and merge results.
+    #[schemars(description = "Project name (required — the persistent path trie is per-project).")]
+    pub project: String,
     #[schemars(description = "Max edit distance (default 2).")]
     pub max_distance: Option<u32>,
     #[schemars(description = "Result limit (default 20).")]

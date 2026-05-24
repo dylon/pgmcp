@@ -1,97 +1,55 @@
-//! `tool_fuzzy_symbol_search` (Phase 8, P13.4 real implementation).
+//! `tool_fuzzy_symbol_search` (Phase 8, P14.3 — persistent
+//! `FuzzyIndex` is the sole candidate source).
 //!
-//! Damerau-Levenshtein candidate generation against the project's
-//! symbol vocabulary (`file_symbols`), with an articulatory-distance
-//! re-rank stage. P13.4 changes from the prior stub:
+//! Routes per-call queries through the on-disk
+//! `PersistentARTrieChar`-backed `FuzzyIndex<SymbolValue>`
+//! materialized by `cron::fuzzy_sync`. The trie persists across
+//! daemon restarts; the helper `open_symbol_trie` lazy-warms it
+//! from PG on first call (idempotent — safe to race the cron's
+//! periodic rebuild).
 //!
-//! - Mandatory `project` filter via the projects JOIN (the prior
-//!   `SELECT DISTINCT name FROM file_symbols LIMIT 5000` ignored
-//!   project boundaries and capped at an arbitrary 5000 rows).
-//! - No `LIMIT` on the vocabulary fetch — the trie scales linearly
-//!   with vocabulary size and a 5k cap was silently dropping rare
-//!   symbols.
-//! - Articulatory re-rank: same Damerau-Levenshtein candidates,
-//!   reordered by articulatory edit distance so phonetically-similar
-//!   matches surface first.
+//! `DynamicDawgChar` is intentionally NOT used here: rebuilding
+//! an in-memory DAWG from a PG `SELECT` on every MCP call wastes
+//! O(n·log n) per request and discards everything between calls.
+//! The right pick for an index that should survive restarts is
+//! `PersistentARTrieChar`. (Per CLAUDE.md, `DynamicDawgChar` is
+//! still appropriate for session-scoped / per-query / one-shot
+//! ad-hoc vocabularies — but not here.)
 
 use std::sync::atomic::Ordering;
 
-use libdictenstein::dynamic_dawg_char::DynamicDawgChar;
-use liblevenshtein::transducer::Transducer;
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
 use serde_json::json;
 
 use crate::context::SystemContext;
 use crate::fuzzy::phonetic::articulatory_distance_score;
+use crate::fuzzy::sync::open_symbol_trie;
 use crate::mcp::server::FuzzySymbolSearchParams;
-use crate::mcp::tools::sota_helpers::{json_result, pool_or_err};
+use crate::mcp::tools::sota_helpers::json_result;
 
 pub async fn run(
     ctx: &SystemContext,
     params: FuzzySymbolSearchParams,
 ) -> Result<CallToolResult, McpError> {
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let pool = pool_or_err(ctx)?;
 
-    // Project filter is recommended — without one the vocabulary
-    // spans every indexed project and produces noisy results. We
-    // still permit the global lookup for cross-project rename
-    // detection use cases.
-    let rows: Vec<(String,)> = if let Some(project_name) = params.project.as_deref() {
-        sqlx::query_as::<_, (String,)>(
-            "SELECT DISTINCT fs.name
-             FROM file_symbols fs
-             JOIN indexed_files f ON fs.file_id = f.id
-             JOIN projects p ON f.project_id = p.id
-             WHERE p.name = $1
-               AND fs.name IS NOT NULL
-               AND length(fs.name) > 0",
-        )
-        .bind(project_name)
-        .fetch_all(pool)
-        .await
-    } else {
-        sqlx::query_as::<_, (String,)>(
-            "SELECT DISTINCT name
-             FROM file_symbols
-             WHERE name IS NOT NULL
-               AND length(name) > 0",
-        )
-        .fetch_all(pool)
-        .await
-    }
-    .map_err(|e| McpError::internal_error(format!("symbol fetch: {e}"), None))?;
-
-    let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
-    if names.is_empty() {
-        return json_result(&json!({
-            "query": params.query,
-            "project": params.project,
-            "max_distance": params.max_distance.unwrap_or(2),
-            "hits": Vec::<serde_json::Value>::new(),
-            "guidance": "No symbols indexed under the requested project (or globally if none was set).",
-        }));
-    }
-
-    let dict: DynamicDawgChar<()> = DynamicDawgChar::from_terms(names);
-    let xducer = Transducer::with_transposition(dict);
+    let idx = open_symbol_trie(ctx, &params.project).await?;
     let max_d = params.max_distance.unwrap_or(2) as usize;
     let limit = params.limit.unwrap_or(20) as usize;
 
-    // Phase 1: Damerau-Levenshtein candidates.
-    let mut hits: Vec<(String, usize, f64)> = xducer
-        .query_with_distance(&params.query, max_d)
-        .map(|c| {
-            let art = articulatory_distance_score(&params.query, &c.term);
-            (c.term, c.distance, art)
+    // Persistent trie returns (term, distance, value); apply
+    // articulatory re-rank as the tiebreaker so phonetically
+    // similar matches (voicing-only edits) surface above arbitrary
+    // substitutions at the same edit distance.
+    let mut hits: Vec<(String, usize, f64)> = idx
+        .query(&params.query, max_d)
+        .into_iter()
+        .map(|(term, distance, _value)| {
+            let art = articulatory_distance_score(&params.query, &term);
+            (term, distance, art)
         })
         .collect();
-
-    // Phase 2: articulatory re-rank — primary key edit_distance,
-    // tiebreaker articulatory_distance. Phonetically-similar matches
-    // (voicing-only edits) surface above arbitrary substitutions at
-    // the same edit distance.
     hits.sort_by(|a, b| {
         a.1.cmp(&b.1)
             .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
@@ -102,6 +60,7 @@ pub async fn run(
         "query": params.query,
         "project": params.project,
         "max_distance": max_d,
+        "vocabulary_size": idx.len(),
         "hits": hits.into_iter().map(|(term, distance, articulatory_distance)| json!({
             "term": term,
             "distance": distance,

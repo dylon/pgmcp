@@ -3,11 +3,21 @@
 //! Each `FuzzyIndex` is rebuildable from its canonical PG table; this
 //! module owns the SELECT loops that materialize the trie at daemon
 //! start and refresh it on the `fuzzy_sync` cron schedule.
+//!
+//! Also exposes `open_symbol_trie` / `open_path_trie` — the
+//! tool-facing helpers that open the per-project persistent
+//! `FuzzyIndex` and lazy-warm it from PG on first call.
+//! `tool_fuzzy_symbol_search`, `tool_fuzzy_path_search`, and
+//! `tool_hybrid_search::try_third_leg` all consume these to avoid
+//! rebuilding a transient `DynamicDawgChar` per call.
 
+use rmcp::ErrorData as McpError;
 use sqlx::PgPool;
 
 use super::persistent_artrie::{FuzzyError, FuzzyIndex};
 use super::values::{CommitRef, DurableMandateRef, PathValue, SymbolValue};
+use crate::context::SystemContext;
+use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
 
 /// Rebuild the symbol index from `file_symbols` + `indexed_files`.
 /// Returns the number of rows ingested.
@@ -98,6 +108,68 @@ pub async fn rebuild_commits(
         count += 1;
     }
     Ok(count)
+}
+
+/// Open (or create + lazy-warm from PG) the per-project symbol
+/// `FuzzyIndex`. Used by `tool_fuzzy_symbol_search` and
+/// `tool_hybrid_search::try_third_leg` to consume the persistent
+/// `PersistentARTrieChar`-backed trie that `cron::fuzzy_sync`
+/// materializes periodically. Lazy warming runs only when the trie
+/// file does not yet exist (fresh deployment); thereafter the cron
+/// keeps the trie current and this helper just mmap-attaches.
+pub async fn open_symbol_trie(
+    ctx: &SystemContext,
+    project_name: &str,
+) -> Result<FuzzyIndex<SymbolValue>, McpError> {
+    let data_dir = ctx.config().load().fuzzy.data_dir.clone();
+    let slug = crate::cron::fuzzy_sync::slugify(project_name);
+    let path = crate::cron::fuzzy_sync::trie_path(&data_dir, "symbols", &slug);
+    let fresh = !path.exists();
+    let (idx, _recovery) = FuzzyIndex::<SymbolValue>::open_or_create(&path)
+        .map_err(|e| McpError::internal_error(format!("fuzzy symbol trie open: {e}"), None))?;
+    if fresh {
+        let project_id = project_id_or_err(ctx, project_name).await?;
+        let pool = pool_or_err(ctx)?;
+        rebuild_symbols(pool, project_id, &idx).await.map_err(|e| {
+            McpError::internal_error(format!("fuzzy symbol trie initial warm: {e}"), None)
+        })?;
+        tracing::info!(
+            path = %path.display(),
+            project = %project_name,
+            entries = idx.len(),
+            "fuzzy symbol trie lazy-warmed from PG"
+        );
+    }
+    Ok(idx)
+}
+
+/// Open (or create + lazy-warm from PG) the per-project path
+/// `FuzzyIndex`. Mirror of `open_symbol_trie` for
+/// `indexed_files.relative_path` keyed lookups.
+pub async fn open_path_trie(
+    ctx: &SystemContext,
+    project_name: &str,
+) -> Result<FuzzyIndex<PathValue>, McpError> {
+    let data_dir = ctx.config().load().fuzzy.data_dir.clone();
+    let slug = crate::cron::fuzzy_sync::slugify(project_name);
+    let path = crate::cron::fuzzy_sync::trie_path(&data_dir, "paths", &slug);
+    let fresh = !path.exists();
+    let (idx, _recovery) = FuzzyIndex::<PathValue>::open_or_create(&path)
+        .map_err(|e| McpError::internal_error(format!("fuzzy path trie open: {e}"), None))?;
+    if fresh {
+        let project_id = project_id_or_err(ctx, project_name).await?;
+        let pool = pool_or_err(ctx)?;
+        rebuild_paths(pool, project_id, &idx).await.map_err(|e| {
+            McpError::internal_error(format!("fuzzy path trie initial warm: {e}"), None)
+        })?;
+        tracing::info!(
+            path = %path.display(),
+            project = %project_name,
+            entries = idx.len(),
+            "fuzzy path trie lazy-warmed from PG"
+        );
+    }
+    Ok(idx)
 }
 
 /// Rebuild the durable-mandate index from `durable_mandates`.

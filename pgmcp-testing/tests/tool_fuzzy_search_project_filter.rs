@@ -1,10 +1,15 @@
-//! P13.4 — fuzzy_symbol_search and fuzzy_path_search filter by project.
+//! P14.3 — `tool_fuzzy_symbol_search` / `tool_fuzzy_path_search`
+//! per-project isolation via the persistent `FuzzyIndex`.
 //!
-//! Seeds two projects with overlapping symbol / path names, calls
-//! each tool with a project filter, asserts the response excludes
-//! rows from the other project. Catches regression to the prior
-//! `SELECT … LIMIT 5000` global scan that ignored project
-//! boundaries.
+//! Pre-P14.3 this test asserted "the PG project-filter SQL works".
+//! Post-P14.3 the tools no longer touch PG at the query path (only
+//! during the first-call lazy warm), and project isolation is a
+//! property of the per-project trie file living under
+//! `<data_dir>/fuzzy/symbols/<slug>/symbols.artrie`. The new
+//! assertion shape: seed two projects in PG, point each test at a
+//! fresh tempdir-rooted `data_dir` so lazy warm pulls them
+//! correctly, call the tool with project A, assert project B's
+//! symbols are absent.
 
 use std::sync::Arc;
 
@@ -72,8 +77,10 @@ async fn seed_project_with_symbols(
     }
 }
 
-fn build_ctx(db: Arc<dyn DbClient>) -> SystemContext {
-    let config = Arc::new(ArcSwap::from_pointee(Config::default()));
+fn build_ctx_with_data_dir(db: Arc<dyn DbClient>, data_dir: std::path::PathBuf) -> SystemContext {
+    let mut cfg = Config::default();
+    cfg.fuzzy.data_dir = data_dir;
+    let config = Arc::new(ArcSwap::from_pointee(cfg));
     let stats = Arc::new(StatsTracker::new());
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
@@ -108,12 +115,13 @@ async fn symbol_search_with_project_excludes_other_projects_symbols() {
     )
     .await;
 
-    let ctx = build_ctx(Arc::new(testdb.pool().clone()));
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ctx = build_ctx_with_data_dir(Arc::new(testdb.pool().clone()), tmp.path().to_path_buf());
     let result = tool_fuzzy_symbol_search::run(
         &ctx,
         FuzzySymbolSearchParams {
             query: "unique_function".to_string(),
-            project: Some("filter_test_alpha".to_string()),
+            project: "filter_test_alpha".to_string(),
             max_distance: Some(8),
             limit: Some(50),
         },
@@ -159,12 +167,13 @@ async fn path_search_with_project_excludes_other_projects_paths() {
     )
     .await;
 
-    let ctx = build_ctx(Arc::new(testdb.pool().clone()));
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ctx = build_ctx_with_data_dir(Arc::new(testdb.pool().clone()), tmp.path().to_path_buf());
     let result = tool_fuzzy_path_search::run(
         &ctx,
         FuzzyPathSearchParams {
             query: "src/alpha_only.rs".to_string(),
-            project: Some("path_filter_alpha".to_string()),
+            project: "path_filter_alpha".to_string(),
             max_distance: Some(0),
             limit: Some(50),
         },

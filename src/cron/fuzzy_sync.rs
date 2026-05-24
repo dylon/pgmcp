@@ -93,7 +93,7 @@ pub struct FuzzySyncReport {
 }
 
 /// Filesystem-safe project slug.
-fn slugify(name: &str) -> String {
+pub fn slugify(name: &str) -> String {
     let mut s = String::with_capacity(name.len());
     for ch in name.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
