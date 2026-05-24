@@ -47,6 +47,8 @@ pub async fn tool_hybrid_search(
     let limit = params.limit.unwrap_or(20);
     let bm25_weight = params.bm25_weight.unwrap_or(0.5);
     let semantic_weight = params.semantic_weight.unwrap_or(0.5);
+    let wfst_lm_weight = params.wfst_lm_weight.unwrap_or(1.0);
+    let max_query_edit_distance = params.max_query_edit_distance.unwrap_or(2);
 
     debug!(
         tool = "hybrid_search",
@@ -56,6 +58,8 @@ pub async fn tool_hybrid_search(
         limit,
         bm25_weight,
         semantic_weight,
+        wfst_lm_weight,
+        max_query_edit_distance,
         "MCP tool invoked",
     );
 
@@ -94,6 +98,42 @@ pub async fn tool_hybrid_search(
         .await
         .map_err(|e| McpError::internal_error(format!("Semantic search failed: {}", e), None))?;
 
+    // Third RRF leg — WFST lattice + per-project HybridLM rescoring.
+    //
+    // Activates iff: (a) the user did not opt out via wfst_lm_weight=0;
+    // (b) a project name is supplied; (c) the per-project HybridLM model
+    // file exists on disk (populated by the `ngram-lm-train` cron).
+    // When any precondition fails we fall through to legacy 2-leg
+    // fusion — this preserves the "no per-project model" baseline.
+    let (wfst_rewritten_results, wfst_rewritten_query, legs_fused) =
+        if wfst_lm_weight > 0.0 && params.project.is_some() {
+            match try_third_leg(
+                ctx,
+                &params,
+                &embedding,
+                limit,
+                ef_search,
+                dedupe_worktrees,
+                wfst_lm_weight,
+                max_query_edit_distance,
+            )
+            .await
+            {
+                Some((results, rewritten_query)) if !results.is_empty() => {
+                    (results, Some(rewritten_query), 3u8)
+                }
+                _ => (Vec::new(), None, 2u8),
+            }
+        } else {
+            (Vec::new(), None, 2u8)
+        };
+
+    let semantic_rewritten_weight = if legs_fused == 3 {
+        semantic_weight
+    } else {
+        0.0
+    };
+
     // Reciprocal Rank Fusion. See `RRF_K` and `rrf_score` above.
     let mut rrf_scores: std::collections::HashMap<String, (f64, serde_json::Value)> =
         std::collections::HashMap::new();
@@ -131,6 +171,29 @@ pub async fn tool_hybrid_search(
                 "snippet": truncate(&result.chunk_content, 300),
                 "language": result.language,
                 "source": "semantic",
+            }),
+        ));
+        entry.0 += rrf;
+    }
+
+    // Third RRF leg — semantic search on the WFST-rewritten query.
+    for (rank, result) in wfst_rewritten_results.iter().enumerate() {
+        let key = format!(
+            "wfst_rewritten:{}:{}",
+            result.relative_path, result.start_line
+        );
+        let rrf = rrf_score(semantic_rewritten_weight, RRF_K, rank);
+        let entry = rrf_scores.entry(key).or_insert((
+            0.0,
+            serde_json::json!({
+                "path": result.path,
+                "relative_path": result.relative_path,
+                "project_name": result.project_name,
+                "start_line": result.start_line,
+                "end_line": result.end_line,
+                "snippet": truncate(&result.chunk_content, 300),
+                "language": result.language,
+                "source": "wfst_rewritten",
             }),
         ));
         entry.0 += rrf;
@@ -192,13 +255,20 @@ pub async fn tool_hybrid_search(
         "language": params.language,
         "bm25_weight": bm25_weight,
         "semantic_weight": semantic_weight,
+        "wfst_lm_weight": wfst_lm_weight,
+        "max_query_edit_distance": max_query_edit_distance,
         "text_results": text_results.len(),
         "semantic_results": semantic_results.len(),
+        "wfst_rewritten_results": wfst_rewritten_results.len(),
+        "wfst_rewritten_query": wfst_rewritten_query,
+        "legs_fused": legs_fused,
         "fused_count": fused.len(),
         "results": fused,
         "guidance": "RRF combines keyword precision with semantic recall. \
                      Increase bm25_weight for exact-match queries (error messages, function names). \
-                     Increase semantic_weight for conceptual queries (design patterns, workflows).",
+                     Increase semantic_weight for conceptual queries (design patterns, workflows). \
+                     A third leg (WFST lattice + HybridLM-rescored query) activates when \
+                     wfst_lm_weight > 0 and the per-project HybridLM model file is present.",
     });
 
     let json = serde_json::to_string_pretty(&result)
@@ -212,4 +282,100 @@ pub async fn tool_hybrid_search(
     );
 
     Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+/// Third RRF leg. Rewrites the query via the per-project WFST lattice
+/// (HybridLM rescoring on top), then re-runs semantic search on the
+/// rewritten query. Returns the rewritten semantic results and the
+/// rewritten query string. Returns `None` on any failure (HybridLM
+/// not trained, no fuzzy vocabulary, re-embed failure) so the caller
+/// falls back to legacy 2-leg fusion silently.
+#[allow(clippy::too_many_arguments)]
+async fn try_third_leg(
+    ctx: &SystemContext,
+    params: &crate::mcp::server::HybridSearchParams,
+    _embedding: &[f32],
+    limit: i32,
+    ef_search: i32,
+    dedupe_worktrees: bool,
+    wfst_lm_weight: f64,
+    max_query_edit_distance: usize,
+) -> Option<(Vec<crate::db::queries::SearchResult>, String)> {
+    let cfg_guard = ctx.config().load();
+    let data_dir = cfg_guard.fuzzy.data_dir.clone();
+    let project_name = params.project.as_ref()?;
+
+    let model_path = crate::cron::ngram_lm_train::model_path_for(&data_dir, project_name);
+    if !model_path.exists() {
+        debug!(
+            tool = "hybrid_search",
+            model_path = %model_path.display(),
+            "third leg skipped: per-project HybridLM model not present"
+        );
+        return None;
+    }
+
+    let lm = match crate::wfst::hybrid_lm::PgmcpHybridLm::open(&model_path) {
+        Ok(lm) => lm,
+        Err(e) => {
+            warn!(error = %e, "third leg skipped: HybridLM load failed");
+            return None;
+        }
+    };
+
+    let pool = ctx.db().pool()?;
+    let vocabulary: Vec<String> = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT lower(fs.name)
+         FROM file_symbols fs
+         JOIN indexed_files f ON fs.file_id = f.id
+         JOIN projects p ON f.project_id = p.id
+         WHERE p.name = $1
+           AND fs.name IS NOT NULL
+           AND length(fs.name) > 0",
+    )
+    .bind(project_name)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    if vocabulary.is_empty() {
+        debug!(
+            tool = "hybrid_search",
+            project = %project_name,
+            "third leg skipped: project has no symbol vocabulary"
+        );
+        return None;
+    }
+
+    let rewritten = crate::wfst::query_rescore::rewrite_query(
+        &params.query,
+        max_query_edit_distance,
+        1.0,
+        wfst_lm_weight,
+        &vocabulary,
+        Some(&lm),
+    );
+    if !rewritten.changed {
+        debug!(
+            tool = "hybrid_search",
+            "third leg skipped: rewrite unchanged"
+        );
+        return None;
+    }
+
+    let rewritten_embedding = ctx.embed().embed_query(&rewritten.rewritten).await.ok()?;
+    let results = ctx
+        .db()
+        .semantic_search(
+            &rewritten_embedding,
+            limit * 2,
+            params.language.as_deref(),
+            params.project.as_deref(),
+            ef_search,
+            dedupe_worktrees,
+        )
+        .await
+        .ok()?;
+
+    Some((results, rewritten.rewritten))
 }

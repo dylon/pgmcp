@@ -2401,6 +2401,21 @@ pub struct HybridSearchParams {
                        Default false."
     )]
     pub dedupe_worktrees: Option<bool>,
+    /// Weight for the third RRF leg (WFST/HybridLM-rescored query).
+    #[schemars(
+        description = "Weight for the third RRF leg (WFST lattice + HybridLM-rescored query). \
+                       Default 1.0. Set 0.0 to force the legacy 2-leg behavior. The third leg \
+                       activates only when the per-project HybridLM model file exists at \
+                       <data_dir>/hybrid_lm/<project>/model.bin (populated by the \
+                       `ngram-lm-train` cron)."
+    )]
+    pub wfst_lm_weight: Option<f64>,
+    /// Max per-token Damerau-Levenshtein distance for query rewriting.
+    #[schemars(
+        description = "Max per-token Damerau-Levenshtein distance used when generating \
+                       candidates for the third-leg lattice. Default 2."
+    )]
+    pub max_query_edit_distance: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

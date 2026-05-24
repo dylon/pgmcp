@@ -314,6 +314,13 @@ pub struct StatsTracker {
     pub topic_dendrogram_runs: AtomicU64,
     pub topic_dendrogram_topics_generated: AtomicU64,
 
+    // Phase 9 / P13.2 — per-project HybridLM training cron.
+    // `runs` counts cron pass starts; `projects_trained` increments
+    // once per project whose model was successfully persisted (skips
+    // small-corpus projects without counting).
+    pub ngram_lm_train_runs: AtomicU64,
+    pub ngram_lm_train_projects_trained: AtomicU64,
+
     // Embedding pool counters
     pub embed_file_batches: AtomicU64,
     pub embed_commit_batches: AtomicU64,
@@ -713,6 +720,8 @@ impl StatsTracker {
             fuzzy_sync_rows_synced: AtomicU64::new(0),
             topic_dendrogram_runs: AtomicU64::new(0),
             topic_dendrogram_topics_generated: AtomicU64::new(0),
+            ngram_lm_train_runs: AtomicU64::new(0),
+            ngram_lm_train_projects_trained: AtomicU64::new(0),
             embed_file_batches: AtomicU64::new(0),
             embed_commit_batches: AtomicU64::new(0),
             embed_query_count: AtomicU64::new(0),

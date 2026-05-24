@@ -12,7 +12,10 @@
 //!   `liblevenshtein`'s `PhoneticPipelineBuilder` for the phonetic
 //!   integration.
 
+pub mod correction;
 pub mod hybrid_lm;
+pub mod lattice;
+pub mod query_rescore;
 
 #[allow(unused_imports)]
-pub use hybrid_lm::HybridLmConfig;
+pub use hybrid_lm::{HybridLmConfig, PgmcpHybridLm};

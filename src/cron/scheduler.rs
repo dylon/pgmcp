@@ -1359,6 +1359,77 @@ pub fn schedule_maintenance_jobs(
         );
     }
 
+    // ngram-lm-train cron — per-project HybridLM training (n-gram +
+    // subword embedding) used by the third RRF leg of
+    // `tool_hybrid_search` and by `tool_correct_query`. Off when
+    // interval = 0.
+    if config.ngram_lm_train_interval_secs > 0 {
+        let db_clone_lm = Arc::clone(&db);
+        let rt_clone_lm = rt.clone();
+        let stats_for_lm = Arc::clone(&stats);
+        let lm_interval = config.ngram_lm_train_interval_secs;
+        let lm_data_dir = fuzzy_config.data_dir.clone();
+        let cron_pool_lm = Arc::clone(&cron_pool);
+        let lc_lm = lifecycle.clone();
+        let lock_lm = Arc::clone(&heavy_cron_lock);
+        let ready_lm: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+        let lm_ready_delay = Duration::from_secs(config.ready_delay_topic_secs);
+        handle.schedule_recurring(
+            staggered_initial_delay_ms("ngram-lm-train", lm_interval * 1000),
+            lm_interval * 1000,
+            "ngram-lm-train",
+            move || {
+                if lc_lm.is_stopping() {
+                    return false;
+                }
+                let lc = lc_lm.clone();
+                let lock = Arc::clone(&lock_lm);
+                let ready = Arc::clone(&ready_lm);
+                let stats = Arc::clone(&stats_for_lm);
+                let db = db_clone_lm.clone();
+                let rt = rt_clone_lm.clone();
+                let data_dir = lm_data_dir.clone();
+                cron_pool_lm.submit(
+                    move || {
+                        let _guard = heavy_gate_or_skip!(
+                            job = "ngram-lm-train",
+                            lc = lc,
+                            ready = ready,
+                            cooldown = lm_ready_delay,
+                            lock = lock,
+                            stats = stats,
+                        );
+                        let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
+                        let t0 = Instant::now();
+                        if let Some(pool) = db.pool().cloned() {
+                            let stats_ref = Arc::clone(&stats);
+                            rt.block_on(async move {
+                                crate::cron::ngram_lm_train::run_or_log(
+                                    Arc::new(pool),
+                                    stats_ref,
+                                    data_dir,
+                                )
+                                .await;
+                            });
+                            tracing::info!(
+                                job = "ngram-lm-train",
+                                elapsed_s = t0.elapsed().as_secs_f64(),
+                                "ngram-lm-train run complete"
+                            );
+                        } else {
+                            tracing::warn!(
+                                job = "ngram-lm-train",
+                                "skipping run: DbClient has no pool"
+                            );
+                        }
+                    },
+                    crate::work_pool::pool::Priority::Low,
+                );
+                true
+            },
+        );
+    }
+
     // Topic-dendrogram cron — hierarchical-agglomerative + c-TF-IDF
     // built on top of the same chunks the online FCM owns. Persists
     // to `topic_dendrograms`; the `dendrogram_topic_hierarchy` MCP

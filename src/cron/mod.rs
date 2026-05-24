@@ -27,6 +27,8 @@ pub mod memory_reflect;
 #[allow(dead_code)]
 pub mod memory_retention;
 #[allow(dead_code)]
+pub mod ngram_lm_train;
+#[allow(dead_code)]
 pub mod scheduler;
 pub mod shutdown;
 #[allow(dead_code)]
