@@ -49,6 +49,7 @@ async fn response_includes_normalized_and_expanded_fields() {
         &ctx,
         PhoneticNormalizeParams {
             term: "phone".to_string(),
+            project: None,
         },
     )
     .await

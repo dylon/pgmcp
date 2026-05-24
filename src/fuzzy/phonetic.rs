@@ -234,6 +234,38 @@ fn english_base_rules() -> Vec<RewriteRuleChar> {
     english::base().rules.clone()
 }
 
+/// P14.4 — install (or reload) a `PgmcpPhonetics` for one project.
+///
+/// Looks up the per-project entry in the registry by `project_root`.
+/// If present, calls `reload_rules` on the existing handle so the
+/// active rule set hot-swaps without dropping the watcher. If
+/// absent, constructs a new `Arc<PgmcpPhonetics>`, installs the
+/// `.pgmcp/rules.llev` watcher via `watch`, and inserts the handle
+/// into the registry.
+///
+/// Called from `event_processor.rs` on every `.pgmcp.toml`-change
+/// event whose `ProjectOverride.phonetics.rules_path` is set.
+/// Idempotent: re-invoking on an already-installed project re-reads
+/// the rules but does not double-install the watcher.
+pub fn install_phonetics_for_project(
+    project_root: &Path,
+    rules_path: &Path,
+    language: Option<&str>,
+    registry: &std::sync::Arc<dashmap::DashMap<PathBuf, std::sync::Arc<PgmcpPhonetics>>>,
+) -> Result<(), PhoneticsError> {
+    if let Some(existing) = registry.get(project_root) {
+        existing.reload_rules(rules_path)?;
+        return Ok(());
+    }
+    let phon = std::sync::Arc::new(PgmcpPhonetics::open(
+        rules_path,
+        language.unwrap_or("en-us"),
+    )?);
+    phon.watch(rules_path.to_path_buf())?;
+    registry.insert(project_root.to_path_buf(), phon);
+    Ok(())
+}
+
 fn load_rules_from_path(path: &Path) -> Result<Vec<RewriteRuleChar>, PhoneticsError> {
     let content = std::fs::read_to_string(path)?;
     let file = parse_str(&content).map_err(|e| PhoneticsError::Llev(format!("parse: {e:?}")))?;

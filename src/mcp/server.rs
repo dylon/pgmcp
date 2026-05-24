@@ -3002,12 +3002,21 @@ pub struct SubtreeMiningParams {
 pub struct PhoneticNormalizeParams {
     #[schemars(description = "String to normalize via liblevenshtein's articulatory framework.")]
     pub term: String,
+    /// Optional project name. When set and the project has a
+    /// `.pgmcp/rules.llev` override loaded by `event_processor.rs`,
+    /// the tool uses that project's rule set instead of the
+    /// embedded English default.
+    #[schemars(description = "Project name (optional — uses per-project rules if loaded).")]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExpandQueryToPhoneticPatternParams {
     #[schemars(description = "Query term to reverse-expand into a regex.")]
     pub term: String,
+    /// Optional project name. See `PhoneticNormalizeParams.project`.
+    #[schemars(description = "Project name (optional — uses per-project rules if loaded).")]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3137,6 +3146,9 @@ pub struct PhoneticGrepCommentsParams {
     #[schemars(description = "Max edit distance on top of phonetic normalization. \
                        Default 1; set 0 for exact normalized match, higher to widen.")]
     pub max_distance: Option<u32>,
+    /// Optional project name. See `PhoneticNormalizeParams.project`.
+    #[schemars(description = "Project name (optional — uses per-project rules if loaded).")]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

@@ -98,6 +98,7 @@ pub fn start_indexing(
     let project_roots_for_filter = Arc::clone(&project_roots);
     let project_overrides_for_filter = Arc::clone(&project_overrides);
     let stats_for_filter = Arc::clone(&stats);
+    let phonetics_for_filter = Arc::clone(ctx.phonetics_registry());
     let filtered_rx = {
         let rx = event_rx;
         // Filter to only configured extensions and non-excluded paths
@@ -121,6 +122,35 @@ pub fn start_indexing(
                         match event.kind {
                             watcher::FileEventKind::Create | watcher::FileEventKind::Modify => {
                                 if let Some(ovr) = config::ProjectOverride::load(project_root) {
+                                    // P14.4 — install / reload the per-project
+                                    // PgmcpPhonetics watcher when the override
+                                    // declares a `[phonetics] rules_path`.
+                                    if let Some(phon_ovr) = ovr.phonetics.as_ref()
+                                        && let Some(rules_path) = phon_ovr.rules_path.as_ref()
+                                    {
+                                        let lang = phon_ovr.language.as_deref();
+                                        if let Err(e) =
+                                            crate::fuzzy::phonetic::install_phonetics_for_project(
+                                                project_root,
+                                                rules_path,
+                                                lang,
+                                                &phonetics_for_filter,
+                                            )
+                                        {
+                                            warn!(
+                                                path = %project_root.display(),
+                                                rules_path = %rules_path.display(),
+                                                error = %e,
+                                                "P14.4: per-project PgmcpPhonetics install failed"
+                                            );
+                                        } else {
+                                            info!(
+                                                path = %project_root.display(),
+                                                rules_path = %rules_path.display(),
+                                                "P14.4: per-project PgmcpPhonetics installed"
+                                            );
+                                        }
+                                    }
                                     project_overrides_for_filter
                                         .insert(project_root.to_path_buf(), ovr);
                                     info!(
@@ -131,6 +161,15 @@ pub fn start_indexing(
                             }
                             watcher::FileEventKind::Remove => {
                                 project_overrides_for_filter.remove(&project_root.to_path_buf());
+                                if phonetics_for_filter
+                                    .remove(&project_root.to_path_buf())
+                                    .is_some()
+                                {
+                                    info!(
+                                        path = %project_root.display(),
+                                        "P14.4: per-project PgmcpPhonetics removed (Drop tears down watcher)"
+                                    );
+                                }
                                 info!(
                                     path = %project_root.display(),
                                     "Removed project config override"

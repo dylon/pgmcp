@@ -21,18 +21,30 @@
 //! pass around. The trait fields hold real shared state; cloning the
 //! context never deep-copies anything.
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 
 use crate::config::Config;
 use crate::daemon_state::DaemonLifecycle;
 use crate::db::DbClient;
 use crate::embed::EmbedSource;
+use crate::fuzzy::phonetic::PgmcpPhonetics;
 use crate::llm::LlmExtractor;
 use crate::mcp::logging::LogBroadcaster;
 use crate::mcp::tasks::TaskStore;
 use crate::stats::tracker::StatsTracker;
+
+/// Per-project `PgmcpPhonetics` registry. Keyed by `project_root`
+/// (the same `PathBuf` `event_processor.rs` uses for
+/// `project_overrides_for_filter`), the installation thread is the
+/// `.pgmcp.toml`-change handler in `event_processor.rs`. Readers
+/// are the three phonetic MCP tools; writers are the
+/// `install_phonetics_for_project` helper (also drop-removed on
+/// `.pgmcp.toml` removal events).
+pub type PhoneticsRegistry = Arc<DashMap<PathBuf, Arc<PgmcpPhonetics>>>;
 
 /// Bundled dependencies shared across the daemon's stateful subsystems.
 #[derive(Clone)]
@@ -63,6 +75,17 @@ pub struct SystemContext {
     /// via `try_lock`; a held lock surfaces as a `Conflict`-style error
     /// to the caller rather than queueing.
     reindex_lock: Arc<tokio::sync::Mutex<()>>,
+    /// P14.4 — per-project `Arc<PgmcpPhonetics>` registry. Populated
+    /// by `event_processor.rs`'s `.pgmcp.toml` change handler when
+    /// the project's `ProjectOverride.phonetics.rules_path` is set.
+    /// Empty in tests / CLI mode (the `phonetics_for` lookup falls
+    /// back to `default_phonetics` for unknown projects).
+    phonetics: PhoneticsRegistry,
+    /// P14.4 — lazy-initialized embedded-English `PgmcpPhonetics`
+    /// used as the default when `phonetics_for(...)` cannot find a
+    /// per-project entry (no `project` param supplied, or the
+    /// project's `.pgmcp.toml` has no `phonetics.rules_path`).
+    default_phonetics: Arc<OnceLock<Arc<PgmcpPhonetics>>>,
 }
 
 impl SystemContext {
@@ -90,6 +113,8 @@ impl SystemContext {
             lifecycle,
             llm_extractor: None,
             reindex_lock: Arc::new(tokio::sync::Mutex::new(())),
+            phonetics: Arc::new(DashMap::new()),
+            default_phonetics: Arc::new(OnceLock::new()),
         }
     }
 
@@ -117,7 +142,50 @@ impl SystemContext {
             lifecycle,
             llm_extractor,
             reindex_lock: Arc::new(tokio::sync::Mutex::new(())),
+            phonetics: Arc::new(DashMap::new()),
+            default_phonetics: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// P14.4 — clone the per-project phonetics registry Arc. The
+    /// daemon's `start_event_processing` threads this through so the
+    /// `.pgmcp.toml`-change handler can install / tear down
+    /// `PgmcpPhonetics` watchers as projects come and go.
+    pub fn phonetics_registry(&self) -> &PhoneticsRegistry {
+        &self.phonetics
+    }
+
+    /// P14.4 — resolve a `PgmcpPhonetics` handle for an MCP tool
+    /// call. Tries the registry by trailing path-segment match
+    /// against `project`; if no per-project entry exists (or
+    /// `project` is `None`), returns the embedded-English default
+    /// (lazy-initialized).
+    pub fn phonetics_for(&self, project: Option<&str>) -> Arc<PgmcpPhonetics> {
+        if let Some(name) = project {
+            // Walk the registry. The key is the project root
+            // `PathBuf`; `file_name()` gives the trailing segment.
+            // Equality on segment matches the convention used by
+            // `event_processor.rs`'s `project_overrides_for_filter`
+            // (also keyed by `PathBuf` but looked up by full path
+            // via the indexer). We do segment match here because the
+            // MCP `project` param is the human-readable name, not a
+            // full path.
+            for entry in self.phonetics.iter() {
+                if entry
+                    .key()
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s == name)
+                    .unwrap_or(false)
+                {
+                    return Arc::clone(entry.value());
+                }
+            }
+        }
+        Arc::clone(
+            self.default_phonetics
+                .get_or_init(|| Arc::new(PgmcpPhonetics::default_english())),
+        )
     }
 
     pub fn db(&self) -> &Arc<dyn DbClient> {

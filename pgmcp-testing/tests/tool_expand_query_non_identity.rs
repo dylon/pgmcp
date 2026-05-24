@@ -50,6 +50,7 @@ async fn ph_to_f_term_produces_alternation_pattern() {
         &ctx,
         ExpandQueryToPhoneticPatternParams {
             term: "phone".to_string(),
+            project: None,
         },
     )
     .await

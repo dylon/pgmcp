@@ -13,7 +13,6 @@ use rmcp::model::CallToolResult;
 use serde_json::json;
 
 use crate::context::SystemContext;
-use crate::fuzzy::phonetic::PgmcpPhonetics;
 use crate::mcp::server::ExpandQueryToPhoneticPatternParams;
 use crate::mcp::tools::sota_helpers::json_result;
 
@@ -22,11 +21,12 @@ pub async fn run(
     params: ExpandQueryToPhoneticPatternParams,
 ) -> Result<CallToolResult, McpError> {
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let phon = PgmcpPhonetics::default_english();
+    let phon = ctx.phonetics_for(params.project.as_deref());
     let expanded = phon.expand_to_pattern(&params.term);
     json_result(&json!({
         "input": params.term,
         "expanded": expanded,
         "language": phon.language().as_str(),
+        "project": params.project,
     }))
 }

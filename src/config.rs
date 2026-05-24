@@ -2033,6 +2033,29 @@ pub struct ProjectOverride {
     pub indexer: Option<ProjectIndexerOverride>,
     #[serde(default)]
     pub git: Option<GitConfig>,
+    /// Per-project phonetic-framework override (P14.4). When
+    /// `rules_path` is set, the daemon's event_processor installs a
+    /// `PgmcpPhonetics` watcher on that path so the three phonetic
+    /// MCP tools (`phonetic_normalize`,
+    /// `expand_query_to_phonetic_pattern`, `phonetic_grep_comments`)
+    /// pick up the project's rule set when their `project` param
+    /// resolves to this root.
+    #[serde(default)]
+    pub phonetics: Option<ProjectPhoneticsOverride>,
+}
+
+/// Per-project phonetic rule + language override (P14.4).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ProjectPhoneticsOverride {
+    /// Path to a `.llev` rule file (typically `.pgmcp/rules.llev`
+    /// under the project root). When set, the daemon's
+    /// `PgmcpPhonetics::watch` watcher hot-reloads on file change
+    /// or deletion.
+    pub rules_path: Option<PathBuf>,
+    /// BCP-47 language tag (e.g. `"en-us"`, `"fr"`). Recorded for
+    /// diagnostics and consumed by `PgmcpPhonetics::for_language`
+    /// when `rules_path` is unset.
+    pub language: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2101,6 +2124,7 @@ impl ProjectOverride {
         let default = ProjectOverride {
             indexer: None,
             git: Some(GitConfig::default()),
+            phonetics: None,
         };
         toml::to_string_pretty(&default).expect("Failed to serialize default project override")
     }

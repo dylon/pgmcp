@@ -19,7 +19,6 @@ use rmcp::model::CallToolResult;
 use serde_json::json;
 
 use crate::context::SystemContext;
-use crate::fuzzy::phonetic::PgmcpPhonetics;
 use crate::mcp::server::PhoneticGrepCommentsParams;
 use crate::mcp::tools::sota_helpers::json_result;
 
@@ -29,7 +28,7 @@ pub async fn run(
 ) -> Result<CallToolResult, McpError> {
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
 
-    let phon = PgmcpPhonetics::default_english();
+    let phon = ctx.phonetics_for(params.project.as_deref());
     let rules = phon.rules();
     let max_distance: u8 = u8::try_from(params.max_distance.unwrap_or(1)).unwrap_or(u8::MAX);
     let scanner = PhoneticGrepOnline::with_rules(&params.query, (*rules).clone(), max_distance)

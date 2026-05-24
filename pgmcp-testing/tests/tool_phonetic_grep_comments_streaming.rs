@@ -63,6 +63,7 @@ async fn phonetic_grep_finds_ph_to_f_via_english_rules() {
             "another line referencing a phonE call".to_string(),
         ],
         max_distance: None,
+        project: None,
     };
     let result = tool_phonetic_grep_comments::run(&ctx, params)
         .await
@@ -102,6 +103,7 @@ async fn empty_haystack_returns_zero_matches() {
         query: "anything".to_string(),
         haystack: vec![],
         max_distance: None,
+        project: None,
     };
     let result = tool_phonetic_grep_comments::run(&ctx, params)
         .await
@@ -135,6 +137,7 @@ async fn max_distance_param_tightens_and_widens_matches() {
             query: "fonr".to_string(),
             haystack: haystack.clone(),
             max_distance: None, // default = 1
+            project: None,
         },
     )
     .await
@@ -153,6 +156,7 @@ async fn max_distance_param_tightens_and_widens_matches() {
             query: "fonr".to_string(),
             haystack: haystack.clone(),
             max_distance: Some(3),
+            project: None,
         },
     )
     .await
