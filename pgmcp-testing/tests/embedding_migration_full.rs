@@ -10,10 +10,7 @@ use pgmcp::embed::signature::{ActiveSignatureCache, EmbeddingSignature};
 
 #[test]
 fn signature_string_round_trip_covers_both_models() {
-    for sig in [
-        EmbeddingSignature::MiniLmV1,
-        EmbeddingSignature::BgeM3V1,
-    ] {
+    for sig in [EmbeddingSignature::MiniLmV1, EmbeddingSignature::BgeM3V1] {
         let parsed = EmbeddingSignature::from_str_signature(sig.as_str());
         assert_eq!(
             parsed,

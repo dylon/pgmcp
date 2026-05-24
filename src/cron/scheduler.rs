@@ -1359,6 +1359,74 @@ pub fn schedule_maintenance_jobs(
         );
     }
 
+    // Topic-dendrogram cron — hierarchical-agglomerative + c-TF-IDF
+    // built on top of the same chunks the online FCM owns. Persists
+    // to `topic_dendrograms`; the `dendrogram_topic_hierarchy` MCP
+    // tool reads from there. Off when interval = 0.
+    if config.topic_dendrogram_interval_secs > 0 {
+        let db_clone_td = Arc::clone(&db);
+        let rt_clone_td = rt.clone();
+        let stats_for_td = Arc::clone(&stats);
+        let td_interval = config.topic_dendrogram_interval_secs;
+        let cron_pool_td = Arc::clone(&cron_pool);
+        let lc_td = lifecycle.clone();
+        let lock_td = Arc::clone(&heavy_cron_lock);
+        let ready_td: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+        let td_ready_delay = Duration::from_secs(config.ready_delay_topic_secs);
+        handle.schedule_recurring(
+            staggered_initial_delay_ms("topic-dendrogram", td_interval * 1000),
+            td_interval * 1000,
+            "topic-dendrogram",
+            move || {
+                if lc_td.is_stopping() {
+                    return false;
+                }
+                let lc = lc_td.clone();
+                let lock = Arc::clone(&lock_td);
+                let ready = Arc::clone(&ready_td);
+                let stats = Arc::clone(&stats_for_td);
+                let db = db_clone_td.clone();
+                let rt = rt_clone_td.clone();
+                cron_pool_td.submit(
+                    move || {
+                        let _guard = heavy_gate_or_skip!(
+                            job = "topic-dendrogram",
+                            lc = lc,
+                            ready = ready,
+                            cooldown = td_ready_delay,
+                            lock = lock,
+                            stats = stats,
+                        );
+                        let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
+                        let t0 = Instant::now();
+                        if let Some(pool) = db.pool().cloned() {
+                            let stats_ref = Arc::clone(&stats);
+                            rt.block_on(async move {
+                                crate::cron::topic_dendrogram::run_or_log(
+                                    Arc::new(pool),
+                                    stats_ref,
+                                )
+                                .await;
+                            });
+                            tracing::info!(
+                                job = "topic-dendrogram",
+                                elapsed_s = t0.elapsed().as_secs_f64(),
+                                "topic-dendrogram run complete"
+                            );
+                        } else {
+                            tracing::warn!(
+                                job = "topic-dendrogram",
+                                "skipping run: DbClient has no pool"
+                            );
+                        }
+                    },
+                    crate::work_pool::pool::Priority::Low,
+                );
+                true
+            },
+        );
+    }
+
     // Topic clustering (global full-chunk — always produces scope = "global")
     let db_clone_topic = db; // final move // final move
     let rt_clone_topic = rt; // final move
