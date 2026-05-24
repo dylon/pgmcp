@@ -323,22 +323,23 @@ async fn try_third_leg(
         }
     };
 
-    let pool = ctx.db().pool()?;
-    let vocabulary: Vec<String> = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT lower(fs.name)
-         FROM file_symbols fs
-         JOIN indexed_files f ON fs.file_id = f.id
-         JOIN projects p ON f.project_id = p.id
-         WHERE p.name = $1
-           AND fs.name IS NOT NULL
-           AND length(fs.name) > 0",
-    )
-    .bind(project_name)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    if vocabulary.is_empty() {
+    // P14.5 — pull candidates from the persistent symbol trie
+    // (PersistentARTrieChar-backed) instead of rebuilding a
+    // DynamicDawgChar per call from a PG SELECT. Lazy-warmed via
+    // `open_symbol_trie`'s `rebuild_symbols` call when the trie
+    // doesn't yet exist.
+    let fuzzy_idx = match crate::fuzzy::sync::open_symbol_trie(ctx, project_name).await {
+        Ok(idx) => idx,
+        Err(e) => {
+            warn!(
+                project = %project_name,
+                error = ?e,
+                "third leg skipped: symbol trie open failed"
+            );
+            return None;
+        }
+    };
+    if fuzzy_idx.is_empty() {
         debug!(
             tool = "hybrid_search",
             project = %project_name,
@@ -352,7 +353,7 @@ async fn try_third_leg(
         max_query_edit_distance,
         1.0,
         wfst_lm_weight,
-        &vocabulary,
+        &fuzzy_idx,
         Some(&lm),
     );
     if !rewritten.changed {

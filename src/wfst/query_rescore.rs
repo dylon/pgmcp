@@ -3,19 +3,21 @@
 //! Entry point used by both `tool_hybrid_search` (third RRF leg) and
 //! `tool_correct_query` (single-shot user-facing correction). The
 //! function takes a free-form query, tokenizes it, generates
-//! Damerau-Levenshtein candidates against a per-token candidate
-//! function, builds a TropicalWeight lattice, optionally rescores
-//! with the per-project HybridLM, and returns the Viterbi-best
-//! rewritten query.
+//! Damerau-Levenshtein candidates from the per-project persistent
+//! `FuzzyIndex` (P14.5 — replaces the prior in-memory
+//! `DynamicDawgChar::from_terms(vocabulary)` rebuild-per-call),
+//! builds a TropicalWeight lattice, optionally rescores with the
+//! per-project HybridLM, and returns the Viterbi-best rewritten
+//! query.
 //!
 //! Plan: `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`
-//! Phase 9 + Phase 13.2.
+//! Phase 9 + Phase 13.2 + Phase 14.5.
 
-use libdictenstein::dynamic_dawg_char::DynamicDawgChar;
-use liblevenshtein::transducer::Transducer;
+use libdictenstein::DictionaryValue;
 
 use super::hybrid_lm::PgmcpHybridLm;
 use super::lattice::{TokenCandidate, build_correction_lattice, rescore_with_lm, viterbi_best};
+use crate::fuzzy::persistent_artrie::FuzzyIndex;
 
 /// Result of a single rewrite call.
 #[derive(Debug, Clone)]
@@ -47,23 +49,27 @@ pub fn tokenize_query(query: &str) -> Vec<String> {
 
 /// Rewrite a query through the WFST pipeline.
 ///
-/// `vocabulary` is the per-project symbol vocabulary the lattice will
-/// search against for candidates. The Transducer is built once per
-/// call from the full vocabulary; for large vocabularies the caller
-/// can pre-build it (see [`rewrite_query_with_transducer`]).
+/// `fuzzy_idx` is the per-project persistent `FuzzyIndex` (typically
+/// `FuzzyIndex<SymbolValue>` from `crate::fuzzy::sync::open_symbol_trie`).
+/// Per-token candidates are pulled via `idx.query(tok, max_distance)`
+/// directly from the on-disk `PersistentARTrieChar` — no per-call
+/// DAWG rebuild.
 ///
 /// `lm_weight` interpolates LM cost into the lattice edge weights
 /// (0.0 = ignore LM, 1.0 = LM only). When `lm` is `None` the LM step
 /// is skipped entirely — the returned `RewrittenQuery.used_lm` field
 /// signals that.
-pub fn rewrite_query(
+pub fn rewrite_query<V>(
     query: &str,
     max_distance: usize,
     edit_weight: f64,
     lm_weight: f64,
-    vocabulary: &[String],
+    fuzzy_idx: &FuzzyIndex<V>,
     lm: Option<&PgmcpHybridLm>,
-) -> RewrittenQuery {
+) -> RewrittenQuery
+where
+    V: DictionaryValue + Clone + Send + Sync + 'static,
+{
     let tokens = tokenize_query(query);
     if tokens.is_empty() {
         return RewrittenQuery {
@@ -75,27 +81,19 @@ pub fn rewrite_query(
         };
     }
 
-    // Build a Damerau-Levenshtein Transducer over the vocabulary once.
-    // Empty vocabulary → no candidates, identity path wins trivially.
-    let candidates_per_token: Vec<Vec<TokenCandidate>> = if vocabulary.is_empty() {
-        tokens.iter().map(|_| Vec::new()).collect()
-    } else {
-        let dict: DynamicDawgChar<()> =
-            DynamicDawgChar::from_terms(vocabulary.iter().map(|s| s.as_str()));
-        let xducer = Transducer::with_transposition(dict);
-        tokens
-            .iter()
-            .map(|tok| {
-                xducer
-                    .query_with_distance(tok, max_distance)
-                    .map(|c| TokenCandidate {
-                        term: c.term,
-                        distance: c.distance,
-                    })
-                    .collect()
-            })
-            .collect()
-    };
+    // Per-token candidates come straight from the persistent trie.
+    // When the trie is empty the query returns Vec::new() → no
+    // candidates → identity path wins.
+    let candidates_per_token: Vec<Vec<TokenCandidate>> = tokens
+        .iter()
+        .map(|tok| {
+            fuzzy_idx
+                .query(tok, max_distance)
+                .into_iter()
+                .map(|(term, distance, _value)| TokenCandidate { term, distance })
+                .collect()
+        })
+        .collect();
 
     let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
     let base_lattice = build_correction_lattice(&token_refs, &candidates_per_token, edit_weight);
@@ -136,9 +134,30 @@ pub fn rewrite_query(
 mod tests {
     use super::*;
 
+    /// Test-only helper: build an empty in-memory `FuzzyIndex<()>`
+    /// in a tempdir for unit tests. The test owns the `tempfile`
+    /// directory; dropping it cleans up the trie files on disk.
+    fn empty_trie() -> (tempfile::TempDir, FuzzyIndex<()>) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("test.artrie");
+        let (idx, _recovery) = FuzzyIndex::<()>::open_or_create(&path).expect("create");
+        (tmp, idx)
+    }
+
+    /// Test-only helper: build a `FuzzyIndex<()>` pre-populated
+    /// with the given terms.
+    fn trie_with(terms: &[&str]) -> (tempfile::TempDir, FuzzyIndex<()>) {
+        let (tmp, idx) = empty_trie();
+        for term in terms {
+            idx.upsert(term, ()).expect("upsert");
+        }
+        (tmp, idx)
+    }
+
     #[test]
     fn empty_query_returns_unchanged() {
-        let out = rewrite_query("", 2, 1.0, 0.0, &[], None);
+        let (_tmp, idx) = empty_trie();
+        let out = rewrite_query("", 2, 1.0, 0.0, &idx, None);
         assert_eq!(out.original, "");
         assert_eq!(out.rewritten, "");
         assert_eq!(out.token_count, 0);
@@ -147,7 +166,8 @@ mod tests {
 
     #[test]
     fn empty_vocabulary_identity_pass_through() {
-        let out = rewrite_query("hello world", 2, 1.0, 0.0, &[], None);
+        let (_tmp, idx) = empty_trie();
+        let out = rewrite_query("hello world", 2, 1.0, 0.0, &idx, None);
         assert_eq!(out.rewritten, "hello world");
         assert!(!out.changed);
         assert_eq!(out.token_count, 2);
@@ -155,18 +175,17 @@ mod tests {
 
     #[test]
     fn vocabulary_with_only_far_candidates_keeps_identity() {
-        // Vocabulary contains nothing within distance 2 of "hello".
-        let vocab = vec!["completely_unrelated_xyzzy".to_string()];
-        let out = rewrite_query("hello", 2, 1.0, 0.0, &vocab, None);
+        let (_tmp, idx) = trie_with(&["completely_unrelated_xyzzy"]);
+        let out = rewrite_query("hello", 2, 1.0, 0.0, &idx, None);
         assert_eq!(out.rewritten, "hello");
     }
 
     #[test]
     fn aggressive_edit_weight_prefers_close_candidate() {
-        let vocab = vec!["receive".to_string()];
+        let (_tmp, idx) = trie_with(&["receive"]);
         // Negative edit weight makes corrections preferable; the LM
         // would normally do this — this test exercises the mechanism.
-        let out = rewrite_query("recieve", 2, -1.0, 0.0, &vocab, None);
+        let out = rewrite_query("recieve", 2, -1.0, 0.0, &idx, None);
         assert_eq!(out.rewritten, "receive");
         assert!(out.changed);
     }

@@ -2,16 +2,18 @@
 //!
 //! Thin wrapper over `wfst::query_rescore::rewrite_query` for callers
 //! that want the corrected string + a confidence proxy without
-//! caring about token-level mechanics. Used by `tool_correct_query`
-//! alongside the existing `llammer_pipeline::lattice::LatticeCorrectionPipeline`
-//! path (the two coexist — pgmcp picks whichever the project has
-//! infrastructure for).
+//! caring about token-level mechanics. P14.5 — signature now takes
+//! `&FuzzyIndex<V>` (the persistent symbol trie), mirroring
+//! `rewrite_query`.
 //!
 //! Plan: `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`
-//! Phase 9 + Phase 13.2.
+//! Phase 9 + Phase 13.2 + Phase 14.5.
+
+use libdictenstein::DictionaryValue;
 
 use super::hybrid_lm::PgmcpHybridLm;
 use super::query_rescore::{RewrittenQuery, rewrite_query};
+use crate::fuzzy::persistent_artrie::FuzzyIndex;
 
 /// Single-shot correction result.
 #[derive(Debug, Clone)]
@@ -30,21 +32,24 @@ pub struct CorrectionResult {
 
 /// Correct a query using the WFST pipeline. See [`rewrite_query`]
 /// for parameter semantics.
-pub fn correct_query_single(
+pub fn correct_query_single<V>(
     query: &str,
     max_distance: usize,
     edit_weight: f64,
     lm_weight: f64,
-    vocabulary: &[String],
+    fuzzy_idx: &FuzzyIndex<V>,
     lm: Option<&PgmcpHybridLm>,
-) -> CorrectionResult {
+) -> CorrectionResult
+where
+    V: DictionaryValue + Clone + Send + Sync + 'static,
+{
     let RewrittenQuery {
         original,
         rewritten,
         changed,
         used_lm,
         ..
-    } = rewrite_query(query, max_distance, edit_weight, lm_weight, vocabulary, lm);
+    } = rewrite_query(query, max_distance, edit_weight, lm_weight, fuzzy_idx, lm);
 
     let confidence = if !changed {
         1.0
@@ -66,9 +71,27 @@ pub fn correct_query_single(
 mod tests {
     use super::*;
 
+    /// Test-only helper: build an empty in-memory `FuzzyIndex<()>`
+    /// in a tempdir.
+    fn empty_trie() -> (tempfile::TempDir, FuzzyIndex<()>) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("test.artrie");
+        let (idx, _recovery) = FuzzyIndex::<()>::open_or_create(&path).expect("create");
+        (tmp, idx)
+    }
+
+    fn trie_with(terms: &[&str]) -> (tempfile::TempDir, FuzzyIndex<()>) {
+        let (tmp, idx) = empty_trie();
+        for term in terms {
+            idx.upsert(term, ()).expect("upsert");
+        }
+        (tmp, idx)
+    }
+
     #[test]
     fn empty_query_unchanged_high_confidence() {
-        let r = correct_query_single("", 2, 1.0, 0.0, &[], None);
+        let (_tmp, idx) = empty_trie();
+        let r = correct_query_single("", 2, 1.0, 0.0, &idx, None);
         assert_eq!(r.input, "");
         assert_eq!(r.corrected, "");
         assert!(!r.changed);
@@ -77,7 +100,8 @@ mod tests {
 
     #[test]
     fn no_correction_keeps_identity_high_confidence() {
-        let r = correct_query_single("hello", 2, 1.0, 0.0, &[], None);
+        let (_tmp, idx) = empty_trie();
+        let r = correct_query_single("hello", 2, 1.0, 0.0, &idx, None);
         assert_eq!(r.corrected, "hello");
         assert!(!r.changed);
         assert_eq!(r.confidence, 1.0);
@@ -85,8 +109,8 @@ mod tests {
 
     #[test]
     fn corrected_no_lm_quarter_confidence() {
-        let vocab = vec!["receive".to_string()];
-        let r = correct_query_single("recieve", 2, -1.0, 0.0, &vocab, None);
+        let (_tmp, idx) = trie_with(&["receive"]);
+        let r = correct_query_single("recieve", 2, -1.0, 0.0, &idx, None);
         assert_eq!(r.corrected, "receive");
         assert!(r.changed);
         assert_eq!(r.confidence, 0.25);
