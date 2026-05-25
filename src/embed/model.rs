@@ -21,10 +21,11 @@
 use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor};
-use candle_nn::VarBuilder;
+use candle_nn::{Linear, Module, VarBuilder};
 use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE as BERT_DTYPE};
 use candle_transformers::models::xlm_roberta::{Config as XlmRobertaConfig, XLMRobertaModel};
 use hf_hub::api::sync::Api;
+use pgvector::SparseVector;
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, TruncationStrategy};
 
 use crate::config::EmbeddingsConfig;
@@ -74,6 +75,13 @@ pub struct Embedder {
     /// `max_length = 512`.
     inference_batch_size: usize,
     dim: usize,
+    /// BGE-M3 learned-sparse (SPLADE-style) projection head, loaded from the
+    /// checkpoint's `sparse_linear` (hidden→1). `None` for MiniLm or when the
+    /// head is absent — the sparse leg is then simply unavailable (additive;
+    /// dense + BM25 retrieval is unaffected). (graph-roadmap Phase 2.3)
+    sparse_linear: Option<Linear>,
+    /// Vocabulary size = dimensionality of the sparse vector (token-id space).
+    sparse_dim: usize,
 }
 
 enum Backbone {
@@ -131,6 +139,10 @@ impl Embedder {
             }
         };
 
+        // Optional BGE-M3 sparse head + its dimensionality (vocab). Set inside
+        // the Bgem3 arm before `vb` is moved into the model.
+        let mut sparse_linear: Option<Linear> = None;
+        let mut sparse_dim: usize = 0;
         let backbone = match kind {
             ModelKind::MiniLm => {
                 let bert_cfg: BertConfig = serde_json::from_str(&cfg_json)
@@ -143,6 +155,16 @@ impl Embedder {
                 let cfg: XlmRobertaConfig = serde_json::from_str(&cfg_json).map_err(|e| {
                     PgmcpError::Embedding(format!("xlm-roberta config.json parse: {}", e))
                 })?;
+                // Load `sparse_linear` (hidden→1) from the same checkpoint if
+                // present. Graceful: `.ok()` so a missing/odd head just leaves
+                // the sparse leg unavailable rather than failing the embedder.
+                // `vb.pp(..)` borrows; `vb` is still moved into the model below.
+                sparse_linear = candle_nn::linear(cfg.hidden_size, 1, vb.pp("sparse_linear"))
+                    .or_else(|_| {
+                        candle_nn::linear_no_bias(cfg.hidden_size, 1, vb.pp("sparse_linear"))
+                    })
+                    .ok();
+                sparse_dim = cfg.vocab_size;
                 let model = XLMRobertaModel::new(&cfg, vb)
                     .map_err(|e| PgmcpError::Embedding(format!("XLMRobertaModel::new: {}", e)))?;
                 Backbone::Bgem3(model)
@@ -186,7 +208,141 @@ impl Embedder {
             max_length,
             inference_batch_size,
             dim,
+            sparse_linear,
+            sparse_dim,
         })
+    }
+
+    /// `true` when this embedder can produce BGE-M3 learned-sparse vectors.
+    pub fn has_sparse(&self) -> bool {
+        self.sparse_linear.is_some()
+    }
+
+    /// Compute BGE-M3 learned-sparse (SPLADE-style) vectors for `texts` — one
+    /// `Some(SparseVector)` per text, or `None` when no sparse head is loaded
+    /// or the text produced no salient tokens. Sub-batches like [`Self::embed`].
+    ///
+    /// NUMERICS (validated on GPU per the roadmap's "implement fully now"
+    /// decision): `relu(sparse_linear(hidden))` per token, then scatter-max of
+    /// the weight into the token's vocab slot, skipping XLM-R special tokens
+    /// (`<s>`,`<pad>`,`</s>`,`<unk>` = ids 0..3) and padding.
+    pub fn embed_sparse(&self, texts: &[&str]) -> Result<Vec<Option<SparseVector>>> {
+        if self.sparse_linear.is_none() {
+            return Ok(vec![None; texts.len()]);
+        }
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<Option<SparseVector>> = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(self.inference_batch_size) {
+            out.append(&mut self.sparse_one_batch(chunk)?);
+        }
+        Ok(out)
+    }
+
+    fn sparse_one_batch(&self, texts: &[&str]) -> Result<Vec<Option<SparseVector>>> {
+        let (Some(sparse_linear), Backbone::Bgem3(xlm)) = (&self.sparse_linear, &self.backbone)
+        else {
+            return Ok(vec![None; texts.len()]);
+        };
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let owned: Vec<String> = texts.iter().map(|s| (*s).to_string()).collect();
+        let encodings = self
+            .tokenizer
+            .encode_batch(owned, true)
+            .map_err(|e| PgmcpError::Embedding(format!("encode_batch: {}", e)))?;
+        let batch_size = encodings.len();
+        let seq_len = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(0)
+            .min(self.max_length);
+        if seq_len == 0 {
+            return Ok(vec![None; batch_size]);
+        }
+
+        let mut input_ids: Vec<i64> = Vec::with_capacity(batch_size * seq_len);
+        let mut attention_mask: Vec<i64> = Vec::with_capacity(batch_size * seq_len);
+        let mut token_type_ids: Vec<i64> = Vec::with_capacity(batch_size * seq_len);
+        for enc in &encodings {
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
+            let types = enc.get_type_ids();
+            let len = ids.len().min(seq_len);
+            for j in 0..len {
+                input_ids.push(ids[j] as i64);
+                attention_mask.push(mask[j] as i64);
+                token_type_ids.push(types[j] as i64);
+            }
+            for _ in len..seq_len {
+                input_ids.push(0);
+                attention_mask.push(0);
+                token_type_ids.push(0);
+            }
+        }
+
+        let shape = (batch_size, seq_len);
+        let input_ids_t = Tensor::from_vec(input_ids.clone(), shape, &self.device)
+            .map_err(|e| PgmcpError::Embedding(format!("input_ids tensor: {}", e)))?;
+        let attention_mask_t = Tensor::from_vec(attention_mask.clone(), shape, &self.device)
+            .map_err(|e| PgmcpError::Embedding(format!("attention_mask tensor: {}", e)))?;
+        let token_type_ids_t = Tensor::from_vec(token_type_ids, shape, &self.device)
+            .map_err(|e| PgmcpError::Embedding(format!("token_type_ids tensor: {}", e)))?;
+
+        let hidden = xlm
+            .forward(
+                &input_ids_t,
+                &attention_mask_t,
+                &token_type_ids_t,
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| PgmcpError::Embedding(format!("XLM-RoBERTa forward (sparse): {}", e)))?;
+        // (b, s, h) → (b, s, 1) → relu → (b, s), in F32 for the scatter-max.
+        let weights = sparse_linear
+            .forward(&hidden)
+            .and_then(|t| t.relu())
+            .and_then(|t| t.squeeze(2))
+            .and_then(|t| t.to_dtype(DType::F32))
+            .map_err(|e| PgmcpError::Embedding(format!("sparse projection: {}", e)))?;
+        let w: Vec<Vec<f32>> = weights
+            .to_vec2::<f32>()
+            .map_err(|e| PgmcpError::Embedding(format!("sparse to_vec2: {}", e)))?;
+
+        let mut result: Vec<Option<SparseVector>> = Vec::with_capacity(batch_size);
+        for (r, row) in w.iter().enumerate() {
+            // scatter-max: per vocab token, keep the maximum ReLU weight.
+            let mut map: std::collections::BTreeMap<i32, f32> = std::collections::BTreeMap::new();
+            for (t, &weight) in row.iter().enumerate().take(seq_len) {
+                let idx = r * seq_len + t;
+                if attention_mask[idx] == 0 {
+                    continue; // padding
+                }
+                let id = input_ids[idx];
+                if (0..=3).contains(&id) {
+                    continue; // XLM-R special tokens
+                }
+                if weight <= 0.0 {
+                    continue;
+                }
+                let slot = map.entry(id as i32).or_insert(0.0);
+                if weight > *slot {
+                    *slot = weight;
+                }
+            }
+            // Always emit a vector (empty when no salient tokens) so the
+            // backfill marks the chunk done instead of re-scanning forever.
+            result.push(Some(SparseVector::from_map(
+                map.iter(),
+                self.sparse_dim as i32,
+            )));
+        }
+        Ok(result)
     }
 
     /// Output embedding dimension (384 for MiniLM-L6-v2, 1024 for BGE-M3).

@@ -20,6 +20,8 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
 use dashmap::DashMap;
 use tracing::{debug, error, info, warn};
 
+use pgvector::SparseVector;
+
 use super::model::Embedder;
 use crate::config::{Config, EmbeddingsConfig, ProjectOverride};
 use crate::db::DbClient;
@@ -96,7 +98,16 @@ pub struct ChunkData {
 /// A query-time embedding request with a oneshot reply channel.
 pub struct EmbedQueryRequest {
     pub text: String,
-    pub reply: tokio::sync::oneshot::Sender<Result<Vec<f32>>>,
+    /// When `true`, also compute the BGE-M3 learned-sparse vector (Phase 2.3).
+    pub want_sparse: bool,
+    pub reply: tokio::sync::oneshot::Sender<Result<QueryEmbedResult>>,
+}
+
+/// Query-time embedding outputs: always the dense vector, plus the sparse
+/// vector when requested and the backbone has a sparse head.
+pub struct QueryEmbedResult {
+    pub dense: Vec<f32>,
+    pub sparse: Option<SparseVector>,
 }
 
 /// Cloneable handle for submitting query-time embedding requests.
@@ -107,13 +118,24 @@ pub struct QueryEmbedder {
 }
 
 impl QueryEmbedder {
-    /// Embed a single query string. Returns the embedding vector.
+    /// Embed a single query string. Returns the dense embedding vector.
     /// Blocks until a pool worker processes the request.
     pub async fn embed_query(&self, text: String) -> Result<Vec<f32>> {
+        Ok(self.embed_query_inner(text, false).await?.dense)
+    }
+
+    /// Embed a query for hybrid retrieval: dense vector + (when the backbone
+    /// has a sparse head) the BGE-M3 learned-sparse vector. (Phase 2.3)
+    pub async fn embed_query_hybrid(&self, text: String) -> Result<QueryEmbedResult> {
+        self.embed_query_inner(text, true).await
+    }
+
+    async fn embed_query_inner(&self, text: String, want_sparse: bool) -> Result<QueryEmbedResult> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(EmbedQueryRequest {
                 text,
+                want_sparse,
                 reply: reply_tx,
             })
             .map_err(|_| PgmcpError::Embedding("Embed pool shut down".into()))?;
@@ -383,10 +405,22 @@ fn run_worker_event_loop(
 }
 
 fn process_query_request(model: &Embedder, request: EmbedQueryRequest, stats: &StatsTracker) {
-    let result = model.embed(&[&request.text]).and_then(|mut vecs| {
-        vecs.pop()
-            .ok_or_else(|| PgmcpError::Embedding("No embedding returned".into()))
-    });
+    let result = (|| {
+        let dense = model
+            .embed(&[&request.text])?
+            .pop()
+            .ok_or_else(|| PgmcpError::Embedding("No embedding returned".into()))?;
+        let sparse = if request.want_sparse {
+            model
+                .embed_sparse(&[&request.text])?
+                .into_iter()
+                .next()
+                .flatten()
+        } else {
+            None
+        };
+        Ok(QueryEmbedResult { dense, sparse })
+    })();
 
     if result.is_ok() {
         stats.embed_query_count.fetch_add(1, Ordering::Relaxed);

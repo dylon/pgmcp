@@ -157,10 +157,11 @@ pub async fn search(
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
     let limit = req.limit.unwrap_or(5);
 
-    // Embed the query
-    let embedding = state
+    // Embed the query — dense + (when the backbone has a sparse head) the
+    // BGE-M3 learned-sparse vector that feeds the optional sparse RRF leg.
+    let query_rep = state
         .query_embedder
-        .embed_query(req.query.clone())
+        .embed_query_hybrid(req.query.clone())
         .await
         .map_err(|e| {
             state
@@ -172,6 +173,8 @@ pub async fn search(
                 format!("Embedding failed: {}", e),
             )
         })?;
+    let embedding = query_rep.dense;
+    let query_sparse = query_rep.sparse;
 
     // The /api/search endpoint is consumed by ~/.claude/hooks/pgmcp-rag.sh
     // (UserPromptSubmit). It always fuses dense + BM25 at chunk level via RRF
@@ -210,6 +213,7 @@ pub async fn search(
         req.language.as_deref(),
         req.project.as_deref(),
         ef_search,
+        query_sparse.as_ref(),
     )
     .await
     .map_err(|e| {

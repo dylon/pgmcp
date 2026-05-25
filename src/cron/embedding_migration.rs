@@ -74,6 +74,8 @@ pub struct MigrationPassReport {
     pub software_pattern_chunks_migrated: u64,
     pub durable_mandates_migrated: u64,
     pub session_mandates_migrated: u64,
+    /// Phase 2.3: file_chunks whose BGE-M3 learned-sparse vector was backfilled.
+    pub file_chunks_sparse_backfilled: u64,
     pub batches_completed: u64,
     /// Number of batches that errored (and are retried on the next tick
     /// because the WHERE clause picks them back up).
@@ -131,6 +133,30 @@ pub async fn run_embedding_migration_pass(
                     .embeddings_migration_errors
                     .fetch_add(1, Ordering::Relaxed);
                 break;
+            }
+        }
+    }
+
+    // Phase 2.3: backfill BGE-M3 learned-sparse vectors for already-dense
+    // file_chunks. Only when the embedder exposes a sparse head; purely
+    // additive — never touches `embedding_v2`, and downstream search is
+    // NULL-tolerant, so dense + BM25 retrieval is unaffected if this lags.
+    if embedder.has_sparse() {
+        for _ in 0..config.max_batches {
+            match backfill_file_chunks_sparse_batch(pool, &embedder, config.batch_size).await {
+                Ok(n) if n > 0 => {
+                    report.file_chunks_sparse_backfilled += n;
+                    report.batches_completed += 1;
+                }
+                Ok(_) => break,
+                Err(e) => {
+                    warn!(error = %e, "file_chunks sparse backfill batch failed");
+                    report.errors += 1;
+                    stats
+                        .embeddings_migration_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
             }
         }
     }
@@ -309,6 +335,56 @@ async fn migrate_file_chunks_batch(
         .bind(id)
         .execute(&mut *tx)
         .await?;
+        count += 1;
+    }
+    tx.commit().await?;
+    Ok(count)
+}
+
+/// Drain up to `batch_size` `file_chunks` rows that have a dense `embedding_v2`
+/// but no `sparse_v2`, computing the BGE-M3 learned-sparse vector for each
+/// (graph-roadmap Phase 2.3). Returns the number backfilled (0 = drained).
+/// Every BGE-M3 chunk gets a vector (empty when no salient tokens) so it is not
+/// re-scanned. `FOR UPDATE SKIP LOCKED` makes concurrent passes safe.
+async fn backfill_file_chunks_sparse_batch(
+    pool: &PgPool,
+    embedder: &Arc<Embedder>,
+    batch_size: usize,
+) -> Result<u64, sqlx::Error> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, content FROM file_chunks
+         WHERE sparse_v2 IS NULL AND embedding_v2 IS NOT NULL
+         ORDER BY id
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(batch_size as i64)
+    .fetch_all(pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let texts: Vec<&str> = rows.iter().map(|(_, c)| c.as_str()).collect();
+    let sparses = match embedder.embed_sparse(&texts) {
+        Ok(v) => v,
+        Err(e) => return Err(sqlx::Error::Configuration(e.to_string().into())),
+    };
+    if sparses.len() != rows.len() {
+        return Err(sqlx::Error::Protocol(format!(
+            "embed_sparse returned {} vectors for {} inputs",
+            sparses.len(),
+            rows.len()
+        )));
+    }
+    let mut tx = pool.begin().await?;
+    let mut count = 0_u64;
+    for ((id, _), sparse) in rows.into_iter().zip(sparses) {
+        let Some(sv) = sparse else { continue };
+        sqlx::query("UPDATE file_chunks SET sparse_v2 = $1 WHERE id = $2")
+            .bind(&sv)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         count += 1;
     }
     tx.commit().await?;

@@ -979,6 +979,7 @@ pub async fn hybrid_search_chunks(
     language: Option<&str>,
     project: Option<&str>,
     ef_search: i32,
+    query_sparse: Option<&pgvector::SparseVector>,
 ) -> Result<Vec<SearchResult>, sqlx::Error> {
     let col = match embedding.len() {
         384 => "embedding",
@@ -998,10 +999,13 @@ pub async fn hybrid_search_chunks(
         .await?;
 
     // Optional filters collapse into one query via `($n IS NULL OR …)`.
-    // RRF constant 60.0 mirrors `tool_hybrid_search::RRF_K`.
-    // $1=embedding, $2=query_text, $3=candidates, $4=language, $5=project, $6=limit
-    let sql = format!(
-        "WITH dense AS (
+    // RRF constant 60.0 mirrors `tool_hybrid_search::RRF_K`. The dense + lexical
+    // CTEs are shared; the BGE-M3 sparse leg (Phase 2.3) is added as a third RRF
+    // leg only when a query sparse vector is supplied AND the chunk has
+    // `sparse_v2` (NULL-tolerant — un-backfilled chunks just miss this leg).
+    // $1=embedding, $2=query_text, $3=candidates, $4=language, $5=project, $6=limit, $7=sparse
+    let dense_lexical = format!(
+        "dense AS (
             SELECT chunk_id, ROW_NUMBER() OVER (ORDER BY dist) AS rnk FROM (
                 SELECT c.id AS chunk_id, (c.{col} <=> $1) AS dist
                 FROM file_chunks c
@@ -1027,15 +1031,10 @@ pub async fn hybrid_search_chunks(
                 ORDER BY rank DESC
                 LIMIT $3
             ) ll
-        ),
-        fused AS (
-            SELECT COALESCE(d.chunk_id, l.chunk_id) AS chunk_id,
-                   COALESCE(1.0 / (60.0 + d.rnk), 0.0)
-                 + COALESCE(1.0 / (60.0 + l.rnk), 0.0) AS rrf
-            FROM dense d
-            FULL OUTER JOIN lexical l ON d.chunk_id = l.chunk_id
-        )
-        SELECT f.path, f.relative_path, f.language,
+        )",
+        col = col
+    );
+    let select_tail = "SELECT f.path, f.relative_path, f.language,
                c.content AS chunk_content, c.start_line, c.end_line,
                fused.rrf AS score,
                p.name AS project_name
@@ -1044,19 +1043,67 @@ pub async fn hybrid_search_chunks(
         JOIN indexed_files f ON f.id = c.file_id
         JOIN projects p ON p.id = f.project_id
         ORDER BY fused.rrf DESC
-        LIMIT $6",
-        col = col
-    );
+        LIMIT $6";
 
-    let results = sqlx::query_as::<_, SearchResult>(&sql)
-        .bind(&embedding_vec)
-        .bind(query_text)
-        .bind(candidates)
-        .bind(language)
-        .bind(project)
-        .bind(limit)
-        .fetch_all(&mut *tx)
-        .await?;
+    let results = if let Some(sparse) = query_sparse {
+        let sql = format!(
+            "WITH {dense_lexical},
+            sparse AS (
+                SELECT chunk_id, ROW_NUMBER() OVER (ORDER BY dist) AS rnk FROM (
+                    SELECT c.id AS chunk_id, (c.sparse_v2 <#> $7) AS dist
+                    FROM file_chunks c
+                    JOIN indexed_files f ON f.id = c.file_id
+                    JOIN projects p ON p.id = f.project_id
+                    WHERE c.sparse_v2 IS NOT NULL
+                      AND ($4::text IS NULL OR f.language = $4)
+                      AND ($5::text IS NULL OR p.name = $5)
+                    ORDER BY c.sparse_v2 <#> $7
+                    LIMIT $3
+                ) ss
+            ),
+            fused AS (
+                SELECT COALESCE(d.chunk_id, l.chunk_id, s.chunk_id) AS chunk_id,
+                       COALESCE(1.0 / (60.0 + d.rnk), 0.0)
+                     + COALESCE(1.0 / (60.0 + l.rnk), 0.0)
+                     + COALESCE(1.0 / (60.0 + s.rnk), 0.0) AS rrf
+                FROM dense d
+                FULL OUTER JOIN lexical l ON d.chunk_id = l.chunk_id
+                FULL OUTER JOIN sparse s ON COALESCE(d.chunk_id, l.chunk_id) = s.chunk_id
+            )
+            {select_tail}"
+        );
+        sqlx::query_as::<_, SearchResult>(&sql)
+            .bind(&embedding_vec)
+            .bind(query_text)
+            .bind(candidates)
+            .bind(language)
+            .bind(project)
+            .bind(limit)
+            .bind(sparse)
+            .fetch_all(&mut *tx)
+            .await?
+    } else {
+        let sql = format!(
+            "WITH {dense_lexical},
+            fused AS (
+                SELECT COALESCE(d.chunk_id, l.chunk_id) AS chunk_id,
+                       COALESCE(1.0 / (60.0 + d.rnk), 0.0)
+                     + COALESCE(1.0 / (60.0 + l.rnk), 0.0) AS rrf
+                FROM dense d
+                FULL OUTER JOIN lexical l ON d.chunk_id = l.chunk_id
+            )
+            {select_tail}"
+        );
+        sqlx::query_as::<_, SearchResult>(&sql)
+            .bind(&embedding_vec)
+            .bind(query_text)
+            .bind(candidates)
+            .bind(language)
+            .bind(project)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?
+    };
 
     tx.commit().await?;
     Ok(results)

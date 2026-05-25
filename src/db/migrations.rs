@@ -1983,6 +1983,13 @@ async fn ensure_memory_v2_columns(pool: &PgPool) -> Result<(), sqlx::Error> {
     let stmts = [
         "ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS embedding_v2 vector(1024)",
         "ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS embedding_signature TEXT",
+        // Graph-roadmap Phase 2.3: BGE-M3 learned-sparse (SPLADE-style) vector,
+        // dimension = XLM-R vocab (250002). Nullable + UNINDEXED: the sparse
+        // retrieval leg is bounded by the project/lang filter + per-leg LIMIT,
+        // so a brute-force `<#>` scan is acceptable and we avoid pgvector's
+        // sparsevec HNSW non-zero-dimension cap. Backfilled by the
+        // embedding-migration cron; chunks without it fall back to dense+BM25.
+        "ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS sparse_v2 sparsevec(250002)",
         "ALTER TABLE session_prompts ADD COLUMN IF NOT EXISTS embedding_v2 vector(1024)",
         "ALTER TABLE session_prompts ADD COLUMN IF NOT EXISTS embedding_signature TEXT",
         "ALTER TABLE durable_mandates ADD COLUMN IF NOT EXISTS embedding vector(1024)",
