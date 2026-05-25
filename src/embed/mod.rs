@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod model;
 pub mod pool;
+pub mod rerank_ext;
 pub mod signature;
 
 pub use backend::EmbeddingBackend;

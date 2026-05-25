@@ -243,6 +243,7 @@ async fn semantic_search_pipeline_with_mock_embedder_and_db() {
     let mut mock = MockDbClient::new();
     // Pretend the DB returns three matching chunks for any vector query.
     mock.semantic_search_results.push(SearchResult {
+        chunk_id: None,
         path: "/ws/p/foo.rs".into(),
         relative_path: "foo.rs".into(),
         language: "rust".into(),
@@ -253,6 +254,7 @@ async fn semantic_search_pipeline_with_mock_embedder_and_db() {
         project_name: "p".into(),
     });
     mock.semantic_search_results.push(SearchResult {
+        chunk_id: None,
         path: "/ws/p/bar.rs".into(),
         relative_path: "bar.rs".into(),
         language: "rust".into(),
@@ -263,6 +265,7 @@ async fn semantic_search_pipeline_with_mock_embedder_and_db() {
         project_name: "p".into(),
     });
     mock.semantic_search_results.push(SearchResult {
+        chunk_id: None,
         path: "/ws/p/baz.rs".into(),
         relative_path: "baz.rs".into(),
         language: "rust".into(),
@@ -583,6 +586,7 @@ async fn hybrid_search_merges_semantic_and_text_results() {
     use pgmcp::db::queries::{SearchResult, TextSearchResult};
     let mut mock = MockDbClient::new();
     mock.semantic_search_results.push(SearchResult {
+        chunk_id: None,
         path: "/ws/p/sem.rs".into(),
         relative_path: "sem.rs".into(),
         language: "rust".into(),
@@ -1196,6 +1200,7 @@ async fn semantic_search_with_project_filter_forwards_param() {
     use pgmcp::embed::EmbeddingBackend;
     let mut mock = MockDbClient::new();
     mock.semantic_search_results.push(SearchResult {
+        chunk_id: None,
         path: "/w/p/x.rs".into(),
         relative_path: "x.rs".into(),
         language: "rust".into(),

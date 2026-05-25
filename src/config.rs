@@ -181,6 +181,17 @@ pub struct ApiConfig {
     /// Default 50 (wider than the cross-encoder net, since MaxSim is cheap).
     #[serde(default = "default_colbert_candidates")]
     pub colbert_candidates: i32,
+    /// MMR diversity λ for the final `/api/search` selection (Phase 4.2):
+    /// `λ·relevance − (1−λ)·max-similarity-to-picked`. 0.0 = disabled (pure
+    /// relevance order); ~0.7 trades a little relevance for de-duplicating
+    /// near-identical chunks in the tiny context budget. Default 0.0.
+    #[serde(default = "default_mmr_lambda")]
+    pub mmr_lambda: f64,
+    /// Recency half-life in days for the `/api/search` recency prior (Phase 4.2):
+    /// a candidate's score is multiplied by `0.5^(age/half_life)` using its
+    /// `blame_date`. 0.0 = disabled. Default 0.0.
+    #[serde(default = "default_recency_half_life_days")]
+    pub recency_half_life_days: f64,
 }
 
 impl Default for ApiConfig {
@@ -190,6 +201,8 @@ impl Default for ApiConfig {
             rerank_candidates: default_rerank_candidates(),
             colbert_rerank: default_colbert_rerank(),
             colbert_candidates: default_colbert_candidates(),
+            mmr_lambda: default_mmr_lambda(),
+            recency_half_life_days: default_recency_half_life_days(),
         }
     }
 }
@@ -205,6 +218,12 @@ fn default_colbert_rerank() -> bool {
 }
 fn default_colbert_candidates() -> i32 {
     50
+}
+fn default_mmr_lambda() -> f64 {
+    0.0
+}
+fn default_recency_half_life_days() -> f64 {
+    0.0
 }
 
 /// Memory-server configuration. Holds Phase 4+ knobs grouped under

@@ -738,6 +738,12 @@ pub struct SearchResult {
     pub end_line: i32,
     pub score: Option<f64>,
     pub project_name: String,
+    /// Chunk id, surfaced by `hybrid_search_chunks` so the API handler can fetch
+    /// per-candidate features (embedding, blame_date) for MMR diversity +
+    /// recency re-ranking (Phase 4.2). `#[sqlx(default)]` ⇒ other SearchResult
+    /// queries (semantic_search) that don't select it default to None.
+    #[sqlx(default)]
+    pub chunk_id: Option<i64>,
 }
 
 /// SQL fragment that filters cross-worktree duplicates of the same
@@ -1037,7 +1043,8 @@ pub async fn hybrid_search_chunks(
     let select_tail = "SELECT f.path, f.relative_path, f.language,
                c.content AS chunk_content, c.start_line, c.end_line,
                fused.rrf AS score,
-               p.name AS project_name
+               p.name AS project_name,
+               c.id AS chunk_id
         FROM fused
         JOIN file_chunks c ON c.id = fused.chunk_id
         JOIN indexed_files f ON f.id = c.file_id
@@ -8676,6 +8683,37 @@ pub async fn code_raptor_search(
     .bind(embedding_vec)
     .bind(project)
     .bind(k)
+    .fetch_all(pool)
+    .await
+}
+
+/// Per-candidate re-ranking features (graph-roadmap Phase 4.2): the embedding
+/// (for MMR diversity) and last-change date (for the recency prior), keyed by
+/// chunk id. `embedding`/`blame_date` may be NULL for un-backfilled chunks.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ChunkRerankFeature {
+    pub chunk_id: i64,
+    pub embedding: Option<pgvector::Vector>,
+    pub blame_date: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Fetch MMR/recency features for a set of chunk ids. `query_dim` selects the
+/// active embedding column (384 = MiniLM, 1024 = BGE-M3) so the returned vectors
+/// share the query's space.
+pub async fn chunk_rerank_features(
+    pool: &PgPool,
+    chunk_ids: &[i64],
+    query_dim: usize,
+) -> Result<Vec<ChunkRerankFeature>, sqlx::Error> {
+    if chunk_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let col = embedding_column_for_dim(query_dim)?;
+    sqlx::query_as::<_, ChunkRerankFeature>(&format!(
+        "SELECT id AS chunk_id, {col} AS embedding, blame_date
+         FROM file_chunks WHERE id = ANY($1)"
+    ))
+    .bind(chunk_ids)
     .fetch_all(pool)
     .await
 }

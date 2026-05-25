@@ -183,7 +183,15 @@ pub async fn search(
     // The /api/search endpoint is consumed by ~/.claude/hooks/pgmcp-rag.sh
     // (UserPromptSubmit). It always fuses dense + BM25 at chunk level via RRF
     // (cheap, no extra model); the cross-encoder rerank stage is opt-in.
-    let (ef_search, rerank_candidates, rerank_enabled, colbert_enabled, colbert_candidates) = {
+    let (
+        ef_search,
+        rerank_candidates,
+        rerank_enabled,
+        colbert_enabled,
+        colbert_candidates,
+        mmr_lambda,
+        recency_half_life_days,
+    ) = {
         let cfg = state.config.load();
         (
             cfg.vector.ef_search,
@@ -191,8 +199,11 @@ pub async fn search(
             cfg.api.rerank_hook && state.reranker.is_some(),
             cfg.api.colbert_rerank,
             cfg.api.colbert_candidates.max(limit),
+            cfg.api.mmr_lambda,
+            cfg.api.recency_half_life_days,
         )
     };
+    let rerank_ext_enabled = mmr_lambda > 0.0 || recency_half_life_days > 0.0;
 
     // Fetch enough candidates to feed whichever rerank stages are active.
     // ColBERT casts the widest net (cheap MaxSim), then the cross-encoder, then
@@ -207,6 +218,12 @@ pub async fn search(
         rerank_candidates
     } else {
         limit
+    };
+    // MMR/recency need a candidate pool wider than `limit` to diversify over.
+    let fetch_n = if rerank_ext_enabled {
+        fetch_n.max((limit * 4).clamp(20, 100))
+    } else {
+        fetch_n
     };
     let per_leg = (fetch_n * 2).clamp(20, 200);
 
@@ -318,31 +335,107 @@ pub async fn search(
         }
     }
 
-    let items: Vec<SearchResultItem> = if rerank_used {
+    // Base candidate order (index into `results`, base relevance) from whatever
+    // the prior stages left: cross-encoder order if it ran, else the
+    // RRF/ColBERT order with its fused score as relevance.
+    let mut order: Vec<(usize, f64)> = if rerank_used {
         rerank_hits
             .iter()
-            .take(limit as usize)
             .filter_map(|h| {
-                results.get(h.original_index).map(|r| SearchResultItem {
-                    file_path: r.path.clone(),
-                    chunk: r.chunk_content.clone(),
-                    similarity: h.score as f64,
-                    language: r.language.clone(),
-                })
+                results
+                    .get(h.original_index)
+                    .map(|_| (h.original_index, h.score as f64))
             })
             .collect()
     } else {
-        results
-            .into_iter()
-            .take(limit as usize)
-            .map(|r| SearchResultItem {
-                file_path: r.path,
-                chunk: r.chunk_content,
-                similarity: r.score.unwrap_or(0.0),
-                language: r.language,
-            })
+        (0..results.len())
+            .map(|i| (i, results[i].score.unwrap_or(0.0)))
             .collect()
     };
+
+    // Phase 4.2: optional recency prior + MMR diversity over the candidate pool,
+    // as the final selection stage. Recency reweights relevance by blame_date;
+    // MMR then picks a diverse top-`limit`. Any feature-fetch failure leaves the
+    // base order untouched.
+    if rerank_ext_enabled && order.len() > 1 {
+        let chunk_ids: Vec<i64> = order
+            .iter()
+            .filter_map(|&(i, _)| results.get(i).and_then(|r| r.chunk_id))
+            .collect();
+        if !chunk_ids.is_empty()
+            && let Ok(feats) =
+                crate::db::queries::chunk_rerank_features(pool, &chunk_ids, embedding.len()).await
+        {
+            let mut emb_by: std::collections::HashMap<i64, Vec<f32>> =
+                std::collections::HashMap::new();
+            let mut date_by: std::collections::HashMap<i64, chrono::DateTime<chrono::Utc>> =
+                std::collections::HashMap::new();
+            for f in feats {
+                if let Some(v) = f.embedding {
+                    emb_by.insert(f.chunk_id, v.as_slice().to_vec());
+                }
+                if let Some(d) = f.blame_date {
+                    date_by.insert(f.chunk_id, d);
+                }
+            }
+            if recency_half_life_days > 0.0 {
+                let now = chrono::Utc::now();
+                for (i, rel) in order.iter_mut() {
+                    if let Some(cid) = results.get(*i).and_then(|r| r.chunk_id)
+                        && let Some(d) = date_by.get(&cid)
+                    {
+                        let age_days = (now - *d).num_seconds().max(0) as f64 / 86_400.0;
+                        *rel *= crate::embed::rerank_ext::recency_multiplier(
+                            age_days,
+                            recency_half_life_days,
+                        );
+                    }
+                }
+            }
+            let selected: Vec<usize> = if mmr_lambda > 0.0 {
+                let embs: Vec<Vec<f32>> = order
+                    .iter()
+                    .map(|&(i, _)| {
+                        results
+                            .get(i)
+                            .and_then(|r| r.chunk_id)
+                            .and_then(|c| emb_by.get(&c).cloned())
+                            .unwrap_or_default()
+                    })
+                    .collect();
+                let rels: Vec<f64> = order.iter().map(|&(_, r)| r).collect();
+                crate::embed::rerank_ext::mmr_select(&embs, &rels, mmr_lambda, limit as usize)
+            } else {
+                let mut pos: Vec<usize> = (0..order.len()).collect();
+                pos.sort_by(|&a, &b| {
+                    order[b]
+                        .1
+                        .partial_cmp(&order[a].1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                pos.truncate(limit as usize);
+                pos
+            };
+            let new_order: Vec<(usize, f64)> = selected
+                .into_iter()
+                .filter_map(|p| order.get(p).copied())
+                .collect();
+            order = new_order;
+        }
+    }
+
+    let items: Vec<SearchResultItem> = order
+        .iter()
+        .take(limit as usize)
+        .filter_map(|&(i, score)| {
+            results.get(i).map(|r| SearchResultItem {
+                file_path: r.path.clone(),
+                chunk: r.chunk_content.clone(),
+                similarity: score,
+                language: r.language.clone(),
+            })
+        })
+        .collect();
 
     Ok(Json(SearchResponse {
         results: items,

@@ -121,6 +121,7 @@ fn server_with_results(
 
 fn semantic_hit(path: &str, line: i32) -> SearchResult {
     SearchResult {
+        chunk_id: None,
         path: format!("/ws/p/{}", path),
         relative_path: path.into(),
         language: "rust".into(),
