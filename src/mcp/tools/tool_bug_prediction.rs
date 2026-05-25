@@ -69,29 +69,68 @@ pub async fn tool_bug_prediction(
         )]));
     }
 
-    // Compute complexity from branch keywords in content
-    let mut scored: Vec<serde_json::Value> = rows
+    // Trained model (Phase 3.5): fit logistic regression on this project's own
+    // history — features = process/structural metrics, label = "touched by a
+    // bug-fix commit" (fix_commit_ratio > 0). fix_commit_ratio is NOT a feature
+    // (no label leakage). Falls back to the hand-weighted heuristic on cold
+    // start (one class only / too little history).
+    let feature_rows: Vec<Vec<f64>> = rows
         .iter()
         .map(|r| {
+            vec![
+                r.churn_rate.unwrap_or(0.0),
+                r.commit_count.unwrap_or(0) as f64,
+                r.author_count.unwrap_or(0) as f64,
+                r.in_degree.unwrap_or(0) as f64,
+                r.out_degree.unwrap_or(0) as f64,
+                r.line_count as f64,
+            ]
+        })
+        .collect();
+    let labels: Vec<f64> = rows
+        .iter()
+        .map(|r| {
+            if r.fix_commit_ratio.unwrap_or(0.0) > 0.0 {
+                1.0
+            } else {
+                0.0
+            }
+        })
+        .collect();
+    let model =
+        crate::code_analysis::defect_model::LogisticModel::fit(&feature_rows, &labels, 2000, 0.3);
+    let score_kind = if model.is_some() {
+        "trained_logreg"
+    } else {
+        "heuristic"
+    };
+
+    let mut scored: Vec<serde_json::Value> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
             let churn = r.churn_rate.unwrap_or(0.0);
             let fix_ratio = r.fix_commit_ratio.unwrap_or(0.0);
             let coupling = (r.in_degree.unwrap_or(0) + r.out_degree.unwrap_or(0)) as f64;
             let size_factor = (r.line_count as f64 / 100.0).min(10.0);
             let authors = r.author_count.unwrap_or(1) as f64;
 
-            // Composite bug-proneness score
-            // Weight: churn * fix_ratio * size * coupling * author_spread
-            let bug_score = (churn * 0.3
-                + fix_ratio * 3.0
-                + size_factor * 0.2
-                + coupling * 0.05
-                + (authors - 1.0).max(0.0) * 0.1)
-                .max(0.0);
+            // Trained probability when a model fit; else the hand-weighted score.
+            let bug_score = match &model {
+                Some(m) => m.predict(&feature_rows[i]),
+                None => (churn * 0.3
+                    + fix_ratio * 3.0
+                    + size_factor * 0.2
+                    + coupling * 0.05
+                    + (authors - 1.0).max(0.0) * 0.1)
+                    .max(0.0),
+            };
 
             serde_json::json!({
                 "path": r.relative_path,
                 "language": r.language,
                 "bug_score": format!("{:.4}", bug_score),
+                "score_kind": score_kind,
                 "churn_rate": format!("{:.2}", churn),
                 "fix_ratio": format!("{:.2}", fix_ratio),
                 "line_count": r.line_count,
@@ -150,14 +189,30 @@ pub async fn tool_bug_prediction(
         Vec::new()
     };
 
+    let model_info = match &model {
+        Some(m) => serde_json::json!({
+            "kind": "logistic_regression",
+            "n_samples": m.n_samples,
+            "n_positive": m.n_positive,
+        }),
+        None => serde_json::json!({ "kind": "heuristic_fallback" }),
+    };
+
     let result = serde_json::json!({
         "project": params.project,
         "file_count": scored.len(),
+        "score_kind": score_kind,
+        "model": model_info,
         "files": scored,
         "bug_prone_effect_symbols": bug_prone_effect_symbols,
-        "guidance": "Files with high bug_score combine high churn, fix ratios, size, and coupling. \
-                     Prioritize code review and testing for these files. \
-                     High fix_ratio (>0.3) means >30% of commits are bug fixes. The `bug_prone_effect_symbols` channel surfaces symbols carrying unsafe / may_panic / blocking_io effects — orthogonal to the file-level metric and useful as additional review priorities.",
+        "guidance": "When `score_kind=trained_logreg`, `bug_score` is a logistic-regression \
+                     defect-proneness PROBABILITY (0-1) learned from this project's own history \
+                     (features = churn/commits/authors/in+out-degree/LOC; label = touched by a bug-fix \
+                     commit; fix_ratio excluded from features to avoid leakage). On cold start (one class \
+                     only / sparse git history) it falls back to `score_kind=heuristic` (the prior \
+                     hand-weighted sum). Prioritize review/testing for high-score files; high fix_ratio \
+                     (>0.3) means >30% of commits are bug fixes. The `bug_prone_effect_symbols` channel \
+                     surfaces unsafe / may_panic / blocking_io symbols — orthogonal review priorities.",
     });
 
     let json = serde_json::to_string_pretty(&result)

@@ -14,6 +14,7 @@
 
 pub mod ast_rules;
 pub mod cpg;
+pub mod defect_model;
 pub mod isolation_forest;
 pub mod language_detect;
 pub mod lof;
