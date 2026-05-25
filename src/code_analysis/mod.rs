@@ -12,6 +12,7 @@
 //! Plan: `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`
 //! Phase 6.
 
+pub mod ast_rules;
 pub mod cpg;
 pub mod language_detect;
 pub mod paradigm;
