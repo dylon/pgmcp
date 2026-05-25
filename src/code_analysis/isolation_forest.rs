@@ -83,8 +83,9 @@ fn build_tree(
         lo = lo.min(v);
         hi = hi.max(v);
     }
-    if !(hi > lo) {
+    if hi <= lo {
         // Degenerate (constant feature over this subset) — can't split here.
+        // (lo/hi are finite min/max over the subset, so a direct `<=` is exact.)
         return Node::External {
             size: indices.len(),
         };

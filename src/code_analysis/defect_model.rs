@@ -55,8 +55,8 @@ impl LogisticModel {
         // Standardization stats per feature.
         let mut means = vec![0.0; d];
         for row in features {
-            for j in 0..d {
-                means[j] += row.get(j).copied().unwrap_or(0.0);
+            for (j, m) in means.iter_mut().enumerate() {
+                *m += row.get(j).copied().unwrap_or(0.0);
             }
         }
         for m in &mut means {

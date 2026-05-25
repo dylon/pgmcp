@@ -83,7 +83,7 @@ pub async fn tool_ck_metrics(
             _ => v["wmc"].as_i64().unwrap_or(0),
         }
     };
-    rows.sort_by(|a, b| key(b).cmp(&key(a)));
+    rows.sort_by_key(|b| std::cmp::Reverse(key(b)));
     rows.truncate(limit);
 
     let inheritance_available = !child_to_parents.is_empty();
