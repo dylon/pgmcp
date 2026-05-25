@@ -1989,6 +1989,15 @@ pub struct GraphConnectivityParams {
     pub limit: Option<i32>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CkMetricsParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Sort key: wmc (default) | dit | noc | cbo | rfc")]
+    pub sort: Option<String>,
+    #[schemars(description = "Max classes to return (default: 40)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ArchitectureDsmParams {
     #[schemars(description = "Project name (required)")]
     pub project: String,
@@ -6604,6 +6613,27 @@ finding a concrete module-decoupling boundary."
             &_ctx,
             &summarize_debug(&params),
             super::tools::tool_graph_connectivity::tool_graph_connectivity(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Chidamber-Kemerer OO metrics per class: WMC (Σ method cyclomatic), DIT (inheritance \
+depth), NOC (number of children), CBO (coupling), RFC (response for class). USE WHEN: finding complex / \
+deeply-inherited / heavily-coupled classes to refactor or prioritize for testing. DIT/NOC need the \
+language's inherit/impl edges (Python & C/C++ emit them today)."
+    )]
+    async fn ck_metrics(
+        &self,
+        Parameters(params): Parameters<CkMetricsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "ck_metrics",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_ck_metrics::tool_ck_metrics(self.ctx(), params),
         )
         .await
     }

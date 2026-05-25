@@ -13,6 +13,7 @@
 //! Phase 6.
 
 pub mod ast_rules;
+pub mod ck_metrics;
 pub mod cpg;
 pub mod defect_model;
 pub mod isolation_forest;

@@ -8687,6 +8687,71 @@ pub async fn code_raptor_search(
     .await
 }
 
+/// One class's arithmetic CK metrics (graph-roadmap Phase 4.3), aggregated in
+/// SQL from `file_symbols` (methods via `parent_id`), `function_metrics`
+/// (cyclomatic), and `symbol_references` (calls). DIT/NOC are computed
+/// separately from the inheritance edges.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CkClassRow {
+    pub symbol_id: i64,
+    pub name: String,
+    pub relative_path: String,
+    pub method_count: i64,
+    /// Weighted Methods per Class = Σ cyclomatic over the class's methods.
+    pub wmc: i64,
+    /// Distinct call targets from the class's methods (the "called" half of RFC).
+    pub distinct_callees: i64,
+    /// Coupling Between Objects proxy: distinct target files the class's methods
+    /// reference.
+    pub cbo: i64,
+}
+
+/// Load per-class CK arithmetic metrics for a project. "Classes" are
+/// `file_symbols` of an OO kind (class/struct/interface/trait/enum); their
+/// methods are rows with `parent_id = class.id`.
+pub async fn ck_class_rows(pool: &PgPool, project_id: i32) -> Result<Vec<CkClassRow>, sqlx::Error> {
+    sqlx::query_as::<_, CkClassRow>(
+        "SELECT c.id AS symbol_id, c.name, f.relative_path,
+                COUNT(DISTINCT m.id) AS method_count,
+                COALESCE(SUM(fm.cyclomatic), 0)::int8 AS wmc,
+                COUNT(DISTINCT sr.target_raw)
+                    FILTER (WHERE sr.ref_kind = 'call') AS distinct_callees,
+                COUNT(DISTINCT sr.target_file_id)
+                    FILTER (WHERE sr.ref_kind = 'call' AND sr.target_file_id IS NOT NULL) AS cbo
+         FROM file_symbols c
+         JOIN indexed_files f ON f.id = c.file_id
+         LEFT JOIN file_symbols m ON m.parent_id = c.id
+         LEFT JOIN function_metrics fm ON fm.function_id = m.id
+         LEFT JOIN symbol_references sr ON sr.source_symbol_id = m.id
+         WHERE f.project_id = $1
+           AND c.kind IN ('class', 'struct', 'interface', 'trait', 'enum')
+         GROUP BY c.id, c.name, f.relative_path",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Load resolved inheritance/impl edges for a project as `(child_symbol_id,
+/// parent_symbol_id)` pairs, for DIT/NOC. (Phase 4.3)
+pub async fn ck_inheritance_edges(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Vec<(i64, i64)>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, i64)>(
+        "SELECT sr.source_symbol_id, sr.target_symbol_id
+         FROM symbol_references sr
+         JOIN indexed_files f ON f.id = sr.source_file_id
+         WHERE f.project_id = $1
+           AND sr.ref_kind IN ('inherit', 'impl')
+           AND sr.source_symbol_id IS NOT NULL
+           AND sr.target_symbol_id IS NOT NULL",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
 /// Per-candidate re-ranking features (graph-roadmap Phase 4.2): the embedding
 /// (for MMR diversity) and last-change date (for the recency prior), keyed by
 /// chunk id. `embedding`/`blame_date` may be NULL for un-backfilled chunks.
