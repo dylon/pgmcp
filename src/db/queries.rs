@@ -7630,6 +7630,13 @@ pub async fn resolve_symbol_reference_targets(
     // module/symbol whose `target_raw` ends with `::<name>` (or `.<name>`
     // for languages using dot-notation). Match against `scope_path` so the
     // resolution is namespace-aware.
+    //
+    // The UPDATE target alias `sr` is in scope ONLY for SET/WHERE/RETURNING
+    // — Postgres rejects references to `sr` inside `JOIN ... ON` predicates
+    // between FROM-list members with `invalid reference to FROM-clause
+    // entry for table "sr"`. The `e.source_file_id = sr.source_file_id`
+    // correlation belongs in WHERE, not in the JOIN ON. See plan
+    // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md F2.
     let phase2 = sqlx::query(
         "UPDATE symbol_references sr
          SET target_symbol_id = fs.id,
@@ -7640,12 +7647,12 @@ pub async fn resolve_symbol_reference_targets(
          FROM file_symbols fs
          JOIN indexed_files tgt_f ON tgt_f.id = fs.file_id
          JOIN code_graph_edges e
-           ON e.source_file_id = sr.source_file_id
-          AND e.target_file_id = fs.file_id
+           ON e.target_file_id = fs.file_id
           AND e.edge_type = 'import'
          WHERE sr.target_raw = fs.name
            AND sr.resolution_kind IS NULL
            AND tgt_f.project_id = $1
+           AND e.source_file_id = sr.source_file_id
            AND EXISTS (
                SELECT 1 FROM indexed_files f
                 WHERE f.id = sr.source_file_id AND f.project_id = $1
@@ -7659,6 +7666,13 @@ pub async fn resolve_symbol_reference_targets(
     // behavior, kept for parity). When multiple matches exist, the database
     // picks one deterministically; downstream tools that need precision can
     // filter on `resolution_confidence >= 0.95`.
+    //
+    // `src_f` exists only to enforce the source file's `project_id`, but
+    // its `JOIN ON src_f.id = sr.source_file_id` predicate references the
+    // UPDATE target alias `sr`, which Postgres rejects (`invalid reference
+    // to FROM-clause entry for table "sr"`). The cleanest fix is to lift
+    // the source-file project filter into an EXISTS subquery mirroring
+    // Phase 1's pattern — `src_f` is no longer in the FROM list at all.
     let phase3 = sqlx::query(
         "UPDATE symbol_references sr
          SET target_symbol_id = fs.id,
@@ -7667,12 +7681,15 @@ pub async fn resolve_symbol_reference_targets(
              resolution_kind = 'bare_name_in_project',
              resolution_confidence = 0.5
          FROM file_symbols fs
-         JOIN indexed_files src_f ON src_f.id = sr.source_file_id
          JOIN indexed_files tgt_f ON tgt_f.id = fs.file_id
-         WHERE src_f.project_id = $1
-           AND tgt_f.project_id = $1
+         WHERE tgt_f.project_id = $1
            AND sr.target_raw = fs.name
-           AND sr.resolution_kind IS NULL",
+           AND sr.resolution_kind IS NULL
+           AND EXISTS (
+               SELECT 1 FROM indexed_files src_f
+                WHERE src_f.id = sr.source_file_id
+                  AND src_f.project_id = $1
+           )",
     )
     .bind(project_id)
     .execute(pool)
