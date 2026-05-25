@@ -95,13 +95,22 @@ impl Embedder {
         let cfg_json =
             std::fs::read_to_string(&cfg_path).map_err(|e| PgmcpError::file_io(&cfg_path, e))?;
 
-        let weights_path = model_dir.join("model.safetensors");
-        // SAFETY: mmap is read-only and the file is owned by the HF cache;
-        // candle's VarBuilder treats the mmap as a stable byte slice for
-        // the session lifetime.
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(&[weights_path], BERT_DTYPE, &device)
-                .map_err(|e| PgmcpError::Embedding(format!("safetensors load: {}", e)))?
+        let vb = match kind {
+            ModelKind::MiniLm => {
+                let weights_path = model_dir.join("model.safetensors");
+                // SAFETY: mmap is read-only and the file is owned by the HF cache;
+                // candle's VarBuilder treats the mmap as a stable byte slice for
+                // the session lifetime.
+                unsafe {
+                    VarBuilder::from_mmaped_safetensors(&[weights_path], BERT_DTYPE, &device)
+                        .map_err(|e| PgmcpError::Embedding(format!("safetensors load: {}", e)))?
+                }
+            }
+            ModelKind::Bgem3 => {
+                let weights_path = model_dir.join("pytorch_model.bin");
+                VarBuilder::from_pth(&weights_path, BERT_DTYPE, &device)
+                    .map_err(|e| PgmcpError::Embedding(format!("pth load: {}", e)))?
+            }
         };
 
         let backbone = match kind {
@@ -312,8 +321,11 @@ impl ModelKind {
     fn model_files(self) -> &'static [&'static str] {
         match self {
             Self::MiniLm => &["model.safetensors", "config.json", "tokenizer.json"],
-            // BGE-M3 ships with the same canonical names as MiniLM.
-            Self::Bgem3 => &["model.safetensors", "config.json", "tokenizer.json"],
+            // BGE-M3 ships its weights as `pytorch_model.bin` (no top-level
+            // `model.safetensors` exists in the BAAI/bge-m3 HF repo at any
+            // revision — verified via the HF API). The loader branches on
+            // ModelKind to use `VarBuilder::from_pth` for this file.
+            Self::Bgem3 => &["pytorch_model.bin", "config.json", "tokenizer.json"],
         }
     }
 
@@ -466,6 +478,25 @@ mod tests {
     fn output_dim_and_signature_are_correct_per_kind() {
         assert_eq!(ModelKind::MiniLm.output_dim(), 384);
         assert_eq!(ModelKind::Bgem3.output_dim(), 1024);
+    }
+
+    #[test]
+    fn bgem3_model_files_targets_pytorch_bin() {
+        // BAAI/bge-m3 HF repo ships pytorch_model.bin, not model.safetensors.
+        // Requesting model.safetensors yields a 404 (deterministic, not
+        // transient) — see plan
+        // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md F1.
+        let files = ModelKind::Bgem3.model_files();
+        assert!(
+            files.contains(&"pytorch_model.bin"),
+            "BGE-M3 file list must include pytorch_model.bin (got {:?})",
+            files
+        );
+        assert!(
+            !files.contains(&"model.safetensors"),
+            "BGE-M3 HF repo does not publish model.safetensors (got {:?})",
+            files
+        );
     }
 
     #[test]
