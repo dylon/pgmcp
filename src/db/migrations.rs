@@ -30,6 +30,55 @@ use crate::config::VectorConfig;
 
 const INITIAL_SCHEMA_VERSION: i32 = 1;
 
+/// Run a HNSW `CREATE INDEX` with HNSW-friendly session settings.
+///
+/// pgvector's HNSW build phase needs the graph to fit in
+/// `maintenance_work_mem`; on the PG cluster default of 64 MB it
+/// spills to a slow disk-merge path at ~12k tuples and blows past
+/// the daemon's 30 s `statement_timeout` (`src/db/pool.rs`) on any
+/// matview / table large enough to matter. This helper opens a
+/// transaction, bumps memory + sets the per-session statement
+/// timeout + enables parallel build workers (pgvector ≥ 0.6
+/// supports parallel HNSW build), runs the CREATE INDEX, and
+/// commits. All three `SET LOCAL` effects are scoped to the
+/// transaction.
+///
+/// The three knobs (`hnsw_maintenance_work_mem`,
+/// `hnsw_build_statement_timeout_secs`, `hnsw_max_parallel_workers`)
+/// live on `[vector]` config — defaults are `"2GB"`, `0` (no
+/// limit), and `4` respectively. See plan F8 in
+/// `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`.
+async fn build_hnsw_index(
+    pool: &PgPool,
+    config: &VectorConfig,
+    create_index_sql: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!(
+        "SET LOCAL maintenance_work_mem = '{}'",
+        config.hnsw_maintenance_work_mem.replace('\'', "''")
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "SET LOCAL statement_timeout = {}",
+        config
+            .hnsw_build_statement_timeout_secs
+            .saturating_mul(1000)
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!(
+        "SET LOCAL max_parallel_maintenance_workers = {}",
+        config.hnsw_max_parallel_workers
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(create_index_sql).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Run all migrations to set up the schema.
 pub async fn run_migrations(
     pool: &PgPool,
@@ -1279,7 +1328,7 @@ pub async fn run_migrations(
     // (NodeRAG-inspired). UNION ALL projection across the existing
     // node-typed tables. See `docs/memory-server/05-schema.md` §12.3.
     // ================================================================
-    ensure_memory_unified_views(pool).await?;
+    ensure_memory_unified_views(pool, vector_config).await?;
 
     // Record the baseline. From this point on, future migration steps
     // can call `apply_step(pool, N, ...)`-style logic to land changes
@@ -1343,11 +1392,140 @@ pub async fn run_migrations(
     Ok(())
 }
 
-/// Phase 6.3: materialized `memory_unified_nodes` view + `memory_unified_edges`
-/// view. Idempotent — drops and recreates on every startup so schema
-/// changes (e.g. adding a new node-typed table later) take effect via
-/// a daemon restart.
-async fn ensure_memory_unified_views(pool: &PgPool) -> Result<(), sqlx::Error> {
+/// Phase 5 C10 — extend the matview to cover every embedding-
+/// bearing table populated by the full BGE-M3 migration. Adds:
+/// - `commit_chunk` arm (git_commit_chunks.embedding_v2)
+/// - `pattern_chunk` arm (software_pattern_chunks.embedding_v2)
+/// - `session_mandate` arm (session_mandates.embedding, 1024d-direct)
+///
+/// The pre-Phase-5 `commit` arm (git_commits, no embedding) stays;
+/// it surfaces commit subjects as labels for graph traversal.
+///
+/// Promoted to a `const` (F9) so its definition is the single source
+/// of truth for the rebuild-gate hash. Edits propagate transparently
+/// — the hash changes, the next restart rebuilds, the new hash is
+/// upserted into `pgmcp_metadata['memory_unified_views_def_hash']`.
+const MEMORY_UNIFIED_NODES_SQL: &str = "CREATE MATERIALIZED VIEW memory_unified_nodes AS
+    SELECT 'memory_entity:' || id::TEXT AS node_id,
+           'memory_entity'::TEXT AS node_type,
+           name AS label,
+           NULL::VECTOR(1024) AS embedding,
+           importance
+      FROM memory_entities WHERE valid_to IS NULL
+    UNION ALL
+    SELECT 'observation:' || id::TEXT, 'observation',
+           LEFT(content, 200), embedding, importance
+      FROM memory_observations WHERE valid_to IS NULL
+    UNION ALL
+    SELECT 'chunk:' || id::TEXT, 'chunk',
+           LEFT(content, 200), embedding_v2, 0.5
+      FROM file_chunks
+      WHERE embedding_v2 IS NOT NULL
+    UNION ALL
+    SELECT 'topic:' || id::TEXT, 'topic',
+           label, NULL::VECTOR(1024), 0.5
+      FROM code_topics
+    UNION ALL
+    SELECT 'durable_mandate:' || id::TEXT, 'durable_mandate',
+           imperative, embedding, 0.7
+      FROM durable_mandates
+    UNION ALL
+    SELECT 'session_mandate:' || id::TEXT, 'session_mandate',
+           imperative, embedding, 0.5
+      FROM session_mandates
+      WHERE embedding IS NOT NULL
+    UNION ALL
+    SELECT 'commit:' || id::TEXT, 'commit',
+           subject, NULL::VECTOR(1024), 0.5
+      FROM git_commits
+    UNION ALL
+    SELECT 'commit_chunk:' || id::TEXT, 'commit_chunk',
+           LEFT(content, 200), embedding_v2, 0.4
+      FROM git_commit_chunks
+      WHERE embedding_v2 IS NOT NULL
+    UNION ALL
+    SELECT 'pattern_chunk:' || id::TEXT, 'pattern_chunk',
+           LEFT(content, 200), embedding_v2, 0.6
+      FROM software_pattern_chunks
+      WHERE embedding_v2 IS NOT NULL";
+
+/// Edges-view definition. Same single-source-of-truth posture as
+/// `MEMORY_UNIFIED_NODES_SQL` — F9's hash-gate covers both.
+const MEMORY_UNIFIED_EDGES_SQL: &str = "CREATE VIEW memory_unified_edges AS
+    SELECT 'memory_entity:' || from_entity_id::TEXT AS from_id,
+           'memory_entity'::TEXT AS from_type,
+           'memory_entity:' || to_entity_id::TEXT AS to_id,
+           'memory_entity'::TEXT AS to_type,
+           relation_type AS edge_type,
+           importance::DOUBLE PRECISION AS weight
+      FROM memory_relations WHERE valid_to IS NULL
+    UNION ALL
+    SELECT 'memory_entity:' || entity_id::TEXT,
+           'memory_entity',
+           CASE
+             WHEN file_id IS NOT NULL THEN 'chunk:' || file_id::TEXT
+             WHEN chunk_id IS NOT NULL THEN 'chunk:' || chunk_id::TEXT
+             ELSE 'topic:' || topic_id::TEXT
+           END,
+           CASE
+             WHEN file_id IS NOT NULL THEN 'chunk'
+             WHEN chunk_id IS NOT NULL THEN 'chunk'
+             ELSE 'topic'
+           END,
+           anchor_type,
+           1.0::DOUBLE PRECISION
+      FROM memory_code_anchor
+    UNION ALL
+    SELECT 'chunk:' || chunk_id::TEXT,
+           'chunk',
+           'topic:' || topic_id::TEXT,
+           'topic',
+           'belongs_to',
+           membership_score
+      FROM chunk_topic_assignments
+      WHERE membership_score >= 0.05";
+
+/// `pgmcp_metadata` key storing the xxh3 hash of the combined matview
+/// and edges-view CREATE SQL. F9 gate skips the rebuild when the stored
+/// hash matches the current hash, avoiding ~35s of redundant matview
+/// rebuild and HNSW index build on every daemon restart.
+const MEMORY_UNIFIED_VIEWS_HASH_KEY: &str = "memory_unified_views_def_hash";
+
+/// Phase 6.3: materialized `memory_unified_nodes` view +
+/// `memory_unified_edges` view. F9: drops and recreates only when
+/// the combined definition (`MEMORY_UNIFIED_NODES_SQL` +
+/// `MEMORY_UNIFIED_EDGES_SQL`) has changed since the last successful
+/// rebuild. The hash is keyed in `pgmcp_metadata` so schema changes
+/// still take effect on the next restart automatically.
+async fn ensure_memory_unified_views(
+    pool: &PgPool,
+    config: &VectorConfig,
+) -> Result<(), sqlx::Error> {
+    let combined = format!(
+        "{}\n---\n{}",
+        MEMORY_UNIFIED_NODES_SQL, MEMORY_UNIFIED_EDGES_SQL
+    );
+    let current_hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(combined.as_bytes()));
+
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT value FROM pgmcp_metadata WHERE key = $1")
+            .bind(MEMORY_UNIFIED_VIEWS_HASH_KEY)
+            .fetch_optional(pool)
+            .await?;
+
+    if stored.as_deref() == Some(current_hash.as_str()) {
+        info!(
+            "memory_unified_views definition unchanged (hash {}); skipping rebuild",
+            current_hash
+        );
+        return Ok(());
+    }
+
+    info!(
+        "memory_unified_views definition changed (was {:?}, now {}); rebuilding",
+        stored, current_hash
+    );
+
     // Drop the matview if it already exists so we can rebuild against
     // the latest column shapes. Order matters: drop the view first
     // (it depends on the matview indirectly through underlying tables
@@ -1359,60 +1537,7 @@ async fn ensure_memory_unified_views(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool)
         .await?;
 
-    // Phase 5 C10 — extend the matview to cover every embedding-
-    // bearing table populated by the full BGE-M3 migration. Adds:
-    // - `commit_chunk` arm (git_commit_chunks.embedding_v2)
-    // - `pattern_chunk` arm (software_pattern_chunks.embedding_v2)
-    // - `session_mandate` arm (session_mandates.embedding, 1024d-direct)
-    // The pre-Phase-5 `commit` arm (git_commits, no embedding) stays;
-    // it surfaces commit subjects as labels for graph traversal.
-    sqlx::query(
-        "CREATE MATERIALIZED VIEW memory_unified_nodes AS
-            SELECT 'memory_entity:' || id::TEXT AS node_id,
-                   'memory_entity'::TEXT AS node_type,
-                   name AS label,
-                   NULL::VECTOR(1024) AS embedding,
-                   importance
-              FROM memory_entities WHERE valid_to IS NULL
-            UNION ALL
-            SELECT 'observation:' || id::TEXT, 'observation',
-                   LEFT(content, 200), embedding, importance
-              FROM memory_observations WHERE valid_to IS NULL
-            UNION ALL
-            SELECT 'chunk:' || id::TEXT, 'chunk',
-                   LEFT(content, 200), embedding_v2, 0.5
-              FROM file_chunks
-              WHERE embedding_v2 IS NOT NULL
-            UNION ALL
-            SELECT 'topic:' || id::TEXT, 'topic',
-                   label, NULL::VECTOR(1024), 0.5
-              FROM code_topics
-            UNION ALL
-            SELECT 'durable_mandate:' || id::TEXT, 'durable_mandate',
-                   imperative, embedding, 0.7
-              FROM durable_mandates
-            UNION ALL
-            SELECT 'session_mandate:' || id::TEXT, 'session_mandate',
-                   imperative, embedding, 0.5
-              FROM session_mandates
-              WHERE embedding IS NOT NULL
-            UNION ALL
-            SELECT 'commit:' || id::TEXT, 'commit',
-                   subject, NULL::VECTOR(1024), 0.5
-              FROM git_commits
-            UNION ALL
-            SELECT 'commit_chunk:' || id::TEXT, 'commit_chunk',
-                   LEFT(content, 200), embedding_v2, 0.4
-              FROM git_commit_chunks
-              WHERE embedding_v2 IS NOT NULL
-            UNION ALL
-            SELECT 'pattern_chunk:' || id::TEXT, 'pattern_chunk',
-                   LEFT(content, 200), embedding_v2, 0.6
-              FROM software_pattern_chunks
-              WHERE embedding_v2 IS NOT NULL",
-    )
-    .execute(pool)
-    .await?;
+    sqlx::query(MEMORY_UNIFIED_NODES_SQL).execute(pool).await?;
     // Lookup index by (node_type, node_id-suffix prefix) for the
     // neighbors / search paths. Cheap b-tree; the HNSW would be on
     // `embedding` but a matview supports HNSW only if pgvector is
@@ -1424,51 +1549,27 @@ async fn ensure_memory_unified_views(pool: &PgPool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
-    // HNSW on embedding for vector retrieval. Built only if the matview
-    // has rows — empty-table HNSW build is fast but harmless either way.
-    sqlx::query(
+    // HNSW on embedding for vector retrieval. Built via the F8
+    // helper so `maintenance_work_mem` / `statement_timeout` /
+    // parallel-workers tuning kicks in.
+    build_hnsw_index(
+        pool,
+        config,
         "CREATE INDEX IF NOT EXISTS idx_memory_unified_nodes_embedding
             ON memory_unified_nodes USING hnsw (embedding vector_cosine_ops)
             WITH (m = 24, ef_construction = 200)",
     )
-    .execute(pool)
     .await?;
 
+    sqlx::query(MEMORY_UNIFIED_EDGES_SQL).execute(pool).await?;
+
     sqlx::query(
-        "CREATE VIEW memory_unified_edges AS
-            SELECT 'memory_entity:' || from_entity_id::TEXT AS from_id,
-                   'memory_entity'::TEXT AS from_type,
-                   'memory_entity:' || to_entity_id::TEXT AS to_id,
-                   'memory_entity'::TEXT AS to_type,
-                   relation_type AS edge_type,
-                   importance::DOUBLE PRECISION AS weight
-              FROM memory_relations WHERE valid_to IS NULL
-            UNION ALL
-            SELECT 'memory_entity:' || entity_id::TEXT,
-                   'memory_entity',
-                   CASE
-                     WHEN file_id IS NOT NULL THEN 'chunk:' || file_id::TEXT
-                     WHEN chunk_id IS NOT NULL THEN 'chunk:' || chunk_id::TEXT
-                     ELSE 'topic:' || topic_id::TEXT
-                   END,
-                   CASE
-                     WHEN file_id IS NOT NULL THEN 'chunk'
-                     WHEN chunk_id IS NOT NULL THEN 'chunk'
-                     ELSE 'topic'
-                   END,
-                   anchor_type,
-                   1.0::DOUBLE PRECISION
-              FROM memory_code_anchor
-            UNION ALL
-            SELECT 'chunk:' || chunk_id::TEXT,
-                   'chunk',
-                   'topic:' || topic_id::TEXT,
-                   'topic',
-                   'belongs_to',
-                   membership_score
-              FROM chunk_topic_assignments
-              WHERE membership_score >= 0.05",
+        "INSERT INTO pgmcp_metadata (key, value)
+         VALUES ($1, $2)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
     )
+    .bind(MEMORY_UNIFIED_VIEWS_HASH_KEY)
+    .bind(&current_hash)
     .execute(pool)
     .await?;
 
@@ -1801,7 +1902,7 @@ async fn ensure_memory_phase2_hnsw_index(
              USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        sqlx::query(&create_sql).execute(pool).await?;
+        build_hnsw_index(pool, config, &create_sql).await?;
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_observations_hnsw_params', $1)
@@ -1828,7 +1929,7 @@ async fn ensure_memory_phase2_hnsw_index(
              WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        sqlx::query(&create_sql).execute(pool).await?;
+        build_hnsw_index(pool, config, &create_sql).await?;
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_summary_tree_hnsw_params', $1)
@@ -1913,7 +2014,7 @@ async fn ensure_memory_v2_hnsw_index(
              WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        sqlx::query(&create_sql).execute(pool).await?;
+        build_hnsw_index(pool, config, &create_sql).await?;
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_v2_file_chunks_hnsw_params', $1)
@@ -1940,7 +2041,7 @@ async fn ensure_memory_v2_hnsw_index(
              WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        sqlx::query(&create_sql).execute(pool).await?;
+        build_hnsw_index(pool, config, &create_sql).await?;
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_v2_session_prompts_hnsw_params', $1)
@@ -1967,7 +2068,7 @@ async fn ensure_memory_v2_hnsw_index(
              WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        sqlx::query(&create_sql).execute(pool).await?;
+        build_hnsw_index(pool, config, &create_sql).await?;
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_v2_durable_mandates_hnsw_params', $1)
@@ -1994,7 +2095,7 @@ async fn ensure_memory_v2_hnsw_index(
              WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        sqlx::query(&create_sql).execute(pool).await?;
+        build_hnsw_index(pool, config, &create_sql).await?;
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_v2_git_commit_chunks_hnsw_params', $1)
@@ -2021,7 +2122,7 @@ async fn ensure_memory_v2_hnsw_index(
              WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        sqlx::query(&create_sql).execute(pool).await?;
+        build_hnsw_index(pool, config, &create_sql).await?;
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_v2_software_pattern_chunks_hnsw_params', $1)
@@ -2090,7 +2191,7 @@ async fn ensure_hnsw_index(pool: &PgPool, config: &VectorConfig) -> Result<(), s
             config.hnsw_m, config.hnsw_ef_construction
         );
         // Ignore error if table is empty (index creation on empty table is fast)
-        sqlx::query(&create_sql).execute(pool).await?;
+        build_hnsw_index(pool, config, &create_sql).await?;
 
         // Store the params we built the index with
         sqlx::query(
@@ -2139,7 +2240,7 @@ async fn ensure_git_commit_hnsw_index(
              USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        sqlx::query(&create_sql).execute(pool).await?;
+        build_hnsw_index(pool, config, &create_sql).await?;
 
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value) VALUES ('git_hnsw_params', $1)
@@ -2183,7 +2284,7 @@ async fn ensure_software_pattern_hnsw_index(
              USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        sqlx::query(&create_sql).execute(pool).await?;
+        build_hnsw_index(pool, config, &create_sql).await?;
 
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
@@ -2227,7 +2328,7 @@ async fn ensure_session_prompts_hnsw_index(
              USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
             config.hnsw_m, config.hnsw_ef_construction
         );
-        sqlx::query(&create_sql).execute(pool).await?;
+        build_hnsw_index(pool, config, &create_sql).await?;
 
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)

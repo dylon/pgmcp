@@ -1297,6 +1297,28 @@ pub struct VectorConfig {
     /// during search. Higher values improve recall at the cost of query latency.
     #[serde(default = "default_ef_search")]
     pub ef_search: i32,
+    /// `maintenance_work_mem` used by `SET LOCAL` during HNSW index
+    /// builds. PG accepts unit-suffixed values like `"2GB"`,
+    /// `"512MB"`. The cluster default (typically 64 MB) is far too
+    /// small for HNSW builds on large tables — pgvector spills to a
+    /// slow disk-merge path when the in-memory graph exceeds this.
+    /// Default: `"2GB"`. See plan F8.
+    #[serde(default = "default_hnsw_maintenance_work_mem")]
+    pub hnsw_maintenance_work_mem: String,
+    /// Per-transaction `statement_timeout` (seconds) used by `SET LOCAL`
+    /// during HNSW index builds. The daemon-wide default
+    /// (`[database].statement_timeout_ms = 30000`) is appropriate for
+    /// query paths but kills large HNSW builds; this knob raises the
+    /// ceiling specifically for the build transaction. `0` (the
+    /// default) disables the timeout for HNSW builds.
+    #[serde(default = "default_hnsw_build_statement_timeout_secs")]
+    pub hnsw_build_statement_timeout_secs: u64,
+    /// `max_parallel_maintenance_workers` used by `SET LOCAL` during
+    /// HNSW index builds. pgvector ≥ 0.6 supports parallel HNSW
+    /// build; this knob caps the worker count. Default 4 (matches
+    /// the cluster's typical headroom and pgvector's recommendation).
+    #[serde(default = "default_hnsw_max_parallel_workers")]
+    pub hnsw_max_parallel_workers: u32,
 }
 
 impl Default for VectorConfig {
@@ -1305,6 +1327,9 @@ impl Default for VectorConfig {
             hnsw_m: default_hnsw_m(),
             hnsw_ef_construction: default_hnsw_ef_construction(),
             ef_search: default_ef_search(),
+            hnsw_maintenance_work_mem: default_hnsw_maintenance_work_mem(),
+            hnsw_build_statement_timeout_secs: default_hnsw_build_statement_timeout_secs(),
+            hnsw_max_parallel_workers: default_hnsw_max_parallel_workers(),
         }
     }
 }
@@ -1317,6 +1342,15 @@ fn default_hnsw_ef_construction() -> i32 {
 }
 fn default_ef_search() -> i32 {
     100
+}
+fn default_hnsw_maintenance_work_mem() -> String {
+    "2GB".to_string()
+}
+fn default_hnsw_build_statement_timeout_secs() -> u64 {
+    0
+}
+fn default_hnsw_max_parallel_workers() -> u32 {
+    4
 }
 
 fn default_model() -> String {
