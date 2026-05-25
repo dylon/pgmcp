@@ -29,15 +29,105 @@ pub async fn tool_test_coverage_gaps(
         "MCP tool invoked",
     );
 
+    // Phase 4.4: REAL line coverage from any indexed lcov / Cobertura / JaCoCo
+    // report, crossed with AST cyclomatic to surface high-complexity,
+    // low-coverage files. Falls through to the topic proxy when no report
+    // exists (opportunistic — gated on the repo actually shipping a report).
+    let mut real_coverage = serde_json::Value::Null;
+    if let Some(pool) = ctx.db().pool()
+        && let Ok(Some(project_id)) =
+            sqlx::query_scalar::<_, i32>("SELECT id FROM projects WHERE name = $1")
+                .bind(&params.project)
+                .fetch_optional(pool)
+                .await
+    {
+        let artifacts: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT relative_path, content FROM indexed_files
+             WHERE project_id = $1 AND content IS NOT NULL
+               AND (relative_path LIKE '%lcov.info' OR relative_path LIKE '%.lcov'
+                    OR relative_path LIKE '%coverage.xml' OR relative_path LIKE '%cobertura.xml'
+                    OR relative_path LIKE '%jacoco.xml')",
+        )
+        .bind(project_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+
+        let mut merged: Vec<crate::code_analysis::coverage::FileCoverage> = Vec::new();
+        let mut formats: std::collections::BTreeSet<&'static str> =
+            std::collections::BTreeSet::new();
+        for (_p, content) in &artifacts {
+            if let Some(c) = content
+                && let Some((fmt, parsed)) = crate::code_analysis::coverage::detect_and_parse(c)
+            {
+                formats.insert(fmt.as_str());
+                for fc in parsed {
+                    if let Some(e) = merged.iter_mut().find(|m| m.path == fc.path) {
+                        e.lines_total += fc.lines_total;
+                        e.lines_covered += fc.lines_covered;
+                    } else {
+                        merged.push(fc);
+                    }
+                }
+            }
+        }
+        if !merged.is_empty() {
+            let tot: u32 = merged.iter().map(|m| m.lines_total).sum();
+            let cov: u32 = merged.iter().map(|m| m.lines_covered).sum();
+            let cc = crate::db::queries::get_file_ast_complexity_by_path(pool, project_id)
+                .await
+                .unwrap_or_default();
+            let mut gaps: Vec<serde_json::Value> = Vec::new();
+            for (path, max_cc, _, _) in &cc {
+                if *max_cc < 8 {
+                    continue; // only flag genuinely complex files
+                }
+                if let Some(m) = merged
+                    .iter()
+                    .find(|m| m.path.ends_with(path.as_str()) || path.ends_with(m.path.as_str()))
+                {
+                    let rate = if m.lines_total > 0 {
+                        m.lines_covered as f64 / m.lines_total as f64
+                    } else {
+                        0.0
+                    };
+                    if rate < 0.5 {
+                        gaps.push(json!({
+                            "file": path, "max_cyclomatic": max_cc,
+                            "line_rate": format!("{:.2}", rate),
+                            "lines_total": m.lines_total, "lines_covered": m.lines_covered,
+                        }));
+                    }
+                }
+            }
+            gaps.sort_by(|a, b| {
+                b["max_cyclomatic"]
+                    .as_i64()
+                    .unwrap_or(0)
+                    .cmp(&a["max_cyclomatic"].as_i64().unwrap_or(0))
+            });
+            gaps.truncate(40);
+            real_coverage = json!({
+                "formats": formats.into_iter().collect::<Vec<_>>(),
+                "files_measured": merged.len(),
+                "overall_line_rate": format!("{:.3}", if tot > 0 { cov as f64 / tot as f64 } else { 0.0 }),
+                "lines_total": tot,
+                "lines_covered": cov,
+                "high_complexity_low_coverage": gaps,
+            });
+        }
+    }
+
     let rows = ctx
         .db()
         .get_test_topic_coverage(&params.project)
         .await
         .map_err(|e| McpError::internal_error(format!("Coverage query failed: {}", e), None))?;
 
-    if rows.is_empty() {
+    if rows.is_empty() && real_coverage.is_null() {
         return Ok(CallToolResult::success(vec![Content::text(
-            "No topic assignments found. Run discover_topics first.",
+            "No coverage report indexed and no topic assignments found. Index an lcov/Cobertura/\
+             JaCoCo report, or run discover_topics for the topic-proxy view.",
         )]));
     }
 
@@ -119,13 +209,17 @@ pub async fn tool_test_coverage_gaps(
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
         "project": params.project,
+        "coverage_source": if real_coverage.is_null() { "topic_proxy" } else { "report+topic_proxy" },
+        "real_coverage": real_coverage,
         "total_impl_chunks": total_impl_chunks,
         "total_test_chunks": total_test_chunks,
         "topic_count": topics.len(),
         "topics": topics,
-        "guidance": "Topics with 0% test coverage are highest priority for test development. \
-                     Focus on topics with many implementation chunks but no corresponding \
-                     test chunks.",
+        "guidance": "`real_coverage` (when present) is REAL line coverage parsed from an indexed lcov / \
+                     Cobertura / JaCoCo report: `high_complexity_low_coverage` lists files with high AST \
+                     cyclomatic AND <50% line coverage — the highest-leverage places to add tests. When no \
+                     report is indexed it's null and only the topic proxy is shown: topics with 0% test \
+                     coverage are the priority, especially those with many impl chunks but no test chunks.",
     });
 
     let json = serde_json::to_string_pretty(&result)
