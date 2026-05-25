@@ -374,6 +374,33 @@ mod tests {
         );
     }
 
+    /// Poll `counter` until it reaches `expected` or the deadline passes.
+    /// Replaces `thread::sleep(short_duration); assert_eq!(...)` which
+    /// silently races worker startup on heavily loaded systems (e.g. when
+    /// the full verify.sh suite runs all tests in parallel under GPU+CPU
+    /// load — the 100ms sleep originally here was too tight and the
+    /// assertion would fail before any worker thread had a chance to
+    /// pull from the queue).
+    fn wait_until_counter(counter: &Arc<AtomicU64>, expected: u64, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        while counter.load(Ordering::Relaxed) < expected {
+            if std::time::Instant::now() >= deadline {
+                panic!(
+                    "timeout: counter = {} after {:?}; expected {}",
+                    counter.load(Ordering::Relaxed),
+                    timeout,
+                    expected,
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            expected,
+            "counter must equal {expected} (not overshoot)",
+        );
+    }
+
     #[test]
     fn test_work_pool_basic() {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -389,8 +416,7 @@ mod tests {
             Priority::High,
         );
 
-        thread::sleep(Duration::from_millis(100));
-        assert_eq!(counter.load(Ordering::Relaxed), 1);
+        wait_until_counter(&counter, 1, Duration::from_secs(5));
 
         pool.shutdown_and_join();
     }
@@ -412,8 +438,7 @@ mod tests {
             );
         }
 
-        thread::sleep(Duration::from_millis(200));
-        assert_eq!(counter.load(Ordering::Relaxed), 10);
+        wait_until_counter(&counter, 10, Duration::from_secs(5));
 
         pool.shutdown_and_join();
     }
