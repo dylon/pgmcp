@@ -1589,6 +1589,23 @@ pub struct CronConfig {
     pub similarity_threshold: f64,
     #[serde(default = "default_similarity_top_k")]
     pub similarity_top_k: i32,
+    /// Interval between within-project semantic-edge materialization passes,
+    /// in seconds (default: 21600 = 6 hours). Feeds the graph-analysis cron's
+    /// blended PageRank / betweenness / community detection. (Phase 3.1)
+    #[serde(default = "default_semantic_edge_interval")]
+    pub semantic_edge_interval_secs: u64,
+    /// Minimum chunk-level cosine similarity for a semantic edge (default:
+    /// 0.75 — deliberately *lower* than the 0.85 clone floor, since community
+    /// blending wants topical affinity, not just near-duplicates).
+    #[serde(default = "default_semantic_edge_threshold")]
+    pub semantic_edge_threshold: f64,
+    /// Max target files retained per source file (fan-out cap, default: 10).
+    /// Caps near-clique formation that would otherwise wash out modularity.
+    #[serde(default = "default_semantic_edge_fanout")]
+    pub semantic_edge_fanout: i32,
+    /// Per-chunk HNSW neighbors probed during the semantic scan (default: 5).
+    #[serde(default = "default_semantic_edge_per_chunk_k")]
+    pub semantic_edge_per_chunk_k: i32,
     /// Interval between global topic scans (default: 43200 = 12 hours)
     #[serde(default = "default_topic_scan_interval")]
     pub topic_scan_interval_secs: u64,
@@ -1702,6 +1719,13 @@ pub struct CronConfig {
     #[serde(default = "default_ready_delay_graph_secs")]
     pub ready_delay_graph_secs: u64,
 
+    /// Ready-relative initial delay for semantic-edges cron (seconds).
+    /// Default 1200 = 20 minutes — sequenced between similarity-scan (15m) and
+    /// graph-analysis (30m) so semantic edges are materialized before the
+    /// graph-analysis pass blends them into centrality/community. (Phase 3.1)
+    #[serde(default = "default_ready_delay_semantic_secs")]
+    pub ready_delay_semantic_secs: u64,
+
     /// Ready-relative initial delay for topic-clustering cron (seconds).
     /// Default 3600 = 60 minutes.
     #[serde(default = "default_ready_delay_topic_secs")]
@@ -1812,6 +1836,10 @@ impl Default for CronConfig {
             similarity_scan_interval_secs: default_similarity_scan_interval(),
             similarity_threshold: default_similarity_threshold(),
             similarity_top_k: default_similarity_top_k(),
+            semantic_edge_interval_secs: default_semantic_edge_interval(),
+            semantic_edge_threshold: default_semantic_edge_threshold(),
+            semantic_edge_fanout: default_semantic_edge_fanout(),
+            semantic_edge_per_chunk_k: default_semantic_edge_per_chunk_k(),
             topic_scan_interval_secs: default_topic_scan_interval(),
             topic_min_cluster_size: default_topic_min_cluster_size(),
             topic_num_clusters: None,
@@ -1834,6 +1862,7 @@ impl Default for CronConfig {
             ready_delay_git_secs: default_ready_delay_git_secs(),
             ready_delay_similarity_secs: default_ready_delay_similarity_secs(),
             ready_delay_graph_secs: default_ready_delay_graph_secs(),
+            ready_delay_semantic_secs: default_ready_delay_semantic_secs(),
             ready_delay_topic_secs: default_ready_delay_topic_secs(),
             ready_delay_embedding_migration_secs: default_ready_delay_embedding_migration_secs(),
             ready_delay_symbol_extraction_secs: default_ready_delay_symbol_extraction_secs(),
@@ -1866,6 +1895,9 @@ fn default_ready_delay_similarity_secs() -> u64 {
 }
 fn default_ready_delay_graph_secs() -> u64 {
     1800
+}
+fn default_ready_delay_semantic_secs() -> u64 {
+    1200
 }
 fn default_ready_delay_topic_secs() -> u64 {
     3600
@@ -1936,6 +1968,18 @@ fn default_similarity_threshold() -> f64 {
 }
 fn default_similarity_top_k() -> i32 {
     10
+}
+fn default_semantic_edge_interval() -> u64 {
+    21600
+} // 6 hours
+fn default_semantic_edge_threshold() -> f64 {
+    0.75
+}
+fn default_semantic_edge_fanout() -> i32 {
+    10
+}
+fn default_semantic_edge_per_chunk_k() -> i32 {
+    5
 }
 fn default_topic_scan_interval() -> u64 {
     43200

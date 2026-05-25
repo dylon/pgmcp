@@ -30,6 +30,8 @@ pub mod memory_retention;
 pub mod ngram_lm_train;
 #[allow(dead_code)]
 pub mod scheduler;
+#[allow(dead_code)]
+pub mod semantic_edges;
 pub mod shutdown;
 #[allow(dead_code)]
 pub mod similarity;

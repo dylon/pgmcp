@@ -8393,6 +8393,141 @@ pub async fn bulk_insert_call_edges(
     Ok(res.rows_affected())
 }
 
+/// A directed file→file semantic-affinity edge (graph-roadmap Phase 3.1).
+/// `weight` is the maximum chunk-level cosine similarity observed between any
+/// chunk of the source file and any chunk of the target file (within the
+/// per-chunk HNSW neighbor set, above threshold).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SemanticFileEdge {
+    pub source_file_id: i64,
+    pub target_file_id: i64,
+    pub weight: f64,
+}
+
+/// Delete prior `edge_type='semantic'` edges for a project so a re-scan is
+/// idempotent. Scoped to the semantic partition — never touches `'import'` /
+/// `'co_change'` / `'call'` edges.
+pub async fn delete_semantic_edges_for_project(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<u64, sqlx::Error> {
+    let res = sqlx::query(
+        "DELETE FROM code_graph_edges WHERE project_id = $1 AND edge_type = 'semantic'",
+    )
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Compute within-project file→file semantic edges via the HNSW chunk index.
+/// Each chunk probes its top `per_chunk_k` nearest neighbors in OTHER files of
+/// the same project; chunk pairs at/above `threshold` cosine are aggregated to
+/// file pairs (MAX cosine), and each source file keeps only its top `fanout_k`
+/// targets (the fan-out cap keeps semantic hubs from forming near-cliques that
+/// wash out community modularity). Uses the legacy `embedding` (MiniLM) column
+/// — the same column the cross-project similarity scanner probes — so coverage
+/// is independent of BGE-M3 backfill progress.
+pub async fn compute_semantic_file_edges(
+    pool: &PgPool,
+    project_id: i32,
+    threshold: f64,
+    per_chunk_k: i32,
+    fanout_k: i32,
+    ef_search: i32,
+) -> Result<Vec<SemanticFileEdge>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+    // The per-project HNSW LATERAL can exceed the daemon-wide statement_timeout
+    // on large indexes; raise the ceiling for this transaction only (mirrors
+    // `batch_find_cross_project_neighbors`).
+    sqlx::query("SET LOCAL statement_timeout = '5min'")
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query_as::<_, SemanticFileEdge>(
+        "WITH chunk_nn AS (
+            SELECT c.file_id AS source_file_id,
+                   nn.file_id AS target_file_id,
+                   nn.similarity
+            FROM file_chunks c
+            JOIN indexed_files f ON f.id = c.file_id
+            CROSS JOIN LATERAL (
+                SELECT c2.file_id,
+                       1 - (c2.embedding <=> c.embedding) AS similarity
+                FROM file_chunks c2
+                JOIN indexed_files f2 ON f2.id = c2.file_id
+                WHERE f2.project_id = $1
+                  AND c2.file_id <> c.file_id
+                  AND c2.embedding IS NOT NULL
+                ORDER BY c2.embedding <=> c.embedding
+                LIMIT $3
+            ) nn
+            WHERE f.project_id = $1
+              AND c.embedding IS NOT NULL
+        ),
+        file_pairs AS (
+            SELECT source_file_id, target_file_id, MAX(similarity) AS weight
+            FROM chunk_nn
+            WHERE similarity >= $2
+            GROUP BY source_file_id, target_file_id
+        ),
+        ranked AS (
+            SELECT source_file_id, target_file_id, weight,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY source_file_id ORDER BY weight DESC
+                   ) AS rn
+            FROM file_pairs
+        )
+        SELECT source_file_id, target_file_id, weight
+        FROM ranked
+        WHERE rn <= $4",
+    )
+    .bind(project_id)
+    .bind(threshold)
+    .bind(per_chunk_k)
+    .bind(fanout_k)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
+}
+
+/// Bulk-insert semantic file→file edges (`edge_type='semantic'`,
+/// `target_raw=NULL`, both symbol endpoints NULL — the `cge_call_needs_source
+/// _symbol` CHECK only constrains `'call'`). Mirrors `bulk_insert_call_edges`'
+/// UNNEST shape. The caller is responsible for de-duplicating the input (the
+/// `ON CONFLICT` target cannot be hit twice within one statement).
+pub async fn bulk_insert_semantic_edges(
+    pool: &PgPool,
+    project_id: i32,
+    edges: &[SemanticFileEdge],
+) -> Result<u64, sqlx::Error> {
+    if edges.is_empty() {
+        return Ok(0);
+    }
+    let project_ids: Vec<i32> = vec![project_id; edges.len()];
+    let source_files: Vec<i64> = edges.iter().map(|e| e.source_file_id).collect();
+    let target_files: Vec<i64> = edges.iter().map(|e| e.target_file_id).collect();
+    let weights: Vec<f64> = edges.iter().map(|e| e.weight).collect();
+    let res = sqlx::query(
+        "INSERT INTO code_graph_edges
+            (project_id, source_file_id, target_file_id, edge_type, target_raw, weight, computed_at)
+         SELECT u.project_id, u.source_file_id, u.target_file_id, 'semantic', NULL, u.weight, NOW()
+         FROM UNNEST($1::int4[], $2::int8[], $3::int8[], $4::float8[])
+             AS u(project_id, source_file_id, target_file_id, weight)
+         ON CONFLICT (source_file_id, COALESCE(target_file_id, -1::BIGINT), edge_type, COALESCE(target_raw, '')) DO NOTHING",
+    )
+    .bind(&project_ids)
+    .bind(&source_files)
+    .bind(&target_files)
+    .bind(&weights)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 /// Update `function_metrics.fan_in` / `fan_out` for a batch of function IDs.
 /// Rows whose function_id has no row in `function_metrics` are silently
 /// ignored (their metrics row hasn't been computed yet; the next

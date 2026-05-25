@@ -989,6 +989,76 @@ pub fn schedule_maintenance_jobs(
         },
     );
 
+    // Semantic-edges materialization (heavy — gates on Ready + heavy_cron_lock).
+    // Sequenced (via its ready-delay) before graph-analysis so its edges are
+    // present for the blended PageRank / betweenness / community pass.
+    let db_clone_sem = Arc::clone(&db);
+    let rt_clone_sem = rt.clone();
+    let stats_for_sem = Arc::clone(&stats);
+    let sem_interval = config.semantic_edge_interval_secs;
+    let sem_cron_config = config.clone();
+    let sem_ef_search = 100; // default ef_search (mirrors similarity-scan)
+    let lc = lifecycle.clone();
+    let lock = Arc::clone(&heavy_cron_lock);
+    let ready_sem: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+    let sem_ready_delay = Duration::from_secs(config.ready_delay_semantic_secs);
+    let cron_pool_sem = Arc::clone(&cron_pool);
+    handle.schedule_recurring(
+        staggered_initial_delay_ms("semantic-edges", sem_interval * 1000),
+        sem_interval * 1000,
+        "semantic-edges",
+        move || {
+            if lc.is_stopping() {
+                return false;
+            }
+            let lc = lc.clone();
+            let lock = Arc::clone(&lock);
+            let ready_sem = Arc::clone(&ready_sem);
+            let stats_for_sem = Arc::clone(&stats_for_sem);
+            let db = db_clone_sem.clone();
+            let cfg = sem_cron_config.clone();
+            let rt = rt_clone_sem.clone();
+            cron_pool_sem.submit(
+                move || {
+                    let _guard = heavy_gate_or_skip!(
+                        job = "semantic-edges",
+                        lc = lc,
+                        ready = ready_sem,
+                        cooldown = sem_ready_delay,
+                        lock = lock,
+                        stats = stats_for_sem,
+                    );
+                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_sem));
+                    let stats = Arc::clone(&stats_for_sem);
+                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    let t0 = Instant::now();
+                    let lc_inner = lc.clone();
+                    rt.block_on(async {
+                        crate::cron::semantic_edges::run_semantic_edges(
+                            db.as_ref(),
+                            &cfg,
+                            sem_ef_search,
+                            &stats,
+                            &lc_inner,
+                        )
+                        .await;
+                    });
+                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    tracing::info!(
+                        job = "semantic-edges",
+                        rss_mb_start = rss_start >> 20,
+                        rss_mb_end = rss_end >> 20,
+                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
+                        elapsed_s = t0.elapsed().as_secs_f64(),
+                        "heavy cron complete"
+                    );
+                },
+                crate::work_pool::pool::Priority::Low,
+            );
+            true
+        },
+    );
+
     // Graph analysis (import extraction, PageRank, betweenness, coupling)
     let db_clone_graph = Arc::clone(&db);
     let rt_clone_graph = rt.clone();

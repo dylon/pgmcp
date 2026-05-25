@@ -296,6 +296,16 @@ pub struct StatsTracker {
     // Similarity analysis counters
     pub similarity_scans: AtomicU64,
     pub similarity_pairs_found: AtomicU64,
+    // Semantic-edge materialization counters (graph-roadmap Phase 3.1)
+    /// Number of `semantic-edges` cron body invocations that reached the
+    /// work-eligible state (pairs with `semantic_edge_noop_returns`).
+    pub semantic_edge_runs: AtomicU64,
+    /// Total symmetric semantic edges inserted across all projects in the
+    /// latest `semantic-edges` pass.
+    pub semantic_edges_found: AtomicU64,
+    /// Number of `semantic-edges` cron body invocations that returned early
+    /// because there were no projects to analyze.
+    pub semantic_edge_noop_returns: AtomicU64,
     /// Cross-language signature-clone pairs inserted in the latest pass.
     pub cross_language_pairs_found: AtomicU64,
 
@@ -712,6 +722,9 @@ impl StatsTracker {
             config_reload_errors: AtomicU64::new(0),
             similarity_scans: AtomicU64::new(0),
             similarity_pairs_found: AtomicU64::new(0),
+            semantic_edge_runs: AtomicU64::new(0),
+            semantic_edges_found: AtomicU64::new(0),
+            semantic_edge_noop_returns: AtomicU64::new(0),
             cross_language_pairs_found: AtomicU64::new(0),
             topic_scans: AtomicU64::new(0),
             topics_discovered: AtomicU64::new(0),
@@ -1026,6 +1039,9 @@ impl StatsTracker {
             "config_reload_errors": self.config_reload_errors.load(Ordering::Acquire),
             "similarity_scans": self.similarity_scans.load(Ordering::Acquire),
             "similarity_pairs_found": self.similarity_pairs_found.load(Ordering::Acquire),
+            "semantic_edge_runs": self.semantic_edge_runs.load(Ordering::Acquire),
+            "semantic_edges_found": self.semantic_edges_found.load(Ordering::Acquire),
+            "semantic_edge_noop_returns": self.semantic_edge_noop_returns.load(Ordering::Acquire),
             "topic_scans": self.topic_scans.load(Ordering::Acquire),
             "topics_discovered": self.topics_discovered.load(Ordering::Acquire),
             "topic_noise_chunks": self.topic_noise_chunks.load(Ordering::Acquire),
