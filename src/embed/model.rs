@@ -108,8 +108,26 @@ impl Embedder {
             }
             ModelKind::Bgem3 => {
                 let weights_path = model_dir.join("pytorch_model.bin");
-                VarBuilder::from_pth(&weights_path, BERT_DTYPE, &device)
-                    .map_err(|e| PgmcpError::Embedding(format!("pth load: {}", e)))?
+                // BGE-M3 (XLM-RoBERTa-Large, ~560M params) at F32 is
+                // ~2.24 GiB per worker; pool_size = 2 plus activations
+                // exceeds the 8 GiB VRAM budget on the project's
+                // reference hardware (RTX 4060 Ti, SM 8.9). On CUDA
+                // we load at BF16: halves weight + activation memory,
+                // same dynamic range as F32 (8-bit exponent) so
+                // attention softmax / LayerNorm are numerically
+                // safer than F16. On CPU fallback we stay at F32 —
+                // candle's CPU matmul does not implement BF16
+                // ("unsupported dtype BF16 for op matmul") and there's
+                // no VRAM constraint to motivate the precision drop.
+                // See ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
+                // F5.
+                let dtype = if device.is_cuda() {
+                    DType::BF16
+                } else {
+                    BERT_DTYPE
+                };
+                VarBuilder::from_pth(&weights_path, dtype, &device)
+                    .map_err(|e| PgmcpError::Embedding(format!("pth load ({:?}): {}", dtype, e)))?
             }
         };
 
@@ -278,7 +296,17 @@ impl Embedder {
                     )
                     .map_err(|e| PgmcpError::Embedding(format!("XLM-RoBERTa forward: {}", e)))?;
                 // BGE-M3 dense mode = CLS pooling: take token index 0.
-                cls_pool(&hidden).map_err(|e| PgmcpError::Embedding(format!("cls_pool: {}", e)))?
+                // Cast BF16 → F32 here so the subsequent L2 normalize
+                // (and the downstream `to_vec2::<f32>` extraction)
+                // runs in F32. Normalization in BF16 would accumulate
+                // ~1e-3 noise in the per-row norm; the cast cost is
+                // (batch × 1024) elements and dominated by the
+                // forward pass.
+                let pooled_bf16 = cls_pool(&hidden)
+                    .map_err(|e| PgmcpError::Embedding(format!("cls_pool: {}", e)))?;
+                pooled_bf16
+                    .to_dtype(DType::F32)
+                    .map_err(|e| PgmcpError::Embedding(format!("bf16→f32 cast: {}", e)))?
             }
         };
 
