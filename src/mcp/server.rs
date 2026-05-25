@@ -8441,6 +8441,15 @@ impl McpServer {
                 "articulation_points"    => articulation_points(ArticulationPointsParams),
                 "hits"                   => hits(HitsParams),
                 "dominator_tree"         => dominator_tree(DominatorTreeParams),
+                // Graph-roadmap Phase 3-4 — connectivity / spectral / DSM / CK /
+                // graph-aware retrieval (file or call graph).
+                "graph_connectivity"     => graph_connectivity(GraphConnectivityParams),
+                "spectral_analysis"      => spectral_analysis(SpectralAnalysisParams),
+                "architecture_dsm"       => architecture_dsm(ArchitectureDsmParams),
+                "ck_metrics"             => ck_metrics(CkMetricsParams),
+                "code_ppr_search"        => code_ppr_search(CodePprSearchParams),
+                "code_path_search"       => code_path_search(CodePathSearchParams),
+                "code_raptor_search"     => code_raptor_search(CodeRaptorSearchParams),
                 // Architecture
                 "coupling_cohesion_report"  => coupling_cohesion_report(CouplingCohesionReportParams),
                 "architecture_violations"   => architecture_violations(ArchitectureViolationsParams),

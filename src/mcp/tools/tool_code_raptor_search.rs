@@ -41,6 +41,19 @@ pub async fn tool_code_raptor_search(
         .await
         .map_err(|e| McpError::internal_error(format!("embed failed: {}", e), None))?;
 
+    // The summary tree stores BGE-M3 (1024-d) centroids; a non-1024 query
+    // backbone (e.g. the legacy MiniLM path) simply has no comparable tree —
+    // return an empty, well-formed result rather than erroring.
+    if embedding.len() != 1024 {
+        return json_result(&json!({
+            "project": params.project.unwrap_or_else(|| "*".to_string()),
+            "result_count": 0,
+            "results": [],
+            "guidance": "code_raptor_search requires a BGE-M3 (1024-d) query embedding; the active \
+                         embedding backbone is not 1024-d, so no summaries are comparable."
+        }));
+    }
+
     let rows = queries::code_raptor_search(pool, &embedding, params.project.as_deref(), k)
         .await
         .map_err(|e| McpError::internal_error(format!("raptor query failed: {}", e), None))?;
