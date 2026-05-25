@@ -22,7 +22,7 @@ use syn::{
 #[path = "rust/helpers.rs"]
 mod helpers;
 #[path = "rust/dataflow.rs"]
-mod rust_dataflow;
+pub mod rust_dataflow;
 #[path = "rust/type_mapper.rs"]
 mod type_mapper;
 use helpers::*;

@@ -19,6 +19,7 @@ use sqlx::PgPool;
 use std::sync::atomic::Ordering;
 
 use crate::code_analysis::taint_dataflow::{TaintFinding, analyze_function};
+use crate::code_analysis::taint_interproc::{InterprocFinding, analyze_file};
 use crate::context::SystemContext;
 use crate::mcp::server::TaintAnalysisParams;
 use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect;
@@ -40,13 +41,24 @@ pub(crate) struct DataflowHit {
     pub finding: TaintFinding,
 }
 
-/// Run the real intraprocedural taint engine over every def-use-capable file in
-/// the project. Fetches only `DATAFLOW_LANGUAGES` files (so the regex fallback
-/// owns the rest). Pure CPU per file; no transaction.
+/// An interprocedural taint finding tagged with its file (Phase 3.4).
+pub(crate) struct InterprocHit {
+    pub path: String,
+    pub language: String,
+    pub finding: InterprocFinding,
+}
+
+/// Run the real taint engine over every def-use-capable file in the project.
+/// Fetches only `DATAFLOW_LANGUAGES` files (so the regex fallback owns the
+/// rest). Each file yields both intraprocedural findings (per function) and
+/// interprocedural findings (source-tainted arg → callee param → sink, via
+/// within-file summaries, Phase 3.4) from one extraction pass. Pure CPU per
+/// file; no transaction.
+#[allow(clippy::type_complexity)]
 pub(crate) async fn scan_project_dataflow(
     pool: &PgPool,
     project_id: i32,
-) -> Result<Vec<DataflowHit>, sqlx::Error> {
+) -> Result<(Vec<DataflowHit>, Vec<InterprocHit>), sqlx::Error> {
     let rows: Vec<(String, String, Option<String>)> =
         sqlx::query_as::<_, (String, String, Option<String>)>(
             "SELECT relative_path, language, content
@@ -59,13 +71,15 @@ pub(crate) async fn scan_project_dataflow(
         .await?;
 
     let mut out = Vec::new();
+    let mut interproc = Vec::new();
     for (path, lang, content) in rows {
         let Some(c) = content else { continue };
         let Some(backend) = LanguageRegistry::for_language(&lang) else {
             continue;
         };
-        for df in backend.extract_dataflow(&c) {
-            for finding in analyze_function(&df) {
+        let dfs = backend.extract_dataflow(&c);
+        for df in &dfs {
+            for finding in analyze_function(df) {
                 out.push(DataflowHit {
                     path: path.clone(),
                     language: lang.clone(),
@@ -73,8 +87,15 @@ pub(crate) async fn scan_project_dataflow(
                 });
             }
         }
+        for finding in analyze_file(&dfs) {
+            interproc.push(InterprocHit {
+                path: path.clone(),
+                language: lang.clone(),
+                finding,
+            });
+        }
     }
-    Ok(out)
+    Ok((out, interproc))
 }
 
 pub async fn tool_taint_analysis(
@@ -87,10 +108,12 @@ pub async fn tool_taint_analysis(
     let pool = pool_or_err(ctx)?;
     let limit = params.limit.unwrap_or(30).max(0) as usize;
 
-    // Real source→sink flows (def-use backends).
-    let mut dataflow_findings: Vec<serde_json::Value> = scan_project_dataflow(pool, project_id)
+    // Real source→sink flows (def-use backends): intraprocedural + (Phase 3.4)
+    // interprocedural via within-file summaries.
+    let (intra_hits, interproc_hits) = scan_project_dataflow(pool, project_id)
         .await
-        .map_err(|e| McpError::internal_error(format!("Dataflow scan failed: {}", e), None))?
+        .map_err(|e| McpError::internal_error(format!("Dataflow scan failed: {}", e), None))?;
+    let mut dataflow_findings: Vec<serde_json::Value> = intra_hits
         .into_iter()
         .map(|h| {
             json!({
@@ -107,6 +130,24 @@ pub async fn tool_taint_analysis(
         })
         .collect();
     dataflow_findings.truncate(limit);
+
+    let mut interprocedural_findings: Vec<serde_json::Value> = interproc_hits
+        .into_iter()
+        .map(|h| {
+            json!({
+                "file": h.path,
+                "language": h.language,
+                "caller": h.finding.caller,
+                "source_kind": h.finding.source_kind,
+                "source_line": h.finding.source_line,
+                "callee": h.finding.callee,
+                "param_index": h.finding.param_index,
+                "call_line": h.finding.call_line,
+                "sink_kind": h.finding.sink_kind,
+            })
+        })
+        .collect();
+    interprocedural_findings.truncate(limit);
 
     // Regex source/sink co-occurrence for languages without a def-use backend.
     let source_re = Regex::new(
@@ -176,13 +217,17 @@ pub async fn tool_taint_analysis(
     json_result(&json!({
         "project": params.project,
         "dataflow_findings": dataflow_findings,
+        "interprocedural_findings": interprocedural_findings,
         "heuristic_findings": heuristic_findings,
         "io_effect_symbols": io_symbols,
         "guidance": "`dataflow_findings` are REAL intraprocedural source→sink flows (Rust): a value from a \
             taint source (env/argv/stdin/request) provably reaches a dangerous sink (command/sql/eval/deserialize/\
-            path) without passing a sanitizer — high confidence. `heuristic_findings` are the older regex \
-            source/sink *co-occurrence* in one file (languages without a def-use backend yet): review candidates, \
-            not confirmed flows. `io_effect_symbols` lists symbols carrying network/filesystem/database/crypto \
-            effects. Analysis is intraprocedural — taint crossing function boundaries is not yet tracked."
+            path) without passing a sanitizer — high confidence. `interprocedural_findings` (Phase 3.4) extend \
+            this ACROSS function boundaries within a file: a source-tainted argument reaches a sink inside a \
+            called helper (via the callee's param→sink summary, bounded IFDS) — `caller` passes the tainted arg \
+            at `call_line` into `callee` param `param_index`, which routes it to a `sink_kind` sink. \
+            `heuristic_findings` are the older regex source/sink *co-occurrence* in one file (languages without a \
+            def-use backend yet): review candidates, not confirmed flows. `io_effect_symbols` lists symbols \
+            carrying network/filesystem/database/crypto effects."
     }))
 }

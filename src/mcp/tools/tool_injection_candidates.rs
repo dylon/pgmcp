@@ -41,9 +41,10 @@ pub async fn tool_injection_candidates(
     };
 
     // High-confidence: real source→sink flows into an injection sink.
-    let mut injection_findings: Vec<serde_json::Value> = scan_project_dataflow(pool, project_id)
+    let (intra_hits, interproc_hits) = scan_project_dataflow(pool, project_id)
         .await
-        .map_err(|e| McpError::internal_error(format!("Dataflow scan failed: {}", e), None))?
+        .map_err(|e| McpError::internal_error(format!("Dataflow scan failed: {}", e), None))?;
+    let mut injection_findings: Vec<serde_json::Value> = intra_hits
         .into_iter()
         .filter(|h| allowed.contains(&h.finding.sink_kind.as_str()))
         .map(|h| {
@@ -56,9 +57,30 @@ pub async fn tool_injection_candidates(
                 "sink_kind": h.finding.sink_kind,
                 "sink_callee": h.finding.sink_callee,
                 "sink_line": h.finding.sink_line,
+                "interprocedural": false,
             })
         })
         .collect();
+    // Interprocedural injection candidates (Phase 3.4): a tainted argument that
+    // a called helper routes to an injection sink.
+    injection_findings.extend(
+        interproc_hits
+            .into_iter()
+            .filter(|h| allowed.contains(&h.finding.sink_kind.as_str()))
+            .map(|h| {
+                json!({
+                    "file": h.path,
+                    "language": h.language,
+                    "function": h.finding.caller,
+                    "source_kind": h.finding.source_kind,
+                    "source_line": h.finding.source_line,
+                    "sink_kind": h.finding.sink_kind,
+                    "sink_callee": h.finding.callee,
+                    "sink_line": h.finding.call_line,
+                    "interprocedural": true,
+                })
+            }),
+    );
     injection_findings.truncate(limit.max(0) as usize);
 
     // Review-candidate heuristic: string concatenation into exec/query (regex),

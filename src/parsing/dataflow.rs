@@ -43,6 +43,23 @@ pub struct TaintSink {
     pub line: u32,
 }
 
+/// A call to another (intra-project, resolvable-by-name) function within the
+/// same function body. Records the arg→node mapping and the result node so the
+/// interprocedural engine can apply the callee's summary (graph-roadmap Phase
+/// 3.4). Dangerous *library* sinks stay in [`FunctionDataflow::sinks`]; this is
+/// for calls to **user** functions whose own dataflow may launder taint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSite {
+    /// Callee function name (bare ident; matched against `FunctionDataflow::function`).
+    pub callee: String,
+    /// Flow nodes passed as positional arguments, in order.
+    pub arg_nodes: Vec<FlowNode>,
+    /// The node that receives the call's return value.
+    pub result: FlowNode,
+    /// 1-based call line.
+    pub line: u32,
+}
+
 /// Intraprocedural def-use facts for one function.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FunctionDataflow {
@@ -61,6 +78,14 @@ pub struct FunctionDataflow {
     pub sanitized: Vec<FlowNode>,
     /// Dangerous consumption sites.
     pub sinks: Vec<TaintSink>,
+    /// Flow nodes for the function's parameters, in declaration order. Empty for
+    /// backends that don't yet emit interprocedural facts. (Phase 3.4)
+    pub params: Vec<FlowNode>,
+    /// Flow nodes whose value reaches the function's return value (explicit
+    /// `return` operands + the block's tail expression). (Phase 3.4)
+    pub return_nodes: Vec<FlowNode>,
+    /// Calls to other user functions, for interprocedural summary application.
+    pub calls: Vec<CallSite>,
 }
 
 impl FunctionDataflow {

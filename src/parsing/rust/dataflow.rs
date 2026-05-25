@@ -20,7 +20,7 @@ use syn::spanned::Spanned;
 use syn::{Block, Expr, ExprCall, ExprMethodCall, ImplItem, Item, Pat, Stmt};
 
 use crate::code_analysis::taint_spec;
-use crate::parsing::dataflow::{FlowNode, FunctionDataflow, TaintSink, TaintSource};
+use crate::parsing::dataflow::{CallSite, FlowNode, FunctionDataflow, TaintSink, TaintSource};
 
 /// Parse `content` and emit one `FunctionDataflow` per non-trivial function
 /// (one with at least one source and one sink). Parse errors yield `Vec::new()`.
@@ -68,18 +68,30 @@ fn collect_item(item: &Item, out: &mut Vec<FunctionDataflow>) {
 
 fn push_fn(sig: &syn::Signature, block: &Block, out: &mut Vec<FunctionDataflow>) {
     let mut v = DfVisitor::new(sig.ident.to_string(), line_of(sig.ident.span()));
-    // Parameters become initial (untainted) nodes so uses resolve.
+    // Parameters become initial (untainted) nodes so uses resolve; recorded in
+    // declaration order for interprocedural param→sink summaries (Phase 3.4).
+    // `self`/receiver is skipped, so positional indices align with free-function
+    // call-site arguments (the calls the extractor records).
     for input in &sig.inputs {
         if let syn::FnArg::Typed(pt) = input
             && let Some(name) = pat_ident(&pt.pat)
         {
             let n = v.new_node();
+            v.params.push(n);
             v.vars.insert(name, n);
         }
     }
-    v.walk_block(block);
+    v.walk_fn_body(block);
     let df = v.finish(line_of(block.brace_token.span.close()));
-    if !df.is_trivial() {
+    // Keep a function when it has an intraprocedural flow to analyze
+    // (`!is_trivial` = source+sink), OR when it participates in interprocedural
+    // taint (Phase 3.4): as a CALLEE that could route a param to a sink
+    // (params + sink/call), or as a CALLER that could pass tainted data into a
+    // callee (sources + calls). `is_trivial` (source+sink) alone would drop
+    // both the sink-only helper and the source-only caller.
+    let callee_relevant = !df.params.is_empty() && (!df.sinks.is_empty() || !df.calls.is_empty());
+    let caller_relevant = !df.sources.is_empty() && !df.calls.is_empty();
+    if !df.is_trivial() || callee_relevant || caller_relevant {
         out.push(df);
     }
 }
@@ -115,6 +127,9 @@ struct DfVisitor {
     edges: Vec<(FlowNode, FlowNode)>,
     sources: Vec<TaintSource>,
     sinks: Vec<TaintSink>,
+    params: Vec<FlowNode>,
+    return_nodes: Vec<FlowNode>,
+    calls: Vec<CallSite>,
 }
 
 impl DfVisitor {
@@ -127,6 +142,9 @@ impl DfVisitor {
             edges: Vec::new(),
             sources: Vec::new(),
             sinks: Vec::new(),
+            params: Vec::new(),
+            return_nodes: Vec::new(),
+            calls: Vec::new(),
         }
     }
 
@@ -146,11 +164,31 @@ impl DfVisitor {
             sources: self.sources,
             sanitized: Vec::new(), // Rust clears taint inline (sanitizer → no carried nodes).
             sinks: self.sinks,
+            params: self.params,
+            return_nodes: self.return_nodes,
+            calls: self.calls,
         }
     }
 
     fn walk_block(&mut self, block: &Block) {
         for stmt in &block.stmts {
+            self.walk_stmt(stmt);
+        }
+    }
+
+    /// Walk a function's top-level body, treating a trailing tail expression
+    /// (the implicit return) as a return site so its value-nodes are recorded
+    /// in `return_nodes` for interprocedural param→return summaries (Phase 3.4).
+    fn walk_fn_body(&mut self, block: &Block) {
+        let last = block.stmts.len().saturating_sub(1);
+        for (i, stmt) in block.stmts.iter().enumerate() {
+            if i == last
+                && let Stmt::Expr(e, None) = stmt
+            {
+                let r = self.eval(e);
+                self.return_nodes.extend(r.nodes);
+                continue;
+            }
             self.walk_stmt(stmt);
         }
     }
@@ -288,7 +326,8 @@ impl DfVisitor {
             }
             Expr::Return(r) => {
                 if let Some(e) = &r.expr {
-                    self.eval(e);
+                    let ev = self.eval(e);
+                    self.return_nodes.extend(ev.nodes);
                 }
                 Eval::empty()
             }
@@ -328,7 +367,22 @@ impl DfVisitor {
                 sink_ctx: Some((kind, callee)),
             };
         }
-        Eval::plain(arg_nodes)
+        // User/unknown function call: record a CallSite + result node so the
+        // interprocedural engine can apply the callee's param→sink summary.
+        // Keep the conservative intra behavior (args flow to the result) so a
+        // tainted arg laundered through the call's return still reaches
+        // downstream sinks even without a summary.
+        let result = self.new_node();
+        for n in &arg_nodes {
+            self.edges.push((*n, result));
+        }
+        self.calls.push(CallSite {
+            callee,
+            arg_nodes,
+            result,
+            line,
+        });
+        Eval::plain(vec![result])
     }
 
     fn eval_method(&mut self, m: &ExprMethodCall) -> Eval {

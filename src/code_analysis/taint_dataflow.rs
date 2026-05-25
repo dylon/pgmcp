@@ -121,6 +121,7 @@ mod tests {
             sources,
             sanitized,
             sinks,
+            ..Default::default()
         }
     }
 
