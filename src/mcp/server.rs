@@ -1998,6 +1998,19 @@ pub struct CkMetricsParams {
     pub limit: Option<i32>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SpectralAnalysisParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Graph scope: \"file\" (import graph, default) or \"function\" (call graph)"
+    )]
+    pub scope: Option<String>,
+    #[schemars(description = "WL refinement rounds for structural clones (default: 2, max 6)")]
+    pub wl_iterations: Option<i32>,
+    #[schemars(description = "Max bisection members / clone classes to list (default: 20)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ArchitectureDsmParams {
     #[schemars(description = "Project name (required)")]
     pub project: String,
@@ -6634,6 +6647,28 @@ language's inherit/impl edges (Python & C/C++ emit them today)."
             &_ctx,
             &summarize_debug(&params),
             super::tools::tool_ck_metrics::tool_ck_metrics(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Spectral analysis over the file import graph or function call graph: algebraic \
+connectivity λ₂ + Fiedler bisection (Fiedler/Shi-Malik — global robustness + a balanced split boundary) \
+and Weisfeiler-Lehman structural clones (repeated call/import shapes despite renamed identifiers). USE \
+WHEN: gauging how bottlenecked the architecture is, finding a natural module split, or detecting \
+structural (not textual) duplication."
+    )]
+    async fn spectral_analysis(
+        &self,
+        Parameters(params): Parameters<SpectralAnalysisParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "spectral_analysis",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_spectral_analysis::tool_spectral_analysis(self.ctx(), params),
         )
         .await
     }

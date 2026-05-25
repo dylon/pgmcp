@@ -10,7 +10,9 @@ pub mod metrics;
 pub mod pathrank;
 #[allow(dead_code)]
 pub mod ports;
+pub mod spectral;
 pub mod types;
+pub mod wl_hash;
 
 #[allow(unused_imports)]
 pub use call_graph::{CallEdge, CallGraph, FunctionNode, RawCallEdge};

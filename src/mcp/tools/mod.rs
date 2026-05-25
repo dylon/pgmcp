@@ -224,6 +224,9 @@ pub mod tool_hits;
 // Graph-roadmap Phase 3.6 — connectivity, min-cut, Leiden refinement.
 pub mod tool_graph_connectivity;
 
+// Graph-roadmap Phase 4.6 — spectral connectivity + WL structural clones.
+pub mod tool_spectral_analysis;
+
 // SOTA Phase 11 — evolution analytics
 pub mod tool_commit_changepoint;
 pub mod tool_commit_topic_drift;
