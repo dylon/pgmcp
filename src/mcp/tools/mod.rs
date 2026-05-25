@@ -220,6 +220,9 @@ pub mod tool_articulation_points;
 pub mod tool_dominator_tree;
 pub mod tool_hits;
 
+// Graph-roadmap Phase 3.6 — connectivity, min-cut, Leiden refinement.
+pub mod tool_graph_connectivity;
+
 // SOTA Phase 11 — evolution analytics
 pub mod tool_commit_changepoint;
 pub mod tool_commit_topic_drift;

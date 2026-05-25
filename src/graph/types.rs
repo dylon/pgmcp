@@ -76,6 +76,16 @@ impl EdgeCost for EdgeWeight {
     }
 }
 
+/// Unit cost for unweighted graphs (e.g. the `DiGraph<NodeMeta, ()>` produced by
+/// `graph_scope::load_scoped_graph`), so weight-reading algorithms — Louvain,
+/// Stoer-Wagner min-cut — run on them treating every edge as weight 1.
+impl EdgeCost for () {
+    #[inline]
+    fn cost(&self) -> f64 {
+        1.0
+    }
+}
+
 impl Default for CodeGraph {
     fn default() -> Self {
         Self::new()

@@ -1978,6 +1978,17 @@ pub struct ArticulationPointsParams {
     pub limit: Option<i32>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GraphConnectivityParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Graph scope: \"file\" (import graph, default) or \"function\" (call graph)"
+    )]
+    pub scope: Option<String>,
+    #[schemars(description = "Max components / partition members to list (default: 20)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ArchitectureDsmParams {
     #[schemars(description = "Project name (required)")]
     pub project: String,
@@ -6571,6 +6582,28 @@ nodes/edges whose removal disconnects the graph — sharper than the ownership-b
             &_ctx,
             &summarize_debug(&params),
             super::tools::tool_articulation_points::tool_articulation_points(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Connectivity & decoupling structure over the file import graph or function call \
+graph: 2-edge-connected components (Tarjan — subsystems robust to single-edge failure), global min-cut \
+(Stoer-Wagner — the weakest seam to split a subsystem), and Leiden well-connectedness refinement of \
+Louvain (how many communities were internally disconnected). USE WHEN: assessing structural robustness or \
+finding a concrete module-decoupling boundary."
+    )]
+    async fn graph_connectivity(
+        &self,
+        Parameters(params): Parameters<GraphConnectivityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "graph_connectivity",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_graph_connectivity::tool_graph_connectivity(self.ctx(), params),
         )
         .await
     }
