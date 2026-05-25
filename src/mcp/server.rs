@@ -2022,6 +2022,17 @@ this; in [0,1], default 0.1"
     pub min_flow: Option<f64>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CodeRaptorSearchParams {
+    #[schemars(
+        description = "Project name to scope to; omit to search conceptual summaries across ALL projects"
+    )]
+    pub project: Option<String>,
+    #[schemars(description = "Conceptual query (required)")]
+    pub query: String,
+    #[schemars(description = "Number of summaries to return (default: 10, max 100)")]
+    pub k: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HitsParams {
     #[schemars(description = "Project name (required)")]
     pub project: String,
@@ -6623,6 +6634,27 @@ or the strongest chain linking a query hit to related code — returns the actua
             &_ctx,
             &summarize_debug(&params),
             super::tools::tool_code_path_search::tool_code_path_search(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "RAPTOR-over-code: query precomputed conceptual cluster summaries (module gists). \
+USE WHEN: a query is conceptual ('where does this project handle retries', 'which module owns auth') and \
+no single chunk answers it; omit `project` to compare modules across ALL indexed projects. Requires the \
+`code-raptor` cron to have run."
+    )]
+    async fn code_raptor_search(
+        &self,
+        Parameters(params): Parameters<CodeRaptorSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "code_raptor_search",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_code_raptor_search::tool_code_raptor_search(self.ctx(), params),
         )
         .await
     }

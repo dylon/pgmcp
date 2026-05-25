@@ -306,6 +306,13 @@ pub struct StatsTracker {
     /// Number of `semantic-edges` cron body invocations that returned early
     /// because there were no projects to analyze.
     pub semantic_edge_noop_returns: AtomicU64,
+    // RAPTOR-over-code summary-tree counters (graph-roadmap Phase 3.3)
+    /// `code-raptor` cron body invocations that reached the work-eligible state.
+    pub code_raptor_runs: AtomicU64,
+    /// Level-1 summaries written across all projects in the latest pass.
+    pub code_raptor_summaries_written: AtomicU64,
+    /// `code-raptor` invocations that returned early (no projects).
+    pub code_raptor_noop_returns: AtomicU64,
     /// Cross-language signature-clone pairs inserted in the latest pass.
     pub cross_language_pairs_found: AtomicU64,
 
@@ -725,6 +732,9 @@ impl StatsTracker {
             semantic_edge_runs: AtomicU64::new(0),
             semantic_edges_found: AtomicU64::new(0),
             semantic_edge_noop_returns: AtomicU64::new(0),
+            code_raptor_runs: AtomicU64::new(0),
+            code_raptor_summaries_written: AtomicU64::new(0),
+            code_raptor_noop_returns: AtomicU64::new(0),
             cross_language_pairs_found: AtomicU64::new(0),
             topic_scans: AtomicU64::new(0),
             topics_discovered: AtomicU64::new(0),
@@ -1042,6 +1052,9 @@ impl StatsTracker {
             "semantic_edge_runs": self.semantic_edge_runs.load(Ordering::Acquire),
             "semantic_edges_found": self.semantic_edges_found.load(Ordering::Acquire),
             "semantic_edge_noop_returns": self.semantic_edge_noop_returns.load(Ordering::Acquire),
+            "code_raptor_runs": self.code_raptor_runs.load(Ordering::Acquire),
+            "code_raptor_summaries_written": self.code_raptor_summaries_written.load(Ordering::Acquire),
+            "code_raptor_noop_returns": self.code_raptor_noop_returns.load(Ordering::Acquire),
             "topic_scans": self.topic_scans.load(Ordering::Acquire),
             "topics_discovered": self.topics_discovered.load(Ordering::Acquire),
             "topic_noise_chunks": self.topic_noise_chunks.load(Ordering::Acquire),

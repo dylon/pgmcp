@@ -1301,6 +1301,67 @@ pub fn schedule_maintenance_jobs(
         },
     );
 
+    // RAPTOR-over-code summary tree (heavy — CUDA FCM per project; gates on
+    // Ready + heavy_cron_lock). Sequenced (via ready-delay) after topic-
+    // clustering so embeddings are settled before the conceptual tree is built.
+    let db_clone_raptor = Arc::clone(&db);
+    let rt_clone_raptor = rt.clone();
+    let stats_for_raptor = Arc::clone(&stats);
+    let raptor_interval = config.code_raptor_interval_secs;
+    let lc = lifecycle.clone();
+    let lock = Arc::clone(&heavy_cron_lock);
+    let ready_raptor: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+    let raptor_ready_delay = Duration::from_secs(config.ready_delay_code_raptor_secs);
+    let cron_pool_raptor = Arc::clone(&cron_pool);
+    handle.schedule_recurring(
+        staggered_initial_delay_ms("code-raptor", raptor_interval * 1000),
+        raptor_interval * 1000,
+        "code-raptor",
+        move || {
+            if lc.is_stopping() {
+                return false;
+            }
+            let lc = lc.clone();
+            let lock = Arc::clone(&lock);
+            let ready_raptor = Arc::clone(&ready_raptor);
+            let stats_for_raptor = Arc::clone(&stats_for_raptor);
+            let db = db_clone_raptor.clone();
+            let rt = rt_clone_raptor.clone();
+            cron_pool_raptor.submit(
+                move || {
+                    let _guard = heavy_gate_or_skip!(
+                        job = "code-raptor",
+                        lc = lc,
+                        ready = ready_raptor,
+                        cooldown = raptor_ready_delay,
+                        lock = lock,
+                        stats = stats_for_raptor,
+                    );
+                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_raptor));
+                    let stats = Arc::clone(&stats_for_raptor);
+                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    let t0 = Instant::now();
+                    let lc_inner = lc.clone();
+                    rt.block_on(async {
+                        crate::cron::code_raptor::run_code_raptor(db.as_ref(), &stats, &lc_inner)
+                            .await;
+                    });
+                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    tracing::info!(
+                        job = "code-raptor",
+                        rss_mb_start = rss_start >> 20,
+                        rss_mb_end = rss_end >> 20,
+                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
+                        elapsed_s = t0.elapsed().as_secs_f64(),
+                        "heavy cron complete"
+                    );
+                },
+                crate::work_pool::pool::Priority::Low,
+            );
+            true
+        },
+    );
+
     // Fuzzy-index sync — clone db / rt / stats BEFORE topic-clustering
     // claims the final-move ownership of each.
     let db_clone_fuzzy = Arc::clone(&db);

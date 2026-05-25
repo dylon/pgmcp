@@ -1606,6 +1606,11 @@ pub struct CronConfig {
     /// Per-chunk HNSW neighbors probed during the semantic scan (default: 5).
     #[serde(default = "default_semantic_edge_per_chunk_k")]
     pub semantic_edge_per_chunk_k: i32,
+    /// Interval between RAPTOR-over-code summary-tree rebuilds, in seconds
+    /// (default: 43200 = 12 hours — the conceptual tree changes slowly).
+    /// (graph-roadmap Phase 3.3)
+    #[serde(default = "default_code_raptor_interval")]
+    pub code_raptor_interval_secs: u64,
     /// Interval between global topic scans (default: 43200 = 12 hours)
     #[serde(default = "default_topic_scan_interval")]
     pub topic_scan_interval_secs: u64,
@@ -1726,6 +1731,12 @@ pub struct CronConfig {
     #[serde(default = "default_ready_delay_semantic_secs")]
     pub ready_delay_semantic_secs: u64,
 
+    /// Ready-relative initial delay for code-raptor cron (seconds).
+    /// Default 2400 = 40 minutes — runs after topic-clustering so embeddings
+    /// are settled; heavy (CUDA FCM per project). (graph-roadmap Phase 3.3)
+    #[serde(default = "default_ready_delay_code_raptor_secs")]
+    pub ready_delay_code_raptor_secs: u64,
+
     /// Ready-relative initial delay for topic-clustering cron (seconds).
     /// Default 3600 = 60 minutes.
     #[serde(default = "default_ready_delay_topic_secs")]
@@ -1840,6 +1851,7 @@ impl Default for CronConfig {
             semantic_edge_threshold: default_semantic_edge_threshold(),
             semantic_edge_fanout: default_semantic_edge_fanout(),
             semantic_edge_per_chunk_k: default_semantic_edge_per_chunk_k(),
+            code_raptor_interval_secs: default_code_raptor_interval(),
             topic_scan_interval_secs: default_topic_scan_interval(),
             topic_min_cluster_size: default_topic_min_cluster_size(),
             topic_num_clusters: None,
@@ -1863,6 +1875,7 @@ impl Default for CronConfig {
             ready_delay_similarity_secs: default_ready_delay_similarity_secs(),
             ready_delay_graph_secs: default_ready_delay_graph_secs(),
             ready_delay_semantic_secs: default_ready_delay_semantic_secs(),
+            ready_delay_code_raptor_secs: default_ready_delay_code_raptor_secs(),
             ready_delay_topic_secs: default_ready_delay_topic_secs(),
             ready_delay_embedding_migration_secs: default_ready_delay_embedding_migration_secs(),
             ready_delay_symbol_extraction_secs: default_ready_delay_symbol_extraction_secs(),
@@ -1980,6 +1993,12 @@ fn default_semantic_edge_fanout() -> i32 {
 }
 fn default_semantic_edge_per_chunk_k() -> i32 {
     5
+}
+fn default_code_raptor_interval() -> u64 {
+    43200
+} // 12 hours
+fn default_ready_delay_code_raptor_secs() -> u64 {
+    2400
 }
 fn default_topic_scan_interval() -> u64 {
     43200

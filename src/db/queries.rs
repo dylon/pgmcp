@@ -8619,6 +8619,52 @@ pub async fn best_chunk_per_file(
     .await
 }
 
+/// A RAPTOR-over-code summary hit (graph-roadmap Phase 3.3): a cluster-level
+/// "module gist" with its cosine similarity to the query.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct CodeRaptorSummary {
+    pub project_name: String,
+    pub summary_text: String,
+    pub member_count: i32,
+    pub member_paths: Vec<String>,
+    pub top_topics: Vec<String>,
+    pub similarity: f64,
+}
+
+/// Query the RAPTOR-over-code summary tree: the level-1 cluster summaries whose
+/// centroid embeddings are nearest the query. `project=None` searches across
+/// all projects (the cross-project conceptual-query use case). Sequential
+/// cosine scan — the table is small (k≈3-24 rows per project), so no HNSW.
+pub async fn code_raptor_search(
+    pool: &PgPool,
+    embedding: &[f32],
+    project: Option<&str>,
+    k: i32,
+) -> Result<Vec<CodeRaptorSummary>, sqlx::Error> {
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "code_raptor_search: expected 1024-d (BGE-M3) embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+    sqlx::query_as::<_, CodeRaptorSummary>(
+        "SELECT p.name AS project_name, t.summary_text, t.member_count,
+                t.member_paths, t.top_topics,
+                (1.0 - (t.summary_embedding <=> $1))::float8 AS similarity
+         FROM code_summary_tree t
+         JOIN projects p ON p.id = t.project_id
+         WHERE ($2::text IS NULL OR p.name = $2)
+         ORDER BY t.summary_embedding <=> $1
+         LIMIT $3",
+    )
+    .bind(embedding_vec)
+    .bind(project)
+    .bind(k)
+    .fetch_all(pool)
+    .await
+}
+
 /// Update `function_metrics.fan_in` / `fan_out` for a batch of function IDs.
 /// Rows whose function_id has no row in `function_metrics` are silently
 /// ignored (their metrics row hasn't been computed yet; the next

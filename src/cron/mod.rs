@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 pub mod call_graph;
 #[allow(dead_code)]
+pub mod code_raptor;
+#[allow(dead_code)]
 pub mod cross_language_signatures;
 #[allow(dead_code)]
 pub mod embedding_migration;

@@ -501,6 +501,39 @@ pub async fn run_migrations(
     }
 
     // ================================================================
+    // RAPTOR-over-code summary tree (graph-roadmap Phase 3.3)
+    // ----------------------------------------------------------------
+    // Per project, the `code-raptor` cron clusters file-chunk embeddings
+    // (CUDA FCM) and emits one level-1 summary per cluster — a conceptual
+    // "module gist" that no single chunk contains. The cluster centroid in
+    // embedding space IS the summary's embedding (no re-embedding), and
+    // `code_raptor_search` does cosine ANN against it. Small per project
+    // (k≈3-24 rows), so no HNSW index is needed — a sequential `<=>` scan
+    // over the whole table is sub-millisecond.
+    // ================================================================
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS code_summary_tree (
+            id                BIGSERIAL PRIMARY KEY,
+            project_id        INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            level             INTEGER NOT NULL DEFAULT 1,
+            summary_text      TEXT NOT NULL,
+            summary_embedding vector(1024) NOT NULL,
+            member_count      INTEGER NOT NULL DEFAULT 0,
+            member_paths      TEXT[] NOT NULL DEFAULT '{}',
+            top_topics        TEXT[] NOT NULL DEFAULT '{}',
+            computed_at       TIMESTAMPTZ DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_code_summary_tree_project
+            ON code_summary_tree (project_id, level)",
+    )
+    .execute(pool)
+    .await?;
+
+    // ================================================================
     // File metrics table (precomputed per-file graph & quality metrics)
     // ================================================================
 
