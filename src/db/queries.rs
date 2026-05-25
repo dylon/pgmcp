@@ -7866,34 +7866,44 @@ pub async fn resolve_symbol_reference_targets(
     .execute(pool)
     .await?;
 
-    // Phase 3: bare_name_in_project. Match name within the project (legacy
-    // behavior, kept for parity). When multiple matches exist, the database
-    // picks one deterministically; downstream tools that need precision can
-    // filter on `resolution_confidence >= 0.95`.
-    //
-    // `src_f` exists only to enforce the source file's `project_id`, but
-    // its `JOIN ON src_f.id = sr.source_file_id` predicate references the
-    // UPDATE target alias `sr`, which Postgres rejects (`invalid reference
-    // to FROM-clause entry for table "sr"`). The cleanest fix is to lift
-    // the source-file project filter into an EXISTS subquery mirroring
-    // Phase 1's pattern — `src_f` is no longer in the FROM list at all.
+    // Phase 3: bare-name match within the project, now CONFIDENCE-GRADED by
+    // ambiguity (graph-roadmap Phase 4.1). The legacy single 0.5 tier matched
+    // ANY same-name symbol and picked one arbitrarily, fabricating edges that
+    // distort centrality/communities. We now split by candidate count:
+    //   - `bare_name_unique`    (exactly one project-wide candidate) — the
+    //                            match is almost certainly right → confidence 0.7.
+    //   - `bare_name_ambiguous` (multiple candidates) — the DB still picks one,
+    //                            but it's an unreliable guess → confidence 0.3,
+    //                            so downstream call-graph weighting and tool
+    //                            `min_confidence` filters can discount it.
+    // (Full receiver-type resolution — resolving `recv.method()` against the
+    // receiver's inferred type — is the per-language extractor follow-up; it
+    // needs a `receiver_type` the symbol extractors don't yet emit.)
     let phase3 = sqlx::query(
-        "UPDATE symbol_references sr
+        "WITH cand AS (
+             SELECT sr.id AS ref_id,
+                    (SELECT COUNT(*)
+                       FROM file_symbols fs2
+                       JOIN indexed_files tf2 ON tf2.id = fs2.file_id
+                      WHERE tf2.project_id = $1 AND fs2.name = sr.target_raw) AS n_cand
+             FROM symbol_references sr
+             JOIN indexed_files src_f ON src_f.id = sr.source_file_id
+             WHERE src_f.project_id = $1 AND sr.resolution_kind IS NULL
+         )
+         UPDATE symbol_references sr
          SET target_symbol_id = fs.id,
              target_file_id = fs.file_id,
              target_path = fs.scope_path,
-             resolution_kind = 'bare_name_in_project',
-             resolution_confidence = 0.5
+             resolution_kind = CASE WHEN cand.n_cand = 1
+                                    THEN 'bare_name_unique'
+                                    ELSE 'bare_name_ambiguous' END,
+             resolution_confidence = CASE WHEN cand.n_cand = 1 THEN 0.7 ELSE 0.3 END
          FROM file_symbols fs
          JOIN indexed_files tgt_f ON tgt_f.id = fs.file_id
+         JOIN cand ON cand.ref_id = sr.id
          WHERE tgt_f.project_id = $1
            AND sr.target_raw = fs.name
-           AND sr.resolution_kind IS NULL
-           AND EXISTS (
-               SELECT 1 FROM indexed_files src_f
-                WHERE src_f.id = sr.source_file_id
-                  AND src_f.project_id = $1
-           )",
+           AND sr.resolution_kind IS NULL",
     )
     .bind(project_id)
     .execute(pool)
@@ -8305,6 +8315,10 @@ pub struct RawCallEdgeRow {
     pub target_file_id: Option<i64>,
     pub target_symbol_id: Option<i64>,
     pub target_raw: String,
+    /// Resolution confidence of the underlying `symbol_reference` (Phase 4.1):
+    /// the call edge's weight, so probability-weighted graph algorithms discount
+    /// low-confidence (ambiguous bare-name) edges.
+    pub resolution_confidence: Option<f64>,
 }
 
 /// Read all call-kind symbol_references for a project.
@@ -8317,7 +8331,8 @@ pub async fn list_call_edges_for_project(
                 sr.source_symbol_id,
                 sr.target_file_id,
                 sr.target_symbol_id,
-                sr.target_raw
+                sr.target_raw,
+                sr.resolution_confidence
          FROM symbol_references sr
          JOIN indexed_files f ON sr.source_file_id = f.id
          WHERE f.project_id = $1

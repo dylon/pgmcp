@@ -146,7 +146,12 @@ async fn analyze_project(
                 source_symbol_id: src,
                 target_symbol_id: r.target_symbol_id,
                 target_raw: r.target_raw.clone(),
-                weight: 1.0,
+                // Phase 4.1: weight the edge by its resolution confidence (with a
+                // small floor so low-confidence edges still participate) — so
+                // PageRank / betweenness / Louvain over the call graph discount
+                // ambiguous bare-name guesses instead of treating every edge as
+                // certain.
+                weight: r.resolution_confidence.unwrap_or(0.5).max(0.05),
             })
         })
         .collect();
