@@ -18,7 +18,7 @@ use petgraph::Direction;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 
-use super::types::{EdgeWeight, FileNode};
+use super::types::EdgeCost;
 
 // ============================================================================
 // 2.1 K-core decomposition (Batagelj-Zaversnik 2003 O(m) algorithm)
@@ -32,7 +32,7 @@ pub struct KCoreResult {
 
 /// K-core decomposition over the *undirected* projection (sum of in+out
 /// neighbours, deduped).
-pub fn k_core_decomposition(graph: &DiGraph<FileNode, EdgeWeight>) -> KCoreResult {
+pub fn k_core_decomposition<N, E>(graph: &DiGraph<N, E>) -> KCoreResult {
     let n = graph.node_count();
     if n == 0 {
         return KCoreResult {
@@ -123,7 +123,7 @@ pub struct KTrussResult {
     pub max_truss: u32,
 }
 
-pub fn k_truss_decomposition(graph: &DiGraph<FileNode, EdgeWeight>) -> KTrussResult {
+pub fn k_truss_decomposition<N, E>(graph: &DiGraph<N, E>) -> KTrussResult {
     // Build undirected edge set + adjacency
     let mut adj: HashMap<NodeIndex, HashSet<NodeIndex>> = HashMap::new();
     for ni in graph.node_indices() {
@@ -220,8 +220,8 @@ pub struct PersonalizedPageRank {
 /// Power-iteration personalized PageRank. `seeds` must be L1-positive; the
 /// function L1-normalises internally. Nodes not in `seeds` get teleport
 /// mass = 0 (vs uniform 1/n in vanilla PageRank).
-pub fn personalized_pagerank(
-    graph: &DiGraph<FileNode, EdgeWeight>,
+pub fn personalized_pagerank<N, E>(
+    graph: &DiGraph<N, E>,
     seeds: &HashMap<NodeIndex, f64>,
     damping: f64,
     max_iter: usize,
@@ -310,7 +310,7 @@ pub fn personalized_pagerank(
 /// Edge-key with canonical (u,v) ordering: u.index() <= v.index().
 pub type EdgeKey = (NodeIndex, NodeIndex);
 
-pub fn edge_betweenness(graph: &DiGraph<FileNode, EdgeWeight>) -> HashMap<EdgeKey, f64> {
+pub fn edge_betweenness<N, E>(graph: &DiGraph<N, E>) -> HashMap<EdgeKey, f64> {
     let n = graph.node_count();
     let mut result: HashMap<EdgeKey, f64> = HashMap::new();
     if n == 0 {
@@ -386,8 +386,8 @@ pub fn edge_betweenness(graph: &DiGraph<FileNode, EdgeWeight>) -> HashMap<EdgeKe
 // 2.5 Eigenvector centrality (Bonacich 1987 — power iteration on adjacency)
 // ============================================================================
 
-pub fn eigenvector_centrality(
-    graph: &DiGraph<FileNode, EdgeWeight>,
+pub fn eigenvector_centrality<N, E: EdgeCost>(
+    graph: &DiGraph<N, E>,
     max_iter: usize,
     tolerance: f64,
 ) -> HashMap<NodeIndex, f64> {
@@ -405,7 +405,7 @@ pub fn eigenvector_centrality(
         adj.entry(*ni).or_default();
     }
     for e in graph.edge_references() {
-        let w = e.weight().weight.max(0.0);
+        let w = e.weight().cost().max(0.0);
         adj.entry(e.source()).or_default().push((e.target(), w));
         adj.entry(e.target()).or_default().push((e.source(), w));
     }
@@ -442,8 +442,8 @@ pub fn eigenvector_centrality(
 // 2.6 Katz centrality (Katz 1953)
 // ============================================================================
 
-pub fn katz_centrality(
-    graph: &DiGraph<FileNode, EdgeWeight>,
+pub fn katz_centrality<N, E: EdgeCost>(
+    graph: &DiGraph<N, E>,
     alpha: f64,
     beta: f64,
     max_iter: usize,
@@ -462,7 +462,7 @@ pub fn katz_centrality(
         adj.entry(*ni).or_default();
     }
     for e in graph.edge_references() {
-        let w = e.weight().weight.max(0.0);
+        let w = e.weight().cost().max(0.0);
         adj.entry(e.source()).or_default().push((e.target(), w));
         adj.entry(e.target()).or_default().push((e.source(), w));
     }
@@ -500,7 +500,7 @@ pub fn katz_centrality(
 // 2.7 Harmonic centrality (Marchiori-Latora 2000)
 // ============================================================================
 
-pub fn harmonic_centrality(graph: &DiGraph<FileNode, EdgeWeight>) -> HashMap<NodeIndex, f64> {
+pub fn harmonic_centrality<N, E>(graph: &DiGraph<N, E>) -> HashMap<NodeIndex, f64> {
     let n = graph.node_count();
     if n == 0 {
         return HashMap::new();
@@ -546,12 +546,140 @@ pub fn harmonic_centrality(graph: &DiGraph<FileNode, EdgeWeight>) -> HashMap<Nod
 }
 
 // ============================================================================
+// 2.7b Closeness centrality (Bavelas 1950 / Sabidussi 1966) with the
+// Wasserman-Faust (1994) disconnected-graph normalization.
+// ============================================================================
+
+/// Closeness centrality over the undirected projection. For each node v with
+/// `r` other reachable nodes and shortest-path sum `S`, returns the
+/// Wasserman-Faust value `(r / (n-1)) * (r / S)` — the standard `r/S` closeness
+/// scaled by the reachable fraction so nodes in small components don't score
+/// spuriously high. Nodes that reach nothing get 0.
+pub fn closeness_centrality<N, E>(graph: &DiGraph<N, E>) -> HashMap<NodeIndex, f64> {
+    let n = graph.node_count();
+    if n == 0 {
+        return HashMap::new();
+    }
+    let nodes: Vec<NodeIndex> = graph.node_indices().collect();
+    let mut adj: HashMap<NodeIndex, Vec<NodeIndex>> = HashMap::with_capacity(n);
+    for ni in &nodes {
+        adj.entry(*ni).or_default();
+    }
+    for e in graph.edge_references() {
+        adj.entry(e.source()).or_default().push(e.target());
+        adj.entry(e.target()).or_default().push(e.source());
+    }
+
+    let mut out: HashMap<NodeIndex, f64> = HashMap::with_capacity(n);
+    let denom = (n as f64 - 1.0).max(1.0);
+    for &source in &nodes {
+        let mut dist: HashMap<NodeIndex, i64> = HashMap::with_capacity(n);
+        for &v in &nodes {
+            dist.insert(v, -1);
+        }
+        dist.insert(source, 0);
+        let mut q: VecDeque<NodeIndex> = VecDeque::new();
+        q.push_back(source);
+        while let Some(v) = q.pop_front() {
+            for &w in adj.get(&v).map(|x| x.as_slice()).unwrap_or(&[]) {
+                if dist[&w] < 0 {
+                    dist.insert(w, dist[&v] + 1);
+                    q.push_back(w);
+                }
+            }
+        }
+        let mut reachable = 0.0_f64;
+        let mut sum_d = 0.0_f64;
+        for &v in &nodes {
+            if v != source && dist[&v] > 0 {
+                reachable += 1.0;
+                sum_d += dist[&v] as f64;
+            }
+        }
+        let c = if sum_d > 0.0 {
+            (reachable / denom) * (reachable / sum_d)
+        } else {
+            0.0
+        };
+        out.insert(source, c);
+    }
+    out
+}
+
+// ============================================================================
+// 2.7c Reverse PageRank / SinkRank (Berkhin 2005) — PageRank on the transpose.
+// ============================================================================
+
+/// PageRank computed on the *transposed* graph: a node's score flows to the
+/// nodes it points to (rather than from them). High reverse-PageRank marks
+/// foundational **sinks** that much of the system ultimately depends on — the
+/// dual of PageRank's "depends-on-everything" hubs. Same power-iteration as
+/// `pagerank`, with edge directions swapped.
+pub fn reverse_pagerank<N, E>(
+    graph: &DiGraph<N, E>,
+    damping: f64,
+    max_iter: usize,
+    tolerance: f64,
+) -> HashMap<NodeIndex, f64> {
+    let n = graph.node_count();
+    if n == 0 {
+        return HashMap::new();
+    }
+    let nodes: Vec<NodeIndex> = graph.node_indices().collect();
+    let mut scores: HashMap<NodeIndex, f64> =
+        nodes.iter().map(|&ni| (ni, 1.0 / n as f64)).collect();
+
+    for _ in 0..max_iter {
+        let mut new_scores: HashMap<NodeIndex, f64> = HashMap::with_capacity(n);
+        let base = (1.0 - damping) / n as f64;
+
+        // Dangling mass in the transpose = nodes with no incoming edges.
+        let mut dangling_sum = 0.0;
+        for &node in &nodes {
+            if graph
+                .neighbors_directed(node, Direction::Incoming)
+                .next()
+                .is_none()
+            {
+                dangling_sum += scores[&node];
+            }
+        }
+        let dangling_contrib = damping * dangling_sum / n as f64;
+
+        for &node in &nodes {
+            // In the transpose, score arrives from this node's OUTGOING
+            // neighbours, normalized by each neighbour's in-degree.
+            let mut incoming_sum = 0.0;
+            for neighbor in graph.neighbors_directed(node, Direction::Outgoing) {
+                let in_deg = graph
+                    .neighbors_directed(neighbor, Direction::Incoming)
+                    .count();
+                if in_deg > 0 {
+                    incoming_sum += scores[&neighbor] / in_deg as f64;
+                }
+            }
+            new_scores.insert(node, base + damping * incoming_sum + dangling_contrib);
+        }
+
+        let max_diff = nodes
+            .iter()
+            .map(|ni| (new_scores[ni] - scores[ni]).abs())
+            .fold(0.0_f64, f64::max);
+        scores = new_scores;
+        if max_diff < tolerance {
+            break;
+        }
+    }
+    scores
+}
+
+// ============================================================================
 // 2.8 Burt's structural-holes constraint (Burt 1992)
 // ============================================================================
 
 /// Per-node Burt constraint. Low values = bridges across structural holes,
 /// high values = redundantly-embedded.
-pub fn burt_constraint(graph: &DiGraph<FileNode, EdgeWeight>) -> HashMap<NodeIndex, f64> {
+pub fn burt_constraint<N, E: EdgeCost>(graph: &DiGraph<N, E>) -> HashMap<NodeIndex, f64> {
     let n = graph.node_count();
     if n == 0 {
         return HashMap::new();
@@ -562,7 +690,7 @@ pub fn burt_constraint(graph: &DiGraph<FileNode, EdgeWeight>) -> HashMap<NodeInd
         adj.entry(ni).or_default();
     }
     for e in graph.edge_references() {
-        let w = e.weight().weight.max(0.0);
+        let w = e.weight().cost().max(0.0);
         if e.source() == e.target() {
             continue;
         }
@@ -626,7 +754,7 @@ pub struct MotifCensus {
     pub graphlets_4: [u64; 2],
 }
 
-pub fn motif_census(graph: &DiGraph<FileNode, EdgeWeight>) -> MotifCensus {
+pub fn motif_census<N, E>(graph: &DiGraph<N, E>) -> MotifCensus {
     let n = graph.node_count();
     let mut out = MotifCensus::default();
     if n < 3 {
@@ -787,7 +915,7 @@ fn classify_four_edge(e: &[bool; 6]) -> usize {
 // across directed edges).
 // ============================================================================
 
-pub fn degree_assortativity(graph: &DiGraph<FileNode, EdgeWeight>) -> f64 {
+pub fn degree_assortativity<N, E>(graph: &DiGraph<N, E>) -> f64 {
     let m = graph.edge_count() as f64;
     if m == 0.0 {
         return 0.0;
@@ -843,8 +971,8 @@ pub struct AttackResult {
 /// Simulate sequential removal in `order`, recording largest connected component
 /// (undirected projection) after each removal. `order` is processed up to
 /// `max_steps` items.
-pub fn modularity_attack(
-    graph: &DiGraph<FileNode, EdgeWeight>,
+pub fn modularity_attack<N, E>(
+    graph: &DiGraph<N, E>,
     order: &[NodeIndex],
     max_steps: usize,
 ) -> AttackResult {
@@ -935,8 +1063,279 @@ fn largest_component_size(
     best
 }
 
+// ============================================================================
+// 2.12 Articulation points + bridges (Hopcroft-Tarjan 1973, single-DFS lowlink)
+// ============================================================================
+
+#[derive(Debug, Clone, Default)]
+pub struct CutResult {
+    /// Cut vertices: nodes whose removal increases the number of connected
+    /// components (true single points of failure on the undirected projection).
+    pub articulation_points: HashSet<NodeIndex>,
+    /// Cut edges (bridges), canonical `(lo, hi)` by node index: edges whose
+    /// removal disconnects the graph (irreplaceable dependencies).
+    pub bridges: Vec<(NodeIndex, NodeIndex)>,
+}
+
+/// Cut vertices and bridges over the undirected projection, via an **iterative**
+/// Hopcroft-Tarjan lowlink DFS (iterative to avoid stack overflow on deep
+/// dependency graphs). Parallel edges are deduped (simple-graph semantics).
+pub fn articulation_points_and_bridges<N, E>(graph: &DiGraph<N, E>) -> CutResult {
+    let mut adj: HashMap<NodeIndex, Vec<NodeIndex>> = HashMap::with_capacity(graph.node_count());
+    for ni in graph.node_indices() {
+        adj.entry(ni).or_default();
+    }
+    for e in graph.edge_references() {
+        let (a, b) = (e.source(), e.target());
+        if a == b {
+            continue;
+        }
+        adj.entry(a).or_default().push(b);
+        adj.entry(b).or_default().push(a);
+    }
+    for v in adj.values_mut() {
+        v.sort_by_key(|n| n.index());
+        v.dedup();
+    }
+
+    let mut disc: HashMap<NodeIndex, i64> = HashMap::with_capacity(graph.node_count());
+    let mut low: HashMap<NodeIndex, i64> = HashMap::with_capacity(graph.node_count());
+    let mut visited: HashSet<NodeIndex> = HashSet::with_capacity(graph.node_count());
+    let mut out = CutResult::default();
+    let mut timer: i64 = 0;
+
+    for start in graph.node_indices() {
+        if visited.contains(&start) {
+            continue;
+        }
+        // Frame: (node, parent, next-neighbour index).
+        let mut stack: Vec<(NodeIndex, Option<NodeIndex>, usize)> = vec![(start, None, 0)];
+        let mut root_children = 0usize;
+        while !stack.is_empty() {
+            let top = stack.len() - 1;
+            let (v, parent, idx) = stack[top];
+            if idx == 0 {
+                visited.insert(v);
+                timer += 1;
+                disc.insert(v, timer);
+                low.insert(v, timer);
+            }
+            let nbrs = &adj[&v];
+            if idx < nbrs.len() {
+                stack[top].2 += 1;
+                let w = nbrs[idx];
+                if Some(w) == parent {
+                    continue; // skip the single edge back to the DFS parent
+                }
+                if visited.contains(&w) {
+                    let dw = disc[&w];
+                    let e = low.get_mut(&v).expect("low initialized on first visit");
+                    *e = (*e).min(dw);
+                } else {
+                    if parent.is_none() {
+                        root_children += 1;
+                    }
+                    stack.push((w, Some(v), 0));
+                }
+            } else {
+                stack.pop();
+                if let Some(p) = parent {
+                    let lv = low[&v];
+                    {
+                        let e = low.get_mut(&p).expect("parent low initialized");
+                        *e = (*e).min(lv);
+                    }
+                    if lv > disc[&p] {
+                        out.bridges.push(canonical_pair(p, v));
+                    }
+                    // Non-root p is a cut vertex if a child can't escape above it.
+                    if p != start && lv >= disc[&p] {
+                        out.articulation_points.insert(p);
+                    }
+                }
+            }
+        }
+        // The DFS root is a cut vertex iff it has >1 DFS-tree child.
+        if root_children > 1 {
+            out.articulation_points.insert(start);
+        }
+    }
+    out.bridges.sort_by_key(|(a, b)| (a.index(), b.index()));
+    out
+}
+
+// ============================================================================
+// 2.13 HITS hubs & authorities (Kleinberg 1999)
+// ============================================================================
+
+#[derive(Debug, Clone, Default)]
+pub struct HitsResult {
+    /// Hub score: high = points to many good authorities (an orchestrator).
+    pub hubs: HashMap<NodeIndex, f64>,
+    /// Authority score: high = pointed to by many good hubs (a core utility).
+    pub authorities: HashMap<NodeIndex, f64>,
+}
+
+/// HITS via mutually-reinforcing power iteration on the directed graph.
+/// Separates orchestrators (hubs) from utilities (authorities) — a distinction
+/// PageRank conflates.
+pub fn hits<N, E>(graph: &DiGraph<N, E>, max_iter: usize, tolerance: f64) -> HitsResult {
+    let n = graph.node_count();
+    if n == 0 {
+        return HitsResult::default();
+    }
+    let nodes: Vec<NodeIndex> = graph.node_indices().collect();
+    let mut hub: HashMap<NodeIndex, f64> = nodes.iter().map(|&v| (v, 1.0)).collect();
+    let mut auth: HashMap<NodeIndex, f64> = nodes.iter().map(|&v| (v, 1.0)).collect();
+
+    for _ in 0..max_iter {
+        // authority[v] = Σ hub[u] over u → v
+        let mut new_auth: HashMap<NodeIndex, f64> = HashMap::with_capacity(n);
+        for &v in &nodes {
+            let s: f64 = graph
+                .neighbors_directed(v, Direction::Incoming)
+                .map(|u| hub[&u])
+                .sum();
+            new_auth.insert(v, s);
+        }
+        // hub[v] = Σ authority[w] over v → w  (using the freshly-updated auth)
+        let mut new_hub: HashMap<NodeIndex, f64> = HashMap::with_capacity(n);
+        for &v in &nodes {
+            let s: f64 = graph
+                .neighbors_directed(v, Direction::Outgoing)
+                .map(|w| new_auth[&w])
+                .sum();
+            new_hub.insert(v, s);
+        }
+        // L2-normalize each vector.
+        let an = new_auth.values().map(|x| x * x).sum::<f64>().sqrt();
+        if an > 0.0 {
+            for x in new_auth.values_mut() {
+                *x /= an;
+            }
+        }
+        let hn = new_hub.values().map(|x| x * x).sum::<f64>().sqrt();
+        if hn > 0.0 {
+            for x in new_hub.values_mut() {
+                *x /= hn;
+            }
+        }
+        let diff = nodes
+            .iter()
+            .map(|v| (new_auth[v] - auth[v]).abs().max((new_hub[v] - hub[v]).abs()))
+            .fold(0.0_f64, f64::max);
+        auth = new_auth;
+        hub = new_hub;
+        if diff < tolerance {
+            break;
+        }
+    }
+    HitsResult {
+        hubs: hub,
+        authorities: auth,
+    }
+}
+
+// ============================================================================
+// 2.14 Dominator tree (Cooper-Harvey-Kennedy 2001 iterative algorithm)
+// ============================================================================
+
+/// Immediate-dominator walk-up helper: ascend the two fingers by reverse-
+/// postorder number until they meet (the common dominator).
+fn dom_intersect(
+    mut a: NodeIndex,
+    mut b: NodeIndex,
+    idom: &HashMap<NodeIndex, NodeIndex>,
+    rpo_num: &HashMap<NodeIndex, usize>,
+) -> NodeIndex {
+    while a != b {
+        while rpo_num[&a] > rpo_num[&b] {
+            a = idom[&a];
+        }
+        while rpo_num[&b] > rpo_num[&a] {
+            b = idom[&b];
+        }
+    }
+    a
+}
+
+/// Immediate-dominator map from `root` over the nodes reachable from it
+/// (Cooper-Harvey-Kennedy). `idom[root] == root`; every other reachable node
+/// maps to its immediate dominator — the last node every path from `root` must
+/// pass through to reach it. Unreachable nodes are absent.
+pub fn dominator_tree<N, E>(
+    graph: &DiGraph<N, E>,
+    root: NodeIndex,
+) -> HashMap<NodeIndex, NodeIndex> {
+    // Iterative postorder DFS from root.
+    let mut postorder: Vec<NodeIndex> = Vec::new();
+    let mut visited: HashSet<NodeIndex> = HashSet::new();
+    visited.insert(root);
+    let mut stack: Vec<(NodeIndex, Vec<NodeIndex>, usize)> = vec![(
+        root,
+        graph
+            .neighbors_directed(root, Direction::Outgoing)
+            .collect(),
+        0,
+    )];
+    while !stack.is_empty() {
+        let top = stack.len() - 1;
+        let (v, ref succ, idx) = stack[top];
+        if idx < succ.len() {
+            let w = succ[idx];
+            stack[top].2 += 1;
+            if visited.insert(w) {
+                let wsucc: Vec<NodeIndex> =
+                    graph.neighbors_directed(w, Direction::Outgoing).collect();
+                stack.push((w, wsucc, 0));
+            }
+            let _ = v;
+        } else {
+            postorder.push(v);
+            stack.pop();
+        }
+    }
+
+    let rpo: Vec<NodeIndex> = postorder.iter().rev().copied().collect();
+    let mut rpo_num: HashMap<NodeIndex, usize> = HashMap::with_capacity(rpo.len());
+    for (i, &v) in rpo.iter().enumerate() {
+        rpo_num.insert(v, i);
+    }
+
+    let mut idom: HashMap<NodeIndex, NodeIndex> = HashMap::with_capacity(rpo.len());
+    idom.insert(root, root);
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &rpo {
+            if b == root {
+                continue;
+            }
+            let mut new_idom: Option<NodeIndex> = None;
+            for p in graph.neighbors_directed(b, Direction::Incoming) {
+                if !rpo_num.contains_key(&p) || !idom.contains_key(&p) {
+                    continue; // predecessor not yet processed / unreachable
+                }
+                new_idom = Some(match new_idom {
+                    None => p,
+                    Some(cur) => dom_intersect(p, cur, &idom, &rpo_num),
+                });
+            }
+            if let Some(ni) = new_idom
+                && idom.get(&b) != Some(&ni)
+            {
+                idom.insert(b, ni);
+                changed = true;
+            }
+        }
+    }
+    idom
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::types::{EdgeWeight, FileNode};
     use super::*;
     use petgraph::graph::DiGraph;
 
@@ -1069,5 +1468,32 @@ mod tests {
         let r = modularity_attack(&g, &nodes, 5);
         assert_eq!(r.trace.len(), 5);
         assert_eq!(r.trace.last().expect("last").largest_component, 0);
+    }
+
+    #[test]
+    fn closeness_centrality_middle_ge_endpoints() {
+        // On a path, the middle node is closer to all others than an endpoint.
+        let g = build_chain(5);
+        let c = closeness_centrality(&g);
+        let nodes: Vec<NodeIndex> = g.node_indices().collect();
+        assert!(
+            c[&nodes[2]] >= c[&nodes[0]],
+            "middle closeness {} should be ≥ endpoint {}",
+            c[&nodes[2]],
+            c[&nodes[0]]
+        );
+    }
+
+    #[test]
+    fn reverse_pagerank_covers_nodes_and_conserves_mass() {
+        let g = build_chain(5);
+        let rp = reverse_pagerank(&g, 0.85, 100, 1e-8);
+        assert_eq!(rp.len(), 5);
+        let total: f64 = rp.values().sum();
+        assert!(
+            (total - 1.0).abs() < 1e-4,
+            "reverse pagerank sum = {}",
+            total
+        );
     }
 }

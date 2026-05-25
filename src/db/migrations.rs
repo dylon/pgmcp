@@ -660,6 +660,33 @@ pub async fn run_migrations(
         sqlx::query(idx_sql).execute(pool).await?;
     }
 
+    // Graph-roadmap Phase 1.1 — function-level centralities. Materialized by
+    // the call-graph cron (src/cron/call_graph.rs) once it builds the in-memory
+    // CallGraph and runs the (now generic) PageRank / Brandes / Louvain / k-core
+    // / harmonic algorithms on it. Additive ADD COLUMN IF NOT EXISTS so existing
+    // installs migrate in place. These columns are OWNED by the call-graph cron;
+    // upsert_function_metrics_batch must never list them in its ON CONFLICT DO
+    // UPDATE clause, or a metrics pass would clobber them back to defaults.
+    // community_id = -1 means "no community computed yet".
+    let function_metrics_centrality_columns = [
+        "ALTER TABLE function_metrics ADD COLUMN IF NOT EXISTS pagerank DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+        "ALTER TABLE function_metrics ADD COLUMN IF NOT EXISTS betweenness DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+        "ALTER TABLE function_metrics ADD COLUMN IF NOT EXISTS community_id INTEGER NOT NULL DEFAULT -1",
+        "ALTER TABLE function_metrics ADD COLUMN IF NOT EXISTS coreness INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE function_metrics ADD COLUMN IF NOT EXISTS harmonic DOUBLE PRECISION NOT NULL DEFAULT 0.0",
+    ];
+    for col_sql in &function_metrics_centrality_columns {
+        sqlx::query(col_sql).execute(pool).await?;
+    }
+    let function_metrics_centrality_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_function_metrics_pagerank_desc ON function_metrics(project_id, pagerank DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_function_metrics_betweenness_desc ON function_metrics(project_id, betweenness DESC)",
+        "CREATE INDEX IF NOT EXISTS idx_function_metrics_coreness_desc ON function_metrics(project_id, coreness DESC)",
+    ];
+    for idx_sql in &function_metrics_centrality_indexes {
+        sqlx::query(idx_sql).execute(pool).await?;
+    }
+
     // ================================================================
     // SOTA Phase 1 — Symbol-resolved call graph (G2)
     //

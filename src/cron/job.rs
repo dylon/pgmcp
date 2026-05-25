@@ -63,7 +63,7 @@ impl CronJob for CallGraphJob {
         "call-graph"
     }
     async fn run(&self, db: &dyn DbClient, stats: &Arc<StatsTracker>) {
-        crate::cron::call_graph::run_call_graph(db, stats).await;
+        crate::cron::call_graph::run_call_graph(db, stats, None).await;
     }
 }
 

@@ -56,6 +56,26 @@ impl EdgeType {
     }
 }
 
+/// Abstraction over an edge payload's scalar weight, so the weight-reading
+/// graph algorithms (eigenvector / Katz centrality, Burt constraint, Louvain
+/// modularity) can run generically over **any** `DiGraph<N, E>` — the
+/// file-level `EdgeWeight` graph and the function-level `CallEdge` graph alike.
+///
+/// "Cost" here is the edge's scalar strength (higher = stronger coupling), not
+/// a distance. Topology-only algorithms (PageRank, Brandes betweenness, k-core,
+/// k-truss, motif census, …) ignore it and need no `EdgeCost` bound.
+pub trait EdgeCost {
+    /// Non-negative edge weight consumed by weighted algorithms.
+    fn cost(&self) -> f64;
+}
+
+impl EdgeCost for EdgeWeight {
+    #[inline]
+    fn cost(&self) -> f64 {
+        self.weight
+    }
+}
+
 impl Default for CodeGraph {
     fn default() -> Self {
         Self::new()

@@ -28,7 +28,7 @@ pub async fn tool_multi_resolution_pagerank(
     let bundle = load_import_graph(ctx, project_id).await?;
     let limit = params.limit.unwrap_or(50);
 
-    let louv = louvain_communities(&bundle.graph, 1.0);
+    let louv = louvain_communities(&bundle.graph.graph, 1.0);
     let global_pr = pagerank(&bundle.graph.graph, 0.85, 100, 1e-6);
 
     // Build per-community induced subgraphs and run PageRank within each.

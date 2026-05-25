@@ -45,7 +45,9 @@ pub async fn tool_trigger_cron(
             }))
         }
         "call-graph" => {
-            crate::cron::call_graph::run_call_graph(db.as_ref(), stats).await;
+            // Manual trigger: no general WorkPool in scope, so betweenness runs
+            // sequentially (gated by DENSE_CENTRALITY_MAX_NODES in the cron).
+            crate::cron::call_graph::run_call_graph(db.as_ref(), stats, None).await;
             json_result(&json!({
                 "job": params.job,
                 "status": "completed",

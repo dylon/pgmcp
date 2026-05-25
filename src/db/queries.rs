@@ -960,6 +960,108 @@ pub async fn semantic_search(
     Ok(results)
 }
 
+/// Chunk-level hybrid search: dense ANN + BM25 full-text, fused by Reciprocal
+/// Rank Fusion (Cormack et al. 2009) entirely in SQL, with optional language /
+/// project filters applied to both legs. Returns chunk-level `SearchResult`s
+/// ordered by RRF score (carried in `score`). Backs the `/api/search` hook,
+/// which then optionally cross-encoder-reranks the top results.
+///
+/// `candidates` bounds each leg's contribution (per-leg `LIMIT`); `limit` is
+/// the fused output size. Uses the same `SET LOCAL hnsw.ef_search` discipline
+/// as `semantic_search` so the ANN leg honours the configured recall budget.
+#[allow(clippy::too_many_arguments)]
+pub async fn hybrid_search_chunks(
+    pool: &PgPool,
+    query_text: &str,
+    embedding: &[f32],
+    limit: i32,
+    candidates: i32,
+    language: Option<&str>,
+    project: Option<&str>,
+    ef_search: i32,
+) -> Result<Vec<SearchResult>, sqlx::Error> {
+    let col = match embedding.len() {
+        384 => "embedding",
+        1024 => "embedding_v2",
+        other => {
+            return Err(sqlx::Error::Protocol(format!(
+                "hybrid_search_chunks: unsupported query-embedding dim {other} \
+                 (expected 384 for MiniLM or 1024 for BGE-M3)."
+            )));
+        }
+    };
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+
+    // Optional filters collapse into one query via `($n IS NULL OR …)`.
+    // RRF constant 60.0 mirrors `tool_hybrid_search::RRF_K`.
+    // $1=embedding, $2=query_text, $3=candidates, $4=language, $5=project, $6=limit
+    let sql = format!(
+        "WITH dense AS (
+            SELECT chunk_id, ROW_NUMBER() OVER (ORDER BY dist) AS rnk FROM (
+                SELECT c.id AS chunk_id, (c.{col} <=> $1) AS dist
+                FROM file_chunks c
+                JOIN indexed_files f ON f.id = c.file_id
+                JOIN projects p ON p.id = f.project_id
+                WHERE c.{col} IS NOT NULL
+                  AND ($4::text IS NULL OR f.language = $4)
+                  AND ($5::text IS NULL OR p.name = $5)
+                ORDER BY c.{col} <=> $1
+                LIMIT $3
+            ) dd
+        ),
+        lexical AS (
+            SELECT chunk_id, ROW_NUMBER() OVER (ORDER BY rank DESC) AS rnk FROM (
+                SELECT c.id AS chunk_id,
+                       ts_rank(to_tsvector('english', c.content), plainto_tsquery('english', $2)) AS rank
+                FROM file_chunks c
+                JOIN indexed_files f ON f.id = c.file_id
+                JOIN projects p ON p.id = f.project_id
+                WHERE to_tsvector('english', c.content) @@ plainto_tsquery('english', $2)
+                  AND ($4::text IS NULL OR f.language = $4)
+                  AND ($5::text IS NULL OR p.name = $5)
+                ORDER BY rank DESC
+                LIMIT $3
+            ) ll
+        ),
+        fused AS (
+            SELECT COALESCE(d.chunk_id, l.chunk_id) AS chunk_id,
+                   COALESCE(1.0 / (60.0 + d.rnk), 0.0)
+                 + COALESCE(1.0 / (60.0 + l.rnk), 0.0) AS rrf
+            FROM dense d
+            FULL OUTER JOIN lexical l ON d.chunk_id = l.chunk_id
+        )
+        SELECT f.path, f.relative_path, f.language,
+               c.content AS chunk_content, c.start_line, c.end_line,
+               fused.rrf AS score,
+               p.name AS project_name
+        FROM fused
+        JOIN file_chunks c ON c.id = fused.chunk_id
+        JOIN indexed_files f ON f.id = c.file_id
+        JOIN projects p ON p.id = f.project_id
+        ORDER BY fused.rrf DESC
+        LIMIT $6",
+        col = col
+    );
+
+    let results = sqlx::query_as::<_, SearchResult>(&sql)
+        .bind(&embedding_vec)
+        .bind(query_text)
+        .bind(candidates)
+        .bind(language)
+        .bind(project)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(results)
+}
+
 /// Full-text search using PostgreSQL tsvector/tsquery over per-chunk
 /// FTS. Returns one row per matching file with `content` set to the
 /// best-ranked chunk's body (not the whole file); this preserves the
@@ -8215,6 +8317,113 @@ pub async fn update_function_fan_io(
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
+}
+
+/// Bulk-update the call-graph-derived centrality columns on `function_metrics`,
+/// keyed by `function_id` (= `file_symbols.id` = the call graph's `symbol_id`).
+/// Owned by the call-graph cron; `upsert_function_metrics_batch` deliberately
+/// omits these columns from its ON CONFLICT clause so a metrics pass never
+/// resets them. Mirrors `update_function_fan_io`'s UNNEST shape.
+#[allow(clippy::type_complexity)]
+pub async fn update_function_centralities(
+    pool: &PgPool,
+    // (function_id, pagerank, betweenness, community_id, coreness, harmonic)
+    rows: &[(i64, f64, f64, i32, i32, f64)],
+) -> Result<u64, sqlx::Error> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+    let pr: Vec<f64> = rows.iter().map(|r| r.1).collect();
+    let btw: Vec<f64> = rows.iter().map(|r| r.2).collect();
+    let comm: Vec<i32> = rows.iter().map(|r| r.3).collect();
+    let core: Vec<i32> = rows.iter().map(|r| r.4).collect();
+    let harm: Vec<f64> = rows.iter().map(|r| r.5).collect();
+    let res = sqlx::query(
+        "UPDATE function_metrics
+         SET pagerank = u.pagerank,
+             betweenness = u.betweenness,
+             community_id = u.community_id,
+             coreness = u.coreness,
+             harmonic = u.harmonic
+         FROM UNNEST($1::int8[], $2::float8[], $3::float8[], $4::int4[], $5::int4[], $6::float8[])
+              AS u(function_id, pagerank, betweenness, community_id, coreness, harmonic)
+         WHERE function_metrics.function_id = u.function_id",
+    )
+    .bind(&ids)
+    .bind(&pr)
+    .bind(&btw)
+    .bind(&comm)
+    .bind(&core)
+    .bind(&harm)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Per-file aggregate of the rigorous per-function `function_metrics` (real AST
+/// cyclomatic / cognitive / Halstead / Maintainability-Index). Lets
+/// `design_metrics` and `complexity_hotspots` emit AST-grade values for parsed
+/// files instead of their regex/line-count heuristics. `sum_cyclomatic` is the
+/// true Chidamber-Kemerer WMC (Σ method complexity); `max_cyclomatic` is the
+/// file's worst single function.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct FileFunctionAggregate {
+    pub file_id: i64,
+    pub function_count: i64,
+    pub sum_cyclomatic: i64,
+    pub max_cyclomatic: i32,
+    pub sum_cognitive: i64,
+    pub sum_halstead_volume: f64,
+    pub avg_maintainability: f64,
+    pub min_maintainability: f64,
+}
+
+/// Aggregate `function_metrics` per file for a project. Files with no parsed
+/// functions simply don't appear (callers fall back to their heuristic).
+pub async fn get_file_function_metric_aggregates(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Vec<FileFunctionAggregate>, sqlx::Error> {
+    sqlx::query_as::<_, FileFunctionAggregate>(
+        "SELECT fm.file_id,
+                COUNT(*)                                      AS function_count,
+                COALESCE(SUM(fm.cyclomatic), 0)               AS sum_cyclomatic,
+                COALESCE(MAX(fm.cyclomatic), 0)               AS max_cyclomatic,
+                COALESCE(SUM(fm.cognitive), 0)                AS sum_cognitive,
+                COALESCE(SUM(fm.halstead_volume), 0.0)        AS sum_halstead_volume,
+                COALESCE(AVG(fm.maintainability_index), 100.0) AS avg_maintainability,
+                COALESCE(MIN(fm.maintainability_index), 100.0) AS min_maintainability
+         FROM function_metrics fm
+         WHERE fm.project_id = $1
+         GROUP BY fm.file_id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Per-file AST-complexity summary keyed by `relative_path` (for tools that
+/// work in path space, e.g. `complexity_hotspots`): `(relative_path,
+/// max_cyclomatic, min_maintainability, function_count)`. Files with no parsed
+/// functions are absent.
+pub async fn get_file_ast_complexity_by_path(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Vec<(String, i32, f64, i64)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, i32, f64, i64)>(
+        "SELECT f.relative_path,
+                COALESCE(MAX(fm.cyclomatic), 0)                AS max_cyclomatic,
+                COALESCE(MIN(fm.maintainability_index), 100.0) AS min_maintainability,
+                COUNT(*)                                       AS function_count
+         FROM function_metrics fm
+         JOIN indexed_files f ON f.id = fm.file_id
+         WHERE fm.project_id = $1
+         GROUP BY f.relative_path",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
 }
 
 /// Read the call-graph watermark for a project.

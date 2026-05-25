@@ -202,6 +202,14 @@ pub mod tool_feature_envy;
 pub mod tool_lcom4;
 pub mod tool_shotgun_surgery;
 
+// Graph-roadmap Phase 1.1 — function-level graph analytics (the file-graph
+// algorithm library, genericized to also run on the symbol call graph).
+pub mod tool_central_functions;
+pub mod tool_extended_centrality;
+pub mod tool_function_communities;
+pub mod tool_function_kcore;
+pub mod tool_recursive_clusters;
+
 // SOTA Phase 11 — evolution analytics
 pub mod tool_commit_changepoint;
 pub mod tool_commit_topic_drift;

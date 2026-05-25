@@ -5,7 +5,7 @@
 //! three validity indices: Xie-Beni, Fuzzy Silhouette, and Gap.
 
 use ndarray::{Array2, ArrayView2};
-use pgmcp::cron::k_selector::{Index, SweepConfig, sweep_k};
+use pgmcp::cron::k_selector::{Index, SweepConfig, sweep_k_seeded};
 
 /// Build N samples drawn from a 3-cluster mixture. Centres are at
 /// (0,0), (10,0), (5,10); each component contributes ~N/3 samples
@@ -50,7 +50,9 @@ fn run_sweep(data: ArrayView2<f32>, index: Index) -> usize {
         tolerance: 1e-3,
         gap_n_refs: 3,
     };
-    let (best_k, _entries) = sweep_k(data, &cfg);
+    // Seeded so K recovery is deterministic (FCM k-means++ init is otherwise
+    // system-RNG seeded, which made this regression test flaky).
+    let (best_k, _entries) = sweep_k_seeded(data, &cfg, 42);
     best_k
 }
 

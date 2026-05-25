@@ -137,6 +137,10 @@ pub struct SearchRequest {
 #[derive(Debug, Serialize)]
 pub struct SearchResponse {
     pub results: Vec<SearchResultItem>,
+    /// True when the cross-encoder rerank stage ran (gated by `[api]
+    /// rerank_hook`). Lets the hook / telemetry see whether reranking fired
+    /// vs. the RRF-only fallback.
+    pub rerank_used: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -169,44 +173,114 @@ pub async fn search(
             )
         })?;
 
-    let ef_search = state.config.load().vector.ef_search;
     // The /api/search endpoint is consumed by ~/.claude/hooks/pgmcp-rag.sh
-    // (UserPromptSubmit). Default dedupe=false preserves existing
-    // behavior — the hook can pass a query param later if it wants
-    // worktree-collapsed results.
-    let results = state
-        .db
-        .semantic_search(
-            &embedding,
-            limit,
-            req.language.as_deref(),
-            req.project.as_deref(),
-            ef_search,
-            false,
+    // (UserPromptSubmit). It always fuses dense + BM25 at chunk level via RRF
+    // (cheap, no extra model); the cross-encoder rerank stage is opt-in.
+    let (ef_search, rerank_candidates, rerank_enabled) = {
+        let cfg = state.config.load();
+        (
+            cfg.vector.ef_search,
+            cfg.api.rerank_candidates.max(limit),
+            cfg.api.rerank_hook && state.reranker.is_some(),
         )
-        .await
-        .map_err(|e| {
-            state
-                .stats
-                .rag_search_failures_total
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Search failed: {}", e),
-            )
-        })?;
+    };
 
-    let items: Vec<SearchResultItem> = results
-        .into_iter()
-        .map(|r| SearchResultItem {
-            file_path: r.path,
-            chunk: r.chunk_content,
-            similarity: r.score.unwrap_or(0.0),
-            language: r.language,
+    // When reranking, fetch a larger candidate pool to give the cross-encoder
+    // material; otherwise just the requested `limit`. Per-leg pool is 2× that.
+    let fetch_n = if rerank_enabled {
+        rerank_candidates
+    } else {
+        limit
+    };
+    let per_leg = (fetch_n * 2).clamp(20, 200);
+
+    let pool = state.db.pool().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "no database pool".to_string(),
+        )
+    })?;
+
+    let results = crate::db::queries::hybrid_search_chunks(
+        pool,
+        &req.query,
+        &embedding,
+        fetch_n,
+        per_leg,
+        req.language.as_deref(),
+        req.project.as_deref(),
+        ef_search,
+    )
+    .await
+    .map_err(|e| {
+        state
+            .stats
+            .rag_search_failures_total
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Search failed: {}", e),
+        )
+    })?;
+
+    // Optional cross-encoder rerank of the fused candidates. The candle forward
+    // is synchronous, so it runs on a blocking thread. Any failure falls back
+    // to the RRF order — the hook must never hard-fail on a rerank error.
+    let mut rerank_hits: Vec<crate::reranker::RerankHit> = Vec::new();
+    let mut rerank_used = false;
+    if rerank_enabled
+        && results.len() > 1
+        && let Some(reranker) = state.reranker.clone()
+    {
+        let query = req.query.clone();
+        let cands: Vec<String> = results.iter().map(|r| r.chunk_content.clone()).collect();
+        match tokio::task::spawn_blocking(move || {
+            let refs: Vec<&str> = cands.iter().map(|s| s.as_str()).collect();
+            reranker.rerank(&query, &refs)
         })
-        .collect();
+        .await
+        {
+            Ok(Ok(hits)) => {
+                rerank_hits = hits;
+                rerank_used = true;
+            }
+            Ok(Err(e)) => tracing::warn!(error = %e, "hook rerank failed; using RRF order"),
+            Err(e) => {
+                tracing::warn!(error = %e, "hook rerank task join failed; using RRF order")
+            }
+        }
+    }
 
-    Ok(Json(SearchResponse { results: items }))
+    let items: Vec<SearchResultItem> = if rerank_used {
+        rerank_hits
+            .iter()
+            .take(limit as usize)
+            .filter_map(|h| {
+                results.get(h.original_index).map(|r| SearchResultItem {
+                    file_path: r.path.clone(),
+                    chunk: r.chunk_content.clone(),
+                    similarity: h.score as f64,
+                    language: r.language.clone(),
+                })
+            })
+            .collect()
+    } else {
+        results
+            .into_iter()
+            .take(limit as usize)
+            .map(|r| SearchResultItem {
+                file_path: r.path,
+                chunk: r.chunk_content,
+                similarity: r.score.unwrap_or(0.0),
+                language: r.language,
+            })
+            .collect()
+    };
+
+    Ok(Json(SearchResponse {
+        results: items,
+        rerank_used,
+    }))
 }
 
 // ============================================================================

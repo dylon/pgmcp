@@ -12,7 +12,7 @@
 use ndarray::Array2;
 use tracing::info;
 
-use crate::cron::topic_clustering::{FcmResult, fuzzy_c_means};
+use crate::cron::topic_clustering::{FcmResult, fuzzy_c_means, fuzzy_c_means_seeded};
 
 /// One input to hierarchy clustering: a global topic with its centroid.
 #[derive(Debug, Clone)]
@@ -56,6 +56,28 @@ pub fn cluster_topic_hierarchy(
         max_iters,
         tolerance,
         |data, k, m, max_iters, tolerance| fuzzy_c_means(data, k, m, max_iters, tolerance, None),
+    )
+}
+
+/// Deterministic variant of [`cluster_topic_hierarchy`] that seeds FCM's
+/// k-means++ init for reproducible meta-grouping. Production uses the
+/// non-seeded version (system RNG); regression tests use this to avoid flaky
+/// meta-group counts from a bad random init.
+pub fn cluster_topic_hierarchy_seeded(
+    inputs: &[TopicCentroid],
+    m: f64,
+    max_iters: usize,
+    tolerance: f64,
+    seed: u64,
+) -> (Vec<MetaGroup>, FcmResult) {
+    cluster_topic_hierarchy_with_runner(
+        inputs,
+        m,
+        max_iters,
+        tolerance,
+        move |data, k, m, max_iters, tolerance| {
+            fuzzy_c_means_seeded(data, k, m, max_iters, tolerance, seed)
+        },
     )
 }
 

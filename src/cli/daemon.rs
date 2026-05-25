@@ -569,6 +569,33 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let extractor_debounce: crate::llm::extractor_worker::DebounceMap =
             std::sync::Arc::new(dashmap::DashMap::new());
 
+        // Optional resident reranker for the /api/search hook. Loaded only when
+        // [api] rerank_hook is set (the BGE-reranker model is VRAM-exclusive
+        // with the Qwen3 extractor). A load failure degrades to RRF-only — the
+        // hook still works — so we warn rather than abort.
+        let api_reranker: Option<Arc<dyn crate::reranker::Reranker>> =
+            if config.load().api.rerank_hook {
+                match crate::reranker::make_reranker(crate::reranker::RerankerChoice::BgeV2M3) {
+                    Ok(Some(r)) => {
+                        tracing::info!(
+                            reranker = r.name(),
+                            "/api/search hook: cross-encoder reranker loaded"
+                        );
+                        Some(Arc::from(r))
+                    }
+                    Ok(None) => None,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "/api/search hook: reranker load failed; falling back to RRF-only"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
         // REST API state (shares query_embedder, db, and stats with MCP server)
         let api_state = api::ApiState {
             db: Arc::clone(&cron_db),
@@ -579,6 +606,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             llm_extractor: api_llm_extractor,
             extractor_debounce,
             system_ctx: system_ctx.clone(),
+            reranker: api_reranker,
         };
 
         let router = axum::Router::new()

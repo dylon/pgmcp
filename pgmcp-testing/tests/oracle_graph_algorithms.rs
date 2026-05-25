@@ -445,7 +445,7 @@ fn louvain_zachary_karate_club_reaches_good_modularity() {
         add_import(&mut g, node_by_id[&a], node_by_id[&b]);
     }
     let cg = into_code_graph(g);
-    let result = louvain_communities(&cg, 1.0);
+    let result = louvain_communities(&cg.graph, 1.0);
 
     assert!(
         result.num_communities > 1,
@@ -494,7 +494,7 @@ fn louvain_two_disjoint_4cliques_modularity_is_half() {
         add_import(&mut g, *s, *t);
     }
     let cg = into_code_graph(g);
-    let result = louvain_communities(&cg, 1.0);
+    let result = louvain_communities(&cg.graph, 1.0);
     assert_eq!(result.num_communities, 2, "expected 2 communities");
     assert!(
         (result.modularity - 0.5).abs() < 1e-5,
@@ -522,7 +522,7 @@ fn louvain_single_triangle_modularity_is_zero() {
     add_import(&mut g, b, c);
     add_import(&mut g, a, c);
     let cg = into_code_graph(g);
-    let result = louvain_communities(&cg, 1.0);
+    let result = louvain_communities(&cg.graph, 1.0);
     // Either Q=0 with the trivial all-in-one partition or a tiny
     // negative residual from the greedy local-move heuristic. Any
     // |Q| < 1e-5 is accepted as "the algorithm correctly recognises

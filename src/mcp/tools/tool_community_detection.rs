@@ -149,7 +149,7 @@ pub async fn tool_community_detection(
         )]));
     }
 
-    let louvain = louvain_communities(&code_graph, resolution);
+    let louvain = louvain_communities(&code_graph.graph, resolution);
 
     // Build community -> files map
     let mut community_files: std::collections::HashMap<usize, Vec<String>> =

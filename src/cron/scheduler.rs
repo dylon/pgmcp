@@ -1180,6 +1180,9 @@ pub fn schedule_maintenance_jobs(
     let ready_cg: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
     let cg_ready_delay = Duration::from_secs(config.ready_delay_call_graph_secs);
     let cron_pool_cg = Arc::clone(&cron_pool);
+    // Same WorkPool the file-graph cron uses for parallel Brandes betweenness;
+    // the call-graph cron now runs betweenness over the function call graph too.
+    let cg_general_pool = general_pool.clone();
     handle.schedule_recurring(
         staggered_initial_delay_ms("call-graph", call_graph_interval * 1000),
         call_graph_interval * 1000,
@@ -1194,6 +1197,7 @@ pub fn schedule_maintenance_jobs(
             let stats_for_cg = Arc::clone(&stats_for_cg);
             let db = db_clone_cg.clone();
             let rt = rt_clone_cg.clone();
+            let wp = cg_general_pool.clone();
             cron_pool_cg.submit(
                 move || {
                     let _guard = heavy_gate_or_skip!(
@@ -1209,7 +1213,7 @@ pub fn schedule_maintenance_jobs(
                     let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
                     let t0 = Instant::now();
                     rt.block_on(async {
-                        crate::cron::call_graph::run_call_graph(db.as_ref(), &stats).await;
+                        crate::cron::call_graph::run_call_graph(db.as_ref(), &stats, wp).await;
                     });
                     let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
                     tracing::info!(

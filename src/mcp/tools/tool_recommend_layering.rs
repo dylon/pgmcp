@@ -79,7 +79,7 @@ pub async fn tool_recommend_layering(
         )]));
     }
 
-    let louvain = louvain_communities(&bundle.graph, 1.0);
+    let louvain = louvain_communities(&bundle.graph.graph, 1.0);
     if louvain.num_communities < num_layers {
         // Not enough communities to bucket distinctly — collapse to actual count
         // and flag as a low-confidence run.

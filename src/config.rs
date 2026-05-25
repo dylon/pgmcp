@@ -42,6 +42,9 @@ pub struct Config {
     /// `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`.
     #[serde(default)]
     pub fuzzy: FuzzyConfig,
+    /// `[api]` — REST API / RAG-hook tuning (optional cross-encoder rerank).
+    #[serde(default)]
+    pub api: ApiConfig,
 }
 
 /// Disk-backed PersistentARTrieChar fuzzy-index configuration.
@@ -148,6 +151,40 @@ fn default_fuzzy_data_dir() -> std::path::PathBuf {
 
 fn default_fuzzy_max_disk_bytes() -> u64 {
     5 * 1024 * 1024 * 1024
+}
+
+/// `[api]` — REST API / RAG-hook tuning. `/api/search` (consumed by the
+/// UserPromptSubmit hook) always fuses dense + BM25 via RRF; these knobs gate
+/// the optional cross-encoder rerank stage, which loads the BGE-reranker model
+/// resident in the API state. That model is mutually exclusive in VRAM with the
+/// Qwen3 extractor (Phase-11 hardware budget), so reranking is off by default
+/// and toggling it requires a daemon restart to (un)load the model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApiConfig {
+    /// Cross-encoder rerank the hybrid `/api/search` results (loads
+    /// BGE-reranker-v2-m3). Default false.
+    #[serde(default = "default_rerank_hook")]
+    pub rerank_hook: bool,
+    /// Number of fused candidates to rerank when `rerank_hook` is on; the
+    /// response still returns only the request's `limit`. Default 30.
+    #[serde(default = "default_rerank_candidates")]
+    pub rerank_candidates: i32,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            rerank_hook: default_rerank_hook(),
+            rerank_candidates: default_rerank_candidates(),
+        }
+    }
+}
+
+fn default_rerank_hook() -> bool {
+    false
+}
+fn default_rerank_candidates() -> i32 {
+    30
 }
 
 /// Memory-server configuration. Holds Phase 4+ knobs grouped under

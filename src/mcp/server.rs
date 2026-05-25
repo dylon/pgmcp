@@ -1906,6 +1906,67 @@ pub struct PanicPathsParams {
     pub limit: Option<i32>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CentralFunctionsParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Ranking metric: \"pagerank\" (default), \"betweenness\", \"harmonic\", or \"coreness\""
+    )]
+    pub metric: Option<String>,
+    #[schemars(description = "Max functions to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FunctionCommunitiesParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Minimum community size to report (default: 2)")]
+    pub min_size: Option<i32>,
+    #[schemars(description = "Max communities to return, largest first (default: 30)")]
+    pub limit: Option<i32>,
+    #[schemars(description = "Max member functions listed per community (default: 15)")]
+    pub members_per_community: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FunctionKcoreParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Minimum coreness to report (default: 2)")]
+    pub min_coreness: Option<i32>,
+    #[schemars(description = "Max functions to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecursiveClustersParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max simple-cycle length to enumerate per cluster (default: 8)")]
+    pub max_cycle_len: Option<i32>,
+    #[schemars(description = "Max recursion clusters to return, largest first (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExtendedCentralityParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Metric: \"eigenvector\" (default), \"katz\", \"harmonic\", \"closeness\", or \"reverse_pagerank\""
+    )]
+    pub metric: Option<String>,
+    #[schemars(
+        description = "Graph scope: \"file\" (import graph, default) or \"function\" (call graph)"
+    )]
+    pub scope: Option<String>,
+    #[schemars(description = "Max nodes to return (default: 50)")]
+    pub limit: Option<i32>,
+    #[schemars(
+        description = "Katz attenuation factor alpha (default: 0.1); only used for metric=katz"
+    )]
+    pub alpha: Option<f64>,
+    #[schemars(description = "Katz base constant beta (default: 1.0); only used for metric=katz")]
+    pub beta: Option<f64>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeadlockCandidatesParams {
     #[schemars(description = "Project name (required)")]
     pub project: String,
@@ -6303,6 +6364,105 @@ USE WHEN: hunting Rust library footguns that crash on unexpected input."
         .await
     }
     #[tool(
+        description = "Function-level centrality (PageRank / betweenness / harmonic / coreness) over the \
+symbol-resolved call graph, read from `function_metrics`. \
+USE WHEN: finding the load-bearing functions to read or refactor first — sharper than file-level `centrality_analysis`."
+    )]
+    async fn central_functions(
+        &self,
+        Parameters(params): Parameters<CentralFunctionsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "central_functions",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_central_functions::tool_central_functions(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Louvain communities over the call graph — cross-file functional clusters. \
+USE WHEN: recovering the real modular structure and spotting concerns smeared across many files vs. the directory layout."
+    )]
+    async fn function_communities(
+        &self,
+        Parameters(params): Parameters<FunctionCommunitiesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "function_communities",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_function_communities::tool_function_communities(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "k-core decomposition over the call graph — functions in the densely interconnected \
+execution core. USE WHEN: locating the tangled architectural nucleus that resists being split out."
+    )]
+    async fn function_kcore(
+        &self,
+        Parameters(params): Parameters<FunctionKcoreParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "function_kcore",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_function_kcore::tool_function_kcore(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Mutual- and direct-recursion in the call graph (strongly-connected components of size ≥ 2 \
+plus the concrete call cycles inside them). USE WHEN: finding unintended call cycles that block layering, \
+complicate testing, and risk unbounded recursion."
+    )]
+    async fn recursive_clusters(
+        &self,
+        Parameters(params): Parameters<RecursiveClustersParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "recursive_clusters",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_recursive_clusters::tool_recursive_clusters(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Extended centrality (eigenvector / Katz / harmonic / closeness / reverse-PageRank) over \
+the file import graph or the function call graph. USE WHEN: `centrality_analysis` (PageRank / betweenness / degree) \
+isn't the right lens — influence among important neighbours (eigenvector/Katz), reach (harmonic/closeness), or \
+foundational sinks everything depends on (reverse-PageRank)."
+    )]
+    async fn extended_centrality(
+        &self,
+        Parameters(params): Parameters<ExtendedCentralityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "extended_centrality",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_extended_centrality::tool_extended_centrality(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
         description = "Lock-order cycles (Havender 1968) by scanning function bodies for lock(A);lock(B) sequences and computing SCCs."
     )]
     async fn deadlock_candidates(
@@ -7938,6 +8098,12 @@ impl McpServer {
                 "community_detection"    => community_detection(CommunityDetectionParams),
                 "circular_dependencies"  => circular_dependencies(CircularDependenciesParams),
                 "change_impact_analysis" => change_impact_analysis(ChangeImpactAnalysisParams),
+                // Graph-roadmap Phase 1.1 — function-level call-graph analytics
+                "central_functions"      => central_functions(CentralFunctionsParams),
+                "function_communities"   => function_communities(FunctionCommunitiesParams),
+                "function_kcore"         => function_kcore(FunctionKcoreParams),
+                "recursive_clusters"     => recursive_clusters(RecursiveClustersParams),
+                "extended_centrality"    => extended_centrality(ExtendedCentralityParams),
                 // Architecture
                 "coupling_cohesion_report"  => coupling_cohesion_report(CouplingCohesionReportParams),
                 "architecture_violations"   => architecture_violations(ArchitectureViolationsParams),

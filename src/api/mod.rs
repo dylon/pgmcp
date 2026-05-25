@@ -11,6 +11,7 @@ use crate::db::DbClient;
 use crate::embed::pool::QueryEmbedder;
 use crate::llm::LlmExtractor;
 use crate::llm::extractor_worker::DebounceMap;
+use crate::reranker::Reranker;
 use crate::stats::tracker::StatsTracker;
 
 /// Shared state for REST API handlers.
@@ -37,4 +38,9 @@ pub struct ApiState {
     /// SystemContext used by the A2A dispatcher to invoke MCP tools.
     /// Cheaply cloned (Arc-clone-per-field).
     pub system_ctx: SystemContext,
+    /// Optional resident cross-encoder reranker for the `/api/search` hook.
+    /// `Some` only when `[api] rerank_hook = true` (the BGE-reranker model is
+    /// VRAM-exclusive with the Qwen3 extractor, so it's opt-in). The RRF
+    /// dense+BM25 fusion runs regardless; this just adds a rerank stage.
+    pub reranker: Option<Arc<dyn Reranker>>,
 }

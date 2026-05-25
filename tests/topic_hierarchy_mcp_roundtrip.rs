@@ -6,7 +6,9 @@
 //! clamp range `[4, 50]` (per `estimate_k_meta(k_global) = clamp(sqrt(K), 4, 50)`)
 //! and that every input topic gets assigned to exactly one meta-group.
 
-use pgmcp::cron::topic_hierarchy::{TopicCentroid, cluster_topic_hierarchy, estimate_k_meta};
+use pgmcp::cron::topic_hierarchy::{
+    TopicCentroid, cluster_topic_hierarchy, cluster_topic_hierarchy_seeded, estimate_k_meta,
+};
 
 /// Build 100 synthetic centroids in 5 well-separated meta-clusters.
 /// Each meta-cluster has 20 topics; within a meta-cluster the topics
@@ -68,7 +70,9 @@ fn cluster_topic_hierarchy_returns_meta_groups_in_clamp_range() {
         "estimate_k_meta(100) must be in [4, 50], got {k_meta_expected}"
     );
 
-    let (meta_groups, fcm_result) = cluster_topic_hierarchy(&inputs, 2.0, 30, 1e-3);
+    // Seeded so the meta-group count is deterministic (FCM k-means++ init is
+    // otherwise system-RNG seeded, which made this regression test flaky).
+    let (meta_groups, fcm_result) = cluster_topic_hierarchy_seeded(&inputs, 2.0, 30, 1e-3, 42);
 
     // The number of non-empty meta-groups must be in the clamp range.
     assert!(

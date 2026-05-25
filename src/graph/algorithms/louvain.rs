@@ -3,10 +3,10 @@
 
 use std::collections::HashMap;
 
-use petgraph::graph::NodeIndex;
+use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
 
-use crate::graph::types::CodeGraph;
+use crate::graph::types::EdgeCost;
 
 /// Result of Louvain community detection.
 pub struct LouvainResult {
@@ -20,8 +20,14 @@ pub struct LouvainResult {
 
 /// Louvain community detection on an undirected view of the graph.
 /// `resolution`: modularity resolution parameter (1.0 = standard).
-pub fn louvain_communities(code_graph: &CodeGraph, resolution: f64) -> LouvainResult {
-    let graph = &code_graph.graph;
+///
+/// Generic over the node payload `N` and any edge payload `E: EdgeCost`, so it
+/// runs on both the file-level import graph (`EdgeWeight`) and the
+/// function-level call graph (`CallEdge`).
+pub fn louvain_communities<N, E: EdgeCost>(
+    graph: &DiGraph<N, E>,
+    resolution: f64,
+) -> LouvainResult {
     let nodes: Vec<NodeIndex> = graph.node_indices().collect();
     let n = nodes.len();
 
@@ -40,7 +46,7 @@ pub fn louvain_communities(code_graph: &CodeGraph, resolution: f64) -> LouvainRe
 
     for edge in graph.edge_references() {
         let (a, b) = (edge.source(), edge.target());
-        let w = edge.weight().weight;
+        let w = edge.weight().cost();
         *adj.entry(a).or_default().entry(b).or_insert(0.0) += w;
         *adj.entry(b).or_default().entry(a).or_insert(0.0) += w;
         total_weight += w;

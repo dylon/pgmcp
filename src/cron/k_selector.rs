@@ -20,7 +20,7 @@
 use ndarray::{Array2, ArrayView2};
 use tracing::info;
 
-use crate::cron::topic_clustering::{FcmResult, fuzzy_c_means};
+use crate::cron::topic_clustering::{FcmResult, fuzzy_c_means, fuzzy_c_means_seeded};
 
 /// Validity index selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,6 +208,20 @@ pub struct SweepEntry {
 pub fn sweep_k(data: ArrayView2<f32>, cfg: &SweepConfig) -> (usize, Vec<SweepEntry>) {
     sweep_k_with_runner(data, cfg, |data, k, m, max_iters, tolerance| {
         fuzzy_c_means(data, k, m, max_iters, tolerance, None)
+    })
+}
+
+/// Deterministic variant of [`sweep_k`] that seeds FCM's k-means++ init so the
+/// selected K is reproducible. Production uses the non-seeded `sweep_k`
+/// (system RNG); regression tests and any reproducibility-sensitive caller use
+/// this to avoid flaky K recovery on synthetic data.
+pub fn sweep_k_seeded(
+    data: ArrayView2<f32>,
+    cfg: &SweepConfig,
+    seed: u64,
+) -> (usize, Vec<SweepEntry>) {
+    sweep_k_with_runner(data, cfg, move |data, k, m, max_iters, tolerance| {
+        fuzzy_c_means_seeded(data, k, m, max_iters, tolerance, seed)
     })
 }
 

@@ -14,8 +14,6 @@ use petgraph::Direction;
 use petgraph::algo::tarjan_scc;
 use petgraph::graph::{DiGraph, NodeIndex};
 
-use super::types::{EdgeWeight, FileNode};
-
 /// PageRank scores per node.
 pub struct PageRankResult {
     pub scores: HashMap<NodeIndex, f64>,
@@ -25,8 +23,8 @@ pub struct PageRankResult {
 /// - `damping`: damping factor (default 0.85)
 /// - `max_iter`: maximum iterations (default 100)
 /// - `tolerance`: convergence threshold (default 1e-8)
-pub fn pagerank(
-    graph: &DiGraph<FileNode, EdgeWeight>,
+pub fn pagerank<N, E>(
+    graph: &DiGraph<N, E>,
     damping: f64,
     max_iter: usize,
     tolerance: f64,
@@ -89,7 +87,7 @@ pub fn pagerank(
 ///
 /// Backward-compatible wrapper: runs the sequential single-threaded path.
 /// For parallel evaluation, see `betweenness_centrality_parallel`.
-pub fn betweenness_centrality(graph: &DiGraph<FileNode, EdgeWeight>) -> HashMap<NodeIndex, f64> {
+pub fn betweenness_centrality<N, E>(graph: &DiGraph<N, E>) -> HashMap<NodeIndex, f64> {
     let nodes: Vec<NodeIndex> = graph.node_indices().collect();
     let n = nodes.len();
     let mut centrality_vec = vec![0.0_f64; max_node_idx(&nodes) + 1];
@@ -114,16 +112,16 @@ pub fn betweenness_centrality(graph: &DiGraph<FileNode, EdgeWeight>) -> HashMap<
 ///
 /// Partitions the source-node set into chunks and evaluates each chunk on a
 /// WorkPool worker; partial contributions (`Vec<f64>` indexed by node.index())
-/// are summed into the final centrality. Graph is immutable-borrowed and
-/// petgraph::DiGraph is Send + Sync for our FileNode + EdgeWeight types, so
-/// concurrent reads are safe.
+/// are summed into the final centrality. An owned `CompactGraph` snapshot is
+/// shared across workers via `Arc`, so no `Send`/`Sync` bound on `N`/`E` is
+/// required — the workers never touch the node/edge payloads.
 ///
 /// `should_cancel` is checked per chunk — a cancelled run leaves centrality
 /// partially summed (still returned, just not converged on all sources).
 ///
 /// Expected speed-up on n=7513 nodes with 32 threads: ~25×.
-pub fn betweenness_centrality_parallel(
-    graph: &DiGraph<FileNode, EdgeWeight>,
+pub fn betweenness_centrality_parallel<N, E>(
+    graph: &DiGraph<N, E>,
     work_pool: &Arc<crate::work_pool::pool::WorkPool>,
     should_cancel: Option<&(dyn Fn() -> bool + Sync)>,
 ) -> HashMap<NodeIndex, f64> {
@@ -143,11 +141,9 @@ pub fn betweenness_centrality_parallel(
     // Channel for partial centrality vectors from worker chunks.
     let (tx, rx) = crossbeam_channel::unbounded::<Vec<f64>>();
 
-    // Wrap the graph reference in an Arc-shareable form. petgraph::DiGraph is
-    // `Send + Sync` when the node/edge types are (FileNode is simple; EdgeWeight
-    // is simple). We use a scoped thread alternative: since closures captured
-    // by WorkPool::submit must be 'static, we build an owned adjacency
-    // representation the workers can hold.
+    // Closures captured by WorkPool::submit must be 'static, so we cannot hold
+    // a borrow of `graph`. Instead we build an owned `CompactGraph` (plain
+    // NodeIndex offsets, no `N`/`E` payloads) that workers share via `Arc`.
     let adj: Arc<CompactGraph> = Arc::new(CompactGraph::from_graph(graph));
 
     let num_chunks = nodes.len().div_ceil(chunk_size);
@@ -214,8 +210,8 @@ pub fn betweenness_centrality_parallel(
 /// Moved out of `betweenness_centrality` so both the sequential and parallel
 /// paths call identical code per-source. `should_cancel` is checked per source
 /// to allow fine-grained cancellation during long runs.
-fn accumulate_brandes_for_sources(
-    graph: &DiGraph<FileNode, EdgeWeight>,
+fn accumulate_brandes_for_sources<N, E>(
+    graph: &DiGraph<N, E>,
     all_nodes: &[NodeIndex],
     sources: &[NodeIndex],
     centrality_vec: &mut [f64],
@@ -311,7 +307,7 @@ struct CompactGraph {
 }
 
 impl CompactGraph {
-    fn from_graph(graph: &DiGraph<FileNode, EdgeWeight>) -> Self {
+    fn from_graph<N, E>(graph: &DiGraph<N, E>) -> Self {
         let nodes: Vec<NodeIndex> = graph.node_indices().collect();
         let n_vec = nodes.iter().map(|n| n.index()).max().unwrap_or(0) + 1;
 
@@ -425,14 +421,14 @@ fn centrality_map_from_vec(nodes: &[NodeIndex], vec: &[f64]) -> HashMap<NodeInde
 }
 
 /// Find strongly connected components with more than one node (dependency cycles).
-pub fn find_cycles(graph: &DiGraph<FileNode, EdgeWeight>) -> Vec<Vec<NodeIndex>> {
+pub fn find_cycles<N, E>(graph: &DiGraph<N, E>) -> Vec<Vec<NodeIndex>> {
     let sccs = tarjan_scc(graph);
     sccs.into_iter().filter(|scc| scc.len() > 1).collect()
 }
 
 /// Extract simple cycles from an SCC up to a maximum length using DFS backtracking.
-pub fn extract_simple_cycles(
-    graph: &DiGraph<FileNode, EdgeWeight>,
+pub fn extract_simple_cycles<N, E>(
+    graph: &DiGraph<N, E>,
     scc: &[NodeIndex],
     max_length: usize,
 ) -> Vec<Vec<NodeIndex>> {
@@ -491,9 +487,7 @@ pub fn extract_simple_cycles(
 }
 
 /// Compute in-degree and out-degree for each node.
-pub fn compute_degrees(
-    graph: &DiGraph<FileNode, EdgeWeight>,
-) -> HashMap<NodeIndex, (usize, usize)> {
+pub fn compute_degrees<N, E>(graph: &DiGraph<N, E>) -> HashMap<NodeIndex, (usize, usize)> {
     let mut degrees: HashMap<NodeIndex, (usize, usize)> = HashMap::new();
     for node in graph.node_indices() {
         let in_deg = graph.neighbors_directed(node, Direction::Incoming).count();
@@ -767,7 +761,7 @@ mod tests {
                 file_id_to_node: HashMap::new(),
                 node_to_file_id: HashMap::new(),
             };
-            let result = louvain_communities(&code_graph, 1.0);
+            let result = louvain_communities(&code_graph.graph, 1.0);
             // Every node must appear exactly once in the communities map.
             prop_assert_eq!(result.communities.len(), code_graph.graph.node_count());
             // Modularity is a valid real number.
@@ -840,7 +834,7 @@ mod tests {
                 file_id_to_node: HashMap::new(),
                 node_to_file_id: HashMap::new(),
             };
-            let result = louvain_communities(&code_graph, 1.0);
+            let result = louvain_communities(&code_graph.graph, 1.0);
             prop_assert!(
                 result.modularity > 0.0,
                 "block-diagonal graph should yield Q>0, got {}",
@@ -858,7 +852,7 @@ mod tests {
                 file_id_to_node: HashMap::new(),
                 node_to_file_id: HashMap::new(),
             };
-            let result = louvain_communities(&code_graph, 1.0);
+            let result = louvain_communities(&code_graph.graph, 1.0);
             let distinct: std::collections::HashSet<usize> =
                 result.communities.values().copied().collect();
             prop_assert_eq!(distinct.len(), result.num_communities);

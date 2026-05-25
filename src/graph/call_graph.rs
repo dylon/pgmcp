@@ -14,8 +14,12 @@
 // panic-path BFS, feature-envy) land in later phases.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use petgraph::graph::{DiGraph, NodeIndex};
+
+use crate::graph::types::EdgeCost;
+use crate::work_pool::pool::WorkPool;
 
 /// One function node in the call graph.
 #[derive(Debug, Clone)]
@@ -37,6 +41,16 @@ pub struct CallEdge {
     /// `true` when `target_symbol_id` was Some at construction time. Unresolved
     /// edges (external crates, dynamic dispatch) keep this `false`.
     pub resolved: bool,
+}
+
+/// Lets the weighted graph algorithms (Louvain modularity, eigenvector/Katz
+/// centrality, Burt constraint) run on the call graph just as they do on the
+/// file-level `EdgeWeight` graph.
+impl EdgeCost for CallEdge {
+    #[inline]
+    fn cost(&self) -> f64 {
+        self.weight
+    }
 }
 
 /// One raw edge tuple as read from the database. `source_symbol_id` must be
@@ -140,6 +154,60 @@ impl CallGraph {
     pub fn edge_count(&self) -> usize {
         self.graph.edge_count()
     }
+
+    /// Remap a `NodeIndex`-keyed result onto `symbol_id` — the database id the
+    /// rest of the system speaks. Built by inverting `symbol_to_node`; O(n).
+    fn remap<V: Copy>(&self, scores: &HashMap<NodeIndex, V>) -> HashMap<i64, V> {
+        let mut out: HashMap<i64, V> = HashMap::with_capacity(self.symbol_to_node.len());
+        for (&sym_id, &node_idx) in &self.symbol_to_node {
+            if let Some(&v) = scores.get(&node_idx) {
+                out.insert(sym_id, v);
+            }
+        }
+        out
+    }
+
+    /// PageRank over the resolved call graph, keyed by `symbol_id`. Identifies
+    /// the load-bearing *functions* of execution (distinct from file PageRank:
+    /// a hub file may hold many trivial functions).
+    pub fn pagerank(&self, damping: f64, max_iter: usize, tolerance: f64) -> HashMap<i64, f64> {
+        let pr = crate::graph::algorithms::pagerank(&self.graph, damping, max_iter, tolerance);
+        self.remap(&pr.scores)
+    }
+
+    /// Brandes betweenness centrality over the call graph, keyed by `symbol_id`.
+    /// Uses the parallel WorkPool path when `work_pool` is supplied (O(V·E), so
+    /// callers gate by node count on large graphs).
+    pub fn betweenness(&self, work_pool: Option<&Arc<WorkPool>>) -> HashMap<i64, f64> {
+        let bc = match work_pool {
+            Some(wp) => {
+                crate::graph::algorithms::betweenness_centrality_parallel(&self.graph, wp, None)
+            }
+            None => crate::graph::algorithms::betweenness_centrality(&self.graph),
+        };
+        self.remap(&bc)
+    }
+
+    /// Louvain community assignment over the call graph. Returns
+    /// `(symbol_id -> community_id, modularity Q)` — the natural functional
+    /// clusters, independent of file/module boundaries.
+    pub fn louvain(&self, resolution: f64) -> (HashMap<i64, usize>, f64) {
+        let lr = crate::graph::algorithms::louvain_communities(&self.graph, resolution);
+        (self.remap(&lr.communities), lr.modularity)
+    }
+
+    /// K-core coreness over the call graph, keyed by `symbol_id` — functions in
+    /// the densely interconnected execution core (hard to remove/refactor).
+    pub fn kcore(&self) -> HashMap<i64, u32> {
+        let kc = crate::graph::algorithms_ext::k_core_decomposition(&self.graph);
+        self.remap(&kc.coreness)
+    }
+
+    /// Harmonic centrality over the call graph, keyed by `symbol_id`.
+    pub fn harmonic(&self) -> HashMap<i64, f64> {
+        let h = crate::graph::algorithms_ext::harmonic_centrality(&self.graph);
+        self.remap(&h)
+    }
 }
 
 #[cfg(test)]
@@ -239,5 +307,41 @@ mod tests {
         // All SCCs are singletons.
         assert!(sccs.iter().all(|c| c.len() == 1));
         assert_eq!(sccs.len(), 3);
+    }
+
+    #[test]
+    fn generic_algorithms_run_on_call_graph() {
+        // a → b → c → a (3-cycle) plus a → c. Exercises the genericized
+        // algorithm library (Phase 1.1) on DiGraph<FunctionNode, CallEdge>.
+        let g = CallGraph::build(
+            vec![node(1, "a"), node(2, "b"), node(3, "c")],
+            vec![
+                edge(1, Some(2)),
+                edge(2, Some(3)),
+                edge(3, Some(1)),
+                edge(1, Some(3)),
+            ],
+        );
+
+        // PageRank: symbol_id-keyed, covers every node, conserves probability.
+        let pr = g.pagerank(0.85, 100, 1e-8);
+        assert_eq!(pr.len(), 3);
+        assert!(pr.contains_key(&1) && pr.contains_key(&2) && pr.contains_key(&3));
+        let total: f64 = pr.values().sum();
+        assert!((total - 1.0).abs() < 1e-4, "pagerank sum = {}", total);
+
+        // Louvain: every node assigned a community, modularity finite.
+        let (comm, q) = g.louvain(1.0);
+        assert_eq!(comm.len(), 3);
+        assert!(q.is_finite());
+
+        // k-core + harmonic: symbol_id-keyed, cover every node.
+        assert_eq!(g.kcore().len(), 3);
+        assert_eq!(g.harmonic().len(), 3);
+
+        // Sequential Brandes betweenness: non-negative for every node.
+        for (&sym, &v) in &g.betweenness(None) {
+            assert!(v >= 0.0, "negative betweenness for symbol {}", sym);
+        }
     }
 }

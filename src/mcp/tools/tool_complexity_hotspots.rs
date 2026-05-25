@@ -75,6 +75,38 @@ pub async fn tool_complexity_hotspots(
         map
     };
 
+    // Rigorous AST complexity per file (function_metrics), keyed by path. When
+    // present it becomes the dominant composite term; when absent for the whole
+    // project (cron not yet run) the composite falls back to the original
+    // structural-only weighting. (graph-roadmap Phase 1.3)
+    let ast_map: std::collections::HashMap<String, (i32, f64, i64)> = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return std::collections::HashMap::new();
+        };
+        let pid: Option<i32> = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
+            .bind(&params.project)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+        match pid {
+            Some(pid) => crate::db::queries::get_file_ast_complexity_by_path(pool, pid)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(path, max_cyc, min_mi, fc)| (path, (max_cyc, min_mi, fc)))
+                .collect(),
+            None => std::collections::HashMap::new(),
+        }
+    })
+    .await;
+    let has_ast = !ast_map.is_empty();
+    let max_cyclomatic_global = ast_map
+        .values()
+        .map(|(c, _, _)| *c)
+        .max()
+        .unwrap_or(0)
+        .max(1) as f64;
+
     // Find max values for normalization
     let max_chunks = file_data.iter().map(|f| f.chunk_count).max().unwrap_or(1) as f64;
     let max_topics = file_data.iter().map(|f| f.topic_count).max().unwrap_or(1) as f64;
@@ -97,8 +129,22 @@ pub async fn tool_complexity_hotspots(
             let norm_size = f.size_bytes as f64 / max_size;
             let norm_coupling = file_max_coupling / max_coupling;
 
-            let composite =
-                0.30 * norm_chunks + 0.25 * norm_topics + 0.25 * norm_size + 0.20 * norm_coupling;
+            let (cyc_max, mi_min, fn_count) =
+                ast_map.get(&f.path).copied().unwrap_or((0, 100.0, 0));
+
+            // With AST data, fold normalized real complexity in as the dominant
+            // term; without it, keep the original structural-only composite so
+            // unparsed projects still rank sensibly.
+            let composite = if has_ast {
+                let norm_cx = cyc_max as f64 / max_cyclomatic_global;
+                0.30 * norm_cx
+                    + 0.20 * norm_chunks
+                    + 0.20 * norm_topics
+                    + 0.15 * norm_size
+                    + 0.15 * norm_coupling
+            } else {
+                0.30 * norm_chunks + 0.25 * norm_topics + 0.25 * norm_size + 0.20 * norm_coupling
+            };
 
             serde_json::json!({
                 "path": f.path,
@@ -106,6 +152,9 @@ pub async fn tool_complexity_hotspots(
                 "size_bytes": f.size_bytes,
                 "chunk_count": f.chunk_count,
                 "topic_count": f.topic_count,
+                "cyclomatic_max": cyc_max,
+                "maintainability_min": format!("{:.1}", mi_min),
+                "function_count": fn_count,
                 "max_coupling": format!("{:.4}", file_max_coupling),
                 "coupled_files": coupled_file_count,
                 "composite_score": format!("{:.4}", composite),
@@ -142,6 +191,11 @@ pub async fn tool_complexity_hotspots(
                 .parse()
                 .unwrap_or(0.0);
             sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
+        }),
+        "cyclomatic" => scored.sort_by(|a, b| {
+            let sa = a["cyclomatic_max"].as_i64().unwrap_or(0);
+            let sb = b["cyclomatic_max"].as_i64().unwrap_or(0);
+            sb.cmp(&sa)
         }),
         _ => scored.sort_by(|a, b| {
             let sa: f64 = a["composite_score"]
@@ -193,9 +247,12 @@ pub async fn tool_complexity_hotspots(
         "sort_by": sort_by,
         "file_count": scored.len(),
         "hotspots": scored,
-        "guidance": "Files with high composite scores are prime candidates for refactoring. \
-                     High topic diversity suggests the file handles too many concerns (SRP violation). \
-                     High coupling with many files indicates the file is a change bottleneck.",
+        "guidance": "Composite score ranks refactor candidates. When the function-metrics cron has run, the \
+                     composite is dominated by real per-function complexity (`cyclomatic_max` = the file's worst \
+                     function, `maintainability_min` = that function's MI) and reports `function_count`; otherwise it \
+                     falls back to structural proxies (chunks/topics/size/coupling). High topic diversity = too many \
+                     concerns (SRP violation); high coupling across many files = a change bottleneck. Use \
+                     sort_by=\"cyclomatic\" to rank purely by worst-function complexity.",
     });
 
     let json = serde_json::to_string_pretty(&result)
