@@ -21,11 +21,18 @@ use chrono::{DateTime, Utc};
 /// - `LockBusy`: `heavy_cron_lock.try_lock()` lost the race to another
 ///   heavy cron. Six of seven heavy crons will skip this way each tick
 ///   while one runs.
+/// - `Shutdown`: the `is_stopping()` check fired between scheduler
+///   enqueue and worker dequeue. Avoids racing the closing PG pool /
+///   broadcast channels during SIGTERM and demotes the resulting
+///   "closed pool" / "disconnected channel" errors out of the log. See
+///   plan ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
+///   F3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     PhaseGate,
     Cooldown,
     LockBusy,
+    Shutdown,
 }
 
 impl SkipReason {
@@ -34,6 +41,7 @@ impl SkipReason {
             SkipReason::PhaseGate => "phase_gate",
             SkipReason::Cooldown => "cooldown",
             SkipReason::LockBusy => "lock_busy",
+            SkipReason::Shutdown => "shutdown",
         }
     }
 }
@@ -66,6 +74,7 @@ impl CronJobOutcome {
             CronJobOutcome::Skipped(SkipReason::PhaseGate) => "skipped:phase_gate",
             CronJobOutcome::Skipped(SkipReason::Cooldown) => "skipped:cooldown",
             CronJobOutcome::Skipped(SkipReason::LockBusy) => "skipped:lock_busy",
+            CronJobOutcome::Skipped(SkipReason::Shutdown) => "skipped:shutdown",
             CronJobOutcome::Panicked => "panicked",
         }
     }

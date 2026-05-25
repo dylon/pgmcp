@@ -102,6 +102,19 @@ macro_rules! heavy_gate_or_skip {
             $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::PhaseGate), 0);
             return;
         }
+        // The PhaseGate check passes through `Terminating` because
+        // `DaemonPhase` is ordered Initializing < Scanning < Ready <
+        // Terminating < Defunct (`src/daemon_state.rs:35-46`). Without
+        // this second gate, closures already enqueued at SIGTERM race
+        // the closing PG pool / channels and the next pool-acquire
+        // logs "attempted to acquire a connection on a closed pool"
+        // (47× across one shutdown in the 2026-05-25 log triage). See
+        // plan ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
+        // F3.
+        if $lc.is_stopping() {
+            $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::Shutdown), 0);
+            return;
+        }
         let first_seen = $ready.get_or_init(Instant::now);
         if first_seen.elapsed() < $cooldown {
             tracing::debug!(
@@ -1872,5 +1885,123 @@ mod tests {
             prop_assert_eq!(final_count, expected,
                 "lost {} of {} submitted tasks", expected - final_count, expected);
         }
+    }
+
+    // F3: `heavy_gate_or_skip!` shutdown gate. Plan reference:
+    // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md F3.
+
+    use crate::daemon_state::{DaemonLifecycle, DaemonPhase};
+    use crate::stats::tracker::{
+        CronJobOutcome as TestCronJobOutcome, SkipReason as TestSkipReason, StatsTracker,
+    };
+    use std::sync::OnceLock as TestOnceLock;
+
+    /// Helper: invoke the body of `heavy_gate_or_skip!` inside a
+    /// `()`-returning closure (the macro early-returns with bare
+    /// `return;`, so the closure cannot return a value). The shared
+    /// `Arc<AtomicBool>` is flipped to `true` only if the macro
+    /// passes through every gate. Caller reads the flag to determine
+    /// "would the work body have run?".
+    fn try_gate(lc: &DaemonLifecycle, stats: &Arc<StatsTracker>) -> bool {
+        // Pre-warm cooldown deadline so cooldown can't be the
+        // returning reason; we want to isolate the shutdown gate.
+        let ready: Arc<TestOnceLock<Instant>> = Arc::new(TestOnceLock::new());
+        let _ = ready.set(Instant::now() - Duration::from_secs(3600));
+        let lock = Arc::new(parking_lot::Mutex::new(()));
+        let proceeded = Arc::new(AtomicBool::new(false));
+
+        let proceeded_for_closure = Arc::clone(&proceeded);
+        let inner = || {
+            // The macro requires a string-literal job name (matched
+            // by `$job:literal`). Tests each construct their own
+            // `StatsTracker`, so re-using one literal across the
+            // three tests does not race on the DashMap.
+            let _guard = heavy_gate_or_skip!(
+                job = "heavy-gate-shutdown-test",
+                lc = lc,
+                ready = ready,
+                cooldown = Duration::from_secs(0),
+                lock = lock,
+                stats = stats,
+            );
+            proceeded_for_closure.store(true, AtomicOrdering::Relaxed);
+        };
+        inner();
+        proceeded.load(AtomicOrdering::Relaxed)
+    }
+
+    #[test]
+    fn heavy_gate_returns_phase_gate_when_not_ready() {
+        let lc = DaemonLifecycle::new();
+        let stats = Arc::new(StatsTracker::new());
+        // Phase: Initializing < Ready → PhaseGate fires.
+        let proceeded = try_gate(&lc, &stats);
+        assert!(!proceeded, "PhaseGate must short-circuit when not Ready");
+        let recorded = stats
+            .last_cron_outcomes
+            .get("heavy-gate-shutdown-test")
+            .expect("outcome recorded")
+            .outcome;
+        assert_eq!(
+            recorded,
+            TestCronJobOutcome::Skipped(TestSkipReason::PhaseGate),
+            "expected PhaseGate, got {:?}",
+            recorded,
+        );
+    }
+
+    #[test]
+    fn heavy_gate_returns_shutdown_when_terminating() {
+        let lc = DaemonLifecycle::new();
+        let stats = Arc::new(StatsTracker::new());
+        // Transition through Scanning → Ready → Terminating. Ready is
+        // crossed so the PhaseGate test passes; Terminating > Ready
+        // numerically so `is_at_least(Ready)` returns true and only
+        // the explicit `is_stopping()` check can catch it.
+        lc.transition(DaemonPhase::Scanning);
+        lc.transition(DaemonPhase::Ready);
+        lc.transition(DaemonPhase::Terminating);
+        assert!(lc.is_stopping(), "precondition: lifecycle reports stopping");
+        assert!(
+            lc.is_at_least(DaemonPhase::Ready),
+            "precondition: Terminating is_at_least(Ready)"
+        );
+
+        let proceeded = try_gate(&lc, &stats);
+        assert!(
+            !proceeded,
+            "Shutdown gate must short-circuit during Terminating"
+        );
+        let recorded = stats
+            .last_cron_outcomes
+            .get("heavy-gate-shutdown-test")
+            .expect("outcome recorded")
+            .outcome;
+        assert_eq!(
+            recorded,
+            TestCronJobOutcome::Skipped(TestSkipReason::Shutdown),
+            "expected Shutdown, got {:?}",
+            recorded,
+        );
+    }
+
+    #[test]
+    fn heavy_gate_proceeds_when_ready_and_not_stopping() {
+        let lc = DaemonLifecycle::new();
+        let stats = Arc::new(StatsTracker::new());
+        lc.transition(DaemonPhase::Scanning);
+        lc.transition(DaemonPhase::Ready);
+        let proceeded = try_gate(&lc, &stats);
+        assert!(proceeded, "no gate should fire when Ready and not stopping");
+        // No outcome recorded by the gate macros on success — the work
+        // body would record one. Verify by confirming no entry was
+        // inserted by our test's macro invocation.
+        assert!(
+            stats
+                .last_cron_outcomes
+                .get("heavy-gate-shutdown-test")
+                .is_none(),
+            "no skip outcome should be recorded when the gate passes"
+        );
     }
 }

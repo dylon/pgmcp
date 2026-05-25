@@ -349,6 +349,14 @@ pub fn start_indexing(
                 std::collections::HashSet::with_capacity(metadata_map.len());
 
             for path in file_rx {
+                // Bail out early on SIGTERM so we don't enqueue more
+                // work into `embed_tx_for_scan` only to have the next
+                // send() fail when shutdown drops the receiver. See
+                // plan ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
+                // F3.
+                if lifecycle_for_scan.is_stopping() {
+                    break;
+                }
                 total_scanned += 1;
                 seen_paths.insert(path.to_string_lossy().into_owned());
 
@@ -382,7 +390,14 @@ pub fn start_indexing(
                     .files_submitted
                     .fetch_add(1, Ordering::Relaxed);
                 if let Err(e) = embed_tx_for_scan.send(EmbedIndexRequest::IndexFile(task)) {
-                    error!(error = %e, "Failed to submit IndexFile task during initial scan");
+                    if lifecycle_for_scan.is_stopping() {
+                        tracing::debug!("initial-scan channel closed during shutdown — exiting");
+                    } else {
+                        error!(
+                            error = %e,
+                            "Failed to submit IndexFile task during initial scan"
+                        );
+                    }
                     break;
                 }
             }
