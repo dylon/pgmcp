@@ -1341,6 +1341,18 @@ pub struct EmbeddingsConfig {
     /// under 1 GiB per worker at `max_length = 512`.
     #[serde(default = "default_inference_batch_size")]
     pub inference_batch_size: usize,
+    /// Maximum number of embedder copies resident on the GPU at once, across
+    /// BOTH the pool workers and the embedding-migration cron. The admission
+    /// semaphore (`crate::embed::admission`) enforces this so the always-on
+    /// pool (`pool_size` copies) plus the migration cron's transient copy
+    /// can't exceed the VRAM budget — the cause of the recurring
+    /// `CUDA_ERROR_OUT_OF_MEMORY` on an 8 GiB card. The pool workers are the
+    /// baseline residents, so the effective allowance for the migration cron
+    /// is `max(gpu_max_resident_embedders, pool_size) - pool_size`: run
+    /// `pool_size = 1` during an active re-embed to give the migration a slot
+    /// under a budget of 2. Only consulted when `use_gpu = true`.
+    #[serde(default = "default_gpu_max_resident_embedders")]
+    pub gpu_max_resident_embedders: usize,
 }
 
 impl Default for EmbeddingsConfig {
@@ -1355,6 +1367,7 @@ impl Default for EmbeddingsConfig {
             use_gpu: false,
             max_length: default_max_length(),
             inference_batch_size: default_inference_batch_size(),
+            gpu_max_resident_embedders: default_gpu_max_resident_embedders(),
         }
     }
 }
@@ -1452,6 +1465,10 @@ fn default_max_length() -> usize {
 }
 fn default_inference_batch_size() -> usize {
     8
+}
+
+fn default_gpu_max_resident_embedders() -> usize {
+    2
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -665,6 +665,15 @@ pub async fn run_migrations(
         "CREATE INDEX IF NOT EXISTS idx_symbol_refs_source_file ON symbol_references(source_file_id)",
         "CREATE INDEX IF NOT EXISTS idx_symbol_refs_target_symbol ON symbol_references(target_symbol_id)",
         "CREATE INDEX IF NOT EXISTS idx_symbol_refs_target_raw ON symbol_references(target_raw)",
+        // `source_symbol_id` has an `ON DELETE SET NULL` FK to file_symbols(id)
+        // but was previously unindexed. Without this, every
+        // `DELETE FROM file_symbols WHERE file_id = $1` in the symbol-extraction
+        // cron forces Postgres to seq-scan all of symbol_references per deleted
+        // row to enforce the SET NULL action — the cause of thousands of
+        // "slow statement" WARNs and the symbol-extraction statement-timeout
+        // cancellations. Partial (most rows are non-NULL) mirrors
+        // idx_cge_source_symbol below.
+        "CREATE INDEX IF NOT EXISTS idx_symbol_refs_source_symbol ON symbol_references(source_symbol_id) WHERE source_symbol_id IS NOT NULL",
     ];
     for idx_sql in &symbol_refs_indexes {
         sqlx::query(idx_sql).execute(pool).await?;

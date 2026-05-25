@@ -213,8 +213,13 @@ fn log_cold_changes(old: &Config, new: &Config) {
         || old.embeddings.pool_size != new.embeddings.pool_size
         || old.embeddings.dimensions != new.embeddings.dimensions
         || old.embeddings.use_gpu != new.embeddings.use_gpu
+        || old.embeddings.inference_batch_size != new.embeddings.inference_batch_size
+        || old.embeddings.gpu_max_resident_embedders != new.embeddings.gpu_max_resident_embedders
     {
-        warn!("embeddings.model/pool_size/dimensions/use_gpu changed — restart required");
+        warn!(
+            "embeddings.model/pool_size/dimensions/use_gpu/inference_batch_size/\
+             gpu_max_resident_embedders changed — restart required"
+        );
     }
     if old.mcp.host != new.mcp.host || old.mcp.port != new.mcp.port {
         warn!("mcp.host/port changed — restart required for changes to take effect");

@@ -7816,6 +7816,20 @@ pub async fn resolve_symbol_reference_targets(
     // Each UPDATE is gated by `resolution_kind IS NULL` so the earlier-tier
     // assignments stick even when a later phase would also match.
 
+    // Heavy project-wide resolution. Bump the per-statement timeout above the
+    // pool default (`DatabaseConfig::statement_timeout_ms`, 30s) so a large
+    // project's resolution pass isn't cancelled mid-flight — that cancellation
+    // `?`-propagates out of `extract_project_symbols` and aborts the entire
+    // symbol-extraction run ("Symbol extraction failed for project"). `SET
+    // LOCAL` is scoped to this transaction, so the pool default returns when
+    // the connection is released; running every phase on the same `tx` is what
+    // makes the override stick (a bare `SET` on a pooled `.execute(pool)` would
+    // land on an arbitrary connection).
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '300s'")
+        .execute(&mut *tx)
+        .await?;
+
     // Phase 1: exact_in_file. Same source file, same name.
     let phase1 = sqlx::query(
         "UPDATE symbol_references sr
@@ -7834,7 +7848,7 @@ pub async fn resolve_symbol_reference_targets(
            )",
     )
     .bind(project_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     // Phase 2: exact_via_import. The reference's source file imports a
@@ -7870,7 +7884,7 @@ pub async fn resolve_symbol_reference_targets(
            )",
     )
     .bind(project_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     // Phase 3: bare-name match within the project, now CONFIDENCE-GRADED by
@@ -7913,7 +7927,7 @@ pub async fn resolve_symbol_reference_targets(
            AND sr.resolution_kind IS NULL",
     )
     .bind(project_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     // Phase 4: anything still unresolved within the project's references is
@@ -7929,13 +7943,15 @@ pub async fn resolve_symbol_reference_targets(
            AND sr.resolution_kind IS NULL",
     )
     .bind(project_id)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
-    Ok(phase1.rows_affected()
+    let resolved = phase1.rows_affected()
         + phase2.rows_affected()
         + phase3.rows_affected()
-        + phase4.rows_affected())
+        + phase4.rows_affected();
+    tx.commit().await?;
+    Ok(resolved)
 }
 
 /// Read the symbol-extraction watermark for a project.

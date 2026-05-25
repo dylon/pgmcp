@@ -28,7 +28,7 @@ pub async fn rebuild_symbols(
 ) -> Result<usize, FuzzyError> {
     let rows: Vec<(String, i64, String, String, i32)> =
         sqlx::query_as::<_, (String, i64, String, String, i32)>(
-            "SELECT fs.name, fs.file_id, fs.kind, fs.visibility, fs.line_start
+            "SELECT fs.name, fs.file_id, fs.kind, fs.visibility, fs.start_line
              FROM file_symbols fs
              JOIN indexed_files f ON fs.file_id = f.id
              WHERE f.project_id = $1",

@@ -678,7 +678,20 @@ fn resolve_device(use_gpu: bool) -> Result<Device> {
 /// Ensure model files are available locally, downloading via hf-hub on
 /// cold caches. Returns the directory containing `model.safetensors`,
 /// `config.json`, and `tokenizer.json`.
+/// Serializes first-time model-file downloads across embedder constructions.
+/// Pool workers (`pool_size` copies) and the embedding-migration cron each build
+/// their own `Embedder`; on a cold HF cache they would otherwise race hf-hub's
+/// per-blob `.lock` file and the loser fails with "Lock acquisition failed".
+/// Downloads are idempotent (the second holder hits the now-warm cache), so a
+/// single process-wide mutex serializes them at negligible cost — constructions
+/// are infrequent (startup + migration ticks). Poison is recovered: a prior
+/// panic mid-download must not wedge every future construction.
+static MODEL_DOWNLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn ensure_model_files(kind: ModelKind) -> Result<PathBuf> {
+    let _download_guard = MODEL_DOWNLOAD_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let api = Api::new().map_err(|e| PgmcpError::Embedding(format!("hf-hub init: {}", e)))?;
     let api = api.model(kind.hf_repo().to_string());
 

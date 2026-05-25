@@ -29,6 +29,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::EmbeddingsConfig;
 use crate::db::queries;
+use crate::embed::admission;
 use crate::embed::model::{BGE_M3_SIGNATURE, Embedder};
 use crate::indexer::contextualize::{ChunkContext, build_context_prefix};
 use crate::stats::tracker::StatsTracker;
@@ -100,6 +101,29 @@ pub async fn run_embedding_migration_pass(
     stats
         .embeddings_migration_runs
         .fetch_add(1, Ordering::Relaxed);
+
+    // Skip the whole pass — including the GPU model upload — when there is
+    // nothing left to migrate. Avoids building a transient embedder copy (and
+    // taking a GPU admission permit) for a no-op tick once cutover is done.
+    if full_backlog_counts(pool).await?.total() == 0 {
+        debug!("embedding-migration: backlog empty; skipping pass");
+        return Ok(MigrationPassReport::default());
+    }
+
+    // GPU admission: take a resident-copy permit before constructing the
+    // embedder so the migration's copy plus the always-on pool workers can't
+    // exceed `embeddings.gpu_max_resident_embedders`. Non-blocking — if no slot
+    // is free (the pool is using the whole budget) defer to the next tick
+    // rather than piling a third BGE-M3 onto a full GPU. Held for the entire
+    // pass; released when the embedder is dropped at function exit.
+    let _gpu_permit = match admission::try_acquire_owned() {
+        admission::Admission::Disabled => None, // CPU mode → proceed unguarded
+        admission::Admission::Granted(permit) => Some(permit),
+        admission::Admission::Deferred => {
+            info!("embedding-migration: GPU embedder budget exhausted; deferring to next tick");
+            return Ok(MigrationPassReport::default());
+        }
+    };
 
     // Construct the embedder. If model load fails we surface the error so
     // the caller can log; failing here doesn't loop forever because the

@@ -71,7 +71,7 @@ async fn seed_project_with_symbols(pool: &sqlx::PgPool, project_name: &str, symb
     .expect("file");
     for name in symbol_names {
         sqlx::query(
-            "INSERT INTO file_symbols (file_id, name, kind, visibility, line_start, line_end) \
+            "INSERT INTO file_symbols (file_id, name, kind, visibility, start_line, end_line) \
              VALUES ($1, $2, 'function', 'public', 1, 1)
              ON CONFLICT DO NOTHING",
         )

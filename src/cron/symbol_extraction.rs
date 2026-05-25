@@ -244,6 +244,13 @@ async fn extract_and_persist_file(
     if symbols.is_empty() && references.is_empty() {
         // Nothing to persist; still scrub stale rows for this file.
         let mut tx = pool.begin().await?;
+        // Per-file cap: a pathological file fails fast and is skipped by the
+        // caller (see the match arm in extract_project_symbols) rather than
+        // blocking the worker. The new idx_symbol_refs_source_symbol keeps the
+        // ON DELETE SET NULL cascade sub-second, so 15s is ample headroom.
+        sqlx::query("SET LOCAL statement_timeout = '15s'")
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM file_symbols WHERE file_id = $1")
             .bind(file_id)
             .execute(&mut *tx)
@@ -277,6 +284,10 @@ async fn extract_and_persist_file(
 
     // Per-file transaction.
     let mut tx = pool.begin().await?;
+    // Per-file cap — see the scrub path above for rationale.
+    sqlx::query("SET LOCAL statement_timeout = '15s'")
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM file_symbols WHERE file_id = $1")
         .bind(file_id)
         .execute(&mut *tx)

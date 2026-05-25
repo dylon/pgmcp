@@ -353,6 +353,32 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     );
 
     // 4. Initialize embedding pool
+    //
+    // GPU admission: when GPU embeddings are enabled, bound the number of
+    // resident BGE-M3 copies (pool workers + the embedding-migration cron's
+    // transient copy) so they can't exhaust VRAM. The budget is raised to at
+    // least `pool_size` so the always-on workers never starve; the headroom
+    // above `pool_size` is what the migration cron competes for. See
+    // `crate::embed::admission` and `embeddings.gpu_max_resident_embedders`.
+    if config_snapshot.embeddings.use_gpu {
+        let budget = config_snapshot
+            .embeddings
+            .gpu_max_resident_embedders
+            .max(config_snapshot.embeddings.pool_size);
+        if config_snapshot.embeddings.gpu_max_resident_embedders
+            < config_snapshot.embeddings.pool_size
+        {
+            warn!(
+                gpu_max_resident_embedders = config_snapshot.embeddings.gpu_max_resident_embedders,
+                pool_size = config_snapshot.embeddings.pool_size,
+                effective_budget = budget,
+                "gpu_max_resident_embedders < pool_size; raising budget to pool_size so \
+                 workers don't starve (migration cron then gets no extra slot)"
+            );
+        }
+        embed::admission::init(budget);
+    }
+
     let embed_pool = embed::pool::EmbeddingPool::new(
         &config_snapshot.embeddings,
         Arc::clone(&stats_tracker),

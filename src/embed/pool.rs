@@ -11,9 +11,10 @@
 //! - **index channel**: file-indexing tasks + git-commit batches
 
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
@@ -22,6 +23,7 @@ use tracing::{debug, error, info, warn};
 
 use pgvector::SparseVector;
 
+use super::admission;
 use super::model::Embedder;
 use crate::config::{Config, EmbeddingsConfig, ProjectOverride};
 use crate::db::DbClient;
@@ -185,10 +187,26 @@ impl QueryEmbedder {
 }
 
 /// Dedicated embedding thread pool with dual channels (query priority + index).
+///
+/// Resilience (the module's history with "sending on a disconnected channel"):
+/// the pool's monitor thread retains the original `index_rx`/`query_rx`
+/// receivers, so the channels can never reach `Disconnected` while the pool is
+/// alive — even if every worker thread dies, scanner/watcher sends keep
+/// buffering instead of erroring. The monitor watches the worker handles and
+/// respawns any slot that exits unexpectedly (e.g. construction-budget
+/// exhaustion under sustained VRAM pressure), so a dead worker recovers
+/// without a daemon restart.
 pub struct EmbeddingPool {
     index_tx: Sender<EmbedIndexRequest>,
     query_tx: Sender<EmbedQueryRequest>,
-    workers: Vec<JoinHandle<()>>,
+    /// Worker handles, shared with the liveness monitor (it detects a dead
+    /// slot via `JoinHandle::is_finished` and respawns it). A slot is briefly
+    /// `None` while a respawn is in flight.
+    workers: Arc<Mutex<Vec<Option<JoinHandle<()>>>>>,
+    /// Liveness monitor handle (joined on shutdown).
+    monitor: Option<JoinHandle<()>>,
+    /// Shutdown flag shared with workers + monitor.
+    shutdown: Arc<AtomicBool>,
 }
 
 impl EmbeddingPool {
@@ -206,33 +224,46 @@ impl EmbeddingPool {
         // Capture the tokio runtime handle so embedding workers can run async DB queries.
         let rt_handle = tokio::runtime::Handle::current();
 
-        let mut workers = Vec::with_capacity(pool_size);
-
-        for i in 0..pool_size {
-            let index_rx = index_rx.clone();
-            let query_rx = query_rx.clone();
-            let config = config.clone();
-            let stats = Arc::clone(&stats);
-            let shutdown = Arc::clone(&shutdown);
-            let rt = rt_handle.clone();
-
-            let handle = thread::Builder::new()
-                .name(format!("pgmcp-embed-{}", i))
-                .spawn(move || {
-                    embedding_worker(i, index_rx, query_rx, &config, &stats, &shutdown, &rt);
-                })
-                .map_err(|e| {
-                    PgmcpError::Other(format!("Failed to spawn embedding worker: {}", e))
-                })?;
-
-            workers.push(handle);
+        let workers: Arc<Mutex<Vec<Option<JoinHandle<()>>>>> =
+            Arc::new(Mutex::new(Vec::with_capacity(pool_size)));
+        {
+            let mut slots = workers.lock().expect("embed worker registry poisoned");
+            for i in 0..pool_size {
+                let handle = spawn_worker(
+                    i,
+                    index_rx.clone(),
+                    query_rx.clone(),
+                    config.clone(),
+                    Arc::clone(&stats),
+                    Arc::clone(&shutdown),
+                    rt_handle.clone(),
+                )?;
+                slots.push(Some(handle));
+            }
         }
+
+        // Liveness monitor. It is also the long-lived owner of an `index_rx` /
+        // `query_rx` clone — which is what keeps the channels from ever
+        // reaching `Disconnected` while the pool exists, so a fully-dead pool
+        // no longer floods the scanner with "sending on a disconnected
+        // channel".
+        let monitor = spawn_monitor(
+            index_rx,
+            query_rx,
+            config.clone(),
+            Arc::clone(&stats),
+            Arc::clone(&shutdown),
+            rt_handle,
+            Arc::clone(&workers),
+        )?;
 
         info!(pool_size, "Embedding pool started");
         Ok(Self {
             index_tx,
             query_tx,
             workers,
+            monitor: Some(monitor),
+            shutdown,
         })
     }
 
@@ -268,9 +299,28 @@ impl EmbeddingPool {
 
     /// Signal shutdown and return worker handles for joining with custom timeout logic.
     pub fn shutdown_take_handles(self) -> Vec<JoinHandle<()>> {
+        // Signal shutdown (idempotent — the daemon usually set it already) so
+        // the monitor stops respawning and workers exit their loops.
+        self.shutdown.store(true, Ordering::Release);
         drop(self.index_tx);
         drop(self.query_tx);
-        self.workers
+        // Join the monitor first so it cannot respawn a worker we are about to
+        // reap. Its loop is shutdown-aware (wakes within ~100ms), so this is
+        // bounded.
+        if let Some(monitor) = self.monitor {
+            let _ = monitor.join();
+        }
+        // The registry is now quiescent; hand the worker handles to the caller
+        // (the daemon joins them with its own per-handle timeout policy).
+        let mut handles = Vec::new();
+        if let Ok(mut slots) = self.workers.lock() {
+            for slot in slots.iter_mut() {
+                if let Some(h) = slot.take() {
+                    handles.push(h);
+                }
+            }
+        }
+        handles
     }
 
     /// Shutdown the embedding pool and wait for workers to finish.
@@ -293,6 +343,116 @@ const MAX_CONSECUTIVE_WORKER_FAILURES: u32 = 10;
 /// Cap on the supervisor's exponential backoff between retries.
 const MAX_WORKER_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Bound on event-loop re-entries before a worker gives up and lets the
+/// monitor respawn it. Re-entry only happens on an unexpected (non-shutdown)
+/// event-loop exit, which should never occur now that the pool retains the
+/// senders — so this is purely a spin guard.
+const MAX_EVENT_LOOP_REENTRIES: u32 = 100;
+
+/// How often the liveness monitor polls worker handles.
+const MONITOR_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Minimum delay between respawns of the SAME worker slot, so a slot that
+/// keeps dying (e.g. a persistent driver fault) can't busy-spawn.
+const RESPAWN_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Spawn one embedding worker thread for slot `id`.
+#[allow(clippy::too_many_arguments)]
+fn spawn_worker(
+    id: usize,
+    index_rx: Receiver<EmbedIndexRequest>,
+    query_rx: Receiver<EmbedQueryRequest>,
+    config: EmbeddingsConfig,
+    stats: Arc<StatsTracker>,
+    shutdown: Arc<AtomicBool>,
+    rt: tokio::runtime::Handle,
+) -> Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name(format!("pgmcp-embed-{}", id))
+        .spawn(move || {
+            embedding_worker(id, index_rx, query_rx, &config, &stats, &shutdown, &rt);
+        })
+        .map_err(|e| PgmcpError::Other(format!("Failed to spawn embedding worker: {}", e)))
+}
+
+/// Liveness monitor: respawns any worker slot whose thread has exited while the
+/// pool is still running. With the per-task `catch_unwind` guard and the
+/// supervisor's re-entry, a worker should only exit on shutdown or after
+/// exhausting its construction-retry budget; this recovers the latter case
+/// (once VRAM/driver pressure clears) without a daemon restart. Holding the
+/// `index_rx`/`query_rx` clones for the monitor's lifetime also keeps the
+/// channels alive (never `Disconnected`) regardless of worker deaths.
+#[allow(clippy::too_many_arguments)]
+fn spawn_monitor(
+    index_rx: Receiver<EmbedIndexRequest>,
+    query_rx: Receiver<EmbedQueryRequest>,
+    config: EmbeddingsConfig,
+    stats: Arc<StatsTracker>,
+    shutdown: Arc<AtomicBool>,
+    rt: tokio::runtime::Handle,
+    workers: Arc<Mutex<Vec<Option<JoinHandle<()>>>>>,
+) -> Result<JoinHandle<()>> {
+    thread::Builder::new()
+        .name("pgmcp-embed-monitor".into())
+        .spawn(move || {
+            let pool_size = workers.lock().map(|w| w.len()).unwrap_or(0);
+            // `None` = never respawned this slot → an immediate first respawn
+            // is allowed. Avoids `Instant - Duration` underflow at startup.
+            let mut last_respawn: Vec<Option<Instant>> = vec![None; pool_size];
+            while !shutdown.load(Ordering::Acquire) {
+                sleep_with_shutdown(MONITOR_POLL_INTERVAL, &shutdown);
+                if shutdown.load(Ordering::Acquire) {
+                    break;
+                }
+                let mut slots = match workers.lock() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                for id in 0..slots.len() {
+                    let dead = slots[id].as_ref().map(|h| h.is_finished()).unwrap_or(true);
+                    if !dead {
+                        continue;
+                    }
+                    if let Some(t) = last_respawn[id]
+                        && t.elapsed() < RESPAWN_COOLDOWN
+                    {
+                        continue;
+                    }
+                    // Re-check shutdown so we don't respawn during teardown.
+                    if shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if let Some(dead_handle) = slots[id].take() {
+                        let _ = dead_handle.join();
+                    }
+                    error!(
+                        worker_id = id,
+                        "embedding worker slot exited unexpectedly; respawning"
+                    );
+                    match spawn_worker(
+                        id,
+                        index_rx.clone(),
+                        query_rx.clone(),
+                        config.clone(),
+                        Arc::clone(&stats),
+                        Arc::clone(&shutdown),
+                        rt.clone(),
+                    ) {
+                        Ok(h) => {
+                            slots[id] = Some(h);
+                            stats.embed_worker_restarts.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            error!(worker_id = id, error = %e, "embedding worker respawn failed; will retry");
+                        }
+                    }
+                    last_respawn[id] = Some(Instant::now());
+                }
+            }
+        })
+        .map_err(|e| PgmcpError::Other(format!("Failed to spawn embed monitor: {}", e)))
+}
+
 /// Supervisor entry point. Constructs the worker's model with retry +
 /// exponential backoff so a transient `Embedder::new` failure (driver
 /// reset, OOM during model load, transient HF download error) doesn't
@@ -308,8 +468,27 @@ fn embedding_worker(
     shutdown: &AtomicBool,
     rt: &tokio::runtime::Handle,
 ) {
+    if shutdown.load(Ordering::Acquire) {
+        return;
+    }
+
+    // GPU admission: hold one resident-copy permit for this worker's entire
+    // lifetime so the pool workers + migration cron together never exceed the
+    // VRAM budget (`embeddings.gpu_max_resident_embedders`). Released on return
+    // — including unwind — so a monitor respawn re-acquires cleanly. `None`
+    // when GPU admission is disabled (CPU mode / `use_gpu = false`).
+    let _gpu_permit = match admission::semaphore() {
+        Some(_) => match admission::acquire_owned(rt) {
+            Some(permit) => Some(permit),
+            // Semaphore closed (teardown) — nothing to do.
+            None => return,
+        },
+        None => None,
+    };
+
     let mut consecutive_failures: u32 = 0;
     let mut backoff = std::time::Duration::from_secs(1);
+    let mut reentries: u32 = 0;
     // Phase C.10: time-to-first-model-ready (embed pool warmup).
     // The recovery-times harness greps `phase="ready"` from the
     // structured log to derive the embed-pool warmup row.
@@ -326,6 +505,7 @@ fn embedding_worker(
                     );
                     stats.embed_worker_restarts.fetch_add(1, Ordering::Relaxed);
                 }
+                consecutive_failures = 0;
                 let elapsed = worker_start.elapsed().as_secs_f64();
                 info!(
                     target: "pgmcp::recovery_times",
@@ -366,10 +546,33 @@ fn embedding_worker(
         debug!(worker_id = id, "Embedding worker started");
         run_worker_event_loop(id, &model, &index_rx, &query_rx, stats, shutdown, rt);
         stats.embed_workers_alive.fetch_sub(1, Ordering::Relaxed);
-        debug!(worker_id = id, "Embedding worker exiting");
-        // Normal exit means the event loop saw shutdown or a disconnected
-        // channel; either way the supervisor is done — no retry.
-        return;
+
+        if shutdown.load(Ordering::Acquire) {
+            debug!(worker_id = id, "Embedding worker exiting (shutdown)");
+            return;
+        }
+
+        // The event loop returned without a shutdown signal. Because the pool
+        // retains the channel senders this should not happen; treat it as an
+        // unexpected disconnect and rebuild the model + re-enter rather than
+        // letting the slot die. Bounded — a genuinely wedged pool surfaces via
+        // the monitor's respawn path instead of spinning here. `model` drops at
+        // the end of this iteration, freeing its GPU memory before the rebuild.
+        reentries += 1;
+        stats
+            .embed_event_loop_reentries
+            .fetch_add(1, Ordering::Relaxed);
+        if reentries > MAX_EVENT_LOOP_REENTRIES {
+            error!(
+                worker_id = id,
+                "embedding worker exceeded event-loop re-entry budget; exiting (monitor will respawn)"
+            );
+            return;
+        }
+        warn!(
+            worker_id = id,
+            reentries, "embedding event loop exited without shutdown; rebuilding model"
+        );
     }
 }
 
@@ -383,6 +586,28 @@ fn sleep_with_shutdown(dur: std::time::Duration, shutdown: &AtomicBool) {
             return;
         }
         std::thread::sleep(std::time::Duration::from_millis(100).min(dur - start.elapsed()));
+    }
+}
+
+/// Run a per-task closure under `catch_unwind` so a panicking task (an
+/// unexpected `.expect()`, a slice panic deep in chunking, or a panic in a
+/// `block_on`-driven DB future) is logged and counted instead of unwinding the
+/// worker thread — which would drop the worker's channel receiver and, before
+/// the pool retained its senders, could permanently disconnect the index
+/// channel. The worker keeps its loaded model and live receiver and moves on
+/// to the next task.
+///
+/// `AssertUnwindSafe` is sound here: the captured `&Embedder` is used read-only
+/// (forward passes don't mutate it), `&StatsTracker` is all atomics, and the
+/// runtime `Handle` is unwind-safe — no torn invariant is observable after a
+/// caught panic.
+fn run_task_caught(id: usize, stats: &StatsTracker, kind: &str, task: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)).is_err() {
+        error!(
+            worker_id = id,
+            kind, "embedding task panicked; worker recovered"
+        );
+        stats.embed_task_panics.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -403,7 +628,11 @@ fn run_worker_event_loop(
         // Priority: drain ALL pending query requests first
         loop {
             match query_rx.try_recv() {
-                Ok(req) => process_query_request(model, req, stats),
+                Ok(req) => {
+                    run_task_caught(id, stats, "query", || {
+                        process_query_request(model, req, stats)
+                    });
+                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => return,
             }
@@ -413,7 +642,11 @@ fn run_worker_event_loop(
         crossbeam_channel::select! {
             recv(query_rx) -> msg => {
                 match msg {
-                    Ok(req) => process_query_request(model, req, stats),
+                    Ok(req) => {
+                        run_task_caught(id, stats, "query", || {
+                            process_query_request(model, req, stats)
+                        });
+                    }
                     Err(_) => return,
                 }
             }
@@ -421,7 +654,7 @@ fn run_worker_event_loop(
                 match msg {
                     Ok(req) => {
                         let start = std::time::Instant::now();
-                        match req {
+                        run_task_caught(id, stats, "index", || match req {
                             EmbedIndexRequest::IndexFile(task) => {
                                 process_index_file_task(model, task, stats, rt, id);
                             }
@@ -431,7 +664,7 @@ fn run_worker_event_loop(
                             EmbedIndexRequest::Commit(commit_req) => {
                                 process_commit_request(model, commit_req, stats, rt, id);
                             }
-                        }
+                        });
                         let elapsed = start.elapsed().as_millis() as u64;
                         stats.embedding_duration_ms.fetch_add(elapsed, Ordering::Relaxed);
                     }
@@ -1453,6 +1686,31 @@ mod tests {
     // us assert on the retry schedule deterministically.
 
     use std::cell::Cell;
+
+    // --- run_task_caught: per-task panic isolation (F2 P1-a) ---------------
+    #[test]
+    fn run_task_caught_isolates_panics() {
+        let stats = StatsTracker::new();
+
+        // A normal task runs and is not counted as a panic.
+        let mut ran = false;
+        run_task_caught(0, &stats, "test", || ran = true);
+        assert!(ran, "task closure should run");
+        assert_eq!(stats.embed_task_panics.load(Ordering::Relaxed), 0);
+
+        // A panicking task is caught (does NOT unwind the caller) and counted,
+        // so a real worker keeps its model + channel receiver and moves to the
+        // next task instead of dying and permanently disconnecting the channel.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {})); // silence the intentional panic
+        run_task_caught(7, &stats, "test", || panic!("boom"));
+        std::panic::set_hook(prev);
+        assert_eq!(stats.embed_task_panics.load(Ordering::Relaxed), 1);
+
+        // The caller survived the panic and can run another task.
+        run_task_caught(0, &stats, "test", || { /* ok */ });
+        assert_eq!(stats.embed_task_panics.load(Ordering::Relaxed), 1);
+    }
 
     #[tokio::test(start_paused = true)]
     async fn retry_returns_immediately_on_success() {

@@ -357,6 +357,16 @@ pub struct StatsTracker {
     /// daemon needs operator attention (usually a CUDA reset or weights
     /// re-download).
     pub embed_worker_permanent_failures: AtomicU64,
+    /// Per-task panics caught by the worker event loop's `catch_unwind` guard.
+    /// A panicking index/query task is logged and counted here instead of
+    /// unwinding the worker thread (which would drop its channel receiver).
+    /// Should stay ~0 in steady state; a rising value points at a reproducible
+    /// panic in chunking/embedding/DB-insert.
+    pub embed_task_panics: AtomicU64,
+    /// Number of times a worker's event loop returned without a shutdown
+    /// signal and the supervisor rebuilt the model and re-entered. Defensive;
+    /// expected to stay 0 now that the pool retains the channel senders.
+    pub embed_event_loop_reentries: AtomicU64,
 
     // File watcher counters
     pub watcher_events_received: AtomicU64,
@@ -752,6 +762,8 @@ impl StatsTracker {
             embed_workers_alive: AtomicU64::new(0),
             embed_worker_restarts: AtomicU64::new(0),
             embed_worker_permanent_failures: AtomicU64::new(0),
+            embed_task_panics: AtomicU64::new(0),
+            embed_event_loop_reentries: AtomicU64::new(0),
             watcher_errors_total: AtomicU64::new(0),
             inotify_overflows_total: AtomicU64::new(0),
             rag_search_failures_total: AtomicU64::new(0),
@@ -1064,6 +1076,8 @@ impl StatsTracker {
             "embed_workers_alive": self.embed_workers_alive.load(Ordering::Acquire),
             "embed_worker_restarts": self.embed_worker_restarts.load(Ordering::Acquire),
             "embed_worker_permanent_failures": self.embed_worker_permanent_failures.load(Ordering::Acquire),
+            "embed_task_panics": self.embed_task_panics.load(Ordering::Acquire),
+            "embed_event_loop_reentries": self.embed_event_loop_reentries.load(Ordering::Acquire),
             "watcher_errors_total": self.watcher_errors_total.load(Ordering::Acquire),
             "inotify_overflows_total": self.inotify_overflows_total.load(Ordering::Acquire),
             "rag_search_failures_total": self.rag_search_failures_total.load(Ordering::Acquire),
