@@ -30,6 +30,7 @@ pub mod sota_regex_scan;
 
 pub mod tool_adoption_lag;
 pub mod tool_anomaly_detection;
+pub mod tool_architecture_dsm;
 pub mod tool_architecture_quality;
 pub mod tool_architecture_violations;
 pub mod tool_boilerplate_clusters;
@@ -245,6 +246,7 @@ pub mod tool_a2a_subscribe_task;
 
 pub use tool_adoption_lag::tool_adoption_lag;
 pub use tool_anomaly_detection::tool_anomaly_detection;
+pub use tool_architecture_dsm::tool_architecture_dsm;
 pub use tool_architecture_quality::tool_architecture_quality;
 pub use tool_architecture_violations::tool_architecture_violations;
 pub use tool_boilerplate_clusters::tool_boilerplate_clusters;

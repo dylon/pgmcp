@@ -300,6 +300,62 @@ pub async fn tool_architecture_violations(
         }
     }
 
+    // Reflexion-model conformance (graph-roadmap Phase 3.2): when the project
+    // declares layer rules in `.pgmcp.toml [architecture]`, map each file to a
+    // layer by path prefix and flag import edges that violate the declared
+    // `allow` rules (divergences). No declared rules ⇒ skipped (purely additive).
+    let mut reflexion_json = serde_json::Value::Null;
+    {
+        let root: Option<String> = sqlx::query_scalar("SELECT path FROM projects WHERE id = $1")
+            .bind(project_id)
+            .fetch_optional(ctx.db().pool().expect(
+                "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
+            ))
+            .await
+            .unwrap_or(None);
+        if let Some(root) = root
+            && let Some(po) = crate::config::ProjectOverride::load(std::path::Path::new(&root))
+            && let Some(arch) = po.architecture
+        {
+            let model = crate::code_analysis::reflexion::LayerModel::from_rules(&arch);
+            if !model.is_empty() {
+                let summary = model.summarize(db_edges.iter().filter_map(|e| {
+                    e.target_relative_path
+                        .as_deref()
+                        .map(|t| (e.source_relative_path.as_str(), t))
+                }));
+                // Push divergences as layer_violation entries (capped so a badly
+                // mis-layered project can't flood the response).
+                const MAX_LAYER_VIOLATIONS: usize = 100;
+                for d in summary.divergences.iter().take(MAX_LAYER_VIOLATIONS) {
+                    violations.push(serde_json::json!({
+                        "type": "layer_violation",
+                        "severity": "high",
+                        "description": format!(
+                            "Illegal dependency: layer '{}' must not import layer '{}'",
+                            d.from_layer, d.to_layer
+                        ),
+                        "from_layer": d.from_layer,
+                        "to_layer": d.to_layer,
+                        "source_file": d.src_path,
+                        "target_file": d.dst_path,
+                    }));
+                }
+                let absences = model.absences(&summary.realized_pairs);
+                reflexion_json = serde_json::json!({
+                    "convergences": summary.convergences,
+                    "divergence_count": summary.divergences.len(),
+                    "divergences_reported": summary.divergences.len().min(MAX_LAYER_VIOLATIONS),
+                    "unlayered_edges": summary.unlayered,
+                    "absences": absences
+                        .iter()
+                        .map(|(f, t)| serde_json::json!({ "from": f, "to": t }))
+                        .collect::<Vec<_>>(),
+                });
+            }
+        }
+    }
+
     // Filter by severity threshold
     let severity_order = |s: &str| -> i32 {
         match s {
@@ -396,8 +452,13 @@ pub async fn tool_architecture_violations(
         "severity_threshold": severity_threshold,
         "violation_count": violations.len(),
         "violations": violations,
-        "guidance": "Fix critical violations first (cycles), then high (god modules, bidirectional deps), \
-                     then medium (SDP violations, Zone of Pain). Each violation includes specific files/modules.",
+        "reflexion": reflexion_json,
+        "guidance": "Fix critical violations first (cycles), then high (god modules, bidirectional deps, \
+                     layer violations), then medium (SDP violations, Zone of Pain). Each violation includes \
+                     specific files/modules. `reflexion` is populated only when the project declares \
+                     `[architecture]` layers + allow-rules in .pgmcp.toml: divergences are illegal cross-layer \
+                     imports (also listed as `layer_violation` entries), absences are declared-but-unused \
+                     dependencies.",
     });
 
     let json = serde_json::to_string_pretty(&result)

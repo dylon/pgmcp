@@ -2193,6 +2193,57 @@ pub struct ProjectOverride {
     /// resolves to this root.
     #[serde(default)]
     pub phonetics: Option<ProjectPhoneticsOverride>,
+    /// Declared layer-dependency rules for reflexion-model conformance checking
+    /// (Murphy-Notkin-Sullivan, TSE 2001). When present, `architecture_violations`
+    /// maps files to layers by path prefix and flags import edges that violate
+    /// the declared `allow` rules (divergences). Absent ⇒ the reflexion check is
+    /// simply skipped (purely additive). (graph-roadmap Phase 3.2)
+    #[serde(default)]
+    pub architecture: Option<ArchitectureRules>,
+}
+
+/// Declared layered-architecture rules for reflexion conformance (Phase 3.2).
+///
+/// Example `.pgmcp.toml`:
+/// ```toml
+/// [architecture]
+/// layers = [
+///   { name = "api",    paths = ["src/api/", "src/mcp/"] },
+///   { name = "domain", paths = ["src/graph/", "src/code_analysis/"] },
+///   { name = "data",   paths = ["src/db/"] },
+/// ]
+/// allow = [
+///   { from = "api",    to = "domain" },
+///   { from = "domain", to = "data" },
+/// ]
+/// ```
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ArchitectureRules {
+    /// Layers, each a name + the path prefixes (relative to the project root)
+    /// whose files belong to it. A file is assigned to the FIRST layer with a
+    /// matching prefix, so list more-specific prefixes first.
+    #[serde(default)]
+    pub layers: Vec<LayerDef>,
+    /// Allowed directed dependencies: a file in `from` MAY import a file in
+    /// `to`. Same-layer imports are always allowed and need not be listed. Any
+    /// import edge that is neither same-layer nor listed here is a divergence.
+    #[serde(default)]
+    pub allow: Vec<AllowRule>,
+}
+
+/// One declared architectural layer: a name and the path prefixes it owns.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct LayerDef {
+    pub name: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+/// One permitted directed layer→layer dependency.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AllowRule {
+    pub from: String,
+    pub to: String,
 }
 
 /// Per-project phonetic rule + language override (P14.4).
@@ -2276,6 +2327,7 @@ impl ProjectOverride {
             indexer: None,
             git: Some(GitConfig::default()),
             phonetics: None,
+            architecture: None,
         };
         toml::to_string_pretty(&default).expect("Failed to serialize default project override")
     }

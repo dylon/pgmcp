@@ -16,6 +16,7 @@ pub mod ast_rules;
 pub mod cpg;
 pub mod language_detect;
 pub mod paradigm;
+pub mod reflexion;
 pub mod subtree;
 pub mod taint_dataflow;
 pub mod taint_spec;

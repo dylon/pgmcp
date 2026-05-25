@@ -1978,6 +1978,19 @@ pub struct ArticulationPointsParams {
     pub limit: Option<i32>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ArchitectureDsmParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Graph scope: \"file\" (import graph, default) or \"function\" (call graph)"
+    )]
+    pub scope: Option<String>,
+    #[schemars(
+        description = "Max files per ranked list (top-by-VFI, top-by-VFO, cyclic core); default 20"
+    )]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HitsParams {
     #[schemars(description = "Project name (required)")]
     pub project: String,
@@ -6516,6 +6529,27 @@ nodes/edges whose removal disconnects the graph — sharper than the ownership-b
             &_ctx,
             &summarize_debug(&params),
             super::tools::tool_articulation_points::tool_articulation_points(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Design Structure Matrix metrics: propagation cost + Core/Shared/Control/Peripheral \
+classification over the file import graph or function call graph (MacCormack-Rusnak-Baldwin). USE WHEN: \
+quantifying overall coupling (what fraction of the system a change ripples through) and locating the \
+architectural core, change-risk hubs (high visibility fan-in), and widest-blast-radius files (high fan-out)."
+    )]
+    async fn architecture_dsm(
+        &self,
+        Parameters(params): Parameters<ArchitectureDsmParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "architecture_dsm",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_architecture_dsm::tool_architecture_dsm(self.ctx(), params),
         )
         .await
     }

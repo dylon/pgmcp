@@ -2,6 +2,7 @@ pub mod algorithms;
 pub mod algorithms_ext;
 pub mod builder;
 pub mod call_graph;
+pub mod dsm;
 pub mod import_extractor;
 pub mod info_theory;
 pub mod metrics;
