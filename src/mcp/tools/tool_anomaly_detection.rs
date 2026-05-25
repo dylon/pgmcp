@@ -168,21 +168,33 @@ pub async fn tool_anomaly_detection(
         })
         .collect();
 
-    // Compute composite anomaly score
-    let mut anomalies: Vec<serde_json::Value> = rows
+    // Isolation Forest (Liu-Ting-Zhou 2008): build per-file feature vectors
+    // (distance / size / churn z-scores) and score by isolation ease. Replaces
+    // the hand-weighted z-score sum the `contamination` param always implied.
+    let features: Vec<Vec<f64>> = rows
         .iter()
         .map(|r| {
             let distance_z = (r.avg_distance - mean_dist) / std_dev;
             let (lc_z, churn_z) = z_map.get(&r.file_id).copied().unwrap_or((0.0, 0.0));
+            vec![distance_z, lc_z, churn_z]
+        })
+        .collect();
+    // ψ = 256 (paper default), 100 trees, fixed seed for reproducibility.
+    let iforest = crate::code_analysis::isolation_forest::anomaly_scores(&features, 100, 256, 42);
 
-            // Composite: weighted sum of absolute z-scores
-            let anomaly_score = distance_z.abs() * 0.5 + lc_z.abs() * 0.25 + churn_z.abs() * 0.25;
-
+    let mut anomalies: Vec<serde_json::Value> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            let distance_z = features[i][0];
+            let lc_z = features[i][1];
+            let churn_z = features[i][2];
             serde_json::json!({
                 "path": r.relative_path,
                 "language": r.language,
                 "line_count": r.line_count,
-                "anomaly_score": format!("{:.4}", anomaly_score),
+                "anomaly_score": format!("{:.4}", iforest[i]),
+                "method": "isolation_forest",
                 "embedding_distance": format!("{:.4}", r.avg_distance),
                 "distance_zscore": format!("{:.2}", distance_z),
                 "size_zscore": format!("{:.2}", lc_z),
@@ -204,7 +216,10 @@ pub async fn tool_anomaly_detection(
             .unwrap_or(0.0);
         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
-    anomalies.truncate(limit as usize);
+    // `contamination` sets how many of the highest-scoring files count as
+    // anomalies; `limit` caps the response. Keep the smaller of the two.
+    let contamination_keep = ((contamination * rows.len() as f64).ceil() as usize).min(rows.len());
+    anomalies.truncate(contamination_keep.min(limit as usize));
 
     // Shadow-ASR channel: per-effect symbol-count distribution. Files in
     // anomalous portions of the codebase often correlate with concentrated
@@ -228,10 +243,12 @@ pub async fn tool_anomaly_detection(
         "anomaly_count": anomalies.len(),
         "anomalies": anomalies,
         "effect_distribution": effect_distribution,
-        "guidance": "High anomaly_score files are statistically unusual in their semantic content, \
-                     size, or change patterns. They may be: abandoned experiments, copied from \
-                     another project, auto-generated code, or architectural outliers. \
-                     High distance_zscore (>2) means the file's content is very different from the project norm.",
+        "guidance": "anomaly_score is the Isolation Forest score (Liu-Ting-Zhou 2008) in (0,1]: files that a \
+                     random split-tree isolates in few cuts — unusual in embedding distance, size, or churn — \
+                     score near 1. `contamination` selects how many top-scoring files are returned as \
+                     anomalies. They may be abandoned experiments, copied-in code, auto-generated files, or \
+                     architectural outliers; the *_zscore fields explain which dimension drives the score \
+                     (high distance_zscore = content unlike the project norm).",
     });
 
     let json = serde_json::to_string_pretty(&result)

@@ -14,7 +14,9 @@
 
 pub mod ast_rules;
 pub mod cpg;
+pub mod isolation_forest;
 pub mod language_detect;
+pub mod lof;
 pub mod paradigm;
 pub mod reflexion;
 pub mod subtree;

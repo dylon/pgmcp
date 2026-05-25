@@ -33,60 +33,78 @@ pub async fn tool_embedding_outliers(
         })?;
     let col = active.read_column();
 
-    // For each chunk, find its k nearest neighbours and compute a simplified
-    // LOF: local_reach_density approximated as 1 / mean k-NN cosine distance.
-    // Pure-SQL with pgvector keeps the heavy lifting in Postgres.
+    // For each chunk, fetch its k nearest neighbours (id + cosine distance) via
+    // the HNSW index, then compute TRUE LRD-LOF (Breunig 2000) in Rust: an
+    // outlier is a chunk whose local reachability density is much lower than its
+    // neighbours' — caught even when its absolute distance is unremarkable.
     let sql = format!(
         "WITH project_chunks AS (
             SELECT fc.id, f.relative_path, fc.start_line, fc.end_line, fc.{col} AS emb
             FROM file_chunks fc
             JOIN indexed_files f ON fc.file_id = f.id
             WHERE f.project_id = $1 AND fc.{col} IS NOT NULL
-        ),
-        nn AS (
-            SELECT a.id AS chunk_id, a.relative_path, a.start_line, a.end_line,
-                   AVG((a.emb <=> b.emb)::float8) AS mean_dist
-            FROM project_chunks a
-            JOIN LATERAL (
-                SELECT b.id, b.emb
-                FROM project_chunks b
-                WHERE b.id <> a.id
-                ORDER BY a.emb <=> b.emb
-                LIMIT $2
-            ) b ON true
-            GROUP BY a.id, a.relative_path, a.start_line, a.end_line
         )
-        SELECT chunk_id, relative_path, start_line, end_line, mean_dist FROM nn"
+        SELECT a.id AS chunk_id, a.relative_path, a.start_line, a.end_line,
+               b.id AS neighbor_id, (a.emb <=> b.emb)::float8 AS dist
+        FROM project_chunks a
+        JOIN LATERAL (
+            SELECT b.id, b.emb
+            FROM project_chunks b
+            WHERE b.id <> a.id
+            ORDER BY a.emb <=> b.emb
+            LIMIT $2
+        ) b ON true
+        ORDER BY a.id, dist"
     );
-    let rows: Vec<(i64, String, i32, i32, f64)> =
-        sqlx::query_as::<_, (i64, String, i32, i32, f64)>(&sql)
+    let rows: Vec<(i64, String, i32, i32, i64, f64)> =
+        sqlx::query_as::<_, (i64, String, i32, i32, i64, f64)>(&sql)
             .bind(project_id)
             .bind(k)
             .fetch_all(pool)
             .await
             .map_err(|e| McpError::internal_error(format!("LOF query failed: {}", e), None))?;
 
-    let mut scored: Vec<(i64, String, i32, i32, f64)> = rows;
-    let global_mean: f64 = if scored.is_empty() {
-        0.0
-    } else {
-        scored.iter().map(|r| r.4).sum::<f64>() / scored.len() as f64
-    };
-    // Approximate LOF: chunk's mean k-NN distance / global mean. Outliers >> 1.0.
+    // Assign each chunk a dense index; build the k-NN adjacency the LOF kernel
+    // expects (neighbor indices must reference back into the point set).
+    let mut id_to_idx: HashMap<i64, usize> = HashMap::new();
+    let mut meta: Vec<(i64, String, i32, i32)> = Vec::new();
+    for (cid, path, sl, el, _nid, _d) in &rows {
+        if !id_to_idx.contains_key(cid) {
+            id_to_idx.insert(*cid, meta.len());
+            meta.push((*cid, path.clone(), *sl, *el));
+        }
+    }
+    let n = meta.len();
+    let mut neighbors: Vec<Vec<(usize, f64)>> = vec![Vec::new(); n];
+    let mut mean_knn: Vec<f64> = vec![0.0; n];
+    let mut mean_cnt: Vec<u32> = vec![0; n];
+    for (cid, _p, _sl, _el, nid, d) in &rows {
+        let (Some(&ci), Some(&ni)) = (id_to_idx.get(cid), id_to_idx.get(nid)) else {
+            continue;
+        };
+        neighbors[ci].push((ni, *d));
+        mean_knn[ci] += *d;
+        mean_cnt[ci] += 1;
+    }
+
+    let lof = crate::code_analysis::lof::local_outlier_factors(&neighbors, k as usize);
+
     let mut findings: Vec<serde_json::Value> = Vec::new();
-    if global_mean > 0.0 {
-        for r in &mut scored {
-            let lof = r.4 / global_mean;
-            if lof >= threshold {
-                findings.push(json!({
-                    "chunk_id": r.0,
-                    "file": r.1.clone(),
-                    "start_line": r.2,
-                    "end_line": r.3,
-                    "lof": lof,
-                    "mean_knn_distance": r.4,
-                }));
-            }
+    for i in 0..n {
+        if lof[i] >= threshold {
+            let mean_d = if mean_cnt[i] > 0 {
+                mean_knn[i] / mean_cnt[i] as f64
+            } else {
+                0.0
+            };
+            findings.push(json!({
+                "chunk_id": meta[i].0,
+                "file": meta[i].1.clone(),
+                "start_line": meta[i].2,
+                "end_line": meta[i].3,
+                "lof": lof[i],
+                "mean_knn_distance": mean_d,
+            }));
         }
     }
     findings.sort_by(|a, b| {
@@ -95,6 +113,11 @@ pub async fn tool_embedding_outliers(
         bv.partial_cmp(&av).unwrap_or(std::cmp::Ordering::Equal)
     });
     findings.truncate(limit.max(0) as usize);
+    let global_mean: f64 = if n > 0 {
+        mean_knn.iter().sum::<f64>() / mean_knn.len() as f64
+    } else {
+        0.0
+    };
     // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown
     // for the project. Universal enrichment — every tool benefits from
     // surfacing the effect distribution alongside its primary output.
@@ -129,6 +152,10 @@ pub async fn tool_embedding_outliers(
         "threshold": threshold,
         "global_mean_distance": global_mean,
         "outliers": findings,
-        "guidance": "Approximate LOF (Breunig et al. SIGMOD 2000): chunks whose mean k-NN cosine distance is >= threshold × global mean are local outliers. Distinct from topic orphans — these are chunks unlike *any* neighbourhood."
+        "guidance": "True LRD-LOF (Breunig et al. SIGMOD 2000): `lof` is the ratio of a chunk's neighbours' \
+            local reachability density to its own. LOF ≈ 1 is an inlier; LOF ≫ threshold (default 1.5) means \
+            the chunk is far sparser than its neighbourhood — a genuine local outlier, caught even when its \
+            absolute distance is ordinary (unlike the prior mean-distance heuristic). Distinct from topic \
+            orphans — these are chunks unlike *any* neighbourhood."
     }))
 }
