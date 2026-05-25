@@ -14,6 +14,7 @@ pub mod analyze;
 pub mod context;
 pub mod daemon;
 pub mod embed_cutover;
+pub mod import_advisories;
 pub mod reindex;
 pub mod results;
 pub mod statistics;

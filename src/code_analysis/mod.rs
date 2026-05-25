@@ -26,3 +26,4 @@ pub mod subtree;
 pub mod taint_dataflow;
 pub mod taint_interproc;
 pub mod taint_spec;
+pub mod vuln_match;

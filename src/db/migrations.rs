@@ -534,6 +534,38 @@ pub async fn run_migrations(
     .await?;
 
     // ================================================================
+    // Offline vulnerability advisories (graph-roadmap Phase 4.5)
+    // ----------------------------------------------------------------
+    // Populated OUT-OF-BAND by `pgmcp import-advisories <osv-dump>` — a local
+    // OSV/GHSA dump import, never a runtime network fetch (local-only posture).
+    // One row per (advisory, affected package, version range);
+    // `cve_supply_chain` matches the parsed dependency inventory against these
+    // by SemVer range.
+    // ================================================================
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS vuln_advisories (
+            id            BIGSERIAL PRIMARY KEY,
+            advisory_id   TEXT NOT NULL,
+            ecosystem     TEXT NOT NULL,
+            package       TEXT NOT NULL,
+            introduced    TEXT,
+            fixed         TEXT,
+            last_affected TEXT,
+            severity      TEXT,
+            summary       TEXT,
+            imported_at   TIMESTAMPTZ DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_vuln_advisories_eco_pkg
+            ON vuln_advisories (ecosystem, package)",
+    )
+    .execute(pool)
+    .await?;
+
+    // ================================================================
     // File metrics table (precomputed per-file graph & quality metrics)
     // ================================================================
 

@@ -196,6 +196,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Import a local OSV/GHSA advisory dump into `vuln_advisories` for
+    /// offline CVE matching (graph-roadmap Phase 4.5). PATH is a single
+    /// `.json`, a `.jsonl`, or a directory tree of OSV JSON files. This is the
+    /// documented out-of-band refresh — pgmcp never fetches advisories over the
+    /// network at runtime. `cve_supply_chain` then matches the dependency
+    /// inventory against the imported advisories by SemVer range.
+    ImportAdvisories {
+        /// Path to the OSV dump (file, .jsonl, or directory).
+        path: std::path::PathBuf,
+    },
 }
 
 /// Cap the number of glibc malloc thread arenas BEFORE the tokio runtime
@@ -267,6 +277,7 @@ async fn async_main() -> anyhow::Result<()> {
             schema,
         } => cli::tool::run(cfg, name, args, json, schema).await,
         Commands::Results { kind, limit } => cli::results::run(cfg, kind, limit).await,
+        Commands::ImportAdvisories { path } => cli::import_advisories::run(cfg, path).await,
         Commands::Status { model, json } => cli::status::run(cfg, model, json).await,
         Commands::EmbedCutover {
             to,

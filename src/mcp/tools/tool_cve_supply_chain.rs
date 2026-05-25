@@ -124,10 +124,84 @@ pub async fn tool_cve_supply_chain(
         })
     })
     .collect::<Vec<_>>();
+
+    // Phase 4.5: match the inventory against OFFLINE-imported advisories
+    // (`pgmcp import-advisories`). Local-only — no network. Group by ecosystem,
+    // load advisories for the inventory's packages, SemVer-match each dependency.
+    use std::collections::{HashMap, HashSet};
+    let mut by_eco: HashMap<String, HashSet<String>> = HashMap::new();
+    for d in &dependencies {
+        if let (Some(eco), Some(name)) = (
+            d.get("ecosystem").and_then(|v| v.as_str()),
+            d.get("name").and_then(|v| v.as_str()),
+        ) {
+            by_eco
+                .entry(eco.to_string())
+                .or_default()
+                .insert(name.to_string());
+        }
+    }
+    let mut adv_map: HashMap<(String, String), Vec<crate::db::queries::VulnAdvisoryRow>> =
+        HashMap::new();
+    for (eco, pkgs) in &by_eco {
+        let pkg_vec: Vec<String> = pkgs.iter().cloned().collect();
+        if let Ok(rows) = crate::db::queries::load_vuln_advisories(pool, eco, &pkg_vec).await {
+            for r in rows {
+                adv_map
+                    .entry((r.ecosystem.clone(), r.package.clone()))
+                    .or_default()
+                    .push(r);
+            }
+        }
+    }
+    let advisories_loaded: usize = adv_map.values().map(|v| v.len()).sum();
+    let mut vulnerabilities: Vec<serde_json::Value> = Vec::new();
+    for d in &dependencies {
+        let (Some(eco), Some(name), Some(ver)) = (
+            d.get("ecosystem").and_then(|v| v.as_str()),
+            d.get("name").and_then(|v| v.as_str()),
+            d.get("version").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let Some(version) = crate::code_analysis::vuln_match::parse_version(ver) else {
+            continue;
+        };
+        if let Some(rows) = adv_map.get(&(eco.to_string(), name.to_string())) {
+            for r in rows {
+                let range = crate::code_analysis::vuln_match::VulnRange {
+                    introduced: r.introduced.clone(),
+                    fixed: r.fixed.clone(),
+                    last_affected: r.last_affected.clone(),
+                };
+                if range.contains(&version) {
+                    vulnerabilities.push(json!({
+                        "advisory_id": r.advisory_id,
+                        "ecosystem": eco,
+                        "package": name,
+                        "version": ver,
+                        "severity": r.severity,
+                        "summary": r.summary,
+                        "introduced": r.introduced,
+                        "fixed": r.fixed,
+                    }));
+                }
+            }
+        }
+    }
+
     json_result(&json!({
         "project": params.project,
         "dependencies": dependencies,
+        "advisories_loaded": advisories_loaded,
+        "vulnerability_count": vulnerabilities.len(),
+        "vulnerabilities": vulnerabilities,
         "risky_effect_symbols": risky_effect_symbols,
-        "guidance": "Lists every dependency parsed from lockfiles. Cross-reference with https://api.osv.dev/v1/querybatch (network access required) — pgmcp surfaces the inventory only, leaving the live CVE lookup to the operator's audit workflow."
+        "guidance": "`vulnerabilities` are dependency versions that fall in a known advisory's vulnerable \
+            SemVer range, matched OFFLINE against advisories imported via `pgmcp import-advisories <osv-dump>` \
+            (no network). `advisories_loaded=0` means no dump has been imported yet — run that command on a \
+            local OSV/GHSA export first. Cross-reference flagged packages with `risky_effect_symbols` \
+            (unsafe / network / weak-crypto) to gauge blast radius; `fixed` is the first non-vulnerable \
+            version to upgrade to."
     }))
 }
