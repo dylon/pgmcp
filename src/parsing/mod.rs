@@ -24,6 +24,7 @@ pub mod c_cpp;
 pub mod clojure;
 pub mod complexity;
 pub mod coq;
+pub mod dataflow;
 pub mod function_metrics;
 pub mod java;
 pub mod javascript;

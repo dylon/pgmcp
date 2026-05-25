@@ -21,6 +21,8 @@ use syn::{
 
 #[path = "rust/helpers.rs"]
 mod helpers;
+#[path = "rust/dataflow.rs"]
+mod rust_dataflow;
 #[path = "rust/type_mapper.rs"]
 mod type_mapper;
 use helpers::*;
@@ -112,6 +114,10 @@ impl LanguageBackend for RustBackend {
         let mut v = ComplexityVisitor::default();
         v.visit_file(&file);
         v.into_metrics()
+    }
+
+    fn extract_dataflow(&self, content: &str) -> Vec<crate::parsing::dataflow::FunctionDataflow> {
+        rust_dataflow::extract(content)
     }
 }
 

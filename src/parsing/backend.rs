@@ -1,3 +1,4 @@
+use super::dataflow::FunctionDataflow;
 use super::function_metrics::FunctionMetrics;
 use super::symbols::{Import, Symbol, SymbolReference};
 
@@ -35,6 +36,18 @@ pub trait LanguageBackend: Send + Sync {
     /// incrementally — until a language's CFG/operator-vocabulary pass
     /// lands, that language simply has no per-function metrics.
     fn extract_function_metrics(&self, _content: &str) -> Vec<FunctionMetrics> {
+        Vec::new()
+    }
+
+    /// Extract per-function intraprocedural data-flow facts (def-use edges +
+    /// taint source/sink/sanitizer tags) for the taint engine
+    /// (`crate::code_analysis::taint_dataflow`).
+    ///
+    /// Default returns `Vec::new()` so backends roll out incrementally (exactly
+    /// like `extract_function_metrics`); until a language's def-use pass lands,
+    /// `tool_taint_analysis` falls back to its regex co-occurrence heuristic for
+    /// that language. Rust ships first (richest AST via `syn`).
+    fn extract_dataflow(&self, _content: &str) -> Vec<FunctionDataflow> {
         Vec::new()
     }
 }

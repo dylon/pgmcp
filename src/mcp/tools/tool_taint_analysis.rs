@@ -1,9 +1,13 @@
-//! `tool_taint_analysis` — Source→sink pattern detection (SOTA Phase 6.1, Newsome-Song NDSS 2005).
+//! `tool_taint_analysis` — source→sink taint (graph-roadmap Phase 2.1; Newsome-Song
+//! NDSS 2005; CPG reachability framing Yamaguchi et al. S&P 2014).
 //!
-//! Heuristic: list lines that match a taint *source* (request input, env var, file read)
-//! and lines that match a taint *sink* (exec, raw SQL, eval, format string into shell)
-//! in the same file. A real CFG-based taint analysis requires call-graph + data-flow
-//! tracking; this tool surfaces high-risk co-occurrences for manual review.
+//! For languages with a def-use backend (currently Rust) this runs a **real
+//! intraprocedural data-flow analysis**: a finding requires that a value
+//! *derived from* a taint source *reaches* a dangerous sink without passing a
+//! sanitizer (`crate::code_analysis::taint_dataflow`). Languages without a
+//! def-use backend fall back to the previous regex source/sink *co-occurrence*
+//! heuristic — separated and labeled, so real flows aren't confused with
+//! review candidates.
 
 #![allow(unused_imports)]
 
@@ -11,16 +15,67 @@ use regex::Regex;
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
 use serde_json::json;
-use std::collections::HashMap;
+use sqlx::PgPool;
 use std::sync::atomic::Ordering;
 
+use crate::code_analysis::taint_dataflow::{TaintFinding, analyze_function};
 use crate::context::SystemContext;
 use crate::mcp::server::TaintAnalysisParams;
 use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
+use crate::parsing::LanguageRegistry;
 use crate::parsing::type_tags::vocabulary::{
     EFFECT_CRYPTO, EFFECT_DATABASE, EFFECT_FILESYSTEM, EFFECT_NETWORK,
 };
+
+/// Languages whose backend implements `extract_dataflow` (real flow). Others
+/// use the regex co-occurrence fallback. Append as backends grow.
+pub(crate) const DATAFLOW_LANGUAGES: &[&str] = &["rust"];
+
+/// One real source→sink flow, tagged with its file and language. Shared by
+/// `taint_analysis` and `injection_candidates`.
+pub(crate) struct DataflowHit {
+    pub path: String,
+    pub language: String,
+    pub finding: TaintFinding,
+}
+
+/// Run the real intraprocedural taint engine over every def-use-capable file in
+/// the project. Fetches only `DATAFLOW_LANGUAGES` files (so the regex fallback
+/// owns the rest). Pure CPU per file; no transaction.
+pub(crate) async fn scan_project_dataflow(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Vec<DataflowHit>, sqlx::Error> {
+    let rows: Vec<(String, String, Option<String>)> =
+        sqlx::query_as::<_, (String, String, Option<String>)>(
+            "SELECT relative_path, language, content
+             FROM indexed_files
+             WHERE project_id = $1 AND content IS NOT NULL AND language = ANY($2)",
+        )
+        .bind(project_id)
+        .bind(DATAFLOW_LANGUAGES)
+        .fetch_all(pool)
+        .await?;
+
+    let mut out = Vec::new();
+    for (path, lang, content) in rows {
+        let Some(c) = content else { continue };
+        let Some(backend) = LanguageRegistry::for_language(&lang) else {
+            continue;
+        };
+        for df in backend.extract_dataflow(&c) {
+            for finding in analyze_function(&df) {
+                out.push(DataflowHit {
+                    path: path.clone(),
+                    language: lang.clone(),
+                    finding,
+                });
+            }
+        }
+    }
+    Ok(out)
+}
 
 pub async fn tool_taint_analysis(
     ctx: &SystemContext,
@@ -30,7 +85,30 @@ pub async fn tool_taint_analysis(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let project_id = project_id_or_err(ctx, &params.project).await?;
     let pool = pool_or_err(ctx)?;
+    let limit = params.limit.unwrap_or(30).max(0) as usize;
 
+    // Real source→sink flows (def-use backends).
+    let mut dataflow_findings: Vec<serde_json::Value> = scan_project_dataflow(pool, project_id)
+        .await
+        .map_err(|e| McpError::internal_error(format!("Dataflow scan failed: {}", e), None))?
+        .into_iter()
+        .map(|h| {
+            json!({
+                "file": h.path,
+                "language": h.language,
+                "function": h.finding.function,
+                "source_kind": h.finding.source_kind,
+                "source_line": h.finding.source_line,
+                "sink_kind": h.finding.sink_kind,
+                "sink_callee": h.finding.sink_callee,
+                "sink_line": h.finding.sink_line,
+                "flow_hops": h.finding.path.len(),
+            })
+        })
+        .collect();
+    dataflow_findings.truncate(limit);
+
+    // Regex source/sink co-occurrence for languages without a def-use backend.
     let source_re = Regex::new(
         r"(?m)\b(req\.body|req\.params|req\.query|request\.json|request\.form|request\.args|argv|env::var|std::env::var|getenv|input\(\)|stdin)\b",
     )
@@ -39,21 +117,22 @@ pub async fn tool_taint_analysis(
         r"(?m)\b(Command::new|exec\(|eval\(|spawn_shell|subprocess\.run|os\.system|sql\.query\(|execute\(|Runtime\.exec|shell_exec|sqlx::query_unchecked)\b",
     )
     .expect("sink regex");
-
     let rows: Vec<(String, String, Option<String>)> =
         sqlx::query_as::<_, (String, String, Option<String>)>(
             "SELECT relative_path, language, content
              FROM indexed_files
-             WHERE project_id = $1 AND content IS NOT NULL",
+             WHERE project_id = $1 AND content IS NOT NULL AND NOT (language = ANY($2))",
         )
         .bind(project_id)
+        .bind(DATAFLOW_LANGUAGES)
         .fetch_all(pool)
         .await
         .map_err(|e| McpError::internal_error(format!("Scan failed: {}", e), None))?;
-
-    let limit = params.limit.unwrap_or(30);
-    let mut findings: Vec<serde_json::Value> = Vec::new();
+    let mut heuristic_findings: Vec<serde_json::Value> = Vec::new();
     for (path, lang, content) in rows {
+        if heuristic_findings.len() >= limit {
+            break;
+        }
         let Some(c) = content else { continue };
         let sources: Vec<u32> = source_re
             .find_iter(&c)
@@ -66,21 +145,14 @@ pub async fn tool_taint_analysis(
         if sources.is_empty() || sinks.is_empty() {
             continue;
         }
-        findings.push(json!({
+        heuristic_findings.push(json!({
             "file": path,
             "language": lang,
             "source_lines": sources,
             "sink_lines": sinks,
         }));
-        if findings.len() >= limit.max(0) as usize {
-            break;
-        }
     }
-    // Shadow-ASR channel: symbols carrying any of the I/O-shaped effects
-    // (`network`, `filesystem`, `database`, `crypto`). These are
-    // candidates for taint sinks even when the regex didn't match —
-    // useful for cross-checking the regex findings or when the regex
-    // misses a sink that the extractor caught structurally.
+
     let io_effects = vec![
         EFFECT_NETWORK.to_string(),
         EFFECT_FILESYSTEM.to_string(),
@@ -103,8 +175,14 @@ pub async fn tool_taint_analysis(
 
     json_result(&json!({
         "project": params.project,
-        "findings": findings,
+        "dataflow_findings": dataflow_findings,
+        "heuristic_findings": heuristic_findings,
         "io_effect_symbols": io_symbols,
-        "guidance": "Files where both sources (request/env/stdin) and sinks (exec/eval/SQL) appear are taint candidates. Manual review needed to confirm flow. The `io_effect_symbols` channel surfaces symbols carrying network/filesystem/database/crypto effects — candidates for sinks beyond the regex's matching surface."
+        "guidance": "`dataflow_findings` are REAL intraprocedural source→sink flows (Rust): a value from a \
+            taint source (env/argv/stdin/request) provably reaches a dangerous sink (command/sql/eval/deserialize/\
+            path) without passing a sanitizer — high confidence. `heuristic_findings` are the older regex \
+            source/sink *co-occurrence* in one file (languages without a def-use backend yet): review candidates, \
+            not confirmed flows. `io_effect_symbols` lists symbols carrying network/filesystem/database/crypto \
+            effects. Analysis is intraprocedural — taint crossing function boundaries is not yet tracked."
     }))
 }
