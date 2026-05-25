@@ -8528,6 +8528,97 @@ pub async fn bulk_insert_semantic_edges(
     Ok(res.rows_affected())
 }
 
+/// A representative chunk for a file in a code-PPR result (graph-roadmap
+/// Phase 3.3): the file's single best-matching chunk for the query.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PprFileChunk {
+    pub file_id: i64,
+    pub relative_path: String,
+    pub language: String,
+    pub content: String,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub similarity: f64,
+}
+
+/// Choose the active embedding column for a query vector by its dimensionality
+/// (384 = legacy MiniLM `embedding`, 1024 = BGE-M3 `embedding_v2`).
+fn embedding_column_for_dim(dim: usize) -> Result<&'static str, sqlx::Error> {
+    match dim {
+        384 => Ok("embedding"),
+        1024 => Ok("embedding_v2"),
+        other => Err(sqlx::Error::Protocol(format!(
+            "unsupported query-embedding dim {other} (expected 384 or 1024)"
+        ))),
+    }
+}
+
+/// Seed files for code-PPR retrieval (Phase 3.3): the distinct files of the top
+/// `limit` chunks nearest to `embedding` within the project, each with its best
+/// (max) chunk cosine similarity. HNSW-accelerated via the top-`limit` chunk
+/// scan; aggregated to files in SQL. Returns `(file_id, similarity)` desc.
+pub async fn ppr_seed_files(
+    pool: &PgPool,
+    embedding: &[f32],
+    project_id: i32,
+    limit: i32,
+    ef_search: i32,
+) -> Result<Vec<(i64, f64)>, sqlx::Error> {
+    let col = embedding_column_for_dim(embedding.len())?;
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query_as::<_, (i64, f64)>(&format!(
+        "SELECT file_id, MAX(sim)::float8 AS sim FROM (
+            SELECT c.file_id, (1.0 - (c.{col} <=> $1)) AS sim
+            FROM file_chunks c
+            JOIN indexed_files f ON f.id = c.file_id
+            WHERE f.project_id = $2 AND c.{col} IS NOT NULL
+            ORDER BY c.{col} <=> $1
+            LIMIT $3
+         ) t
+         GROUP BY file_id
+         ORDER BY sim DESC"
+    ))
+    .bind(embedding_vec)
+    .bind(project_id)
+    .bind(limit)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
+}
+
+/// The single best-matching chunk per file (by cosine to `embedding`) for the
+/// given `file_ids`. Used to materialize code-PPR results after the graph walk
+/// re-ranks files. (Phase 3.3)
+pub async fn best_chunk_per_file(
+    pool: &PgPool,
+    embedding: &[f32],
+    file_ids: &[i64],
+) -> Result<Vec<PprFileChunk>, sqlx::Error> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let col = embedding_column_for_dim(embedding.len())?;
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+    sqlx::query_as::<_, PprFileChunk>(&format!(
+        "SELECT DISTINCT ON (c.file_id)
+                c.file_id, f.relative_path, f.language, c.content,
+                c.start_line, c.end_line, (1.0 - (c.{col} <=> $1))::float8 AS similarity
+         FROM file_chunks c
+         JOIN indexed_files f ON f.id = c.file_id
+         WHERE c.file_id = ANY($2) AND c.{col} IS NOT NULL
+         ORDER BY c.file_id, c.{col} <=> $1"
+    ))
+    .bind(embedding_vec)
+    .bind(file_ids)
+    .fetch_all(pool)
+    .await
+}
+
 /// Update `function_metrics.fan_in` / `fan_out` for a batch of function IDs.
 /// Rows whose function_id has no row in `function_metrics` are silently
 /// ignored (their metrics row hasn't been computed yet; the next

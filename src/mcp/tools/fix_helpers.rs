@@ -156,6 +156,79 @@ pub async fn load_import_graph(
     })
 }
 
+/// Load the project's **full** dependency graph — every `edge_type`
+/// (`import` / `call` / `co_change` / `semantic`) at file granularity — plus
+/// file metadata, returning the composed `CodeGraph`. Identical to
+/// `load_import_graph` minus the `edge_type = 'import'` filter; used by
+/// graph-aware retrieval (code-PPR, Phase 3.3) where all relatedness signals
+/// help expansion, not just structural imports.
+pub async fn load_code_graph_all_edges(
+    ctx: &SystemContext,
+    project_id: i32,
+) -> Result<ImportGraphBundle, McpError> {
+    let pool = pool_or_err(ctx)?;
+
+    let edges: Vec<EdgeRowDb> = sqlx::query_as::<_, EdgeRowDb>(
+        "SELECT
+            e.source_file_id,
+            sf.relative_path AS source_relative_path,
+            sf.language AS source_language,
+            e.target_file_id,
+            tf.relative_path AS target_relative_path,
+            tf.language AS target_language,
+            e.edge_type,
+            e.weight
+         FROM code_graph_edges e
+         JOIN indexed_files sf ON e.source_file_id = sf.id
+         LEFT JOIN indexed_files tf ON e.target_file_id = tf.id
+         WHERE e.project_id = $1 AND e.target_file_id IS NOT NULL",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| McpError::internal_error(format!("Edge query failed: {}", e), None))?;
+
+    let file_metas: Vec<FileMetaDb> = sqlx::query_as::<_, FileMetaDb>(
+        "SELECT id AS file_id, relative_path, language
+         FROM indexed_files WHERE project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| McpError::internal_error(format!("File query failed: {}", e), None))?;
+
+    let graph_edges: Vec<GraphEdgeRow> = edges
+        .iter()
+        .map(|e| GraphEdgeRow {
+            source_file_id: e.source_file_id,
+            source_relative_path: e.source_relative_path.clone(),
+            source_language: e.source_language.clone(),
+            target_file_id: e.target_file_id,
+            target_relative_path: e.target_relative_path.clone(),
+            target_language: e.target_language.clone(),
+            edge_type: e.edge_type.clone(),
+            weight: e.weight,
+        })
+        .collect();
+
+    let metas: Vec<FileMetaRow> = file_metas
+        .iter()
+        .map(|f| FileMetaRow {
+            file_id: f.file_id,
+            relative_path: f.relative_path.clone(),
+            language: f.language.clone(),
+        })
+        .collect();
+
+    let graph = build_graph(&graph_edges, &metas);
+
+    Ok(ImportGraphBundle {
+        graph,
+        edges,
+        file_metas,
+    })
+}
+
 /// List the files that import (have an outgoing edge into) `target_file_id`,
 /// using only the in-memory graph (no DB roundtrip). Returns `(file_id, path)`
 /// pairs sorted by path for deterministic output.

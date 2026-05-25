@@ -1991,6 +1991,19 @@ pub struct ArchitectureDsmParams {
     pub limit: Option<i32>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CodePprSearchParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Natural-language or code query (required)")]
+    pub query: String,
+    #[schemars(description = "Number of result files to return (default: 10, max 100)")]
+    pub k: Option<i32>,
+    #[schemars(description = "Dense seed files to restart PageRank on (default: 10, max 100)")]
+    pub max_seeds: Option<i32>,
+    #[schemars(description = "PageRank damping/restart factor alpha in [0,1] (default: 0.85)")]
+    pub alpha: Option<f64>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HitsParams {
     #[schemars(description = "Project name (required)")]
     pub project: String,
@@ -6550,6 +6563,27 @@ architectural core, change-risk hubs (high visibility fan-in), and widest-blast-
             &_ctx,
             &summarize_debug(&params),
             super::tools::tool_architecture_dsm::tool_architecture_dsm(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Graph-aware code retrieval via Personalized PageRank (HippoRAG) over the code \
+graph (import/call/co_change/semantic). USE WHEN: a query is relational ('how does X flow to Y', 'what \
+configures Z') — PPR pulls in callers/callees/config one or two hops from the lexical hits that flat \
+`semantic_search` / `hybrid_search` miss, in one shot."
+    )]
+    async fn code_ppr_search(
+        &self,
+        Parameters(params): Parameters<CodePprSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "code_ppr_search",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_code_ppr_search::tool_code_ppr_search(self.ctx(), params),
         )
         .await
     }
