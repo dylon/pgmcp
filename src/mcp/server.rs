@@ -2004,6 +2004,24 @@ pub struct CodePprSearchParams {
     pub alpha: Option<f64>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CodePathSearchParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Natural-language or code query (required)")]
+    pub query: String,
+    #[schemars(description = "Number of ranked paths to return (default: 15, max 200)")]
+    pub k: Option<i32>,
+    #[schemars(description = "Dense seed files to start paths from (default: 5, max 50)")]
+    pub max_seeds: Option<i32>,
+    #[schemars(description = "Maximum edges per path (default: 4, max 6)")]
+    pub max_hops: Option<i32>,
+    #[schemars(
+        description = "Prune a path once its accumulated flow (product of edge weights) drops below \
+this; in [0,1], default 0.1"
+    )]
+    pub min_flow: Option<f64>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct HitsParams {
     #[schemars(description = "Project name (required)")]
     pub project: String,
@@ -6584,6 +6602,27 @@ configures Z') — PPR pulls in callers/callees/config one or two hops from the 
             &_ctx,
             &summarize_debug(&params),
             super::tools::tool_code_ppr_search::tool_code_ppr_search(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "PathRAG over the code graph: ranked, flow-pruned dependency ROUTES (import/call/\
+co_change/semantic chains) from the query's dense-similar files. USE WHEN: tracing 'how does A reach B' \
+or the strongest chain linking a query hit to related code — returns the actual paths, where \
+`code_ppr_search` returns ranked files."
+    )]
+    async fn code_path_search(
+        &self,
+        Parameters(params): Parameters<CodePathSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "code_path_search",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_code_path_search::tool_code_path_search(self.ctx(), params),
         )
         .await
     }

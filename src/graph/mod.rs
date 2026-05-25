@@ -6,6 +6,7 @@ pub mod dsm;
 pub mod import_extractor;
 pub mod info_theory;
 pub mod metrics;
+pub mod pathrank;
 #[allow(dead_code)]
 pub mod ports;
 pub mod types;
