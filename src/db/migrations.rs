@@ -1990,6 +1990,12 @@ async fn ensure_memory_v2_columns(pool: &PgPool) -> Result<(), sqlx::Error> {
         // sparsevec HNSW non-zero-dimension cap. Backfilled by the
         // embedding-migration cron; chunks without it fall back to dense+BM25.
         "ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS sparse_v2 sparsevec(250002)",
+        // Graph-roadmap Phase 2.4 (Contextual Retrieval): the deterministic
+        // situating prefix prepended to a chunk before embedding. NULL = not yet
+        // contextualized; the cron drains those, re-embeds `embedding_v2` from
+        // `contextual_text || content`, and stamps the prefix here. The raw
+        // `content` returned to the agent is never modified.
+        "ALTER TABLE file_chunks ADD COLUMN IF NOT EXISTS contextual_text TEXT",
         "ALTER TABLE session_prompts ADD COLUMN IF NOT EXISTS embedding_v2 vector(1024)",
         "ALTER TABLE session_prompts ADD COLUMN IF NOT EXISTS embedding_signature TEXT",
         "ALTER TABLE durable_mandates ADD COLUMN IF NOT EXISTS embedding vector(1024)",

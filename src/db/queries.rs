@@ -1109,6 +1109,61 @@ pub async fn hybrid_search_chunks(
     Ok(results)
 }
 
+/// One chunk plus its deterministic context inputs, for the contextual
+/// re-embed cron (graph-roadmap Phase 2.4). The enclosing symbol is the
+/// innermost `file_symbols` row whose line span contains the chunk.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ChunkContextRow {
+    pub id: i64,
+    pub content: String,
+    pub relative_path: String,
+    pub language: String,
+    pub symbol_kind: Option<String>,
+    pub symbol_name: Option<String>,
+    pub symbol_signature: Option<String>,
+    pub importer_count: i64,
+}
+
+/// Drain up to `batch_size` `file_chunks` that have a dense `embedding_v2` but
+/// no `contextual_text` yet, with their context inputs (enclosing symbol via a
+/// line-span LATERAL, importer count from import edges). `FOR UPDATE OF c SKIP
+/// LOCKED` makes concurrent passes safe.
+pub async fn get_chunks_needing_context(
+    pool: &PgPool,
+    batch_size: i32,
+) -> Result<Vec<ChunkContextRow>, sqlx::Error> {
+    sqlx::query_as::<_, ChunkContextRow>(
+        "SELECT c.id, c.content, f.relative_path, f.language,
+                sym.kind AS symbol_kind, sym.name AS symbol_name,
+                sym.signature AS symbol_signature,
+                COALESCE(imp.cnt, 0) AS importer_count
+         FROM file_chunks c
+         JOIN indexed_files f ON f.id = c.file_id
+         LEFT JOIN LATERAL (
+             SELECT fs.kind, fs.name, fs.signature
+             FROM file_symbols fs
+             WHERE fs.file_id = c.file_id
+               AND fs.start_line <= c.start_line
+               AND fs.end_line >= c.end_line
+               AND fs.kind IN ('function','method','class','struct','impl','trait','interface','enum','module')
+             ORDER BY fs.start_line DESC
+             LIMIT 1
+         ) sym ON true
+         LEFT JOIN LATERAL (
+             SELECT COUNT(*) AS cnt
+             FROM code_graph_edges e
+             WHERE e.target_file_id = c.file_id AND e.edge_type = 'import'
+         ) imp ON true
+         WHERE c.contextual_text IS NULL AND c.embedding_v2 IS NOT NULL
+         ORDER BY c.id
+         LIMIT $1
+         FOR UPDATE OF c SKIP LOCKED",
+    )
+    .bind(batch_size as i64)
+    .fetch_all(pool)
+    .await
+}
+
 /// Full-text search using PostgreSQL tsvector/tsquery over per-chunk
 /// FTS. Returns one row per matching file with `content` set to the
 /// best-ranked chunk's body (not the whole file); this preserves the

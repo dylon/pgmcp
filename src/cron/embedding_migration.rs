@@ -28,7 +28,9 @@ use sqlx::PgPool;
 use tracing::{debug, error, info, warn};
 
 use crate::config::EmbeddingsConfig;
+use crate::db::queries;
 use crate::embed::model::{BGE_M3_SIGNATURE, Embedder};
+use crate::indexer::contextualize::{ChunkContext, build_context_prefix};
 use crate::stats::tracker::StatsTracker;
 
 /// Configuration for the embedding-migration cron pass. Built from the
@@ -76,6 +78,8 @@ pub struct MigrationPassReport {
     pub session_mandates_migrated: u64,
     /// Phase 2.3: file_chunks whose BGE-M3 learned-sparse vector was backfilled.
     pub file_chunks_sparse_backfilled: u64,
+    /// Phase 2.4: file_chunks re-embedded with a contextual-retrieval prefix.
+    pub file_chunks_contextualized: u64,
     pub batches_completed: u64,
     /// Number of batches that errored (and are retried on the next tick
     /// because the WHERE clause picks them back up).
@@ -157,6 +161,30 @@ pub async fn run_embedding_migration_pass(
                         .fetch_add(1, Ordering::Relaxed);
                     break;
                 }
+            }
+        }
+    }
+
+    // Phase 2.4: contextual re-embed — prepend a deterministic situating prefix
+    // (file/symbol/importers) and re-embed `embedding_v2` from prefix||content.
+    // Dense leg only (primary semantic signal); NULL-tolerant — un-processed
+    // chunks keep their non-contextual embedding, comparable since same
+    // model/dim. Runs after symbol-extraction/graph-analysis ideally, but
+    // degrades gracefully (thinner prefix) if those lag.
+    for _ in 0..config.max_batches {
+        match contextualize_file_chunks_batch(pool, &embedder, config.batch_size).await {
+            Ok(n) if n > 0 => {
+                report.file_chunks_contextualized += n;
+                report.batches_completed += 1;
+            }
+            Ok(_) => break,
+            Err(e) => {
+                warn!(error = %e, "file_chunks contextual re-embed batch failed");
+                report.errors += 1;
+                stats
+                    .embeddings_migration_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                break;
             }
         }
     }
@@ -385,6 +413,69 @@ async fn backfill_file_chunks_sparse_batch(
             .bind(id)
             .execute(&mut *tx)
             .await?;
+        count += 1;
+    }
+    tx.commit().await?;
+    Ok(count)
+}
+
+/// Drain up to `batch_size` `file_chunks` with a dense `embedding_v2` but no
+/// `contextual_text`, prepend the deterministic contextual prefix, and
+/// re-embed `embedding_v2` from `prefix || content` (graph-roadmap Phase 2.4).
+/// Stamps `contextual_text` (empty string when no context) so the row is not
+/// re-processed. Returns the number contextualized (0 = drained).
+async fn contextualize_file_chunks_batch(
+    pool: &PgPool,
+    embedder: &Arc<Embedder>,
+    batch_size: usize,
+) -> Result<u64, sqlx::Error> {
+    let rows = queries::get_chunks_needing_context(pool, batch_size as i32).await?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let mut prefixes: Vec<String> = Vec::with_capacity(rows.len());
+    let mut prefixed: Vec<String> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        let ctx = ChunkContext {
+            relative_path: r.relative_path.clone(),
+            language: r.language.clone(),
+            symbol_kind: r.symbol_kind.clone(),
+            symbol_name: r.symbol_name.clone(),
+            symbol_signature: r.symbol_signature.clone(),
+            topics: Vec::new(),
+            importer_count: r.importer_count,
+        };
+        let prefix = build_context_prefix(&ctx);
+        prefixed.push(format!("{prefix}{}", r.content));
+        prefixes.push(prefix);
+    }
+    let texts: Vec<&str> = prefixed.iter().map(|s| s.as_str()).collect();
+    let vectors = match embedder.embed(&texts) {
+        Ok(v) => v,
+        Err(e) => return Err(sqlx::Error::Configuration(e.to_string().into())),
+    };
+    if vectors.len() != rows.len() {
+        return Err(sqlx::Error::Protocol(format!(
+            "embed returned {} vectors for {} inputs",
+            vectors.len(),
+            rows.len()
+        )));
+    }
+    let mut tx = pool.begin().await?;
+    let mut count = 0_u64;
+    for ((r, prefix), vec) in rows.iter().zip(prefixes).zip(vectors) {
+        let v = Vector::from(vec);
+        sqlx::query(
+            "UPDATE file_chunks
+             SET embedding_v2 = $1, contextual_text = $2, embedding_signature = $3
+             WHERE id = $4",
+        )
+        .bind(&v)
+        .bind(prefix.as_str())
+        .bind(BGE_M3_SIGNATURE)
+        .bind(r.id)
+        .execute(&mut *tx)
+        .await?;
         count += 1;
     }
     tx.commit().await?;

@@ -2,6 +2,7 @@ pub mod chunker;
 pub mod claude_chunker;
 pub mod codex_chunker;
 pub mod config_watcher;
+pub mod contextualize;
 pub mod document_chunker;
 pub mod event_processor;
 pub mod extract;
