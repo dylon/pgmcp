@@ -57,7 +57,7 @@ pub async fn tool_semantic_drift(
             JOIN git_commit_chunks gcc ON gcc.commit_id = gc.id
             WHERE f.project_id = $1 AND gc.project_id = $1
               AND gcc.{col} IS NOT NULL
-              AND gc.committed_at < NOW() - INTERVAL '30 days'
+              AND gc.author_date < NOW() - INTERVAL '30 days'
             GROUP BY f.id
             HAVING COUNT(*) >= 2
         )

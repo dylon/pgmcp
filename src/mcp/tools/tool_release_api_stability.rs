@@ -26,11 +26,11 @@ pub async fn tool_release_api_stability(
     let limit = params.limit.unwrap_or(50);
 
     let releases: Vec<(String, DateTime<Utc>)> = sqlx::query_as::<_, (String, DateTime<Utc>)>(
-        "SELECT subject, committed_at
+        "SELECT subject, author_date
          FROM git_commits
          WHERE project_id = $1
            AND (subject ~* '^(v?\\d+\\.\\d+\\.\\d+)' OR subject ~* '\\brelease\\b' OR subject ~* '\\bbump\\b')
-         ORDER BY committed_at",
+         ORDER BY author_date",
     )
     .bind(project_id)
     .fetch_all(pool)

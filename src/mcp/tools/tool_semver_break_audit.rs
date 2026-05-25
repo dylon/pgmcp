@@ -56,7 +56,7 @@ pub async fn tool_semver_break_audit(
          FROM git_commits gc
          JOIN git_commit_chunks gcc ON gcc.commit_id = gc.id
          WHERE gc.project_id = $1
-         ORDER BY gc.committed_at DESC
+         ORDER BY gc.author_date DESC
          LIMIT $2",
     )
     .bind(project_id)

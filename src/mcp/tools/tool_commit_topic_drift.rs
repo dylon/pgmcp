@@ -55,7 +55,7 @@ pub async fn tool_commit_topic_drift(
          FROM git_commits gc
          JOIN git_commit_files gcf ON gcf.commit_id = gc.id
          WHERE gc.project_id = $1
-         ORDER BY gc.committed_at",
+         ORDER BY gc.author_date",
     )
     .bind(project_id)
     .fetch_all(pool)

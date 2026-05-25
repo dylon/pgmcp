@@ -35,7 +35,7 @@ pub async fn tool_shotgun_surgery(
             SELECT gc.id, gc.subject
             FROM git_commits gc
             WHERE gc.project_id = $1
-            ORDER BY gc.committed_at DESC
+            ORDER BY gc.author_date DESC
             LIMIT $2
         ),
         scope AS (

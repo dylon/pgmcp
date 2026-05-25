@@ -25,7 +25,7 @@ pub async fn tool_commit_changepoint(
     let limit = params.limit.unwrap_or(20);
 
     let rows: Vec<(String, DateTime<Utc>)> = sqlx::query_as::<_, (String, DateTime<Utc>)>(
-        "SELECT gcf.file_path, gc.committed_at
+        "SELECT gcf.file_path, gc.author_date
          FROM git_commits gc
          JOIN git_commit_files gcf ON gcf.commit_id = gc.id
          WHERE gc.project_id = $1",
