@@ -1967,6 +1967,43 @@ pub struct ExtendedCentralityParams {
     pub beta: Option<f64>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ArticulationPointsParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Graph scope: \"file\" (import graph, default) or \"function\" (call graph)"
+    )]
+    pub scope: Option<String>,
+    #[schemars(description = "Max cut vertices and bridges to return (default: 100)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HitsParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Graph scope: \"file\" (import graph, default) or \"function\" (call graph)"
+    )]
+    pub scope: Option<String>,
+    #[schemars(description = "Max hubs and authorities to return (default: 25)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DominatorTreeParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Graph scope: \"file\" (import graph, default) or \"function\" (call graph)"
+    )]
+    pub scope: Option<String>,
+    #[schemars(
+        description = "Root/entry node (exact label else substring); default = highest-out-degree node"
+    )]
+    pub root: Option<String>,
+    #[schemars(description = "Max chokepoints to return (default: 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeadlockCandidatesParams {
     #[schemars(description = "Project name (required)")]
     pub project: String,
@@ -6463,6 +6500,66 @@ foundational sinks everything depends on (reverse-PageRank)."
         .await
     }
     #[tool(
+        description = "Articulation points (cut vertices) + bridges (cut edges) over the file import graph \
+or the function call graph (Hopcroft-Tarjan). USE WHEN: finding true structural single points of failure — \
+nodes/edges whose removal disconnects the graph — sharper than the ownership-based `bus_factor`."
+    )]
+    async fn articulation_points(
+        &self,
+        Parameters(params): Parameters<ArticulationPointsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "articulation_points",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_articulation_points::tool_articulation_points(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "HITS hubs & authorities over the file import graph or the function call graph \
+(Kleinberg). USE WHEN: separating orchestrators (hubs) from core utilities (authorities) — a split \
+PageRank conflates into one score."
+    )]
+    async fn hits(
+        &self,
+        Parameters(params): Parameters<HitsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "hits",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_hits::tool_hits(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Dominator-tree chokepoints from an entry node over the file import or function call \
+graph (Cooper-Harvey-Kennedy). USE WHEN: finding must-pass-through funnels — nodes every path from the \
+root traverses — to place caching/validation/boundaries or assess blast radius."
+    )]
+    async fn dominator_tree(
+        &self,
+        Parameters(params): Parameters<DominatorTreeParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "dominator_tree",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_dominator_tree::tool_dominator_tree(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
         description = "Lock-order cycles (Havender 1968) by scanning function bodies for lock(A);lock(B) sequences and computing SCCs."
     )]
     async fn deadlock_candidates(
@@ -8104,6 +8201,9 @@ impl McpServer {
                 "function_kcore"         => function_kcore(FunctionKcoreParams),
                 "recursive_clusters"     => recursive_clusters(RecursiveClustersParams),
                 "extended_centrality"    => extended_centrality(ExtendedCentralityParams),
+                "articulation_points"    => articulation_points(ArticulationPointsParams),
+                "hits"                   => hits(HitsParams),
+                "dominator_tree"         => dominator_tree(DominatorTreeParams),
                 // Architecture
                 "coupling_cohesion_report"  => coupling_cohesion_report(CouplingCohesionReportParams),
                 "architecture_violations"   => architecture_violations(ArchitectureViolationsParams),

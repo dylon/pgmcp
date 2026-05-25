@@ -210,6 +210,12 @@ pub mod tool_function_communities;
 pub mod tool_function_kcore;
 pub mod tool_recursive_clusters;
 
+// Graph-roadmap Phase 2.6 — Tier-A graph algorithms (file or call graph).
+pub mod graph_scope;
+pub mod tool_articulation_points;
+pub mod tool_dominator_tree;
+pub mod tool_hits;
+
 // SOTA Phase 11 — evolution analytics
 pub mod tool_commit_changepoint;
 pub mod tool_commit_topic_drift;

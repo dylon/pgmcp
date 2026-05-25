@@ -1222,7 +1222,11 @@ pub fn hits<N, E>(graph: &DiGraph<N, E>, max_iter: usize, tolerance: f64) -> Hit
         }
         let diff = nodes
             .iter()
-            .map(|v| (new_auth[v] - auth[v]).abs().max((new_hub[v] - hub[v]).abs()))
+            .map(|v| {
+                (new_auth[v] - auth[v])
+                    .abs()
+                    .max((new_hub[v] - hub[v]).abs())
+            })
             .fold(0.0_f64, f64::max);
         auth = new_auth;
         hub = new_hub;
@@ -1495,5 +1499,52 @@ mod tests {
             "reverse pagerank sum = {}",
             total
         );
+    }
+
+    #[test]
+    fn articulation_points_on_path_graph() {
+        // Undirected projection of 0→1→2→3→4 is the path 0-1-2-3-4: the three
+        // internal nodes are cut vertices, every edge is a bridge.
+        let g = build_chain(5);
+        let r = articulation_points_and_bridges(&g);
+        assert_eq!(r.articulation_points.len(), 3, "3 internal cut vertices");
+        assert_eq!(r.bridges.len(), 4, "every path edge is a bridge");
+    }
+
+    #[test]
+    fn articulation_points_on_cycle_has_none() {
+        // A directed cycle's undirected projection is a ring — no cut vertices,
+        // no bridges (every node has an alternate path).
+        let mut g: DiGraph<FileNode, EdgeWeight> = DiGraph::new();
+        let nodes: Vec<NodeIndex> = (0..5)
+            .map(|i| g.add_node(fnode(i as i64 + 1, &format!("n{i}"))))
+            .collect();
+        for i in 0..5 {
+            g.add_edge(nodes[i], nodes[(i + 1) % 5], ew());
+        }
+        let r = articulation_points_and_bridges(&g);
+        assert!(r.articulation_points.is_empty(), "ring has no cut vertices");
+        assert!(r.bridges.is_empty(), "ring has no bridges");
+    }
+
+    #[test]
+    fn hits_returns_scores_for_all_nodes() {
+        let g = build_chain(5);
+        let r = hits(&g, 100, 1e-8);
+        assert_eq!(r.hubs.len(), 5);
+        assert_eq!(r.authorities.len(), 5);
+    }
+
+    #[test]
+    fn dominator_tree_on_chain_is_linear() {
+        // On 0→1→2→3→4, each node's immediate dominator is its predecessor.
+        let g = build_chain(5);
+        let nodes: Vec<NodeIndex> = g.node_indices().collect();
+        let idom = dominator_tree(&g, nodes[0]);
+        assert_eq!(idom[&nodes[0]], nodes[0], "root self-dominates");
+        assert_eq!(idom[&nodes[1]], nodes[0]);
+        assert_eq!(idom[&nodes[2]], nodes[1]);
+        assert_eq!(idom[&nodes[3]], nodes[2]);
+        assert_eq!(idom[&nodes[4]], nodes[3]);
     }
 }
