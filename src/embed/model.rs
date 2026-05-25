@@ -82,6 +82,10 @@ pub struct Embedder {
     sparse_linear: Option<Linear>,
     /// Vocabulary size = dimensionality of the sparse vector (token-id space).
     sparse_dim: usize,
+    /// BGE-M3 ColBERT multi-vector projection head (`colbert_linear`,
+    /// hidden→hidden). `None` for MiniLm / when absent. Produces per-token
+    /// vectors for late-interaction (MaxSim) reranking (graph-roadmap Phase 2.5).
+    colbert_linear: Option<Linear>,
 }
 
 enum Backbone {
@@ -143,6 +147,7 @@ impl Embedder {
         // the Bgem3 arm before `vb` is moved into the model.
         let mut sparse_linear: Option<Linear> = None;
         let mut sparse_dim: usize = 0;
+        let mut colbert_linear: Option<Linear> = None;
         let backbone = match kind {
             ModelKind::MiniLm => {
                 let bert_cfg: BertConfig = serde_json::from_str(&cfg_json)
@@ -165,6 +170,17 @@ impl Embedder {
                     })
                     .ok();
                 sparse_dim = cfg.vocab_size;
+                // ColBERT head (hidden→hidden); optional/graceful (Phase 2.5).
+                colbert_linear =
+                    candle_nn::linear(cfg.hidden_size, cfg.hidden_size, vb.pp("colbert_linear"))
+                        .or_else(|_| {
+                            candle_nn::linear_no_bias(
+                                cfg.hidden_size,
+                                cfg.hidden_size,
+                                vb.pp("colbert_linear"),
+                            )
+                        })
+                        .ok();
                 let model = XLMRobertaModel::new(&cfg, vb)
                     .map_err(|e| PgmcpError::Embedding(format!("XLMRobertaModel::new: {}", e)))?;
                 Backbone::Bgem3(model)
@@ -210,7 +226,124 @@ impl Embedder {
             dim,
             sparse_linear,
             sparse_dim,
+            colbert_linear,
         })
+    }
+
+    /// `true` when this embedder can produce BGE-M3 ColBERT per-token vectors.
+    pub fn has_colbert(&self) -> bool {
+        self.colbert_linear.is_some()
+    }
+
+    /// Compute BGE-M3 ColBERT per-token vectors for `texts` — one
+    /// `Some(Vec<token_vector>)` per text (each token vector L2-normalized,
+    /// `hidden`-dim), or `None` when no ColBERT head is loaded. Used for
+    /// late-interaction (MaxSim) reranking. NUMERICS GPU/deployment-verified.
+    pub fn embed_colbert(&self, texts: &[&str]) -> Result<Vec<Option<Vec<Vec<f32>>>>> {
+        if !self.has_colbert() {
+            return Ok(vec![None; texts.len()]);
+        }
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<Option<Vec<Vec<f32>>>> = Vec::with_capacity(texts.len());
+        for chunk in texts.chunks(self.inference_batch_size) {
+            out.append(&mut self.colbert_one_batch(chunk)?);
+        }
+        Ok(out)
+    }
+
+    fn colbert_one_batch(&self, texts: &[&str]) -> Result<Vec<Option<Vec<Vec<f32>>>>> {
+        let (Some(colbert_linear), Backbone::Bgem3(xlm)) = (&self.colbert_linear, &self.backbone)
+        else {
+            return Ok(vec![None; texts.len()]);
+        };
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let owned: Vec<String> = texts.iter().map(|s| (*s).to_string()).collect();
+        let encodings = self
+            .tokenizer
+            .encode_batch(owned, true)
+            .map_err(|e| PgmcpError::Embedding(format!("encode_batch: {}", e)))?;
+        let batch_size = encodings.len();
+        let seq_len = encodings
+            .iter()
+            .map(|e| e.get_ids().len())
+            .max()
+            .unwrap_or(0)
+            .min(self.max_length);
+        if seq_len == 0 {
+            return Ok(vec![None; batch_size]);
+        }
+
+        let mut input_ids: Vec<i64> = Vec::with_capacity(batch_size * seq_len);
+        let mut attention_mask: Vec<i64> = Vec::with_capacity(batch_size * seq_len);
+        let mut token_type_ids: Vec<i64> = Vec::with_capacity(batch_size * seq_len);
+        for enc in &encodings {
+            let ids = enc.get_ids();
+            let mask = enc.get_attention_mask();
+            let types = enc.get_type_ids();
+            let len = ids.len().min(seq_len);
+            for j in 0..len {
+                input_ids.push(ids[j] as i64);
+                attention_mask.push(mask[j] as i64);
+                token_type_ids.push(types[j] as i64);
+            }
+            for _ in len..seq_len {
+                input_ids.push(0);
+                attention_mask.push(0);
+                token_type_ids.push(0);
+            }
+        }
+
+        let shape = (batch_size, seq_len);
+        let input_ids_t = Tensor::from_vec(input_ids.clone(), shape, &self.device)
+            .map_err(|e| PgmcpError::Embedding(format!("input_ids tensor: {}", e)))?;
+        let attention_mask_t = Tensor::from_vec(attention_mask.clone(), shape, &self.device)
+            .map_err(|e| PgmcpError::Embedding(format!("attention_mask tensor: {}", e)))?;
+        let token_type_ids_t = Tensor::from_vec(token_type_ids, shape, &self.device)
+            .map_err(|e| PgmcpError::Embedding(format!("token_type_ids tensor: {}", e)))?;
+
+        let hidden = xlm
+            .forward(
+                &input_ids_t,
+                &attention_mask_t,
+                &token_type_ids_t,
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| PgmcpError::Embedding(format!("XLM-RoBERTa forward (colbert): {}", e)))?;
+        // (b, s, h) → colbert_linear → (b, s, h), F32.
+        let proj = colbert_linear
+            .forward(&hidden)
+            .and_then(|t| t.to_dtype(DType::F32))
+            .map_err(|e| PgmcpError::Embedding(format!("colbert projection: {}", e)))?;
+        let m: Vec<Vec<Vec<f32>>> = proj
+            .to_vec3::<f32>()
+            .map_err(|e| PgmcpError::Embedding(format!("colbert to_vec3: {}", e)))?;
+
+        let mut result: Vec<Option<Vec<Vec<f32>>>> = Vec::with_capacity(batch_size);
+        for (r, rows) in m.iter().enumerate() {
+            let mut toks: Vec<Vec<f32>> = Vec::new();
+            for (t, vec) in rows.iter().enumerate().take(seq_len) {
+                let idx = r * seq_len + t;
+                if attention_mask[idx] == 0 {
+                    continue; // padding
+                }
+                if (0..=3).contains(&input_ids[idx]) {
+                    continue; // XLM-R special tokens
+                }
+                // L2-normalize each token vector so MaxSim dot == cosine.
+                let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 1e-12 {
+                    toks.push(vec.iter().map(|x| x / norm).collect());
+                }
+            }
+            result.push(if toks.is_empty() { None } else { Some(toks) });
+        }
+        Ok(result)
     }
 
     /// `true` when this embedder can produce BGE-M3 learned-sparse vectors.
@@ -615,6 +748,30 @@ pub fn matryoshka_truncate(full: &[f32], target_dim: usize) -> Vec<f32> {
     out
 }
 
+/// ColBERT late-interaction score (Khattab & Zaharia 2020): sum over query
+/// tokens of the maximum cosine similarity to any document token. Inputs are
+/// L2-normalized per token (so dot product == cosine). Higher is better; 0 for
+/// an empty side. (graph-roadmap Phase 2.5)
+pub fn colbert_maxsim(query: &[Vec<f32>], doc: &[Vec<f32>]) -> f32 {
+    if query.is_empty() || doc.is_empty() {
+        return 0.0;
+    }
+    let mut total = 0.0_f32;
+    for q in query {
+        let mut best = f32::NEG_INFINITY;
+        for d in doc {
+            let dot: f32 = q.iter().zip(d).map(|(a, b)| a * b).sum();
+            if dot > best {
+                best = dot;
+            }
+        }
+        if best.is_finite() {
+            total += best;
+        }
+    }
+    total
+}
+
 // Re-export the `IndexOp` trait so the `i((..., 0, ...))` call above
 // resolves. Adding the import at the top of the file is the conventional
 // place, but keeping it scoped here documents *why* we need it.
@@ -623,6 +780,25 @@ use candle_core::IndexOp;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn colbert_maxsim_scores_alignment() {
+        // Query tokens that each align exactly with a doc token score ~= n_query.
+        let q = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let doc_match = vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.5, 0.5]];
+        let s_match = colbert_maxsim(&q, &doc_match);
+        assert!(
+            (s_match - 2.0).abs() < 1e-6,
+            "perfect per-token match = 2, got {s_match}"
+        );
+        // An orthogonal doc scores lower.
+        let doc_orth = vec![vec![0.0, 1.0]];
+        let s_orth = colbert_maxsim(&[vec![1.0, 0.0]], &doc_orth);
+        assert!(s_orth.abs() < 1e-6, "orthogonal = 0, got {s_orth}");
+        // Empty sides score 0.
+        assert_eq!(colbert_maxsim(&[], &doc_match), 0.0);
+        assert_eq!(colbert_maxsim(&q, &[]), 0.0);
+    }
 
     #[test]
     fn model_kind_dispatch_matches_string_names() {

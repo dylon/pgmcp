@@ -169,6 +169,18 @@ pub struct ApiConfig {
     /// response still returns only the request's `limit`. Default 30.
     #[serde(default = "default_rerank_candidates")]
     pub rerank_candidates: i32,
+    /// ColBERT late-interaction (MaxSim) rerank of the hybrid `/api/search`
+    /// results (Phase 2.5). Recomputes the query + candidate per-token matrices
+    /// with the BGE-M3 ColBERT head and reorders by MaxSim. Unlike the
+    /// cross-encoder, this reuses the resident embedding model (no extra VRAM),
+    /// so it is cheap to leave on. Applied before the cross-encoder when both
+    /// are enabled. Default false.
+    #[serde(default = "default_colbert_rerank")]
+    pub colbert_rerank: bool,
+    /// Number of fused candidates to ColBERT-rerank when `colbert_rerank` is on.
+    /// Default 50 (wider than the cross-encoder net, since MaxSim is cheap).
+    #[serde(default = "default_colbert_candidates")]
+    pub colbert_candidates: i32,
 }
 
 impl Default for ApiConfig {
@@ -176,6 +188,8 @@ impl Default for ApiConfig {
         Self {
             rerank_hook: default_rerank_hook(),
             rerank_candidates: default_rerank_candidates(),
+            colbert_rerank: default_colbert_rerank(),
+            colbert_candidates: default_colbert_candidates(),
         }
     }
 }
@@ -185,6 +199,12 @@ fn default_rerank_hook() -> bool {
 }
 fn default_rerank_candidates() -> i32 {
     30
+}
+fn default_colbert_rerank() -> bool {
+    false
+}
+fn default_colbert_candidates() -> i32 {
+    50
 }
 
 /// Memory-server configuration. Holds Phase 4+ knobs grouped under

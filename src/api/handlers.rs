@@ -141,6 +141,10 @@ pub struct SearchResponse {
     /// rerank_hook`). Lets the hook / telemetry see whether reranking fired
     /// vs. the RRF-only fallback.
     pub rerank_used: bool,
+    /// True when the ColBERT late-interaction (MaxSim) rerank stage ran (gated
+    /// by `[api] colbert_rerank` and a backbone with a ColBERT head). Applied
+    /// before the cross-encoder when both are enabled. (Phase 2.5)
+    pub colbert_used: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -179,18 +183,27 @@ pub async fn search(
     // The /api/search endpoint is consumed by ~/.claude/hooks/pgmcp-rag.sh
     // (UserPromptSubmit). It always fuses dense + BM25 at chunk level via RRF
     // (cheap, no extra model); the cross-encoder rerank stage is opt-in.
-    let (ef_search, rerank_candidates, rerank_enabled) = {
+    let (ef_search, rerank_candidates, rerank_enabled, colbert_enabled, colbert_candidates) = {
         let cfg = state.config.load();
         (
             cfg.vector.ef_search,
             cfg.api.rerank_candidates.max(limit),
             cfg.api.rerank_hook && state.reranker.is_some(),
+            cfg.api.colbert_rerank,
+            cfg.api.colbert_candidates.max(limit),
         )
     };
 
-    // When reranking, fetch a larger candidate pool to give the cross-encoder
-    // material; otherwise just the requested `limit`. Per-leg pool is 2× that.
-    let fetch_n = if rerank_enabled {
+    // Fetch enough candidates to feed whichever rerank stages are active.
+    // ColBERT casts the widest net (cheap MaxSim), then the cross-encoder, then
+    // the bare `limit`. Per-leg pool is 2× the deepest fetch.
+    let fetch_n = if colbert_enabled {
+        colbert_candidates.max(if rerank_enabled {
+            rerank_candidates
+        } else {
+            limit
+        })
+    } else if rerank_enabled {
         rerank_candidates
     } else {
         limit
@@ -204,7 +217,7 @@ pub async fn search(
         )
     })?;
 
-    let results = crate::db::queries::hybrid_search_chunks(
+    let mut results = crate::db::queries::hybrid_search_chunks(
         pool,
         &req.query,
         &embedding,
@@ -226,6 +239,56 @@ pub async fn search(
             format!("Search failed: {}", e),
         )
     })?;
+
+    // Optional ColBERT late-interaction (MaxSim) rerank. Recomputes per-token
+    // matrices for the query + the top candidates with the resident BGE-M3
+    // ColBERT head (no extra VRAM, unlike the cross-encoder) and reorders the
+    // candidate pool in place, so a subsequent cross-encoder pass operates on
+    // the improved order. Any failure (no ColBERT head, embed error) leaves the
+    // RRF order untouched — never hard-fail the hook.
+    let mut colbert_used = false;
+    if colbert_enabled && results.len() > 1 {
+        let n = (colbert_candidates as usize).min(results.len());
+        // [query, cand_0, .., cand_{n-1}] share one forward pass.
+        let mut texts: Vec<String> = Vec::with_capacity(n + 1);
+        texts.push(req.query.clone());
+        texts.extend(results[..n].iter().map(|r| r.chunk_content.clone()));
+        match state.query_embedder.embed_colbert_batch(texts).await {
+            Ok(mats) => {
+                // mats[0] = query tokens; mats[1..=n] = candidate tokens.
+                match mats.split_first() {
+                    Some((Some(query_tokens), cand_mats)) => {
+                        // Score each candidate; missing matrices sort last.
+                        let mut scored: Vec<(usize, f32)> = (0..n)
+                            .map(|i| {
+                                let score = cand_mats
+                                    .get(i)
+                                    .and_then(|m| m.as_ref())
+                                    .map(|doc| {
+                                        crate::embed::model::colbert_maxsim(query_tokens, doc)
+                                    })
+                                    .unwrap_or(f32::NEG_INFINITY);
+                                (i, score)
+                            })
+                            .collect();
+                        // Descending by MaxSim; stable so RRF order breaks ties.
+                        scored.sort_by(|a, b| {
+                            b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        // Reorder the top-n in place; the tail keeps RRF order.
+                        let head: Vec<_> = scored
+                            .into_iter()
+                            .map(|(i, _)| results[i].clone())
+                            .collect();
+                        results.splice(..n, head);
+                        colbert_used = true;
+                    }
+                    _ => tracing::debug!("ColBERT rerank skipped: backbone has no ColBERT head"),
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "ColBERT rerank failed; using RRF order"),
+        }
+    }
 
     // Optional cross-encoder rerank of the fused candidates. The candle forward
     // is synchronous, so it runs on a blocking thread. Any failure falls back
@@ -284,6 +347,7 @@ pub async fn search(
     Ok(Json(SearchResponse {
         results: items,
         rerank_used,
+        colbert_used,
     }))
 }
 

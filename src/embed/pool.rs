@@ -100,14 +100,22 @@ pub struct EmbedQueryRequest {
     pub text: String,
     /// When `true`, also compute the BGE-M3 learned-sparse vector (Phase 2.3).
     pub want_sparse: bool,
+    /// Texts to encode as ColBERT multi-vector matrices (Phase 2.5). The query
+    /// plus its rerank candidates ride in one request so they share a single
+    /// forward pass / GPU hop. Empty = skip the ColBERT head entirely.
+    pub colbert_texts: Vec<String>,
     pub reply: tokio::sync::oneshot::Sender<Result<QueryEmbedResult>>,
 }
 
 /// Query-time embedding outputs: always the dense vector, plus the sparse
-/// vector when requested and the backbone has a sparse head.
+/// vector when requested and the backbone has a sparse head, plus per-text
+/// ColBERT token matrices when `colbert_texts` was non-empty (Phase 2.5).
 pub struct QueryEmbedResult {
     pub dense: Vec<f32>,
     pub sparse: Option<SparseVector>,
+    /// One entry per `colbert_texts` input, in order. `None` when the backbone
+    /// has no ColBERT head; otherwise the L2-normalized per-token vectors.
+    pub colbert: Vec<Option<Vec<Vec<f32>>>>,
 }
 
 /// Cloneable handle for submitting query-time embedding requests.
@@ -136,12 +144,43 @@ impl QueryEmbedder {
             .send(EmbedQueryRequest {
                 text,
                 want_sparse,
+                colbert_texts: Vec::new(),
                 reply: reply_tx,
             })
             .map_err(|_| PgmcpError::Embedding("Embed pool shut down".into()))?;
         reply_rx
             .await
             .map_err(|_| PgmcpError::Embedding("Embed worker dropped reply".into()))?
+    }
+
+    /// Encode a batch of texts as ColBERT multi-vector matrices (Phase 2.5).
+    /// Used by the API rerank stage to score query↔candidate MaxSim. The dense
+    /// vector of the request is computed-but-ignored; `colbert_texts` carries
+    /// the real payload so the whole batch shares one forward pass. Returns one
+    /// entry per input (in order); `None` entries mean the backbone has no
+    /// ColBERT head (caller should fall back to the prior ordering).
+    pub async fn embed_colbert_batch(
+        &self,
+        texts: Vec<String>,
+    ) -> Result<Vec<Option<Vec<Vec<f32>>>>> {
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(EmbedQueryRequest {
+                // A non-empty dense text keeps the worker's dense path well-defined;
+                // the result's `dense`/`sparse` fields are unused by the caller.
+                text: texts[0].clone(),
+                want_sparse: false,
+                colbert_texts: texts,
+                reply: reply_tx,
+            })
+            .map_err(|_| PgmcpError::Embedding("Embed pool shut down".into()))?;
+        let result = reply_rx
+            .await
+            .map_err(|_| PgmcpError::Embedding("Embed worker dropped reply".into()))??;
+        Ok(result.colbert)
     }
 }
 
@@ -419,7 +458,17 @@ fn process_query_request(model: &Embedder, request: EmbedQueryRequest, stats: &S
         } else {
             None
         };
-        Ok(QueryEmbedResult { dense, sparse })
+        let colbert = if request.colbert_texts.is_empty() {
+            Vec::new()
+        } else {
+            let refs: Vec<&str> = request.colbert_texts.iter().map(|s| s.as_str()).collect();
+            model.embed_colbert(&refs)?
+        };
+        Ok(QueryEmbedResult {
+            dense,
+            sparse,
+            colbert,
+        })
     })();
 
     if result.is_ok() {
