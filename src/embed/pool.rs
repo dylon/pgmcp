@@ -816,7 +816,14 @@ fn process_index_file_task(
                 return;
             }
             Err(extract::ExtractError::Timeout) => {
-                error!(
+                // F4: per-file extraction timeout is a content/tool
+                // interaction issue, not a service-health failure. The
+                // `documents_extraction_timeout` counter still increments
+                // (visible via the metrics endpoint). Demote to warn! so
+                // operators tailing the log can spot real service errors.
+                // See plan ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
+                // F4.
+                warn!(
                     path = %path_str,
                     worker_id,
                     lang = %language,
@@ -842,7 +849,12 @@ fn process_index_file_task(
                 return;
             }
             Err(e) => {
-                error!(
+                // F4: per-file extraction failure (pandoc / pdftotext /
+                // ps2ascii rejecting the file's content) is a content
+                // problem, not a service-health failure. The
+                // `files_failed` counter still increments. Demote to
+                // warn! to match the timeout case above.
+                warn!(
                     path = %path_str,
                     worker_id,
                     lang = %language,
