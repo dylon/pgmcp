@@ -1616,6 +1616,18 @@ pub struct CronConfig {
     #[serde(default = "default_ready_delay_topic_secs")]
     pub ready_delay_topic_secs: u64,
 
+    /// Ready-relative initial delay for the embedding-migration cron
+    /// (seconds). Default 60 = 1 minute. Unlike topic clustering or
+    /// graph analysis, the migration cron has nothing to wait for
+    /// post-Ready — it just drains rows whose `embedding_v2` column
+    /// is NULL. A 1-hour delay (the prior behaviour, inherited by
+    /// reusing `ready_delay_topic_secs`) blocked the BGE-M3 cutover
+    /// drain for an hour after every daemon restart. See plan
+    /// `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`
+    /// boy-scout follow-up (2026-05-25).
+    #[serde(default = "default_ready_delay_embedding_migration_secs")]
+    pub ready_delay_embedding_migration_secs: u64,
+
     /// Ready-relative initial delay for symbol-extraction cron (seconds).
     /// Default 1800 = 30 minutes (matches `ready_delay_graph_secs`).
     #[serde(default = "default_ready_delay_symbol_extraction_secs")]
@@ -1732,6 +1744,7 @@ impl Default for CronConfig {
             ready_delay_similarity_secs: default_ready_delay_similarity_secs(),
             ready_delay_graph_secs: default_ready_delay_graph_secs(),
             ready_delay_topic_secs: default_ready_delay_topic_secs(),
+            ready_delay_embedding_migration_secs: default_ready_delay_embedding_migration_secs(),
             ready_delay_symbol_extraction_secs: default_ready_delay_symbol_extraction_secs(),
             function_metrics_interval_secs: default_function_metrics_interval(),
             ready_delay_function_metrics_secs: default_ready_delay_function_metrics_secs(),
@@ -1765,6 +1778,9 @@ fn default_ready_delay_graph_secs() -> u64 {
 }
 fn default_ready_delay_topic_secs() -> u64 {
     3600
+}
+fn default_ready_delay_embedding_migration_secs() -> u64 {
+    60
 }
 fn default_ready_delay_symbol_extraction_secs() -> u64 {
     1800

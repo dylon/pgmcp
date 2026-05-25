@@ -1321,7 +1321,14 @@ pub fn schedule_maintenance_jobs(
         let lc_mig = lifecycle.clone();
         let lock_mig = Arc::clone(&heavy_cron_lock);
         let ready_mig: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-        let mig_ready_delay = Duration::from_secs(config.ready_delay_topic_secs);
+        // F6 (boy-scout 2026-05-25): use the migration-specific
+        // ready-delay (default 60s) instead of reusing
+        // `ready_delay_topic_secs` (default 3600s). Migration has
+        // nothing to wait for post-Ready — it just drains rows
+        // whose `embedding_v2` column is NULL. The prior 1-hour
+        // delay blocked the BGE-M3 cutover drain for an hour after
+        // every daemon restart.
+        let mig_ready_delay = Duration::from_secs(config.ready_delay_embedding_migration_secs);
         handle.schedule_recurring(
             staggered_initial_delay_ms("embedding-migration", mig_interval * 1000),
             mig_interval * 1000,
