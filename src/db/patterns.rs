@@ -413,7 +413,8 @@ pub async fn insert_source_chunk(
             .bind(end_line)
             .bind(embedding_vec)
             .execute(pool)
-            .await?;
+            .await
+            .map_err(super::queries::map_legacy_embedding_insert_error)?;
         }
         1024 => {
             sqlx::query(
@@ -642,10 +643,16 @@ pub async fn catalog_stats(pool: &PgPool) -> Result<PatternCatalogStats, sqlx::E
     let chunks = sqlx::query_scalar("SELECT COUNT(*) FROM software_pattern_chunks")
         .fetch_one(pool)
         .await?;
-    let chunks_missing_embeddings =
-        sqlx::query_scalar("SELECT COUNT(*) FROM software_pattern_chunks WHERE embedding IS NULL")
-            .fetch_one(pool)
-            .await?;
+    // Post-cutover the legacy `embedding` column is gone; count rows missing
+    // the active signature's embedding column (embedding_v2 under BGE-M3).
+    let missing_col = crate::embed::signature::read_active_signature(pool)
+        .await?
+        .read_column();
+    let chunks_missing_embeddings = sqlx::query_scalar(&format!(
+        "SELECT COUNT(*) FROM software_pattern_chunks WHERE {missing_col} IS NULL"
+    ))
+    .fetch_one(pool)
+    .await?;
     let source_families = sqlx::query_as::<_, SourceFamilyStats>(
         "SELECT s.source_family,
                 COUNT(DISTINCT s.id)::bigint AS source_count,

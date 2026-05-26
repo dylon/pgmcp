@@ -19,9 +19,11 @@
 
 use sqlx::PgPool;
 
+mod schema_introspect;
 mod v2_shadow_asr;
 mod v3_cross_language_signatures;
 mod versioning;
+use schema_introspect::*;
 use versioning::*;
 
 use tracing::info;
@@ -2198,18 +2200,37 @@ async fn ensure_memory_v2_columns(pool: &PgPool) -> Result<(), sqlx::Error> {
         "ALTER TABLE git_commit_chunks ADD COLUMN IF NOT EXISTS embedding_signature TEXT",
         "ALTER TABLE software_pattern_chunks ADD COLUMN IF NOT EXISTS embedding_v2 vector(1024)",
         "ALTER TABLE software_pattern_chunks ADD COLUMN IF NOT EXISTS embedding_signature TEXT",
-        // Phase 5 C1: drop NOT NULL on every legacy 384d embedding column
-        // so the indexer dual-write (zero placeholder into legacy +
-        // real 1024d into embedding_v2) succeeds during the migration
-        // window. The legacy column itself is dropped in C12
-        // (post-soak operator action via `pgmcp embed-cutover --drop-legacy`).
-        "ALTER TABLE file_chunks ALTER COLUMN embedding DROP NOT NULL",
-        "ALTER TABLE session_prompts ALTER COLUMN embedding DROP NOT NULL",
-        "ALTER TABLE git_commit_chunks ALTER COLUMN embedding DROP NOT NULL",
-        "ALTER TABLE software_pattern_chunks ALTER COLUMN embedding DROP NOT NULL",
+        // (Legacy `embedding` DROP NOT NULL is handled in the guarded loop
+        // below — it must tolerate the column being absent post-cutover.)
     ];
     for s in stmts {
         sqlx::query(s).execute(pool).await?;
+    }
+
+    // Phase 5 C1: drop NOT NULL on every legacy 384d `embedding` column so the
+    // indexer dual-write (zero placeholder into legacy + real 1024d into
+    // embedding_v2) succeeds during the migration window. GUARDED on column
+    // presence: `embed-cutover --drop-legacy` permanently drops the column
+    // post-soak (C12), and `ALTER COLUMN … DROP NOT NULL` has no `IF EXISTS`
+    // form — so without this guard `run_migrations` would throw
+    // `column "embedding" of relation "…" does not exist` on every boot of a
+    // post-cutover database. `DROP NOT NULL` is itself idempotent when the
+    // column exists, so the guard only needs to skip when it is ABSENT. The
+    // table names are a fixed literal allowlist (not user input) ⇒ the
+    // `format!` is injection-safe.
+    for table in [
+        "file_chunks",
+        "session_prompts",
+        "git_commit_chunks",
+        "software_pattern_chunks",
+    ] {
+        if column_exists(pool, table, "embedding").await? {
+            sqlx::query(&format!(
+                "ALTER TABLE {table} ALTER COLUMN embedding DROP NOT NULL"
+            ))
+            .execute(pool)
+            .await?;
+        }
     }
     Ok(())
 }
@@ -2437,7 +2458,11 @@ async fn ensure_hnsw_index(pool: &PgPool, config: &VectorConfig) -> Result<(), s
 
     let needs_rebuild = stored.as_deref() != Some(&current_params);
 
-    if needs_rebuild {
+    // Also gate on the legacy column's presence: post-`embed-cutover
+    // --drop-legacy` the `embedding` column is gone, so `CREATE INDEX … (embedding
+    // …)` would throw. embedding_v2 has its own index helper
+    // (ensure_memory_v2_hnsw_index), so dropping this legacy index entirely is fine.
+    if needs_rebuild && column_exists(pool, "file_chunks", "embedding").await? {
         // Drop old index if it exists
         sqlx::query("DROP INDEX IF EXISTS idx_chunks_embedding")
             .execute(pool)
@@ -2489,7 +2514,7 @@ async fn ensure_git_commit_hnsw_index(
 
     let needs_rebuild = stored.as_deref() != Some(&current_params);
 
-    if needs_rebuild {
+    if needs_rebuild && column_exists(pool, "git_commit_chunks", "embedding").await? {
         sqlx::query("DROP INDEX IF EXISTS idx_git_commit_chunks_embedding")
             .execute(pool)
             .await?;
@@ -2533,7 +2558,7 @@ async fn ensure_software_pattern_hnsw_index(
 
     let needs_rebuild = stored.as_deref() != Some(&current_params);
 
-    if needs_rebuild {
+    if needs_rebuild && column_exists(pool, "software_pattern_chunks", "embedding").await? {
         sqlx::query("DROP INDEX IF EXISTS idx_software_pattern_chunks_embedding")
             .execute(pool)
             .await?;
@@ -2577,7 +2602,9 @@ async fn ensure_session_prompts_hnsw_index(
     .fetch_optional(pool)
     .await?;
 
-    if stored.as_deref() != Some(&current_params) {
+    if stored.as_deref() != Some(&current_params)
+        && column_exists(pool, "session_prompts", "embedding").await?
+    {
         sqlx::query("DROP INDEX IF EXISTS idx_session_prompts_embedding")
             .execute(pool)
             .await?;

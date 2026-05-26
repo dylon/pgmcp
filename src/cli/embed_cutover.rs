@@ -187,6 +187,28 @@ async fn demote(pool: &sqlx::PgPool, force: bool, format: OutputFormat) -> anyho
     // Demote requires every row to still have a legacy `embedding` value
     // (otherwise the daemon would read empty results post-rollback).
     if !force {
+        // If `--drop-legacy` already removed the legacy `embedding` column,
+        // rollback to MiniLM is impossible (nothing to read) and the stranded
+        // count below would itself throw `column "embedding" does not exist`.
+        // Detect that explicitly and fail with a clear message.
+        let legacy_present: bool = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = 'public' AND table_name = 'file_chunks'
+                   AND column_name = 'embedding'
+             )",
+        )
+        .fetch_one(pool)
+        .await
+        .context("probe legacy embedding column")?;
+        if !legacy_present {
+            anyhow::bail!(
+                "pgmcp embed-cutover --to minilm refuses: the legacy `embedding` column was \
+                 already dropped by `--drop-legacy`. Rollback to MiniLM is no longer possible \
+                 without a full re-index under the MiniLM model. (--force will still restamp \
+                 the signature, but legacy readers will see no data until a re-index.)"
+            );
+        }
         let stranded: (i64,) = sqlx::query_as(
             "SELECT (SELECT COUNT(*) FROM file_chunks WHERE embedding IS NULL) \
              + (SELECT COUNT(*) FROM session_prompts WHERE embedding IS NULL)",
@@ -237,12 +259,17 @@ async fn drop_legacy(pool: &sqlx::PgPool, force: bool, format: OutputFormat) -> 
              (`pgmcp embed-cutover --promote`), then drop. Pass --force to override."
         );
     }
-    // Drop legacy HNSW indices first (cheap if not present).
+    // Drop legacy HNSW indices first (cheap if not present). These names must
+    // match what migrations.rs actually creates (ensure_*_hnsw_index):
+    // idx_chunks_embedding / idx_session_prompts_embedding /
+    // idx_git_commit_chunks_embedding / idx_software_pattern_chunks_embedding.
+    // (The DROP COLUMN below also cascades to them, but naming them correctly
+    // keeps the intent explicit and independent of cascade behavior.)
     let stmts = [
-        "DROP INDEX IF EXISTS idx_file_chunks_embedding_hnsw",
-        "DROP INDEX IF EXISTS idx_session_prompts_embedding_hnsw",
-        "DROP INDEX IF EXISTS idx_git_commit_chunks_embedding_hnsw",
-        "DROP INDEX IF EXISTS idx_software_pattern_chunks_embedding_hnsw",
+        "DROP INDEX IF EXISTS idx_chunks_embedding",
+        "DROP INDEX IF EXISTS idx_session_prompts_embedding",
+        "DROP INDEX IF EXISTS idx_git_commit_chunks_embedding",
+        "DROP INDEX IF EXISTS idx_software_pattern_chunks_embedding",
         // Now drop the columns.
         "ALTER TABLE file_chunks DROP COLUMN IF EXISTS embedding",
         "ALTER TABLE session_prompts DROP COLUMN IF EXISTS embedding",

@@ -136,18 +136,7 @@ impl ActiveSignatureCache {
         )
         .fetch_optional(pool)
         .await?;
-        let signature = raw
-            .as_deref()
-            .and_then(EmbeddingSignature::from_str_signature)
-            .unwrap_or_else(|| {
-                tracing::warn!(
-                    raw = ?raw,
-                    "active_embedding_signature in pgmcp_metadata is unrecognized; \
-                     defaulting to MiniLM-L6-v2 for safety. Verify with \
-                     `pgmcp embed-cutover --check`."
-                );
-                EmbeddingSignature::MiniLmV1
-            });
+        let signature = resolve_signature_or_schema_default(pool, raw.as_deref()).await?;
         self.snapshot.store(Arc::new(Some(Snapshot {
             signature,
             read_at: Instant::now(),
@@ -170,6 +159,44 @@ impl Default for ActiveSignatureCache {
     }
 }
 
+/// Parse a raw `active_embedding_signature` value, falling back to a
+/// SCHEMA-INFERRED default when it is absent/unrecognized: a dropped legacy
+/// `file_chunks.embedding` column means the install is post-cutover (BGE-M3);
+/// otherwise the conservative pre-migration MiniLM default. This removes the
+/// old footgun where an absent metadata row always defaulted to MiniLM even on
+/// a post-cutover schema where the legacy column is gone. Logs at WARN so an
+/// operator sees the inconsistency without losing service.
+async fn resolve_signature_or_schema_default(
+    pool: &PgPool,
+    raw: Option<&str>,
+) -> Result<EmbeddingSignature, sqlx::Error> {
+    if let Some(sig) = raw.and_then(EmbeddingSignature::from_str_signature) {
+        return Ok(sig);
+    }
+    let legacy_present: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM information_schema.columns
+             WHERE table_schema = 'public' AND table_name = 'file_chunks'
+               AND column_name = 'embedding'
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+    let fallback = if legacy_present {
+        EmbeddingSignature::MiniLmV1
+    } else {
+        EmbeddingSignature::BgeM3V1
+    };
+    tracing::warn!(
+        raw = ?raw,
+        legacy_embedding_column = legacy_present,
+        fallback = fallback.as_str(),
+        "active_embedding_signature absent/unrecognized; inferring from schema. \
+         Verify with `pgmcp embed-cutover --check`."
+    );
+    Ok(fallback)
+}
+
 /// One-shot resolver for callers that don't have access to a cached
 /// `ActiveSignatureCache` (currently: the C7 inline-SQL MCP tools that
 /// `format!` the column name into an `AVG(c.<col>)::vector(<dim>)`
@@ -183,10 +210,7 @@ pub async fn read_active_signature(pool: &PgPool) -> Result<EmbeddingSignature, 
     )
     .fetch_optional(pool)
     .await?;
-    Ok(raw
-        .as_deref()
-        .and_then(EmbeddingSignature::from_str_signature)
-        .unwrap_or(EmbeddingSignature::MiniLmV1))
+    resolve_signature_or_schema_default(pool, raw.as_deref()).await
 }
 
 #[cfg(test)]

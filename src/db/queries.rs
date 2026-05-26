@@ -499,6 +499,32 @@ pub async fn delete_file_chunks(pool: &PgPool, file_id: i64) -> Result<(), sqlx:
     Ok(())
 }
 
+/// Translate the Postgres "undefined_column" error (SQLSTATE 42703) raised by a
+/// legacy-`embedding` (384d / MiniLM) chunk insert into a clear operator
+/// message. That arm only fires when the daemon's model emits 384d vectors; if
+/// the legacy `file_chunks.embedding` column was dropped by
+/// `embed-cutover --drop-legacy` (BGE-M3 `embedding_v2` is now canonical) the
+/// raw PG error is otherwise opaque. Non-42703 errors pass through unchanged.
+/// (Note: dim-dispatch is kept rather than signature-dispatch because
+/// mid-migration the model is BGE-M3 while the stored signature is still
+/// MiniLM — see the truth table in `src/cli/daemon.rs` — so the *actual*
+/// emitted dim, not the signature, must pick the column.)
+pub(crate) fn map_legacy_embedding_insert_error(e: sqlx::Error) -> sqlx::Error {
+    match &e {
+        sqlx::Error::Database(db) if db.code().as_deref() == Some("42703") => {
+            sqlx::Error::Protocol(
+                "chunk insert targeted the legacy 384d `embedding` column, but it \
+                 was dropped by `embed-cutover --drop-legacy` (BGE-M3 `embedding_v2` \
+                 is now canonical). The daemon model emits 384d (MiniLM) vectors — \
+                 set [embeddings].model to `bge-m3` and restart. \
+                 Run `pgmcp embed-cutover --check`."
+                    .to_string(),
+            )
+        }
+        _ => e,
+    }
+}
+
 /// Insert a chunk with its embedding.
 pub async fn insert_chunk(
     pool: &PgPool,
@@ -538,7 +564,8 @@ pub async fn insert_chunk(
             .bind(end_line)
             .bind(embedding_vec)
             .execute(pool)
-            .await?;
+            .await
+            .map_err(map_legacy_embedding_insert_error)?;
         }
         1024 => {
             sqlx::query(
@@ -690,7 +717,11 @@ pub async fn insert_chunks_batch(
                 drop(tx);
                 return Ok(ChunkBatchOutcome {
                     fk_violation: fk,
-                    error: if fk { None } else { Some(e) },
+                    error: if fk {
+                        None
+                    } else {
+                        Some(map_legacy_embedding_insert_error(e))
+                    },
                 });
             }
         }
@@ -3936,7 +3967,8 @@ pub async fn insert_git_commit_chunk(
             .bind(content)
             .bind(embedding_vec)
             .execute(pool)
-            .await?;
+            .await
+            .map_err(map_legacy_embedding_insert_error)?;
         }
         1024 => {
             sqlx::query(
@@ -4219,17 +4251,22 @@ pub async fn compare_two_files(
         .execute(&mut *tx)
         .await?;
 
-    let results = sqlx::query_as::<_, ChunkPairSimilarity>(
+    // Post-cutover the legacy `embedding` column is gone; read the active
+    // signature's column (embedding_v2 under BGE-M3).
+    let col = crate::embed::signature::read_active_signature(pool)
+        .await?
+        .read_column();
+    let results = sqlx::query_as::<_, ChunkPairSimilarity>(&format!(
         "SELECT ca.id as chunk_id_a, ca.content as content_a,
                 ca.start_line as start_line_a, ca.end_line as end_line_a,
                 cb.id as chunk_id_b, cb.content as content_b,
                 cb.start_line as start_line_b, cb.end_line as end_line_b,
-                1 - (ca.embedding <=> cb.embedding) as similarity
+                1 - (ca.{col} <=> cb.{col}) as similarity
          FROM file_chunks ca
          CROSS JOIN file_chunks cb
          WHERE ca.file_id = $1 AND cb.file_id = $2
          ORDER BY similarity DESC",
-    )
+    ))
     .bind(file_id_a)
     .bind(file_id_b)
     .fetch_all(&mut *tx)
@@ -4255,19 +4292,22 @@ pub async fn compare_chunks_within_file(
         .execute(&mut *tx)
         .await?;
 
-    let results = sqlx::query_as::<_, ChunkPairSimilarity>(
+    let col = crate::embed::signature::read_active_signature(pool)
+        .await?
+        .read_column();
+    let results = sqlx::query_as::<_, ChunkPairSimilarity>(&format!(
         "SELECT ca.id AS chunk_id_a, ca.content AS content_a,
                 ca.start_line AS start_line_a, ca.end_line AS end_line_a,
                 cb.id AS chunk_id_b, cb.content AS content_b,
                 cb.start_line AS start_line_b, cb.end_line AS end_line_b,
-                1 - (ca.embedding <=> cb.embedding) AS similarity
+                1 - (ca.{col} <=> cb.{col}) AS similarity
          FROM file_chunks ca
          JOIN file_chunks cb
               ON ca.file_id = cb.file_id AND ca.id < cb.id
          WHERE ca.file_id = $1
-           AND 1 - (ca.embedding <=> cb.embedding) >= $2
+           AND 1 - (ca.{col} <=> cb.{col}) >= $2
          ORDER BY similarity DESC",
-    )
+    ))
     .bind(file_id)
     .bind(min_similarity)
     .fetch_all(&mut *tx)
@@ -4373,9 +4413,12 @@ pub async fn batch_find_cross_project_neighbors(
     // materialized similarity table fills with same-code-different-branch
     // false positives that drown out genuine cross-repo refactor candidates.
     // See plan: ~/.claude/plans/thoroughly-examine-home-dylon-workspace-melodic-cake.md
-    let results = sqlx::query_as::<_, SimilarityNeighborRow>(
+    let col = crate::embed::signature::read_active_signature(pool)
+        .await?
+        .read_column();
+    let results = sqlx::query_as::<_, SimilarityNeighborRow>(&format!(
         "WITH batch AS (
-            SELECT c.id, c.file_id, c.embedding, f.project_id, f.path, f.language,
+            SELECT c.id, c.file_id, c.{col} AS embedding, f.project_id, f.path, f.language,
                    p.name as project_name,
                    p.git_common_dir as git_common_dir_b,
                    p.git_root_commits as git_root_commits_b
@@ -4394,7 +4437,7 @@ pub async fn batch_find_cross_project_neighbors(
         CROSS JOIN LATERAL (
             SELECT c2.id as chunk_id_b, c2.file_id as file_id_b, f2.project_id as project_id_b,
                    f2.path as path_b, p2.name as project_name_b,
-                   1 - (c2.embedding <=> b.embedding) as similarity
+                   1 - (c2.{col} <=> b.embedding) as similarity
             FROM file_chunks c2
             JOIN indexed_files f2 ON f2.id = c2.file_id
             JOIN projects p2 ON p2.id = f2.project_id
@@ -4407,11 +4450,11 @@ pub async fn batch_find_cross_project_neighbors(
                   p2.git_root_commits IS NOT NULL
                   AND p2.git_root_commits = b.git_root_commits_b
               )
-            ORDER BY c2.embedding <=> b.embedding
+            ORDER BY c2.{col} <=> b.embedding
             LIMIT $3
         ) nn
         WHERE nn.similarity >= $4",
-    )
+    ))
     .bind(last_chunk_id)
     .bind(batch_size)
     .bind(top_k)
@@ -6708,14 +6751,20 @@ pub async fn load_topic_centroids(
 
     let mut results = Vec::with_capacity(topics.len());
 
+    // Post-cutover the legacy `embedding` column is gone; read the active
+    // signature's column (embedding_v2 under BGE-M3).
+    let col = crate::embed::signature::read_active_signature(pool)
+        .await?
+        .read_column();
+
     for topic in &topics {
         // Get all chunk embeddings for this topic
-        let embeddings: Vec<Vec<f32>> = sqlx::query_scalar::<_, Vec<f32>>(
-            "SELECT c.embedding::real[] as embedding
+        let embeddings: Vec<Vec<f32>> = sqlx::query_scalar::<_, Vec<f32>>(&format!(
+            "SELECT c.{col}::real[] as embedding
              FROM chunk_topic_assignments cta
              JOIN file_chunks c ON c.id = cta.chunk_id
              WHERE cta.topic_id = $1",
-        )
+        ))
         .bind(topic.topic_id)
         .fetch_all(pool)
         .await?;
@@ -8503,7 +8552,10 @@ pub async fn compute_semantic_file_edges(
     sqlx::query("SET LOCAL statement_timeout = '5min'")
         .execute(&mut *tx)
         .await?;
-    let rows = sqlx::query_as::<_, SemanticFileEdge>(
+    let col = crate::embed::signature::read_active_signature(pool)
+        .await?
+        .read_column();
+    let rows = sqlx::query_as::<_, SemanticFileEdge>(&format!(
         "WITH chunk_nn AS (
             SELECT c.file_id AS source_file_id,
                    nn.file_id AS target_file_id,
@@ -8512,17 +8564,17 @@ pub async fn compute_semantic_file_edges(
             JOIN indexed_files f ON f.id = c.file_id
             CROSS JOIN LATERAL (
                 SELECT c2.file_id,
-                       1 - (c2.embedding <=> c.embedding) AS similarity
+                       1 - (c2.{col} <=> c.{col}) AS similarity
                 FROM file_chunks c2
                 JOIN indexed_files f2 ON f2.id = c2.file_id
                 WHERE f2.project_id = $1
                   AND c2.file_id <> c.file_id
-                  AND c2.embedding IS NOT NULL
-                ORDER BY c2.embedding <=> c.embedding
+                  AND c2.{col} IS NOT NULL
+                ORDER BY c2.{col} <=> c.{col}
                 LIMIT $3
             ) nn
             WHERE f.project_id = $1
-              AND c.embedding IS NOT NULL
+              AND c.{col} IS NOT NULL
         ),
         file_pairs AS (
             SELECT source_file_id, target_file_id, MAX(similarity) AS weight
@@ -8540,7 +8592,7 @@ pub async fn compute_semantic_file_edges(
         SELECT source_file_id, target_file_id, weight
         FROM ranked
         WHERE rn <= $4",
-    )
+    ))
     .bind(project_id)
     .bind(threshold)
     .bind(per_chunk_k)

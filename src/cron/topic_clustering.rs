@@ -1570,19 +1570,32 @@ async fn run_mmap_global_topic_scan(
         embedding: Vec<f32>,
     }
 
+    // Phase 5 C8: dispatch on the active embedding signature so we read
+    // the canonical column (`embedding_v2` post-cutover, `embedding`
+    // pre-cutover). The legacy `embedding` column is dropped after
+    // `embed-cutover --drop-legacy`, so hardcoding it would break.
+    // Resolved once here — the column cannot change mid-scan.
+    let col = match crate::embed::signature::read_active_signature(pool).await {
+        Ok(sig) => sig.read_column(),
+        Err(e) => {
+            error!(error = %e, "global topic scan: read active signature");
+            return;
+        }
+    };
+
     while offset < n_total {
         // Worktree-aware: filter to canonical project per repo so we
         // don't re-index the same chunks across worktrees / sibling
         // clones. See `bulk_extract_embeddings` in src/db/queries.rs
         // for rationale; the SQL is the same shape.
-        let rows = sqlx::query_as::<_, EmbRow>(
+        let rows = sqlx::query_as::<_, EmbRow>(&format!(
             "SELECT c.id AS id, c.file_id AS file_id, p.name AS project_name,
                     f.path AS path, f.language AS language,
-                    c.embedding::real[] AS embedding
+                    c.{col}::real[] AS embedding
              FROM file_chunks c
              JOIN indexed_files f ON c.file_id = f.id
              JOIN projects p ON f.project_id = p.id
-             WHERE c.embedding IS NOT NULL
+             WHERE c.{col} IS NOT NULL
                AND NOT EXISTS (
                    SELECT 1 FROM projects p_dup
                    WHERE p_dup.id < p.id
@@ -1598,7 +1611,7 @@ async fn run_mmap_global_topic_scan(
                )
              ORDER BY c.id
              LIMIT $1 OFFSET $2",
-        )
+        ))
         .bind(batch_size as i64)
         .bind(offset as i64)
         .fetch_all(&pool_for_meta)
@@ -2130,6 +2143,19 @@ async fn run_online_global_topic_scan(
     let pool_clone = pool.clone();
     let rt_handle = tokio::runtime::Handle::current();
 
+    // Phase 5 C8: resolve the active-signature column ONCE here (async
+    // context), then move the `&'static str` into the blocking + fetcher
+    // closures by copy. Reads `embedding_v2` post-cutover, `embedding`
+    // pre-cutover; the legacy column is dropped after
+    // `embed-cutover --drop-legacy`.
+    let col = match crate::embed::signature::read_active_signature(pool).await {
+        Ok(sig) => sig.read_column(),
+        Err(e) => {
+            error!(error = %e, "online global topic scan: read active signature");
+            return;
+        }
+    };
+
     // Move to blocking context for the long-running FCM loop.
     let cfg = OnlineFcmConfig {
         k,
@@ -2154,12 +2180,12 @@ async fn run_online_global_topic_scan(
                 }
                 // Worktree-aware: filter to canonical project per
                 // repo. See bulk_extract_embeddings rationale.
-                let rows = sqlx::query_as::<_, Row>(
-                    "SELECT c.id AS id, c.embedding::real[] AS embedding
+                let rows = sqlx::query_as::<_, Row>(&format!(
+                    "SELECT c.id AS id, c.{col}::real[] AS embedding
                      FROM file_chunks c
                      JOIN indexed_files f ON c.file_id = f.id
                      JOIN projects p ON f.project_id = p.id
-                     WHERE c.embedding IS NOT NULL
+                     WHERE c.{col} IS NOT NULL
                        AND NOT EXISTS (
                            SELECT 1 FROM projects p_dup
                            WHERE p_dup.id < p.id
@@ -2175,7 +2201,7 @@ async fn run_online_global_topic_scan(
                        )
                      ORDER BY c.id
                      LIMIT $1 OFFSET $2",
-                )
+                ))
                 .bind(bs as i64)
                 .bind(off as i64)
                 .fetch_all(&pool_clone)
@@ -2326,12 +2352,22 @@ async fn count_chunks(db: &dyn DbClient) -> Option<usize> {
     let pool = db
         .pool()
         .expect("count_chunks requires a real &PgPool from DbClient::pool()");
-    match sqlx::query_scalar::<_, i64>(
+    // Phase 5 C8: count must use the same active-signature column as the
+    // streaming query (`embedding_v2` post-cutover, `embedding`
+    // pre-cutover). Mismatching here would over/under-size the mmap.
+    let col = match crate::embed::signature::read_active_signature(pool).await {
+        Ok(sig) => sig.read_column(),
+        Err(e) => {
+            warn!(error = %e, "count_chunks: read active signature failed");
+            return None;
+        }
+    };
+    match sqlx::query_scalar::<_, i64>(&format!(
         "SELECT COUNT(*)
          FROM file_chunks c
          JOIN indexed_files f ON c.file_id = f.id
          JOIN projects p ON f.project_id = p.id
-         WHERE c.embedding IS NOT NULL
+         WHERE c.{col} IS NOT NULL
            AND NOT EXISTS (
                SELECT 1 FROM projects p_dup
                WHERE p_dup.id < p.id
@@ -2345,7 +2381,7 @@ async fn count_chunks(db: &dyn DbClient) -> Option<usize> {
                       AND p_dup.git_root_commits = p.git_root_commits)
                  )
            )",
-    )
+    ))
     .fetch_one(pool)
     .await
     {

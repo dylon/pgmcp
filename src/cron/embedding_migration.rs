@@ -893,13 +893,15 @@ pub async fn promote_to_bge_m3(pool: &PgPool, force: bool) -> Result<(), sqlx::E
     Ok(())
 }
 
-/// Read the current active embedding signature. Returns "minilm-l6-v2"
-/// when the row hasn't been written yet, mirroring the migration default.
+/// Read the current active embedding signature as a string. Delegates to the
+/// schema-aware resolver: when the metadata row is absent/unrecognized it
+/// infers from the physical schema (a dropped legacy `file_chunks.embedding`
+/// column ⇒ `bge-m3-v1`, else `minilm-l6-v2`). This keeps `drop_legacy`'s
+/// idempotency check correct on a re-run (the column is already gone ⇒
+/// signature reads `bge-m3-v1`, so the guard passes instead of erroring).
 pub async fn active_embedding_signature(pool: &PgPool) -> Result<String, sqlx::Error> {
-    let sig: Option<String> = sqlx::query_scalar(
-        "SELECT value FROM pgmcp_metadata WHERE key = 'active_embedding_signature'",
-    )
-    .fetch_optional(pool)
-    .await?;
-    Ok(sig.unwrap_or_else(|| "minilm-l6-v2".into()))
+    Ok(crate::embed::signature::read_active_signature(pool)
+        .await?
+        .as_str()
+        .to_string())
 }
