@@ -593,6 +593,14 @@ pub struct StatsTracker {
     pub a2a_pattern_deliberation_invocations: AtomicU64,
     pub a2a_peer_fanout_calls: AtomicU64,
     pub a2a_specialty_lookups: AtomicU64,
+    /// Best-practice outcomes captured via `record_outcome`
+    /// (the `a2a_report_outcome` tool + the A2 write-back seam).
+    pub a2a_outcomes_recorded: AtomicU64,
+    /// RLM (`a2a_pattern_recursive`) runs + recursive sub-calls (Part B).
+    pub a2a_rlm_invocations: AtomicU64,
+    pub a2a_rlm_subcalls: AtomicU64,
+    /// Inbound RLM recursion continuations served (depth>1; Part D).
+    pub a2a_rlm_recursions: AtomicU64,
 
     /// Currently-connected Streamable HTTP MCP sessions. Incremented when
     /// a peer issues an `initialize` and a session is created in the
@@ -862,6 +870,10 @@ impl StatsTracker {
             a2a_pattern_deliberation_invocations: AtomicU64::new(0),
             a2a_peer_fanout_calls: AtomicU64::new(0),
             a2a_specialty_lookups: AtomicU64::new(0),
+            a2a_outcomes_recorded: AtomicU64::new(0),
+            a2a_rlm_invocations: AtomicU64::new(0),
+            a2a_rlm_subcalls: AtomicU64::new(0),
+            a2a_rlm_recursions: AtomicU64::new(0),
             http_mcp_sessions: AtomicU64::new(0),
             peak_rss_bytes: AtomicU64::new(0),
             current_rss_bytes: AtomicU64::new(0),
@@ -1182,6 +1194,10 @@ impl StatsTracker {
                 self.a2a_pattern_deliberation_invocations.load(Ordering::Acquire),
             "a2a_peer_fanout_calls": self.a2a_peer_fanout_calls.load(Ordering::Acquire),
             "a2a_specialty_lookups": self.a2a_specialty_lookups.load(Ordering::Acquire),
+            "a2a_outcomes_recorded": self.a2a_outcomes_recorded.load(Ordering::Acquire),
+            "a2a_rlm_invocations": self.a2a_rlm_invocations.load(Ordering::Acquire),
+            "a2a_rlm_subcalls": self.a2a_rlm_subcalls.load(Ordering::Acquire),
+            "a2a_rlm_recursions": self.a2a_rlm_recursions.load(Ordering::Acquire),
             "http_mcp_sessions": self.http_mcp_sessions.load(Ordering::Acquire),
             "telemetry_rows_written": self.telemetry_rows_written.load(Ordering::Acquire),
             "telemetry_writes_dropped": self.telemetry_writes_dropped.load(Ordering::Acquire),

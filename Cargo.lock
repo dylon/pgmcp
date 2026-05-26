@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "adaptive-msm"
+version = "0.1.0"
+dependencies = [
+ "liblevenshtein",
+ "rand 0.8.5",
+]
+
+[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3897,6 +3905,7 @@ dependencies = [
 name = "pgmcp"
 version = "0.1.0"
 dependencies = [
+ "adaptive-msm",
  "anyhow",
  "arc-swap",
  "assert_cmd",

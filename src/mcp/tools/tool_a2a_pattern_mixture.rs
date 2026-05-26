@@ -31,6 +31,10 @@ pub async fn tool_a2a_pattern_mixture(
         .fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
 
+    // Read-before-act (Part A): peer best practices, prepended to the
+    // specialist prompt. Empty unless [a2a] inject_best_practices = true.
+    let bp = crate::a2a::best_practices::retrieve_for_prompt(ctx, None, &params.message, 512).await;
+
     if params.specialist_agents.is_empty() {
         return Err(McpError::invalid_params(
             "specialist_agents must contain at least one agent",
@@ -67,7 +71,7 @@ pub async fn tool_a2a_pattern_mixture(
 
     // Fan out to specialists in parallel.
     let specialist_message = format!(
-        "[Role: Domain Specialist] Query:\n{}\n\nProduce your domain-specific answer.",
+        "{bp}[Role: Domain Specialist] Query:\n{}\n\nProduce your domain-specific answer.",
         params.message
     );
     let futures: Vec<_> = specialist_urls
@@ -139,6 +143,17 @@ pub async fn tool_a2a_pattern_mixture(
     let final_text = task_to_text(&summary_task);
 
     mark_parent_completed(pool, parent_task_id).await?;
+
+    // Best-practice write-back (Part A): distill the Summarizer's synthesis
+    // into the shared memory graph. No-op unless [a2a] writeback_enabled.
+    crate::a2a::best_practices::writeback_peer_artifact(
+        ctx,
+        parent_task_id,
+        &params.summarizer_agent,
+        "a2a_pattern_mixture:Summarizer",
+        &final_text,
+    )
+    .await;
 
     // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
     let effect_breakdown: Vec<serde_json::Value> = (async {

@@ -208,8 +208,16 @@ async-trait = "0.1"
 # - `llammer-pipeline`: extracted library form of llammer's WFST
 #   correction pipeline. Imports flow into `src/wfst/lattice.rs` (Phase 9)
 #   and the `correct_query` MCP tool (Phase 8).
-libdictenstein = { path = "../libdictenstein", features = ["pathmap-backend", "persistent-artrie"] }
+# `persistent-artrie` kept explicit: pgmcp imports `persistent_artrie_char`
+# directly (fuzzy index + the vocab-indexed n-gram LM backend). `pathmap-backend`
+# is dropped — pgmcp no longer names PathMapDictionary; it stays enabled
+# transitively via libgrammstein→liblevenshtein anyway (cosmetic removal).
+libdictenstein = { path = "../libdictenstein", features = ["persistent-artrie"] }
 liblevenshtein = { path = "../liblevenshtein-rust", features = ["phonetic-rules", "embedded-rules", "serialization", "parallel-grep"] }
+# Real FPTL AdaptiveMsm learner (extracted from liblevenshtein's wfst::msm to
+# break the liblevenshtein↔lling-llang cycle). Learner-only: default-features
+# off ⇒ no `wfst`, no lling-llang edge into pgmcp.
+adaptive-msm = { path = "../adaptive-msm", default-features = false }
 lling-llang = { path = "../lling-llang", features = ["levenshtein", "lm-rerank", "phonetic-rescore", "serde", "bincode-ser"] }
 # `code-neural` is NOT enabled because it pulls `ort 2.x` (needs
 # `ndarray 0.17`) while libgrammstein top-level pins `ndarray 0.16`.

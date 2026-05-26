@@ -83,9 +83,80 @@ pub async fn tool_trigger_cron(
                     "guidance": "Function metrics populated (cyclomatic, cognitive, Halstead, NPath, MI).",
                 }))
         }
+        "a2a-reflect" => {
+            // Part A phase A4: consensus-gate peer outcomes into the shared
+            // scope and promote the strongest agreed practices to durable
+            // mandates. On-demand counterpart to the off-by-default cron.
+            let pool = ctx
+                .db()
+                .pool()
+                .ok_or_else(|| McpError::internal_error("no pool available", None))?;
+            let cfg = ctx.config().load().a2a.reflection.clone();
+            let report = crate::a2a::best_practices::run_cross_agent_reflection(
+                pool,
+                stats,
+                ctx.llm_extractor().map(|e| &**e),
+                &cfg,
+            )
+            .await
+            .map_err(|e| McpError::internal_error(format!("a2a-reflect failed: {e}"), None))?;
+            json_result(&json!({
+                "job": params.job,
+                "status": "completed",
+                "consensus_groups": report.consensus_groups,
+                "scopes_reflected": report.scopes_reflected,
+                "mandates_promoted": report.mandates_promoted,
+                "guidance": "Agreed peer best practices promoted to durable mandates; they re-inject via the UserPromptSubmit hook.",
+            }))
+        }
+        "msm-calibrate" => {
+            // Part E (closed MSM loop): refresh trajectory success labels from
+            // explicit outcomes, then re-tune the adaptive split/merge cost c
+            // for cohort separation (LOO precision-guarded) and persist it.
+            let pool = ctx
+                .db()
+                .pool()
+                .ok_or_else(|| McpError::internal_error("no pool available", None))?;
+            use crate::fuzzy::trajectory_index::{
+                DEFAULT_MSM_C, calibrate_adaptive_c, label_trajectories_from_outcomes, load_msm_c,
+                loo_accuracy, store_msm_c,
+            };
+            let labeled = label_trajectories_from_outcomes(pool)
+                .await
+                .map_err(|e| McpError::internal_error(format!("label step: {e}"), None))?;
+            let cohort = |success: bool| async move {
+                sqlx::query_as::<_, (i64, Vec<f64>)>(
+                    "SELECT id, encoded_series FROM agent_trajectories
+                     WHERE success = $1 AND cardinality(encoded_series) > 0",
+                )
+                .bind(success)
+                .fetch_all(pool)
+                .await
+            };
+            let success = cohort(true)
+                .await
+                .map_err(|e| McpError::internal_error(format!("success cohort: {e}"), None))?;
+            let fail = cohort(false)
+                .await
+                .map_err(|e| McpError::internal_error(format!("fail cohort: {e}"), None))?;
+            let prev_c = load_msm_c(pool).await.unwrap_or(DEFAULT_MSM_C);
+            let new_c = calibrate_adaptive_c(&success, &fail, prev_c, 64);
+            let _ = store_msm_c(pool, new_c).await;
+            json_result(&json!({
+                "job": params.job,
+                "status": "completed",
+                "newly_labeled": labeled,
+                "success_cohort": success.len(),
+                "fail_cohort": fail.len(),
+                "previous_c": prev_c,
+                "calibrated_c": new_c,
+                "loo_accuracy": loo_accuracy(&success, &fail, new_c),
+                "guidance": "Adaptive MSM cost re-tuned for cohort separation; the RLM strategy chooser (a2a_pattern_recursive) now uses it.",
+            }))
+        }
         other => Err(McpError::invalid_params(
             format!(
-                "Unknown job {other:?}. Valid: symbol-extraction | call-graph | function-metrics"
+                "Unknown job {other:?}. Valid: symbol-extraction | call-graph | function-metrics | a2a-reflect | msm-calibrate"
             ),
             None,
         )),

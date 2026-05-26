@@ -32,6 +32,10 @@ pub async fn tool_a2a_pattern_distillation(
         .fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
 
+    // Read-before-act (Part A): peer best practices, prepended to the
+    // Expert prompt. Empty unless [a2a] inject_best_practices = true.
+    let bp = crate::a2a::best_practices::retrieve_for_prompt(ctx, None, &params.message, 512).await;
+
     let expert_url = resolve_agent_url(pool, &params.expert_agent).await?;
     let learner_url = resolve_agent_url(pool, &params.learner_agent).await?;
 
@@ -53,7 +57,7 @@ pub async fn tool_a2a_pattern_distillation(
 
     // 1. Expert answer.
     let expert_prompt = format!(
-        "[Role: Expert] Query:\n{}\n\nProduce a thorough, high-quality answer. Show your reasoning explicitly.",
+        "{bp}[Role: Expert] Query:\n{}\n\nProduce a thorough, high-quality answer. Show your reasoning explicitly.",
         params.message
     );
     let t_expert_start = Instant::now();
@@ -84,6 +88,17 @@ pub async fn tool_a2a_pattern_distillation(
     let learner_text = task_to_text(&learner_task);
 
     mark_parent_completed(pool, parent_task_id).await?;
+
+    // Best-practice write-back (Part A): distill the Learner's distilled
+    // answer into the shared memory graph. No-op unless [a2a] writeback_enabled.
+    crate::a2a::best_practices::writeback_peer_artifact(
+        ctx,
+        parent_task_id,
+        &params.learner_agent,
+        "a2a_pattern_distillation:Learner",
+        &learner_text,
+    )
+    .await;
 
     // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
     let effect_breakdown: Vec<serde_json::Value> = (async {

@@ -2449,6 +2449,14 @@ pub struct A2aFindAgentsBySpecialtyParams {
     pub recommended_role: Option<String>,
     #[schemars(description = "Max results (default 10)")]
     pub limit: Option<usize>,
+    #[schemars(
+        description = "Optional typed-capability filter: agents must carry ALL of these type tags in their structured capabilities descriptor (AND-logic). Adds a ranked `typed_capability_matches` list to the result."
+    )]
+    pub required_type_tags: Option<Vec<String>>,
+    #[schemars(
+        description = "Optional typed-capability filter: agents must carry ALL of these effects (e.g. \"network\", \"database\") in their structured capabilities descriptor (AND-logic)."
+    )]
+    pub required_effects: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2495,6 +2503,78 @@ pub struct A2aPatternDeliberationParams {
     pub message: String,
     #[schemars(description = "Max deliberation rounds (default 3, hard cap 10)")]
     pub max_rounds: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aReportOutcomeParams {
+    #[schemars(
+        description = "Kind of task this is about, e.g. \"rust-collections\" or \"a2a_pattern_sequential:Solver\""
+    )]
+    pub task_kind: String,
+    #[schemars(description = "Short imperative approach, e.g. \"preallocate Vec with capacity\"")]
+    pub approach: String,
+    #[schemars(
+        description = "Outcome: worked | failed | mixed | prefer | avoid | superseded_by_peer"
+    )]
+    pub outcome: String,
+    #[schemars(description = "Confidence in [0,1] (default 0.6)")]
+    pub confidence: Option<f32>,
+    #[schemars(description = "Optional supporting snippet / rationale")]
+    pub evidence: Option<String>,
+    #[schemars(description = "Owning project id; omit for a workspace-general practice")]
+    pub project_id: Option<i32>,
+    #[schemars(description = "Reporting agent id; defaults to the MCP client name")]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aPatternRecursiveParams {
+    #[schemars(description = "The long-context question to answer")]
+    pub query: String,
+    #[schemars(
+        description = "Environment handle: {\"kind\":\"file\",\"path\":\"...\"} or {\"kind\":\"corpus\",\"project\":\"...\"}"
+    )]
+    pub environment: serde_json::Value,
+    #[schemars(
+        description = "Registered peer name for per-snippet sub-calls (e.g. a Claude/Codex adapter)"
+    )]
+    pub sub_agent: String,
+    #[schemars(description = "Registered peer for the final reduce (defaults to sub_agent)")]
+    pub reduce_agent: Option<String>,
+    #[schemars(description = "Max snippets to decompose into (1..=64, default 8)")]
+    pub max_chunks: Option<usize>,
+    #[schemars(description = "Run an extra verification sub-call on the final answer")]
+    pub verify: Option<bool>,
+    #[schemars(description = "Bounded sub-call concurrency (1..=8, default 4)")]
+    pub concurrency: Option<usize>,
+    #[schemars(
+        description = "Decompose strategy: \"chunk\" | \"semantic\" | \"grep\" (default by environment)"
+    )]
+    pub strategy: Option<String>,
+    #[schemars(
+        description = "Max recursion depth (1..=4, default from [a2a.rlm].max_depth). >1 enables true RLM self-recursion over narrowed sub-environments."
+    )]
+    pub rlm_depth: Option<u32>,
+    #[schemars(
+        description = "Total sub-call budget across the whole recursion tree (default from [a2a.rlm].max_budget); telescopes across depth so the tree never exceeds it."
+    )]
+    pub rlm_budget: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TrajectorySimilarityParams {
+    #[schemars(
+        description = "Probe by an existing RLM run's task_id (uses its recorded trajectory)"
+    )]
+    pub task_id: Option<String>,
+    #[schemars(description = "Or an explicit probe series (encoded step f64s)")]
+    pub probe_series: Option<Vec<f64>>,
+    #[schemars(description = "Number of nearest trajectories to return (1..=50, default 5)")]
+    pub k: Option<usize>,
+    #[schemars(
+        description = "Re-tune the adaptive MSM cost c from the trajectory set and persist it"
+    )]
+    pub recalibrate_c: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -6044,6 +6124,81 @@ RecursiveMAS Table 1 Deliberation Style."
         .await
     }
 
+    #[tool(
+        description = "Report that an approach worked / failed for a kind of task. Records it to the \
+shared best-practice memory graph (agent_outcomes + a mirrored observation) so peer agents can learn \
+what works and what does not. Part A cross-agent best-practice exchange."
+    )]
+    async fn a2a_report_outcome(
+        &self,
+        Parameters(params): Parameters<A2aReportOutcomeParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // Attribute to the MCP client (claude-code / codex / …) unless the
+        // caller supplied an explicit agent_id.
+        let mut params = params;
+        if params.agent_id.is_none() {
+            params.agent_id = Some(extract_caller(&_ctx).client_name);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_report_outcome",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_a2a_report_outcome::tool_a2a_report_outcome(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Recursive Language Model decomposition (Part B): treat a corpus/file as an external \
+environment, decompose into snippets, recursively sub-call a peer LM over each (small context), and stitch \
+the partials — the full context is never inlined. Solves beyond-context-window queries over indexed code."
+    )]
+    async fn a2a_pattern_recursive(
+        &self,
+        Parameters(params): Parameters<A2aPatternRecursiveParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_pattern_recursive",
+            600,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_a2a_pattern_recursive::tool_a2a_pattern_recursive(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "MSM trajectory similarity (Part B): retrieve the most similar past RLM runs to a probe \
+(Move-Split-Merge distance over their step sequences) and classify whether it trends toward success or \
+failure. Powers the 'learn which decomposition worked' loop."
+    )]
+    async fn trajectory_similarity(
+        &self,
+        Parameters(params): Parameters<TrajectorySimilarityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "trajectory_similarity",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_trajectory_similarity::tool_trajectory_similarity(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
     // ========================================================================
     // SOTA Phase 2 — Graph algorithms
     // ========================================================================
@@ -8479,6 +8634,9 @@ impl McpServer {
                     => a2a_pattern_distillation(A2aPatternDistillationParams),
                 "a2a_pattern_deliberation"
                     => a2a_pattern_deliberation(A2aPatternDeliberationParams),
+                "a2a_report_outcome"     => a2a_report_outcome(A2aReportOutcomeParams),
+                "a2a_pattern_recursive"  => a2a_pattern_recursive(A2aPatternRecursiveParams),
+                "trajectory_similarity"  => trajectory_similarity(TrajectorySimilarityParams),
                 // SOTA Phase 2 — graph algorithms
                 "kcore_analysis"         => kcore_analysis(KcoreAnalysisParams),
                 "ktruss_analysis"        => ktruss_analysis(KtrussAnalysisParams),

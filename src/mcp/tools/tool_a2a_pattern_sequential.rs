@@ -35,6 +35,10 @@ pub async fn tool_a2a_pattern_sequential(
         .fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
 
+    // Read-before-act (Part A): peer best practices, prepended to the lead
+    // role prompt. Empty unless [a2a] inject_best_practices = true.
+    let bp = crate::a2a::best_practices::retrieve_for_prompt(ctx, None, &params.message, 512).await;
+
     let planner_url = resolve_agent_url(pool, &params.planner_agent).await?;
     let critic_url = resolve_agent_url(pool, &params.critic_agent).await?;
     let solver_url = resolve_agent_url(pool, &params.solver_agent).await?;
@@ -61,7 +65,7 @@ pub async fn tool_a2a_pattern_sequential(
         // 1. Planner — refines based on previous round's solver output (if any).
         let plan_prompt = match &prev_solver_output {
             None => format!(
-                "[Role: Planner] Original query:\n{}\n\nProduce a step-by-step plan to solve the query.",
+                "{bp}[Role: Planner] Original query:\n{}\n\nProduce a step-by-step plan to solve the query.",
                 params.message
             ),
             Some(prev) => format!(
@@ -107,6 +111,17 @@ pub async fn tool_a2a_pattern_sequential(
     }
 
     mark_parent_completed(pool, parent_task_id).await?;
+
+    // Best-practice write-back (Part A): distill the Solver's final answer
+    // into the shared memory graph. No-op unless [a2a] writeback_enabled.
+    crate::a2a::best_practices::writeback_peer_artifact(
+        ctx,
+        parent_task_id,
+        &params.solver_agent,
+        "a2a_pattern_sequential:Solver",
+        &final_text,
+    )
+    .await;
 
     // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
     let effect_breakdown: Vec<serde_json::Value> = (async {

@@ -21,13 +21,14 @@ use std::sync::atomic::Ordering;
 use libgrammstein::corpus::{CorpusReader, Document};
 use libgrammstein::embedding::EmbeddingTrainerBuilder;
 use libgrammstein::hybrid::HybridLanguageModel;
-use libgrammstein::ngram::{NgramEntry, TrainerBuilder};
-use liblevenshtein::dictionary::pathmap::PathMapDictionary;
+use libgrammstein::ngram::TrainerBuilder;
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
 use crate::stats::tracker::StatsTracker;
-use crate::wfst::hybrid_lm::{HybridLmConfig, PgmcpLmDictionary};
+use crate::wfst::hybrid_lm::{
+    HybridLmConfig, PgmcpLmDictionary, lm_trie_paths, try_build_lm_dictionary,
+};
 
 /// Cron entry point. Runs across all projects; logs and continues
 /// on per-project errors.
@@ -105,9 +106,25 @@ async fn train_project(
     let cfg = HybridLmConfig::default();
     let order = cfg.order;
 
+    // Build the vocab-indexed persistent dictionary backed by fresh on-disk
+    // tries under the project's model dir (a `train/` subdir, kept separate
+    // from readers' `live/` dir so the cron and a reader never share a trie
+    // path). Wipe it first so the tries start empty (`create` reuses, not
+    // truncates, existing files).
+    let model_path = model_path_for(data_dir, project_name);
+    let train_dir = model_path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| data_dir.to_path_buf())
+        .join("train");
+    let _ = std::fs::remove_dir_all(&train_dir);
+    std::fs::create_dir_all(&train_dir)?;
+    let (vocab_path, counts_path) = lm_trie_paths(&train_dir);
+    let dictionary = try_build_lm_dictionary(&vocab_path, &counts_path)
+        .map_err(|e| TrainError::Train(format!("lm dictionary: {e}")))?;
+
     // Train the n-gram side.
     let reader_ngram = ChunkCorpus::new(contents.clone());
-    let dictionary = PathMapDictionary::<NgramEntry>::new();
     let ngram_model = TrainerBuilder::new(dictionary)
         .order(order)
         .train(reader_ngram)
@@ -128,7 +145,6 @@ async fn train_project(
     let model: HybridLanguageModel<PgmcpLmDictionary> =
         HybridLanguageModel::new(ngram_model, embedding, cfg.to_grammstein());
 
-    let model_path = model_path_for(data_dir, project_name);
     if let Some(parent) = model_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -202,4 +218,80 @@ enum TrainError {
     Io(#[from] std::io::Error),
     #[error("train: {0}")]
     Train(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wfst::hybrid_lm::PgmcpHybridLm;
+    use libgrammstein::embedding::EmbeddingTrainerBuilder;
+
+    /// End-to-end proof of the vocab-indexed persistent LM backend: train →
+    /// `save_portable` → `open` (which rebuilds the on-disk vocab+counts tries
+    /// from `model.bin`) → score, plus stability across a reload. Exercises
+    /// both `IterableDictionary` impls (save iterates the wrapper → decodes to
+    /// `'|'`-joined keys; load replays them) and the `'|'` delimiter invariant
+    /// (a mismatch would corrupt the round-trip silently).
+    #[test]
+    fn vocab_indexed_lm_roundtrip_train_save_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path();
+        let project = "roundtrip_proj";
+
+        // ≥5 chunks, ≥50 tokens, and enough distinct tokens to satisfy the
+        // embedding trainer's minimum-vocabulary requirement.
+        let contents: Vec<String> = (0..12)
+            .map(|i| {
+                format!(
+                    "the quick brown fox jumps over the lazy dog number {i} \
+                     and then the quick brown cat runs away very fast today"
+                )
+            })
+            .collect();
+
+        let cfg = HybridLmConfig::default();
+        let model_path = model_path_for(data_dir, project);
+        let train_dir = model_path
+            .parent()
+            .expect("model path has parent")
+            .join("train");
+        std::fs::create_dir_all(&train_dir).expect("mkdir train");
+        let (vocab_path, counts_path) = lm_trie_paths(&train_dir);
+        let dictionary =
+            try_build_lm_dictionary(&vocab_path, &counts_path).expect("build dictionary");
+
+        let ngram_model = TrainerBuilder::new(dictionary)
+            .order(cfg.order)
+            .train(ChunkCorpus::new(contents.clone()))
+            .expect("train ngram");
+        let embedding = EmbeddingTrainerBuilder::new()
+            .dim(16)
+            .window_size(3)
+            .min_count(1)
+            .epochs(1)
+            .train(ChunkCorpus::new(contents))
+            .expect("train embedding");
+        let model: HybridLanguageModel<PgmcpLmDictionary> =
+            HybridLanguageModel::new(ngram_model, embedding, cfg.to_grammstein());
+        std::fs::create_dir_all(model_path.parent().expect("parent")).expect("mkdir model dir");
+        model.save_portable(&model_path).expect("save_portable");
+
+        // The vocab-indexed backend really did write both persistent tries.
+        assert!(vocab_path.exists(), "vocab.artrie was created on disk");
+        assert!(counts_path.exists(), "counts.artrie was created on disk");
+
+        // The production loader rebuilds the tries under `live/` and scores.
+        let lm = PgmcpHybridLm::open(&model_path).expect("open");
+        let s1 = lm.score_continuation(&["quick", "brown"], "fox");
+        assert!(s1.is_finite(), "score is finite: {s1}");
+
+        // Reload → identical score: the portable round-trip is deterministic.
+        let s2 = PgmcpHybridLm::open(&model_path)
+            .expect("reopen")
+            .score_continuation(&["quick", "brown"], "fox");
+        assert!(
+            (s1 - s2).abs() < 1e-9,
+            "score stable across reload: {s1} vs {s2}"
+        );
+    }
 }

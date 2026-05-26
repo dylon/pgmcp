@@ -9,6 +9,7 @@
 //! `main.rs` (notably `tool::parse_tool_args`) become externally visible
 //! once they live here.
 
+pub mod a2a_adapter;
 pub mod admin;
 pub mod analyze;
 pub mod context;

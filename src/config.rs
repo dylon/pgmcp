@@ -45,6 +45,140 @@ pub struct Config {
     /// `[api]` — REST API / RAG-hook tuning (optional cross-encoder rerank).
     #[serde(default)]
     pub api: ApiConfig,
+    /// `[a2a]` — inter-agent best-practice exchange + RLM knobs. All
+    /// fields default off/inert so a stock pgmcp install behaves as before.
+    #[serde(default)]
+    pub a2a: A2aConfig,
+}
+
+/// `[a2a]` — Agent-to-Agent best-practice exchange + RLM tuning. Every
+/// field defaults off/inert: a stock pgmcp install neither writes peer
+/// outcomes to the memory graph nor injects them into prompts until the
+/// operator opts in.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct A2aConfig {
+    /// When true, the A2A pattern tools and the dispatcher distill each
+    /// peer artifact / task outcome into the shared `memory_*` graph
+    /// (Part A write-back seam).
+    #[serde(default)]
+    pub writeback_enabled: bool,
+    /// When true, peer best practices are retrieved and injected into
+    /// pattern role prompts and the `/api/session/observe`
+    /// `additional_context` (Part A read-before-act).
+    #[serde(default)]
+    pub inject_best_practices: bool,
+    #[serde(default)]
+    pub reflection: A2aReflectionConfig,
+    #[serde(default)]
+    pub rlm: A2aRlmConfig,
+}
+
+/// `[a2a.reflection]` — cross-agent consensus reflection + promotion
+/// (Part A phase A4). Mirrors `[memory.reflection]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct A2aReflectionConfig {
+    /// Whether the periodic `a2a-reflect` cron runs.
+    #[serde(default)]
+    pub cron_enabled: bool,
+    #[serde(default = "default_a2a_reflection_interval")]
+    pub cron_interval_secs: u64,
+    /// Minimum distinct agents that must agree on the same
+    /// approach+outcome before it enters the shared (agent_id=NULL)
+    /// scope. The core anti-flooding gate.
+    #[serde(default = "default_a2a_min_agents")]
+    pub min_agents: i64,
+    /// Minimum mean confidence for the consensus gate.
+    #[serde(default = "default_a2a_min_confidence")]
+    pub min_confidence: f32,
+    /// Promote a practice to workspace scope (cross-task reach) when it
+    /// has agreeing reports across at least this many distinct projects.
+    #[serde(default = "default_a2a_workspace_promotion")]
+    pub workspace_promotion: i64,
+    /// Trust-weighted promotion-score threshold for `durable_mandates`.
+    #[serde(default = "default_a2a_promote_threshold")]
+    pub promote_threshold: f32,
+    /// When true, promotion also appends a bullet under the
+    /// `## Agreed best practices (pgmcp)` marker in the target file
+    /// (AGENTS.md/CLAUDE.md). Default false — DB-only.
+    #[serde(default)]
+    pub write_to_file: bool,
+}
+
+impl Default for A2aReflectionConfig {
+    fn default() -> Self {
+        Self {
+            cron_enabled: false,
+            cron_interval_secs: default_a2a_reflection_interval(),
+            min_agents: default_a2a_min_agents(),
+            min_confidence: default_a2a_min_confidence(),
+            workspace_promotion: default_a2a_workspace_promotion(),
+            promote_threshold: default_a2a_promote_threshold(),
+            write_to_file: false,
+        }
+    }
+}
+
+fn default_a2a_reflection_interval() -> u64 {
+    86400
+}
+fn default_a2a_min_agents() -> i64 {
+    2
+}
+fn default_a2a_min_confidence() -> f32 {
+    0.6
+}
+fn default_a2a_workspace_promotion() -> i64 {
+    2
+}
+fn default_a2a_promote_threshold() -> f32 {
+    0.5
+}
+
+/// `[a2a.rlm]` — Recursive-Language-Model knobs (Parts D + E). Safe
+/// defaults; depth>1 is opt-in per call (default `rlm_depth = 1`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct A2aRlmConfig {
+    /// Max recursion depth a run may request (clamped to the hard cap).
+    #[serde(default = "default_rlm_max_depth")]
+    pub max_depth: u32,
+    /// Default total sub-call budget across a recursion tree.
+    #[serde(default = "default_rlm_max_budget")]
+    pub max_budget: u32,
+    /// MSM neighbors examined per candidate strategy in the chooser.
+    #[serde(default = "default_rlm_neighbor_k")]
+    pub neighbor_k: usize,
+    /// Epsilon for explore/exploit over decomposition strategies.
+    #[serde(default = "default_rlm_explore_epsilon")]
+    pub explore_epsilon: f32,
+    /// Whether RLM runs self-grade (via the verify rubric) to label
+    /// trajectories. The verify sub-call itself is still opt-in per run.
+    #[serde(default = "default_true")]
+    pub self_grade_enabled: bool,
+}
+
+impl Default for A2aRlmConfig {
+    fn default() -> Self {
+        Self {
+            max_depth: default_rlm_max_depth(),
+            max_budget: default_rlm_max_budget(),
+            neighbor_k: default_rlm_neighbor_k(),
+            explore_epsilon: default_rlm_explore_epsilon(),
+            self_grade_enabled: true,
+        }
+    }
+}
+
+fn default_rlm_max_depth() -> u32 {
+    4
+}
+fn default_rlm_max_budget() -> u32 {
+    64
+}
+fn default_rlm_neighbor_k() -> usize {
+    5
+}
+fn default_rlm_explore_epsilon() -> f32 {
+    0.15
 }
 
 /// Disk-backed PersistentARTrieChar fuzzy-index configuration.

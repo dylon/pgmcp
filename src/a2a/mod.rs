@@ -21,9 +21,11 @@
 #![allow(unused_imports)] // Public re-exports for external consumers (tests, examples).
 
 pub mod adapters;
+pub mod best_practices;
 pub mod client;
 pub mod dispatcher;
 pub mod handlers;
+pub mod rlm;
 pub mod server;
 pub mod skills;
 pub mod sse;

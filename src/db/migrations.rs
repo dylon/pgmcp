@@ -1692,6 +1692,10 @@ async fn ensure_memory_phase2_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
             "memory_source",
             "CREATE TYPE memory_source AS ENUM ('user_explicit','llm_extraction','reflection','consolidation','agent_write','migration')",
         ),
+        (
+            "memory_outcome",
+            "CREATE TYPE memory_outcome AS ENUM ('worked','failed','mixed','prefer','avoid','superseded_by_peer')",
+        ),
     ];
     for (name, create_sql) in enum_stmts {
         let exists: bool =
@@ -1973,6 +1977,116 @@ async fn ensure_memory_phase2_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // A2A best-practice exchange (Part A). Authoritative, cheaply
+    // aggregatable outcome ledger: one row per peer report about an
+    // approach for a task-kind, mirrored into a memory_observation
+    // (observation_id) so it also participates in PPR/unified retrieval
+    // and reflection. Created here, after memory_observations, so the FK
+    // resolves; a2a_tasks (created earlier in run_migrations) backs
+    // parent_task_id.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS agent_outcomes (
+            id              BIGSERIAL PRIMARY KEY,
+            agent_id        TEXT NOT NULL,
+            project_id      INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            task_kind       TEXT NOT NULL,
+            approach        TEXT NOT NULL,
+            outcome         memory_outcome NOT NULL,
+            confidence      REAL NOT NULL DEFAULT 0.5 CHECK (confidence >= 0.0 AND confidence <= 1.0),
+            evidence        TEXT,
+            parent_task_id  UUID REFERENCES a2a_tasks(id) ON DELETE SET NULL,
+            observation_id  BIGINT REFERENCES memory_observations(id) ON DELETE SET NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let outcome_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_agent_outcomes_proj_kind
+            ON agent_outcomes (project_id, task_kind)",
+        "CREATE INDEX IF NOT EXISTS idx_agent_outcomes_agent
+            ON agent_outcomes (agent_id)",
+    ];
+    for s in outcome_indexes {
+        sqlx::query(s).execute(pool).await?;
+    }
+
+    // Per-agent trust prior — anti-flooding weight read by A4 promotion.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS agent_trust (
+            agent_id          TEXT PRIMARY KEY,
+            importance_prior  REAL NOT NULL DEFAULT 0.5 CHECK (importance_prior >= 0.0 AND importance_prior <= 1.0),
+            reports_total     BIGINT NOT NULL DEFAULT 0,
+            reports_promoted  BIGINT NOT NULL DEFAULT 0,
+            updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    // RLM trajectory recording (Part B phase B3). One row per recursive
+    // decomposition run; `encoded_series` is the precomputed step→f64
+    // sequence the MSM trajectory index (B4) compares. `success` is
+    // back-filled by the outcome labeler joining agent_outcomes.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS agent_trajectories (
+            id               BIGSERIAL PRIMARY KEY,
+            task_id          UUID NOT NULL REFERENCES a2a_tasks(id) ON DELETE CASCADE,
+            parent_task_id   UUID REFERENCES a2a_tasks(id) ON DELETE SET NULL,
+            kind             TEXT NOT NULL DEFAULT 'rlm',
+            environment      JSONB NOT NULL DEFAULT '{}'::jsonb,
+            query_sha256     CHAR(64) NOT NULL,
+            strategy         TEXT,
+            depth_reached    INTEGER NOT NULL DEFAULT 1,
+            total_subcalls   INTEGER NOT NULL DEFAULT 0,
+            total_latency_ms BIGINT NOT NULL DEFAULT 0,
+            success          BOOLEAN,
+            self_grade       DOUBLE PRECISION,
+            outcome_obs_id   BIGINT REFERENCES memory_observations(id) ON DELETE SET NULL,
+            encoded_series   DOUBLE PRECISION[] NOT NULL DEFAULT '{}',
+            created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+    // E (closed MSM loop): the RLM self-grade in [0,1] from the verify
+    // rubric. Idempotent add for installs created before Part E.
+    sqlx::query(
+        "ALTER TABLE agent_trajectories ADD COLUMN IF NOT EXISTS self_grade DOUBLE PRECISION",
+    )
+    .execute(pool)
+    .await?;
+    let traj_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_agent_trajectories_task
+            ON agent_trajectories (task_id)",
+        "CREATE INDEX IF NOT EXISTS idx_agent_trajectories_success
+            ON agent_trajectories (success) WHERE success IS NOT NULL",
+    ];
+    for s in traj_indexes {
+        sqlx::query(s).execute(pool).await?;
+    }
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS trajectory_steps (
+            id            BIGSERIAL PRIMARY KEY,
+            trajectory_id BIGINT NOT NULL REFERENCES agent_trajectories(id) ON DELETE CASCADE,
+            ord           INTEGER NOT NULL,
+            step_kind     TEXT NOT NULL,
+            depth         INTEGER NOT NULL DEFAULT 0,
+            latency_ms    BIGINT NOT NULL DEFAULT 0,
+            est_tokens    BIGINT NOT NULL DEFAULT 0,
+            success       BOOLEAN NOT NULL DEFAULT TRUE,
+            UNIQUE (trajectory_id, ord)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_trajectory_steps_traj
+            ON trajectory_steps (trajectory_id, ord)",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -2240,6 +2354,37 @@ async fn ensure_memory_v2_hnsw_index(
         sqlx::query(
             "INSERT INTO pgmcp_metadata (key, value)
              VALUES ('memory_v2_software_pattern_chunks_hnsw_params', $1)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+    }
+
+    // session_mandates.embedding — restores symmetry with durable_mandates
+    // above. `ensure_memory_v2_columns` adds session_mandates.embedding
+    // (vector(1024)) and the migration cron populates it, but the original
+    // index builder shipped without this block, leaving session_mandates the
+    // only embedding-bearing table with no ANN index.
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'memory_v2_session_mandates_hnsw_params'",
+    )
+    .fetch_optional(pool)
+    .await?;
+    if stored.as_deref() != Some(&current_params) {
+        sqlx::query("DROP INDEX IF EXISTS idx_session_mandates_embedding")
+            .execute(pool)
+            .await?;
+        let create_sql = format!(
+            "CREATE INDEX idx_session_mandates_embedding ON session_mandates \
+             USING hnsw (embedding vector_cosine_ops) \
+             WITH (m = {}, ef_construction = {})",
+            config.hnsw_m, config.hnsw_ef_construction
+        );
+        build_hnsw_index(pool, config, &create_sql).await?;
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value)
+             VALUES ('memory_v2_session_mandates_hnsw_params', $1)
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         )
         .bind(&current_params)

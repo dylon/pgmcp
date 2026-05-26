@@ -201,26 +201,34 @@ async fn append_mandate_to_file(
         mandate.polarity, scope, mandate.imperative
     );
 
+    append_bullet_to_marker(path, MARKER, &bullet)
+}
+
+/// Append a bullet under a marker section in a file (pure I/O, idempotent).
+/// Creates the marker section if absent. Shared by session-mandate
+/// promotion and the A4 cross-agent best-practice promotion.
+pub(crate) fn append_bullet_to_marker(
+    path: &str,
+    marker: &str,
+    bullet: &str,
+) -> Result<(), String> {
     let existing = std::fs::read_to_string(path).unwrap_or_default();
-    if existing.contains(&bullet) {
+    if existing.contains(bullet) {
         return Ok(());
     }
-
     let mut out = existing.clone();
-    if !out.contains(MARKER) {
+    if !out.contains(marker) {
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }
         out.push('\n');
-        out.push_str(MARKER);
+        out.push_str(marker);
         out.push_str("\n\n");
     }
     if !out.ends_with('\n') {
         out.push('\n');
     }
-    out.push_str(&bullet);
+    out.push_str(bullet);
     out.push('\n');
-
-    std::fs::write(path, out).map_err(|e| format!("write {}: {}", path, e))?;
-    Ok(())
+    std::fs::write(path, out).map_err(|e| format!("write {}: {}", path, e))
 }

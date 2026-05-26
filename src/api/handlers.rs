@@ -456,6 +456,12 @@ pub struct ObserveRequest {
     #[serde(default = "default_true")]
     pub include_rag: bool,
     pub rag_limit: Option<i32>,
+    /// Reporting agent id (e.g. "claude-code"). Attributed to the memory
+    /// scope so the multi-agent shared-memory `agent_id` dimension is
+    /// populated. Optional — defaults to workspace scope when absent
+    /// (no regression for hooks that don't send it).
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -603,7 +609,7 @@ pub async fn session_observe(
             session_id: req.session_id,
             source_prompt_id: prompt_id,
             project_id,
-            agent_id: None, // populated from MCP clientInfo in a future phase
+            agent_id: req.agent_id.clone(), // A6: from the hook / MCP clientInfo
             user_id: std::env::var("USER").ok(),
             prompt_text: req.prompt.clone(),
         };
@@ -656,6 +662,20 @@ pub async fn session_observe(
             additional_context.push_str(&line);
             used += line.len();
         }
+    }
+
+    // Read-before-act (Part A): inject peer best practices (workspace ∪
+    // project scope, G1). No-op unless [a2a] inject_best_practices = true.
+    let bp = crate::a2a::best_practices::retrieve_for_prompt(
+        &state.system_ctx,
+        project_id,
+        &req.prompt,
+        512,
+    )
+    .await;
+    if !bp.is_empty() && additional_context.len() + bp.len() < 2048 {
+        additional_context.push('\n');
+        additional_context.push_str(&bp);
     }
 
     Ok(Json(ObserveResponse {

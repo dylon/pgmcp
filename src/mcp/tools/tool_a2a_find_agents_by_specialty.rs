@@ -77,12 +77,56 @@ pub async fn tool_a2a_find_agents_by_specialty(
     })
     .await;
 
+    // Optional typed-capability routing (Pattern H): when the caller supplies
+    // required type-tags / effects, additionally rank peers by their
+    // structured `capabilities` descriptor (AND-logic on the requirements).
+    // Peers without a typed descriptor are filtered out of this list; they
+    // remain reachable via the free-text `matches` above.
+    let required_type_tags = params.required_type_tags.clone().unwrap_or_default();
+    let required_effects = params.required_effects.clone().unwrap_or_default();
+    let typed_capability_matches: Vec<serde_json::Value> =
+        if required_type_tags.is_empty() && required_effects.is_empty() {
+            Vec::new()
+        } else {
+            use crate::mcp::tools::sema_helpers::a2a_capabilities::{
+                AgentMatchFilter, find_agents_by_typed_capability,
+            };
+            let filter = AgentMatchFilter {
+                required_type_tags,
+                required_effects,
+            };
+            match find_agents_by_typed_capability(pool, &filter, limit).await {
+                Ok(matches) => matches
+                    .into_iter()
+                    .map(|m| {
+                        json!({
+                            "agent_id": m.agent_id,
+                            "name": m.name,
+                            "specialty": m.specialty,
+                            "score": m.score,
+                            "capability": {
+                                "type_tags": m.capability.type_tags,
+                                "effects": m.capability.effects,
+                            },
+                        })
+                    })
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(error = %e, "typed-capability lookup failed (non-fatal)");
+                    Vec::new()
+                }
+            }
+        };
+
     json_result(&json!({
         "effect_breakdown": effect_breakdown,
         "query": {
             "specialty": params.specialty,
             "recommended_role": params.recommended_role,
+            "required_type_tags": params.required_type_tags,
+            "required_effects": params.required_effects,
         },
         "matches": agents,
+        "typed_capability_matches": typed_capability_matches,
     }))
 }

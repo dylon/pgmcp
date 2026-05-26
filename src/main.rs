@@ -162,6 +162,24 @@ enum Commands {
         #[arg(long)]
         schema: bool,
     },
+    /// Expose a CLI agent (Claude Code / Codex) as a live A2A peer. Binds a
+    /// minimal A2A JSON-RPC server on `--port` that translates inbound
+    /// `tasks/send` into a `claude -p` / `codex` subprocess invocation, and
+    /// optionally self-registers with a pgmcp daemon's agent registry.
+    A2aAdapter {
+        /// Which CLI to wrap: "claude" or "codex".
+        #[arg(long)]
+        kind: String,
+        /// TCP port to bind the adapter's A2A server on.
+        #[arg(long)]
+        port: u16,
+        /// Agent name to advertise (defaults: claude-code / codex-cli).
+        #[arg(long)]
+        name: Option<String>,
+        /// pgmcp daemon base URL to self-register with (e.g. http://localhost:3100).
+        #[arg(long)]
+        register_with: Option<String>,
+    },
     /// Print daemon and model state. With no MODEL argument, every section
     /// renders. MODEL filters to one of: daemon, database, embeddings,
     /// topics, similarity, graph, git.
@@ -278,6 +296,12 @@ async fn async_main() -> anyhow::Result<()> {
         } => cli::tool::run(cfg, name, args, json, schema).await,
         Commands::Results { kind, limit } => cli::results::run(cfg, kind, limit).await,
         Commands::ImportAdvisories { path } => cli::import_advisories::run(cfg, path).await,
+        Commands::A2aAdapter {
+            kind,
+            port,
+            name,
+            register_with,
+        } => cli::a2a_adapter::run(kind, port, name, register_with).await,
         Commands::Status { model, json } => cli::status::run(cfg, model, json).await,
         Commands::EmbedCutover {
             to,

@@ -545,6 +545,31 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         );
     }
 
+    // 11d. Schedule the cross-agent best-practice reflection cron (Part A
+    // phase A4). Off by default ([a2a.reflection] cron_enabled = false):
+    // consensus-gates peer outcomes into the shared scope and promotes the
+    // strongest agreed practices to durable mandates.
+    if config_snapshot.a2a.reflection.cron_enabled
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let stats_for_a2a = Arc::clone(&stats_tracker);
+        let extractor_for_a2a = llm_extractor.clone();
+        let a2a_cfg = config_snapshot.a2a.reflection.clone();
+        let interval_ms = a2a_cfg.cron_interval_secs.saturating_mul(1000);
+        let rt_for_a2a = tokio::runtime::Handle::current();
+        // 60s initial delay so we don't run during the startup window.
+        cron_handle.schedule_recurring(60_000, interval_ms, "a2a-reflect", move || {
+            let pool = pool.clone();
+            let stats = Arc::clone(&stats_for_a2a);
+            let extractor = extractor_for_a2a.clone();
+            let cfg = a2a_cfg.clone();
+            rt_for_a2a.spawn(async move {
+                cron::a2a_reflect::run_or_log(Arc::new(pool), stats, extractor, cfg).await;
+            });
+            true
+        });
+    }
+
     // 12. Construct the MCP server from the same SystemContext.
     let mcp_server = mcp::server::McpServer::new(system_ctx.clone());
 

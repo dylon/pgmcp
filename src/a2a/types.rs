@@ -170,6 +170,12 @@ impl Role {
 pub struct Message {
     pub role: Role,
     pub parts: Vec<Part>,
+    /// Optional control envelope. Carries the RLM recursion frame under
+    /// `metadata.rlm` when this task is an RLM sub-call to a pgmcp peer;
+    /// absent for ordinary tasks and ignored by leaf adapters. Backward
+    /// compatible — defaults to null.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub metadata: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

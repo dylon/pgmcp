@@ -12,6 +12,7 @@ pub mod phonetic;
 pub mod suffix_automaton;
 pub mod sync;
 pub mod time_series;
+pub mod trajectory_index;
 pub mod values;
 
 #[allow(unused_imports)]

@@ -289,6 +289,11 @@ fn dispatched_tool_names() -> Vec<&'static str> {
         "a2a_pattern_mixture",
         "a2a_pattern_distillation",
         "a2a_pattern_deliberation",
+        // RLM recursive decomposition (Part B)
+        "a2a_pattern_recursive",
+        "trajectory_similarity",
+        // A2A best-practice exchange (Part A)
+        "a2a_report_outcome",
     ]
 }
 

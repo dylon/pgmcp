@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+pub mod a2a_reflect;
+#[allow(dead_code)]
 pub mod call_graph;
 #[allow(dead_code)]
 pub mod code_raptor;

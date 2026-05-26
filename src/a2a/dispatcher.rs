@@ -76,6 +76,32 @@ pub async fn create_and_start(state: &ApiState, params: SendParams) -> Result<Ta
         .a2a_tasks_created
         .fetch_add(1, Ordering::Relaxed);
 
+    // Part D — inbound RLM recursion. If the peer's message carried an `rlm`
+    // frame, CONTINUE decomposing (self-recursion, depth>1) instead of
+    // answering as a leaf. A malformed frame / exhausted depth or budget /
+    // unparseable environment degrades gracefully to the ordinary skill loop
+    // (Ok(None)); a genuine failure inside the continuation fails the task.
+    match try_dispatch_rlm(state, task_id, &params).await {
+        Ok(Some(task)) => {
+            emit_event(state, task_id, "final", json!({ "task": task })).await?;
+            return Ok(task);
+        }
+        Ok(None) => {}
+        Err(e) => {
+            set_state(state, task_id, TaskState::Failed, Some(&e)).await?;
+            state.stats.a2a_tasks_failed.fetch_add(1, Ordering::Relaxed);
+            let mut t = initial_task(task_id, params.session_id, params.message);
+            t.status = TaskStatus {
+                state: TaskState::Failed,
+                message: Some(text_message(&e)),
+                timestamp: Utc::now(),
+            };
+            t.parent_task_id = params.parent_task_id;
+            emit_event(state, task_id, "final", json!({ "task": t })).await?;
+            return Ok(t);
+        }
+    }
+
     let original_text = extract_text(&params.message);
     let skill = params
         .skill_id
@@ -167,6 +193,107 @@ pub async fn create_and_start(state: &ApiState, params: SendParams) -> Result<Ta
     emit_event(state, task_id, "final", json!({"task": final_task})).await?;
 
     Ok(final_task)
+}
+
+/// Part D — continue an inbound RLM recursion. Returns `Ok(Some(task))` when
+/// the inbound message carried an `rlm` frame and we re-decomposed its
+/// (narrowed) environment via [`run_rlm`]; `Ok(None)` when there is no frame
+/// or we must answer as a leaf (exhausted depth/budget, malformed frame, or
+/// an unparseable environment) so the caller runs the ordinary skill loop.
+/// `Err` only for a genuine failure inside the continuation.
+///
+/// The frame carries the LM peer URLs verbatim, so this works even when the
+/// recursing peer shares no agent registry with the root. The recursion
+/// target is the daemon's own A2A endpoint (self-recursion); depth + budget
+/// caps (clamped in [`RlmFrame::entered`]) guarantee termination.
+async fn try_dispatch_rlm(
+    state: &ApiState,
+    task_id: Uuid,
+    params: &SendParams,
+) -> Result<Option<Task>, String> {
+    use crate::a2a::rlm::{RlmEnvironment, RlmFrame, own_a2a_url, persist_trajectory, run_rlm};
+
+    let Some(frame_json) = params.message.metadata.get("rlm") else {
+        return Ok(None);
+    };
+    let frame: RlmFrame = match serde_json::from_value(frame_json.clone()) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "malformed RLM frame; answering as leaf");
+            return Ok(None);
+        }
+    };
+    // Exhausted → leaf: the ordinary skill loop answers the query directly.
+    if frame.depth_remaining == 0 || frame.budget_remaining == 0 {
+        return Ok(None);
+    }
+
+    let ctx = &state.system_ctx;
+    let frame = frame.entered(own_a2a_url(ctx));
+    let env = match RlmEnvironment::from_json(&frame.environment) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::warn!(error = %e, "RLM frame environment unparseable; answering as leaf");
+            return Ok(None);
+        }
+    };
+
+    state
+        .stats
+        .a2a_rlm_recursions
+        .fetch_add(1, Ordering::Relaxed);
+    let outcome = run_rlm(ctx, &env, &frame, task_id)
+        .await
+        .map_err(|e| format!("RLM continuation failed: {e:?}"))?;
+    state
+        .stats
+        .a2a_rlm_subcalls
+        .fetch_add(outcome.subcalls as u64, Ordering::Relaxed);
+
+    // Persist this node's trajectory (the closed MSM loop labels it from the
+    // self-grade). Best-effort — a persistence hiccup must not sink the
+    // answer we already computed.
+    if let Some(pool) = state.db.pool()
+        && let Err(e) = persist_trajectory(
+            pool,
+            task_id,
+            params.parent_task_id,
+            &frame.environment,
+            &frame.query,
+            &outcome,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "RLM child trajectory persistence failed (non-fatal)");
+    }
+
+    let parts = vec![Part::Text {
+        text: outcome.final_answer.clone(),
+        metadata: serde_json::Value::Null,
+    }];
+    insert_artifact(state, task_id, parts.clone()).await?;
+    set_state(state, task_id, TaskState::Completed, None).await?;
+    state
+        .stats
+        .a2a_tasks_completed
+        .fetch_add(1, Ordering::Relaxed);
+
+    let mut t = initial_task(task_id, params.session_id, params.message.clone());
+    t.status = TaskStatus {
+        state: TaskState::Completed,
+        message: Some(text_message("RLM recursion completed")),
+        timestamp: Utc::now(),
+    };
+    t.parent_task_id = params.parent_task_id;
+    t.artifacts.push(Artifact {
+        name: Some("a2a_pattern_recursive".to_string()),
+        parts,
+        index: 0,
+        append: false,
+        last_chunk: true,
+        metadata: serde_json::Value::Null,
+    });
+    Ok(Some(t))
 }
 
 /// Collapse a Vec<Part> down to its concatenated text body. Used by the
@@ -270,6 +397,7 @@ pub async fn get_task(state: &ApiState, task_id: Uuid) -> Result<Option<Task>, S
         .map(|(role, parts, _)| Message {
             role: Role::from_db_str(&role),
             parts: serde_json::from_value(parts).unwrap_or_default(),
+            metadata: serde_json::Value::Null,
         })
         .collect();
 

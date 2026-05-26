@@ -239,6 +239,7 @@ pub mod tool_documented_tech_debt;
 // Operational: on-demand cron trigger (skips the Ready-delay + interval
 // wait when the operator needs symbol/function-metric/call-graph data
 // for `dead_code_reachability` / `naming_consistency` immediately).
+pub mod tool_trajectory_similarity;
 pub mod tool_trigger_cron;
 
 // A2A inter-agent IPC bridge — outbound MCP-side tools
@@ -249,8 +250,10 @@ pub mod tool_a2a_list_agents;
 pub mod tool_a2a_pattern_deliberation;
 pub mod tool_a2a_pattern_distillation;
 pub mod tool_a2a_pattern_mixture;
+pub mod tool_a2a_pattern_recursive;
 pub mod tool_a2a_pattern_sequential;
 pub mod tool_a2a_register_agent;
+pub mod tool_a2a_report_outcome;
 pub mod tool_a2a_send_task;
 pub mod tool_a2a_subscribe_task;
 

@@ -32,6 +32,10 @@ pub async fn tool_a2a_pattern_deliberation(
         .fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
 
+    // Read-before-act (Part A): peer best practices, prepended to the
+    // round-0 Reflector prompt. Empty unless [a2a] inject_best_practices = true.
+    let bp = crate::a2a::best_practices::retrieve_for_prompt(ctx, None, &params.message, 512).await;
+
     let reflector_url = resolve_agent_url(pool, &params.reflector_agent).await?;
     let tool_caller_url = resolve_agent_url(pool, &params.tool_caller_agent).await?;
 
@@ -61,7 +65,7 @@ pub async fn tool_a2a_pattern_deliberation(
         // Reflector turn.
         let reflector_prompt = if round == 0 {
             format!(
-                "[Role: Reflector — round {}] Query:\n{}\n\nPropose a single concrete sub-task or refinement, or return literal 'CONVERGED' followed by the final answer.",
+                "{bp}[Role: Reflector — round {}] Query:\n{}\n\nPropose a single concrete sub-task or refinement, or return literal 'CONVERGED' followed by the final answer.",
                 round, params.message
             )
         } else {
@@ -117,6 +121,17 @@ pub async fn tool_a2a_pattern_deliberation(
     }
 
     mark_parent_completed(pool, parent_task_id).await?;
+
+    // Best-practice write-back (Part A): distill the deliberation's final
+    // answer into the shared memory graph. No-op unless [a2a] writeback_enabled.
+    crate::a2a::best_practices::writeback_peer_artifact(
+        ctx,
+        parent_task_id,
+        &params.reflector_agent,
+        "a2a_pattern_deliberation",
+        &final_answer,
+    )
+    .await;
 
     // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
     let effect_breakdown: Vec<serde_json::Value> = (async {

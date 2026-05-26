@@ -268,3 +268,68 @@ async fn a2a_send_task_with_recursion_rounds_threads_parameter() {
         .await;
     let _ = r;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a2a_report_outcome_records_cleanly() {
+    let db = require_test_db!();
+    let _ = seed_project(db.pool(), "a2a-bp", "/ws/a2a-bp").await;
+    let server = server_with_pool(db.pool().clone());
+    // Exercises the full record_outcome path (scope → entity → tier →
+    // agent_outcomes ledger → relation → trust) against a real test DB.
+    let r = server
+        .call_tool_cli(
+            "a2a_report_outcome",
+            serde_json::json!({
+                "task_kind": "rust-collections",
+                "approach": "preallocate Vec with capacity",
+                "outcome": "worked",
+                "confidence": 0.8,
+                "evidence": "Vec::with_capacity avoided reallocations",
+                "agent_id": "agent-a",
+            }),
+        )
+        .await
+        .expect("tool");
+    assert!(r.is_error != Some(true));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a2a_pattern_recursive_unregistered_peer_errors_gracefully() {
+    let db = require_test_db!();
+    let _ = seed_project(db.pool(), "a2a-rlm", "/ws/a2a-rlm").await;
+    let server = server_with_pool(db.pool().clone());
+    // No peer registered: the call should fail at sub_agent lookup, but the
+    // param schema must accept the environment handle and dispatch cleanly.
+    let r = server
+        .call_tool_cli(
+            "a2a_pattern_recursive",
+            serde_json::json!({
+                "query": "summarize the error handling",
+                "environment": {"kind": "corpus", "project": "a2a-rlm"},
+                "sub_agent": "no-peer",
+                "max_chunks": 4,
+            }),
+        )
+        .await;
+    let _ = r;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trajectory_similarity_probe_series_runs() {
+    let db = require_test_db!();
+    let _ = seed_project(db.pool(), "a2a-traj", "/ws/a2a-traj").await;
+    let server = server_with_pool(db.pool().clone());
+    // Probe by an explicit encoded series — no trajectories needed; the
+    // index is simply empty, so nearest is empty and trend is null.
+    let r = server
+        .call_tool_cli(
+            "trajectory_similarity",
+            serde_json::json!({
+                "probe_series": [1.0, 2.3, 4.4, 6.2],
+                "k": 3,
+            }),
+        )
+        .await
+        .expect("tool");
+    assert!(r.is_error != Some(true));
+}

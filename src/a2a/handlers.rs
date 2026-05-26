@@ -244,6 +244,7 @@ pub fn text_message(text: &str) -> Message {
             text: text.to_string(),
             metadata: serde_json::Value::Null,
         }],
+        metadata: serde_json::Value::Null,
     }
 }
 
@@ -256,5 +257,6 @@ pub fn user_text_message(text: &str) -> Message {
             text: text.to_string(),
             metadata: serde_json::Value::Null,
         }],
+        metadata: serde_json::Value::Null,
     }
 }

@@ -3563,6 +3563,11 @@ pub async fn memory_retention_purge(
            AND id NOT IN (
                SELECT superseded_by FROM memory_entities
                WHERE superseded_by IS NOT NULL
+           )
+           -- G2: never purge promoted best practices (procedural/reflective tier).
+           AND id NOT IN (
+               SELECT entity_id FROM memory_entity_tier
+               WHERE tier IN ('procedural','reflective')
            )",
     )
     .bind(window_days as i32)
@@ -3577,6 +3582,15 @@ pub async fn memory_retention_purge(
            AND id NOT IN (
                SELECT superseded_by FROM memory_observations
                WHERE superseded_by IS NOT NULL
+           )
+           -- G2: never purge best-practice observations or outcome-linked rows.
+           AND entity_id NOT IN (
+               SELECT entity_id FROM memory_entity_tier
+               WHERE tier IN ('procedural','reflective')
+           )
+           AND id NOT IN (
+               SELECT observation_id FROM agent_outcomes
+               WHERE observation_id IS NOT NULL
            )",
     )
     .bind(window_days as i32)
@@ -7920,9 +7934,14 @@ pub async fn resolve_symbol_reference_targets(
                                     ELSE 'bare_name_ambiguous' END,
              resolution_confidence = CASE WHEN cand.n_cand = 1 THEN 0.7 ELSE 0.3 END
          FROM file_symbols fs
-         JOIN indexed_files tgt_f ON tgt_f.id = fs.file_id
-         JOIN cand ON cand.ref_id = sr.id
+         JOIN indexed_files tgt_f ON tgt_f.id = fs.file_id,
+              cand
          WHERE tgt_f.project_id = $1
+           -- correlate cand to the UPDATE target in WHERE, not a JOIN ON:
+           -- Postgres rejects `sr` refs in FROM-list JOIN predicates (the same
+           -- trap fixed in phase 2) -> invalid reference to FROM-clause entry
+           -- for table \"sr\".
+           AND cand.ref_id = sr.id
            AND sr.target_raw = fs.name
            AND sr.resolution_kind IS NULL",
     )

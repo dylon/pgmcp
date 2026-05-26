@@ -76,6 +76,12 @@ impl A2aClient {
         if let Some(p) = opts.parent_task_id {
             params["parentTaskId"] = json!(p.to_string());
         }
+        self.send_params(params).await
+    }
+
+    /// POST a pre-built `tasks/send` params object and parse the `result`
+    /// into a `Task`. Shared by `send_task_with` and `send_task_rlm`.
+    async fn send_params(&self, params: serde_json::Value) -> Result<Task, String> {
         let body = serde_json::json!({
             "jsonrpc": "2.0", "id": 1, "method": "tasks/send", "params": params,
         });
@@ -92,6 +98,42 @@ impl A2aClient {
         }
         let result = body.get("result").ok_or("no result")?.clone();
         serde_json::from_value(result).map_err(|e| e.to_string())
+    }
+
+    /// Override the per-call timeout. Part D uses this so a deeper RLM
+    /// recursive sub-call (whose subtree must finish inside the caller's
+    /// clock) gets a proportionally longer window.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// `tasks/send` carrying an RLM recursion frame in `message.metadata.rlm`
+    /// (Part D). A pgmcp peer's dispatcher reads the frame and CONTINUES
+    /// decomposing; a leaf adapter ignores `metadata` and answers the query.
+    /// The message text is the frame's `query` (leaf-readable).
+    pub async fn send_task_rlm(
+        &self,
+        skill_id: Option<&str>,
+        opts: SendOptions,
+        frame: &super::rlm::RlmFrame,
+    ) -> Result<Task, String> {
+        let id = Uuid::new_v4();
+        let mut params = serde_json::json!({
+            "id": id.to_string(),
+            "message": {
+                "role": "user",
+                "parts": [{"type": "text", "text": frame.query}],
+                "metadata": { "rlm": frame },
+            }
+        });
+        if let Some(s) = skill_id {
+            params["skillId"] = json!(s);
+        }
+        if let Some(p) = opts.parent_task_id {
+            params["parentTaskId"] = json!(p.to_string());
+        }
+        self.send_params(params).await
     }
 
     /// `tasks/get`: poll Task state on a peer.
@@ -145,5 +187,6 @@ pub fn user_text_message(text: impl Into<String>) -> Message {
             text: text.into(),
             metadata: serde_json::Value::Null,
         }],
+        metadata: serde_json::Value::Null,
     }
 }

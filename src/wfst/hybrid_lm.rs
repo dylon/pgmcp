@@ -8,10 +8,14 @@
 //! `src/wfst/query_rescore.rs` can score candidate paths.
 //!
 //! Persistence uses libgrammstein's "portable" format
-//! (`save_portable` / `load_portable`) so the on-disk file is
-//! independent of dictionary-backend choice. pgmcp pins the backend
-//! to `PathMapDictionary<NgramEntry>` — same backend the topic
-//! pipeline already uses, no new dependency surface introduced.
+//! (`save_portable` / `load_portable`), which is backend-INDEPENDENT — the
+//! on-disk `model.bin` stores `(key, NgramEntrySnapshot)` pairs + embedding +
+//! config, never the dictionary's in-memory representation. pgmcp pins the
+//! backend to a vocabulary-indexed disk-backed ART trie
+//! (`VocabularyIndexedDictionary<SharedCharARTrie<NgramEntry>>`): a
+//! `PersistentVocabARTrie` maps words ↔ u64 ids and a `PersistentARTrieChar`
+//! holds the integer-keyed n-gram counts. The vocab + counts tries are real
+//! on-disk working files rebuilt from `model.bin` on load.
 //!
 //! Plan: `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`
 //! Phase 9 + Phase 13.2.
@@ -19,17 +23,67 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use libdictenstein::persistent_artrie_char::{PersistentARTrieChar, SharedCharARTrie};
 use libgrammstein::hybrid::{HybridConfig, HybridLanguageModel, InterpolationStrategy};
 use libgrammstein::ngram::NgramEntry;
-use liblevenshtein::dictionary::pathmap::PathMapDictionary;
+use libgrammstein::ngram::open_or_create_vocabulary;
+use libgrammstein::ngram::vocabulary_indexed::VocabularyIndexedDictionary;
 use lling_llang::layers::rescoring::lm_rerank::LanguageModel as LlingLanguageModel;
+use parking_lot::RwLock;
 use thiserror::Error;
 
-/// Concrete dictionary backend pgmcp uses for the per-project LM.
-/// Pinned for serialization stability — bincode files persist this
-/// type's representation, so we don't make it generic at the
-/// pgmcp-wrapper layer.
-pub type PgmcpLmDictionary = PathMapDictionary<NgramEntry>;
+/// Concrete dictionary backend pgmcp uses for the per-project LM: a
+/// vocabulary-indexed dictionary over a disk-backed char ARTrie. The
+/// vocabulary (`SharedVocabARTrie`, a `PersistentVocabARTrie`) maps words ↔
+/// u64 ids; the n-gram counts live in a `PersistentARTrieChar`-backed
+/// `SharedCharARTrie`. The delimiter is pinned to `'|'` to match
+/// libgrammstein's `LEGACY_NGRAM_SEPARATOR`, so portable keys round-trip
+/// through `NgramTrie`'s legacy split/join. The runtime dictionary is rebuilt
+/// from the backend-independent portable `model.bin` on load (see module doc).
+pub type PgmcpLmDictionary = VocabularyIndexedDictionary<SharedCharARTrie<NgramEntry>>;
+
+/// Delimiter pinned to libgrammstein's `LEGACY_NGRAM_SEPARATOR` (`'|'`) — the
+/// `VocabularyIndexedDictionary` MUST split/join on the same char `NgramTrie`
+/// uses for its legacy keys, or the portable round-trip silently breaks.
+const LM_NGRAM_DELIMITER: char = '|';
+
+/// Filenames of the two on-disk tries that back the LM dictionary, under a
+/// given working dir (`<model_dir>/live` for readers, `<model_dir>/train` for
+/// the training cron).
+pub(crate) fn lm_trie_paths(dir: &Path) -> (PathBuf, PathBuf) {
+    (dir.join("vocab.artrie"), dir.join("counts.artrie"))
+}
+
+/// Build an empty vocabulary-indexed LM dictionary backed by FRESH on-disk
+/// tries (vocab ↔ id + integer-keyed n-gram counts) with the pinned `'|'`
+/// delimiter. Shared by the loader ([`PgmcpHybridLm::open`]) and the training
+/// cron. The caller must ensure the paths are empty (their dir wiped) first —
+/// `PersistentARTrieChar::create` reuses, not truncates, an existing file.
+pub(crate) fn try_build_lm_dictionary(
+    vocab_path: &Path,
+    counts_path: &Path,
+) -> Result<PgmcpLmDictionary, LmError> {
+    let vocab = open_or_create_vocabulary(vocab_path)
+        .map_err(|e| LmError::Grammstein(format!("vocab trie: {e}")))?;
+    let counts: SharedCharARTrie<NgramEntry> = Arc::new(RwLock::new(
+        PersistentARTrieChar::<NgramEntry>::create(counts_path)
+            .map_err(|e| LmError::Grammstein(format!("counts trie: {e}")))?,
+    ));
+    Ok(VocabularyIndexedDictionary::with_delimiter(
+        counts,
+        vocab,
+        LM_NGRAM_DELIMITER,
+    ))
+}
+
+/// Infallible wrapper for the `FnOnce() -> D` factory that
+/// [`HybridLanguageModel::load_portable`] requires (it has no error channel).
+/// A persistent-trie I/O failure here means the model working dir is
+/// unrecoverable, so panicking with a clear message is the right behavior.
+pub(crate) fn build_lm_dictionary(vocab_path: &Path, counts_path: &Path) -> PgmcpLmDictionary {
+    try_build_lm_dictionary(vocab_path, counts_path)
+        .expect("hybrid-lm: build persistent LM dictionary")
+}
 
 /// pgmcp-side config knob for the n-gram-LM third leg of hybrid_search.
 /// Maps directly to libgrammstein's `HybridConfig`; carried separately
@@ -104,10 +158,29 @@ pub struct PgmcpHybridLm {
 impl PgmcpHybridLm {
     /// Load a previously-trained model from the portable bincode
     /// format produced by `cron::ngram_lm_train`.
+    ///
+    /// The runtime dictionary is rebuilt from `model.bin` into fresh on-disk
+    /// vocab + counts tries under `<model_dir>/live/`. These are working
+    /// storage derived from the (crash-safe) portable file, so the dir is
+    /// wiped first — `DiskManager::create` reuses, not truncates, an existing
+    /// file, and stale WAL/archive segments could corrupt a "fresh" trie.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LmError> {
         let path = path.as_ref().to_path_buf();
-        let inner =
-            HybridLanguageModel::<PgmcpLmDictionary>::load_portable(&path, PgmcpLmDictionary::new)?;
+        let model_dir = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let live_dir = model_dir.join("live");
+        let _ = std::fs::remove_dir_all(&live_dir);
+        std::fs::create_dir_all(&live_dir)?;
+        let vocab_path = live_dir.join("vocab.artrie");
+        let counts_path = live_dir.join("counts.artrie");
+
+        // `load_portable`'s factory is `FnOnce() -> D` (no error channel), so
+        // the infallible builder is used here; trie I/O failure surfaces as a
+        // panic with a clear message (a corrupt model dir is unrecoverable).
+        let factory = move || build_lm_dictionary(&vocab_path, &counts_path);
+        let inner = HybridLanguageModel::<PgmcpLmDictionary>::load_portable(&path, factory)?;
         Ok(Self {
             inner: Arc::new(inner),
             path,

@@ -102,11 +102,21 @@ pub async fn run_embedding_migration_pass(
         .embeddings_migration_runs
         .fetch_add(1, Ordering::Relaxed);
 
-    // Skip the whole pass — including the GPU model upload — when there is
-    // nothing left to migrate. Avoids building a transient embedder copy (and
-    // taking a GPU admission permit) for a no-op tick once cutover is done.
-    if full_backlog_counts(pool).await?.total() == 0 {
-        debug!("embedding-migration: backlog empty; skipping pass");
+    // Skip the whole pass — including the GPU model upload — only when every
+    // backfill this pass performs has drained: the dense backlog
+    // (embedding_v2/embedding NULL) AND the contextual re-embed backlog
+    // (file_chunks.contextual_text NULL with a dense vector present). Counting
+    // the dense backlog alone stranded the contextual leg the instant cutover
+    // completed — it runs later in the pass (below), so once dense hit 0 this
+    // guard returned every tick and contextual_text froze partway. Sparse is
+    // intentionally excluded here: it is gated on `embedder.has_sparse()`
+    // (false unless `sparse_linear.pt` is wired into the checkpoint load), so
+    // including it would block the short-circuit forever on a dense-only
+    // checkpoint and rebuild the embedder for a no-op every tick.
+    let dense_backlog = full_backlog_counts(pool).await?.total();
+    let contextual_backlog = contextual_backlog_count(pool).await?;
+    if dense_backlog == 0 && contextual_backlog == 0 {
+        debug!("embedding-migration: dense + contextual backlog empty; skipping pass");
         return Ok(MigrationPassReport::default());
     }
 
@@ -837,6 +847,28 @@ pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::E
         durable_mandates: row.4,
         session_mandates: row.5,
     })
+}
+
+/// Count `file_chunks` still needing a contextual re-embed (graph-roadmap
+/// Phase 2.4). This MUST mirror the exact selectable set of
+/// `queries::get_chunks_needing_context` — the INNER `JOIN indexed_files`,
+/// `contextual_text IS NULL`, and `embedding_v2 IS NOT NULL` — so the
+/// short-circuit in `run_embedding_migration_pass` never diverges from what the
+/// drain can actually process. If this counted rows the drain can't reach (e.g.
+/// chunks orphaned from `indexed_files`), the pass would spin forever rebuilding
+/// the embedder; if it counted fewer, contextual would be stranded again.
+///
+/// Distinct from `full_backlog_counts` (dense embeddings): contextual is an
+/// additive re-embed of already-dense rows, so it is tracked separately and the
+/// guard ORs the two backlogs.
+async fn contextual_backlog_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM file_chunks c
+         JOIN indexed_files f ON f.id = c.file_id
+         WHERE c.contextual_text IS NULL AND c.embedding_v2 IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
 }
 
 /// Flip the cutover flag in `pgmcp_metadata`. Validates `migration_complete`

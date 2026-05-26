@@ -61,9 +61,11 @@ pub struct AgentMatchFilter {
 
 #[derive(Debug, Clone)]
 pub struct AgentMatch {
-    pub agent_id: String,
+    /// `a2a_agents.id` (the BIGSERIAL primary key).
+    pub agent_id: i64,
     pub name: String,
-    pub specialty: String,
+    /// `a2a_agents.specialty` is a `TEXT[]`, so this is the full tag set.
+    pub specialty: Vec<String>,
     pub capability: TypedCapability,
     pub score: f32,
 }
@@ -87,53 +89,31 @@ pub async fn find_agents_by_typed_capability(
         return Ok(Vec::new());
     }
 
-    let rows: Vec<(String, String, String, Option<serde_json::Value>)> = sqlx::query_as(
-        "SELECT agent_id, name, specialty, capabilities
+    // a2a_agents' PK is `id` (BIGINT) and `specialty` is `TEXT[]` — decode
+    // them as such (the earlier `agent_id`/scalar-`specialty` shapes did not
+    // match the schema and would fail at runtime).
+    let rows: Vec<(i64, String, Vec<String>, Option<serde_json::Value>)> = sqlx::query_as(
+        "SELECT id, name, specialty, capabilities
          FROM a2a_agents
-         ORDER BY agent_id
+         ORDER BY id
          LIMIT $1",
     )
     .bind(limit.max(1))
     .fetch_all(pool)
     .await?;
 
-    let mut out: Vec<AgentMatch> = Vec::new();
+    let mut out: Vec<AgentMatch> = Vec::with_capacity(rows.len());
     for (agent_id, name, specialty, caps) in rows {
         let cap = caps.as_ref().map(parse_capability).unwrap_or_default();
-        // Required filters: short-circuit when an agent lacks a required tag/effect.
-        let has_all_tags = filter
-            .required_type_tags
-            .iter()
-            .all(|t| cap.type_tags.iter().any(|x| x == t));
-        let has_all_effects = filter
-            .required_effects
-            .iter()
-            .all(|e| cap.effects.iter().any(|x| x == e));
-        if !has_all_tags || !has_all_effects {
-            continue;
+        if let Some(score) = score_capability(filter, &cap) {
+            out.push(AgentMatch {
+                agent_id,
+                name,
+                specialty,
+                capability: cap,
+                score,
+            });
         }
-        // Score = (|tag_overlap| + |effect_overlap|) / (|required| + 1)
-        // The +1 keeps unconstrained queries from dividing by zero.
-        let required_total =
-            (filter.required_type_tags.len() + filter.required_effects.len()) as f32;
-        let overlap = (filter
-            .required_type_tags
-            .iter()
-            .filter(|t| cap.type_tags.iter().any(|x| x == *t))
-            .count()
-            + filter
-                .required_effects
-                .iter()
-                .filter(|e| cap.effects.iter().any(|x| x == *e))
-                .count()) as f32;
-        let score = overlap / (required_total + 1.0);
-        out.push(AgentMatch {
-            agent_id,
-            name,
-            specialty,
-            capability: cap,
-            score,
-        });
     }
     out.sort_by(|a, b| {
         b.score
@@ -141,6 +121,37 @@ pub async fn find_agents_by_typed_capability(
             .unwrap_or(std::cmp::Ordering::Equal)
     });
     Ok(out)
+}
+
+/// Pure match-and-score (DB-independent, hence unit-testable): `None` when
+/// the capability lacks a required tag/effect (filtered out), else the
+/// overlap score `(|tag_overlap| + |effect_overlap|) / (|required| + 1)` in
+/// `[0, 1]`. The `+1` keeps an unconstrained query from dividing by zero and
+/// from scoring 1.0 for every agent.
+fn score_capability(filter: &AgentMatchFilter, cap: &TypedCapability) -> Option<f32> {
+    let has_all_tags = filter
+        .required_type_tags
+        .iter()
+        .all(|t| cap.type_tags.contains(t));
+    let has_all_effects = filter
+        .required_effects
+        .iter()
+        .all(|e| cap.effects.contains(e));
+    if !has_all_tags || !has_all_effects {
+        return None;
+    }
+    let required_total = (filter.required_type_tags.len() + filter.required_effects.len()) as f32;
+    let overlap = (filter
+        .required_type_tags
+        .iter()
+        .filter(|t| cap.type_tags.contains(*t))
+        .count()
+        + filter
+            .required_effects
+            .iter()
+            .filter(|e| cap.effects.contains(*e))
+            .count()) as f32;
+    Some(overlap / (required_total + 1.0))
 }
 
 #[cfg(test)]
@@ -186,5 +197,55 @@ mod tests {
         let v = json!("a plain string");
         let cap = parse_capability(&v);
         assert!(cap.is_empty());
+    }
+
+    fn cap(tags: &[&str], effects: &[&str]) -> TypedCapability {
+        TypedCapability {
+            type_tags: tags.iter().map(|s| s.to_string()).collect(),
+            effects: effects.iter().map(|s| s.to_string()).collect(),
+            parameter_shapes: Vec::new(),
+            free_text: None,
+        }
+    }
+
+    #[test]
+    fn score_requires_all_tags_and_effects() {
+        let filter = AgentMatchFilter {
+            required_type_tags: vec!["async".into()],
+            required_effects: vec!["network".into()],
+        };
+        // Missing the required effect → filtered out.
+        assert!(score_capability(&filter, &cap(&["async"], &[])).is_none());
+        // Has both → matches with a positive score.
+        let s = score_capability(&filter, &cap(&["async", "container"], &["network"]))
+            .expect("should match");
+        assert!(s > 0.0 && s <= 1.0, "score in (0,1]: {s}");
+    }
+
+    #[test]
+    fn unconstrained_filter_matches_everything_with_zero_score() {
+        let filter = AgentMatchFilter::default();
+        // No requirements → matches, score 0/(0+1) = 0.
+        let s = score_capability(&filter, &cap(&["async"], &["network"])).expect("matches");
+        assert_eq!(s, 0.0);
+    }
+
+    #[test]
+    fn more_overlap_scores_higher() {
+        let one = AgentMatchFilter {
+            required_type_tags: vec!["async".into()],
+            required_effects: vec![],
+        };
+        let two = AgentMatchFilter {
+            required_type_tags: vec!["async".into(), "container".into()],
+            required_effects: vec![],
+        };
+        let c = cap(&["async", "container"], &[]);
+        let s1 = score_capability(&one, &c).expect("matches");
+        let s2 = score_capability(&two, &c).expect("matches");
+        assert!(
+            s2 > s1,
+            "two satisfied requirements outrank one: {s2} > {s1}"
+        );
     }
 }
