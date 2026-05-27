@@ -25,6 +25,7 @@ mod v3_cross_language_signatures;
 mod v4_work_items;
 mod v5_work_items_collab;
 mod v6_unified_graph;
+mod v7_cge_orphan_cleanup;
 mod versioning;
 use schema_introspect::*;
 use versioning::*;
@@ -980,7 +981,17 @@ pub async fn run_migrations(
             id BIGSERIAL PRIMARY KEY,
             project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
             source_file_id BIGINT NOT NULL REFERENCES indexed_files(id) ON DELETE CASCADE,
-            target_file_id BIGINT REFERENCES indexed_files(id) ON DELETE SET NULL,
+            -- CASCADE, NOT SET NULL: target_file_id is a member of the unique
+            -- index idx_cge_unique (below) via COALESCE(target_file_id, -1).
+            -- Under SET NULL, deleting a referenced file nulled this column on
+            -- surviving edges, collapsing their key to (source, -1, type, raw)
+            -- and colliding with idx_cge_unique — which failed the parent
+            -- DELETE. An edge whose target file is gone is meaningless; the
+            -- graph-analysis cron rebuilds resolved imports as unresolved on
+            -- its next pass. The re-tighten DO block further below repairs
+            -- pre-existing installs (CREATE TABLE IF NOT EXISTS won't alter
+            -- them). See docs/scientific-ledger/idx-cge-unique-set-null-collision-2026-05-27.md.
+            target_file_id BIGINT REFERENCES indexed_files(id) ON DELETE CASCADE,
             edge_type TEXT NOT NULL,
             target_raw TEXT,
             weight DOUBLE PRECISION DEFAULT 1.0,
@@ -1349,6 +1360,64 @@ pub async fn run_migrations(
                     ADD CONSTRAINT code_graph_edges_source_symbol_id_fkey
                     FOREIGN KEY (source_symbol_id)
                     REFERENCES file_symbols(id)
+                    ON DELETE CASCADE;
+            END IF;
+         END $$;",
+    )
+    .execute(pool)
+    .await?;
+
+    // Re-tighten the target_file_id FK from ON DELETE SET NULL to ON DELETE
+    // CASCADE. Unlike source_symbol_id above (whose SET NULL conflicted with a
+    // CHECK), target_file_id is broken because it is a MEMBER of the unique
+    // index idx_cge_unique via COALESCE(target_file_id, -1::BIGINT). When an
+    // indexed_files row is deleted, the cascade NULLs target_file_id on every
+    // edge that pointed at it; after COALESCE the surviving row's key collapses
+    // to (source_file_id, -1, edge_type, COALESCE(target_raw,'')). If another
+    // edge from the same source already has target_file_id IS NULL with the
+    // same (edge_type, target_raw) — which accumulates as referenced files are
+    // deleted over time — the SET NULL update COLLIDES with idx_cge_unique and
+    // fails the parent DELETE. Observed in production as "Failed to delete file
+    // from index … duplicate key value violates unique constraint
+    // idx_cge_unique" from pgmcp::embed::pool, notably on rotating
+    // ~/.claude/sessions/*.json files. See
+    // docs/scientific-ledger/idx-cge-unique-set-null-collision-2026-05-27.md.
+    //
+    // CASCADE is the correct response: an edge whose target file no longer
+    // exists is meaningless and is removed; the graph-analysis cron rebuilds a
+    // still-valid import as unresolved (target_file_id NULL, target_raw kept)
+    // on its next pass via ON CONFLICT DO UPDATE, so nothing is permanently
+    // lost. (target_symbol_id keeps SET NULL — it is NOT in any unique index,
+    // so nulling it never collides; migration step 7 then removes the orphan
+    // NULL-target rows the old SET NULL already left behind.)
+    //
+    // Idempotent DO block, identical idiom to the source_symbol_id re-tighten
+    // above: look up the FK name + confdeltype dynamically from pg_constraint
+    // and rewrite only when not already CASCADE ('c'), so re-running against an
+    // already-fixed DB is a no-op. confdeltype per Postgres docs:
+    //   a = no action, r = restrict, c = cascade, n = set null, d = set default
+    sqlx::query(
+        "DO $$
+         DECLARE
+            con_name      TEXT;
+            con_deltype   CHAR(1);
+         BEGIN
+            SELECT conname, confdeltype INTO con_name, con_deltype
+              FROM pg_constraint c
+              JOIN pg_class t   ON t.oid = c.conrelid
+              JOIN pg_attribute a
+                ON a.attrelid = c.conrelid
+               AND a.attnum   = ANY (c.conkey)
+             WHERE t.relname = 'code_graph_edges'
+               AND a.attname = 'target_file_id'
+               AND c.contype = 'f'
+             LIMIT 1;
+            IF con_name IS NOT NULL AND con_deltype <> 'c' THEN
+                EXECUTE format('ALTER TABLE code_graph_edges DROP CONSTRAINT %I', con_name);
+                ALTER TABLE code_graph_edges
+                    ADD CONSTRAINT code_graph_edges_target_file_id_fkey
+                    FOREIGN KEY (target_file_id)
+                    REFERENCES indexed_files(id)
                     ON DELETE CASCADE;
             END IF;
          END $$;",
@@ -2055,6 +2124,29 @@ pub async fn run_migrations(
         info!(
             version = v6_unified_graph::UNIFIED_GRAPH_V1,
             "unified_graph_v1 migration applied"
+        );
+    }
+
+    // ================================================================
+    // Migration step 7 — cge_orphan_cleanup_v1
+    // One-time removal of code_graph_edges rows orphaned by the old
+    // target_file_id ON DELETE SET NULL behavior (semantic / co-change
+    // edges left with a NULL target and NULL target_raw). The FK itself is
+    // re-tightened to CASCADE inline far above; this step deletes the rows
+    // the old behavior already left behind. Runs after every table exists.
+    // See src/db/migrations/v7_cge_orphan_cleanup.rs.
+    // ================================================================
+    if !version_applied(pool, v7_cge_orphan_cleanup::CGE_ORPHAN_CLEANUP_V1).await? {
+        v7_cge_orphan_cleanup::apply(pool).await?;
+        record_version(
+            pool,
+            v7_cge_orphan_cleanup::CGE_ORPHAN_CLEANUP_V1,
+            v7_cge_orphan_cleanup::CGE_ORPHAN_CLEANUP_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v7_cge_orphan_cleanup::CGE_ORPHAN_CLEANUP_V1,
+            "cge_orphan_cleanup_v1 migration applied"
         );
     }
 

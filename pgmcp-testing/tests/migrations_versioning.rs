@@ -23,7 +23,7 @@ async fn run_migrations_records_initial_schema_version_once() {
         "initial schema version must be recorded after the harness migration"
     );
 
-    // Running migrations again must be a no-op for the version row —
+    // Running migrations again must be a no-op for the version rows —
     // ON CONFLICT DO NOTHING + the version_applied short-circuit ensure
     // we don't double-insert and `applied_at` is unchanged.
     let applied_at_before: chrono::DateTime<chrono::Utc> =
@@ -31,6 +31,10 @@ async fn run_migrations_records_initial_schema_version_once() {
             .fetch_one(&pool)
             .await
             .expect("applied_at lookup");
+    let count_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pgmcp_schema_versions")
+        .fetch_one(&pool)
+        .await
+        .expect("count query");
 
     pgmcp::db::migrations::run_migrations(&pool, &vector_cfg)
         .await
@@ -46,9 +50,23 @@ async fn run_migrations_records_initial_schema_version_once() {
         "applied_at must not change on a no-op rerun"
     );
 
-    let still_one: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pgmcp_schema_versions")
+    // The version set is stable across an idempotent rerun: every numbered
+    // step (version 1 plus each vN submodule) is gated by `version_applied`,
+    // so a second run records nothing new. Assert the count is *unchanged*
+    // rather than hardcoding a single expected value — the old `== 1` was
+    // only true before v2..vN existed and would silently rot as steps are
+    // added (it survived only because this test self-skips without a
+    // CREATEDB-privileged test role).
+    let count_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pgmcp_schema_versions")
         .fetch_one(&pool)
         .await
         .expect("count query");
-    assert_eq!(still_one, 1, "only one version row should exist");
+    assert_eq!(
+        count_before, count_after,
+        "no new version rows may be inserted on a no-op rerun"
+    );
+    assert!(
+        count_before >= 1,
+        "at least the initial_schema baseline version must be recorded"
+    );
 }
