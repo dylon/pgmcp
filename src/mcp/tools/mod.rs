@@ -264,6 +264,10 @@ pub use tool_experiments::{
     tool_experiment_timeline,
 };
 
+// Work-item / plan tracker tool surface (CRUD + lifecycle). Submodule layout
+// (`crud` + `lifecycle`) mirrors the tracker's domain split.
+pub mod work_items;
+
 pub use tool_adoption_lag::tool_adoption_lag;
 pub use tool_anomaly_detection::tool_anomaly_detection;
 pub use tool_architecture_dsm::tool_architecture_dsm;

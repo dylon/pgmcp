@@ -353,6 +353,8 @@ async fn try_third_leg(
         max_query_edit_distance,
         1.0,
         wfst_lm_weight,
+        cfg_guard.fuzzy.phonetic_cost_weight,
+        cfg_guard.fuzzy.phonetic_max_total_cost,
         &fuzzy_idx,
         Some(&lm),
     );

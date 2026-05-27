@@ -65,8 +65,11 @@ run_gate "Gate 2/8: cargo build --all-targets" \
     cargo build --all-targets
 run_gate "Gate 3/8: cargo clippy --all-targets -- -D warnings" \
     cargo clippy --all-targets -- -D warnings
-run_gate "Gate 4/8: cargo test --release --bin pgmcp" \
-    cargo test --release --bin pgmcp
+# Build the release CLI binary BEFORE the pgmcp-testing gates: the CLI smoke
+# tests (cli_harness) exec `target/release/pgmcp`, so without this build they
+# would run a stale artifact. Then run the bin's unit tests.
+run_gate "Gate 4/8: cargo build + test --release --bin pgmcp" \
+    bash -c "cargo build --release --bin pgmcp && cargo test --release --bin pgmcp"
 run_gate "Gate 5/8: cargo test --release -p pgmcp-testing" \
     cargo test --release -p pgmcp-testing
 run_gate "Gate 6/8: cargo test --release --test gpu_fallback_smoke -- --ignored" \

@@ -593,6 +593,14 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
                 "/api/session/observe",
                 axum::routing::post(api::handlers::session_observe),
             )
+            .route(
+                "/api/tracker/ingest_plan",
+                axum::routing::post(api::handlers::tracker_ingest_plan),
+            )
+            .route(
+                "/api/tracker/record_evidence",
+                axum::routing::post(api::handlers::tracker_record_evidence),
+            )
             .merge(crate::a2a::a2a_router())
             .with_state(api_state);
         let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)

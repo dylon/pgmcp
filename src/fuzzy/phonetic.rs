@@ -27,7 +27,8 @@ use arc_swap::ArcSwap;
 use liblevenshtein::dictionary::phonetic_normalized::PhoneticNormalizedDictionaryChar;
 use liblevenshtein::phonetic::expansion::expand_phonetic_alternatives_char;
 use liblevenshtein::phonetic::feature_distance::{
-    articulatory_distance, articulatory_edit_distance,
+    FeatureDistanceWeights, articulatory_distance, articulatory_edit_distance,
+    articulatory_edit_distance_weighted,
 };
 use liblevenshtein::phonetic::language::dispatch::rules_for_language;
 use liblevenshtein::phonetic::llev::{RuleSetChar, parse_str};
@@ -47,6 +48,18 @@ use tracing::{info, warn};
 /// duplicate detection, rename detection).
 pub fn articulatory_distance_score(a: &str, b: &str) -> f64 {
     articulatory_edit_distance(a, b)
+}
+
+/// Weighted variant of [`articulatory_distance_score`] using caller-supplied
+/// per-dimension [`FeatureDistanceWeights`] (typically built from the `[fuzzy]`
+/// knobs via `crate::config::FuzzyConfig::articulatory_weights`). With default
+/// weights this is identical to [`articulatory_distance_score`].
+pub fn articulatory_distance_score_weighted(
+    a: &str,
+    b: &str,
+    weights: &FeatureDistanceWeights,
+) -> f64 {
+    articulatory_edit_distance_weighted(a, b, weights)
 }
 
 /// Per-character articulatory distance (forwarded for callers that
@@ -157,6 +170,31 @@ impl PgmcpPhonetics {
     {
         let rules = self.rules.load_full();
         PhoneticNormalizedDictionaryChar::<()>::from_terms_with_rules(terms, (*rules).clone())
+    }
+
+    /// Composed phonetic∘edit search over a vocabulary. Normalizes both the
+    /// query and each term with the active rules, then matches within
+    /// Damerau-Levenshtein distance `max_distance` in normalized space (the
+    /// `PhoneticNormalizedDictionary` automaton, trie-pruned for d≥1). Returns
+    /// `(original_term, distance, normalized_form)` per hit, sorted by ascending
+    /// distance. The caller joins payloads (e.g. `SymbolValue`) back by term —
+    /// the dictionary is built over `()` so this stays decoupled from
+    /// libdictenstein's value trait.
+    pub fn phonetic_search<S, I>(
+        &self,
+        terms: I,
+        query: &str,
+        max_distance: usize,
+    ) -> Vec<(String, usize, String)>
+    where
+        S: AsRef<str>,
+        I: IntoIterator<Item = S>,
+    {
+        let dict = self.build_dictionary(terms);
+        dict.query(query, max_distance)
+            .into_iter()
+            .map(|c| (c.term, c.distance, c.normalized_form))
+            .collect()
     }
 
     /// Articulatory distance between two strings (delegates to the

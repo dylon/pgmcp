@@ -244,7 +244,13 @@ fn list_tools(tools: &[rmcp::model::Tool]) {
                 // First sentence only
                 let short = desc.split_once(". ").map(|(s, _)| s).unwrap_or(desc);
                 let short = if short.len() > 70 {
-                    &short[..70]
+                    // Back off to a char boundary so multi-byte glyphs
+                    // (e.g. `→`, `∘`) in descriptions are never split.
+                    let mut end = 70;
+                    while end > 0 && !short.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    &short[..end]
                 } else {
                     short
                 };
@@ -271,7 +277,13 @@ fn list_tools(tools: &[rmcp::model::Tool]) {
             let desc = tool.description.as_deref().unwrap_or("");
             let short = desc.split_once(". ").map(|(s, _)| s).unwrap_or(desc);
             let short = if short.len() > 70 {
-                &short[..70]
+                // Back off to a char boundary so multi-byte glyphs
+                // (e.g. `→`, `∘`) in descriptions are never split.
+                let mut end = 70;
+                while end > 0 && !short.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &short[..end]
             } else {
                 short
             };

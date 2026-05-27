@@ -22,6 +22,8 @@ use sqlx::PgPool;
 mod schema_introspect;
 mod v2_shadow_asr;
 mod v3_cross_language_signatures;
+mod v4_work_items;
+mod v5_work_items_collab;
 mod versioning;
 use schema_introspect::*;
 use versioning::*;
@@ -78,6 +80,91 @@ async fn build_hnsw_index(
     .await?;
     sqlx::query(create_index_sql).execute(&mut *tx).await?;
     tx.commit().await?;
+    Ok(())
+}
+
+/// HNSW index on `work_items.embedding` (1024-d BGE-M3) for semantic backlog
+/// search. Drop + rebuild only when the configured (m, ef_construction) change
+/// — the `ensure_experiment_hnsw_index` idiom. Called unconditionally after the
+/// v4 step so the table exists on both fresh and existing installs.
+async fn ensure_work_items_hnsw_index(
+    pool: &PgPool,
+    config: &VectorConfig,
+) -> Result<(), sqlx::Error> {
+    let current_params = format!(
+        "m={},ef_construction={}",
+        config.hnsw_m, config.hnsw_ef_construction
+    );
+    let meta_key = "work_items_hnsw_params";
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT value FROM pgmcp_metadata WHERE key = $1")
+            .bind(meta_key)
+            .fetch_optional(pool)
+            .await?;
+    if stored.as_deref() != Some(&current_params) {
+        sqlx::query("DROP INDEX IF EXISTS idx_work_items_embedding")
+            .execute(pool)
+            .await?;
+        build_hnsw_index(
+            pool,
+            config,
+            &format!(
+                "CREATE INDEX IF NOT EXISTS idx_work_items_embedding ON work_items \
+                 USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
+                config.hnsw_m, config.hnsw_ef_construction
+            ),
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value) VALUES ($1, $2)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(meta_key)
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Tracker ↔ experiment bridge (Phase 10). A `kind='experiment'` work_item is a
+/// lightweight tracking handle; the rich hypotheses/runs/samples/results stay
+/// in the experiment tables. This join table links the two so an experiment
+/// gains the tracker's priority/tags/progress/roll-up/claiming, and the
+/// experiment's frozen-criterion statistical verdict can post trusted
+/// (`source='experiment'`) verification evidence back to the work_item.
+///
+/// Guarded by a `to_regclass` preflight: created only when BOTH `work_items`
+/// (tracker v4) and `experiments` (the sibling subsystem) exist, so a partial
+/// install of either side cannot break migrations. Idempotent.
+async fn ensure_work_item_experiment_bridge(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let has_both: bool = sqlx::query_scalar(
+        "SELECT to_regclass('public.work_items') IS NOT NULL
+            AND to_regclass('public.experiments') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await?;
+    if !has_both {
+        return Ok(());
+    }
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS work_item_experiment (
+            work_item_id    BIGINT NOT NULL REFERENCES work_items(id) ON DELETE CASCADE,
+            experiment_id   BIGINT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+            hypothesis_id   BIGINT REFERENCES experiment_hypotheses(id) ON DELETE SET NULL,
+            experiment_slug TEXT NOT NULL,
+            created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (work_item_id, experiment_id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    // Reverse lookup: all work_items tracking a given experiment (the sync path).
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_wie_experiment ON work_item_experiment(experiment_id)",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -1772,6 +1859,13 @@ pub async fn run_migrations(
     ensure_experiment_tables(pool).await?;
     ensure_experiment_hnsw_index(pool, vector_config).await?;
 
+    // Tracker ↔ experiment bridge (Phase 10). Created LATE and guarded by a
+    // to_regclass preflight because `experiments` is itself an inline ensure_*
+    // (above) and the tracker's `work_items` is the numbered v4 step — this
+    // keeps migration order-independent and resilient to either subsystem being
+    // absent in a partial install.
+    ensure_work_item_experiment_bridge(pool).await?;
+
     // ================================================================
     // Memory-server Phase 6.3: heterogeneous-node graph view
     // (NodeRAG-inspired). UNION ALL projection across the existing
@@ -1837,6 +1931,68 @@ pub async fn run_migrations(
             "cross_language_signatures_v1 migration applied"
         );
     }
+
+    // ================================================================
+    // Migration step 4 — work_items_v1
+    // Work-item / plan tracker: work_items spine + status-history audit,
+    // tags, progress, plan_definitions + rules, acceptance_criteria +
+    // verification_evidence, relations, code anchors, scope_negotiations.
+    // Runs after `ensure_experiment_tables` (above) so the Phase-10
+    // experiment bridge (v5) has its FK target. See
+    // `src/db/migrations/v4_work_items.rs` and the plan
+    // `~/.claude/plans/plan-mcp-support-for-moonlit-dongarra.md`.
+    // ================================================================
+    if !version_applied(pool, v4_work_items::WORK_ITEMS_V1).await? {
+        v4_work_items::apply(pool).await?;
+        record_version(
+            pool,
+            v4_work_items::WORK_ITEMS_V1,
+            v4_work_items::WORK_ITEMS_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v4_work_items::WORK_ITEMS_V1,
+            "work_items_v1 migration applied"
+        );
+    }
+
+    // Re-apply the work_items kind/status/origin vocabulary CHECKs
+    // UNCONDITIONALLY on every startup (idempotent DROP+ADD). The vocabulary is
+    // built from the closed Rust enums (`crate::tracker::kind|status`), so a new
+    // kind/status (e.g. adding `brainstorm`) becomes a constraint swap that
+    // lands on existing installs too — not just fresh ones gated behind the v4
+    // version flag. Guarded by a to_regclass preflight in case work_items is
+    // somehow absent.
+    if sqlx::query_scalar::<_, bool>("SELECT to_regclass('public.work_items') IS NOT NULL")
+        .fetch_one(pool)
+        .await?
+    {
+        v4_work_items::install_work_items_checks(pool).await?;
+    }
+
+    // ================================================================
+    // Migration step 5 — work_items_collab_v1
+    // A2A collaboration layer: claim/lease columns on work_items,
+    // work_item_claims ledger, agent_presence, agent_identity view.
+    // Runs after v4 (work_items) and the initial schema (a2a_agents).
+    // ================================================================
+    if !version_applied(pool, v5_work_items_collab::WORK_ITEMS_COLLAB_V1).await? {
+        v5_work_items_collab::apply(pool).await?;
+        record_version(
+            pool,
+            v5_work_items_collab::WORK_ITEMS_COLLAB_V1,
+            v5_work_items_collab::WORK_ITEMS_COLLAB_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v5_work_items_collab::WORK_ITEMS_COLLAB_V1,
+            "work_items_collab_v1 migration applied"
+        );
+    }
+
+    // Build/refresh the work_items HNSW index (unconditional; the table exists
+    // after the v4 step on fresh installs and already exists on upgrades).
+    ensure_work_items_hnsw_index(pool, vector_config).await?;
 
     Ok(())
 }

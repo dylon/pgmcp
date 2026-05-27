@@ -51,6 +51,7 @@ mod shutdown;
 mod stats;
 #[allow(dead_code)]
 mod topic_store;
+mod tracker;
 #[allow(dead_code)]
 mod wfst;
 mod work_pool;

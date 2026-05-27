@@ -29,6 +29,11 @@ pub struct TokenCandidate {
     /// Edit distance from the input token. 0 means identity / no
     /// correction.
     pub distance: usize,
+    /// Articulatory (phonetic) distance from the input token. Blended
+    /// into the edge cost via `phonetic_cost_weight` so phonetically
+    /// closer corrections are preferred among equal-edit-distance
+    /// candidates. 0.0 for an identity candidate.
+    pub phonetic_cost: f64,
 }
 
 /// Output of `rescore_lattice` and `viterbi_best`.
@@ -46,16 +51,26 @@ pub struct LatticeRescoreOutput {
 /// For each token i, an edge from position i → i+1 is added per
 /// candidate. The identity token (matching the input verbatim) is
 /// always added at cost 0 so the "no correction" path is always
-/// available; candidate edges carry cost `distance * edit_weight`.
+/// available; candidate edges carry cost
+/// `distance * edit_weight + phonetic_cost * phonetic_cost_weight`.
 ///
 /// `edit_weight` lets the caller dial how aggressively to prefer
 /// corrections vs. originals. Default 1.0 (one unit of cost per
 /// edit). Values < 1 make corrections cheaper (more aggressive),
 /// values > 1 make corrections more expensive.
+///
+/// `phonetic_cost_weight` blends each candidate's articulatory
+/// distance into the edge cost (0.0 disables the phonetic term →
+/// pure edit-distance behavior). `phonetic_max_total_cost`, when
+/// positive, drops candidates whose blended cost exceeds the cap; the
+/// identity edge (cost 0) always survives, so the no-correction path is
+/// never pruned.
 pub fn build_correction_lattice(
     tokens: &[&str],
     candidates_per_token: &[Vec<TokenCandidate>],
     edit_weight: f64,
+    phonetic_cost_weight: f64,
+    phonetic_max_total_cost: f64,
 ) -> Lattice<TropicalWeight, HashMapBackend> {
     debug_assert_eq!(tokens.len(), candidates_per_token.len());
     let backend = HashMapBackend::new();
@@ -87,7 +102,14 @@ pub fn build_correction_lattice(
             if cand.term == *tok && cand.distance == 0 {
                 continue;
             }
-            let cost = (cand.distance as f64) * edit_weight;
+            let cost =
+                (cand.distance as f64) * edit_weight + cand.phonetic_cost * phonetic_cost_weight;
+            // Drop candidates whose blended cost exceeds the configured cap
+            // (a positive cap activates this; 0.0 disables it). The identity
+            // edge above is unaffected, so the no-correction path survives.
+            if phonetic_max_total_cost > 0.0 && cost > phonetic_max_total_cost {
+                continue;
+            }
             // EdgeMetadata::correction takes u8 (max edit cost
             // representable per-edge); saturate at u8::MAX for the
             // pathological "huge distance" case rather than wrap.
@@ -170,11 +192,19 @@ pub fn viterbi_best(
 mod tests {
     use super::*;
 
+    fn cand(term: &str, distance: usize, phonetic_cost: f64) -> TokenCandidate {
+        TokenCandidate {
+            term: term.to_string(),
+            distance,
+            phonetic_cost,
+        }
+    }
+
     #[test]
     fn identity_path_is_zero_cost_without_lm() {
         let tokens = ["hello", "world"];
         let cands = vec![Vec::<TokenCandidate>::new(), Vec::new()];
-        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0);
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0);
         let out = viterbi_best(&lat).expect("viterbi");
         assert_eq!(
             out.viterbi_path,
@@ -193,11 +223,8 @@ mod tests {
         // earlier-added "hello" because it has matching cost) — point
         // of the test is to exercise multi-edge case without LM.
         let tokens = ["hello"];
-        let cands = vec![vec![TokenCandidate {
-            term: "hello".to_string(),
-            distance: 0,
-        }]];
-        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0);
+        let cands = vec![vec![cand("hello", 0, 0.0)]];
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0);
         let out = viterbi_best(&lat).expect("viterbi");
         assert_eq!(out.viterbi_path, vec!["hello".to_string()]);
     }
@@ -205,11 +232,8 @@ mod tests {
     #[test]
     fn higher_distance_costs_more() {
         let tokens = ["recieve"];
-        let cands = vec![vec![TokenCandidate {
-            term: "receive".to_string(),
-            distance: 2,
-        }]];
-        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0);
+        let cands = vec![vec![cand("receive", 2, 0.0)]];
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0);
         let out = viterbi_best(&lat).expect("viterbi");
         // Identity path (cost 0) beats the correction (cost 2).
         assert_eq!(out.viterbi_path, vec!["recieve".to_string()]);
@@ -218,16 +242,37 @@ mod tests {
     #[test]
     fn aggressive_edit_weight_picks_correction() {
         let tokens = ["recieve"];
-        let cands = vec![vec![TokenCandidate {
-            term: "receive".to_string(),
-            distance: 2,
-        }]];
+        let cands = vec![vec![cand("receive", 2, 0.0)]];
         // Negative edit_weight makes corrections free / preferable.
         // (In practice edit_weight stays positive and the LM layer
         // produces the preference; this test just verifies the
         // mechanism.)
-        let lat = build_correction_lattice(tokens.as_ref(), &cands, -1.0);
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, -1.0, 0.0, 0.0);
         let out = viterbi_best(&lat).expect("viterbi");
         assert_eq!(out.viterbi_path, vec!["receive".to_string()]);
+    }
+
+    #[test]
+    fn phonetic_cost_breaks_ties_among_equal_edit_distance() {
+        // Two corrections at the same edit distance; with a negative edit
+        // weight both beat identity, and the phonetically-closer one (lower
+        // phonetic_cost) must win once phonetic_cost_weight > 0.
+        let tokens = ["kat"];
+        let cands = vec![vec![cand("cat", 1, 0.05), cand("bat", 1, 0.9)]];
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, -1.0, 1.0, 0.0);
+        let out = viterbi_best(&lat).expect("viterbi");
+        assert_eq!(out.viterbi_path, vec!["cat".to_string()]);
+    }
+
+    #[test]
+    fn phonetic_max_total_cost_drops_over_budget_candidate() {
+        // A far candidate whose blended cost exceeds the cap is dropped, so
+        // the identity path wins even with an aggressive phonetic weight.
+        let tokens = ["xyz"];
+        let cands = vec![vec![cand("receive", 2, 5.0)]];
+        // blended cost = 2 * 1.0 + 5.0 * 1.0 = 7.0 > cap 3.0 → dropped.
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 1.0, 3.0);
+        let out = viterbi_best(&lat).expect("viterbi");
+        assert_eq!(out.viterbi_path, vec!["xyz".to_string()]);
     }
 }

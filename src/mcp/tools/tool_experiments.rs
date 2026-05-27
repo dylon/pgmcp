@@ -712,6 +712,38 @@ pub async fn tool_experiment_decide(
         .await
         .map_err(|e| McpError::internal_error(format!("set_experiment_status: {e}"), None))?;
 
+    // Phase 10 — tracker bridge: post the verdict to any linked work_items as
+    // trusted (source='experiment') verification evidence and auto-verify an
+    // accepted hypothesis. Best-effort: a sync failure must not fail the
+    // decision (the experiment record is already the source of truth).
+    let wi_detail = json!({
+        "verdict": verdict,
+        "accepted": accepted,
+        "test_type": test_type,
+        "statistic": statistic,
+        "p_value": p_value,
+        "effect_size": effect_size,
+        "ci_low": ci_low,
+        "ci_high": ci_high,
+        "criterion_snapshot": serde_json::from_str::<serde_json::Value>(&criterion_snapshot).unwrap_or(serde_json::Value::Null),
+    })
+    .to_string();
+    match queries::sync_experiment_verdict_to_work_items(
+        pool,
+        hyp.experiment_id,
+        &verdict,
+        &wi_detail,
+    )
+    .await
+    {
+        Ok(n) if n > 0 => {
+            tracing::info!(experiment_id = hyp.experiment_id, synced = n, verdict = %verdict,
+                "experiment_decide: synced verdict to linked work_items")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!(error = %e, "experiment_decide: work_item verdict sync failed"),
+    }
+
     // Optional: graduate a confirmed/rejected verdict into the cross-agent
     // best-practice ledger (consensus → durable-mandate pipeline).
     let link = params.link_outcome.unwrap_or(true);

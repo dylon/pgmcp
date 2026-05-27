@@ -815,6 +815,192 @@ pub async fn context(
 }
 
 // ============================================================================
+// POST /api/tracker/ingest_plan — auto-translate an agent plan into a tree
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct TrackerIngestRequest {
+    pub plan_markdown: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub definition_slug: Option<String>,
+}
+
+/// Ingest an agent's plan markdown into a tracked `work_items` subtree. Resolves
+/// the project from `cwd` (longest-prefix) when not given. This is the seam the
+/// PostToolUse:ExitPlanMode hook POSTs to. Reuses the tool's `ingest_plan_core`.
+pub async fn tracker_ingest_plan(
+    State(state): State<ApiState>,
+    Json(req): Json<TrackerIngestRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let project = match (&req.project, &req.cwd) {
+        (Some(p), _) => Some(p.clone()),
+        (None, Some(cwd)) => state
+            .db
+            .find_project_by_cwd(cwd)
+            .await
+            .ok()
+            .flatten()
+            .map(|p| p.name),
+        _ => None,
+    };
+    let out = crate::mcp::tools::work_items::ingest_plan_core(
+        &state.system_ctx,
+        &req.plan_markdown,
+        project.as_deref(),
+        req.definition_slug.as_deref(),
+    )
+    .await
+    .map_err(|e| (StatusCode::BAD_REQUEST, e.message.to_string()))?;
+    Ok(Json(out))
+}
+
+// ============================================================================
+// POST /api/tracker/record_evidence — trusted-source evidence (hooks/CI)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct TrackerEvidenceRequest {
+    /// Must match `[tracker] user_token` — the credential that distinguishes a
+    /// trusted producer (hook/CI) from the agent.
+    pub token: String,
+    pub criterion_id: i64,
+    pub verdict: String,
+    pub source: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub coverage_count: Option<i32>,
+    #[serde(default)]
+    pub coverage_total: Option<i32>,
+    #[serde(default)]
+    pub runner_identity: Option<String>,
+    #[serde(default)]
+    pub commit_sha: Option<String>,
+    #[serde(default)]
+    pub spec_sha256: Option<String>,
+    #[serde(default)]
+    pub detail_json: Option<String>,
+}
+
+/// Record TRUSTED-source verification evidence (the path agents cannot use — it
+/// is token-gated and only accepts trusted sources). On passing evidence it
+/// best-effort runs the gatekeeper `→verified` transition, closing the
+/// verification loop for CI / the Stop-hook.
+pub async fn tracker_record_evidence(
+    State(state): State<ApiState>,
+    Json(req): Json<TrackerEvidenceRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Credential gate (guard scoped so it is not held across an await).
+    let token_ok = {
+        let cfg = state.config.load();
+        cfg.tracker
+            .user_token
+            .as_deref()
+            .map(|t| t == req.token)
+            .unwrap_or(false)
+    };
+    if !token_ok {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "invalid or missing tracker token (set [tracker] user_token)".to_string(),
+        ));
+    }
+    const TRUSTED: &[&str] = &[
+        "ci",
+        "stop_hook",
+        "subagent_audit",
+        "external_auditor",
+        "user_signoff",
+        "experiment",
+    ];
+    if !TRUSTED.contains(&req.source.as_str()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("source must be one of {TRUSTED:?}"),
+        ));
+    }
+    if !matches!(req.verdict.as_str(), "pass" | "fail" | "unknown" | "error") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "verdict must be pass|fail|unknown|error".to_string(),
+        ));
+    }
+    let pool = state.db.pool().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "raw pool unavailable".to_string(),
+    ))?;
+    let detail = req.detail_json.clone().unwrap_or_else(|| "{}".to_string());
+    if serde_json::from_str::<serde_json::Value>(&detail).is_err() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "detail_json must be valid JSON".to_string(),
+        ));
+    }
+    let evidence_id = crate::db::queries::record_verification_evidence(
+        pool,
+        req.criterion_id,
+        &req.verdict,
+        &req.source,
+        req.exit_code,
+        req.coverage_count,
+        req.coverage_total,
+        req.runner_identity.as_deref(),
+        None,
+        req.commit_sha.as_deref(),
+        req.spec_sha256.as_deref(),
+        &detail,
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("record evidence failed (unknown criterion?): {e}"),
+        )
+    })?;
+
+    // Best-effort auto-verify on passing evidence: the gatekeeper transition
+    // succeeds only if the item is in claimed_done/verifying and every required
+    // criterion now passes (errors are swallowed — the evidence is still saved).
+    let mut verified = false;
+    if req.verdict == "pass" {
+        let item_id: Option<i64> =
+            sqlx::query_scalar("SELECT item_id FROM acceptance_criteria WHERE id = $1")
+                .bind(req.criterion_id)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        if let Some(iid) = item_id {
+            let ev = crate::db::queries::latest_passing_evidence_id(pool, iid)
+                .await
+                .ok()
+                .flatten();
+            verified = crate::db::queries::set_work_item_status(
+                pool,
+                iid,
+                crate::tracker::status::WorkItemStatus::Verified,
+                crate::tracker::transition::Actor::Gatekeeper,
+                Some(req.source.as_str()),
+                Some("auto-verify on trusted evidence"),
+                ev,
+                None,
+            )
+            .await
+            .is_ok();
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "evidence_id": evidence_id,
+        "source": req.source,
+        "verified": verified,
+    })))
+}
+
+// ============================================================================
 // GET /api/mandates?project=name&cwd=/path — Effective mandates
 // ============================================================================
 

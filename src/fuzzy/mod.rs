@@ -6,6 +6,7 @@
 //!
 //! Plan: `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`.
 
+pub mod disk_guard;
 pub mod dynamic_dawg;
 pub mod persistent_artrie;
 pub mod phonetic;

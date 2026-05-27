@@ -18,6 +18,7 @@ use libdictenstein::DictionaryValue;
 use super::hybrid_lm::PgmcpHybridLm;
 use super::lattice::{TokenCandidate, build_correction_lattice, rescore_with_lm, viterbi_best};
 use crate::fuzzy::persistent_artrie::FuzzyIndex;
+use crate::fuzzy::phonetic::articulatory_distance_score;
 
 /// Result of a single rewrite call.
 #[derive(Debug, Clone)]
@@ -59,11 +60,14 @@ pub fn tokenize_query(query: &str) -> Vec<String> {
 /// (0.0 = ignore LM, 1.0 = LM only). When `lm` is `None` the LM step
 /// is skipped entirely — the returned `RewrittenQuery.used_lm` field
 /// signals that.
+#[allow(clippy::too_many_arguments)]
 pub fn rewrite_query<V>(
     query: &str,
     max_distance: usize,
     edit_weight: f64,
     lm_weight: f64,
+    phonetic_cost_weight: f64,
+    phonetic_max_total_cost: f64,
     fuzzy_idx: &FuzzyIndex<V>,
     lm: Option<&PgmcpHybridLm>,
 ) -> RewrittenQuery
@@ -90,13 +94,29 @@ where
             fuzzy_idx
                 .query(tok, max_distance)
                 .into_iter()
-                .map(|(term, distance, _value)| TokenCandidate { term, distance })
+                .map(|(term, distance, _value)| {
+                    // Phonetic cost = articulatory distance between the input
+                    // token and the candidate; blended into the lattice edge
+                    // cost so phonetically-closer corrections are preferred.
+                    let phonetic_cost = articulatory_distance_score(tok, &term);
+                    TokenCandidate {
+                        term,
+                        distance,
+                        phonetic_cost,
+                    }
+                })
                 .collect()
         })
         .collect();
 
     let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
-    let base_lattice = build_correction_lattice(&token_refs, &candidates_per_token, edit_weight);
+    let base_lattice = build_correction_lattice(
+        &token_refs,
+        &candidates_per_token,
+        edit_weight,
+        phonetic_cost_weight,
+        phonetic_max_total_cost,
+    );
 
     let (lattice, used_lm) = match (lm, lm_weight > 0.0) {
         (Some(lm), true) => match rescore_with_lm(&base_lattice, lm, lm_weight) {
@@ -157,7 +177,7 @@ mod tests {
     #[test]
     fn empty_query_returns_unchanged() {
         let (_tmp, idx) = empty_trie();
-        let out = rewrite_query("", 2, 1.0, 0.0, &idx, None);
+        let out = rewrite_query("", 2, 1.0, 0.0, 0.0, 0.0, &idx, None);
         assert_eq!(out.original, "");
         assert_eq!(out.rewritten, "");
         assert_eq!(out.token_count, 0);
@@ -167,7 +187,7 @@ mod tests {
     #[test]
     fn empty_vocabulary_identity_pass_through() {
         let (_tmp, idx) = empty_trie();
-        let out = rewrite_query("hello world", 2, 1.0, 0.0, &idx, None);
+        let out = rewrite_query("hello world", 2, 1.0, 0.0, 0.0, 0.0, &idx, None);
         assert_eq!(out.rewritten, "hello world");
         assert!(!out.changed);
         assert_eq!(out.token_count, 2);
@@ -176,7 +196,7 @@ mod tests {
     #[test]
     fn vocabulary_with_only_far_candidates_keeps_identity() {
         let (_tmp, idx) = trie_with(&["completely_unrelated_xyzzy"]);
-        let out = rewrite_query("hello", 2, 1.0, 0.0, &idx, None);
+        let out = rewrite_query("hello", 2, 1.0, 0.0, 0.0, 0.0, &idx, None);
         assert_eq!(out.rewritten, "hello");
     }
 
@@ -185,7 +205,19 @@ mod tests {
         let (_tmp, idx) = trie_with(&["receive"]);
         // Negative edit weight makes corrections preferable; the LM
         // would normally do this — this test exercises the mechanism.
-        let out = rewrite_query("recieve", 2, -1.0, 0.0, &idx, None);
+        let out = rewrite_query("recieve", 2, -1.0, 0.0, 0.0, 0.0, &idx, None);
+        assert_eq!(out.rewritten, "receive");
+        assert!(out.changed);
+    }
+
+    #[test]
+    fn phonetic_weighting_threads_through_and_still_corrects() {
+        let (_tmp, idx) = trie_with(&["receive"]);
+        // phonetic_cost_weight > 0 with a generous cap: the strongly-preferred
+        // correction (edit_weight -10) still wins after the phonetic term is
+        // blended in — i.e. the phonetic params are threaded without breaking
+        // a legitimate near-miss correction.
+        let out = rewrite_query("recieve", 2, -10.0, 0.0, 1.0, 100.0, &idx, None);
         assert_eq!(out.rewritten, "receive");
         assert!(out.changed);
     }

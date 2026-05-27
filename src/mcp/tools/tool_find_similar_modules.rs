@@ -125,10 +125,12 @@ pub async fn tool_find_similar_modules(
             .fetch_all(pool)
             .await
             .unwrap_or_default();
+            let art_weights = ctx.config().load().fuzzy.articulatory_weights();
             for (a, b, lang_a, lang_b, sim, name_a, name_b) in rows {
-                let art_dist = crate::fuzzy::phonetic::articulatory_distance_score(
+                let art_dist = crate::fuzzy::phonetic::articulatory_distance_score_weighted(
                     &name_a.to_lowercase(),
                     &name_b.to_lowercase(),
+                    &art_weights,
                 );
                 cross_language_pairs.push(serde_json::json!({
                     "symbol_id_a": a,

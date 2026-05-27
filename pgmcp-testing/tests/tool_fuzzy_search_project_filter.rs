@@ -124,6 +124,7 @@ async fn symbol_search_with_project_excludes_other_projects_symbols() {
             project: "filter_test_alpha".to_string(),
             max_distance: Some(8),
             limit: Some(50),
+            phonetic: None,
         },
     )
     .await

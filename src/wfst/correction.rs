@@ -28,15 +28,21 @@ pub struct CorrectionResult {
     /// unchanged (identity wins); `0.5` when LM rescoring was applied;
     /// `0.25` when only edit-distance scoring was available.
     pub confidence: f64,
+    /// Whether the per-project n-gram language model was applied during
+    /// lattice rescoring (false when no model exists or `lm_weight == 0`).
+    pub used_lm: bool,
 }
 
 /// Correct a query using the WFST pipeline. See [`rewrite_query`]
 /// for parameter semantics.
+#[allow(clippy::too_many_arguments)]
 pub fn correct_query_single<V>(
     query: &str,
     max_distance: usize,
     edit_weight: f64,
     lm_weight: f64,
+    phonetic_cost_weight: f64,
+    phonetic_max_total_cost: f64,
     fuzzy_idx: &FuzzyIndex<V>,
     lm: Option<&PgmcpHybridLm>,
 ) -> CorrectionResult
@@ -49,7 +55,16 @@ where
         changed,
         used_lm,
         ..
-    } = rewrite_query(query, max_distance, edit_weight, lm_weight, fuzzy_idx, lm);
+    } = rewrite_query(
+        query,
+        max_distance,
+        edit_weight,
+        lm_weight,
+        phonetic_cost_weight,
+        phonetic_max_total_cost,
+        fuzzy_idx,
+        lm,
+    );
 
     let confidence = if !changed {
         1.0
@@ -64,6 +79,7 @@ where
         corrected: rewritten,
         changed,
         confidence,
+        used_lm,
     }
 }
 
@@ -91,7 +107,7 @@ mod tests {
     #[test]
     fn empty_query_unchanged_high_confidence() {
         let (_tmp, idx) = empty_trie();
-        let r = correct_query_single("", 2, 1.0, 0.0, &idx, None);
+        let r = correct_query_single("", 2, 1.0, 0.0, 0.0, 0.0, &idx, None);
         assert_eq!(r.input, "");
         assert_eq!(r.corrected, "");
         assert!(!r.changed);
@@ -101,7 +117,7 @@ mod tests {
     #[test]
     fn no_correction_keeps_identity_high_confidence() {
         let (_tmp, idx) = empty_trie();
-        let r = correct_query_single("hello", 2, 1.0, 0.0, &idx, None);
+        let r = correct_query_single("hello", 2, 1.0, 0.0, 0.0, 0.0, &idx, None);
         assert_eq!(r.corrected, "hello");
         assert!(!r.changed);
         assert_eq!(r.confidence, 1.0);
@@ -110,7 +126,7 @@ mod tests {
     #[test]
     fn corrected_no_lm_quarter_confidence() {
         let (_tmp, idx) = trie_with(&["receive"]);
-        let r = correct_query_single("recieve", 2, -1.0, 0.0, &idx, None);
+        let r = correct_query_single("recieve", 2, -1.0, 0.0, 0.0, 0.0, &idx, None);
         assert_eq!(r.corrected, "receive");
         assert!(r.changed);
         assert_eq!(r.confidence, 0.25);

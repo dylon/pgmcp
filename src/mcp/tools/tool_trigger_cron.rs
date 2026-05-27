@@ -154,9 +154,45 @@ pub async fn tool_trigger_cron(
                 "guidance": "Adaptive MSM cost re-tuned for cohort separation; the RLM strategy chooser (a2a_pattern_recursive) now uses it.",
             }))
         }
+        "fuzzy-sync" => {
+            // Rebuild the per-project symbol/path/commit + durable-mandate fuzzy
+            // tries from PostgreSQL — the on-demand counterpart to the fuzzy-sync
+            // cron. Clone config values before the await so the ArcSwap guard is
+            // not held across it.
+            let pool = ctx
+                .db()
+                .pool()
+                .ok_or_else(|| McpError::internal_error("no pool available", None))?;
+            let (data_dir, max_disk_bytes, eviction_cfg) = {
+                let cfg = ctx.config().load();
+                (
+                    cfg.fuzzy.data_dir.clone(),
+                    cfg.fuzzy.max_disk_bytes,
+                    cfg.fuzzy.eviction_config(),
+                )
+            };
+            let report = crate::cron::fuzzy_sync::run_fuzzy_sync(
+                pool,
+                &data_dir,
+                max_disk_bytes,
+                eviction_cfg,
+                std::sync::Arc::clone(stats),
+            )
+            .await
+            .map_err(|e| McpError::internal_error(format!("fuzzy-sync failed: {e}"), None))?;
+            json_result(&json!({
+                "job": params.job,
+                "status": "completed",
+                "symbols_synced": report.symbols_synced,
+                "paths_synced": report.paths_synced,
+                "commits_synced": report.commits_synced,
+                "durable_mandates_synced": report.durable_mandates_synced,
+                "guidance": "Per-project symbol/path/commit + durable-mandate fuzzy tries rebuilt from PG.",
+            }))
+        }
         other => Err(McpError::invalid_params(
             format!(
-                "Unknown job {other:?}. Valid: symbol-extraction | call-graph | function-metrics | a2a-reflect | msm-calibrate"
+                "Unknown job {other:?}. Valid: symbol-extraction | call-graph | function-metrics | a2a-reflect | msm-calibrate | fuzzy-sync"
             ),
             None,
         )),

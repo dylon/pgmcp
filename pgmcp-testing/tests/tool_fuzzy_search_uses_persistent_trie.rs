@@ -21,7 +21,6 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use libdictenstein::Dictionary;
 use pgmcp::config::Config;
 use pgmcp::context::SystemContext;
 use pgmcp::cron::fuzzy_sync::{slugify, trie_path};
@@ -125,6 +124,7 @@ async fn lazy_warm_from_empty() {
             project: "lazy_warm_test".to_string(),
             max_distance: Some(0),
             limit: Some(10),
+            phonetic: None,
         },
     )
     .await
@@ -187,6 +187,7 @@ async fn persistent_trie_beats_stale_pg() {
             project: "trie_beats_pg".to_string(),
             max_distance: Some(20),
             limit: Some(20),
+            phonetic: None,
         },
     )
     .await

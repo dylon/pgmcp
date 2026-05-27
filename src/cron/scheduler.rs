@@ -688,6 +688,40 @@ pub fn schedule_maintenance_jobs(
         },
     );
 
+    // Work-item presence + lease decay (light — runs unconditionally, like
+    // stale-cleanup). Releases expired claims (A2A crash-safety: a dead agent's
+    // claims become stealable) and decays agent_presence active→idle→offline.
+    let db_clone = Arc::clone(&db);
+    let rt_clone = rt.clone();
+    let stats_clone = Arc::clone(&stats);
+    let lc = lifecycle.clone();
+    let presence_interval = config.work_item_presence_interval_secs;
+    let presence_idle = config.work_item_presence_idle_secs as i64;
+    let presence_offline = config.work_item_presence_offline_secs as i64;
+    handle.schedule_recurring(
+        staggered_initial_delay_ms("work-item-presence", presence_interval * 1000),
+        presence_interval * 1000,
+        "work-item-presence",
+        move || {
+            if lc.is_stopping() {
+                return false;
+            }
+            let stats = Arc::clone(&stats_clone);
+            if let Some(pool) = db_clone.pool().cloned() {
+                rt_clone.spawn(async move {
+                    crate::cron::work_item_presence::run_or_log(
+                        pool,
+                        stats,
+                        presence_idle,
+                        presence_offline,
+                    )
+                    .await;
+                });
+            }
+            true
+        },
+    );
+
     // Integrity check: clean up files with incomplete indexing (NULL content_hash).
     // These are files where pgmcp was killed between upsert and embedding completion.
     // Deleting them causes re-indexing on the next scan; ON DELETE CASCADE cleans partial chunks.
@@ -1368,6 +1402,8 @@ pub fn schedule_maintenance_jobs(
     let rt_clone_fuzzy = rt.clone();
     let stats_for_fuzzy = Arc::clone(&stats);
     let fuzzy_data_dir = fuzzy_config.data_dir.clone();
+    let fuzzy_max_disk_bytes = fuzzy_config.max_disk_bytes;
+    let fuzzy_eviction_cfg = fuzzy_config.eviction_config();
     let fuzzy_interval = config.fuzzy_sync_interval_secs;
     let cron_pool_fuzzy = Arc::clone(&cron_pool);
     let lc_fuzzy = lifecycle.clone();
@@ -1389,6 +1425,8 @@ pub fn schedule_maintenance_jobs(
             let db = db_clone_fuzzy.clone();
             let rt = rt_clone_fuzzy.clone();
             let data_dir = fuzzy_data_dir.clone();
+            let max_disk_bytes = fuzzy_max_disk_bytes;
+            let eviction_cfg = fuzzy_eviction_cfg.clone();
             cron_pool_fuzzy.submit(
                 move || {
                     let _guard = heavy_gate_or_skip!(
@@ -1405,7 +1443,11 @@ pub fn schedule_maintenance_jobs(
                         let stats_ref = Arc::clone(&stats);
                         rt.block_on(async move {
                             match crate::cron::fuzzy_sync::run_fuzzy_sync(
-                                &pool, &data_dir, stats_ref,
+                                &pool,
+                                &data_dir,
+                                max_disk_bytes,
+                                eviction_cfg,
+                                stats_ref,
                             )
                             .await
                             {

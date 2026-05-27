@@ -10,7 +10,7 @@ use rmcp::model::CallToolResult;
 use serde_json::json;
 
 use crate::context::SystemContext;
-use crate::fuzzy::phonetic::articulatory_distance_score;
+use crate::fuzzy::phonetic::articulatory_distance_score_weighted;
 use crate::mcp::server::RenameOracleParams;
 use crate::mcp::tools::sota_helpers::json_result;
 
@@ -25,9 +25,10 @@ pub async fn run(
     let candidates: Vec<liblevenshtein::transducer::Candidate> = xducer
         .query_with_distance(&params.removed_name, 2)
         .collect();
+    let weights = ctx.config().load().fuzzy.articulatory_weights();
     let best = candidates.into_iter().min_by(|a, b| {
-        let aad = articulatory_distance_score(&params.removed_name, &a.term);
-        let bad = articulatory_distance_score(&params.removed_name, &b.term);
+        let aad = articulatory_distance_score_weighted(&params.removed_name, &a.term, &weights);
+        let bad = articulatory_distance_score_weighted(&params.removed_name, &b.term, &weights);
         aad.partial_cmp(&bad)
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| a.distance.cmp(&b.distance))

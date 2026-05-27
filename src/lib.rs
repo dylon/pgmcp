@@ -57,6 +57,7 @@ pub mod shutdown;
 pub mod stats;
 #[allow(dead_code)]
 pub mod topic_store;
+pub mod tracker;
 #[allow(dead_code)]
 pub mod wfst;
 pub mod work_pool;

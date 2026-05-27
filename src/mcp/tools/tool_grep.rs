@@ -13,6 +13,8 @@ use serde::Serialize;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 
+use liblevenshtein::phonetic::token_grep::TokenGrep;
+
 use crate::context::SystemContext;
 use crate::db::queries::GrepChunkResult;
 use crate::mcp::server::*;
@@ -48,6 +50,11 @@ pub async fn tool_grep(
     let before = params.before_context.unwrap_or(0).max(0);
     let after = params.after_context.unwrap_or(0).max(0);
     let case_insensitive = params.case_insensitive.unwrap_or(false);
+
+    // Fuzzy mode: approximate matching over indexed chunks via TokenGrep.
+    if params.fuzzy.unwrap_or(false) {
+        return fuzzy_grep(ctx, &params, limit, before, after).await;
+    }
 
     debug!(
         tool = "grep",
@@ -212,4 +219,115 @@ fn build_hit(
         window_end,
         content,
     }
+}
+
+/// Approximate (fuzzy) grep over indexed `file_chunks` via liblevenshtein's
+/// `TokenGrep`. Fuzzy matching can't use an exact SQL prefilter (a typo'd query
+/// must still find the correct spelling), so this fetches a broad bounded
+/// candidate set of chunks for the project/glob (match-any) and scans each
+/// fuzzily, returning the lowest-distance match per chunk. Strongly recommend a
+/// `project` to bound the corpus.
+async fn fuzzy_grep(
+    ctx: &SystemContext,
+    params: &GrepParams,
+    limit: i32,
+    before: i32,
+    after: i32,
+) -> Result<CallToolResult, McpError> {
+    let max_d = params.fuzzy_max_distance.unwrap_or(2) as u8;
+    let grep = TokenGrep::new(&params.pattern, max_d)
+        .map_err(|e| McpError::internal_error(format!("fuzzy grep query: {e:?}"), None))?;
+
+    // Candidate cap: scan a broad bounded set (fuzzy has no exact prefilter).
+    let candidate_cap = limit.max(1).saturating_mul(200).min(5000);
+    let chunks = ctx
+        .db()
+        .grep_search_chunks(
+            ".", // match-any: candidate chunks for the project/glob
+            params.project.as_deref(),
+            params.language.as_deref(),
+            params.glob.as_deref(),
+            true,
+            candidate_cap,
+            params.dedupe_worktrees.unwrap_or(false),
+        )
+        .await
+        .map_err(|e| McpError::internal_error(format!("fuzzy grep fetch: {}", e), None))?;
+    let candidates_scanned = chunks.len();
+
+    let mut hits: Vec<(u8, serde_json::Value)> = Vec::new();
+    for chunk in &chunks {
+        if let Some(best) = grep
+            .scan(&chunk.content)
+            .into_iter()
+            .min_by_key(|m| m.total_distance)
+        {
+            let (window_start, window_end, content) = fuzzy_window(
+                &chunk.content,
+                best.byte_range.0,
+                chunk.start_line,
+                before,
+                after,
+            );
+            hits.push((
+                best.total_distance,
+                serde_json::json!({
+                    "project_name": chunk.project_name,
+                    "path": chunk.path,
+                    "relative_path": chunk.relative_path,
+                    "language": chunk.language,
+                    "chunk_index": chunk.chunk_index,
+                    "window_start": window_start,
+                    "window_end": window_end,
+                    "content": content,
+                    "distance": best.total_distance,
+                    "matched_text": best.matched_text,
+                }),
+            ));
+        }
+    }
+    hits.sort_by_key(|(d, _)| *d);
+    let hits: Vec<serde_json::Value> = hits
+        .into_iter()
+        .take(limit.max(0) as usize)
+        .map(|(_, h)| h)
+        .collect();
+
+    let envelope = serde_json::json!({
+        "hits": hits,
+        "fuzzy": true,
+        "max_distance": max_d,
+        "candidates_scanned": candidates_scanned,
+    });
+    let json = serde_json::to_string_pretty(&envelope)
+        .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
+    Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+/// Map a byte offset within a chunk's content to a 1-based absolute line window
+/// `[start, end]` (using the chunk's `start_line`) plus the windowed text.
+fn fuzzy_window(
+    content: &str,
+    match_byte: usize,
+    chunk_start_line: i32,
+    before: i32,
+    after: i32,
+) -> (i32, i32, String) {
+    let clamped = match_byte.min(content.len());
+    let line_local = content[..clamped].bytes().filter(|&b| b == b'\n').count() as i32;
+    let lines: Vec<&str> = content.split('\n').collect();
+    let win_start = (line_local - before).max(0);
+    let win_end = (line_local + after).min(lines.len() as i32 - 1);
+    let text = lines
+        .iter()
+        .skip(win_start as usize)
+        .take((win_end - win_start + 1).max(0) as usize)
+        .copied()
+        .collect::<Vec<&str>>()
+        .join("\n");
+    (
+        chunk_start_line + win_start,
+        chunk_start_line + win_end,
+        text,
+    )
 }

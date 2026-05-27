@@ -8,6 +8,10 @@ pub use queries_stats::*;
 mod queries_experiments;
 pub use queries_experiments::*;
 
+#[path = "queries/work_items.rs"]
+mod queries_work_items;
+pub use queries_work_items::*;
+
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 

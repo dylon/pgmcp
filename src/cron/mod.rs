@@ -51,3 +51,4 @@ pub mod topic_clustering_online;
 pub mod topic_dendrogram;
 #[allow(dead_code)]
 pub mod topic_hierarchy;
+pub mod work_item_presence;

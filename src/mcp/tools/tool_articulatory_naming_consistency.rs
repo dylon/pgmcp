@@ -6,7 +6,7 @@ use rmcp::model::CallToolResult;
 use serde_json::json;
 
 use crate::context::SystemContext;
-use crate::fuzzy::phonetic::articulatory_distance_score;
+use crate::fuzzy::phonetic::articulatory_distance_score_weighted;
 use crate::mcp::server::ArticulatoryNamingConsistencyParams;
 use crate::mcp::tools::sota_helpers::json_result;
 
@@ -16,11 +16,16 @@ pub async fn run(
 ) -> Result<CallToolResult, McpError> {
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let threshold = params.max_distance.unwrap_or(0.5);
+    let weights = ctx.config().load().fuzzy.articulatory_weights();
     let n = params.identifiers.len();
     let mut close: Vec<serde_json::Value> = Vec::new();
     for i in 0..n {
         for j in (i + 1)..n {
-            let d = articulatory_distance_score(&params.identifiers[i], &params.identifiers[j]);
+            let d = articulatory_distance_score_weighted(
+                &params.identifiers[i],
+                &params.identifiers[j],
+                &weights,
+            );
             if d > 0.0 && d <= threshold {
                 close.push(json!({
                     "a": params.identifiers[i].clone(),

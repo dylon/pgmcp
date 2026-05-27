@@ -28,7 +28,11 @@ pub async fn rebuild_symbols(
 ) -> Result<usize, FuzzyError> {
     let rows: Vec<(String, i64, String, String, i32)> =
         sqlx::query_as::<_, (String, i64, String, String, i32)>(
-            "SELECT fs.name, fs.file_id, fs.kind, fs.visibility, fs.start_line
+            // `file_symbols.visibility` is nullable (the symbol extractor leaves it
+            // NULL for symbols whose visibility it can't determine). COALESCE to the
+            // project-wide convention 'private' so the non-Option tuple slot never
+            // decodes a NULL (see tool_dead_code_reachability / tool_panic_paths).
+            "SELECT fs.name, fs.file_id, fs.kind, COALESCE(fs.visibility, 'private'), fs.start_line
              FROM file_symbols fs
              JOIN indexed_files f ON fs.file_id = f.id
              WHERE f.project_id = $1",
@@ -88,7 +92,9 @@ pub async fn rebuild_commits(
     idx: &FuzzyIndex<CommitRef>,
 ) -> Result<usize, FuzzyError> {
     let rows: Vec<(String, i64, String)> = sqlx::query_as::<_, (String, i64, String)>(
-        "SELECT subject, id, sha
+        // The commit-hash column is `commit_hash`, not `sha` (the old name referenced a
+        // nonexistent column and failed at plan time with `column "sha" does not exist`).
+        "SELECT subject, id, commit_hash
          FROM git_commits
          WHERE project_id = $1",
     )

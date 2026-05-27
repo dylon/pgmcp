@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 
 use libdictenstein::Dictionary;
 use libdictenstein::DictionaryValue;
+use libdictenstein::EvictableARTrie;
 use libdictenstein::MappedDictionary;
 use libdictenstein::MutableMappedDictionary;
+use libdictenstein::persistent_artrie::eviction::{EvictionConfig, EvictionStats};
 use libdictenstein::persistent_artrie::recovery::RecoveryReport;
 use libdictenstein::persistent_artrie_char::{PersistentARTrieChar, SharedCharARTrie};
 use liblevenshtein::transducer::{Algorithm, Transducer};
@@ -129,13 +131,10 @@ where
     pub fn query(&self, query: &str, max_distance: usize) -> Vec<(String, usize, V)> {
         let storage_for_transducer = self.storage.clone();
         let transducer = Transducer::new(storage_for_transducer, Algorithm::Transposition);
-        let mut out = Vec::new();
-        for candidate in transducer.query_with_distance(query, max_distance) {
-            if let Some(value) = self.get(&candidate.term) {
-                out.push((candidate.term, candidate.distance, value));
-            }
-        }
-        out
+        // `query_values` reads each match's value during the automaton traversal
+        // (a single walk) — no per-candidate `get` re-walk. Enabled by the
+        // `MappedDictionaryNode` impl on `PersistentARTrieCharNode`.
+        transducer.query_values(query, max_distance).collect()
     }
 
     /// Approximate query with a value-side predicate filter applied at
@@ -150,10 +149,28 @@ where
     where
         F: Fn(&V) -> bool,
     {
-        self.query(query, max_distance)
-            .into_iter()
-            .filter(|(_, _, v)| predicate(v))
+        // Single-walk value-yielding query with the value predicate applied to
+        // each match — e.g. fuzzy symbol search restricted to public symbols or
+        // a given kind, without a second lookup per candidate.
+        let storage_for_transducer = self.storage.clone();
+        let transducer = Transducer::new(storage_for_transducer, Algorithm::Transposition);
+        transducer
+            .query_values(query, max_distance)
+            .filter(|(_, _, value)| predicate(value))
             .collect()
+    }
+
+    /// Collect every term in the trie as owned `String`s. Collected under
+    /// the read guard and returned owned, so no lock is held across an await.
+    pub fn iter_strings(&self) -> Vec<String> {
+        self.storage.read().iter().collect()
+    }
+
+    /// Collect every `(term, value)` pair in the trie. Used by composed
+    /// search (e.g. building a transient phonetic-normalized dictionary over
+    /// the project vocabulary and joining values back by term).
+    pub fn iter_with_values(&self) -> Vec<(String, V)> {
+        self.storage.read().iter_with_values().collect()
     }
 
     /// Returns the underlying shared-trie handle, for callers that
@@ -161,6 +178,45 @@ where
     /// that writes while a tool reads).
     pub fn storage(&self) -> SharedCharARTrie<V> {
         self.storage.clone()
+    }
+
+    /// Enable heap eviction: under system memory pressure the libdictenstein
+    /// eviction coordinator reclaims in-memory node boxes (swizzling them to
+    /// their on-disk locations, which `checkpoint` records). Idempotent guard
+    /// inside libdictenstein returns an error if already enabled.
+    pub fn enable_eviction(&self, config: EvictionConfig) -> Result<(), FuzzyError> {
+        self.storage
+            .enable_eviction(config)
+            .map_err(|e| FuzzyError::Trie(format!("enable_eviction: {e}")))
+    }
+
+    /// Whether heap eviction is currently enabled on this trie.
+    pub fn eviction_enabled(&self) -> bool {
+        self.storage.eviction_enabled()
+    }
+
+    /// Cumulative eviction statistics for this trie instance.
+    pub fn eviction_stats(&self) -> EvictionStats {
+        self.storage.eviction_stats()
+    }
+
+    /// Force eviction of at least `target_bytes` of in-memory node boxes,
+    /// returning `(nodes_evicted, bytes_freed)`. Only effective once a
+    /// `checkpoint` has populated the disk-location registry.
+    pub fn force_eviction(&self, target_bytes: usize) -> Result<(usize, usize), FuzzyError> {
+        self.storage
+            .force_eviction(target_bytes)
+            .map_err(|e| FuzzyError::Trie(format!("force_eviction: {e}")))
+    }
+
+    /// Checkpoint the trie to disk. Persists pending mutations and, when
+    /// eviction is enabled, (re)populates the eviction coordinator's
+    /// disk-location registry so eviction can reclaim node boxes.
+    pub fn checkpoint(&self) -> Result<(), FuzzyError> {
+        self.storage
+            .write()
+            .checkpoint()
+            .map_err(|e| FuzzyError::Trie(format!("checkpoint: {e}")))
     }
 }
 

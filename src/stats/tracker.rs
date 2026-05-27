@@ -326,6 +326,15 @@ pub struct StatsTracker {
     // fuzzy indexes; refreshed by `cron::fuzzy_sync`).
     pub fuzzy_sync_runs: AtomicU64,
     pub fuzzy_sync_rows_synced: AtomicU64,
+    /// Times a fuzzy trie's on-disk size exceeded `[fuzzy].max_disk_bytes`
+    /// (advisory — logged by `crate::fuzzy::disk_guard`, disk not shrunk).
+    pub fuzzy_disk_cap_exceeded: AtomicU64,
+    /// Most-recent on-disk byte size observed for a fuzzy trie by disk_guard.
+    pub fuzzy_disk_bytes_last: AtomicU64,
+    /// Cumulative in-memory node boxes reclaimed by libdictenstein eviction.
+    pub fuzzy_nodes_evicted: AtomicU64,
+    /// Cumulative heap bytes freed by libdictenstein eviction (estimate).
+    pub fuzzy_bytes_freed: AtomicU64,
 
     // Phase 7 — topic-dendrogram cron (libgrammstein
     // hierarchical-agglomerative + c-TF-IDF).
@@ -617,6 +626,40 @@ pub struct StatsTracker {
     /// Markdown ledgers rendered via `experiment_render_ledger`/auto-render.
     pub experiment_ledgers_rendered: AtomicU64,
 
+    // Work-item / plan tracker counters.
+    /// Work items created via `work_item_create`.
+    pub work_items_created: AtomicU64,
+    /// `work_item_list` query invocations.
+    pub work_item_queries: AtomicU64,
+    /// Status transitions performed via `work_item_set_status`.
+    pub work_item_status_changes: AtomicU64,
+    /// Tag attachments applied via `work_item_tag` (sum of applied tags).
+    pub work_item_tags_applied: AtomicU64,
+    /// Progress notes appended via `work_item_record_progress`.
+    pub work_item_progress_logged: AtomicU64,
+    /// `work_item_reprioritize` invocations (each rescores all active items).
+    pub work_item_reprioritizations: AtomicU64,
+    /// `plan_validate` invocations.
+    pub plan_validations: AtomicU64,
+    /// `work_item_record_evidence` invocations.
+    pub work_item_evidence_recorded: AtomicU64,
+    /// `work_item_attempt_verify` invocations.
+    pub work_item_verifications: AtomicU64,
+    /// `work_item_ingest_plan` invocations.
+    pub plan_ingests: AtomicU64,
+    /// Successful work-item claims / claim-next.
+    pub work_item_claims_succeeded: AtomicU64,
+    /// Work-item claims lost to contention / blocked / terminal.
+    pub work_item_claims_contended: AtomicU64,
+    /// Work-item claim handoffs.
+    pub work_item_handoffs: AtomicU64,
+    /// `agent_heartbeat` invocations.
+    pub agent_heartbeats: AtomicU64,
+    /// `work-item-presence` cron sweeps.
+    pub presence_sweeps: AtomicU64,
+    /// Work-item leases expired by the presence cron.
+    pub work_item_leases_expired: AtomicU64,
+
     /// Currently-connected Streamable HTTP MCP sessions. Incremented when
     /// a peer issues an `initialize` and a session is created in the
     /// `LocalSessionManager` wrapper; decremented on session close /
@@ -775,6 +818,10 @@ impl StatsTracker {
             topic_noise_chunks: AtomicU64::new(0),
             fuzzy_sync_runs: AtomicU64::new(0),
             fuzzy_sync_rows_synced: AtomicU64::new(0),
+            fuzzy_disk_cap_exceeded: AtomicU64::new(0),
+            fuzzy_disk_bytes_last: AtomicU64::new(0),
+            fuzzy_nodes_evicted: AtomicU64::new(0),
+            fuzzy_bytes_freed: AtomicU64::new(0),
             topic_dendrogram_runs: AtomicU64::new(0),
             topic_dendrogram_topics_generated: AtomicU64::new(0),
             ngram_lm_train_runs: AtomicU64::new(0),
@@ -896,6 +943,22 @@ impl StatsTracker {
             experiment_searches: AtomicU64::new(0),
             experiment_artifacts_logged: AtomicU64::new(0),
             experiment_ledgers_rendered: AtomicU64::new(0),
+            work_items_created: AtomicU64::new(0),
+            work_item_queries: AtomicU64::new(0),
+            work_item_status_changes: AtomicU64::new(0),
+            work_item_tags_applied: AtomicU64::new(0),
+            work_item_progress_logged: AtomicU64::new(0),
+            work_item_reprioritizations: AtomicU64::new(0),
+            plan_validations: AtomicU64::new(0),
+            work_item_evidence_recorded: AtomicU64::new(0),
+            work_item_verifications: AtomicU64::new(0),
+            plan_ingests: AtomicU64::new(0),
+            work_item_claims_succeeded: AtomicU64::new(0),
+            work_item_claims_contended: AtomicU64::new(0),
+            work_item_handoffs: AtomicU64::new(0),
+            agent_heartbeats: AtomicU64::new(0),
+            presence_sweeps: AtomicU64::new(0),
+            work_item_leases_expired: AtomicU64::new(0),
             http_mcp_sessions: AtomicU64::new(0),
             peak_rss_bytes: AtomicU64::new(0),
             current_rss_bytes: AtomicU64::new(0),
@@ -1018,6 +1081,12 @@ impl StatsTracker {
             "bytes_processed": self.bytes_processed.load(Ordering::Acquire),
             "mcp_requests": self.mcp_requests.load(Ordering::Acquire),
             "mcp_errors": self.mcp_errors.load(Ordering::Acquire),
+            "fuzzy_sync_runs": self.fuzzy_sync_runs.load(Ordering::Acquire),
+            "fuzzy_sync_rows_synced": self.fuzzy_sync_rows_synced.load(Ordering::Acquire),
+            "fuzzy_disk_cap_exceeded": self.fuzzy_disk_cap_exceeded.load(Ordering::Acquire),
+            "fuzzy_disk_bytes_last": self.fuzzy_disk_bytes_last.load(Ordering::Acquire),
+            "fuzzy_nodes_evicted": self.fuzzy_nodes_evicted.load(Ordering::Acquire),
+            "fuzzy_bytes_freed": self.fuzzy_bytes_freed.load(Ordering::Acquire),
             "semantic_searches": self.semantic_searches.load(Ordering::Acquire),
             "text_searches": self.text_searches.load(Ordering::Acquire),
             "grep_searches": self.grep_searches.load(Ordering::Acquire),
@@ -1227,6 +1296,22 @@ impl StatsTracker {
             "experiment_searches": self.experiment_searches.load(Ordering::Acquire),
             "experiment_artifacts_logged": self.experiment_artifacts_logged.load(Ordering::Acquire),
             "experiment_ledgers_rendered": self.experiment_ledgers_rendered.load(Ordering::Acquire),
+            "work_items_created": self.work_items_created.load(Ordering::Acquire),
+            "work_item_queries": self.work_item_queries.load(Ordering::Acquire),
+            "work_item_status_changes": self.work_item_status_changes.load(Ordering::Acquire),
+            "work_item_tags_applied": self.work_item_tags_applied.load(Ordering::Acquire),
+            "work_item_progress_logged": self.work_item_progress_logged.load(Ordering::Acquire),
+            "work_item_reprioritizations": self.work_item_reprioritizations.load(Ordering::Acquire),
+            "plan_validations": self.plan_validations.load(Ordering::Acquire),
+            "work_item_evidence_recorded": self.work_item_evidence_recorded.load(Ordering::Acquire),
+            "work_item_verifications": self.work_item_verifications.load(Ordering::Acquire),
+            "plan_ingests": self.plan_ingests.load(Ordering::Acquire),
+            "work_item_claims_succeeded": self.work_item_claims_succeeded.load(Ordering::Acquire),
+            "work_item_claims_contended": self.work_item_claims_contended.load(Ordering::Acquire),
+            "work_item_handoffs": self.work_item_handoffs.load(Ordering::Acquire),
+            "agent_heartbeats": self.agent_heartbeats.load(Ordering::Acquire),
+            "presence_sweeps": self.presence_sweeps.load(Ordering::Acquire),
+            "work_item_leases_expired": self.work_item_leases_expired.load(Ordering::Acquire),
             "http_mcp_sessions": self.http_mcp_sessions.load(Ordering::Acquire),
             "telemetry_rows_written": self.telemetry_rows_written.load(Ordering::Acquire),
             "telemetry_writes_dropped": self.telemetry_writes_dropped.load(Ordering::Acquire),

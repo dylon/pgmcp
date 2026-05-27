@@ -74,11 +74,14 @@ pub async fn tool_find_duplicates(
         .fetch_all(pool)
         .await
         .unwrap_or_default();
-        let merge_threshold = ctx.config().load().fuzzy.phonetic_merge_threshold;
+        let dup_cfg = ctx.config().load();
+        let merge_threshold = dup_cfg.fuzzy.phonetic_merge_threshold;
+        let art_weights = dup_cfg.fuzzy.articulatory_weights();
         for (a, b, lang_a, lang_b, sim, name_a, name_b) in rows {
-            let art_dist = crate::fuzzy::phonetic::articulatory_distance_score(
+            let art_dist = crate::fuzzy::phonetic::articulatory_distance_score_weighted(
                 &name_a.to_lowercase(),
                 &name_b.to_lowercase(),
+                &art_weights,
             );
             // Mark pairs that the [fuzzy] cost model would
             // consider "near-name" duplicates (articulatory

@@ -639,8 +639,19 @@ pub struct TextSearchParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GrepParams {
-    #[schemars(description = "Regex pattern to search for")]
+    #[schemars(
+        description = "Regex pattern to search for (or, when fuzzy=true, a TokenGrep query)"
+    )]
     pub pattern: String,
+    #[schemars(
+        description = "If true, match `pattern` APPROXIMATELY (liblevenshtein TokenGrep) across \
+                       indexed file_chunks instead of exact regex — finds typo'd / near-miss \
+                       identifiers. Strongly recommend setting `project` to bound the scan. \
+                       Default false."
+    )]
+    pub fuzzy: Option<bool>,
+    #[schemars(description = "Max edit distance per token when fuzzy=true (default 2).")]
+    pub fuzzy_max_distance: Option<u32>,
     #[schemars(description = "Glob pattern to filter files (e.g. '*.rs')")]
     pub glob: Option<String>,
     #[schemars(description = "Maximum number of results (default: 10)")]
@@ -2743,6 +2754,590 @@ pub struct ExperimentRenderLedgerParams {
     pub dry_run: Option<bool>,
 }
 
+// ── Work-item / plan tracker subsystem ──────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemCreateParams {
+    #[schemars(
+        description = "Item kind: plan | goal | epic | task | sub_task | todo | fixme | idea | note | question | nice_to_have | action_item | experiment"
+    )]
+    pub kind: String,
+    #[schemars(description = "Short, human-legible title (also the public_id slug stem)")]
+    pub title: String,
+    #[schemars(description = "Optional longer description / body")]
+    pub body: Option<String>,
+    #[schemars(description = "public_id of the parent item (omit for a root)")]
+    pub parent_public_id: Option<String>,
+    #[schemars(description = "Project name to scope the item to (omit for workspace-global)")]
+    pub project: Option<String>,
+    #[schemars(description = "Priority; higher sorts first (default 0)")]
+    pub priority: Option<i32>,
+    #[schemars(description = "Roll-up weight (default 1.0)")]
+    pub weight: Option<f32>,
+    #[schemars(description = "Whether this item is a parametric (corpus-expanded) template")]
+    pub parametric: Option<bool>,
+    #[schemars(description = "Corpus glob/spec for a parametric item")]
+    pub parametric_corpus: Option<String>,
+    #[schemars(description = "Explicit stable public_id (default: generated from the title slug)")]
+    pub public_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemGetParams {
+    #[schemars(description = "The item's stable public_id")]
+    pub public_id: String,
+    #[schemars(description = "Also return the full descendant subtree (default false)")]
+    pub include_subtree: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemUpdateParams {
+    #[schemars(description = "The item's stable public_id")]
+    pub public_id: String,
+    #[schemars(description = "New title (omit to keep)")]
+    pub title: Option<String>,
+    #[schemars(description = "New body (omit to keep)")]
+    pub body: Option<String>,
+    #[schemars(description = "New priority (omit to keep)")]
+    pub priority: Option<i32>,
+    #[schemars(description = "New roll-up weight (omit to keep)")]
+    pub weight: Option<f32>,
+    #[schemars(
+        description = "Due date as an RFC3339 timestamp (set); empty string or 'none'/'clear' clears it; omit to keep."
+    )]
+    pub due_at: Option<String>,
+    #[schemars(
+        description = "Snooze until an RFC3339 timestamp (hides the item from default lists until then); empty/'none' clears; omit to keep."
+    )]
+    pub snooze_until: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemListParams {
+    #[schemars(description = "Filter by project name")]
+    pub project: Option<String>,
+    #[schemars(description = "Filter by kind")]
+    pub kind: Option<String>,
+    #[schemars(description = "Filter by status")]
+    pub status: Option<String>,
+    #[schemars(description = "Filter by parent public_id (direct children of that item)")]
+    pub parent_public_id: Option<String>,
+    #[schemars(
+        description = "When true, return only overdue items (due_at in the past, not done/cancelled/deferred)."
+    )]
+    pub overdue: Option<bool>,
+    #[schemars(
+        description = "When true, include currently-snoozed items (snooze_until in the future). Default false hides them."
+    )]
+    pub include_snoozed: Option<bool>,
+    #[schemars(description = "Max rows (default 50, clamped 1..=1000)")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemTreeParams {
+    #[schemars(description = "public_id of the subtree root")]
+    pub public_id: String,
+    #[schemars(description = "Max rows to return (default 10000, clamped 1..=100000)")]
+    pub max_rows: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemReparentParams {
+    #[schemars(description = "public_id of the item to move")]
+    pub public_id: String,
+    #[schemars(
+        description = "public_id of the new parent (omit / null to make the item a root). Rejected if it is the item itself or one of its descendants (cycle)."
+    )]
+    pub new_parent_public_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemSetStatusParams {
+    #[schemars(description = "The item's stable public_id")]
+    pub public_id: String,
+    #[schemars(
+        description = "Target status: pending | ready | in_progress | blocked | claimed_done | verifying | cancelled. (verified/deferred/rejected are NOT agent-reachable.)"
+    )]
+    pub status: String,
+    #[schemars(description = "Optional human-readable reason recorded in the status history")]
+    pub reason: Option<String>,
+}
+
+// ── Phase 2: tags + progress ────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TagCreateParams {
+    #[schemars(
+        description = "Human-legible tag name (also the slug stem; the slug is the stable key)"
+    )]
+    pub name: String,
+    #[schemars(description = "Optional longer description of what the tag means")]
+    pub description: Option<String>,
+    #[schemars(description = "Optional display color (free-form, e.g. 'red' or '#cc0000')")]
+    pub color: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TagListParams {
+    #[schemars(
+        description = "Also include merged (tombstoned) tags (default false = active only)"
+    )]
+    pub include_merged: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TagMergeParams {
+    #[schemars(
+        description = "Source tag (slug or label) — its assignments are repointed, then it is tombstoned"
+    )]
+    pub src: String,
+    #[schemars(
+        description = "Destination tag (slug or label) that absorbs the source's assignments"
+    )]
+    pub dst: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TagRenameParams {
+    #[schemars(
+        description = "The tag's stable slug (or original label; it is slugified for lookup). The slug itself is preserved so references survive."
+    )]
+    pub slug: String,
+    #[schemars(description = "The new human-legible name")]
+    pub new_name: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemTagParams {
+    #[schemars(description = "The item's stable public_id")]
+    pub public_id: String,
+    #[schemars(description = "Tag names/slugs to attach (each is slugified)")]
+    pub tags: Vec<String>,
+    #[schemars(
+        description = "Create unknown tags on demand (default true). When false, unknown tags are reported under 'skipped'."
+    )]
+    pub auto_create: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemUntagParams {
+    #[schemars(description = "The item's stable public_id")]
+    pub public_id: String,
+    #[schemars(description = "Tag name/slug to detach (slugified for lookup)")]
+    pub tag: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemRecordProgressParams {
+    #[schemars(description = "The item's stable public_id")]
+    pub public_id: String,
+    #[schemars(description = "Free-text progress note (required, non-empty)")]
+    pub note: String,
+    #[schemars(
+        description = "Optional self-reported overall percent (0..=100); updates the item's claimed_percent. NOT trusted for the verified roll-up."
+    )]
+    pub percent: Option<i32>,
+    #[schemars(
+        description = "Optional agent identity attributed to this progress note (defaults to the calling client's name). Recorded as the progress row's actor_id so the activity feed can attribute it; provenance stays 'agent_write' (NOT trusted for the verified roll-up)."
+    )]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemProgressLogParams {
+    #[schemars(description = "The item's stable public_id")]
+    pub public_id: String,
+    #[schemars(description = "Max notes to return, newest first (default 50, clamped 1..=500)")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemCompletionParams {
+    #[schemars(description = "The root item's stable public_id; rolls up its whole subtree")]
+    pub public_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemReprioritizeParams {
+    #[schemars(description = "Restrict to a project by name (omit = workspace-wide)")]
+    pub project: Option<String>,
+    #[schemars(description = "Recency half-life in days for the score (default 14)")]
+    pub half_life_days: Option<f64>,
+    #[schemars(
+        description = "How many top items in the now/next/later plan (default 30, max 500)"
+    )]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemSearchParams {
+    #[schemars(
+        description = "Natural-language query; matched semantically against item title+body"
+    )]
+    pub query: String,
+    #[schemars(description = "Restrict to a project by name (omit = workspace-wide)")]
+    pub project: Option<String>,
+    #[schemars(description = "Max hits (default 10, max 100)")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PlanRuleInput {
+    #[schemars(
+        description = "Rule kind: required_kind | allowed_child_kind | required_child_kind | min_children | max_children | required_field | required_acceptance_criterion | quantifier_requires_corpus | naming_rule | id_rule | max_depth_advice"
+    )]
+    pub rule_kind: String,
+    #[schemars(description = "Item kind the rule constrains (omit = whole plan)")]
+    pub applies_to_kind: Option<String>,
+    #[schemars(
+        description = "Child kind for allowed/required_child_kind (comma-separated whitelist allowed)"
+    )]
+    pub child_kind: Option<String>,
+    #[schemars(description = "Min children (min_children)")]
+    pub min_count: Option<i32>,
+    #[schemars(description = "Max children (max_children) or max depth (max_depth_advice)")]
+    pub max_count: Option<i32>,
+    #[schemars(description = "Field for required_field: body | due_at | title")]
+    pub field_name: Option<String>,
+    #[schemars(description = "Regex for naming_rule / id_rule")]
+    pub pattern: Option<String>,
+    #[schemars(description = "Severity: error | warn | info (default error)")]
+    pub severity: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PlanDefineParams {
+    #[schemars(description = "Definition title (required)")]
+    pub title: String,
+    #[schemars(description = "Stable slug (defaults to slugified title)")]
+    pub slug: Option<String>,
+    #[schemars(
+        description = "Version (default 1); re-defining a (slug,version) replaces its rules"
+    )]
+    pub version: Option<i32>,
+    #[schemars(description = "Description")]
+    pub description: Option<String>,
+    #[schemars(description = "Slug of a definition this one extends (inheritance)")]
+    pub extends_slug: Option<String>,
+    #[schemars(description = "Status: draft | active | deprecated (default active)")]
+    pub status: Option<String>,
+    #[schemars(description = "The dictated structural rules")]
+    pub rules: Vec<PlanRuleInput>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PlanValidateParams {
+    #[schemars(description = "Root item public_id of the plan instance to validate")]
+    pub root_public_id: String,
+    #[schemars(description = "Definition slug to validate against")]
+    pub definition_slug: String,
+    #[schemars(description = "Definition version (omit = latest)")]
+    pub definition_version: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PlanDefinitionExportParams {
+    #[schemars(description = "Definition slug to export")]
+    pub slug: String,
+    #[schemars(description = "Definition version (omit = latest)")]
+    pub version: Option<i32>,
+    #[schemars(
+        description = "Optional file path to also write the TOML to (parent dirs created). The TOML string is always returned regardless."
+    )]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PlanDefinitionImportParams {
+    #[schemars(
+        description = "Inline serene-eclipse-shaped TOML ([definition] + optional [scope] + [[rule]]). Provide this OR path."
+    )]
+    pub toml: Option<String>,
+    #[schemars(description = "Path to a TOML file to read. Provide this OR toml.")]
+    pub path: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemAddCriterionParams {
+    #[schemars(description = "The item's public_id")]
+    pub public_id: String,
+    #[schemars(
+        description = "Criterion kind: test | build | lint | proof | model_check | smt | script | auditor_verdict | manual_user_signoff | experiment_verdict"
+    )]
+    pub criterion_kind: String,
+    #[schemars(description = "Human description of what must hold")]
+    pub description: String,
+    #[schemars(
+        description = "Acceptance URI, e.g. cargo://path::test | lean://f.lean::thm | shell://script.sh | auditor://gamma | experiment://slug"
+    )]
+    pub acceptance_uri: Option<String>,
+    #[schemars(description = "Required exit code for shell/cargo/build criteria (default 0)")]
+    pub expect_exit: Option<i32>,
+    #[schemars(
+        description = "Coverage mode: single | universal (universal must cover the full corpus)"
+    )]
+    pub coverage_mode: Option<String>,
+    #[schemars(
+        description = "Deferred Stop-hook gate owner: alpha_antistub | beta_verify | gamma_audit | formal (omit normally)"
+    )]
+    pub gate: Option<String>,
+    #[schemars(description = "Whether this criterion is required for verification (default true)")]
+    pub required: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemRecordEvidenceParams {
+    #[schemars(description = "The acceptance_criteria id this evidence is for")]
+    pub criterion_id: i64,
+    #[schemars(description = "Verdict: pass | fail | unknown | error")]
+    pub verdict: String,
+    #[schemars(description = "Exit code (for command/test criteria)")]
+    pub exit_code: Option<i32>,
+    #[schemars(description = "For universal criteria: how many corpus cases passed")]
+    pub coverage_count: Option<i32>,
+    #[schemars(description = "For universal criteria: corpus size at check time")]
+    pub coverage_total: Option<i32>,
+    #[schemars(description = "Repo HEAD sha at verification")]
+    pub commit_sha: Option<String>,
+    #[schemars(description = "Structured verdict detail as a JSON string (default {})")]
+    pub detail_json: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemAttemptVerifyParams {
+    #[schemars(description = "The item's public_id; tries the gatekeeper →verified transition")]
+    pub public_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemDeferParams {
+    #[schemars(description = "The item's public_id to defer (skip)")]
+    pub public_id: String,
+    #[schemars(
+        description = "Why it is being deferred (required; recorded in the append-only audit)"
+    )]
+    pub reason: String,
+    #[schemars(
+        description = "The tracker user_token (user-authority gate; agents do not have it)"
+    )]
+    pub user_token: String,
+    #[schemars(description = "Who granted the deferral (default 'user')")]
+    pub granted_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemReinstateParams {
+    #[schemars(description = "The item's public_id to reinstate (deferred → in_progress)")]
+    pub public_id: String,
+    #[schemars(description = "Why it is being reinstated (required)")]
+    pub reason: String,
+    #[schemars(description = "The tracker user_token (user-authority gate)")]
+    pub user_token: String,
+    #[schemars(description = "Who granted the reinstatement (default 'user')")]
+    pub granted_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemIngestPlanParams {
+    #[schemars(
+        description = "The plan as markdown (headings → plan/epic/task/sub_task; checklists → todos; numbered → sub_tasks; 'acceptance:' lines → criteria). Idempotent on re-ingest."
+    )]
+    pub plan_markdown: String,
+    #[schemars(description = "Project name to scope the items to (omit = workspace-wide)")]
+    pub project: Option<String>,
+    #[schemars(
+        description = "Optional plan definition slug to validate the ingested tree against"
+    )]
+    pub definition_slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemPromoteMarkerParams {
+    #[schemars(
+        description = "The marker text (e.g. the TODO/FIXME comment) to promote into a tracked item"
+    )]
+    pub marker_text: String,
+    #[schemars(description = "Source file path the marker came from")]
+    pub file: Option<String>,
+    #[schemars(description = "Line number of the marker")]
+    pub line: Option<i64>,
+    #[schemars(description = "Item kind (default: inferred fixme/todo from the marker word)")]
+    pub kind: Option<String>,
+    #[schemars(description = "Project name to scope to")]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemClaimParams {
+    #[schemars(description = "The item's public_id to claim")]
+    pub public_id: String,
+    #[schemars(
+        description = "Lease seconds before the claim auto-expires (default 300; 10..=86400)"
+    )]
+    pub lease_secs: Option<i64>,
+    #[schemars(description = "Claiming agent id (auto-filled from the MCP client name)")]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemClaimNextParams {
+    #[schemars(
+        description = "Restrict to the subtree under this plan public_id (omit = workspace-wide)"
+    )]
+    pub plan_public_id: Option<String>,
+    #[schemars(description = "Lease seconds (default 300)")]
+    pub lease_secs: Option<i64>,
+    #[schemars(description = "Claiming agent id (auto-filled)")]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemReleaseParams {
+    #[schemars(description = "The item's public_id to release")]
+    pub public_id: String,
+    #[schemars(description = "Releasing agent id (auto-filled); must be the current owner")]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemHandoffParams {
+    #[schemars(description = "The item's public_id to hand off")]
+    pub public_id: String,
+    #[schemars(description = "The agent id to hand the claim to")]
+    pub to_agent: String,
+    #[schemars(description = "Lease seconds for the new owner (default 300)")]
+    pub lease_secs: Option<i64>,
+    #[schemars(description = "Current owner agent id (auto-filled); must be the current owner")]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AgentHeartbeatParams {
+    #[schemars(description = "Agent id (auto-filled from the MCP client name)")]
+    pub agent_id: Option<String>,
+    #[schemars(description = "Optionally set the agent's current item public_id")]
+    pub current_work_item_public_id: Option<String>,
+    #[schemars(description = "Lease seconds to renew the agent's claims to (default 300)")]
+    pub lease_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemWhoOwnsParams {
+    #[schemars(description = "The item's public_id")]
+    pub public_id: String,
+    #[schemars(description = "Max claim-history events (default 20)")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AgentActivityParams {
+    #[schemars(
+        description = "Agent id to inspect; omit for the active-agent roster ('who is working')"
+    )]
+    pub agent_id: Option<String>,
+    #[schemars(description = "Roster window in seconds (default 600)")]
+    pub active_within_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemActivityParams {
+    #[schemars(
+        description = "Restrict to a plan subtree by its root public_id (omit = workspace-wide)"
+    )]
+    pub plan_public_id: Option<String>,
+    #[schemars(description = "Only events after this RFC3339 timestamp")]
+    pub since: Option<String>,
+    #[schemars(description = "Max events (default 50, max 500)")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemLinkParams {
+    #[schemars(description = "The source item's public_id (the 'from' end)")]
+    pub from_public_id: String,
+    #[schemars(description = "The target item's public_id (the 'to' end)")]
+    pub to_public_id: String,
+    #[schemars(
+        description = "Relation type: blocks | depends_on | relates_to | duplicates | supersedes | derived_from. The ordering relations (depends_on/blocks) are rejected if they would create a dependency cycle."
+    )]
+    pub relation_type: String,
+    #[schemars(description = "Optional free-text author attribution for the relation")]
+    pub created_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemUnlinkParams {
+    #[schemars(description = "The source item's public_id")]
+    pub from_public_id: String,
+    #[schemars(description = "The target item's public_id")]
+    pub to_public_id: String,
+    #[schemars(description = "Relation type to remove (must match the linked type exactly)")]
+    pub relation_type: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemCyclesParams {
+    #[schemars(
+        description = "Restrict the cycle search to one plan's subtree by its root public_id (only edges with both endpoints in the subtree). Omit for the whole-workspace schedule graph (depends_on + blocks)."
+    )]
+    pub plan_public_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemAnchorCodeParams {
+    #[schemars(description = "The item's public_id to anchor")]
+    pub public_id: String,
+    #[schemars(
+        description = "A file path (project-relative or suffix) to resolve to an indexed file"
+    )]
+    pub file: Option<String>,
+    #[schemars(description = "An explicit file_chunks.id to anchor to")]
+    pub chunk_id: Option<i64>,
+    #[schemars(description = "An explicit file_symbols.id to anchor to (most precise)")]
+    pub symbol_id: Option<i64>,
+    #[schemars(description = "Anchor type label (default inferred: symbol > chunk > file)")]
+    pub anchor_type: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemBurndownParams {
+    #[schemars(description = "Root public_id of the plan to report on")]
+    pub plan_public_id: String,
+    #[schemars(description = "Velocity window in days (default 14, clamped 1..=365)")]
+    pub window_days: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemExportParams {
+    #[schemars(description = "Root public_id of the plan subtree to export")]
+    pub plan_public_id: String,
+    #[schemars(description = "Output format: 'markdown' (default) or 'org'")]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemLinkExperimentParams {
+    #[schemars(description = "The experiment's slug to link/track")]
+    pub experiment_slug: String,
+    #[schemars(
+        description = "Existing work_item public_id to link; omit to auto-create a kind='experiment' tracking task from the experiment's title/question."
+    )]
+    pub work_item_public_id: Option<String>,
+    #[schemars(
+        description = "Optional hypothesis id to scope the verdict criterion to one hypothesis"
+    )]
+    pub hypothesis_id: Option<i64>,
+    #[schemars(
+        description = "Title for the auto-created tracking task (defaults to the experiment's title)"
+    )]
+    pub title: Option<String>,
+    #[schemars(
+        description = "Seed an 'experiment_verdict' acceptance criterion so experiment_decide can auto-verify the task (default true)."
+    )]
+    pub seed_criterion: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct A2aPatternRecursiveParams {
     #[schemars(description = "The long-context question to answer")]
@@ -2829,7 +3424,7 @@ pub struct DocumentedTechDebtParams {
 pub struct TriggerCronParams {
     /// Cron job to run on demand.
     #[schemars(
-        description = "Cron job name: \"symbol-extraction\" | \"call-graph\" | \"function-metrics\". Use symbol-extraction first to populate file_symbols (needed by dead_code_reachability and naming_consistency), then call-graph to populate symbol_references edges, then function-metrics for cyclomatic/cognitive/Halstead/NPath/MI. All three jobs are workspace-wide; per-project scoping happens through the project filter on the underlying queries."
+        description = "Cron job name: \"symbol-extraction\" | \"call-graph\" | \"function-metrics\" | \"fuzzy-sync\" | \"a2a-reflect\" | \"msm-calibrate\". Use symbol-extraction first to populate file_symbols (needed by dead_code_reachability and naming_consistency), then call-graph to populate symbol_references edges, then function-metrics for cyclomatic/cognitive/Halstead/NPath/MI. fuzzy-sync rebuilds the per-project symbol/path/commit/mandate fuzzy tries from PG. Workspace-wide; per-project scoping happens through the project filter on the underlying queries."
     )]
     pub job: String,
 }
@@ -3531,6 +4126,10 @@ pub struct FuzzySymbolSearchParams {
     pub max_distance: Option<u32>,
     #[schemars(description = "Result limit (default 20).")]
     pub limit: Option<u32>,
+    #[schemars(
+        description = "If true, match in phonetic-normalized space (composed phonetic∘edit) instead of raw edit distance. Default false. For a richer phonetic result with kind/visibility, use phonetic_symbol_search."
+    )]
+    pub phonetic: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3587,6 +4186,16 @@ pub struct TimeSeriesEntry {
 pub struct CorrectQueryParams {
     #[schemars(description = "User query to correct.")]
     pub query: String,
+    #[schemars(
+        description = "Project whose persistent symbol vocabulary + n-gram LM drive the correction."
+    )]
+    pub project: String,
+    #[schemars(description = "Max per-token edit distance for candidate generation (default 2).")]
+    pub max_distance: Option<u32>,
+    #[schemars(
+        description = "Language-model interpolation weight 0.0–1.0 (default 0.5; 0 disables LM rescoring)."
+    )]
+    pub lm_weight: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3635,16 +4244,24 @@ pub struct PhoneticGrepCommentsParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PhoneticSymbolSearchParams {
-    #[schemars(description = "Query symbol (phonetic-normalized match).")]
+    #[schemars(description = "Query symbol (composed phonetic∘edit match in normalized space).")]
     pub query: String,
-    #[schemars(description = "Candidate symbol set.")]
-    pub candidates: Vec<String>,
+    #[schemars(description = "Project to search — its persistent symbol trie is consulted.")]
+    pub project: String,
+    #[schemars(description = "Max edit distance in phonetic-normalized space (default 2).")]
+    pub max_distance: Option<u32>,
+    #[schemars(description = "Maximum number of results (default 20).")]
+    pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PhoneticNamingConsistencyParams {
     #[schemars(description = "Identifiers in a directory / class scope to check.")]
     pub identifiers: Vec<String>,
+    #[schemars(
+        description = "Max articulatory distance to flag as phonetically similar (default: [fuzzy].phonetic_merge_threshold)."
+    )]
+    pub max_distance: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3754,7 +4371,9 @@ USE WHEN: searching for a regex across the full indexed codebase or across multi
 projects, especially when the model has no idea which project the match is in. \
 DO NOT USE WHEN: you only need to search within the current cwd or a specific small \
 directory tree — the built-in `Grep` tool is faster and respects .gitignore. \
-Returns file paths, line numbers, and matching snippets across all indexed projects."
+Returns file paths, line numbers, and matching snippets across all indexed projects. \
+Set fuzzy=true to match the pattern APPROXIMATELY (liblevenshtein TokenGrep over indexed \
+chunks) — finds typo'd / near-miss identifiers exact regex would miss; bound the scan with project."
     )]
     async fn grep(
         &self,
@@ -6575,6 +7194,958 @@ without writing. The structured record is the source of truth; the ledger is the
         .await
     }
 
+    // ── Work-item / plan tracker subsystem ──────────────────────────────────
+
+    #[tool(
+        description = "Create a work item (plan/goal/epic/task/sub_task/todo/fixme/idea/note/question/\
+nice_to_have/action_item/experiment), optionally under a parent and scoped to a project. USE WHEN you need to \
+record a tracked unit of work or decompose a plan into a hierarchy. DO NOT USE WHEN you just want a free-form \
+note to yourself outside the tracker. Returns the created row (with its generated public_id)."
+    )]
+    async fn work_item_create(
+        &self,
+        Parameters(params): Parameters<WorkItemCreateParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_create",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_create(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Fetch one work item by its public_id, optionally with its full descendant subtree. USE \
+WHEN you need the current state of a specific item (status, priority, parent, timestamps). DO NOT USE WHEN you \
+want to browse/filter many items — use work_item_list instead. Returns {item, subtree?}."
+    )]
+    async fn work_item_get(
+        &self,
+        Parameters(params): Parameters<WorkItemGetParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_get",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_get(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Update a work item's mutable non-status fields (title, body, priority, weight) by \
+public_id; omitted fields are left unchanged. USE WHEN re-grooming an item. DO NOT USE WHEN you want to change \
+its lifecycle status — use work_item_set_status (status transitions are gated). Returns the updated row."
+    )]
+    async fn work_item_update(
+        &self,
+        Parameters(params): Parameters<WorkItemUpdateParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_update",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_update(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List work items (newest/highest-priority first), filterable by project, kind, status, and \
+parent public_id. USE WHEN browsing or triaging the backlog. DO NOT USE WHEN you already know the exact \
+public_id — use work_item_get. Returns an array of rows."
+    )]
+    async fn work_item_list(
+        &self,
+        Parameters(params): Parameters<WorkItemListParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_list",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_list(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Return a work item and its entire descendant subtree (depth-ordered) by public_id. USE \
+WHEN you need the materialized hierarchy under a plan/epic for roll-up or rendering. DO NOT USE WHEN you only \
+need the single item — use work_item_get. Returns an array of rows ordered by depth then priority."
+    )]
+    async fn work_item_tree(
+        &self,
+        Parameters(params): Parameters<WorkItemTreeParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_tree",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_tree(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Move a work item (and its subtree) under a new parent by public_id, or to the root \
+(omit new_parent_public_id). USE WHEN re-organizing the hierarchy. DO NOT USE WHEN the target parent is the item \
+itself or one of its own descendants — that is rejected to prevent a cycle. Returns the updated row."
+    )]
+    async fn work_item_reparent(
+        &self,
+        Parameters(params): Parameters<WorkItemReparentParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_reparent",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_reparent(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Transition a work item's lifecycle status by public_id, AS THE AGENT. USE WHEN advancing \
+your own work (ready, in_progress, blocked, claimed_done, verifying, cancelled). DO NOT USE to mark work \
+verified/deferred/rejected — the agent actor cannot reach those states (they require user negotiation or \
+gatekeeper evidence); such a request is refused with an explanatory error. Returns the updated row."
+    )]
+    async fn work_item_set_status(
+        &self,
+        Parameters(params): Parameters<WorkItemSetStatusParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_set_status",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_set_status(self.ctx(), params),
+        )
+        .await
+    }
+
+    // ── Phase 2: tags + progress ────────────────────────────────────────────
+
+    #[tool(
+        description = "Create (or upsert) a shared tag in the catalog, addressed by a stable slug derived \
+from the name. USE WHEN you want a reusable label to attach across many work items (e.g. 'urgent', 'tech-debt'). \
+DO NOT USE WHEN you just want to attach an existing tag to one item — use work_item_tag. Re-running with the \
+same name updates the color/description without clobbering existing values. Returns the tag row."
+    )]
+    async fn tag_create(
+        &self,
+        Parameters(params): Parameters<TagCreateParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "tag_create",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_tag_create(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List tags in the catalog, ordered by name. USE WHEN browsing the available labels or \
+building a tag picker. DO NOT USE WHEN you want the tags ON a specific item — fetch the item (work_item_tag \
+returns its current tags). By default returns active tags only; pass include_merged=true to also see \
+tombstoned (merged) tags. Returns an array of tag rows."
+    )]
+    async fn tag_list(
+        &self,
+        Parameters(params): Parameters<TagListParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "tag_list",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_tag_list(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Merge one tag into another: repoint every item tagged with src so it is tagged with \
+dst instead, then tombstone src (its slug still resolves to dst). USE WHEN consolidating duplicate/synonym \
+tags. DO NOT USE WHEN you merely want to rename a tag — use tag_rename (which keeps the slug stable). src/dst \
+may be slugs or labels. Returns {merged: <count>, into: <dst_slug>}; an unknown tag is an invalid_params error."
+    )]
+    async fn tag_merge(
+        &self,
+        Parameters(params): Parameters<TagMergeParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "tag_merge",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_tag_merge(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Rename a tag in place by slug; the slug is intentionally preserved so existing \
+references survive. USE WHEN fixing a label's display name. DO NOT USE WHEN you want to fold two tags together \
+— use tag_merge. The lookup key is slugified, so you may pass either the slug or the original label. Returns \
+the updated tag row; a missing tag is an invalid_params error."
+    )]
+    async fn tag_rename(
+        &self,
+        Parameters(params): Parameters<TagRenameParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "tag_rename",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_tag_rename(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Attach one or more tags to a work item (by public_id), auto-creating unknown tags by \
+default. USE WHEN labeling an item for triage/filtering. DO NOT USE WHEN you want to define a tag's \
+metadata (color/description) — use tag_create. With auto_create=false, unknown tags are returned under \
+'skipped' instead of being created. Returns {item, applied:[slugs], skipped:[names], tags:[current tags]}."
+    )]
+    async fn work_item_tag(
+        &self,
+        Parameters(params): Parameters<WorkItemTagParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_tag",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_tag(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Detach a single tag from a work item (by public_id). USE WHEN a label no longer \
+applies. DO NOT USE WHEN you want to delete the tag globally — untag only removes the item↔tag pairing, the \
+catalog tag remains. The tag is slugified for lookup; an unknown tag is an invalid_params error. Returns \
+{removed: <bool>} (false if the pairing did not exist)."
+    )]
+    async fn work_item_untag(
+        &self,
+        Parameters(params): Parameters<WorkItemUntagParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_untag",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_untag(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Append a progress note to a work item (by public_id), optionally with a self-reported \
+percent that updates the item's claimed_percent. USE WHEN recording incremental progress / an activity-feed \
+entry as you work. DO NOT USE to change the item's lifecycle status — use work_item_set_status. The note is \
+recorded as provenance='agent_write' (the agent's claim, NOT trusted for the verified roll-up). Returns the \
+new progress row."
+    )]
+    async fn work_item_record_progress(
+        &self,
+        Parameters(mut params): Parameters<WorkItemRecordProgressParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.agent_id.is_none() {
+            params.agent_id = Some(extract_caller(&_ctx).client_name);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_record_progress",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_record_progress(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Read a work item's progress log, newest first (by public_id). USE WHEN reviewing the \
+activity history / how an item progressed over time. DO NOT USE WHEN you only need the current status or \
+claimed_percent — use work_item_get. Returns an array of progress rows (note, percent, provenance, timestamps)."
+    )]
+    async fn work_item_progress_log(
+        &self,
+        Parameters(params): Parameters<WorkItemProgressLogParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_progress_log",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_progress_log(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Weighted completion roll-up of a work item's subtree. USE WHEN you need overall \
+progress of a plan/epic/goal. Returns BOTH verified_* (trustworthy: only evidence-verified leaves count) and \
+claimed_* (advisory: also counts agent-reported claimed_done). DO NOT treat claimed_* as actually done."
+    )]
+    async fn work_item_completion(
+        &self,
+        Parameters(params): Parameters<WorkItemCompletionParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_completion",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_completion(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Recompute computed_score for active items (recency × manual priority × \
+dependency-unblock) and return a now/next/later work plan of the top items. USE WHEN deciding what to work \
+on next across a backlog. DO NOT USE WHEN you just want a filtered list — use work_item_list."
+    )]
+    async fn work_item_reprioritize(
+        &self,
+        Parameters(params): Parameters<WorkItemReprioritizeParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_reprioritize",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_reprioritize(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Semantic search over the work-item backlog by meaning (cosine over BGE-M3 \
+embeddings). USE WHEN finding items related to a concept/topic across the tracker. DO NOT USE WHEN you have \
+an exact public_id (use work_item_get) or want a structured filter (use work_item_list)."
+    )]
+    async fn work_item_search(
+        &self,
+        Parameters(params): Parameters<WorkItemSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_search",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_search(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Define a reusable plan template + its dictated structural rules (required kinds, \
+allowed/required child kinds, min/max children, required fields, required acceptance criteria, \
+quantifier-needs-corpus, naming/id regex, max-depth advice). Plan instances are checked against it with \
+plan_validate. Re-defining a (slug, version) replaces its rule set."
+    )]
+    async fn plan_define(
+        &self,
+        Parameters(params): Parameters<PlanDefineParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "plan_define",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_plan_define(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Validate a plan instance (the subtree under root_public_id) against a plan definition's \
+rules; returns a severity-sorted violations report (advisory — reports, does not block). USE WHEN checking a \
+plan conforms to a template. DO NOT confuse with verification — that gates on evidence, not structure."
+    )]
+    async fn plan_validate(
+        &self,
+        Parameters(params): Parameters<PlanValidateParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "plan_validate",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_plan_validate(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Export a stored plan definition (metadata + [scope] passthrough + rules) to \
+serene-eclipse-shaped TOML. Always returns the TOML string; if 'path' is given, also writes the file. USE \
+WHEN producing a portable/inspectable .claude/tasks/<slug>.toml artifact. DB stays the source of truth."
+    )]
+    async fn plan_definition_export(
+        &self,
+        Parameters(params): Parameters<PlanDefinitionExportParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "plan_definition_export",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_plan_definition_export(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Import a serene-eclipse-shaped TOML definition ([definition] + optional [scope] + \
+[[rule]]) into the tracker — inline via 'toml' or from a file via 'path'. Idempotent on (slug, version); \
+replaces the rule set and stores the raw TOML in body_toml. USE WHEN loading a shared/edited plan template."
+    )]
+    async fn plan_definition_import(
+        &self,
+        Parameters(params): Parameters<PlanDefinitionImportParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "plan_definition_import",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_plan_definition_import(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Attach a machine-checkable acceptance criterion to an item (its definition-of-done). \
+USE WHEN specifying what must pass for a task to be verifiable. Pair with record_evidence + attempt_verify."
+    )]
+    async fn work_item_add_criterion(
+        &self,
+        Parameters(params): Parameters<WorkItemAddCriterionParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_add_criterion",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_add_criterion(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Record evidence for an acceptance criterion. NOTE: MCP-recorded evidence is \
+source='manual' and CANNOT satisfy the verified gate (agents cannot self-verify) — trusted evidence comes \
+from CI / the Stop-hook (REST) or the experiment engine."
+    )]
+    async fn work_item_record_evidence(
+        &self,
+        Parameters(params): Parameters<WorkItemRecordEvidenceParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_record_evidence",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_record_evidence(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Attempt the gatekeeper →verified transition for an item; succeeds only when every \
+required criterion has passing, trusted-source evidence, else returns the explanatory refusal. The item must \
+be in claimed_done or verifying."
+    )]
+    async fn work_item_attempt_verify(
+        &self,
+        Parameters(params): Parameters<WorkItemAttemptVerifyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_attempt_verify",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_attempt_verify(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "USER-only: defer (explicitly skip) an item so it is excluded from completion \
+roll-up. Requires the tracker user_token — an agent CANNOT self-defer (no token; →deferred has no agent arm \
+in the transition matrix). Records an append-only scope-negotiation."
+    )]
+    async fn work_item_defer(
+        &self,
+        Parameters(params): Parameters<WorkItemDeferParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_defer",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_defer(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "USER-only: reinstate a deferred item (deferred → in_progress). Requires the tracker \
+user_token."
+    )]
+    async fn work_item_reinstate(
+        &self,
+        Parameters(params): Parameters<WorkItemReinstateParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_reinstate",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_reinstate(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Auto-translate an agent's markdown plan into a tracked work_items subtree \
+(headings→plan/epic/task/sub_task, checklists→todos, numbered→sub_tasks, 'acceptance:' lines→criteria). \
+Idempotent on re-ingest — preserves status/progress. Optionally validates against a plan definition."
+    )]
+    async fn work_item_ingest_plan(
+        &self,
+        Parameters(params): Parameters<WorkItemIngestPlanParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_ingest_plan",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_ingest_plan(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Promote a discovered code marker (TODO/FIXME/HACK/…) into a tracked work item \
+(fixme/todo). Idempotent on the marker text+location. USE WHEN turning documented_tech_debt findings into \
+trackable items."
+    )]
+    async fn work_item_promote_marker(
+        &self,
+        Parameters(params): Parameters<WorkItemPromoteMarkerParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_promote_marker",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_promote_marker(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Atomically claim a work item to work on it (open→in_progress). USE WHEN starting work \
+on a shared plan so other agents see it's taken. Returns claimed:false (with the current owner) if another \
+agent holds it, it's blocked by a dependency, or it's terminal. Leases auto-expire (crash-safe)."
+    )]
+    async fn work_item_claim(
+        &self,
+        Parameters(mut params): Parameters<WorkItemClaimParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.agent_id.is_none() {
+            params.agent_id = Some(extract_caller(&_ctx).client_name);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_claim",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_claim(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Claim the next available (unclaimed, unblocked, ready) item, top by priority/score — \
+optionally within a plan subtree. The fan-out execution primitive: N agents each get a distinct item. \
+Returns claimed:false when the queue is empty."
+    )]
+    async fn work_item_claim_next(
+        &self,
+        Parameters(mut params): Parameters<WorkItemClaimNextParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.agent_id.is_none() {
+            params.agent_id = Some(extract_caller(&_ctx).client_name);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_claim_next",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_claim_next(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Release your claim on an item (owner-gated). USE WHEN you stop working on a claimed \
+item so another agent can pick it up."
+    )]
+    async fn work_item_release(
+        &self,
+        Parameters(mut params): Parameters<WorkItemReleaseParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.agent_id.is_none() {
+            params.agent_id = Some(extract_caller(&_ctx).client_name);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_release",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_release(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Hand off your claim on an item to another agent (owner-gated re-key). USE WHEN \
+delegating a claimed item to a peer agent."
+    )]
+    async fn work_item_handoff(
+        &self,
+        Parameters(mut params): Parameters<WorkItemHandoffParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.agent_id.is_none() {
+            params.agent_id = Some(extract_caller(&_ctx).client_name);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_handoff",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_handoff(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Heartbeat: mark this agent active and renew the leases on all items it holds (one \
+call). USE WHEN working a long-running claimed item so the lease doesn't expire and let another agent steal it."
+    )]
+    async fn agent_heartbeat(
+        &self,
+        Parameters(mut params): Parameters<AgentHeartbeatParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.agent_id.is_none() {
+            params.agent_id = Some(extract_caller(&_ctx).client_name);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "agent_heartbeat",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_agent_heartbeat(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Who currently owns a work item + its claim/handoff history. USE WHEN checking whether \
+an item is being worked and by whom before claiming it."
+    )]
+    async fn work_item_who_owns(
+        &self,
+        Parameters(params): Parameters<WorkItemWhoOwnsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_who_owns",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_who_owns(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "What an agent is doing (its presence + currently-claimed items + workload), or — with \
+no agent_id — the active-agent roster ('who is working'). USE WHEN coordinating multiple agents."
+    )]
+    async fn agent_activity(
+        &self,
+        Parameters(params): Parameters<AgentActivityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "agent_activity",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_agent_activity(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "The workspace (or plan-scoped) activity feed: recent progress + claim/handoff events, \
+newest first, agent-attributed. USE WHEN reviewing 'what is happening' across the tracker or on a plan."
+    )]
+    async fn work_item_activity(
+        &self,
+        Parameters(params): Parameters<WorkItemActivityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_activity",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_activity(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Link two work items with a typed relation (blocks | depends_on | relates_to | \
+duplicates | supersedes | derived_from). The ordering relations (depends_on/blocks) are REJECTED if they \
+would create a dependency cycle (an unschedulable loop). USE WHEN recording that one item blocks/depends-on \
+another, duplicates it, or supersedes it."
+    )]
+    async fn work_item_link(
+        &self,
+        Parameters(mut params): Parameters<WorkItemLinkParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.created_by.is_none() {
+            params.created_by = Some(extract_caller(&_ctx).client_name);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_link",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_link(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Remove a typed relation between two work items. Returns {removed: bool}. USE WHEN a \
+dependency/blocks/duplicates link no longer holds."
+    )]
+    async fn work_item_unlink(
+        &self,
+        Parameters(params): Parameters<WorkItemUnlinkParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_unlink",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_unlink(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Report dependency cycles in the schedule graph (depends_on + blocks). Each cycle is a \
+strongly-connected component of size > 1; an empty report (is_dag=true) means the schedule is a valid DAG. \
+USE WHEN diagnosing why items are stuck or after a bulk import that bypassed the per-edge cycle guard."
+    )]
+    async fn work_item_cycles(
+        &self,
+        Parameters(params): Parameters<WorkItemCyclesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_cycles",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_cycles(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Anchor a work item to a code location (a file path and/or an explicit chunk_id/symbol_id; \
+at least one must resolve). USE WHEN tying a task/clause to the precise code it concerns — feeds the auditor \
+and change-impact surfaces."
+    )]
+    async fn work_item_anchor_code(
+        &self,
+        Parameters(params): Parameters<WorkItemAnchorCodeParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_anchor_code",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_anchor_code(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Burndown/velocity for a plan: verified-vs-remaining counts, realized velocity \
+(items verified/day over the window), and a naive ETA. USE WHEN reporting plan progress or estimating \
+completion. Reads the append-only status history — reflects evidence-verified completion, not agent claims."
+    )]
+    async fn work_item_burndown(
+        &self,
+        Parameters(params): Parameters<WorkItemBurndownParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_burndown",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_burndown(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Export a plan subtree as a markdown task list or an Org-mode outline (status → \
+checkbox/keyword). USE WHEN sharing or archiving a plan as a portable document. Returns the rendered text."
+    )]
+    async fn work_item_export(
+        &self,
+        Parameters(params): Parameters<WorkItemExportParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_export",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_export(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Link a scientific experiment to the tracker as a kind='experiment' task (auto-created \
+if no work_item_public_id is given) and seed an 'experiment_verdict' criterion. The experiment then gains \
+priority/tags/progress/roll-up/claiming, and experiment_decide posts its statistical verdict as trusted \
+evidence that auto-verifies the task. USE WHEN you want an experiment tracked + verified like any other task."
+    )]
+    async fn work_item_link_experiment(
+        &self,
+        Parameters(params): Parameters<WorkItemLinkExperimentParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_link_experiment",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::work_items::tool_work_item_link_experiment(self.ctx(), params),
+        )
+        .await
+    }
+
     #[tool(
         description = "Recursive Language Model decomposition (Part B): treat a corpus/file as an external \
 environment, decompose into snippets, recursively sub-call a peer LM over each (small context), and stitch \
@@ -8427,7 +9998,9 @@ review. Pure code analysis — no DB access."
         .await
     }
 
-    #[tool(description = "Correct a user query via llammer-pipeline's lattice correction.")]
+    #[tool(
+        description = "Correct a user query against a project's persistent symbol vocabulary using pgmcp's WFST corrector: per-token Damerau-Levenshtein candidates from the symbol trie, an edit+phonetic-cost correction lattice, and (when a trained per-project model exists) Modified-Kneser-Ney LM rescoring. Returns corrected text, changed flag, confidence, and used_lm. Params: query, project, max_distance (default 2), lm_weight (default 0.5)."
+    )]
     async fn correct_query(
         &self,
         Parameters(params): Parameters<CorrectQueryParams>,
@@ -8462,7 +10035,7 @@ review. Pure code analysis — no DB access."
     }
 
     #[tool(
-        description = "Fuzzy grep: SuffixAutomaton substring containment + Damerau-Levenshtein verification."
+        description = "Positional fuzzy grep over a caller-supplied haystack via liblevenshtein TokenGrep: matches the query approximately at every position (byte spans + edit distance), not as whole-line dictionary terms. For approximate search across the INDEXED codebase, use `grep` with fuzzy=true."
     )]
     async fn fuzzy_grep(
         &self,
@@ -8497,7 +10070,9 @@ review. Pure code analysis — no DB access."
         .await
     }
 
-    #[tool(description = "Phonetic symbol search via PhoneticNormalizedDictionary.")]
+    #[tool(
+        description = "Composed phonetic∘edit symbol search over a project's persistent symbol trie (liblevenshtein PhoneticNormalizedDictionary): normalizes query+terms with the active phonetic rules, matches within max_distance in normalized space, returns symbols with kind/visibility/file_id/line ranked by edit then articulatory distance. Params: query, project, max_distance (default 2), limit (default 20)."
+    )]
     async fn phonetic_symbol_search(
         &self,
         Parameters(params): Parameters<PhoneticSymbolSearchParams>,
@@ -9070,6 +10645,52 @@ impl McpServer {
                 "experiment_timeline"           => experiment_timeline(ExperimentTimelineParams) in tool_experiments,
                 "experiment_log_artifact"       => experiment_log_artifact(ExperimentLogArtifactParams) in tool_experiments,
                 "experiment_render_ledger"      => experiment_render_ledger(ExperimentRenderLedgerParams) in tool_experiments,
+                // Work-item / plan tracker subsystem (share the work_items module).
+                "work_item_create"       => work_item_create(WorkItemCreateParams) in work_items,
+                "work_item_get"          => work_item_get(WorkItemGetParams) in work_items,
+                "work_item_update"       => work_item_update(WorkItemUpdateParams) in work_items,
+                "work_item_list"         => work_item_list(WorkItemListParams) in work_items,
+                "work_item_tree"         => work_item_tree(WorkItemTreeParams) in work_items,
+                "work_item_reparent"     => work_item_reparent(WorkItemReparentParams) in work_items,
+                "work_item_set_status"   => work_item_set_status(WorkItemSetStatusParams) in work_items,
+                // Work-item tracker Phase 2 — tags + progress (share the work_items module).
+                "tag_create"             => tag_create(TagCreateParams) in work_items,
+                "tag_list"               => tag_list(TagListParams) in work_items,
+                "tag_merge"              => tag_merge(TagMergeParams) in work_items,
+                "tag_rename"             => tag_rename(TagRenameParams) in work_items,
+                "work_item_tag"          => work_item_tag(WorkItemTagParams) in work_items,
+                "work_item_untag"        => work_item_untag(WorkItemUntagParams) in work_items,
+                "work_item_record_progress" => work_item_record_progress(WorkItemRecordProgressParams) in work_items,
+                "work_item_progress_log" => work_item_progress_log(WorkItemProgressLogParams) in work_items,
+                "work_item_completion"   => work_item_completion(WorkItemCompletionParams) in work_items,
+                "work_item_reprioritize" => work_item_reprioritize(WorkItemReprioritizeParams) in work_items,
+                "work_item_search"       => work_item_search(WorkItemSearchParams) in work_items,
+                "plan_define"            => plan_define(PlanDefineParams) in work_items,
+                "plan_validate"          => plan_validate(PlanValidateParams) in work_items,
+                "plan_definition_export" => plan_definition_export(PlanDefinitionExportParams) in work_items,
+                "plan_definition_import" => plan_definition_import(PlanDefinitionImportParams) in work_items,
+                "work_item_add_criterion" => work_item_add_criterion(WorkItemAddCriterionParams) in work_items,
+                "work_item_record_evidence" => work_item_record_evidence(WorkItemRecordEvidenceParams) in work_items,
+                "work_item_attempt_verify" => work_item_attempt_verify(WorkItemAttemptVerifyParams) in work_items,
+                "work_item_defer"        => work_item_defer(WorkItemDeferParams) in work_items,
+                "work_item_reinstate"    => work_item_reinstate(WorkItemReinstateParams) in work_items,
+                "work_item_ingest_plan"  => work_item_ingest_plan(WorkItemIngestPlanParams) in work_items,
+                "work_item_promote_marker" => work_item_promote_marker(WorkItemPromoteMarkerParams) in work_items,
+                "work_item_claim"        => work_item_claim(WorkItemClaimParams) in work_items,
+                "work_item_claim_next"   => work_item_claim_next(WorkItemClaimNextParams) in work_items,
+                "work_item_release"      => work_item_release(WorkItemReleaseParams) in work_items,
+                "work_item_handoff"      => work_item_handoff(WorkItemHandoffParams) in work_items,
+                "agent_heartbeat"        => agent_heartbeat(AgentHeartbeatParams) in work_items,
+                "work_item_who_owns"     => work_item_who_owns(WorkItemWhoOwnsParams) in work_items,
+                "agent_activity"         => agent_activity(AgentActivityParams) in work_items,
+                "work_item_activity"     => work_item_activity(WorkItemActivityParams) in work_items,
+                "work_item_link"         => work_item_link(WorkItemLinkParams) in work_items,
+                "work_item_unlink"       => work_item_unlink(WorkItemUnlinkParams) in work_items,
+                "work_item_cycles"       => work_item_cycles(WorkItemCyclesParams) in work_items,
+                "work_item_anchor_code"  => work_item_anchor_code(WorkItemAnchorCodeParams) in work_items,
+                "work_item_burndown"     => work_item_burndown(WorkItemBurndownParams) in work_items,
+                "work_item_export"       => work_item_export(WorkItemExportParams) in work_items,
+                "work_item_link_experiment" => work_item_link_experiment(WorkItemLinkExperimentParams) in work_items,
                 "a2a_pattern_recursive"  => a2a_pattern_recursive(A2aPatternRecursiveParams),
                 "trajectory_similarity"  => trajectory_similarity(TrajectorySimilarityParams),
                 // SOTA Phase 2 — graph algorithms

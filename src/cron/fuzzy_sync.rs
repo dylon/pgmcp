@@ -10,6 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use libdictenstein::DictionaryValue;
+use libdictenstein::persistent_artrie::eviction::EvictionConfig;
 use sqlx::PgPool;
 
 use crate::fuzzy::persistent_artrie::{FuzzyError, FuzzyIndex};
@@ -34,6 +36,8 @@ pub fn trie_path(data_dir: &Path, kind: &str, project_slug: &str) -> PathBuf {
 pub async fn run_fuzzy_sync(
     pool: &PgPool,
     data_dir: &Path,
+    max_disk_bytes: u64,
+    eviction_cfg: EvictionConfig,
     stats: Arc<StatsTracker>,
 ) -> Result<FuzzySyncReport, FuzzyError> {
     let mut report = FuzzySyncReport::default();
@@ -58,8 +62,29 @@ pub async fn run_fuzzy_sync(
             FuzzyIndex::<CommitRef>::open_or_create(&commits_path)?;
 
         report.symbols_synced += sync::rebuild_symbols(pool, *project_id, &sym_idx).await?;
+        finalize_trie(
+            &sym_idx,
+            &symbols_path,
+            max_disk_bytes,
+            &eviction_cfg,
+            &stats,
+        )?;
         report.paths_synced += sync::rebuild_paths(pool, *project_id, &path_idx).await?;
+        finalize_trie(
+            &path_idx,
+            &paths_path,
+            max_disk_bytes,
+            &eviction_cfg,
+            &stats,
+        )?;
         report.commits_synced += sync::rebuild_commits(pool, *project_id, &commit_idx).await?;
+        finalize_trie(
+            &commit_idx,
+            &commits_path,
+            max_disk_bytes,
+            &eviction_cfg,
+            &stats,
+        )?;
     }
 
     // Durable mandates are workspace-global; one trie shared across
@@ -68,6 +93,13 @@ pub async fn run_fuzzy_sync(
     let (mandate_idx, _mandate_recovery) =
         FuzzyIndex::<DurableMandateRef>::open_or_create(&mandates_path)?;
     report.durable_mandates_synced += sync::rebuild_durable_mandates(pool, &mandate_idx).await?;
+    finalize_trie(
+        &mandate_idx,
+        &mandates_path,
+        max_disk_bytes,
+        &eviction_cfg,
+        &stats,
+    )?;
 
     stats
         .fuzzy_sync_runs
@@ -81,6 +113,34 @@ pub async fn run_fuzzy_sync(
     );
 
     Ok(report)
+}
+
+/// Post-rebuild finalization for one trie: enable heap eviction (when
+/// `max_disk_bytes > 0`), checkpoint to persist + populate the eviction
+/// registry, enforce the on-disk advisory cap, and fold the trie's eviction
+/// stats into the global counters.
+fn finalize_trie<V>(
+    idx: &FuzzyIndex<V>,
+    path: &Path,
+    max_disk_bytes: u64,
+    eviction_cfg: &EvictionConfig,
+    stats: &StatsTracker,
+) -> Result<(), FuzzyError>
+where
+    V: DictionaryValue + Clone + Send + Sync + 'static,
+{
+    if max_disk_bytes > 0 {
+        // A freshly-opened trie is never already-enabled; tolerate the
+        // "already enabled" error rather than abort the whole sync.
+        let _ = idx.enable_eviction(eviction_cfg.clone());
+    }
+    // Checkpoint persists the rebuilt trie and, when eviction is enabled,
+    // populates the coordinator's disk-location registry so eviction can
+    // reclaim in-memory node boxes under memory pressure.
+    idx.checkpoint()?;
+    crate::fuzzy::disk_guard::enforce_disk_cap(path, max_disk_bytes, stats);
+    crate::fuzzy::disk_guard::record_eviction_stats(idx, stats);
+    Ok(())
 }
 
 /// Per-run summary for the fuzzy-sync cron.

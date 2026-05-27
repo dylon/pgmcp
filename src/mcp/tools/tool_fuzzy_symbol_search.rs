@@ -37,19 +37,33 @@ pub async fn run(
     let idx = open_symbol_trie(ctx, &params.project).await?;
     let max_d = params.max_distance.unwrap_or(2) as usize;
     let limit = params.limit.unwrap_or(20) as usize;
+    let phonetic = params.phonetic.unwrap_or(false);
 
-    // Persistent trie returns (term, distance, value); apply
-    // articulatory re-rank as the tiebreaker so phonetically
-    // similar matches (voicing-only edits) surface above arbitrary
-    // substitutions at the same edit distance.
-    let mut hits: Vec<(String, usize, f64)> = idx
-        .query(&params.query, max_d)
-        .into_iter()
-        .map(|(term, distance, _value)| {
-            let art = articulatory_distance_score(&params.query, &term);
-            (term, distance, art)
-        })
-        .collect();
+    // Edit mode (default): the persistent trie returns (term, distance, value)
+    // via a Damerau-Levenshtein transducer. Phonetic mode: a composed
+    // phonetic∘edit search over the same vocabulary (query+terms normalized by
+    // the project's phonetic rules, matched in normalized space). Both apply an
+    // articulatory re-rank tiebreaker so phonetically similar matches surface
+    // above arbitrary substitutions at the same edit distance.
+    let mut hits: Vec<(String, usize, f64)> = if phonetic {
+        let terms = idx.iter_strings();
+        let phon = ctx.phonetics_for(Some(&params.project));
+        phon.phonetic_search(terms.iter(), &params.query, max_d)
+            .into_iter()
+            .map(|(term, distance, _normalized)| {
+                let art = articulatory_distance_score(&params.query, &term);
+                (term, distance, art)
+            })
+            .collect()
+    } else {
+        idx.query(&params.query, max_d)
+            .into_iter()
+            .map(|(term, distance, _value)| {
+                let art = articulatory_distance_score(&params.query, &term);
+                (term, distance, art)
+            })
+            .collect()
+    };
     hits.sort_by(|a, b| {
         a.1.cmp(&b.1)
             .then_with(|| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
@@ -60,6 +74,7 @@ pub async fn run(
         "query": params.query,
         "project": params.project,
         "max_distance": max_d,
+        "mode": if phonetic { "phonetic" } else { "edit" },
         "vocabulary_size": idx.len(),
         "hits": hits.into_iter().map(|(term, distance, articulatory_distance)| json!({
             "term": term,

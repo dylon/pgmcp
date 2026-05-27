@@ -54,6 +54,23 @@ pub struct Config {
     /// enforcement). All read per-call via the live `ArcSwap<Config>`.
     #[serde(default)]
     pub experiments: ExperimentsConfig,
+    /// `[tracker]` — work-item / plan tracker config. `user_token` gates the
+    /// user-authority operations (`work_item_defer`/`work_item_reinstate`) so
+    /// an agent cannot self-defer (scope-cut): the user supplies the token; the
+    /// MCP agent path does not have it.
+    #[serde(default)]
+    pub tracker: TrackerConfig,
+}
+
+/// `[tracker]` configuration. Inert by default: with no `user_token`, the
+/// defer/reinstate tools are disabled (they tell the user to set it).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TrackerConfig {
+    /// Shared secret authorizing `work_item_defer`/`work_item_reinstate`. Keep
+    /// it in the user's local config; do not reveal it to the agent. `None`
+    /// (default) disables those user-authority operations.
+    #[serde(default)]
+    pub user_token: Option<String>,
 }
 
 /// `[experiments]` — defaults the experiment-protocol engine prescribes and
@@ -272,10 +289,17 @@ pub struct FuzzyConfig {
     /// `$data_dir/fuzzy/{kind}/{project_slug}/{kind}.artrie`.
     #[serde(default = "default_fuzzy_data_dir")]
     pub data_dir: std::path::PathBuf,
-    /// Soft cap on total trie disk usage in bytes (default 5 GiB).
-    /// The MemoryPressure decorator triggers eviction above this cap;
-    /// the cap is advisory, not enforced — the underlying
-    /// PersistentARTrieChar happily exceeds it if there's free disk.
+    /// Soft cap on per-trie on-disk usage in bytes (default 5 GiB), and the
+    /// master switch for heap eviction. `cron::fuzzy_sync`'s `disk_guard`
+    /// measures each trie file's on-disk size after a rebuild and logs a warning
+    /// (bumping `fuzzy_disk_cap_exceeded`) when it exceeds this cap (advisory —
+    /// on-disk size is not shrunk online). Separately, when this is > 0 each
+    /// persistent trie is opened with heap eviction enabled
+    /// (`FuzzyConfig::eviction_config`): under system memory pressure the
+    /// libdictenstein eviction coordinator reclaims in-memory node boxes
+    /// (swizzling them to their on-disk locations), bounding RAM independent of
+    /// on-disk size. Set to 0 to disable both the disk-cap warning and heap
+    /// eviction.
     #[serde(default = "default_fuzzy_max_disk_bytes")]
     pub max_disk_bytes: u64,
 
@@ -311,6 +335,37 @@ pub struct FuzzyConfig {
     /// snake_case ↔ camelCase) while excluding unrelated names.
     #[serde(default = "default_phonetic_merge_threshold")]
     pub phonetic_merge_threshold: f64,
+}
+
+impl FuzzyConfig {
+    /// Build the libdictenstein [`EvictionConfig`] for the persistent fuzzy
+    /// tries. Heap eviction (reclaiming in-memory node boxes under system memory
+    /// pressure) is enabled when `max_disk_bytes > 0`, disabled otherwise. This
+    /// is distinct from the on-disk `max_disk_bytes` advisory enforced by
+    /// `crate::fuzzy::disk_guard`.
+    pub fn eviction_config(&self) -> libdictenstein::persistent_artrie::eviction::EvictionConfig {
+        use libdictenstein::persistent_artrie::eviction::EvictionConfig;
+        if self.max_disk_bytes > 0 {
+            EvictionConfig::default()
+        } else {
+            EvictionConfig::disabled()
+        }
+    }
+
+    /// Build the per-dimension articulatory feature weights from the `[fuzzy]`
+    /// knobs. The three consonant dimensions (voicing/place/manner) are
+    /// overridable; vowel dimensions + the manner-table scale stay at
+    /// liblevenshtein's built-in defaults.
+    pub fn articulatory_weights(
+        &self,
+    ) -> liblevenshtein::phonetic::feature_distance::FeatureDistanceWeights {
+        liblevenshtein::phonetic::feature_distance::FeatureDistanceWeights {
+            voicing: self.articulatory_voicing_weight,
+            place_step: self.articulatory_place_step,
+            manner_default: self.articulatory_manner_default,
+            ..liblevenshtein::phonetic::feature_distance::FeatureDistanceWeights::default()
+        }
+    }
 }
 
 impl Default for FuzzyConfig {
@@ -2091,6 +2146,25 @@ pub struct CronConfig {
     /// (Phase 8) takes over.
     #[serde(default = "default_topic_mmap_n_threshold")]
     pub topic_mmap_n_threshold: usize,
+
+    /// Interval between work-item-presence/lease-decay cron sweeps, in seconds
+    /// (default: 60). A light job (a couple of bounded UPDATEs): NULLs expired
+    /// `work_items.claimed_by` leases (+ `expire` ledger rows) and decays
+    /// `agent_presence` active→idle→offline. Backs the A2A collaboration
+    /// crash-safety guarantee (a crashed agent's claims become stealable).
+    #[serde(default = "default_work_item_presence_interval")]
+    pub work_item_presence_interval_secs: u64,
+
+    /// Seconds of inactivity after which an `active` agent_presence row decays
+    /// to `idle` (default: 300 = 5 min). Liveness only — does not release leases.
+    #[serde(default = "default_work_item_presence_idle")]
+    pub work_item_presence_idle_secs: u64,
+
+    /// Seconds of inactivity after which an agent_presence row decays to
+    /// `offline` (default: 900 = 15 min). Independent of lease expiry, which is
+    /// driven by each claim's own `lease_expires_at`.
+    #[serde(default = "default_work_item_presence_offline")]
+    pub work_item_presence_offline_secs: u64,
 }
 
 impl Default for CronConfig {
@@ -2150,8 +2224,21 @@ impl Default for CronConfig {
             topic_online_n_threshold: default_topic_online_n_threshold(),
             topic_online_batch_size: default_topic_online_batch_size(),
             topic_mmap_n_threshold: default_topic_mmap_n_threshold(),
+            work_item_presence_interval_secs: default_work_item_presence_interval(),
+            work_item_presence_idle_secs: default_work_item_presence_idle(),
+            work_item_presence_offline_secs: default_work_item_presence_offline(),
         }
     }
+}
+
+fn default_work_item_presence_interval() -> u64 {
+    60
+}
+fn default_work_item_presence_idle() -> u64 {
+    300
+}
+fn default_work_item_presence_offline() -> u64 {
+    900
 }
 
 fn default_topic_max_mem_fraction() -> f64 {
