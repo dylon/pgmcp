@@ -56,8 +56,8 @@ async fn seed_chunks(
         let embedding = backend.embed_one(content).await.expect("embed");
         let v = pgvector::Vector::from(embedding);
         sqlx::query(
-            "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding) \
-             VALUES ($1, $2, $3, $4, $5, $6)"
+            "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding_v2, embedding_signature) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1')"
         )
         .bind(file_id)
         .bind(i as i32)
@@ -75,7 +75,7 @@ async fn seed_chunks(
 #[tokio::test(flavor = "multi_thread")]
 async fn similarity_scan_populates_cross_project_similarities() {
     let testdb = require_test_db!();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     // Seed two projects with identical content so the similarity scan
     // finds a cross-project pair.
     let shared = vec!["fn hello_world() { }", "fn process_request() { }"];
@@ -128,7 +128,7 @@ async fn similarity_scan_populates_cross_project_similarities() {
 #[tokio::test(flavor = "multi_thread")]
 async fn topic_clustering_populates_code_topics() {
     let testdb = require_test_db!();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     // Need ≥ min_cluster_size * 2 chunks for FCM to produce meaningful topics.
     // CronConfig default min_cluster_size=5, so seed ~20 diverse chunks.
     let mut contents: Vec<&str> = Vec::new();
@@ -171,7 +171,7 @@ async fn topic_clustering_populates_code_topics() {
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_analysis_writes_file_metrics_rows() {
     let testdb = require_test_db!();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
 
     // Seed two files in the same project with at least one "use crate::"
     // statement so the import extractor picks up an edge.
@@ -220,7 +220,7 @@ async fn graph_analysis_writes_file_metrics_rows() {
 #[tokio::test(flavor = "multi_thread")]
 async fn similarity_scan_below_threshold_emits_nothing() {
     let testdb = require_test_db!();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     // Two projects with *different* content so similarity is low.
     seed_chunks(
         testdb.pool(),
@@ -270,7 +270,7 @@ async fn similarity_scan_below_threshold_emits_nothing() {
 #[tokio::test(flavor = "multi_thread")]
 async fn topic_clustering_assigns_chunks_above_threshold() {
     let testdb = require_test_db!();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     let chunk_strings: Vec<String> = (0..20)
         .map(|i| format!("chunk content number {} with unique tokens", i))
         .collect();
@@ -327,7 +327,7 @@ async fn graph_analysis_increments_counter_per_run() {
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_analysis_with_work_pool_runs_without_hanging() {
     let testdb = require_test_db!();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     seed_chunks(
         testdb.pool(),
         "wp",
@@ -367,7 +367,7 @@ async fn graph_analysis_with_work_pool_runs_without_hanging() {
 #[tokio::test(flavor = "multi_thread")]
 async fn similarity_scan_is_idempotent_across_runs() {
     let testdb = require_test_db!();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     let shared = vec!["fn common() {}"];
     seed_chunks(
         testdb.pool(),
@@ -424,7 +424,7 @@ async fn similarity_scan_is_idempotent_across_runs() {
 #[tokio::test(flavor = "multi_thread")]
 async fn topic_clustering_with_insufficient_chunks_handles_gracefully() {
     let testdb = require_test_db!();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     // Only 2 chunks — below min_cluster_size default (5).
     seed_chunks(
         testdb.pool(),
@@ -528,7 +528,7 @@ async fn git_history_cron_indexes_real_repo() {
 #[tokio::test(flavor = "multi_thread")]
 async fn topic_clustering_num_clusters_override_is_honored() {
     let testdb = require_test_db!();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     let strings: Vec<String> = (0..15).map(|i| format!("item number {} text", i)).collect();
     let contents: Vec<&str> = strings.iter().map(|s| s.as_str()).collect();
     seed_chunks(

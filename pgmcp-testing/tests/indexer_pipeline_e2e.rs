@@ -110,7 +110,7 @@ async fn process_file_indexes_new_rust_file_end_to_end() {
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let project_id = seed_project(testdb.pool(), workdir.path().to_str().unwrap()).await;
     let (embed_tx, embed_rx): (Sender<EmbedIndexRequest>, _) = crossbeam_channel::unbounded();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     let drain = spawn_embed_drain(embed_rx, backend);
     let stats = StatsTracker::new();
     let config = default_config();
@@ -176,7 +176,7 @@ async fn process_file_skips_unchanged_file_on_rescan() {
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let project_id = seed_project(testdb.pool(), workdir.path().to_str().unwrap()).await;
     let (embed_tx, embed_rx): (Sender<EmbedIndexRequest>, _) = crossbeam_channel::unbounded();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     let drain = spawn_embed_drain(embed_rx, backend);
     let stats = StatsTracker::new();
     let config = default_config();
@@ -270,7 +270,7 @@ async fn process_file_re_embeds_on_content_change() {
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let project_id = seed_project(testdb.pool(), workdir.path().to_str().unwrap()).await;
     let (embed_tx, embed_rx): (Sender<EmbedIndexRequest>, _) = crossbeam_channel::unbounded();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     let drain = spawn_embed_drain(embed_rx, backend);
     let stats = StatsTracker::new();
     let config = default_config();
@@ -416,7 +416,7 @@ async fn process_file_writes_all_files_in_directory() {
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let project_id = seed_project(testdb.pool(), workdir.path().to_str().unwrap()).await;
     let (embed_tx, embed_rx): (Sender<EmbedIndexRequest>, _) = crossbeam_channel::unbounded();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     let drain = spawn_embed_drain(embed_rx, backend);
     let stats = StatsTracker::new();
     let config = default_config();
@@ -480,7 +480,7 @@ async fn process_file_claude_jsonl_routes_through_claude_chunker() {
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let project_id = seed_project(testdb.pool(), workdir.path().to_str().unwrap()).await;
     let (embed_tx, embed_rx): (Sender<EmbedIndexRequest>, _) = crossbeam_channel::unbounded();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     let drain = spawn_embed_drain(embed_rx, backend);
     let stats = StatsTracker::new();
     let config = default_config();
@@ -555,7 +555,7 @@ async fn process_file_codex_jsonl_routes_through_codex_chunker() {
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let project_id = seed_project(testdb.pool(), workdir.path().to_str().unwrap()).await;
     let (embed_tx, embed_rx): (Sender<EmbedIndexRequest>, _) = crossbeam_channel::unbounded();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     let drain = spawn_embed_drain(embed_rx, backend);
     let stats = StatsTracker::new();
     let config = default_config();
@@ -626,7 +626,7 @@ async fn process_file_concurrent_on_distinct_paths_no_deadlock() {
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let project_id = seed_project(testdb.pool(), workdir.path().to_str().unwrap()).await;
     let (embed_tx, embed_rx): (Sender<EmbedIndexRequest>, _) = crossbeam_channel::unbounded();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     let drain = spawn_embed_drain(embed_rx, backend);
     let stats = Arc::new(StatsTracker::new());
     let config = Arc::new(default_config());
@@ -686,7 +686,7 @@ async fn process_file_deletes_chunks_before_re_embedding_on_change() {
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let project_id = seed_project(testdb.pool(), workdir.path().to_str().unwrap()).await;
     let (embed_tx, embed_rx): (Sender<EmbedIndexRequest>, _) = crossbeam_channel::unbounded();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     let drain = spawn_embed_drain(embed_rx, backend);
     let stats = StatsTracker::new();
     let config = default_config();
@@ -775,7 +775,7 @@ async fn process_file_respects_exclude_patterns() {
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let project_id = seed_project(testdb.pool(), workdir.path().to_str().unwrap()).await;
     let (embed_tx, embed_rx): (Sender<EmbedIndexRequest>, _) = crossbeam_channel::unbounded();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     let drain = spawn_embed_drain(embed_rx, backend);
     let stats = StatsTracker::new();
     let mut config = default_config();
@@ -864,7 +864,7 @@ async fn process_file_burst_of_rewrites_converges_to_last_version() {
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let project_id = seed_project(testdb.pool(), workdir.path().to_str().unwrap()).await;
     let (embed_tx, embed_rx): (Sender<EmbedIndexRequest>, _) = crossbeam_channel::unbounded();
-    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(384));
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
     let drain = spawn_embed_drain(embed_rx, backend);
     let stats = StatsTracker::new();
     let config = default_config();

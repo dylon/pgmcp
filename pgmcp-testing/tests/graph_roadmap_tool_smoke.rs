@@ -97,8 +97,9 @@ async fn ck_metrics_smoke() {
         .expect("ck_metrics must not error on a corpus with no OO classes");
 }
 
-/// Graph-aware retrieval tools embed the query (the test backbone is 384-d, so
-/// code_raptor_search returns its graceful empty path); all must return Ok.
+/// Graph-aware retrieval tools embed the query with the 1024-d BGE-M3 test
+/// backbone (the only supported signature); all must return Ok whether or not
+/// the corpus yields a hit.
 #[tokio::test]
 async fn code_retrieval_tools_smoke() {
     let db = require_test_db!();

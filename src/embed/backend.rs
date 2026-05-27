@@ -22,7 +22,7 @@ use crate::error::{PgmcpError, Result};
 #[async_trait]
 pub trait EmbeddingBackend: Send + Sync {
     /// Embed a single text. Returns a vector of length
-    /// `EmbeddingsConfig::dimensions` (384 for all-MiniLM-L6-v2).
+    /// `EmbeddingsConfig::dimensions` (1024 for BGE-M3).
     async fn embed_one(&self, text: &str) -> Result<Vec<f32>>;
 
     /// Embed a batch of texts. Default impl loops over `embed_one`; backends

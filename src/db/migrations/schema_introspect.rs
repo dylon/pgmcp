@@ -1,6 +1,6 @@
 //! Lightweight schema-introspection helpers shared across migration steps.
 //!
-//! These make legacy-column DDL tolerant of a post-`embed-cutover --drop-legacy`
+//! These make legacy-column DDL tolerant of the post-cutover
 //! schema. The pre-BGE-M3 384-dim `embedding` column is permanently dropped at
 //! cutover, but `ALTER TABLE … ALTER COLUMN embedding DROP NOT NULL` (and
 //! `CREATE INDEX … (embedding …)`) have no `IF EXISTS` form — so callers gate

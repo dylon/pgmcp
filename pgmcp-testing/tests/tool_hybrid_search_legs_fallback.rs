@@ -28,7 +28,7 @@ fn build_ctx(cfg: Config, db: Arc<dyn DbClient>) -> SystemContext {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
-        Arc::new(DeterministicEmbeddingBackend::new(384));
+        Arc::new(DeterministicEmbeddingBackend::new(1024));
     let embed_source = EmbedSource::backend(embed_backend);
     let lifecycle = DaemonLifecycle::new();
     SystemContext::production(
@@ -70,14 +70,14 @@ async fn seed_minimal(pool: &sqlx::PgPool) -> i32 {
     .expect("file");
 
     use pgmcp::embed::EmbeddingBackend;
-    let backend = DeterministicEmbeddingBackend::new(384);
+    let backend = DeterministicEmbeddingBackend::new(1024);
     let chunks = ["fn hello_world() {}", "fn process_request() {}"];
     for (i, content) in chunks.iter().enumerate() {
         let emb = backend.embed_one(content).await.expect("embed");
         let v = pgvector::Vector::from(emb);
         sqlx::query(
-            "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding) \
-             VALUES ($1, $2, $3, $4, $5, $6)"
+            "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding_v2, embedding_signature) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1')"
         )
         .bind(file_id)
         .bind(i as i32)

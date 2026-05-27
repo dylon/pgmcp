@@ -14,7 +14,7 @@ use crate::error::{PgmcpError, Result};
 pub struct StoredCentroid {
     /// Scope string: "global", "project:<name>", or "hierarchy".
     pub scope: String,
-    /// Centroid vector in f32; length = `d` (typically 384 for all-MiniLM-L6-v2).
+    /// Centroid vector in f32; length = `d` (1024 for BGE-M3).
     pub centroid: Vec<f32>,
     /// Creation timestamp (unix seconds).
     pub created_at: i64,

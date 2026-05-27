@@ -1,4 +1,6 @@
+pub mod acceptance;
 pub mod cli;
+pub mod inference;
 pub mod metrics;
 pub mod recorder;
 #[allow(dead_code)]

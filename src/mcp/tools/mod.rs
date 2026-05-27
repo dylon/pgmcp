@@ -256,6 +256,13 @@ pub mod tool_a2a_register_agent;
 pub mod tool_a2a_report_outcome;
 pub mod tool_a2a_send_task;
 pub mod tool_a2a_subscribe_task;
+pub mod tool_experiments;
+pub use tool_experiments::{
+    tool_experiment_decide, tool_experiment_get, tool_experiment_list,
+    tool_experiment_log_artifact, tool_experiment_open, tool_experiment_protocol,
+    tool_experiment_record_measurement, tool_experiment_render_ledger, tool_experiment_search,
+    tool_experiment_timeline,
+};
 
 pub use tool_adoption_lag::tool_adoption_lag;
 pub use tool_anomaly_detection::tool_anomaly_detection;

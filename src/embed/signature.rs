@@ -4,13 +4,14 @@
 
 //! Active-embedding-signature lookup with a short in-process cache.
 //!
-//! Every read-side query that targets a dual-column table must consult
-//! `pgmcp_metadata.active_embedding_signature` to pick the right
-//! column (`embedding` for MiniLM-era data, `embedding_v2` for BGE-M3).
-//! The cache here serves that lookup with a 30-second TTL plus an
-//! explicit `force_refresh()` hook that the cutover CLI calls
-//! immediately after flipping the metadata row, so the running daemon
-//! observes the change in < 1 s instead of waiting for the TTL.
+//! The read-side column is always `embedding_v2` (BGE-M3, 1024-d) — the
+//! only supported signature. Read-side queries still consult
+//! `pgmcp_metadata.active_embedding_signature` so the seam survives a
+//! future signature bump. The cache here serves that lookup with a
+//! 30-second TTL plus an explicit `force_refresh()` hook that the
+//! migration cron (or a manual metadata flip) calls immediately after
+//! flipping the metadata row, so the running daemon observes the change
+//! in < 1 s instead of waiting for the TTL.
 //!
 //! Plan: `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`
 //! Phase 5 C2.
@@ -21,7 +22,7 @@ use std::time::{Duration, Instant};
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
 
-use crate::embed::model::{BGE_M3_SIGNATURE, MINILM_SIGNATURE};
+use crate::embed::model::BGE_M3_SIGNATURE;
 
 /// Canonical enum form of `pgmcp_metadata.active_embedding_signature`.
 ///
@@ -32,9 +33,6 @@ use crate::embed::model::{BGE_M3_SIGNATURE, MINILM_SIGNATURE};
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EmbeddingSignature {
-    /// 384-dim `all-MiniLM-L6-v2` BERT-base. Reads/writes the legacy
-    /// `embedding` column.
-    MiniLmV1,
     /// 1024-dim BGE-M3 XLM-RoBERTa-Large. Reads/writes the
     /// `embedding_v2` column on dual-column tables and the canonical
     /// `embedding` column on tables that ship 1024d-direct (mandates,
@@ -47,7 +45,6 @@ impl EmbeddingSignature {
     /// `pgmcp_metadata.active_embedding_signature`.
     pub fn as_str(self) -> &'static str {
         match self {
-            EmbeddingSignature::MiniLmV1 => MINILM_SIGNATURE,
             EmbeddingSignature::BgeM3V1 => BGE_M3_SIGNATURE,
         }
     }
@@ -55,7 +52,6 @@ impl EmbeddingSignature {
     /// Output dimensionality of the corresponding embedder.
     pub fn dim(self) -> usize {
         match self {
-            EmbeddingSignature::MiniLmV1 => 384,
             EmbeddingSignature::BgeM3V1 => 1024,
         }
     }
@@ -65,7 +61,6 @@ impl EmbeddingSignature {
     /// `software_pattern_chunks`) under this signature.
     pub fn read_column(self) -> &'static str {
         match self {
-            EmbeddingSignature::MiniLmV1 => "embedding",
             EmbeddingSignature::BgeM3V1 => "embedding_v2",
         }
     }
@@ -74,7 +69,6 @@ impl EmbeddingSignature {
     /// suitable for error messages pointing operators at the CLI.
     pub fn model_name(self) -> &'static str {
         match self {
-            EmbeddingSignature::MiniLmV1 => "all-MiniLM-L6-v2",
             EmbeddingSignature::BgeM3V1 => "bge-m3",
         }
     }
@@ -84,7 +78,6 @@ impl EmbeddingSignature {
     /// silently default.
     pub fn from_str_signature(s: &str) -> Option<Self> {
         match s {
-            MINILM_SIGNATURE => Some(EmbeddingSignature::MiniLmV1),
             BGE_M3_SIGNATURE => Some(EmbeddingSignature::BgeM3V1),
             _ => None,
         }
@@ -122,8 +115,8 @@ impl ActiveSignatureCache {
     /// Resolve the active signature, hitting `pgmcp_metadata` if the
     /// cache is empty or older than [`TTL`]. The DB row's text value
     /// is parsed via [`EmbeddingSignature::from_str_signature`]; an
-    /// unknown signature is treated as `MiniLmV1` (the conservative
-    /// pre-migration default) and logged at WARN level so the
+    /// unknown/absent signature defaults to `BgeM3V1` (the only
+    /// supported signature) and is logged at WARN level so the
     /// operator sees the inconsistency without losing service.
     pub async fn current(&self, pool: &PgPool) -> Result<EmbeddingSignature, sqlx::Error> {
         if let Some(snap) = self.snapshot.load_full().as_ref()
@@ -145,9 +138,8 @@ impl ActiveSignatureCache {
     }
 
     /// Drop the cached snapshot so the next [`current`] call hits the
-    /// DB. Called by `pgmcp embed-cutover` (and by the in-process
-    /// `promote_to_bge_m3` helper) so a flip is visible to running
-    /// readers instantly rather than after the TTL.
+    /// DB. Called after a metadata-row flip so the change is visible to
+    /// running readers instantly rather than after the TTL.
     pub fn force_refresh(&self) {
         self.snapshot.store(Arc::new(None));
     }
@@ -159,42 +151,24 @@ impl Default for ActiveSignatureCache {
     }
 }
 
-/// Parse a raw `active_embedding_signature` value, falling back to a
-/// SCHEMA-INFERRED default when it is absent/unrecognized: a dropped legacy
-/// `file_chunks.embedding` column means the install is post-cutover (BGE-M3);
-/// otherwise the conservative pre-migration MiniLM default. This removes the
-/// old footgun where an absent metadata row always defaulted to MiniLM even on
-/// a post-cutover schema where the legacy column is gone. Logs at WARN so an
-/// operator sees the inconsistency without losing service.
+/// Parse a raw `active_embedding_signature` value, defaulting to
+/// `BgeM3V1` (the only supported signature) when it is absent or
+/// unrecognized. Logs at WARN so an operator sees the inconsistency
+/// without losing service. The `_pool` param is retained so the two
+/// callers can pass their pool unchanged even though no DB probe is
+/// needed anymore.
 async fn resolve_signature_or_schema_default(
-    pool: &PgPool,
+    _pool: &PgPool,
     raw: Option<&str>,
 ) -> Result<EmbeddingSignature, sqlx::Error> {
     if let Some(sig) = raw.and_then(EmbeddingSignature::from_str_signature) {
         return Ok(sig);
     }
-    let legacy_present: bool = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM information_schema.columns
-             WHERE table_schema = 'public' AND table_name = 'file_chunks'
-               AND column_name = 'embedding'
-         )",
-    )
-    .fetch_one(pool)
-    .await?;
-    let fallback = if legacy_present {
-        EmbeddingSignature::MiniLmV1
-    } else {
-        EmbeddingSignature::BgeM3V1
-    };
     tracing::warn!(
         raw = ?raw,
-        legacy_embedding_column = legacy_present,
-        fallback = fallback.as_str(),
-        "active_embedding_signature absent/unrecognized; inferring from schema. \
-         Verify with `pgmcp embed-cutover --check`."
+        "active_embedding_signature absent/unrecognized; defaulting to bge-m3-v1 (the only supported signature)"
     );
-    Ok(fallback)
+    Ok(EmbeddingSignature::BgeM3V1)
 }
 
 /// One-shot resolver for callers that don't have access to a cached
@@ -219,23 +193,20 @@ mod tests {
 
     #[test]
     fn signature_round_trip_str() {
-        for sig in [EmbeddingSignature::MiniLmV1, EmbeddingSignature::BgeM3V1] {
-            assert_eq!(
-                EmbeddingSignature::from_str_signature(sig.as_str()),
-                Some(sig)
-            );
-        }
+        let sig = EmbeddingSignature::BgeM3V1;
+        assert_eq!(
+            EmbeddingSignature::from_str_signature(sig.as_str()),
+            Some(sig)
+        );
     }
 
     #[test]
     fn dim_matches_documented_model_output() {
-        assert_eq!(EmbeddingSignature::MiniLmV1.dim(), 384);
         assert_eq!(EmbeddingSignature::BgeM3V1.dim(), 1024);
     }
 
     #[test]
     fn read_column_is_correct_per_signature() {
-        assert_eq!(EmbeddingSignature::MiniLmV1.read_column(), "embedding");
         assert_eq!(EmbeddingSignature::BgeM3V1.read_column(), "embedding_v2");
     }
 

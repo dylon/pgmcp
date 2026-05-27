@@ -105,10 +105,10 @@ fn find_ort_lib_dir() -> Option<String> {
 /// Cargo build-script context has no `dirs` crate available without
 /// declaring one; reimplement the bit we need.
 fn dirs_cache_dir() -> Option<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("XDG_CACHE_HOME") {
-        if !p.is_empty() {
-            return Some(std::path::PathBuf::from(p));
-        }
+    if let Ok(p) = std::env::var("XDG_CACHE_HOME")
+        && !p.is_empty()
+    {
+        return Some(std::path::PathBuf::from(p));
     }
     let home = std::env::var("HOME").ok()?;
     Some(std::path::PathBuf::from(home).join(".cache"))

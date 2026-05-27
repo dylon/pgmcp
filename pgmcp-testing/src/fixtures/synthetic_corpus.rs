@@ -40,8 +40,9 @@
 
 use sqlx::PgPool;
 
-/// Vector dimension matches the production fastembed model.
-pub const DIM: usize = 384;
+/// Vector dimension matches the production BGE-M3 model (the only supported
+/// embedding signature; the legacy 384-d MiniLM path was removed).
+pub const DIM: usize = 1024;
 
 /// Topic IDs (database PK) assigned by [`SyntheticCorpus::seed_with_assignments`].
 /// Captured for tests that need to reference a specific topic by id.
@@ -282,10 +283,13 @@ async fn insert_chunk_with_embedding(
     end_line: i32,
 ) -> i64 {
     let v = pgvector::Vector::from(embedding.to_vec());
+    // BGE-M3/1024-only: chunks live in the 1024-d `embedding_v2` column with
+    // the `bge-m3-v1` signature. The legacy 384-d `embedding` column was
+    // dropped, so writing to it would 42703 at runtime.
     sqlx::query_scalar(
         "INSERT INTO file_chunks \
-         (file_id, chunk_index, content, start_line, end_line, embedding) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+         (file_id, chunk_index, content, start_line, end_line, embedding_v2, embedding_signature) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1') RETURNING id",
     )
     .bind(file_id)
     .bind(chunk_idx)

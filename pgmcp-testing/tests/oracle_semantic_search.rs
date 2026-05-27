@@ -19,7 +19,7 @@ use pgmcp_testing::fixtures::test_embedding;
 use pgmcp_testing::require_test_db;
 use sqlx::PgPool;
 
-const D: usize = 384;
+const D: usize = 1024;
 
 /// Insert a project and return its id.
 async fn insert_project(pool: &PgPool, name: &str) -> i32 {
@@ -56,9 +56,11 @@ async fn insert_file(pool: &PgPool, project_id: i32, path: &str, language: &str)
 /// Insert a chunk with the given embedding. Returns the chunk id.
 async fn insert_chunk(pool: &PgPool, file_id: i64, idx: i32, embedding: &[f32]) -> i64 {
     let v = pgvector::Vector::from(embedding.to_vec());
+    // BGE-M3/1024-only: chunks live in `embedding_v2` (the legacy 384-d
+    // `embedding` column was dropped).
     sqlx::query_scalar(
-        "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding_v2, embedding_signature) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1') RETURNING id",
     )
     .bind(file_id)
     .bind(idx)
@@ -94,7 +96,7 @@ async fn brute_force_top_k(pool: &PgPool, query: &[f32], k: i32) -> Vec<i64> {
 
     let v = pgvector::Vector::from(query.to_vec());
     let rows: Vec<(i64,)> =
-        sqlx::query_as("SELECT id FROM file_chunks ORDER BY embedding <=> $1 LIMIT $2")
+        sqlx::query_as("SELECT id FROM file_chunks ORDER BY embedding_v2 <=> $1 LIMIT $2")
             .bind(v)
             .bind(k)
             .fetch_all(&mut *tx)
@@ -114,7 +116,7 @@ async fn hnsw_recall_matches_brute_force_within_recall_floor() {
     let project_id = insert_project(&pool, "recall-test").await;
     let file_id = insert_file(&pool, project_id, "recall.rs", "rust").await;
 
-    // Seed 200 deterministic 384-dim L2-normalized embeddings. The
+    // Seed 200 deterministic 1024-dim L2-normalized embeddings. The
     // index is built incrementally as we INSERT — this is the same
     // path production uses.
     for i in 0..200 {
@@ -146,13 +148,14 @@ async fn hnsw_recall_matches_brute_force_within_recall_floor() {
         // For each truth chunk_id, compute its true cosine to query
         // and round to the same precision as the SearchResult.score.
         let v = pgvector::Vector::from(query.clone());
-        let rows: Vec<(i64, f64)> =
-            sqlx::query_as("SELECT id, 1 - (embedding <=> $1) FROM file_chunks WHERE id = ANY($2)")
-                .bind(v)
-                .bind(&truth)
-                .fetch_all(&pool)
-                .await
-                .expect("truth scores");
+        let rows: Vec<(i64, f64)> = sqlx::query_as(
+            "SELECT id, 1 - (embedding_v2 <=> $1) FROM file_chunks WHERE id = ANY($2)",
+        )
+        .bind(v)
+        .bind(&truth)
+        .fetch_all(&pool)
+        .await
+        .expect("truth scores");
         let mut scores: Vec<f64> = rows.into_iter().map(|(_, s)| s).collect();
         scores.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
         scores

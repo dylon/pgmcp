@@ -23,7 +23,7 @@
 //!
 //! Both produce chunks of ~`max_chunk_chars` characters (~500 tokens
 //! given typical English prose), which is the sweet spot for the
-//! all-MiniLM-L6-v2 model used by pgmcp.
+//! BGE-M3 model used by pgmcp.
 
 use std::sync::OnceLock;
 
@@ -35,7 +35,7 @@ use super::chunker::Chunk;
 #[derive(Debug, Clone, Copy)]
 pub struct ParagraphOpts {
     /// Maximum characters per chunk. Targeting ~2000 (≈ 500 tokens of
-    /// English prose) hits the MiniLM-L6-v2 sweet spot without
+    /// English prose) hits the BGE-M3 sweet spot without
     /// over-truncating long paragraphs.
     pub max_chunk_chars: usize,
     /// Minimum characters per chunk before merging into a neighbor.

@@ -45,7 +45,7 @@ use sqlx::PgPool;
 
 use common::text_of;
 
-const D: usize = 384;
+const D: usize = 1024;
 
 /// Test server with a `DeterministicEmbeddingBackend` (predictable
 /// query embeddings for the search_commits oracle).
@@ -120,9 +120,11 @@ async fn insert_chunk(
     end_line: i32,
 ) -> i64 {
     let v = pgvector::Vector::from(embedding.to_vec());
+    // BGE-M3/1024-only: chunks live in `embedding_v2` (the legacy 384-d
+    // `embedding` column was dropped).
     sqlx::query_scalar(
-        "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding_v2, embedding_signature) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1') RETURNING id",
     )
     .bind(file_id)
     .bind(idx)
@@ -550,9 +552,11 @@ async fn search_commits_ranks_by_known_commit_message_similarity() {
         .expect("commit");
 
         let v = pgvector::Vector::from(test_embedding(D, seed));
+        // BGE-M3/1024-only: commit chunks live in `embedding_v2` with the
+        // `bge-m3-v1` signature (the legacy 384-d `embedding` column was dropped).
         sqlx::query(
-            "INSERT INTO git_commit_chunks (commit_id, chunk_index, content, embedding) \
-             VALUES ($1, $2, $3, $4)",
+            "INSERT INTO git_commit_chunks (commit_id, chunk_index, content, embedding_v2, embedding_signature) \
+             VALUES ($1, $2, $3, $4, 'bge-m3-v1')",
         )
         .bind(cid)
         .bind(0_i32)

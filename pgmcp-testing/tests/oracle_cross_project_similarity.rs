@@ -20,7 +20,7 @@ use pgmcp::db::queries::{
 use pgmcp_testing::require_test_db;
 use sqlx::PgPool;
 
-const D: usize = 384;
+const D: usize = 1024;
 
 fn basis(idx: usize) -> Vec<f32> {
     let mut v = vec![0.0_f32; D];
@@ -73,9 +73,11 @@ async fn insert_file(pool: &PgPool, project_id: i32, path: &str) -> i64 {
 
 async fn insert_chunk(pool: &PgPool, file_id: i64, idx: i32, embedding: &[f32]) -> i64 {
     let v = pgvector::Vector::from(embedding.to_vec());
+    // BGE-M3/1024-only: chunks live in `embedding_v2` (the legacy 384-d
+    // `embedding` column was dropped).
     sqlx::query_scalar(
-        "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding) \
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id",
+        "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding_v2, embedding_signature) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1') RETURNING id",
     )
     .bind(file_id)
     .bind(idx)

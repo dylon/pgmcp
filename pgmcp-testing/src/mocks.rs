@@ -9,7 +9,7 @@
 //! let mut mock = MockDbClient::new();
 //! mock.semantic_search_results = vec![row1, row2, row3];
 //! let arc: Arc<dyn DbClient> = Arc::new(mock);
-//! let result = arc.semantic_search(&[0.0; 384], 10, None, None, 100).await?;
+//! let result = arc.semantic_search(&[0.0; 1024], 10, None, None, 100).await?;
 //! assert_eq!(result.len(), 3);
 //! ```
 //!
@@ -907,7 +907,8 @@ mod tests {
 /// `crate::fixtures::test_embedding` so two calls with the same text always
 /// return the same vector — useful for asserting end-to-end pipelines.
 ///
-/// `dim` defaults to 384 to match the production fastembed model.
+/// `dim` defaults to 1024 to match the production BGE-M3 model (the only
+/// supported embedding signature; the legacy 384-d MiniLM path was removed).
 pub struct DeterministicEmbeddingBackend {
     pub dim: usize,
 }
@@ -920,7 +921,7 @@ impl DeterministicEmbeddingBackend {
 
 impl Default for DeterministicEmbeddingBackend {
     fn default() -> Self {
-        Self::new(384)
+        Self::new(1024)
     }
 }
 
@@ -942,12 +943,12 @@ mod backend_tests {
 
     #[tokio::test]
     async fn deterministic_backend_matches_fixture() {
-        let backend = DeterministicEmbeddingBackend::new(384);
+        let backend = DeterministicEmbeddingBackend::new(1024);
         let arc: Arc<dyn EmbeddingBackend> = Arc::new(backend);
         let v1 = arc.embed_one("alpha").await.expect("embed_one");
         let v2 = arc.embed_one("alpha").await.expect("embed_one");
         assert_eq!(v1, v2);
-        assert_eq!(v1.len(), 384);
+        assert_eq!(v1.len(), 1024);
         let v3 = arc.embed_one("beta").await.expect("embed_one");
         assert_ne!(v1, v3);
     }

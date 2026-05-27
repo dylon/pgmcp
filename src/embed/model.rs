@@ -1,14 +1,11 @@
 //! Direct-candle embedder. Replaces the prior fastembed/ort wrapper.
 //!
-//! Two backbones are supported (selected by `EmbeddingsConfig::model`):
+//! One backbone is supported (selected by `EmbeddingsConfig::model`):
 //!
-//! - **`all-MiniLM-L6-v2`** (legacy, 384d) — BERT-base architecture with
-//!   mean-pooling over the masked sequence; the original pgmcp embedder.
-//!   Phase 1 keeps it alive during the BGE-M3 migration window so the
-//!   embedding-migration cron can dual-read against both columns.
-//! - **`bge-m3`** (Phase 1, 1024d) — XLM-RoBERTa-Large with CLS pooling
-//!   and L2 normalization. Multilingual; Matryoshka-truncatable. The
-//!   eventual replacement.
+//! - **`bge-m3`** (1024d) — XLM-RoBERTa-Large with CLS pooling and L2
+//!   normalization. Multilingual; Matryoshka-truncatable. This is the
+//!   only supported embedding model; the legacy MiniLM/384d path has
+//!   been removed.
 //!
 //! One `Embedder` per worker thread, bound to one device. `embed()` runs
 //! one forward pass per inference sub-batch (size capped by
@@ -22,7 +19,6 @@ use std::path::{Path, PathBuf};
 
 use candle_core::{DType, Device, Tensor};
 use candle_nn::{Linear, Module, VarBuilder};
-use candle_transformers::models::bert::{BertModel, Config as BertConfig, DTYPE as BERT_DTYPE};
 use candle_transformers::models::xlm_roberta::{Config as XlmRobertaConfig, XLMRobertaModel};
 use hf_hub::api::sync::Api;
 use pgvector::SparseVector;
@@ -31,32 +27,10 @@ use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams, Tr
 use crate::config::EmbeddingsConfig;
 use crate::error::{PgmcpError, Result};
 
-/// Versioned signature for the legacy MiniLM column. Stamped on rows
-/// written via the MiniLM backbone so a mixed-signature transition window
-/// cannot silently mis-rank cosine distances. See
-/// `docs/memory-server/02-phases.md` Phase 1.
-#[allow(dead_code)]
-pub const MINILM_SIGNATURE: &str = "minilm-l6-v2";
-
 /// Versioned signature for the BGE-M3 column. Bump this whenever the
 /// embedding behaviour changes in a way that would invalidate prior
 /// vectors (model swap, normalization change, instruction-prefix change).
 pub const BGE_M3_SIGNATURE: &str = "bge-m3-v1";
-
-/// Compute the embedding signature that THIS build will stamp on rows it
-/// writes for `model_name` (matching `EmbeddingsConfig::model`). Used by
-/// the daemon startup probe to compare against the signature already
-/// stored in `pgmcp_metadata.active_embedding_signature` and warn the
-/// operator when they diverge — a mismatch usually means either an
-/// incomplete migration cron run or a daemon downgrade against a
-/// newer-signature database, both of which silently degrade recall if
-/// not addressed.
-pub fn signature_for_model_name(model_name: &str) -> Result<&'static str> {
-    Ok(match ModelKind::from_config_name(model_name)? {
-        ModelKind::MiniLm => MINILM_SIGNATURE,
-        ModelKind::Bgem3 => BGE_M3_SIGNATURE,
-    })
-}
 
 /// Direct-candle embedder. Owns one model instance bound to one device.
 ///
@@ -76,21 +50,19 @@ pub struct Embedder {
     inference_batch_size: usize,
     dim: usize,
     /// BGE-M3 learned-sparse (SPLADE-style) projection head, loaded from the
-    /// checkpoint's `sparse_linear` (hidden→1). `None` for MiniLm or when the
-    /// head is absent — the sparse leg is then simply unavailable (additive;
+    /// checkpoint's `sparse_linear` (hidden→1). `None` when the head is
+    /// absent — the sparse leg is then simply unavailable (additive;
     /// dense + BM25 retrieval is unaffected). (graph-roadmap Phase 2.3)
     sparse_linear: Option<Linear>,
     /// Vocabulary size = dimensionality of the sparse vector (token-id space).
     sparse_dim: usize,
     /// BGE-M3 ColBERT multi-vector projection head (`colbert_linear`,
-    /// hidden→hidden). `None` for MiniLm / when absent. Produces per-token
+    /// hidden→hidden). `None` when absent. Produces per-token
     /// vectors for late-interaction (MaxSim) reranking (graph-roadmap Phase 2.5).
     colbert_linear: Option<Linear>,
 }
 
 enum Backbone {
-    /// BERT-base architecture, mean-pooled. 384d output.
-    MiniLm(BertModel),
     /// XLM-RoBERTa-Large, CLS-pooled. 1024d output.
     Bgem3(XLMRobertaModel),
 }
@@ -108,16 +80,6 @@ impl Embedder {
             std::fs::read_to_string(&cfg_path).map_err(|e| PgmcpError::file_io(&cfg_path, e))?;
 
         let vb = match kind {
-            ModelKind::MiniLm => {
-                let weights_path = model_dir.join("model.safetensors");
-                // SAFETY: mmap is read-only and the file is owned by the HF cache;
-                // candle's VarBuilder treats the mmap as a stable byte slice for
-                // the session lifetime.
-                unsafe {
-                    VarBuilder::from_mmaped_safetensors(&[weights_path], BERT_DTYPE, &device)
-                        .map_err(|e| PgmcpError::Embedding(format!("safetensors load: {}", e)))?
-                }
-            }
             ModelKind::Bgem3 => {
                 let weights_path = model_dir.join("pytorch_model.bin");
                 // BGE-M3 (XLM-RoBERTa-Large, ~560M params) at F32 is
@@ -136,26 +98,18 @@ impl Embedder {
                 let dtype = if device.is_cuda() {
                     DType::BF16
                 } else {
-                    BERT_DTYPE
+                    DType::F32
                 };
                 VarBuilder::from_pth(&weights_path, dtype, &device)
                     .map_err(|e| PgmcpError::Embedding(format!("pth load ({:?}): {}", dtype, e)))?
             }
         };
 
-        // Optional BGE-M3 sparse head + its dimensionality (vocab). Set inside
-        // the Bgem3 arm before `vb` is moved into the model.
-        let mut sparse_linear: Option<Linear> = None;
-        let mut sparse_dim: usize = 0;
-        let mut colbert_linear: Option<Linear> = None;
-        let backbone = match kind {
-            ModelKind::MiniLm => {
-                let bert_cfg: BertConfig = serde_json::from_str(&cfg_json)
-                    .map_err(|e| PgmcpError::Embedding(format!("bert config.json parse: {}", e)))?;
-                let model = BertModel::load(vb, &bert_cfg)
-                    .map_err(|e| PgmcpError::Embedding(format!("BertModel::load: {}", e)))?;
-                Backbone::MiniLm(model)
-            }
+        // Build the backbone plus the optional BGE-M3 sparse/ColBERT heads,
+        // binding all of them out of the match so there are no overwritten
+        // pre-initializers. `vb.pp(..)` borrows; `vb` is still moved into the
+        // model below.
+        let (backbone, sparse_linear, sparse_dim, colbert_linear) = match kind {
             ModelKind::Bgem3 => {
                 let cfg: XlmRobertaConfig = serde_json::from_str(&cfg_json).map_err(|e| {
                     PgmcpError::Embedding(format!("xlm-roberta config.json parse: {}", e))
@@ -163,15 +117,14 @@ impl Embedder {
                 // Load `sparse_linear` (hidden→1) from the same checkpoint if
                 // present. Graceful: `.ok()` so a missing/odd head just leaves
                 // the sparse leg unavailable rather than failing the embedder.
-                // `vb.pp(..)` borrows; `vb` is still moved into the model below.
-                sparse_linear = candle_nn::linear(cfg.hidden_size, 1, vb.pp("sparse_linear"))
+                let sparse_linear = candle_nn::linear(cfg.hidden_size, 1, vb.pp("sparse_linear"))
                     .or_else(|_| {
                         candle_nn::linear_no_bias(cfg.hidden_size, 1, vb.pp("sparse_linear"))
                     })
                     .ok();
-                sparse_dim = cfg.vocab_size;
+                let sparse_dim = cfg.vocab_size;
                 // ColBERT head (hidden→hidden); optional/graceful (Phase 2.5).
-                colbert_linear =
+                let colbert_linear =
                     candle_nn::linear(cfg.hidden_size, cfg.hidden_size, vb.pp("colbert_linear"))
                         .or_else(|_| {
                             candle_nn::linear_no_bias(
@@ -183,7 +136,12 @@ impl Embedder {
                         .ok();
                 let model = XLMRobertaModel::new(&cfg, vb)
                     .map_err(|e| PgmcpError::Embedding(format!("XLMRobertaModel::new: {}", e)))?;
-                Backbone::Bgem3(model)
+                (
+                    Backbone::Bgem3(model),
+                    sparse_linear,
+                    sparse_dim,
+                    colbert_linear,
+                )
             }
         };
 
@@ -478,7 +436,7 @@ impl Embedder {
         Ok(result)
     }
 
-    /// Output embedding dimension (384 for MiniLM-L6-v2, 1024 for BGE-M3).
+    /// Output embedding dimension (1024 for BGE-M3).
     #[allow(dead_code)]
     pub fn dim(&self) -> usize {
         self.dim
@@ -491,7 +449,6 @@ impl Embedder {
     #[allow(dead_code)]
     pub fn signature(&self) -> &'static str {
         match self.backbone {
-            Backbone::MiniLm(_) => MINILM_SIGNATURE,
             Backbone::Bgem3(_) => BGE_M3_SIGNATURE,
         }
     }
@@ -565,14 +522,6 @@ impl Embedder {
             .map_err(|e| PgmcpError::Embedding(format!("token_type_ids tensor: {}", e)))?;
 
         let pooled = match &self.backbone {
-            Backbone::MiniLm(bert) => {
-                let hidden = bert
-                    .forward(&input_ids_t, &token_type_ids_t, Some(&attention_mask_t))
-                    .map_err(|e| PgmcpError::Embedding(format!("BERT forward: {}", e)))?;
-                // hidden: (batch, seq_len, hidden_dim) → mean-pool with mask
-                mean_pool_with_mask(&hidden, &attention_mask_t)
-                    .map_err(|e| PgmcpError::Embedding(format!("mean_pool: {}", e)))?
-            }
             Backbone::Bgem3(xlm) => {
                 let hidden = xlm
                     .forward(
@@ -612,14 +561,12 @@ impl Embedder {
 /// Closed-set model selector. New backbones land here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ModelKind {
-    MiniLm,
     Bgem3,
 }
 
 impl ModelKind {
     fn from_config_name(name: &str) -> Result<Self> {
         match name {
-            "all-MiniLM-L6-v2" => Ok(Self::MiniLm),
             "bge-m3" | "BAAI/bge-m3" => Ok(Self::Bgem3),
             other => Err(PgmcpError::Embedding(format!(
                 "Unsupported embedding model: {}",
@@ -630,25 +577,22 @@ impl ModelKind {
 
     fn hf_repo(self) -> &'static str {
         match self {
-            Self::MiniLm => "sentence-transformers/all-MiniLM-L6-v2",
             Self::Bgem3 => "BAAI/bge-m3",
         }
     }
 
     fn model_files(self) -> &'static [&'static str] {
         match self {
-            Self::MiniLm => &["model.safetensors", "config.json", "tokenizer.json"],
             // BGE-M3 ships its weights as `pytorch_model.bin` (no top-level
             // `model.safetensors` exists in the BAAI/bge-m3 HF repo at any
-            // revision — verified via the HF API). The loader branches on
-            // ModelKind to use `VarBuilder::from_pth` for this file.
+            // revision — verified via the HF API). The loader uses
+            // `VarBuilder::from_pth` for this file.
             Self::Bgem3 => &["pytorch_model.bin", "config.json", "tokenizer.json"],
         }
     }
 
     fn default_max_length(self) -> usize {
         match self {
-            Self::MiniLm => 512,
             // BGE-M3 supports up to 8192 but inference at 8k is impractical
             // on consumer hardware; cap at 512 for parity with the existing
             // chunker output (paragraph-class chunks fit easily).
@@ -658,7 +602,6 @@ impl ModelKind {
 
     fn output_dim(self) -> usize {
         match self {
-            Self::MiniLm => 384,
             Self::Bgem3 => 1024,
         }
     }
@@ -676,8 +619,8 @@ fn resolve_device(use_gpu: bool) -> Result<Device> {
 }
 
 /// Ensure model files are available locally, downloading via hf-hub on
-/// cold caches. Returns the directory containing `model.safetensors`,
-/// `config.json`, and `tokenizer.json`.
+/// cold caches. Returns the directory containing the model weights
+/// (`pytorch_model.bin`), `config.json`, and `tokenizer.json`.
 /// Serializes first-time model-file downloads across embedder constructions.
 /// Pool workers (`pool_size` copies) and the embedding-migration cron each build
 /// their own `Embedder`; on a cold HF cache they would otherwise race hf-hub's
@@ -705,20 +648,6 @@ fn ensure_model_files(kind: ModelKind) -> Result<PathBuf> {
         }
     }
     dir.ok_or_else(|| PgmcpError::Embedding("hf cache resolution".into()))
-}
-
-/// Mean pool the per-token hidden states using the attention mask,
-/// yielding a (batch, hidden_dim) tensor. Used for MiniLM.
-fn mean_pool_with_mask(
-    hidden: &Tensor,
-    mask: &Tensor,
-) -> std::result::Result<Tensor, candle_core::Error> {
-    // hidden: (b, s, d); mask: (b, s)
-    let mask = mask.to_dtype(DType::F32)?.unsqueeze(2)?; // (b, s, 1)
-    let masked = hidden.broadcast_mul(&mask)?; // (b, s, d)
-    let summed = masked.sum(1)?; // (b, d)
-    let counts = mask.sum(1)?.clamp(1f32, f32::INFINITY)?; // (b, 1)
-    summed.broadcast_div(&counts)
 }
 
 /// CLS pool: take the first token's hidden state from each row. Used for
@@ -816,10 +745,6 @@ mod tests {
     #[test]
     fn model_kind_dispatch_matches_string_names() {
         assert_eq!(
-            ModelKind::from_config_name("all-MiniLM-L6-v2").unwrap(),
-            ModelKind::MiniLm
-        );
-        assert_eq!(
             ModelKind::from_config_name("bge-m3").unwrap(),
             ModelKind::Bgem3
         );
@@ -828,28 +753,11 @@ mod tests {
             ModelKind::Bgem3
         );
         assert!(ModelKind::from_config_name("unsupported").is_err());
-    }
-
-    #[test]
-    fn signature_for_model_name_matches_kind_constants() {
-        assert_eq!(
-            signature_for_model_name("all-MiniLM-L6-v2").unwrap(),
-            MINILM_SIGNATURE
-        );
-        assert_eq!(
-            signature_for_model_name("bge-m3").unwrap(),
-            BGE_M3_SIGNATURE
-        );
-        assert_eq!(
-            signature_for_model_name("BAAI/bge-m3").unwrap(),
-            BGE_M3_SIGNATURE
-        );
-        assert!(signature_for_model_name("totally-fake-model").is_err());
+        assert!(ModelKind::from_config_name("all-MiniLM-L6-v2").is_err());
     }
 
     #[test]
     fn output_dim_and_signature_are_correct_per_kind() {
-        assert_eq!(ModelKind::MiniLm.output_dim(), 384);
         assert_eq!(ModelKind::Bgem3.output_dim(), 1024);
     }
 

@@ -108,18 +108,21 @@ SELECT COUNT(*) FROM file_chunks c JOIN indexed_files f ON f.id=c.file_id
 WHERE c.contextual_text IS NULL AND c.embedding_v2 IS NOT NULL;   -- target: 0
 ```
 
-**As-built status (2026-05-26):** Fixes 1–2 landed; nextest-green (1162/1162, 0
-skipped); my files fmt-clean; release binary rebuilt (00:20, predates a
-concurrent A2A-session build break — see below). Drain config staged
-(`pool_size=1`, `interval=120`, `max_batches=128`). The drain is **ON HOLD per
-the operator's choice** to wait for the concurrent A2A/RLM session to finish
-compiling and do a single unified rebuild+restart; on that restart the cron
-drains `contextual_text` to 0 (to be monitored), after which `pool_size→2` /
-`interval→0` is reverted for a final restart. Whole-tree `verify.sh` is
-currently red **only** because the concurrent A2A session left the tree
-non-compiling (`E0308` in `tool_a2a_pattern_recursive.rs` after an `rlm.rs`
-signature change) + 2 unformatted A2A files — none of which is this change; my
-three files pass fmt/build/clippy/tests.
+**As-built status (2026-05-26, COMPLETE):** Fixes 1–2 landed; nextest-green
+(1162/1162); my files fmt-clean; release binary rebuilt (00:20). The operator
+folded the drain into their concurrent A2A/RLM session's unified rebuild+restart
+(daemon up ~11:17). Daemon reached Ready ~11:30; the migration cron then drained
+`contextual_text` from 382,446 to **0 at 17:47** (~6.3h, ~17 rows/sec,
+GPU-bound, no stall) — coverage **414,745 / 414,772 = 99.99%** (the remainder is
+steady-state churn from files indexed after 0, swept by the still-running cron).
+Drain config then reverted: `pool_size 1→2`, `embedding_migration_interval_secs
+120→0` (cron disabled per Q1 "then stop"), `max_batches` override removed —
+effective on the next daemon restart. Dense cutover stayed clean throughout
+(`active=bge-m3-v1`, 0 NULL dense, `safe_to_promote: true`). Final whole-tree
+`verify.sh` is gated on the concurrent A2A session compiling (it was mid-refactor
+— `E0583` `mod acceptance` / earlier `E0308`); my three files pass
+fmt/build/clippy/tests + nextest, and the A2A session's own verify.sh run covers
+them.
 
 ## 6. Verification
 

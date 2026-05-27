@@ -821,32 +821,22 @@ pub async fn insert_prompt(
     sha256: &str,
     embedding: Option<&[f32]>,
 ) -> Result<i64, sqlx::Error> {
-    // Phase 5 C3: dispatch on embedding dim. NULL embeddings stay
-    // NULL on the legacy column (the cron will pick them up to fill
-    // embedding_v2 once the model is configured for BGE-M3). Plan
-    // reference:
-    // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
-    // Phase 5 C3.
-    let id: i64 = match embedding.map(<[f32]>::len) {
-        Some(384) => {
-            let vector = Vector::from(embedding.unwrap().to_vec());
-            sqlx::query_scalar(
-                "INSERT INTO session_prompts
-                    (session_id, prompt_text, prompt_sha256,
-                     embedding, embedding_signature)
-                 VALUES ($1, $2, $3, $4, 'minilm-l6-v2')
-                 ON CONFLICT (session_id, prompt_sha256) DO UPDATE SET ts = NOW()
-                 RETURNING id",
-            )
-            .bind(session_id)
-            .bind(text)
-            .bind(sha256)
-            .bind(vector)
-            .fetch_one(pool)
-            .await?
-        }
-        Some(1024) => {
-            let vector = Vector::from(embedding.unwrap().to_vec());
+    // BGE-M3/1024-only: write the embedding to `embedding_v2` and stamp
+    // the active signature. NULL embeddings stay NULL on `embedding_v2`
+    // (the cron will pick them up to fill it once a model is configured).
+    // Any non-1024 vector is rejected up front — the legacy 384/MiniLM
+    // path and its `embedding` column have been removed.
+    if let Some(n) = embedding.map(<[f32]>::len)
+        && n != 1024
+    {
+        return Err(sqlx::Error::Protocol(format!(
+            "insert_prompt: unsupported embedding dim {n} \
+             (expected a 1024-dimension BGE-M3 embedding, got {n})"
+        )));
+    }
+    let id: i64 = match embedding {
+        Some(values) => {
+            let vector = Vector::from(values.to_vec());
             sqlx::query_scalar(
                 "INSERT INTO session_prompts
                     (session_id, prompt_text, prompt_sha256,
@@ -861,13 +851,6 @@ pub async fn insert_prompt(
             .bind(vector)
             .fetch_one(pool)
             .await?
-        }
-        Some(other) => {
-            return Err(sqlx::Error::Protocol(format!(
-                "insert_prompt: unsupported embedding dim {other} \
-                 (expected 384 for MiniLM-L6-v2 or 1024 for BGE-M3); \
-                 run `pgmcp embed-cutover --check`"
-            )));
         }
         None => {
             sqlx::query_scalar(

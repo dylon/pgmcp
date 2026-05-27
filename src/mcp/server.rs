@@ -2527,6 +2527,222 @@ pub struct A2aReportOutcomeParams {
     pub agent_id: Option<String>,
 }
 
+// ── Scientific-experiment subsystem ─────────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentOpenParams {
+    #[schemars(description = "Short experiment title (also the ledger filename stem)")]
+    pub title: String,
+    #[schemars(description = "The observation/question driving the experiment")]
+    pub question: String,
+    #[schemars(description = "Problem statement / reproduction / motivation")]
+    pub context: Option<String>,
+    #[schemars(
+        description = "Kind: optimization | feature_refactor | feature_addition | bugfix | investigation | other (default other)"
+    )]
+    pub kind: Option<String>,
+    #[schemars(description = "Owning project id; omit for a workspace-general experiment")]
+    pub project_id: Option<i32>,
+    #[schemars(description = "The first hypothesis statement (testable prediction)")]
+    pub hypothesis: String,
+    #[schemars(description = "Primary metric name, e.g. \"p99_latency_ms\", \"lcom4\"")]
+    pub primary_metric: String,
+    #[schemars(description = "Metric unit, e.g. \"ms\", \"MiB\", \"qps\"")]
+    pub unit: Option<String>,
+    #[schemars(description = "Predicted effect direction: increase | decrease | either | none")]
+    pub predicted_direction: Option<String>,
+    #[schemars(
+        description = "For the default criterion's tail when none is supplied: true ⇒ lower metric is better (default true)"
+    )]
+    pub lower_is_better: Option<bool>,
+    #[schemars(
+        description = "Pre-registered acceptance criterion as JSON (e.g. {\"type\":\"welch_t\",\"alpha\":0.05,\"tail\":\"less\",\"min_effect\":{\"kind\":\"cohens_d\",\"threshold\":0.5}}). Omit for the kind default."
+    )]
+    pub acceptance_criterion: Option<serde_json::Value>,
+    #[schemars(
+        description = "Expected standardized effect (Cohen's d) for power-based sample sizing"
+    )]
+    pub expected_effect: Option<f64>,
+    #[schemars(description = "Hardware descriptor JSON {host, gpu, cpu, ram_gb, os}")]
+    pub hardware: Option<serde_json::Value>,
+    #[schemars(description = "Git commit/branch at open time")]
+    pub git_ref: Option<String>,
+    #[schemars(description = "Plan / ADR reference path")]
+    pub plan_ref: Option<String>,
+    #[schemars(description = "Explicit slug; auto-derived from title when omitted")]
+    pub slug: Option<String>,
+    #[schemars(
+        description = "Workspace/relative paths to anchor this experiment to (code it concerns)"
+    )]
+    pub anchor_paths: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentProtocolParams {
+    #[schemars(description = "Experiment id (or use slug)")]
+    pub experiment_id: Option<i64>,
+    #[schemars(description = "Experiment slug (or use experiment_id)")]
+    pub slug: Option<String>,
+    #[schemars(description = "Hypothesis id; defaults to the experiment's first hypothesis")]
+    pub hypothesis_id: Option<i64>,
+    #[schemars(description = "Refined expected effect (Cohen's d) to re-size the sample")]
+    pub expected_effect: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentRecordMeasurementParams {
+    #[schemars(description = "Experiment id")]
+    pub experiment_id: i64,
+    #[schemars(description = "Hypothesis id this measurement is for (recommended)")]
+    pub hypothesis_id: Option<i64>,
+    #[schemars(description = "Arm label, e.g. \"control\" | \"treatment\" | a free label")]
+    pub arm_label: String,
+    #[schemars(description = "Arm kind: control | treatment | baseline")]
+    pub arm_kind: String,
+    #[schemars(
+        description = "Metric name (matches the hypothesis's primary_metric or a secondary)"
+    )]
+    pub metric: String,
+    #[schemars(description = "Metric unit")]
+    pub unit: Option<String>,
+    #[schemars(description = "Raw per-replicate (or per-unit) sample values")]
+    pub samples: Vec<f64>,
+    #[schemars(
+        description = "Per-sample keys (e.g. file paths) for paired tests; must align 1:1 with samples"
+    )]
+    pub unit_keys: Option<Vec<String>>,
+    #[schemars(description = "Mark these as warm-up samples (excluded from the test)")]
+    pub is_warmup: Option<bool>,
+    #[schemars(
+        description = "Metric source: external_benchmark | pgmcp_metric | agent_scalar | manual (default manual)"
+    )]
+    pub source: Option<String>,
+    #[schemars(
+        description = "Command spec JSON {cmd,args,env,cwd,warmup,runs} or {tool,args,ref}"
+    )]
+    pub command_spec: Option<serde_json::Value>,
+    #[schemars(description = "Run plan JSON (replicates, warmup, pinning, …)")]
+    pub run_plan: Option<serde_json::Value>,
+    #[schemars(description = "Host metadata JSON (hardware, governor, pinned cores, env)")]
+    pub host_meta: Option<serde_json::Value>,
+    #[schemars(description = "Git ref this arm was measured at")]
+    pub git_ref: Option<String>,
+    #[schemars(description = "RNG seed used (for reproducibility)")]
+    pub seed: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentDecideParams {
+    #[schemars(description = "Hypothesis id to decide")]
+    pub hypothesis_id: i64,
+    #[schemars(description = "Metric to test; defaults to the hypothesis's primary_metric")]
+    pub metric: Option<String>,
+    #[schemars(description = "Control arm label (default \"control\")")]
+    pub control_arm: Option<String>,
+    #[schemars(description = "Treatment arm label (default \"treatment\")")]
+    pub treatment_arm: Option<String>,
+    #[schemars(description = "Decider id (agent/operator)")]
+    pub decided_by: Option<String>,
+    #[schemars(description = "Operator prose appended to the auto-generated rationale")]
+    pub rationale_note: Option<String>,
+    #[schemars(
+        description = "Emit a linked agent_outcomes row on accept/reject (consensus→mandate pipeline). Default true."
+    )]
+    pub link_outcome: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentSearchParams {
+    #[schemars(description = "Natural-language query, e.g. \"arena allocation on the hot path\"")]
+    pub query: String,
+    #[schemars(description = "Restrict to a project id; omit for CROSS-PROJECT recall")]
+    pub project_id: Option<i32>,
+    #[schemars(description = "Filter by kind (optimization | feature_refactor | …)")]
+    pub kind: Option<String>,
+    #[schemars(
+        description = "Filter by a hypothesis verdict (accepted | rejected | inconclusive)"
+    )]
+    pub verdict: Option<String>,
+    #[schemars(description = "Max results (default 20, max 100)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentGetParams {
+    #[schemars(description = "Experiment id (or use slug)")]
+    pub experiment_id: Option<i64>,
+    #[schemars(description = "Experiment slug (or use experiment_id)")]
+    pub slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentListParams {
+    #[schemars(description = "Filter by project id")]
+    pub project_id: Option<i32>,
+    #[schemars(description = "Filter by kind")]
+    pub kind: Option<String>,
+    #[schemars(
+        description = "Filter by status (open | measuring | decided | abandoned | superseded)"
+    )]
+    pub status: Option<String>,
+    #[schemars(description = "Max rows (default 50, max 500)")]
+    pub limit: Option<i32>,
+    #[schemars(description = "Offset for pagination (default 0)")]
+    pub offset: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentTimelineParams {
+    #[schemars(description = "Experiment id (or use slug)")]
+    pub experiment_id: Option<i64>,
+    #[schemars(description = "Experiment slug (or use experiment_id)")]
+    pub slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentLogArtifactParams {
+    #[schemars(description = "Tie to a formal experiment (omit for an ad-hoc capture)")]
+    pub experiment_id: Option<i64>,
+    #[schemars(description = "Project id for an ad-hoc (experiment-less) artifact")]
+    pub project_id: Option<i32>,
+    #[schemars(
+        description = "Artifact kind: perf | hyperfine | criterion | massif | flamegraph | log"
+    )]
+    pub kind: String,
+    #[schemars(description = "Tool that produced it, e.g. \"hyperfine\", \"valgrind\"")]
+    pub tool: Option<String>,
+    #[schemars(description = "Short label")]
+    pub label: Option<String>,
+    #[schemars(
+        description = "The captured text (perf report, hyperfine JSON, folded stacks, log…)"
+    )]
+    pub content: Option<String>,
+    #[schemars(description = "Pre-parsed metrics JSON (merged with auto-parsed ones)")]
+    pub metrics: Option<serde_json::Value>,
+    #[schemars(
+        description = "Link to an indexed file id if the artifact is also a committed file"
+    )]
+    pub file_id: Option<i64>,
+    #[schemars(description = "Git ref the artifact was captured at")]
+    pub git_ref: Option<String>,
+    #[schemars(
+        description = "Auto-parse known formats (hyperfine/criterion) into a metrics summary (default false)"
+    )]
+    pub parse: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentRenderLedgerParams {
+    #[schemars(description = "Experiment id (or use slug)")]
+    pub experiment_id: Option<i64>,
+    #[schemars(description = "Experiment slug (or use experiment_id)")]
+    pub slug: Option<String>,
+    #[schemars(
+        description = "Render and RETURN the markdown without writing the file (default false → writes under [experiments] ledger_dir relative to cwd)"
+    )]
+    pub dry_run: Option<bool>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct A2aPatternRecursiveParams {
     #[schemars(description = "The long-context question to answer")]
@@ -6152,6 +6368,214 @@ what works and what does not. Part A cross-agent best-practice exchange."
     }
 
     #[tool(
+        description = "Open a scientific experiment and PRE-REGISTER its acceptance criterion (anti-p-hacking), \
+then receive the server-prescribed PROTOCOL: required sample size (power analysis), the recommended statistical \
+test, warm-up, the data schema to submit, and a reproducibility checklist (CPU pinning, governor, hardware/seed \
+capture). USE for optimizations, feature refactors, feature additions, bug fixes, and diagnostic deep-dives. The \
+AGENT runs the work; the server dictates the methodology. Returns {experiment_id, hypothesis_id, slug, protocol}."
+    )]
+    async fn experiment_open(
+        &self,
+        Parameters(params): Parameters<ExperimentOpenParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_open",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_experiments::tool_experiment_open(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "(Re)fetch the prescribed protocol for an experiment/hypothesis — e.g. after supplying a \
+refined expected effect size to tighten the required sample count. Read-only. Returns the kind-aware protocol."
+    )]
+    async fn experiment_protocol(
+        &self,
+        Parameters(params): Parameters<ExperimentProtocolParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_protocol",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_experiments::tool_experiment_protocol(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Submit RAW per-replicate (or per-unit) samples for one arm/metric of an experiment. The \
+server stores them, upserts the run with the reported host_meta (hardware/governor/pinning), and VALIDATES \
+conformance against the prescribed protocol (sample count, warm-up). Use unit_keys for paired structural metrics."
+    )]
+    async fn experiment_record_measurement(
+        &self,
+        Parameters(params): Parameters<ExperimentRecordMeasurementParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_record_measurement",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_experiments::tool_experiment_record_measurement(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Run the PRE-REGISTERED statistical test on the recorded samples and render the verdict \
+(accepted/rejected/inconclusive). Refuses if the criterion was locked after measurements began. Persists the \
+decision, sets the hypothesis verdict, mirrors to the memory graph (PROV), and optionally graduates the result \
+into the cross-agent best-practice ledger. Returns {verdict, test_type, statistic, p_value, effect_size, CI}."
+    )]
+    async fn experiment_decide(
+        &self,
+        Parameters(params): Parameters<ExperimentDecideParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_decide",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_experiments::tool_experiment_decide(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "CROSS-PROJECT recall: \"has anyone tried X / what worked for Y / what refactor reduced \
+coupling in Z\". Semantic + full-text search over experiments, hypotheses, and decisions across ALL projects \
+(omit project_id). Filter by kind/verdict. Returns ranked experiments with verdict, p-value, and effect size."
+    )]
+    async fn experiment_search(
+        &self,
+        Parameters(params): Parameters<ExperimentSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_search",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_experiments::tool_experiment_search(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Fetch one experiment's full record: hypotheses (with their frozen criteria and verdicts) \
+and all decisions. Use experiment_id or slug."
+    )]
+    async fn experiment_get(
+        &self,
+        Parameters(params): Parameters<ExperimentGetParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_get",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_experiments::tool_experiment_get(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List experiments (paged), filterable by project / kind / status, newest first."
+    )]
+    async fn experiment_list(
+        &self,
+        Parameters(params): Parameters<ExperimentListParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_list",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_experiments::tool_experiment_list(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "The ordered event stream for an experiment (open → criterion locks → runs → decisions) — \
+the narrative of how it unfolded, useful for rendering a ledger or reviewing a diagnostic hypothesis chain."
+    )]
+    async fn experiment_timeline(
+        &self,
+        Parameters(params): Parameters<ExperimentTimelineParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_timeline",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_experiments::tool_experiment_timeline(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Capture an ad-hoc profiling/benchmark/debug artifact (perf report, hyperfine/criterion \
+JSON, massif, flamegraph, log) — tied to an experiment or free-standing. With parse=true, hyperfine/criterion \
+JSON is summarized into metrics. Indexed + embedded so `experiment_search`/grep can later find it."
+    )]
+    async fn experiment_log_artifact(
+        &self,
+        Parameters(params): Parameters<ExperimentLogArtifactParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_log_artifact",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_experiments::tool_experiment_log_artifact(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Render an experiment's structured record to a committed markdown ledger under \
+docs/scientific-ledger/ (with YAML frontmatter carrying the slug join-key). dry_run=true returns the markdown \
+without writing. The structured record is the source of truth; the ledger is the human-readable, indexed view."
+    )]
+    async fn experiment_render_ledger(
+        &self,
+        Parameters(params): Parameters<ExperimentRenderLedgerParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_render_ledger",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_experiments::tool_experiment_render_ledger(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Recursive Language Model decomposition (Part B): treat a corpus/file as an external \
 environment, decompose into snippets, recursively sub-call a peer LM over each (small context), and stitch \
 the partials — the full context is never inlined. Solves beyond-context-window queries over indexed code."
@@ -8635,6 +9059,17 @@ impl McpServer {
                 "a2a_pattern_deliberation"
                     => a2a_pattern_deliberation(A2aPatternDeliberationParams),
                 "a2a_report_outcome"     => a2a_report_outcome(A2aReportOutcomeParams),
+                // Scientific-experiment subsystem (share the tool_experiments module).
+                "experiment_open"               => experiment_open(ExperimentOpenParams) in tool_experiments,
+                "experiment_protocol"           => experiment_protocol(ExperimentProtocolParams) in tool_experiments,
+                "experiment_record_measurement" => experiment_record_measurement(ExperimentRecordMeasurementParams) in tool_experiments,
+                "experiment_decide"             => experiment_decide(ExperimentDecideParams) in tool_experiments,
+                "experiment_search"             => experiment_search(ExperimentSearchParams) in tool_experiments,
+                "experiment_get"                => experiment_get(ExperimentGetParams) in tool_experiments,
+                "experiment_list"               => experiment_list(ExperimentListParams) in tool_experiments,
+                "experiment_timeline"           => experiment_timeline(ExperimentTimelineParams) in tool_experiments,
+                "experiment_log_artifact"       => experiment_log_artifact(ExperimentLogArtifactParams) in tool_experiments,
+                "experiment_render_ledger"      => experiment_render_ledger(ExperimentRenderLedgerParams) in tool_experiments,
                 "a2a_pattern_recursive"  => a2a_pattern_recursive(A2aPatternRecursiveParams),
                 "trajectory_similarity"  => trajectory_similarity(TrajectorySimilarityParams),
                 // SOTA Phase 2 — graph algorithms

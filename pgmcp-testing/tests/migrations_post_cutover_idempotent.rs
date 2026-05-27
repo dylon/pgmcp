@@ -87,17 +87,17 @@ async fn post_cutover_runtime_paths_avoid_dropped_column() {
         .await
         .expect("post-cutover migration");
 
-    // A 384d insert must surface the clear, translated error (not a raw
-    // `column "embedding" does not exist`) because the legacy column is gone.
-    // Column resolution (SQLSTATE 42703) fires before the FK check, so an
-    // arbitrary file_id is fine.
+    // A 384d insert must surface the clear, BGE-M3/1024-only rejection
+    // (not a raw `column "embedding" does not exist`). The dimension guard
+    // in `insert_chunk` fires before any SQL, so an arbitrary file_id is fine.
     let err = pgmcp::db::queries::insert_chunk(&pool, 999_999, 0, "x", 1, 1, &vec![0.0f32; 384])
         .await
         .expect_err("384d insert must fail post-cutover (legacy column dropped)");
     let msg = format!("{err}");
+    let msg_lc = msg.to_lowercase();
     assert!(
-        msg.contains("embed-cutover") || msg.contains("bge-m3"),
-        "expected the translated cutover message, got: {msg}"
+        msg_lc.contains("bge-m3") || msg_lc.contains("1024") || msg_lc.contains("embed-cutover"),
+        "expected the BGE-M3/1024-only rejection message, got: {msg}"
     );
 
     // A read path that references the chunk-embedding column must use

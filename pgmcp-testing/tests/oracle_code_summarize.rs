@@ -43,7 +43,7 @@ async fn code_summarize_reports_correct_file_lang_topic_counts_for_synthetic_cor
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
-        Arc::new(DeterministicEmbeddingBackend::new(384));
+        Arc::new(DeterministicEmbeddingBackend::new(1024));
     let embed_source = EmbedSource::backend(embed_backend);
     let db_arc: Arc<dyn DbClient> = Arc::new(pool.clone());
     let ctx = SystemContext::production(
@@ -132,7 +132,7 @@ async fn code_summarize_brief_detail_omits_topics_field() {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
-        Arc::new(DeterministicEmbeddingBackend::new(384));
+        Arc::new(DeterministicEmbeddingBackend::new(1024));
     let embed_source = EmbedSource::backend(embed_backend);
     let db_arc: Arc<dyn DbClient> = Arc::new(pool.clone());
     let ctx = SystemContext::production(

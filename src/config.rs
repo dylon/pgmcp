@@ -49,6 +49,88 @@ pub struct Config {
     /// fields default off/inert so a stock pgmcp install behaves as before.
     #[serde(default)]
     pub a2a: A2aConfig,
+    /// `[experiments]` — scientific-experiment subsystem defaults (acceptance
+    /// α, statistical test, power target, ledger rendering, CPU-governor
+    /// enforcement). All read per-call via the live `ArcSwap<Config>`.
+    #[serde(default)]
+    pub experiments: ExperimentsConfig,
+}
+
+/// `[experiments]` — defaults the experiment-protocol engine prescribes and
+/// the runner/decide path consults. Read live (effectively hot) via
+/// `ctx.config().load()`. See
+/// `~/.claude/plans/plan-how-to-effectively-drifting-fox.md`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExperimentsConfig {
+    /// Default significance level for pre-registered NHST criteria.
+    #[serde(default = "default_experiment_alpha")]
+    pub default_alpha: f64,
+    /// Default two-sample test when the metric is stochastic ("welch_t" or
+    /// "mann_whitney_u"); the protocol may override per normality.
+    #[serde(default = "default_experiment_test")]
+    pub default_test: String,
+    /// Statistical power target used to size `required_samples_per_arm`.
+    #[serde(default = "default_experiment_power")]
+    pub default_power: f64,
+    /// Hard floor on samples/arm for stochastic metrics, regardless of the
+    /// power calculation (benchmark tails need replicates — Kalibera-Jones).
+    #[serde(default = "default_experiment_min_samples")]
+    pub min_samples_per_arm: u32,
+    /// Default multiple-comparison correction for multi-metric composites
+    /// ("benjamini_hochberg", "bonferroni", or "none").
+    #[serde(default = "default_experiment_correction")]
+    pub default_correction: String,
+    /// Embed experiment/hypothesis/decision text synchronously on write so
+    /// `experiment_search` works immediately (the cron also backfills NULLs).
+    #[serde(default = "default_true")]
+    pub embed_on_write: bool,
+    /// Render the committed markdown ledger automatically on
+    /// `experiment_decide`. Off by default so the daemon stays out of the
+    /// working tree unless asked (`experiment_render_ledger` is explicit).
+    #[serde(default)]
+    pub auto_render_ledger: bool,
+    /// Directory (relative to a project root) for rendered ledgers.
+    #[serde(default = "default_experiment_ledger_dir")]
+    pub ledger_dir: String,
+    /// When the CLI runner executes arms, refuse to run unless every pinned
+    /// CPU is on the `performance` governor (per the benchmarking mandate).
+    #[serde(default = "default_true")]
+    pub require_performance_governor: bool,
+}
+
+fn default_experiment_alpha() -> f64 {
+    0.05
+}
+fn default_experiment_test() -> String {
+    "welch_t".to_string()
+}
+fn default_experiment_power() -> f64 {
+    0.8
+}
+fn default_experiment_min_samples() -> u32 {
+    30
+}
+fn default_experiment_correction() -> String {
+    "benjamini_hochberg".to_string()
+}
+fn default_experiment_ledger_dir() -> String {
+    "docs/scientific-ledger".to_string()
+}
+
+impl Default for ExperimentsConfig {
+    fn default() -> Self {
+        Self {
+            default_alpha: default_experiment_alpha(),
+            default_test: default_experiment_test(),
+            default_power: default_experiment_power(),
+            min_samples_per_arm: default_experiment_min_samples(),
+            default_correction: default_experiment_correction(),
+            embed_on_write: default_true(),
+            auto_render_ledger: false,
+            ledger_dir: default_experiment_ledger_dir(),
+            require_performance_governor: default_true(),
+        }
+    }
 }
 
 /// `[a2a]` — Agent-to-Agent best-practice exchange + RLM tuning. Every
@@ -1464,9 +1546,10 @@ pub struct EmbeddingsConfig {
     #[serde(default)]
     pub use_gpu: bool,
     /// Maximum input token sequence length. Inputs that tokenize to more
-    /// than this are truncated. all-MiniLM-L6-v2 was trained with
-    /// `max_position_embeddings = 512`; matching that gives full fidelity.
-    /// Lowering trades long-input accuracy for transient memory.
+    /// than this are truncated. BGE-M3 (XLM-RoBERTa-Large) supports up to
+    /// 8192 positions; pgmcp caps at 512 by default, which covers the chunk
+    /// sizes this indexer produces. Lowering trades long-input accuracy for
+    /// transient memory.
     #[serde(default = "default_max_length")]
     pub max_length: usize,
     /// Cap on input texts per single forward pass inside `Embedder::embed`.
@@ -1577,10 +1660,13 @@ fn default_hnsw_max_parallel_workers() -> u32 {
 }
 
 fn default_model() -> String {
-    "all-MiniLM-L6-v2".into()
+    // ADR-005: pgmcp is BGE-M3/1024-only. MiniLM/384 is no longer supported.
+    "bge-m3".into()
 }
 fn default_dimensions() -> usize {
-    384
+    // Advisory only — the embedder's true output dim follows `model`
+    // (`ModelKind::output_dim`); BGE-M3 is 1024.
+    1024
 }
 fn default_chunk_size() -> usize {
     50
@@ -1845,14 +1931,15 @@ pub struct CronConfig {
     #[serde(default = "default_subtree_mining_interval")]
     pub subtree_mining_interval_secs: u64,
 
-    /// Interval between BGE-M3 embedding-migration cron passes in
+    /// Interval between BGE-M3 embedding-backfill cron passes in
     /// seconds (default: 0 = disabled). When non-zero, the daemon
     /// drains `file_chunks` and `session_prompts` rows whose
     /// `embedding_v2` column is NULL each tick. See
     /// `docs/memory-server/02-phases.md` Phase 1 and Phase 5 of
     /// `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`.
-    /// Setting > 0 ALONG with `[embeddings] model = "bge-m3"` enables
-    /// migration; cutover is manual via `pgmcp embed-cutover --force`.
+    /// pgmcp is BGE-M3/1024-only (ADR-005): the schema is pinned to
+    /// `bge-m3-v1` at migration time, so this cron only backfills any
+    /// 1024d columns still left NULL — there is no separate cutover step.
     #[serde(default = "default_embedding_migration_interval")]
     pub embedding_migration_interval_secs: u64,
 

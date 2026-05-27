@@ -55,7 +55,7 @@ async fn recall_prompts_returns_top_k_by_vector_similarity() {
     // Two prompts with deterministic embeddings: the "target" sits on a
     // distinctive axis so it's easy to query for.
     let target_text = "let's investigate the auth refactor compliance requirements";
-    let target_embedding: Vec<f32> = (0..384)
+    let target_embedding: Vec<f32> = (0..1024)
         .map(|i| if i == 7 { 1.0_f32 } else { 0.0 })
         .collect();
     seed_prompt(
@@ -68,7 +68,7 @@ async fn recall_prompts_returns_top_k_by_vector_similarity() {
     .await;
 
     let distractor_text = "totally unrelated question about cron schedules";
-    let distractor_embedding: Vec<f32> = (0..384)
+    let distractor_embedding: Vec<f32> = (0..1024)
         .map(|i| if i == 42 { 1.0_f32 } else { 0.0 })
         .collect();
     seed_prompt(
@@ -126,7 +126,7 @@ async fn recall_prompts_filters_by_session() {
 
     let session_a = Uuid::new_v4();
     let session_b = Uuid::new_v4();
-    let embedding: Vec<f32> = (0..384)
+    let embedding: Vec<f32> = (0..1024)
         .map(|i| if i == 11 { 1.0_f32 } else { 0.0 })
         .collect();
 

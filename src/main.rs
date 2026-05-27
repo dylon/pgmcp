@@ -1,3 +1,6 @@
+// Lifted above the default (128) for the large `serde_json::json!` stats-snapshot
+// literal in `src/stats/tracker.rs` (see src/lib.rs); unrelated to the
+// AcceptanceCriterion serde fix (adjacent tagging, ADR-006).
 #![recursion_limit = "1024"]
 
 // Phase 11: install mimalloc as the global allocator. Eliminates
@@ -25,6 +28,7 @@ mod daemon_state;
 mod db;
 mod embed;
 mod error;
+mod experiment;
 mod fcm;
 #[allow(dead_code)]
 mod fuzzy;
@@ -190,30 +194,6 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    /// Inspect or flip the BGE-M3 embedding-migration cutover. With no
-    /// flags, prints a read-only status report (--check is the default).
-    /// `--to bge-m3` flips active_embedding_signature; refuses unless
-    /// the migration cron has drained the backlog. `--to minilm`
-    /// rolls back. `--drop-legacy` drops the 384d columns and HNSW
-    /// indices after cutover is complete.
-    EmbedCutover {
-        /// Target signature: "bge-m3" (promote) or "minilm" (rollback).
-        /// Omitted = `--check` (read-only status).
-        #[arg(long)]
-        to: Option<String>,
-        /// Read-only status report (the default action).
-        #[arg(long)]
-        check: bool,
-        /// Drop the legacy 384d columns + HNSW indices after cutover.
-        #[arg(long)]
-        drop_legacy: bool,
-        /// Bypass the safety checks (backlog, daemon-model, soak time).
-        #[arg(long)]
-        force: bool,
-        /// Emit JSON output for scripted callers.
-        #[arg(long)]
-        json: bool,
-    },
     /// Import a local OSV/GHSA advisory dump into `vuln_advisories` for
     /// offline CVE matching (graph-roadmap Phase 4.5). PATH is a single
     /// `.json`, a `.jsonl`, or a directory tree of OSV JSON files. This is the
@@ -223,6 +203,18 @@ enum Commands {
     ImportAdvisories {
         /// Path to the OSV dump (file, .jsonl, or directory).
         path: std::path::PathBuf,
+    },
+    /// Perform & record scientific experiments: execute benchmark arms from a
+    /// spec (CPU-pinned, governor-checked) and submit samples, or ingest a
+    /// hyperfine/criterion artifact. (Open/decide/search via `pgmcp tool experiment_*`.)
+    Experiment {
+        #[command(subcommand)]
+        sub: cli::experiment::ExperimentCmd,
+    },
+    /// Render an experiment's scientific ledger, or inspect ledger frontmatter.
+    Ledger {
+        #[command(subcommand)]
+        sub: cli::ledger::LedgerCmd,
     },
 }
 
@@ -296,6 +288,8 @@ async fn async_main() -> anyhow::Result<()> {
         } => cli::tool::run(cfg, name, args, json, schema).await,
         Commands::Results { kind, limit } => cli::results::run(cfg, kind, limit).await,
         Commands::ImportAdvisories { path } => cli::import_advisories::run(cfg, path).await,
+        Commands::Experiment { sub } => cli::experiment::run(cfg, sub).await,
+        Commands::Ledger { sub } => cli::ledger::run(cfg, sub).await,
         Commands::A2aAdapter {
             kind,
             port,
@@ -303,43 +297,5 @@ async fn async_main() -> anyhow::Result<()> {
             register_with,
         } => cli::a2a_adapter::run(kind, port, name, register_with).await,
         Commands::Status { model, json } => cli::status::run(cfg, model, json).await,
-        Commands::EmbedCutover {
-            to,
-            check,
-            drop_legacy,
-            force,
-            json,
-        } => {
-            use cli::embed_cutover::{CutoverMode, OutputFormat};
-            let format = if json {
-                OutputFormat::Json
-            } else {
-                OutputFormat::Text
-            };
-            // Mode precedence: --drop-legacy > --to > --check (default).
-            let mode = if drop_legacy {
-                CutoverMode::DropLegacy { force }
-            } else {
-                match to.as_deref() {
-                    Some("bge-m3") | Some("bge-m3-v1") => CutoverMode::PromoteToBgeM3 { force },
-                    Some("minilm") | Some("minilm-l6-v2") | Some("all-MiniLM-L6-v2") => {
-                        CutoverMode::DemoteToMiniLm { force }
-                    }
-                    Some(other) => {
-                        anyhow::bail!(
-                            "pgmcp embed-cutover --to: unknown signature `{other}` \
-                             (expected `bge-m3` or `minilm`)"
-                        );
-                    }
-                    None => {
-                        // --check is the default; --check explicitly is
-                        // also fine (no-op vs default).
-                        let _ = check;
-                        CutoverMode::Check
-                    }
-                }
-            };
-            cli::embed_cutover::run(cfg, mode, format).await
-        }
     }
 }

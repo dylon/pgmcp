@@ -1,9 +1,8 @@
 //! `tool_lsh_clone_detection` — SimHash LSH on chunk embeddings (SOTA Phase 8.1,
 //! Indyk-Motwani STOC 1998; Datar et al. SoCG 2004).
 //!
-//! Random-hyperplane LSH: each chunk's embedding (384-d MiniLM or
-//! 1024-d BGE-M3 — selected by the active embedding signature at
-//! query time, Phase 5 C7) is projected onto 64
+//! Random-hyperplane LSH: each chunk's embedding (1024-d BGE-M3) is projected
+//! onto 64
 //! signed hyperplanes producing a 64-bit signature. Banded LSH (4 bands of
 //! 16 bits) finds candidate pairs in O(1). Re-rank by exact cosine.
 

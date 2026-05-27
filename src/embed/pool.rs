@@ -1390,10 +1390,11 @@ fn process_index_file_task(
     };
 
     // Chunk content with the language-appropriate chunker. JSONL gets
-    // record-aware variants for Claude/Codex session transcripts; latex
-    // and org get heading-aware chunking (post-pandoc plain text mostly
-    // falls back to paragraph mode internally); pdf/postscript/docx/etc.
-    // use paragraph-aware chunking; everything else uses the line chunker.
+    // record-aware variants for Claude/Codex session transcripts; latex,
+    // org, rst, and markdown get heading-aware chunking (content with no
+    // headings falls back to paragraph mode internally); pdf/postscript/
+    // docx/etc. use paragraph-aware chunking; everything else uses the
+    // line chunker.
     let mut chunks = if &*language == "jsonl" && claude_chunker::is_claude_session_transcript(&path)
     {
         claude_chunker::chunk_claude_jsonl(&content)
@@ -1401,7 +1402,7 @@ fn process_index_file_task(
         codex_chunker::chunk_codex_jsonl(&content)
     } else if &*language == "jsonl" {
         chunker::chunk_jsonl_content(&content)
-    } else if matches!(&*language, "latex" | "org" | "rst") {
+    } else if matches!(&*language, "latex" | "org" | "rst" | "markdown") {
         document_chunker::chunk_by_heading(&content, &language)
     } else if matches!(
         &*language,

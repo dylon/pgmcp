@@ -3,7 +3,7 @@
 //! Built on candle (pure-Rust BERT inference with CUDA) and
 //! `libgrammstein`'s `ModernBertEmbedder` / `ModernBertRescorer` /
 //! `Summarizer`. pgmcp's existing `src/embed/` continues to own the
-//! current MiniLM-L6-v2 path; this module adds the ModernBERT loader
+//! current BGE-M3 path; this module adds the ModernBERT loader
 //! alongside it in Phase 5.
 //!
 //! Phases that populate this module:

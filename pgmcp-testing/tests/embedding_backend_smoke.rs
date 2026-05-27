@@ -14,16 +14,16 @@ use pgmcp_testing::mocks::DeterministicEmbeddingBackend;
 
 #[tokio::test]
 async fn deterministic_backend_returns_unit_normalized_vectors() {
-    let backend = DeterministicEmbeddingBackend::new(384);
+    let backend = DeterministicEmbeddingBackend::new(1024);
     let v = backend.embed_one("hello world").await.expect("embed");
-    assert_eq!(v.len(), 384);
+    assert_eq!(v.len(), 1024);
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!((norm - 1.0).abs() < 1e-4, "‖v‖ = {}", norm);
 }
 
 #[tokio::test]
 async fn deterministic_backend_is_stable_for_same_input() {
-    let backend = DeterministicEmbeddingBackend::new(384);
+    let backend = DeterministicEmbeddingBackend::new(1024);
     let a = backend.embed_one("repeatable").await.expect("first");
     let b = backend.embed_one("repeatable").await.expect("second");
     assert_eq!(a.len(), b.len());
@@ -37,7 +37,7 @@ async fn deterministic_backend_is_stable_for_same_input() {
 
 #[tokio::test]
 async fn deterministic_backend_distinguishes_different_inputs() {
-    let backend = DeterministicEmbeddingBackend::new(384);
+    let backend = DeterministicEmbeddingBackend::new(1024);
     let a = backend.embed_one("alpha").await.expect("a");
     let b = backend.embed_one("beta").await.expect("b");
     // Not identical (extremely unlikely collision).
@@ -50,7 +50,7 @@ async fn deterministic_backend_distinguishes_different_inputs() {
 
 #[tokio::test]
 async fn deterministic_backend_embed_batch_matches_embed_one() {
-    let backend = DeterministicEmbeddingBackend::new(384);
+    let backend = DeterministicEmbeddingBackend::new(1024);
     let inputs: Vec<&str> = vec!["alpha", "beta", "gamma"];
     let batch = backend.embed_batch(&inputs).await.expect("batch");
     assert_eq!(batch.len(), 3);

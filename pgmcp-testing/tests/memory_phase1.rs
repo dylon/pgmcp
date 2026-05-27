@@ -1,15 +1,17 @@
 //! Phase 1 memory-server integration tests.
 //!
-//! Covers the BGE-M3 migration plumbing from
-//! `docs/memory-server/02-phases.md` Phase 1:
+//! Covers the BGE-M3/1024-only memory plumbing:
 //!
 //! - Schema: `embedding_v2 vector(1024)` + `embedding_signature TEXT`
 //!   exist on `file_chunks` and `session_prompts`; HNSW indices built.
-//! - Operator helpers: `migration_complete`, `promote_to_bge_m3`,
-//!   `active_embedding_signature` behave as documented.
-//! - Cutover dispatch: `recall_prompts_semantic` selects the correct
-//!   column based on the query embedding dimension (384 → legacy,
-//!   1024 → BGE-M3).
+//! - Active signature: `read_active_signature` resolves to the only
+//!   supported signature (`bge-m3-v1`) — there is no legacy default.
+//! - Read path: `recall_prompts_semantic` always reads the 1024-d
+//!   `embedding_v2` column and rejects any non-1024 query embedding.
+//!
+//! The legacy 384-d MiniLM dual-column migration window has been removed:
+//! the former dual-dim dispatch and `promote_to_bge_m3` backlog-gating
+//! tests are gone, rewritten here to assert the 1024-only invariants.
 //!
 //! Skips cleanly with `SKIPPED:` if no test DB is configured.
 //!
@@ -18,10 +20,8 @@
 //! `cargo test --test memory_phase1 -- --ignored` once the cache is
 //! warm to validate end-to-end inference.
 
-use pgmcp::cron::embedding_migration::{
-    active_embedding_signature, migration_complete, promote_to_bge_m3,
-};
 use pgmcp::db::queries::recall_prompts_semantic;
+use pgmcp::embed::signature::read_active_signature;
 use pgmcp_testing::require_test_db;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -74,117 +74,59 @@ async fn embedding_v2_column_exists_and_accepts_1024d_vector() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn active_embedding_signature_defaults_to_minilm() {
+async fn active_signature_resolves_to_bge_m3() {
     let db = require_test_db!();
     let pool = db.pool();
-    let sig = active_embedding_signature(pool)
+    // BGE-M3/1024-only: with no metadata row (or any value), the active
+    // signature resolves to the single supported signature. There is no
+    // legacy MiniLM default anymore.
+    let sig = read_active_signature(pool)
         .await
-        .expect("active_embedding_signature");
+        .expect("read_active_signature");
     assert_eq!(
-        sig, "minilm-l6-v2",
-        "pre-cutover signature must remain legacy"
+        sig.as_str(),
+        "bge-m3-v1",
+        "the only supported signature must be bge-m3-v1"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn promote_to_bge_m3_refuses_when_backlog_present_and_succeeds_with_force() {
+async fn active_signature_reads_back_stamped_metadata() {
     let db = require_test_db!();
     let pool = db.pool();
-
-    // Insert a row that lacks embedding_v2 — simulates backlog.
-    let project_id: i32 = sqlx::query_scalar(
-        "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3)
-         ON CONFLICT (path) DO UPDATE SET name = $3 RETURNING id",
-    )
-    .bind("/ws")
-    .bind("/ws/backlog-test")
-    .bind("backlog-test")
-    .fetch_one(pool)
-    .await
-    .expect("project");
-    let file_id: i64 = sqlx::query_scalar(
-        "INSERT INTO indexed_files (project_id, path, relative_path, language, size_bytes, content, line_count, modified_at) \
-         VALUES ($1, $2, $3, 'rust', 10, 'fn f() {}', 1, NOW()) RETURNING id",
-    )
-    .bind(project_id)
-    .bind("/ws/backlog-test/x.rs")
-    .bind("x.rs")
-    .fetch_one(pool)
-    .await
-    .expect("indexed_file");
+    // Stamping the canonical signature into pgmcp_metadata round-trips
+    // through the resolver. (The migration-window `promote_to_bge_m3`
+    // backlog-gating helper was removed alongside the legacy path; the
+    // durable invariant is simply that the stamped value is read back.)
     sqlx::query(
-        "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line)
-         VALUES ($1, 0, 'has no embedding_v2', 1, 1)",
+        "INSERT INTO pgmcp_metadata (key, value)
+         VALUES ('active_embedding_signature', 'bge-m3-v1')
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
     )
-    .bind(file_id)
     .execute(pool)
     .await
-    .expect("backlog chunk insert");
-
-    // migration_complete must report false now.
-    let complete = migration_complete(pool)
+    .expect("stamp bge-m3-v1 signature");
+    let sig = read_active_signature(pool)
         .await
-        .expect("migration_complete check");
-    assert!(
-        !complete,
-        "presence of NULL embedding_v2 row must keep migration_complete=false"
-    );
-
-    // Non-forced promote refuses.
-    let err = promote_to_bge_m3(pool, false).await.unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("migration incomplete"),
-        "expected refusal text; got: {msg}"
-    );
-
-    // Forced promote succeeds and flips the signature.
-    promote_to_bge_m3(pool, true)
-        .await
-        .expect("forced promote should succeed");
-    let sig = active_embedding_signature(pool)
-        .await
-        .expect("active_embedding_signature");
-    assert_eq!(sig, "bge-m3-v1");
-
-    // Reset for other tests in this transaction... actually require_test_db
-    // gives a fresh transaction per test so this is isolated already.
+        .expect("read_active_signature");
+    assert_eq!(sig.as_str(), "bge-m3-v1");
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn recall_prompts_dispatch_picks_correct_column_by_query_dim() {
+async fn recall_prompts_reads_embedding_v2_for_1024d_query() {
     let db = require_test_db!();
     let pool = db.pool();
 
-    // Seed a session + two prompts: one with a 384d embedding (legacy),
-    // one with a 1024d embedding (v2). Each lives on its own session so
-    // the test can verify column-selection without cross-talk.
+    // Seed one session + one prompt with a 1024d embedding in the
+    // canonical `embedding_v2` column. A 1024d query must surface it.
     use uuid::Uuid;
-    let sess_legacy = Uuid::new_v4();
     let sess_v2 = Uuid::new_v4();
-    pgmcp::sessions::upsert_session(pool, sess_legacy, "/ws/recall-legacy", None)
-        .await
-        .expect("session_legacy");
     pgmcp::sessions::upsert_session(pool, sess_v2, "/ws/recall-v2", None)
         .await
         .expect("session_v2");
 
-    let v384: Vec<f32> = (0..384).map(|i| if i == 5 { 1.0 } else { 0.0 }).collect();
     let v1024: Vec<f32> = (0..1024).map(|i| if i == 9 { 1.0 } else { 0.0 }).collect();
-
-    let pgv_384 = pgvector::Vector::from(v384.clone());
     let pgv_1024 = pgvector::Vector::from(v1024.clone());
-
-    sqlx::query(
-        "INSERT INTO session_prompts (session_id, prompt_text, prompt_sha256, embedding, embedding_signature)
-         VALUES ($1, 'legacy prompt', $2, $3, 'minilm-l6-v2')",
-    )
-    .bind(sess_legacy)
-    .bind(pgmcp::sessions::prompt_sha256("legacy prompt"))
-    .bind(&pgv_384)
-    .execute(pool)
-    .await
-    .expect("legacy prompt row");
 
     sqlx::query(
         "INSERT INTO session_prompts (session_id, prompt_text, prompt_sha256, embedding_v2, embedding_signature)
@@ -197,46 +139,33 @@ async fn recall_prompts_dispatch_picks_correct_column_by_query_dim() {
     .await
     .expect("v2 prompt row");
 
-    // 384d query → reads `embedding` column → finds the legacy prompt only.
-    let r_legacy = recall_prompts_semantic(pool, &v384, None, None, 5, 64)
-        .await
-        .expect("legacy recall");
-    assert!(
-        r_legacy.iter().any(|r| r.prompt_text == "legacy prompt"),
-        "legacy column reads should surface 'legacy prompt'"
-    );
-    assert!(
-        r_legacy.iter().all(|r| r.prompt_text != "v2 prompt"),
-        "legacy column reads must NOT surface the v2-only row"
-    );
-
-    // 1024d query → reads `embedding_v2` column → finds the v2 prompt only.
+    // 1024d query → reads `embedding_v2` column → finds the v2 prompt.
     let r_v2 = recall_prompts_semantic(pool, &v1024, None, None, 5, 64)
         .await
         .expect("v2 recall");
     assert!(
         r_v2.iter().any(|r| r.prompt_text == "v2 prompt"),
-        "v2 column reads should surface 'v2 prompt'"
-    );
-    assert!(
-        r_v2.iter().all(|r| r.prompt_text != "legacy prompt"),
-        "v2 column reads must NOT surface the legacy-only row"
+        "embedding_v2 reads should surface 'v2 prompt'"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn recall_prompts_rejects_unsupported_query_dim() {
+async fn recall_prompts_rejects_non_1024d_query_dim() {
     let db = require_test_db!();
     let pool = db.pool();
-    let v_bad: Vec<f32> = vec![0.0; 768]; // neither 384 nor 1024
-    let err = recall_prompts_semantic(pool, &v_bad, None, None, 5, 64)
-        .await
-        .unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("unsupported query-embedding dim"),
-        "expected dim-rejection message; got: {msg}"
-    );
+    // Both the former legacy MiniLM dim (384) and any other non-1024 dim
+    // are rejected: BGE-M3/1024 is the only supported query shape.
+    for bad_dim in [384usize, 768] {
+        let v_bad: Vec<f32> = vec![0.0; bad_dim];
+        let err = recall_prompts_semantic(pool, &v_bad, None, None, 5, 64)
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("1024-dimension BGE-M3"),
+            "expected 1024-only dim-rejection message for dim {bad_dim}; got: {msg}"
+        );
+    }
 }
 
 // ============================================================================

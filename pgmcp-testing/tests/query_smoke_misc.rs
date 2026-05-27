@@ -59,7 +59,7 @@ fn make_ctx(pool: PgPool) -> SystemContext {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn EmbeddingBackend> =
-        Arc::new(DeterministicEmbeddingBackend::new(384));
+        Arc::new(DeterministicEmbeddingBackend::new(1024));
     let embed_source = EmbedSource::backend(embed_backend);
     let lifecycle = pgmcp::daemon_state::DaemonLifecycle::new();
     lifecycle.transition(pgmcp::daemon_state::DaemonPhase::Ready);

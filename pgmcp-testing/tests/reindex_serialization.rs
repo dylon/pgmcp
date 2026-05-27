@@ -25,7 +25,7 @@ async fn tool_reindex_rejects_concurrent_invocation() {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn EmbeddingBackend> =
-        Arc::new(DeterministicEmbeddingBackend::new(384));
+        Arc::new(DeterministicEmbeddingBackend::new(1024));
     let lifecycle = DaemonLifecycle::new();
     lifecycle.transition(pgmcp::daemon_state::DaemonPhase::Ready);
     let db_client: Arc<dyn DbClient> = Arc::new(pool);

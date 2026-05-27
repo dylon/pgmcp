@@ -387,65 +387,36 @@ pub async fn insert_source_chunk(
     end_line: i32,
     embedding: &[f32],
 ) -> Result<(), sqlx::Error> {
-    // Phase 5 C3: dispatch on embedding dim. Same shape as
-    // queries::insert_chunk. Plan reference:
-    // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
-    // Phase 5 C3.
-    let embedding_vec = Vector::from(embedding.to_vec());
-    match embedding.len() {
-        384 => {
-            sqlx::query(
-                "INSERT INTO software_pattern_chunks
-                    (source_id, chunk_index, content, start_line, end_line,
-                     embedding, embedding_signature)
-                 VALUES ($1, $2, $3, $4, $5, $6, 'minilm-l6-v2')
-                 ON CONFLICT (source_id, chunk_index) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    start_line = EXCLUDED.start_line,
-                    end_line = EXCLUDED.end_line,
-                    embedding = EXCLUDED.embedding,
-                    embedding_signature = EXCLUDED.embedding_signature",
-            )
-            .bind(source_id)
-            .bind(chunk_index)
-            .bind(content)
-            .bind(start_line)
-            .bind(end_line)
-            .bind(embedding_vec)
-            .execute(pool)
-            .await
-            .map_err(super::queries::map_legacy_embedding_insert_error)?;
-        }
-        1024 => {
-            sqlx::query(
-                "INSERT INTO software_pattern_chunks
-                    (source_id, chunk_index, content, start_line, end_line,
-                     embedding_v2, embedding_signature)
-                 VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1')
-                 ON CONFLICT (source_id, chunk_index) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    start_line = EXCLUDED.start_line,
-                    end_line = EXCLUDED.end_line,
-                    embedding_v2 = EXCLUDED.embedding_v2,
-                    embedding_signature = EXCLUDED.embedding_signature",
-            )
-            .bind(source_id)
-            .bind(chunk_index)
-            .bind(content)
-            .bind(start_line)
-            .bind(end_line)
-            .bind(embedding_vec)
-            .execute(pool)
-            .await?;
-        }
-        other => {
-            return Err(sqlx::Error::Protocol(format!(
-                "insert_source_chunk: unsupported embedding dim {other} \
-                 (expected 384 for MiniLM-L6-v2 or 1024 for BGE-M3); \
-                 run `pgmcp embed-cutover --check`"
-            )));
-        }
+    // BGE-M3-only: pattern chunks are written to the 1024-d
+    // `embedding_v2` column. Same shape as queries::insert_chunk; a
+    // non-1024 dim is a configuration error.
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "insert_source_chunk: expected a 1024-dimension BGE-M3 embedding, got {}",
+            embedding.len()
+        )));
     }
+    let embedding_vec = Vector::from(embedding.to_vec());
+    sqlx::query(
+        "INSERT INTO software_pattern_chunks
+            (source_id, chunk_index, content, start_line, end_line,
+             embedding_v2, embedding_signature)
+         VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1')
+         ON CONFLICT (source_id, chunk_index) DO UPDATE SET
+            content = EXCLUDED.content,
+            start_line = EXCLUDED.start_line,
+            end_line = EXCLUDED.end_line,
+            embedding_v2 = EXCLUDED.embedding_v2,
+            embedding_signature = EXCLUDED.embedding_signature",
+    )
+    .bind(source_id)
+    .bind(chunk_index)
+    .bind(content)
+    .bind(start_line)
+    .bind(end_line)
+    .bind(embedding_vec)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -459,20 +430,15 @@ pub async fn semantic_search_patterns(
     let embedding_vec = Vector::from(embedding.to_vec());
     let paradigms = options.paradigms;
 
-    // Phase 5 C8: signature-aware column dispatch. The
-    // software_pattern_chunks table gained an `embedding_v2` column in
-    // C1; pick the right one based on the incoming query's dim.
-    let col = match embedding.len() {
-        384 => "embedding",
-        1024 => "embedding_v2",
-        other => {
-            return Err(sqlx::Error::Protocol(format!(
-                "semantic_search_patterns: unsupported query-embedding dim {other} \
-                 (expected 384 for MiniLM or 1024 for BGE-M3). \
-                 Run `pgmcp embed-cutover --check` to inspect."
-            )));
-        }
-    };
+    // BGE-M3-only: read from the 1024-d `embedding_v2` column on
+    // software_pattern_chunks. A non-1024 query embedding is rejected.
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "semantic_search_patterns: expected a 1024-dimension BGE-M3 query embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let col = "embedding_v2";
 
     let mut tx = pool.begin().await?;
     sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))

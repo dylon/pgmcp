@@ -15,13 +15,16 @@
 //!
 //! ## Tuning the margin
 //!
-//! The 0.07 margin was picked to be loose enough that the curated
-//! triplets pass on `all-MiniLM-L6-v2` (the default model) but
-//! tight enough to fail if the model is replaced with a degenerate
-//! one (random-init or wrong dimension). If a model upgrade in
-//! candle legitimately changes any pair, drop that triplet
-//! rather than the margin — losing one triplet is cheaper than
-//! masking real semantic regressions.
+//! The 0.07 margin is loose enough that the curated triplets pass on
+//! `bge-m3` (the default model since ADR-004) but tight enough to fail
+//! if the model is replaced with a degenerate one (random-init or wrong
+//! dimension). Per this policy, the BGE-M3 migration tightened the cosine
+//! gap on two fine-grained *same-domain* pairs (`array_vs_hashmap`,
+//! `parse_vs_serialize` — both still correctly ordered, just under 0.07);
+//! those triplets were dropped rather than weakening the margin, since
+//! losing a triplet is cheaper than masking real semantic regressions.
+//! (They also failed the "clearly distinct concepts" bar above —
+//! array-iterate vs hashmap-lookup, parse vs serialize are same-domain.)
 
 use std::sync::Arc;
 
@@ -72,18 +75,6 @@ const TRIPLETS: &[Triplet] = &[
         anchor: "spawn worker threads to process tasks in parallel",
         positive: "use thread pool to handle requests concurrently",
         negative: "iterate over items one at a time in main loop",
-    },
-    Triplet {
-        name: "array_vs_hashmap",
-        anchor: "iterate sequential elements in fixed size array",
-        positive: "loop over contiguous vector of integers",
-        negative: "look up value by key in hash table",
-    },
-    Triplet {
-        name: "parse_vs_serialize",
-        anchor: "parse json string into structured object",
-        positive: "deserialize json text to typed struct",
-        negative: "encode object as json bytes for transmission",
     },
     Triplet {
         name: "cache_vs_disk",

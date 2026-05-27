@@ -173,100 +173,17 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     db::migrations::run_migrations(&db_pool, &config_snapshot.vector).await?;
     info!("Database initialized");
 
-    // 1b. Embedding-signature consistency probe — Phase 5 C4 truth-table.
-    // Compares the bundled signature for the configured model against
-    // whatever this DB last wrote, and either continues, warns, or
-    // ABORTS daemon startup based on the (model, active_sig, cron_enabled)
-    // triple:
-    //
-    // | model    | active_sig    | cron enabled | Action                  |
-    // |----------|---------------|--------------|-------------------------|
-    // | MiniLM   | minilm-l6-v2  | *            | start (pre-migration)   |
-    // | BGE-M3   | minilm-l6-v2  | OFF (0)      | ABORT: enable cron first|
-    // | BGE-M3   | minilm-l6-v2  | ON (>0)      | start (mid-migration)   |
-    // | BGE-M3   | bge-m3-v1     | *            | start (post-cutover)    |
-    // | MiniLM   | bge-m3-v1     | *            | ABORT: downgrade        |
-    //
-    // The downgrade refusal is the most important guard: silently
-    // running MiniLM against a BGE-M3 database mixes 384d and 1024d
-    // queries against `embedding_v2` columns and degrades recall to
-    // random. Plan reference:
-    // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
-    // Phase 5 C4.
-    match embed::model::signature_for_model_name(&config_snapshot.embeddings.model) {
-        Ok(bundled) => {
-            match cron::embedding_migration::active_embedding_signature(&db_pool).await {
-                Ok(stored) if stored == bundled => {
-                    info!(
-                        signature = bundled,
-                        "Embedding signature consistent with DB",
-                    );
-                }
-                Ok(stored)
-                    if bundled == embed::model::BGE_M3_SIGNATURE
-                        && stored == embed::model::MINILM_SIGNATURE =>
-                {
-                    let cron_on = config_snapshot.cron.embedding_migration_interval_secs > 0;
-                    if cron_on {
-                        info!(
-                            bundled,
-                            stored = %stored,
-                            interval_secs = config_snapshot.cron.embedding_migration_interval_secs,
-                            "Daemon starting mid-migration: model is BGE-M3, DB still on MiniLM, migration cron enabled."
-                        );
-                    } else {
-                        anyhow::bail!(
-                            "Daemon refuses to start: [embeddings].model = `bge-m3` but \
-                             pgmcp_metadata.active_embedding_signature = `{stored}` AND \
-                             [cron].embedding_migration_interval_secs = 0. The migration cron \
-                             is the only way to drain the legacy `embedding` column into the new \
-                             1024d `embedding_v2` column. Set [cron].embedding_migration_interval_secs \
-                             to a positive value (e.g. 600 = 10 min) and restart, OR switch \
-                             [embeddings].model back to `all-MiniLM-L6-v2` to remain pre-migration. \
-                             Run `pgmcp embed-cutover --check` for guided diagnosis."
-                        );
-                    }
-                }
-                Ok(stored)
-                    if bundled == embed::model::MINILM_SIGNATURE
-                        && stored == embed::model::BGE_M3_SIGNATURE =>
-                {
-                    anyhow::bail!(
-                        "Daemon refuses to start: [embeddings].model = `all-MiniLM-L6-v2` \
-                         (384d) but pgmcp_metadata.active_embedding_signature = `{stored}` \
-                         (1024d). This is a DOWNGRADE — running MiniLM against a BGE-M3 \
-                         database would silently route 384d queries against the 1024d \
-                         `embedding_v2` column and corrupt recall to random. To genuinely \
-                         roll back, run `pgmcp embed-cutover --to minilm --force` first, \
-                         which restamps the signature row, then restart. Otherwise switch \
-                         [embeddings].model back to `bge-m3` to remain post-cutover."
-                    );
-                }
-                Ok(stored) => {
-                    warn!(
-                        bundled,
-                        stored = %stored,
-                        model = %config_snapshot.embeddings.model,
-                        "Embedding signature mismatch with no matching truth-table rule; \
-                         starting daemon but semantic queries may degrade. Investigate via \
-                         `pgmcp embed-cutover --check`.",
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        error = %e,
-                        "Failed to read stored embedding signature; signature consistency unverified",
-                    );
-                }
-            }
-        }
-        Err(e) => {
-            warn!(
-                error = %e,
-                model = %config_snapshot.embeddings.model,
-                "Unknown embedding model in config; signature consistency unverified",
-            );
-        }
+    // 1b. Log the active embedding signature for operator visibility. The
+    // MiniLM/384 path has been removed: BGE-M3 (bge-m3-v1, 1024-d) is the only
+    // supported signature and the schema is pinned to it at migration time, so
+    // there is no cross-signature state to guard against at startup.
+    match crate::embed::signature::read_active_signature(&db_pool).await {
+        Ok(sig) => info!(
+            signature = sig.as_str(),
+            dim = sig.dim(),
+            "Active embedding signature"
+        ),
+        Err(e) => warn!(error = %e, "Failed to read active embedding signature; continuing"),
     }
 
     // 2. Initialize stats tracker

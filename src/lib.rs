@@ -9,6 +9,11 @@
 //! Module layout mirrors `src/main.rs`; if you add a new top-level module
 //! there, add it here too so external test/example surface stays aligned.
 
+// `serde_json::json!` in `src/stats/tracker.rs` builds the stats snapshot as one
+// ~250-field object literal; the macro recurses once per field, exceeding rustc's
+// default macro-expansion depth (128). Lift it to 1024 (the long-standing value;
+// generous headroom over the literal). This is NOT related to `AcceptanceCriterion`
+// serde — that recursive enum uses adjacent tagging (ADR-006) and needs no bump.
 #![recursion_limit = "1024"]
 
 // BLAS provider for ndarray's `blas` feature (cblas-sys FFI) is wired by
@@ -29,6 +34,7 @@ pub mod daemon_state;
 pub mod db;
 pub mod embed;
 pub mod error;
+pub mod experiment;
 pub mod fcm;
 #[allow(dead_code)]
 pub mod fuzzy;

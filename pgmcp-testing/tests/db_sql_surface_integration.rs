@@ -578,10 +578,11 @@ async fn project_upsert_conflict_updates_workspace_path() {
     );
 }
 
-/// Inserting a chunk row with `embedding vector(384)` succeeds when the
-/// bound value is a 384-length f32 array.
+/// Inserting a chunk row with `embedding_v2 vector(1024)` succeeds when the
+/// bound value is a 1024-length f32 array (BGE-M3, the only supported
+/// signature; the legacy 384-d `embedding` column was dropped).
 #[tokio::test]
-async fn vector_column_accepts_384_dim_embedding() {
+async fn vector_column_accepts_1024_dim_embedding() {
     let mut txn = require_test_txn!();
     let project_id: i32 = sqlx::query_scalar(
         "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3) RETURNING id",
@@ -606,10 +607,10 @@ async fn vector_column_accepts_384_dim_embedding() {
     .fetch_one(txn.conn())
     .await
     .expect("file");
-    let embedding = pgvector::Vector::from(vec![0.1_f32; 384]);
+    let embedding = pgvector::Vector::from(vec![0.1_f32; 1024]);
     sqlx::query(
-        "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding) \
-         VALUES ($1, $2, $3, $4, $5, $6)",
+        "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding_v2, embedding_signature) \
+         VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1')",
     )
     .bind(file_id)
     .bind(0_i32)
@@ -658,19 +659,19 @@ async fn vector_cosine_similarity_ranks_nearer_vectors_higher() {
 
     // Two chunks: chunk 0 is identical to query, chunk 1 is orthogonal.
     let v_same = pgvector::Vector::from({
-        let mut v = vec![0.0_f32; 384];
+        let mut v = vec![0.0_f32; 1024];
         v[0] = 1.0;
         v
     });
     let v_other = pgvector::Vector::from({
-        let mut v = vec![0.0_f32; 384];
+        let mut v = vec![0.0_f32; 1024];
         v[1] = 1.0;
         v
     });
     for (idx, emb) in [v_same.clone(), v_other].iter().enumerate() {
         sqlx::query(
-            "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding) \
-             VALUES ($1, $2, $3, $4, $5, $6)"
+            "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding_v2, embedding_signature) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1')"
         )
         .bind(file_id)
         .bind(idx as i32)
@@ -685,7 +686,7 @@ async fn vector_cosine_similarity_ranks_nearer_vectors_higher() {
     // Order by cosine distance ascending — chunk 0 (identical) must come first.
     let rows: Vec<(i32,)> = sqlx::query_as(
         "SELECT chunk_index FROM file_chunks WHERE file_id = $1 \
-         ORDER BY embedding <=> $2 LIMIT 2",
+         ORDER BY embedding_v2 <=> $2 LIMIT 2",
     )
     .bind(file_id)
     .bind(v_same)

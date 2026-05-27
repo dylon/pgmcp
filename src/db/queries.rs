@@ -4,6 +4,10 @@
 mod queries_stats;
 pub use queries_stats::*;
 
+#[path = "queries/experiments.rs"]
+mod queries_experiments;
+pub use queries_experiments::*;
+
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
@@ -499,32 +503,6 @@ pub async fn delete_file_chunks(pool: &PgPool, file_id: i64) -> Result<(), sqlx:
     Ok(())
 }
 
-/// Translate the Postgres "undefined_column" error (SQLSTATE 42703) raised by a
-/// legacy-`embedding` (384d / MiniLM) chunk insert into a clear operator
-/// message. That arm only fires when the daemon's model emits 384d vectors; if
-/// the legacy `file_chunks.embedding` column was dropped by
-/// `embed-cutover --drop-legacy` (BGE-M3 `embedding_v2` is now canonical) the
-/// raw PG error is otherwise opaque. Non-42703 errors pass through unchanged.
-/// (Note: dim-dispatch is kept rather than signature-dispatch because
-/// mid-migration the model is BGE-M3 while the stored signature is still
-/// MiniLM — see the truth table in `src/cli/daemon.rs` — so the *actual*
-/// emitted dim, not the signature, must pick the column.)
-pub(crate) fn map_legacy_embedding_insert_error(e: sqlx::Error) -> sqlx::Error {
-    match &e {
-        sqlx::Error::Database(db) if db.code().as_deref() == Some("42703") => {
-            sqlx::Error::Protocol(
-                "chunk insert targeted the legacy 384d `embedding` column, but it \
-                 was dropped by `embed-cutover --drop-legacy` (BGE-M3 `embedding_v2` \
-                 is now canonical). The daemon model emits 384d (MiniLM) vectors — \
-                 set [embeddings].model to `bge-m3` and restart. \
-                 Run `pgmcp embed-cutover --check`."
-                    .to_string(),
-            )
-        }
-        _ => e,
-    }
-}
-
 /// Insert a chunk with its embedding.
 pub async fn insert_chunk(
     pool: &PgPool,
@@ -535,68 +513,37 @@ pub async fn insert_chunk(
     end_line: i32,
     embedding: &[f32],
 ) -> Result<(), sqlx::Error> {
-    // Phase 5 C3: dispatch on embedding dim. 384 → legacy `embedding`
-    // column with MiniLM signature; 1024 → `embedding_v2` with
-    // BGE-M3 signature. Any other dim is a configuration error
-    // (model and DB out of sync) — refuse rather than silently
-    // misroute. Plan reference:
-    // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
-    // Phase 5 C3.
-    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
-    match embedding.len() {
-        384 => {
-            sqlx::query(
-                "INSERT INTO file_chunks
-                    (file_id, chunk_index, content, start_line, end_line,
-                     embedding, embedding_signature)
-                 VALUES ($1, $2, $3, $4, $5, $6, 'minilm-l6-v2')
-                 ON CONFLICT (file_id, chunk_index) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    start_line = EXCLUDED.start_line,
-                    end_line = EXCLUDED.end_line,
-                    embedding = EXCLUDED.embedding,
-                    embedding_signature = EXCLUDED.embedding_signature",
-            )
-            .bind(file_id)
-            .bind(chunk_index)
-            .bind(content)
-            .bind(start_line)
-            .bind(end_line)
-            .bind(embedding_vec)
-            .execute(pool)
-            .await
-            .map_err(map_legacy_embedding_insert_error)?;
-        }
-        1024 => {
-            sqlx::query(
-                "INSERT INTO file_chunks
-                    (file_id, chunk_index, content, start_line, end_line,
-                     embedding_v2, embedding_signature)
-                 VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1')
-                 ON CONFLICT (file_id, chunk_index) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    start_line = EXCLUDED.start_line,
-                    end_line = EXCLUDED.end_line,
-                    embedding_v2 = EXCLUDED.embedding_v2,
-                    embedding_signature = EXCLUDED.embedding_signature",
-            )
-            .bind(file_id)
-            .bind(chunk_index)
-            .bind(content)
-            .bind(start_line)
-            .bind(end_line)
-            .bind(embedding_vec)
-            .execute(pool)
-            .await?;
-        }
-        other => {
-            return Err(sqlx::Error::Protocol(format!(
-                "insert_chunk: unsupported embedding dim {other} (expected 384 \
-                 for MiniLM-L6-v2 or 1024 for BGE-M3); daemon model and database \
-                 schema are out of sync — run `pgmcp embed-cutover --check`"
-            )));
-        }
+    // BGE-M3-only: chunks are written to the 1024-d `embedding_v2`
+    // column with the `bge-m3-v1` signature. Any other dim is a
+    // configuration error (model and DB out of sync) — refuse rather
+    // than silently misroute.
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "insert_chunk: expected a 1024-dimension BGE-M3 embedding, got {}",
+            embedding.len()
+        )));
     }
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+    sqlx::query(
+        "INSERT INTO file_chunks
+            (file_id, chunk_index, content, start_line, end_line,
+             embedding_v2, embedding_signature)
+         VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1')
+         ON CONFLICT (file_id, chunk_index) DO UPDATE SET
+            content = EXCLUDED.content,
+            start_line = EXCLUDED.start_line,
+            end_line = EXCLUDED.end_line,
+            embedding_v2 = EXCLUDED.embedding_v2,
+            embedding_signature = EXCLUDED.embedding_signature",
+    )
+    .bind(file_id)
+    .bind(chunk_index)
+    .bind(content)
+    .bind(start_line)
+    .bind(end_line)
+    .bind(embedding_vec)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -658,23 +605,22 @@ pub async fn insert_chunks_batch(
     }
     let mut tx = pool.begin().await?;
     for chunk in chunks {
-        // Phase 5 C3: dispatch on dim. Same shape as insert_chunk.
+        // BGE-M3-only: chunks are written to the 1024-d `embedding_v2`
+        // column. Same shape as insert_chunk; a non-1024 dim is a
+        // configuration error reported back through the batch outcome.
         let embedding_vec = pgvector::Vector::from(chunk.embedding.to_vec());
-        let sql = match chunk.embedding.len() {
-            384 => {
-                "INSERT INTO file_chunks
-                    (file_id, chunk_index, content, start_line, end_line,
-                     embedding, embedding_signature)
-                 VALUES ($1, $2, $3, $4, $5, $6, 'minilm-l6-v2')
-                 ON CONFLICT (file_id, chunk_index) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    start_line = EXCLUDED.start_line,
-                    end_line = EXCLUDED.end_line,
-                    embedding = EXCLUDED.embedding,
-                    embedding_signature = EXCLUDED.embedding_signature"
-            }
-            1024 => {
-                "INSERT INTO file_chunks
+        if chunk.embedding.len() != 1024 {
+            drop(tx);
+            return Ok(ChunkBatchOutcome {
+                fk_violation: false,
+                error: Some(sqlx::Error::Protocol(format!(
+                    "insert_chunks_batch: expected a 1024-dimension BGE-M3 \
+                     embedding, got {}",
+                    chunk.embedding.len()
+                ))),
+            });
+        }
+        let sql = "INSERT INTO file_chunks
                     (file_id, chunk_index, content, start_line, end_line,
                      embedding_v2, embedding_signature)
                  VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1')
@@ -683,20 +629,7 @@ pub async fn insert_chunks_batch(
                     start_line = EXCLUDED.start_line,
                     end_line = EXCLUDED.end_line,
                     embedding_v2 = EXCLUDED.embedding_v2,
-                    embedding_signature = EXCLUDED.embedding_signature"
-            }
-            other => {
-                drop(tx);
-                return Ok(ChunkBatchOutcome {
-                    fk_violation: false,
-                    error: Some(sqlx::Error::Protocol(format!(
-                        "insert_chunks_batch: unsupported embedding dim {other} \
-                         (expected 384 for MiniLM-L6-v2 or 1024 for BGE-M3); \
-                         run `pgmcp embed-cutover --check`"
-                    ))),
-                });
-            }
-        };
+                    embedding_signature = EXCLUDED.embedding_signature";
         match sqlx::query(sql)
             .bind(file_id)
             .bind(chunk.chunk_index)
@@ -717,11 +650,7 @@ pub async fn insert_chunks_batch(
                 drop(tx);
                 return Ok(ChunkBatchOutcome {
                     fk_violation: fk,
-                    error: if fk {
-                        None
-                    } else {
-                        Some(map_legacy_embedding_insert_error(e))
-                    },
+                    error: if fk { None } else { Some(e) },
                 });
             }
         }
@@ -863,21 +792,16 @@ pub async fn semantic_search(
 ) -> Result<Vec<SearchResult>, sqlx::Error> {
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
 
-    // Phase 5 C8: dispatch the query against the column whose dim
-    // matches the incoming embedding. 384 → legacy `embedding`,
-    // 1024 → `embedding_v2`. Mismatched dims surface a clear
-    // protocol error pointing at `pgmcp embed-cutover --check`.
-    let col = match embedding.len() {
-        384 => "embedding",
-        1024 => "embedding_v2",
-        other => {
-            return Err(sqlx::Error::Protocol(format!(
-                "semantic_search: unsupported query-embedding dim {other} \
-                 (expected 384 for MiniLM or 1024 for BGE-M3). \
-                 Run `pgmcp embed-cutover --check` to inspect."
-            )));
-        }
-    };
+    // BGE-M3-only: the query runs against the 1024-d `embedding_v2`
+    // column. A non-1024 query embedding is a configuration error and
+    // surfaces a clear protocol error.
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "semantic_search: expected a 1024-dimension BGE-M3 query embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let col = "embedding_v2";
 
     // Acquire a dedicated connection so ef_search applies to our query.
     // Using SET LOCAL within a transaction keeps it scoped to this operation.
@@ -1018,16 +942,13 @@ pub async fn hybrid_search_chunks(
     ef_search: i32,
     query_sparse: Option<&pgvector::SparseVector>,
 ) -> Result<Vec<SearchResult>, sqlx::Error> {
-    let col = match embedding.len() {
-        384 => "embedding",
-        1024 => "embedding_v2",
-        other => {
-            return Err(sqlx::Error::Protocol(format!(
-                "hybrid_search_chunks: unsupported query-embedding dim {other} \
-                 (expected 384 for MiniLM or 1024 for BGE-M3)."
-            )));
-        }
-    };
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "hybrid_search_chunks: expected a 1024-dimension BGE-M3 query embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let col = "embedding_v2";
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
 
     let mut tx = pool.begin().await?;
@@ -1498,12 +1419,8 @@ pub async fn project_tree(
 // 1024d BGE-M3 column).
 
 /// Vector-similarity search over `session_prompts`. Returns the top-k most
-/// similar historical prompts under the given embedding signature.
-///
-/// `signature` is the value of `session_prompts.embedding_signature` to
-/// match (e.g. `"minilm-l6-v2"` pre-cutover, `"bge-m3-v1"` post-cutover).
-/// Pre-Phase-1, the column doesn't exist yet; pass `None` to skip the
-/// signature filter and match the legacy 384d `embedding` column directly.
+/// similar historical prompts, reading from the 1024-d BGE-M3
+/// `embedding_v2` column.
 ///
 /// `project_name` and `session_id` are independent filters; both may be
 /// `None`. `limit` is clamped to [1, 200] by the caller.
@@ -1527,37 +1444,17 @@ pub async fn recall_prompts_semantic(
 ) -> Result<Vec<PromptRecallResult>, sqlx::Error> {
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
 
-    // Phase 1 cutover dispatch: query length (384 vs 1024) selects the
-    // column we read from. 384d → legacy MiniLM `embedding`; 1024d →
-    // BGE-M3 `embedding_v2`. Other dims are rejected here so an
-    // accidental mid-cutover misconfiguration surfaces as a clear error
-    // instead of as wrong-shape vector arithmetic at the pgvector layer.
-    //
-    // Phase 5 C6 invariant: under the daemon-startup truth-table refusal
-    // (`src/cli/daemon.rs::1b`), the configured `[embeddings].model`
-    // and the persisted `active_embedding_signature` are guaranteed to
-    // agree on dim (modulo the explicit mid-migration combination,
-    // where the daemon is configured for BGE-M3 and the cron drains
-    // backlog with the same model). Therefore `embedding.len()` (the
-    // dim the daemon's `Embedder` produced) is provably equal to
-    // `embed::signature::ActiveSignatureCache::current(pool).await?.dim()`
-    // for every well-aligned daemon. The dispatch-on-len here and the
-    // cache-based dispatch in C7/C8 inline-SQL tools are two sides of
-    // the same invariant; the C2 cache is the single source of truth
-    // for the *write* side (C3) and for tools that don't have a
-    // query-vector to dispatch on (C7's centroid-aggregating tools).
-    let column = match embedding.len() {
-        384 => "embedding",
-        1024 => "embedding_v2",
-        other => {
-            return Err(sqlx::Error::Protocol(format!(
-                "recall_prompts: unsupported query-embedding dim {} \
-                 (expected 384 for MiniLM or 1024 for BGE-M3). Run \
-                 `pgmcp embed-cutover --check` to inspect.",
-                other
-            )));
-        }
-    };
+    // BGE-M3-only: read from the 1024-d `embedding_v2` column. A
+    // non-1024 query embedding is rejected here so an accidental
+    // misconfiguration surfaces as a clear error instead of as
+    // wrong-shape vector arithmetic at the pgvector layer.
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "recall_prompts: expected a 1024-dimension BGE-M3 query embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let column = "embedding_v2";
 
     let mut tx = pool.begin().await?;
     sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
@@ -3938,11 +3835,10 @@ pub async fn upsert_git_commit(
     Ok(row)
 }
 
-/// Insert a git commit chunk with its embedding. Phase 5 C3:
-/// dispatch by embedding dim to legacy `embedding` (384d) or new
-/// `embedding_v2` (1024d, post-C1 schema), stamping the matching
-/// `embedding_signature`. Unsupported dims surface a clear
-/// configuration-error message pointing at `pgmcp embed-cutover --check`.
+/// Insert a git commit chunk with its embedding. BGE-M3-only: writes to
+/// the 1024-d `embedding_v2` column, stamping the `bge-m3-v1`
+/// `embedding_signature`. A non-1024 dim surfaces a clear
+/// configuration-error message.
 pub async fn insert_git_commit_chunk(
     pool: &PgPool,
     commit_id: i64,
@@ -3950,51 +3846,28 @@ pub async fn insert_git_commit_chunk(
     content: &str,
     embedding: &[f32],
 ) -> Result<(), sqlx::Error> {
-    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
-    match embedding.len() {
-        384 => {
-            sqlx::query(
-                "INSERT INTO git_commit_chunks
-                    (commit_id, chunk_index, content, embedding, embedding_signature)
-                 VALUES ($1, $2, $3, $4, 'minilm-l6-v2')
-                 ON CONFLICT (commit_id, chunk_index) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    embedding = EXCLUDED.embedding,
-                    embedding_signature = EXCLUDED.embedding_signature",
-            )
-            .bind(commit_id)
-            .bind(chunk_index)
-            .bind(content)
-            .bind(embedding_vec)
-            .execute(pool)
-            .await
-            .map_err(map_legacy_embedding_insert_error)?;
-        }
-        1024 => {
-            sqlx::query(
-                "INSERT INTO git_commit_chunks
-                    (commit_id, chunk_index, content, embedding_v2, embedding_signature)
-                 VALUES ($1, $2, $3, $4, 'bge-m3-v1')
-                 ON CONFLICT (commit_id, chunk_index) DO UPDATE SET
-                    content = EXCLUDED.content,
-                    embedding_v2 = EXCLUDED.embedding_v2,
-                    embedding_signature = EXCLUDED.embedding_signature",
-            )
-            .bind(commit_id)
-            .bind(chunk_index)
-            .bind(content)
-            .bind(embedding_vec)
-            .execute(pool)
-            .await?;
-        }
-        other => {
-            return Err(sqlx::Error::Protocol(format!(
-                "insert_git_commit_chunk: unsupported embedding dim {other} \
-                 (expected 384 for MiniLM-L6-v2 or 1024 for BGE-M3); \
-                 run `pgmcp embed-cutover --check`"
-            )));
-        }
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "insert_git_commit_chunk: expected a 1024-dimension BGE-M3 embedding, got {}",
+            embedding.len()
+        )));
     }
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+    sqlx::query(
+        "INSERT INTO git_commit_chunks
+            (commit_id, chunk_index, content, embedding_v2, embedding_signature)
+         VALUES ($1, $2, $3, $4, 'bge-m3-v1')
+         ON CONFLICT (commit_id, chunk_index) DO UPDATE SET
+            content = EXCLUDED.content,
+            embedding_v2 = EXCLUDED.embedding_v2,
+            embedding_signature = EXCLUDED.embedding_signature",
+    )
+    .bind(commit_id)
+    .bind(chunk_index)
+    .bind(content)
+    .bind(embedding_vec)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 
@@ -4053,10 +3926,8 @@ pub async fn update_blame_for_file(
     Ok(())
 }
 
-/// Semantic search across git commit chunks. Phase 5 C8: signature-
-/// aware column dispatch. `git_commit_chunks` gained an `embedding_v2`
-/// column in C1; this function picks it based on the incoming
-/// embedding's dim.
+/// Semantic search across git commit chunks. BGE-M3-only: reads from the
+/// 1024-d `embedding_v2` column on `git_commit_chunks`.
 pub async fn semantic_search_commits(
     pool: &PgPool,
     embedding: &[f32],
@@ -4064,19 +3935,15 @@ pub async fn semantic_search_commits(
     project: Option<&str>,
     ef_search: i32,
 ) -> Result<Vec<CommitSearchResult>, sqlx::Error> {
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "semantic_search_commits: expected a 1024-dimension BGE-M3 query embedding, got {}",
+            embedding.len()
+        )));
+    }
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
 
-    let col = match embedding.len() {
-        384 => "embedding",
-        1024 => "embedding_v2",
-        other => {
-            return Err(sqlx::Error::Protocol(format!(
-                "semantic_search_commits: unsupported query-embedding dim {other} \
-                 (expected 384 for MiniLM or 1024 for BGE-M3). \
-                 Run `pgmcp embed-cutover --check` to inspect."
-            )));
-        }
-    };
+    let col = "embedding_v2";
 
     let mut tx = pool.begin().await?;
     sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
@@ -8531,9 +8398,8 @@ pub async fn delete_semantic_edges_for_project(
 /// the same project; chunk pairs at/above `threshold` cosine are aggregated to
 /// file pairs (MAX cosine), and each source file keeps only its top `fanout_k`
 /// targets (the fan-out cap keeps semantic hubs from forming near-cliques that
-/// wash out community modularity). Uses the legacy `embedding` (MiniLM) column
-/// — the same column the cross-project similarity scanner probes — so coverage
-/// is independent of BGE-M3 backfill progress.
+/// wash out community modularity). Uses the active BGE-M3 `embedding_v2`
+/// column — the same column the cross-project similarity scanner probes.
 pub async fn compute_semantic_file_edges(
     pool: &PgPool,
     project_id: i32,
@@ -8650,16 +8516,15 @@ pub struct PprFileChunk {
     pub similarity: f64,
 }
 
-/// Choose the active embedding column for a query vector by its dimensionality
-/// (384 = legacy MiniLM `embedding`, 1024 = BGE-M3 `embedding_v2`).
+/// Choose the active embedding column for a query vector by its dimensionality.
+/// BGE-M3-only: the sole supported dim is 1024 → `embedding_v2`.
 fn embedding_column_for_dim(dim: usize) -> Result<&'static str, sqlx::Error> {
-    match dim {
-        384 => Ok("embedding"),
-        1024 => Ok("embedding_v2"),
-        other => Err(sqlx::Error::Protocol(format!(
-            "unsupported query-embedding dim {other} (expected 384 or 1024)"
-        ))),
+    if dim != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "unsupported query-embedding dim {dim} (expected a 1024-dimension BGE-M3 embedding)"
+        )));
     }
+    Ok("embedding_v2")
 }
 
 /// Seed files for code-PPR retrieval (Phase 3.3): the distinct files of the top
@@ -8931,8 +8796,8 @@ pub struct ChunkRerankFeature {
 }
 
 /// Fetch MMR/recency features for a set of chunk ids. `query_dim` selects the
-/// active embedding column (384 = MiniLM, 1024 = BGE-M3) so the returned vectors
-/// share the query's space.
+/// active embedding column (1024 = BGE-M3 `embedding_v2`) so the returned
+/// vectors share the query's space.
 pub async fn chunk_rerank_features(
     pool: &PgPool,
     chunk_ids: &[i64],

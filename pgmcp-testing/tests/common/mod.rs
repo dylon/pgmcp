@@ -42,7 +42,7 @@ fn server_with_db_arc(db: Arc<dyn DbClient>, cfg: Config) -> McpServer {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
-        Arc::new(DeterministicEmbeddingBackend::new(384));
+        Arc::new(DeterministicEmbeddingBackend::new(1024));
     let embed_source = EmbedSource::backend(embed_backend);
     let ctx = SystemContext::production(
         db,

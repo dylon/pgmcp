@@ -39,7 +39,7 @@ async fn batch_inserts_all_chunks_in_one_transaction() {
     .await
     .expect("seed file");
 
-    let embedding = vec![0.1_f32; 384];
+    let embedding = vec![0.1_f32; 1024];
     let chunks = vec![
         ChunkInsert {
             chunk_index: 0,
@@ -89,7 +89,7 @@ async fn batch_rolls_back_on_fk_violation_without_partial_rows() {
     // `fk_violation = true` so the caller knows to log it as such
     // rather than as an opaque error.
     let nonexistent_file_id: i64 = 99_999_999;
-    let embedding = vec![0.2_f32; 384];
+    let embedding = vec![0.2_f32; 1024];
     let chunks = vec![
         ChunkInsert {
             chunk_index: 0,
@@ -149,7 +149,7 @@ async fn batch_via_trait_routes_through_pgpool_impl() {
     .await
     .expect("seed file");
 
-    let embedding = vec![0.5_f32; 384];
+    let embedding = vec![0.5_f32; 1024];
     let outcome = db_client
         .insert_chunks_batch(
             file_id,

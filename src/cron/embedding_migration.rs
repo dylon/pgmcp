@@ -1,18 +1,19 @@
-//! Memory-server Phase 1: BGE-M3 embedding migration cron.
+//! Memory-server Phase 1: BGE-M3 `embedding_v2` NULL-backfill cron.
 //!
 //! Drains `file_chunks` and `session_prompts` rows whose `embedding_v2`
 //! column is NULL, embeds the source text with the BGE-M3 backbone, and
 //! writes back `embedding_v2` + `embedding_signature = 'bge-m3-v1'`.
 //!
-//! See `docs/memory-server/02-phases.md` Phase 1 for the broader migration
-//! design (parallel columns, manual cutover via
-//! `pgmcp_metadata.active_embedding_signature`). This module owns the
-//! background-fill half — the read-side cutover is handled in
-//! `src/db/queries.rs`.
+//! See `docs/memory-server/02-phases.md` Phase 1 for the broader design.
+//! pgmcp is BGE-M3/1024-only (ADR-005): the schema is pinned to
+//! `bge-m3-v1` at migration time, so there is no cutover step — this cron
+//! simply fills any 1024-d `embedding_v2` columns that are still NULL
+//! (e.g. rows written before a backbone was warm). The read side is
+//! handled in `src/db/queries.rs`.
 //!
 //! The cron is **off by default** in the daemon's cron registry; the
-//! operator enables it once they're ready to begin migration. While
-//! enabled, it polls on a configurable interval (default 10 minutes per
+//! operator enables it once they're ready to backfill. While enabled, it
+//! polls on a configurable interval (default 10 minutes per
 //! `EmbeddingMigrationConfig`).
 //!
 //! Each pass embeds at most `batch_size × max_batches` rows so a single
@@ -69,6 +70,10 @@ impl EmbeddingMigrationConfig {
 /// Outcome of one cron pass. Phase 5 C5: extended with four new
 /// counters covering the additional tables that the full BGE-M3
 /// migration drains beyond Phase 1's file_chunks + session_prompts.
+/// Experiment-subsystem Boy-Scout fix: `memory_observations` — the
+/// shipped memory subsystem authored this column 1024d-direct but never
+/// wrote it, so `memory_semantic_search` returned nothing for agent/LLM
+/// observations until this batch began draining the backlog.
 #[derive(Debug, Default)]
 pub struct MigrationPassReport {
     pub file_chunks_migrated: u64,
@@ -77,6 +82,14 @@ pub struct MigrationPassReport {
     pub software_pattern_chunks_migrated: u64,
     pub durable_mandates_migrated: u64,
     pub session_mandates_migrated: u64,
+    pub memory_observations_migrated: u64,
+    /// Experiment subsystem: NULL-embedding backfill for the 1024d-direct
+    /// experiment tables (synchronous embed-on-write is the primary path; this
+    /// is the robustness net for embed failures / `embed_on_write=false`).
+    pub experiments_migrated: u64,
+    pub experiment_hypotheses_migrated: u64,
+    pub experiment_results_migrated: u64,
+    pub experiment_artifacts_migrated: u64,
     /// Phase 2.3: file_chunks whose BGE-M3 learned-sparse vector was backfilled.
     pub file_chunks_sparse_backfilled: u64,
     /// Phase 2.4: file_chunks re-embedded with a contextual-retrieval prefix.
@@ -319,12 +332,95 @@ pub async fn run_embedding_migration_pass(
         }
     }
 
+    // Boy-Scout fix (experiment subsystem): drain `memory_observations`.
+    // The shipped memory server authored `embedding vector(1024)` directly
+    // but no writer ever populated it, so every dense memory-retrieval leg
+    // (memory_semantic_search / memory_hybrid_search / PPR-vector) filtered
+    // `WHERE embedding IS NOT NULL` and returned nothing. Same SKIP LOCKED
+    // batch shape as the mandate tables; only active rows (valid_to IS NULL)
+    // are embedded, kept consistent with `full_backlog_counts`.
+    for _ in 0..config.max_batches {
+        match migrate_memory_observations_batch(pool, &embedder, config.batch_size).await {
+            Ok(n) if n > 0 => {
+                report.memory_observations_migrated += n;
+                report.batches_completed += 1;
+                stats
+                    .embeddings_migrated_memory_observations
+                    .fetch_add(n, Ordering::Relaxed);
+            }
+            Ok(_) => break,
+            Err(e) => {
+                warn!(error = %e, "memory_observations migration batch failed");
+                report.errors += 1;
+                stats
+                    .embeddings_migration_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+
+    // Experiment-subsystem embedding backfill (robustness net for the
+    // 1024d-direct experiment tables; synchronous embed-on-write at
+    // experiment_open/_decide/_log_artifact is the primary path). The text per
+    // table mirrors what those tools embed. `experiments_migrated` etc. are
+    // report-only counters (no dedicated StatsTracker field, matching
+    // git_commit_chunks / software_pattern_chunks).
+    for (table, text_select) in [
+        (
+            "experiments",
+            "coalesce(title,'') || ' ' || coalesce(question,'') || ' ' || coalesce(context,'')",
+        ),
+        ("experiment_hypotheses", "statement"),
+        ("experiment_results", "coalesce(rationale, metric_name)"),
+        (
+            "experiment_artifacts",
+            "coalesce(label,'') || ' ' || left(coalesce(content,''), 280)",
+        ),
+    ] {
+        for _ in 0..config.max_batches {
+            match migrate_embedding_table_batch(
+                pool,
+                &embedder,
+                config.batch_size,
+                table,
+                text_select,
+            )
+            .await
+            {
+                Ok(n) if n > 0 => {
+                    match table {
+                        "experiments" => report.experiments_migrated += n,
+                        "experiment_hypotheses" => report.experiment_hypotheses_migrated += n,
+                        "experiment_results" => report.experiment_results_migrated += n,
+                        _ => report.experiment_artifacts_migrated += n,
+                    }
+                    report.batches_completed += 1;
+                }
+                Ok(_) => break,
+                Err(e) => {
+                    warn!(error = %e, table, "experiment embedding backfill batch failed");
+                    report.errors += 1;
+                    stats
+                        .embeddings_migration_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    }
+
     if report.file_chunks_migrated > 0
         || report.session_prompts_migrated > 0
         || report.git_commit_chunks_migrated > 0
         || report.software_pattern_chunks_migrated > 0
         || report.durable_mandates_migrated > 0
         || report.session_mandates_migrated > 0
+        || report.memory_observations_migrated > 0
+        || report.experiments_migrated > 0
+        || report.experiment_hypotheses_migrated > 0
+        || report.experiment_results_migrated > 0
+        || report.experiment_artifacts_migrated > 0
     {
         info!(
             file_chunks = report.file_chunks_migrated,
@@ -333,6 +429,11 @@ pub async fn run_embedding_migration_pass(
             software_pattern_chunks = report.software_pattern_chunks_migrated,
             durable_mandates = report.durable_mandates_migrated,
             session_mandates = report.session_mandates_migrated,
+            memory_observations = report.memory_observations_migrated,
+            experiments = report.experiments_migrated,
+            experiment_hypotheses = report.experiment_hypotheses_migrated,
+            experiment_results = report.experiment_results_migrated,
+            experiment_artifacts = report.experiment_artifacts_migrated,
             batches = report.batches_completed,
             errors = report.errors,
             "embedding-migration pass complete",
@@ -719,8 +820,8 @@ async fn migrate_durable_mandates_batch(
 /// `migrate_durable_mandates_batch`. The session mandate dedupe in
 /// `sessions::mark_near_duplicate_superseded` does NOT consume this
 /// embedding (it runs the in-process DynamicDawgChar dedup from
-/// Phase 3), but the memory-server reranker and PPR helpers do once
-/// `pgmcp embed-cutover --to bge-m3` flips the active signature.
+/// Phase 3), but the memory-server reranker and PPR helpers do once the
+/// column is backfilled.
 async fn migrate_session_mandates_batch(
     pool: &PgPool,
     embedder: &Arc<Embedder>,
@@ -766,6 +867,107 @@ async fn migrate_session_mandates_batch(
     Ok(count)
 }
 
+/// Boy-Scout fix (experiment subsystem): populate `memory_observations.embedding`.
+/// The memory server (`ensure_memory_phase2_tables`) authored this column
+/// 1024d-direct but shipped without a writer — `extractor_worker`/`reflect`
+/// only ever set provenance, never the vector — so every dense memory
+/// retrieval path silently returned nothing. Same SKIP LOCKED batch shape as
+/// `migrate_durable_mandates_batch`, scoped to active rows (`valid_to IS NULL`)
+/// so it stays consistent with `full_backlog_counts` and never embeds a
+/// soft-deleted/superseded observation.
+async fn migrate_memory_observations_batch(
+    pool: &PgPool,
+    embedder: &Arc<Embedder>,
+    batch_size: usize,
+) -> Result<u64, sqlx::Error> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, content FROM memory_observations
+         WHERE embedding IS NULL AND valid_to IS NULL
+         ORDER BY id
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(batch_size as i64)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let texts: Vec<&str> = rows.iter().map(|(_, c)| c.as_str()).collect();
+    let vectors = match embedder.embed(&texts) {
+        Ok(v) => v,
+        Err(e) => return Err(sqlx::Error::Configuration(e.to_string().into())),
+    };
+
+    let mut tx = pool.begin().await?;
+    let mut count = 0_u64;
+    for ((id, _), vec) in rows.into_iter().zip(vectors) {
+        let v = Vector::from(vec);
+        sqlx::query(
+            "UPDATE memory_observations
+             SET embedding = $1, embedding_signature = $2
+             WHERE id = $3",
+        )
+        .bind(&v)
+        .bind(BGE_M3_SIGNATURE)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        count += 1;
+    }
+    tx.commit().await?;
+    Ok(count)
+}
+
+/// Generic NULL-`embedding` backfill for a 1024d-direct table. `table` and
+/// `text_select` are TRUSTED, hardcoded-per-call-site SQL fragments (no user
+/// input → no injection); `text_select` must `coalesce` to non-NULL text.
+/// Same SKIP LOCKED batch shape as the mandate/observation backfills. Used for
+/// the experiment subsystem's `experiments`/`experiment_hypotheses`/
+/// `experiment_results`/`experiment_artifacts` embedding columns.
+async fn migrate_embedding_table_batch(
+    pool: &PgPool,
+    embedder: &Arc<Embedder>,
+    batch_size: usize,
+    table: &str,
+    text_select: &str,
+) -> Result<u64, sqlx::Error> {
+    let select_sql = format!(
+        "SELECT id, {text_select} AS t FROM {table}
+         WHERE embedding IS NULL
+         ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED"
+    );
+    let rows: Vec<(i64, String)> = sqlx::query_as(&select_sql)
+        .bind(batch_size as i64)
+        .fetch_all(pool)
+        .await?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let texts: Vec<&str> = rows.iter().map(|(_, c)| c.as_str()).collect();
+    let vectors = match embedder.embed(&texts) {
+        Ok(v) => v,
+        Err(e) => return Err(sqlx::Error::Configuration(e.to_string().into())),
+    };
+    let update_sql =
+        format!("UPDATE {table} SET embedding = $1, embedding_signature = $2 WHERE id = $3");
+    let mut tx = pool.begin().await?;
+    let mut count = 0_u64;
+    for ((id, _), vec) in rows.into_iter().zip(vectors) {
+        let v = Vector::from(vec);
+        sqlx::query(&update_sql)
+            .bind(&v)
+            .bind(BGE_M3_SIGNATURE)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        count += 1;
+    }
+    tx.commit().await?;
+    Ok(count)
+}
+
 /// Daemon-facing entry point. Logs and swallows errors so a single bad
 /// tick doesn't kill the cron thread.
 pub async fn run_or_log(
@@ -783,16 +985,18 @@ pub async fn run_or_log(
 // ============================================================================
 
 /// Returns true once every BGE-M3-migration-bearing table is fully
-/// drained (zero rows with `embedding_v2 IS NULL`, or for the mandate
-/// tables which were authored 1024d-direct, zero rows with
-/// `embedding IS NULL`).
+/// drained (zero rows with `embedding_v2 IS NULL`, or for the
+/// 1024d-direct tables — mandates, `memory_observations`, and the
+/// experiment tables — zero un-embedded rows).
 ///
-/// Phase 5 C5 extends the Phase 1 check from 2 tables to the full 6:
-/// file_chunks, session_prompts, git_commit_chunks,
-/// software_pattern_chunks, durable_mandates, session_mandates.
-/// Operators use this before flipping
-/// `pgmcp_metadata.active_embedding_signature` to `bge-m3-v1` — flipping
-/// before the drain leaves cold rows that hash against the wrong column.
+/// Phase 5 C5 extended the Phase 1 check from 2 tables to 6; the
+/// experiment subsystem brings it to 11: file_chunks, session_prompts,
+/// git_commit_chunks, software_pattern_chunks, durable_mandates,
+/// session_mandates, memory_observations (active rows only), experiments,
+/// experiment_hypotheses, experiment_results, experiment_artifacts.
+/// Reports whether the 1024-d `embedding_v2` backfill has fully drained
+/// across every bearing table — true means no rows are left with a NULL
+/// (or otherwise un-embedded) 1024-d column.
 ///
 /// Cheap to call: counts NULLs over partial indices.
 pub async fn migration_complete(pool: &PgPool) -> Result<bool, sqlx::Error> {
@@ -800,10 +1004,9 @@ pub async fn migration_complete(pool: &PgPool) -> Result<bool, sqlx::Error> {
     Ok(counts.total() == 0)
 }
 
-/// Per-table backlog counts. Used by `pgmcp embed-cutover --check`
-/// (lands in C9) to give the operator a row-level picture before the
-/// flip; `migration_complete` is the cheap boolean wrapper around
-/// `total() == 0`.
+/// Per-table backlog counts. Gives a row-level picture of how many
+/// `embedding_v2` columns the cron still has to fill; `migration_complete`
+/// is the cheap boolean wrapper around `total() == 0`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct BacklogCounts {
     pub file_chunks: i64,
@@ -812,6 +1015,11 @@ pub struct BacklogCounts {
     pub software_pattern_chunks: i64,
     pub durable_mandates: i64,
     pub session_mandates: i64,
+    pub memory_observations: i64,
+    pub experiments: i64,
+    pub experiment_hypotheses: i64,
+    pub experiment_results: i64,
+    pub experiment_artifacts: i64,
 }
 
 impl BacklogCounts {
@@ -822,20 +1030,30 @@ impl BacklogCounts {
             + self.software_pattern_chunks
             + self.durable_mandates
             + self.session_mandates
+            + self.memory_observations
+            + self.experiments
+            + self.experiment_hypotheses
+            + self.experiment_results
+            + self.experiment_artifacts
     }
 }
 
-/// Read the per-table backlog. One round trip via UNION ALL of six
+/// Read the per-table backlog. One round trip via UNION ALL of eleven
 /// COUNT(*) probes.
 pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::Error> {
-    let row: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+    let row: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
             (SELECT COUNT(*) FROM file_chunks            WHERE embedding_v2 IS NULL),
             (SELECT COUNT(*) FROM session_prompts        WHERE embedding_v2 IS NULL),
             (SELECT COUNT(*) FROM git_commit_chunks      WHERE embedding_v2 IS NULL),
             (SELECT COUNT(*) FROM software_pattern_chunks WHERE embedding_v2 IS NULL),
             (SELECT COUNT(*) FROM durable_mandates       WHERE embedding    IS NULL),
-            (SELECT COUNT(*) FROM session_mandates       WHERE embedding    IS NULL)",
+            (SELECT COUNT(*) FROM session_mandates       WHERE embedding    IS NULL),
+            (SELECT COUNT(*) FROM memory_observations    WHERE embedding    IS NULL AND valid_to IS NULL),
+            (SELECT COUNT(*) FROM experiments            WHERE embedding    IS NULL),
+            (SELECT COUNT(*) FROM experiment_hypotheses  WHERE embedding    IS NULL),
+            (SELECT COUNT(*) FROM experiment_results     WHERE embedding    IS NULL),
+            (SELECT COUNT(*) FROM experiment_artifacts   WHERE embedding    IS NULL)",
     )
     .fetch_one(pool)
     .await?;
@@ -846,6 +1064,11 @@ pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::E
         software_pattern_chunks: row.3,
         durable_mandates: row.4,
         session_mandates: row.5,
+        memory_observations: row.6,
+        experiments: row.7,
+        experiment_hypotheses: row.8,
+        experiment_results: row.9,
+        experiment_artifacts: row.10,
     })
 }
 
@@ -869,39 +1092,4 @@ async fn contextual_backlog_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
     )
     .fetch_one(pool)
     .await
-}
-
-/// Flip the cutover flag in `pgmcp_metadata`. Validates `migration_complete`
-/// first to refuse a flip while backlog remains. The caller can override
-/// the safety check with `force = true` (e.g. for tests or recoveries).
-pub async fn promote_to_bge_m3(pool: &PgPool, force: bool) -> Result<(), sqlx::Error> {
-    if !force && !migration_complete(pool).await? {
-        return Err(sqlx::Error::Configuration(
-            "embedding migration incomplete — rows still have embedding_v2 IS NULL. \
-             Pass force=true to override (not recommended)."
-                .into(),
-        ));
-    }
-    sqlx::query(
-        "INSERT INTO pgmcp_metadata (key, value)
-         VALUES ('active_embedding_signature', $1)
-         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-    )
-    .bind(BGE_M3_SIGNATURE)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-/// Read the current active embedding signature as a string. Delegates to the
-/// schema-aware resolver: when the metadata row is absent/unrecognized it
-/// infers from the physical schema (a dropped legacy `file_chunks.embedding`
-/// column ⇒ `bge-m3-v1`, else `minilm-l6-v2`). This keeps `drop_legacy`'s
-/// idempotency check correct on a re-run (the column is already gone ⇒
-/// signature reads `bge-m3-v1`, so the guard passes instead of erroring).
-pub async fn active_embedding_signature(pool: &PgPool) -> Result<String, sqlx::Error> {
-    Ok(crate::embed::signature::read_active_signature(pool)
-        .await?
-        .as_str()
-        .to_string())
 }

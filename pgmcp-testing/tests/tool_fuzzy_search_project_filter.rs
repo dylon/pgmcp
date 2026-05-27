@@ -85,7 +85,7 @@ fn build_ctx_with_data_dir(db: Arc<dyn DbClient>, data_dir: std::path::PathBuf) 
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
-        Arc::new(DeterministicEmbeddingBackend::new(384));
+        Arc::new(DeterministicEmbeddingBackend::new(1024));
     SystemContext::production(
         db,
         EmbedSource::backend(embed_backend),

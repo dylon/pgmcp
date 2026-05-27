@@ -1435,13 +1435,14 @@ pub fn schedule_maintenance_jobs(
         },
     );
 
-    // BGE-M3 embedding migration (off when interval = 0). The cron
+    // BGE-M3 embedding backfill (off when interval = 0). The cron
     // drains `file_chunks` + `session_prompts` rows whose
     // `embedding_v2` (1024d) column is NULL, embeds the source text
     // with BGE-M3, and writes back the new column plus
-    // `embedding_signature = 'bge-m3-v1'`. Cutover (flipping
-    // `pgmcp_metadata.active_embedding_signature`) remains manual via
-    // `pgmcp embed-cutover --force`.
+    // `embedding_signature = 'bge-m3-v1'`. pgmcp is BGE-M3/1024-only
+    // (ADR-005): the schema is pinned to `bge-m3-v1` at migration time,
+    // so there is no separate cutover step — this cron just fills any
+    // 1024d columns still left NULL.
     if config.embedding_migration_interval_secs > 0 {
         let db_clone_mig = Arc::clone(&db);
         let rt_clone_mig = rt.clone();

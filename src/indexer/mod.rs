@@ -6,6 +6,7 @@ pub mod contextualize;
 pub mod document_chunker;
 pub mod event_processor;
 pub mod extract;
+pub mod frontmatter;
 pub mod git_indexer;
 pub mod processor;
 pub mod scanner;

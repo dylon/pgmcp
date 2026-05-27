@@ -162,3 +162,29 @@ High-level project understanding and engineering quality assessment.
 
 ---
 
+### Scientific Experiments (10 tools)
+
+Perform & record empirical experiments (optimization / feature_refactor / feature_addition /
+bugfix / investigation) with **pre-registered** acceptance criteria. The MCP server
+prescribes the protocol (sample size via power analysis, statistical test, reproducibility
+checklist); the agent executes the work and submits raw samples; the server runs the frozen
+test and renders the verdict. Full design: `docs/experiments/README.md`.
+
+- **experiment_open** -- register an experiment + first hypothesis, pre-register the acceptance criterion (anti-p-hacking), and return the kind-aware protocol
+- **experiment_protocol** -- (re)fetch / refine the prescribed protocol
+- **experiment_record_measurement** -- submit raw per-replicate samples for an arm/metric (conformance-validated against the protocol)
+- **experiment_decide** -- run the pre-registered test → verdict (accepted/rejected/inconclusive) + effect size + CI; mirrors to the memory graph (PROV) and optionally graduates to a durable mandate
+- **experiment_search** -- cross-project "has anyone tried X / what worked for Y / what refactor reduced coupling in Z"
+- **experiment_get** / **experiment_list** / **experiment_timeline** -- full record / paged list / ordered event stream
+- **experiment_log_artifact** -- capture ad-hoc profiling/benchmark/debug output (perf / hyperfine / criterion / massif / flamegraph / log)
+- **experiment_render_ledger** -- render the structured record to a committed markdown ledger (YAML-frontmatter linked)
+
+Statistics (`src/stats/inference.rs`): Welch's t, Mann-Whitney U, Wilcoxon signed-rank,
+BCa bootstrap, Cohen's d / Cliff's δ, Anderson-Darling / D'Agostino-Pearson normality,
+TOST equivalence, Benjamini-Hochberg FDR, power-based sample sizing.
+
+CLI: `pgmcp experiment run --spec <file>` (CPU-pinned, `performance`-governor-checked
+executor) · `pgmcp experiment ingest` (hyperfine/criterion import) · `pgmcp ledger render|import`.
+
+---
+

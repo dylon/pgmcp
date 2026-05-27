@@ -35,7 +35,7 @@ fn build_ctx(db: Arc<dyn DbClient>) -> SystemContext {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
-        Arc::new(DeterministicEmbeddingBackend::new(384));
+        Arc::new(DeterministicEmbeddingBackend::new(1024));
     let embed_source = EmbedSource::backend(embed_backend);
     let lifecycle = DaemonLifecycle::new();
     SystemContext::production(

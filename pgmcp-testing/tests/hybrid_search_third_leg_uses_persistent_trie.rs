@@ -71,7 +71,7 @@ async fn seed_project_and_chunks(pool: &sqlx::PgPool, project_name: &str) -> i32
     // seeded — only chunks. The third leg's lazy-warm would find
     // an empty file_symbols set for this project, so a regression
     // back to the PG path returns a zero-vocab response.
-    let backend = DeterministicEmbeddingBackend::new(384);
+    let backend = DeterministicEmbeddingBackend::new(1024);
     let chunks = [
         "receive handler dispatch reply process emit",
         "receive socket parse decode encode transmit",
@@ -84,8 +84,8 @@ async fn seed_project_and_chunks(pool: &sqlx::PgPool, project_name: &str) -> i32
         let emb = backend.embed_one(content).await.expect("embed");
         let v = pgvector::Vector::from(emb);
         sqlx::query(
-            "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding) \
-             VALUES ($1, $2, $3, $4, $5, $6)"
+            "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding_v2, embedding_signature) \
+             VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1')"
         )
         .bind(file_id)
         .bind(i as i32)
@@ -151,7 +151,7 @@ async fn third_leg_pulls_candidates_from_persistent_trie() {
     let config = Arc::new(ArcSwap::from_pointee(cfg));
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let embed_backend: Arc<dyn EmbeddingBackend> =
-        Arc::new(DeterministicEmbeddingBackend::new(384));
+        Arc::new(DeterministicEmbeddingBackend::new(1024));
     let ctx = SystemContext::production(
         db,
         EmbedSource::backend(embed_backend),

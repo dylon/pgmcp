@@ -81,6 +81,354 @@ async fn build_hnsw_index(
     Ok(())
 }
 
+/// Scientific-experiment subsystem tables. Idempotent (`CREATE TABLE IF NOT
+/// EXISTS`), created after `ensure_memory_phase2_tables` so the FK targets
+/// (`projects`, `indexed_files`, `file_chunks`, `code_topics`,
+/// `memory_observations`) all exist. The structured experiment record is the
+/// source of truth that renders the committed `docs/scientific-ledger/*.md`
+/// ledgers; see `docs/experiments/` and the plan
+/// `~/.claude/plans/plan-how-to-effectively-drifting-fox.md`.
+///
+/// Shape follows MLflow (Experiment → Run → samples/results/artifacts) with a
+/// pre-registered, frozen acceptance criterion + a statistical decision that
+/// MLflow lacks. New tables are 1024d-direct (`embedding vector(1024)`, the
+/// `durable_mandates` model) — the embedding-migration cron backfills NULLs
+/// and `experiment_open`/`experiment_decide` embed synchronously on write.
+async fn ensure_experiment_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
+    // ENUMs (idempotent pg_type probe, matching `ensure_memory_phase2_tables`).
+    let enum_stmts = [
+        (
+            "experiment_kind",
+            "CREATE TYPE experiment_kind AS ENUM ('optimization','feature_refactor','feature_addition','bugfix','investigation','other')",
+        ),
+        (
+            "experiment_status",
+            "CREATE TYPE experiment_status AS ENUM ('open','measuring','decided','abandoned','superseded')",
+        ),
+        (
+            "hypothesis_verdict",
+            "CREATE TYPE hypothesis_verdict AS ENUM ('pending','accepted','rejected','inconclusive')",
+        ),
+        (
+            "experiment_arm_kind",
+            "CREATE TYPE experiment_arm_kind AS ENUM ('control','treatment','baseline')",
+        ),
+        (
+            "effect_direction",
+            "CREATE TYPE effect_direction AS ENUM ('increase','decrease','either','none')",
+        ),
+    ];
+    for (name, create_sql) in enum_stmts {
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname = $1)")
+                .bind(name)
+                .fetch_one(pool)
+                .await?;
+        if !exists {
+            sqlx::query(create_sql).execute(pool).await?;
+        }
+    }
+
+    // Root experiment: the observation/question + kind + provenance, with a
+    // bi-temporal supersession chain (a re-run can obsolete an earlier one).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS experiments (
+            id                  BIGSERIAL PRIMARY KEY,
+            slug                TEXT NOT NULL,
+            title               TEXT NOT NULL,
+            question            TEXT NOT NULL,
+            context             TEXT,
+            kind                experiment_kind NOT NULL DEFAULT 'other',
+            project_id          INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            status              experiment_status NOT NULL DEFAULT 'open',
+            hardware            JSONB NOT NULL DEFAULT '{}'::jsonb,
+            git_ref             TEXT,
+            plan_ref            TEXT,
+            correction          TEXT NOT NULL DEFAULT 'benjamini_hochberg',
+            embedding           vector(1024),
+            embedding_signature TEXT NOT NULL DEFAULT 'bge-m3-v1',
+            observation_id      BIGINT REFERENCES memory_observations(id) ON DELETE SET NULL,
+            decided_by          TEXT,
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_from          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_to            TIMESTAMPTZ,
+            superseded_by       BIGINT REFERENCES experiments(id),
+            UNIQUE (slug, valid_from)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let exp_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_experiments_project ON experiments (project_id) WHERE valid_to IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_experiments_status  ON experiments (status)     WHERE valid_to IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_experiments_kind    ON experiments (kind)       WHERE valid_to IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_experiments_slug    ON experiments (slug)       WHERE valid_to IS NULL",
+        "CREATE INDEX IF NOT EXISTS idx_experiments_fts ON experiments USING gin \
+         (to_tsvector('english', coalesce(title,'') || ' ' || coalesce(question,'') || ' ' || coalesce(context,'')))",
+    ];
+    for stmt in exp_indexes {
+        sqlx::query(stmt).execute(pool).await?;
+    }
+
+    // Anchor an experiment to the code it concerns (mirrors memory_code_anchor).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS experiment_code_anchor (
+            id            BIGSERIAL PRIMARY KEY,
+            experiment_id BIGINT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+            file_id       BIGINT REFERENCES indexed_files(id) ON DELETE CASCADE,
+            chunk_id      BIGINT REFERENCES file_chunks(id) ON DELETE CASCADE,
+            topic_id      BIGINT REFERENCES code_topics(id) ON DELETE CASCADE,
+            anchor_type   TEXT NOT NULL,
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            CHECK (file_id IS NOT NULL OR chunk_id IS NOT NULL OR topic_id IS NOT NULL)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_experiment_code_anchor_exp ON experiment_code_anchor (experiment_id)",
+    )
+    .execute(pool)
+    .await?;
+
+    // Hypothesis with a PRE-REGISTERED, frozen acceptance criterion. The
+    // criterion JSONB is opaque here; `crate::stats::acceptance` interprets
+    // it. `criterion_locked_at` proves the criterion predates measurement
+    // (anti-p-hacking, enforced in experiment_decide).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS experiment_hypotheses (
+            id                   BIGSERIAL PRIMARY KEY,
+            experiment_id        BIGINT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+            statement            TEXT NOT NULL,
+            primary_metric       TEXT NOT NULL,
+            unit                 TEXT,
+            predicted_direction  effect_direction NOT NULL DEFAULT 'either',
+            acceptance_criterion JSONB NOT NULL,
+            criterion_locked_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            planned_n            INTEGER,
+            verdict              hypothesis_verdict NOT NULL DEFAULT 'pending',
+            embedding            vector(1024),
+            embedding_signature  TEXT NOT NULL DEFAULT 'bge-m3-v1',
+            created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_from           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            valid_to             TIMESTAMPTZ,
+            superseded_by        BIGINT REFERENCES experiment_hypotheses(id)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let hyp_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_experiment_hypotheses_exp     ON experiment_hypotheses (experiment_id)",
+        "CREATE INDEX IF NOT EXISTS idx_experiment_hypotheses_verdict ON experiment_hypotheses (verdict)",
+        "CREATE INDEX IF NOT EXISTS idx_experiment_hypotheses_fts ON experiment_hypotheses USING gin \
+         (to_tsvector('english', coalesce(statement,'')))",
+    ];
+    for stmt in hyp_indexes {
+        sqlx::query(stmt).execute(pool).await?;
+    }
+
+    // One arm execution / metric collection. The agent reports command_spec
+    // + host_meta (hardware/governor/pinning) for reproducibility.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS experiment_runs (
+            id            UUID PRIMARY KEY,
+            experiment_id BIGINT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+            hypothesis_id BIGINT REFERENCES experiment_hypotheses(id) ON DELETE SET NULL,
+            arm_label     TEXT NOT NULL,
+            arm_kind      experiment_arm_kind NOT NULL,
+            command_spec  JSONB NOT NULL DEFAULT '{}'::jsonb,
+            run_plan      JSONB NOT NULL DEFAULT '{}'::jsonb,
+            host_meta     JSONB NOT NULL DEFAULT '{}'::jsonb,
+            git_ref       TEXT,
+            runner        TEXT,
+            seed          BIGINT NOT NULL DEFAULT 0,
+            status        TEXT NOT NULL DEFAULT 'pending',
+            error         TEXT,
+            started_at    TIMESTAMPTZ,
+            finished_at   TIMESTAMPTZ,
+            created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (experiment_id, hypothesis_id, arm_label)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_experiment_runs_exp ON experiment_runs (experiment_id)",
+    )
+    .execute(pool)
+    .await?;
+
+    // Raw per-replicate samples (row-per-replicate so warm-up is flaggable
+    // and steady-state filtering is an index predicate — Kalibera-Jones). For
+    // deterministic distribution-valued metrics (per-file complexity), one
+    // row per measured unit, keyed by `unit_key` for the paired Wilcoxon test.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS experiment_samples (
+            id              BIGSERIAL PRIMARY KEY,
+            run_id          UUID NOT NULL REFERENCES experiment_runs(id) ON DELETE CASCADE,
+            arm             TEXT NOT NULL,
+            metric_name     TEXT NOT NULL,
+            replicate_index INTEGER NOT NULL,
+            value           DOUBLE PRECISION NOT NULL,
+            unit_key        TEXT,
+            is_warmup       BOOLEAN NOT NULL DEFAULT FALSE,
+            recorded_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_experiment_samples_run ON experiment_samples \
+         (run_id, metric_name, arm) WHERE NOT is_warmup",
+    )
+    .execute(pool)
+    .await?;
+
+    // The statistical decision (verdict + full TestResult evidence).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS experiment_results (
+            id                  BIGSERIAL PRIMARY KEY,
+            experiment_id       BIGINT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
+            hypothesis_id       BIGINT NOT NULL REFERENCES experiment_hypotheses(id) ON DELETE CASCADE,
+            test_type           TEXT NOT NULL,
+            metric_name         TEXT NOT NULL,
+            control_run_id      UUID REFERENCES experiment_runs(id) ON DELETE SET NULL,
+            treatment_run_id    UUID REFERENCES experiment_runs(id) ON DELETE SET NULL,
+            statistic           DOUBLE PRECISION,
+            df                  DOUBLE PRECISION,
+            p_value             DOUBLE PRECISION,
+            effect_size         DOUBLE PRECISION,
+            effect_size_kind    TEXT,
+            ci_low              DOUBLE PRECISION,
+            ci_high             DOUBLE PRECISION,
+            ci_level            DOUBLE PRECISION DEFAULT 0.95,
+            verdict             hypothesis_verdict NOT NULL,
+            accepted            BOOLEAN NOT NULL,
+            correction          TEXT,
+            criterion_snapshot  JSONB NOT NULL DEFAULT '{}'::jsonb,
+            test_result         JSONB NOT NULL DEFAULT '{}'::jsonb,
+            rationale           TEXT,
+            decided_by          TEXT,
+            embedding           vector(1024),
+            embedding_signature TEXT NOT NULL DEFAULT 'bge-m3-v1',
+            observation_id      BIGINT REFERENCES memory_observations(id) ON DELETE SET NULL,
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let res_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_experiment_results_hyp ON experiment_results (hypothesis_id)",
+        "CREATE INDEX IF NOT EXISTS idx_experiment_results_exp ON experiment_results (experiment_id)",
+        "CREATE INDEX IF NOT EXISTS idx_experiment_results_fts ON experiment_results USING gin \
+         (to_tsvector('english', coalesce(rationale,'')))",
+    ];
+    for stmt in res_indexes {
+        sqlx::query(stmt).execute(pool).await?;
+    }
+
+    // Ad-hoc profiling/benchmark/debug capture: tied to an experiment
+    // (experiment_id set) or free-standing (`experiment_id` NULL, project_id
+    // only) for the low-ceremony "I profiled this, remember it" path.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS experiment_artifacts (
+            id                  BIGSERIAL PRIMARY KEY,
+            experiment_id       BIGINT REFERENCES experiments(id) ON DELETE CASCADE,
+            project_id          INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            kind                TEXT NOT NULL,
+            tool                TEXT,
+            label               TEXT,
+            content             TEXT,
+            content_sha256      CHAR(64),
+            metrics             JSONB NOT NULL DEFAULT '{}'::jsonb,
+            file_id             BIGINT REFERENCES indexed_files(id) ON DELETE SET NULL,
+            embedding           vector(1024),
+            embedding_signature TEXT NOT NULL DEFAULT 'bge-m3-v1',
+            git_ref             TEXT,
+            created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )",
+    )
+    .execute(pool)
+    .await?;
+    let art_indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_experiment_artifacts_exp  ON experiment_artifacts (experiment_id) WHERE experiment_id IS NOT NULL",
+        "CREATE INDEX IF NOT EXISTS idx_experiment_artifacts_proj ON experiment_artifacts (project_id, kind)",
+        "CREATE INDEX IF NOT EXISTS idx_experiment_artifacts_fts ON experiment_artifacts USING gin \
+         (to_tsvector('english', coalesce(content,'')))",
+    ];
+    for stmt in art_indexes {
+        sqlx::query(stmt).execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+/// HNSW indexes for the experiment subsystem's four embedding columns, with
+/// the same params-tracking rebuild discipline as
+/// `ensure_memory_phase2_hnsw_index` (drop + rebuild only when
+/// `[vector] m / ef_construction` change). Built on the (initially empty)
+/// `vector(1024)` columns; pgvector maintains them incrementally on insert.
+async fn ensure_experiment_hnsw_index(
+    pool: &PgPool,
+    config: &VectorConfig,
+) -> Result<(), sqlx::Error> {
+    let current_params = format!(
+        "m={},ef_construction={}",
+        config.hnsw_m, config.hnsw_ef_construction
+    );
+    // (metadata key, index name, table, embedding column)
+    let specs = [
+        (
+            "experiments_hnsw_params",
+            "idx_experiments_embedding",
+            "experiments",
+        ),
+        (
+            "experiment_hypotheses_hnsw_params",
+            "idx_experiment_hypotheses_embedding",
+            "experiment_hypotheses",
+        ),
+        (
+            "experiment_results_hnsw_params",
+            "idx_experiment_results_embedding",
+            "experiment_results",
+        ),
+        (
+            "experiment_artifacts_hnsw_params",
+            "idx_experiment_artifacts_embedding",
+            "experiment_artifacts",
+        ),
+    ];
+    for (meta_key, index_name, table) in specs {
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT value FROM pgmcp_metadata WHERE key = $1")
+                .bind(meta_key)
+                .fetch_optional(pool)
+                .await?;
+        if stored.as_deref() != Some(&current_params) {
+            sqlx::query(&format!("DROP INDEX IF EXISTS {index_name}"))
+                .execute(pool)
+                .await?;
+            let create_sql = format!(
+                "CREATE INDEX {index_name} ON {table} \
+                 USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
+                config.hnsw_m, config.hnsw_ef_construction
+            );
+            build_hnsw_index(pool, config, &create_sql).await?;
+            sqlx::query(
+                "INSERT INTO pgmcp_metadata (key, value) VALUES ($1, $2)
+                 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            )
+            .bind(meta_key)
+            .bind(&current_params)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
 /// Run all migrations to set up the schema.
 pub async fn run_migrations(
     pool: &PgPool,
@@ -183,7 +531,6 @@ pub async fn run_migrations(
             content TEXT NOT NULL,
             start_line INTEGER NOT NULL,
             end_line INTEGER NOT NULL,
-            embedding vector(384) NOT NULL,
             UNIQUE (file_id, chunk_index)
         )",
     )
@@ -308,7 +655,6 @@ pub async fn run_migrations(
             commit_id BIGINT REFERENCES git_commits(id) ON DELETE CASCADE,
             chunk_index INTEGER NOT NULL,
             content TEXT NOT NULL,
-            embedding vector(384) NOT NULL,
             UNIQUE (commit_id, chunk_index)
         )",
     )
@@ -1099,7 +1445,6 @@ pub async fn run_migrations(
             content TEXT NOT NULL,
             start_line INTEGER NOT NULL,
             end_line INTEGER NOT NULL,
-            embedding vector(384) NOT NULL,
             UNIQUE (source_id, chunk_index)
         )",
     )
@@ -1224,7 +1569,6 @@ pub async fn run_migrations(
             ts            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             prompt_text   TEXT NOT NULL,
             prompt_sha256 CHAR(64) NOT NULL,
-            embedding     vector(384),
             UNIQUE (session_id, prompt_sha256)
         )",
     )
@@ -1378,11 +1722,9 @@ pub async fn run_migrations(
     // `embedding` column on `file_chunks` and `session_prompts` for the
     // duration of the BGE-M3 cutover. The Phase 1 embedding-migration
     // cron (`src/cron/embedding_migration.rs`) populates `embedding_v2`
-    // incrementally; when both tables have zero unmigrated rows the
-    // operator flips `pgmcp_metadata.active_embedding_signature` from
-    // `minilm-l6-v2` to `bge-m3-v1` to route reads to the new column.
-    // The old column is dropped in a separate cleanup migration after
-    // one release of soak time.
+    // incrementally. Post-ADR-005 (1024-only) the legacy `embedding` column is
+    // dropped below and `embedding_v2` is the sole vector column;
+    // `active_embedding_signature` is pinned to `bge-m3-v1`.
     //
     // `embedding_signature TEXT` stamps each row with the model that
     // produced it so a mixed-signature transition window cannot silently
@@ -1425,6 +1767,10 @@ pub async fn run_migrations(
     // ================================================================
     ensure_memory_phase2_tables(pool).await?;
     ensure_memory_phase2_hnsw_index(pool, vector_config).await?;
+
+    // Scientific-experiment subsystem (depends on the tables above for FKs).
+    ensure_experiment_tables(pool).await?;
+    ensure_experiment_hnsw_index(pool, vector_config).await?;
 
     // ================================================================
     // Memory-server Phase 6.3: heterogeneous-node graph view
@@ -2207,30 +2553,32 @@ async fn ensure_memory_v2_columns(pool: &PgPool) -> Result<(), sqlx::Error> {
         sqlx::query(s).execute(pool).await?;
     }
 
-    // Phase 5 C1: drop NOT NULL on every legacy 384d `embedding` column so the
-    // indexer dual-write (zero placeholder into legacy + real 1024d into
-    // embedding_v2) succeeds during the migration window. GUARDED on column
-    // presence: `embed-cutover --drop-legacy` permanently drops the column
-    // post-soak (C12), and `ALTER COLUMN … DROP NOT NULL` has no `IF EXISTS`
-    // form — so without this guard `run_migrations` would throw
-    // `column "embedding" of relation "…" does not exist` on every boot of a
-    // post-cutover database. `DROP NOT NULL` is itself idempotent when the
-    // column exists, so the guard only needs to skip when it is ABSENT. The
-    // table names are a fixed literal allowlist (not user input) ⇒ the
-    // `format!` is injection-safe.
-    for table in [
-        "file_chunks",
-        "session_prompts",
-        "git_commit_chunks",
-        "software_pattern_chunks",
+    // 1024-only cutover (ADR-005): pgmcp supports ONLY BGE-M3 1024d embeddings.
+    // The legacy 384d MiniLM `embedding` column (and its HNSW index) is dropped
+    // entirely on every dual-column table; `embedding_v2 vector(1024)` is the
+    // sole canonical vector column. This DROP is idempotent across all three
+    // states: a fresh DB (the column is no longer in the CREATE TABLE defs →
+    // `IF EXISTS` no-ops), a mid-migration DB (drops the 384 column + index),
+    // and an already-dropped DB (no-ops). DESTRUCTIVE BY DESIGN — any
+    // remaining 384d MiniLM vectors are discarded (re-index produces 1024d).
+    // The table/index names are a fixed literal allowlist ⇒ injection-safe.
+    for (table, legacy_index) in [
+        ("file_chunks", "idx_chunks_embedding"),
+        ("session_prompts", "idx_session_prompts_embedding"),
+        ("git_commit_chunks", "idx_git_commit_chunks_embedding"),
+        (
+            "software_pattern_chunks",
+            "idx_software_pattern_chunks_embedding",
+        ),
     ] {
-        if column_exists(pool, table, "embedding").await? {
-            sqlx::query(&format!(
-                "ALTER TABLE {table} ALTER COLUMN embedding DROP NOT NULL"
-            ))
+        sqlx::query(&format!("DROP INDEX IF EXISTS {legacy_index}"))
             .execute(pool)
             .await?;
-        }
+        sqlx::query(&format!(
+            "ALTER TABLE {table} DROP COLUMN IF EXISTS embedding"
+        ))
+        .execute(pool)
+        .await?;
     }
     Ok(())
 }
@@ -2416,14 +2764,16 @@ async fn ensure_memory_v2_hnsw_index(
     Ok(())
 }
 
-/// Phase 1: initialize the `active_embedding_signature` row in `pgmcp_metadata`.
-/// Defaults to `minilm-l6-v2`; the operator flips it to `bge-m3-v1` once the
-/// embedding-migration cron has drained the backlog.
+/// Pin the `active_embedding_signature` row to `bge-m3-v1`. Post-ADR-005,
+/// pgmcp is BGE-M3/1024-only — there is no MiniLM path to cut over from — so
+/// this is force-set on every boot (`DO UPDATE`), upgrading any legacy DB that
+/// still carried `minilm-l6-v2`. The row is retained purely as a forward-looking
+/// breadcrumb for a future model swap; nothing selects a column from it anymore.
 async fn ensure_active_embedding_signature(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO pgmcp_metadata (key, value)
-         VALUES ('active_embedding_signature', 'minilm-l6-v2')
-         ON CONFLICT (key) DO NOTHING",
+         VALUES ('active_embedding_signature', 'bge-m3-v1')
+         ON CONFLICT (key) DO UPDATE SET value = 'bge-m3-v1'",
     )
     .execute(pool)
     .await?;
@@ -2458,8 +2808,8 @@ async fn ensure_hnsw_index(pool: &PgPool, config: &VectorConfig) -> Result<(), s
 
     let needs_rebuild = stored.as_deref() != Some(&current_params);
 
-    // Also gate on the legacy column's presence: post-`embed-cutover
-    // --drop-legacy` the `embedding` column is gone, so `CREATE INDEX … (embedding
+    // Also gate on the legacy column's presence: post-cutover (ADR-005) the
+    // `embedding` column is gone, so `CREATE INDEX … (embedding
     // …)` would throw. embedding_v2 has its own index helper
     // (ensure_memory_v2_hnsw_index), so dropping this legacy index entirely is fine.
     if needs_rebuild && column_exists(pool, "file_chunks", "embedding").await? {

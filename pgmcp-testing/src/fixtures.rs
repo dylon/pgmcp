@@ -31,8 +31,8 @@ pub fn test_config() -> Config {
 
 /// Deterministic L2-normalized embedding for tests.
 ///
-/// `dim` controls the vector length (typically 384 to match the production
-/// fastembed model). `seed` is hashed (xxh3-style folding via wrapping
+/// `dim` controls the vector length (typically 1024 to match the production
+/// BGE-M3 model). `seed` is hashed (xxh3-style folding via wrapping
 /// arithmetic) to produce a reproducible sequence of f32s, then L2
 /// normalized. Two calls with the same `(dim, seed)` always return the same
 /// vector.
@@ -73,21 +73,21 @@ mod tests {
 
     #[test]
     fn test_embedding_is_deterministic() {
-        let a = test_embedding(384, "alpha");
-        let b = test_embedding(384, "alpha");
+        let a = test_embedding(1024, "alpha");
+        let b = test_embedding(1024, "alpha");
         assert_eq!(a, b);
     }
 
     #[test]
     fn test_embedding_different_seeds_differ() {
-        let a = test_embedding(384, "alpha");
-        let b = test_embedding(384, "beta");
+        let a = test_embedding(1024, "alpha");
+        let b = test_embedding(1024, "beta");
         assert_ne!(a, b);
     }
 
     #[test]
     fn test_embedding_is_unit_normalized() {
-        let v = test_embedding(384, "alpha");
+        let v = test_embedding(1024, "alpha");
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!((norm - 1.0).abs() < 1e-5, "norm = {}", norm);
     }

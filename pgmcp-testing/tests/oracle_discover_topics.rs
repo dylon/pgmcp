@@ -55,7 +55,7 @@ async fn discover_topics_realtime_partitions_synthetic_corpus_into_three_cluster
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
-        Arc::new(DeterministicEmbeddingBackend::new(384));
+        Arc::new(DeterministicEmbeddingBackend::new(1024));
     let embed_source = EmbedSource::backend(embed_backend);
     let db_arc: Arc<dyn DbClient> = Arc::new(pool.clone());
     let ctx = SystemContext::production(
@@ -144,7 +144,7 @@ async fn discover_topics_global_cached_path_returns_persisted_topics() {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
-        Arc::new(DeterministicEmbeddingBackend::new(384));
+        Arc::new(DeterministicEmbeddingBackend::new(1024));
     let embed_source = EmbedSource::backend(embed_backend);
     let db_arc: Arc<dyn DbClient> = Arc::new(pool.clone());
     let ctx = SystemContext::production(

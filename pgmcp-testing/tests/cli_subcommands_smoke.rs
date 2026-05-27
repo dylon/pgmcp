@@ -635,7 +635,7 @@ async fn cli_reindex_clears_file_chunks_and_indexed_files() {
             return;
         }
     };
-    // Seed one project + one file. (No chunk — inserting a vector(384)
+    // Seed one project + one file. (No chunk — inserting a vector(1024)
     // from a bash subprocess is more effort than it's worth.)
     let project_id: i32 = sqlx::query_scalar(
         "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3) RETURNING id",

@@ -25,7 +25,7 @@ use pgmcp::stats::tracker::StatsTracker;
 use pgmcp_testing::fixtures::test_config;
 use pgmcp_testing::mocks::{DeterministicEmbeddingBackend, MockDbClient};
 
-const D: usize = 384;
+const D: usize = 1024;
 
 fn server_with_mock(mock: MockDbClient) -> McpServer {
     let db: Arc<dyn DbClient> = Arc::new(mock);
@@ -34,7 +34,7 @@ fn server_with_mock(mock: MockDbClient) -> McpServer {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
-        Arc::new(DeterministicEmbeddingBackend::new(384));
+        Arc::new(DeterministicEmbeddingBackend::new(1024));
     let embed_source = EmbedSource::backend(embed_backend);
     let ctx = SystemContext::production(
         db,

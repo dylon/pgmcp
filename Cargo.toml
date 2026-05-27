@@ -102,6 +102,12 @@ regex = "1"
 libc = "0.2"
 uuid = { version = "1", features = ["v4", "serde"] }
 rand = "0.9"
+# Inferential statistics (experiment subsystem): used ONLY for the
+# numerically-validated distribution CDFs / quantiles (Student-t, normal,
+# χ²) in `src/stats/inference.rs`. Welch/Mann-Whitney/Wilcoxon/bootstrap/
+# effect-sizes/TOST/FDR are implemented in-crate; statrs supplies the
+# error-prone incomplete-beta / erf tails only. Pure Rust, no system libs.
+statrs = "0.18"
 ndarray = { version = "0.16", features = ["blas", "serde"] }
 petgraph = "0.7"
 # Tree-sitter (Tier 0e). Per-language grammar crates are added incrementally

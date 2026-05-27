@@ -42,7 +42,7 @@ pub async fn tool_code_raptor_search(
         .map_err(|e| McpError::internal_error(format!("embed failed: {}", e), None))?;
 
     // The summary tree stores BGE-M3 (1024-d) centroids; a non-1024 query
-    // backbone (e.g. the legacy MiniLM path) simply has no comparable tree —
+    // embedding simply has no comparable tree —
     // return an empty, well-formed result rather than erroring.
     if embedding.len() != 1024 {
         return json_result(&json!({

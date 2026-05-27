@@ -453,10 +453,10 @@ async fn rest_api_search_returns_chunks_with_seeded_data() {
     .fetch_one(db.pool())
     .await
     .expect("file");
-    let v = pgvector::Vector::from(vec![0.1_f32; 384]);
+    let v = pgvector::Vector::from(vec![0.1_f32; 1024]);
     sqlx::query(
-        "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding) \
-         VALUES ($1, 0, $2, 1, 1, $3)",
+        "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding_v2, embedding_signature) \
+         VALUES ($1, 0, $2, 1, 1, $3, 'bge-m3-v1')",
     )
     .bind(file_id)
     .bind("fn a() { println!(); }")

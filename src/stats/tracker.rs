@@ -168,6 +168,7 @@ pub struct StatsTracker {
     pub embeddings_migration_runs: AtomicU64,
     pub embeddings_migrated_file_chunks: AtomicU64,
     pub embeddings_migrated_session_prompts: AtomicU64,
+    pub embeddings_migrated_memory_observations: AtomicU64,
     pub embeddings_migration_errors: AtomicU64,
 
     // Memory-server Phase 3 (official-compat CRUD) counters
@@ -602,6 +603,20 @@ pub struct StatsTracker {
     /// Inbound RLM recursion continuations served (depth>1; Part D).
     pub a2a_rlm_recursions: AtomicU64,
 
+    // Scientific-experiment subsystem counters.
+    /// Experiments registered via `experiment_open`.
+    pub experiments_opened: AtomicU64,
+    /// Measurement submissions accepted by `experiment_record_measurement`.
+    pub experiment_measurements_recorded: AtomicU64,
+    /// Verdicts rendered by `experiment_decide`.
+    pub experiment_decisions_made: AtomicU64,
+    /// `experiment_search` invocations.
+    pub experiment_searches: AtomicU64,
+    /// Ad-hoc artifacts captured via `experiment_log_artifact`.
+    pub experiment_artifacts_logged: AtomicU64,
+    /// Markdown ledgers rendered via `experiment_render_ledger`/auto-render.
+    pub experiment_ledgers_rendered: AtomicU64,
+
     /// Currently-connected Streamable HTTP MCP sessions. Incremented when
     /// a peer issues an `initialize` and a session is created in the
     /// `LocalSessionManager` wrapper; decremented on session close /
@@ -679,6 +694,7 @@ impl StatsTracker {
             embeddings_migration_runs: AtomicU64::new(0),
             embeddings_migrated_file_chunks: AtomicU64::new(0),
             embeddings_migrated_session_prompts: AtomicU64::new(0),
+            embeddings_migrated_memory_observations: AtomicU64::new(0),
             embeddings_migration_errors: AtomicU64::new(0),
             memory_entities_created: AtomicU64::new(0),
             memory_relations_created: AtomicU64::new(0),
@@ -874,6 +890,12 @@ impl StatsTracker {
             a2a_rlm_invocations: AtomicU64::new(0),
             a2a_rlm_subcalls: AtomicU64::new(0),
             a2a_rlm_recursions: AtomicU64::new(0),
+            experiments_opened: AtomicU64::new(0),
+            experiment_measurements_recorded: AtomicU64::new(0),
+            experiment_decisions_made: AtomicU64::new(0),
+            experiment_searches: AtomicU64::new(0),
+            experiment_artifacts_logged: AtomicU64::new(0),
+            experiment_ledgers_rendered: AtomicU64::new(0),
             http_mcp_sessions: AtomicU64::new(0),
             peak_rss_bytes: AtomicU64::new(0),
             current_rss_bytes: AtomicU64::new(0),
@@ -1006,6 +1028,7 @@ impl StatsTracker {
             "embeddings_migration_runs": self.embeddings_migration_runs.load(Ordering::Acquire),
             "embeddings_migrated_file_chunks": self.embeddings_migrated_file_chunks.load(Ordering::Acquire),
             "embeddings_migrated_session_prompts": self.embeddings_migrated_session_prompts.load(Ordering::Acquire),
+            "embeddings_migrated_memory_observations": self.embeddings_migrated_memory_observations.load(Ordering::Acquire),
             "embeddings_migration_errors": self.embeddings_migration_errors.load(Ordering::Acquire),
             "memory_entities_created": self.memory_entities_created.load(Ordering::Acquire),
             "memory_relations_created": self.memory_relations_created.load(Ordering::Acquire),
@@ -1198,6 +1221,12 @@ impl StatsTracker {
             "a2a_rlm_invocations": self.a2a_rlm_invocations.load(Ordering::Acquire),
             "a2a_rlm_subcalls": self.a2a_rlm_subcalls.load(Ordering::Acquire),
             "a2a_rlm_recursions": self.a2a_rlm_recursions.load(Ordering::Acquire),
+            "experiments_opened": self.experiments_opened.load(Ordering::Acquire),
+            "experiment_measurements_recorded": self.experiment_measurements_recorded.load(Ordering::Acquire),
+            "experiment_decisions_made": self.experiment_decisions_made.load(Ordering::Acquire),
+            "experiment_searches": self.experiment_searches.load(Ordering::Acquire),
+            "experiment_artifacts_logged": self.experiment_artifacts_logged.load(Ordering::Acquire),
+            "experiment_ledgers_rendered": self.experiment_ledgers_rendered.load(Ordering::Acquire),
             "http_mcp_sessions": self.http_mcp_sessions.load(Ordering::Acquire),
             "telemetry_rows_written": self.telemetry_rows_written.load(Ordering::Acquire),
             "telemetry_writes_dropped": self.telemetry_writes_dropped.load(Ordering::Acquire),

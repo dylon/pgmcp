@@ -1188,7 +1188,7 @@ pub(crate) fn check_memory_budget(
     if chunk_count == 0 {
         return BudgetDecision::NotChecked;
     }
-    let d = 384u64;
+    let d = 1024u64;
     let n = chunk_count as u64;
     let k = k as u64;
     // Conservative prediction matching the in-memory FCM buffer footprint.
@@ -1533,7 +1533,7 @@ async fn run_mmap_global_topic_scan(
         .expect("run_mmap_global_topic_scan requires a real &PgPool");
 
     let params = FcmParams::from_config(config);
-    let d = 384usize;
+    let d = 1024usize;
 
     // Resolve scratch directory.
     let scratch_dir = crate::mmap_array::resolve_scratch_dir(params.topic_scratch_dir().as_deref());
@@ -1571,9 +1571,9 @@ async fn run_mmap_global_topic_scan(
     }
 
     // Phase 5 C8: dispatch on the active embedding signature so we read
-    // the canonical column (`embedding_v2` post-cutover, `embedding`
-    // pre-cutover). The legacy `embedding` column is dropped after
-    // `embed-cutover --drop-legacy`, so hardcoding it would break.
+    // the canonical column. The legacy 384/`embedding` column has been
+    // dropped, leaving `embedding_v2` as the only embedding column, so
+    // we resolve it via the active signature rather than hardcoding.
     // Resolved once here — the column cannot change mid-scan.
     let col = match crate::embed::signature::read_active_signature(pool).await {
         Ok(sig) => sig.read_column(),
@@ -2088,7 +2088,7 @@ async fn run_online_global_topic_scan(
         .expect("run_online_global_topic_scan requires a real &PgPool");
 
     let params = FcmParams::from_config(config);
-    let d = 384usize;
+    let d = 1024usize;
     let k = params
         .num_clusters
         .unwrap_or_else(|| estimate_k(n_total, params.min_cluster_size));
@@ -2145,9 +2145,8 @@ async fn run_online_global_topic_scan(
 
     // Phase 5 C8: resolve the active-signature column ONCE here (async
     // context), then move the `&'static str` into the blocking + fetcher
-    // closures by copy. Reads `embedding_v2` post-cutover, `embedding`
-    // pre-cutover; the legacy column is dropped after
-    // `embed-cutover --drop-legacy`.
+    // closures by copy. The legacy 384/`embedding` column has been
+    // dropped, leaving `embedding_v2` as the only embedding column.
     let col = match crate::embed::signature::read_active_signature(pool).await {
         Ok(sig) => sig.read_column(),
         Err(e) => {
@@ -3091,7 +3090,7 @@ mod tests {
         let mut rows = Vec::new();
         // Cluster A: similar embeddings around [1, 0, 0, ...]
         for i in 0..10 {
-            let mut emb = vec![0.0f32; 384];
+            let mut emb = vec![0.0f32; 1024];
             emb[0] = 1.0;
             emb[1] = 0.01 * i as f32;
             rows.push(ChunkEmbeddingRow {
@@ -3107,7 +3106,7 @@ mod tests {
         }
         // Cluster B: similar embeddings around [0, 1, 0, ...]
         for i in 0..10 {
-            let mut emb = vec![0.0f32; 384];
+            let mut emb = vec![0.0f32; 1024];
             emb[1] = 1.0;
             emb[2] = 0.01 * i as f32;
             rows.push(ChunkEmbeddingRow {

@@ -1,52 +1,50 @@
-//! Phase 5 C11 regression tests for the full BGE-M3 migration.
+//! Regression tests for the BGE-M3-only signature dispatch
+//! (`pgmcp::embed::signature::EmbeddingSignature`).
 //!
-//! Pure-Rust unit tests for the cache and signature dispatch
-//! (`pgmcp::embed::signature::EmbeddingSignature`); DB-gated
-//! integration tests via `require_test_db!()` for the cron extension
-//! and CLI cutover paths. Without a test DB the integration cases
-//! self-skip via the existing harness convention.
+//! The legacy 384-d MiniLM path was removed: `EmbeddingSignature` now has a
+//! single `BgeM3V1` variant. These pure-Rust unit tests pin the one supported
+//! signature's invariants (dim 1024, `embedding_v2` column, `bge-m3` model,
+//! `bge-m3-v1` string) plus the cache's construction/refresh contract.
 
 use pgmcp::embed::signature::{ActiveSignatureCache, EmbeddingSignature};
 
 #[test]
-fn signature_string_round_trip_covers_both_models() {
-    for sig in [EmbeddingSignature::MiniLmV1, EmbeddingSignature::BgeM3V1] {
-        let parsed = EmbeddingSignature::from_str_signature(sig.as_str());
-        assert_eq!(
-            parsed,
-            Some(sig),
-            "round-trip failed for `{}`",
-            sig.as_str()
-        );
-    }
+fn signature_string_round_trips() {
+    let sig = EmbeddingSignature::BgeM3V1;
+    let parsed = EmbeddingSignature::from_str_signature(sig.as_str());
+    assert_eq!(
+        parsed,
+        Some(sig),
+        "round-trip failed for `{}`",
+        sig.as_str()
+    );
+    assert_eq!(
+        EmbeddingSignature::BgeM3V1.as_str(),
+        "bge-m3-v1",
+        "the persisted signature string must be `bge-m3-v1`"
+    );
 }
 
 #[test]
 fn signature_dim_matches_documented_model_output() {
-    assert_eq!(EmbeddingSignature::MiniLmV1.dim(), 384);
-    assert_eq!(EmbeddingSignature::BgeM3V1.dim(), 1024);
+    assert_eq!(
+        EmbeddingSignature::BgeM3V1.dim(),
+        1024,
+        "BGE-M3 is the only supported signature and emits 1024-d vectors"
+    );
 }
 
 #[test]
-fn signature_read_column_dispatches_to_correct_column() {
-    assert_eq!(
-        EmbeddingSignature::MiniLmV1.read_column(),
-        "embedding",
-        "legacy MiniLM reads the original `embedding` column"
-    );
+fn signature_read_column_dispatches_to_embedding_v2() {
     assert_eq!(
         EmbeddingSignature::BgeM3V1.read_column(),
         "embedding_v2",
-        "BGE-M3 reads the parallel `embedding_v2` column"
+        "BGE-M3 reads the 1024-d `embedding_v2` column"
     );
 }
 
 #[test]
 fn signature_model_name_is_operator_friendly() {
-    assert_eq!(
-        EmbeddingSignature::MiniLmV1.model_name(),
-        "all-MiniLM-L6-v2"
-    );
     assert_eq!(EmbeddingSignature::BgeM3V1.model_name(), "bge-m3");
 }
 
