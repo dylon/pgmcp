@@ -10,8 +10,8 @@ Endpoints (registered at `src/cli/daemon.rs`):
 
 | Endpoint                  | Method | Purpose                                                                                                          |
 |---------------------------|--------|------------------------------------------------------------------------------------------------------------------|
-| `/health`                 | GET    | Cheap liveness probe (no DB queries). 200 when daemon is `Ready`, 503 otherwise.                                 |
-| `/api/search`             | POST   | Semantic search; embeds query, runs vector ranking. Used by `~/.claude/hooks/pgmcp-rag.sh`.                      |
+| `/health`                 | GET    | Serving-readiness probe (no DB queries). 200 once DB+embedder are ready (during the initial scan too); 503 while warming up. |
+| `/api/search`             | POST   | Semantic search; embeds query, runs vector ranking. Used by `~/.claude/hooks/pgmcp-rag.sh`. 503 while the embedder is still warming up. |
 | `/api/context`            | GET    | Project context for a working directory; used by `pgmcp context` CLI and the SessionStart hook.                  |
 | `/api/status`             | GET    | Rich status snapshot — daemon phase, pool state, embeddings config, indexing counters, MCP session counts, etc.  |
 | `/api/grep`               | POST   | Cross-project regex grep. Used by `~/.claude/hooks/pgmcp-grep-companion.sh`.                                     |
@@ -21,27 +21,38 @@ The MCP server is also mounted at `/mcp` (Streamable HTTP transport). All
 endpoints share a single Axum router and an `ApiState` that includes the
 `DbClient`, query embedder, config, stats tracker, and `DaemonLifecycle`.
 
-### `GET /health` -- Cheap Liveness Probe
+### `GET /health` -- Serving-Readiness Probe
 
-Sub-millisecond probe that reads only the atomic `DaemonPhase` — no DB queries,
-no model touch. Designed to be polled at high frequency by k8s probes, systemd
-watchdogs, uptime monitors, and the `~/.claude/hooks/pgmcp-*.sh` PreToolUse
-hooks (which check it with a 300 ms timeout to fail-fast on daemon outage).
+Sub-millisecond probe — no DB queries, no model forward. Designed to be polled
+at high frequency by k8s probes, systemd watchdogs, uptime monitors, and the
+`~/.claude/hooks/pgmcp-*.sh` PreToolUse hooks (which check it with a 300 ms
+timeout to fail-fast on daemon outage).
 
-| Phase          | HTTP Status         | Body                              |
-|----------------|---------------------|-----------------------------------|
-| `Ready`        | 200 OK              | `{"phase": "ready"}`              |
-| `Initializing` | 503 SERVICE_UNAVAIL | `{"phase": "initializing"}`       |
-| `Scanning`     | 503 SERVICE_UNAVAIL | `{"phase": "scanning"}`           |
-| `Terminating`  | 503 SERVICE_UNAVAIL | `{"phase": "terminating"}`        |
-| `Defunct`      | 503 SERVICE_UNAVAIL | `{"phase": "defunct"}`            |
+Returns **200** once the daemon is *serving-ready* — the DB pool is up
+(migrations ran before the listener bound) **and** at least one embedder worker
+has finished loading its model — otherwise **503**. Serving-readiness is
+deliberately **decoupled from the initial file scan**: search and RAG are
+answerable as soon as the service can answer them (during the scan, on a warm
+DB), so `/health` flips to 200 within seconds of boot rather than waiting out
+the whole first scan.
+
+| Condition                                     | HTTP Status         |
+|-----------------------------------------------|---------------------|
+| DB ready **and** ≥1 embedder worker ready     | 200 OK              |
+| migrations pending / no embedder worker ready | 503 SERVICE_UNAVAIL |
+
+The body (on both statuses) reports `phase` for index-progress visibility plus
+the readiness breakdown. `phase` is the lifecycle phase (`initializing` →
+`scanning` → `ready`); `ready` means the *initial scan* finished — the gate for
+heavy cron jobs, **not** for serving. A serving-ready daemon can therefore report
+`"phase":"scanning"` while the first full index is still running.
 
 **Example:**
 
 ```bash
 curl -i -m 0.3 http://localhost:3100/health
 # HTTP/1.1 200 OK
-# {"phase":"ready"}
+# {"phase":"scanning","serving_ready":true,"db_ready":true,"embedder_ready":true,"ready_workers":4}
 ```
 
 Distinct from `/api/status`, which returns rich state but issues ~10 SQL

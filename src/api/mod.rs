@@ -31,7 +31,7 @@ pub struct ApiState {
     /// extraction disabled (`[memory.extractor] backend = "disabled"`),
     /// in which case the session-observation pipeline runs Stage A
     /// only.
-    pub llm_extractor: Option<Arc<dyn LlmExtractor>>,
+    pub llm_extractor: Arc<parking_lot::RwLock<Option<Arc<dyn LlmExtractor>>>>,
     /// Per-session debounce ledger for the Stage-B worker. Empty until
     /// the first observation; `extractor_worker` populates it.
     pub extractor_debounce: DebounceMap,
@@ -42,5 +42,5 @@ pub struct ApiState {
     /// `Some` only when `[api] rerank_hook = true` (the BGE-reranker model is
     /// VRAM-exclusive with the Qwen3 extractor, so it's opt-in). The RRF
     /// dense+BM25 fusion runs regardless; this just adds a rerank stage.
-    pub reranker: Option<Arc<dyn Reranker>>,
+    pub reranker: Arc<parking_lot::RwLock<Option<Arc<dyn Reranker>>>>,
 }

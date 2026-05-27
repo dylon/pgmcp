@@ -6,7 +6,7 @@
 
 use pgmcp::db::queries::{
     memory_neighbors, memory_path_search, memory_ppr_search, memory_raptor_search,
-    memory_unified_search, refresh_memory_unified_nodes,
+    memory_unified_search, refresh_memory_unified_edges, refresh_memory_unified_nodes,
 };
 use pgmcp::reranker::{RerankerChoice, parse_reranker_choice};
 use pgmcp_testing::require_test_db;
@@ -59,6 +59,9 @@ async fn unified_search_returns_observation_matching_query_axis() {
     refresh_memory_unified_nodes(pool)
         .await
         .expect("refresh matview");
+    refresh_memory_unified_edges(pool)
+        .await
+        .expect("refresh edges matview");
 
     let hits = memory_unified_search(pool, &v, None, 5, 64)
         .await
@@ -103,6 +106,9 @@ async fn memory_neighbors_walks_unified_edges() {
     refresh_memory_unified_nodes(pool)
         .await
         .expect("refresh matview");
+    refresh_memory_unified_edges(pool)
+        .await
+        .expect("refresh edges matview");
 
     let seed = format!("memory_entity:{}", a);
     let result = memory_neighbors(pool, &seed, 1, None, 10)
@@ -163,8 +169,11 @@ async fn memory_path_search_returns_seeded_paths() {
     refresh_memory_unified_nodes(pool)
         .await
         .expect("refresh matview");
+    refresh_memory_unified_edges(pool)
+        .await
+        .expect("refresh edges matview");
 
-    let result = memory_path_search(pool, &v, None, None, 2, 5, 0.7, 64)
+    let result = memory_path_search(pool, &v, None, None, 2, 5, 0.7, 64, None, 90.0)
         .await
         .expect("path search");
     assert!(!result.seeds.is_empty(), "seeds should be discovered");
@@ -244,12 +253,25 @@ async fn memory_ppr_search_returns_seed_and_neighbor_hits() {
         .expect("rel");
     }
 
+    refresh_memory_unified_nodes(pool)
+        .await
+        .expect("refresh nodes");
+    refresh_memory_unified_edges(pool)
+        .await
+        .expect("refresh edges");
     let result = memory_ppr_search(pool, &v, 5, 0.85, 5, 64)
         .await
         .expect("ppr");
-    assert!(result.seeds.contains(&a), "seed should be entity a");
-    let hit_ids: Vec<i64> = result.hits.iter().map(|h| h.entity_id).collect();
-    assert!(hit_ids.contains(&a) || hit_ids.contains(&b) || hit_ids.contains(&c));
+    assert!(
+        result.seeds.contains(&format!("memory_entity:{a}")),
+        "seed should be entity a"
+    );
+    let hit_ids: Vec<String> = result.hits.iter().map(|h| h.node_id.clone()).collect();
+    assert!(
+        hit_ids.contains(&format!("memory_entity:{a}"))
+            || hit_ids.contains(&format!("memory_entity:{b}"))
+            || hit_ids.contains(&format!("memory_entity:{c}"))
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

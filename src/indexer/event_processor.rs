@@ -497,8 +497,14 @@ pub fn start_indexing(
                 stale_removed = stale_count,
                 "Initial scan complete"
             );
+            info!(
+                target: "pgmcp::recovery_times",
+                phase = "scan_complete",
+                "initial scan complete — daemon fully indexed"
+            );
 
-            // Signal that the daemon is ready for full operation
+            // Signal that the daemon is ready for full operation (gates heavy
+            // crons; serving-readiness for /health + search is separate).
             lifecycle_for_scan.transition(DaemonPhase::Ready);
         })
         .expect("Failed to spawn scanner thread");

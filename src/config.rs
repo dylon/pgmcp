@@ -513,6 +513,8 @@ pub struct MemoryConfig {
     pub eval: MemoryEvalConfig,
     #[serde(default)]
     pub latent_pipeline: MemoryLatentPipelineConfig,
+    #[serde(default)]
+    pub concepts: MemoryConceptsConfig,
 }
 
 /// `[memory.latent_pipeline]` — Phase 11 RecursiveLink hand-off
@@ -763,6 +765,105 @@ fn default_reflection_min_new() -> i64 {
 }
 fn default_reflection_window() -> i64 {
     200
+}
+
+/// `[memory.concepts]` — Stage-4 auto-population concept layer. Off by default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryConceptsConfig {
+    /// Whether the periodic `memory-concept-extract` cron runs.
+    #[serde(default)]
+    pub cron_enabled: bool,
+    #[serde(default = "default_concepts_cron_interval")]
+    pub cron_interval_secs: u64,
+    /// Minimum member chunks for a topic to seed a concept entity.
+    #[serde(default = "default_concepts_min_chunks")]
+    pub min_chunks_per_topic: i64,
+    /// Max concepts seeded / extracted per run.
+    #[serde(default = "default_concepts_max_per_run")]
+    pub max_concepts_per_run: i64,
+    /// Whether the LLM-emergent concept pass runs (also requires a configured
+    /// `[memory.extractor]` backend).
+    #[serde(default)]
+    pub llm_enabled: bool,
+}
+
+impl Default for MemoryConceptsConfig {
+    fn default() -> Self {
+        Self {
+            cron_enabled: false,
+            cron_interval_secs: default_concepts_cron_interval(),
+            min_chunks_per_topic: default_concepts_min_chunks(),
+            max_concepts_per_run: default_concepts_max_per_run(),
+            llm_enabled: false,
+        }
+    }
+}
+
+fn default_concepts_cron_interval() -> u64 {
+    86400
+}
+fn default_concepts_min_chunks() -> i64 {
+    5
+}
+fn default_concepts_max_per_run() -> i64 {
+    200
+}
+
+/// `[cron.trajectory_similarity]` — Stage-5c MSM `evolves_like` edges. Off by default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrajectorySimilarityConfig {
+    #[serde(default)]
+    pub cron_enabled: bool,
+    #[serde(default = "default_traj_interval")]
+    pub cron_interval_secs: u64,
+    /// Minimum trajectory samples for a record to participate.
+    #[serde(default = "default_traj_min_points")]
+    pub min_points: i64,
+    /// Cap on trajectories per node type (bounds the O(n²) k-NN).
+    #[serde(default = "default_traj_max_per_type")]
+    pub max_per_type: i64,
+    /// Nearest neighbors retained per record.
+    #[serde(default = "default_traj_k")]
+    pub k_neighbors: i64,
+    /// Max MSM distance for an edge (large ⇒ effectively pure k-NN).
+    #[serde(default = "default_traj_max_distance")]
+    pub max_distance: f64,
+    /// MSM split/merge cost `c` (Stefan et al. recommend [0.01, 1.0]).
+    #[serde(default = "default_traj_msm_c")]
+    pub msm_c: f64,
+}
+
+impl Default for TrajectorySimilarityConfig {
+    fn default() -> Self {
+        Self {
+            cron_enabled: false,
+            cron_interval_secs: default_traj_interval(),
+            min_points: default_traj_min_points(),
+            max_per_type: default_traj_max_per_type(),
+            k_neighbors: default_traj_k(),
+            max_distance: default_traj_max_distance(),
+            msm_c: default_traj_msm_c(),
+        }
+    }
+}
+
+fn default_traj_interval() -> u64 {
+    21600
+}
+fn default_traj_min_points() -> i64 {
+    3
+}
+fn default_traj_max_per_type() -> i64 {
+    500
+}
+fn default_traj_k() -> i64 {
+    5
+}
+fn default_traj_max_distance() -> f64 {
+    1.0e9
+}
+fn default_traj_msm_c() -> f64 {
+    0.1
 }
 
 /// `[memory.retention]` — Phase 8 eviction policy. Stub config now so
@@ -1474,6 +1575,19 @@ pub struct DatabaseConfig {
     #[serde(default = "default_lock_timeout_ms")]
     pub lock_timeout_ms: u32,
 
+    /// Server-side `client_connection_check_interval` (PostgreSQL ≥ 14; ignored
+    /// on older servers). While a backend runs a long query it otherwise never
+    /// notices a vanished client, so a daemon that is SIGKILL-ed / OOM-killed /
+    /// crashes mid-query leaves an *orphaned backend* holding its locks until
+    /// `statement_timeout` fires (minutes). With this set, the backend polls the
+    /// client socket every interval and self-terminates once the client is gone,
+    /// releasing its locks promptly — so a restarted daemon's startup migrations
+    /// no longer collide with the dead instance and abort at `lock_timeout`.
+    /// `0` disables the check. This is the safety net for ungraceful death;
+    /// graceful shutdown additionally sweeps heavy backends (see src/db/admin.rs).
+    #[serde(default = "default_client_connection_check_interval_ms")]
+    pub client_connection_check_interval_ms: u32,
+
     /// `sqlx` pool-level `idle_timeout`. Connections idle longer than
     /// this are returned to the OS, forcing reconnects through natural
     /// churn instead of waiting for a Postgres-restart cliff to surface
@@ -1507,6 +1621,7 @@ impl Default for DatabaseConfig {
             statement_timeout_ms: default_statement_timeout_ms(),
             idle_in_transaction_timeout_ms: default_idle_in_transaction_timeout_ms(),
             lock_timeout_ms: default_lock_timeout_ms(),
+            client_connection_check_interval_ms: default_client_connection_check_interval_ms(),
             pool_idle_timeout_secs: default_pool_idle_timeout_secs(),
             pool_max_lifetime_secs: default_pool_max_lifetime_secs(),
             test_before_acquire: default_test_before_acquire(),
@@ -1572,6 +1687,9 @@ fn default_idle_in_transaction_timeout_ms() -> u32 {
 }
 fn default_lock_timeout_ms() -> u32 {
     5_000
+}
+fn default_client_connection_check_interval_ms() -> u32 {
+    10_000
 }
 fn default_pool_idle_timeout_secs() -> u64 {
     1_800
@@ -1896,6 +2014,14 @@ pub struct CronConfig {
     pub git_history_index_interval_secs: u64,
     #[serde(default = "default_similarity_scan_interval")]
     pub similarity_scan_interval_secs: u64,
+    /// Interval between `memory-graph-refresh` cron passes (default: 21600 = 6
+    /// hours) that refresh the unified knowledge-graph matviews
+    /// (`memory_unified_nodes` + `memory_unified_edges`).
+    #[serde(default = "default_memory_graph_refresh_interval")]
+    pub memory_graph_refresh_interval_secs: u64,
+    /// Stage-5c MSM `evolves_like` trajectory-similarity cron settings.
+    #[serde(default)]
+    pub trajectory_similarity: TrajectorySimilarityConfig,
     #[serde(default = "default_similarity_threshold")]
     pub similarity_threshold: f64,
     #[serde(default = "default_similarity_top_k")]
@@ -2176,6 +2302,8 @@ impl Default for CronConfig {
             db_maintenance_interval_secs: default_db_maintenance(),
             git_history_index_interval_secs: default_git_history_index(),
             similarity_scan_interval_secs: default_similarity_scan_interval(),
+            memory_graph_refresh_interval_secs: default_memory_graph_refresh_interval(),
+            trajectory_similarity: TrajectorySimilarityConfig::default(),
             similarity_threshold: default_similarity_threshold(),
             similarity_top_k: default_similarity_top_k(),
             semantic_edge_interval_secs: default_semantic_edge_interval(),
@@ -2318,6 +2446,9 @@ fn default_git_history_index() -> u64 {
     3600
 }
 fn default_similarity_scan_interval() -> u64 {
+    21600
+} // 6 hours
+fn default_memory_graph_refresh_interval() -> u64 {
     21600
 } // 6 hours
 fn default_similarity_threshold() -> f64 {

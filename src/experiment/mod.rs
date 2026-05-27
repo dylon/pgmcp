@@ -19,5 +19,6 @@ pub mod ledger;
 pub mod mirror;
 pub mod pinning;
 pub mod protocol;
+pub mod relation;
 pub mod runner;
 pub mod spec;

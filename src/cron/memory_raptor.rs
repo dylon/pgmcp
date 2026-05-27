@@ -29,6 +29,9 @@ pub const MIN_OBSERVATIONS_PER_SCOPE: i64 = 8;
 /// Hard cap on observations sampled per scope to keep the FCM run
 /// bounded; oldest are dropped by `ORDER BY created_at DESC`.
 pub const MAX_OBSERVATIONS_PER_SCOPE: i64 = 800;
+/// Cap on embedded unified-graph nodes fed into the GLOBAL RAPTOR tree
+/// (Stage 6). Bounds the FCM cost; the highest-`importance` nodes win.
+pub const MAX_UNIFIED_NODES: i64 = 4000;
 /// Membership-degree cap. K clusters = √(N / min_cluster_size) clamped
 /// to [3, 24]. Matches the `topic-clustering` cron's heuristic.
 pub const FCM_FUZZINESS: f64 = 1.7;
@@ -98,6 +101,26 @@ pub async fn run_raptor_build(
             }
         }
     }
+
+    // Stage 6: also build the GLOBAL unified-graph summary tree spanning every
+    // embedded node type — so `memory_raptor_search` returns ontology-wide
+    // thematic summaries, not just per-scope observation clusters.
+    match build_unified_tree(pool, extractor).await {
+        Ok(w) => {
+            stats
+                .memory_raptor_summaries_written
+                .fetch_add(w as u64, Ordering::Relaxed);
+            if w > 0 {
+                done += 1;
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "raptor: unified-graph tree build failed");
+            stats
+                .memory_raptor_build_errors
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     Ok(done)
 }
 
@@ -142,11 +165,6 @@ async fn build_scope_tree(
         }
     }
 
-    let k = ((n as f64 / 8.0).sqrt().ceil() as usize).clamp(3, 24);
-    if k > n {
-        return Ok(0);
-    }
-
     // Clear existing rows for this scope (idempotent rebuild).
     sqlx::query("DELETE FROM memory_summary_tree WHERE scope_id = $1")
         .bind(scope_id)
@@ -169,6 +187,36 @@ async fn build_scope_tree(
         .execute(pool)
         .await
         .context("level-0 leaf insert")?;
+    }
+
+    // Level-1 summaries via the shared cluster-and-summarize helper.
+    let written = write_cluster_summaries(pool, extractor, scope_id, &texts, &data).await?;
+    debug!(
+        scope_id,
+        level_1_written = written,
+        "raptor: scope build complete"
+    );
+    Ok(written)
+}
+
+/// Shared RAPTOR step: FCM-cluster the `data` embeddings (rows aligned with
+/// `texts`), LLM-summarize each cluster (via the extractor's `reflect`), and
+/// write one level-1 summary row per non-empty cluster under `scope_id` — with
+/// the L2-normalized cluster centroid as `summary_embedding` (what the query
+/// path searches against). Returns the number of summaries written. Used by
+/// both the per-scope observation tree and the global unified-graph tree
+/// (Stage 6).
+async fn write_cluster_summaries(
+    pool: &PgPool,
+    extractor: &dyn LlmExtractor,
+    scope_id: i64,
+    texts: &[String],
+    data: &Array2<f32>,
+) -> Result<usize> {
+    let n = texts.len();
+    let k = ((n as f64 / 8.0).sqrt().ceil() as usize).clamp(3, 24);
+    if k > n {
+        return Ok(0);
     }
 
     // Cluster with FCM. CUDA is mandatory for production pgmcp; surface init
@@ -197,11 +245,11 @@ async fn build_scope_tree(
         "raptor: clustering complete"
     );
 
-    // Assign each observation to its argmax cluster; gather text
-    // contexts to summarize per cluster.
+    // Assign each item to its argmax cluster; gather text contexts per cluster.
+    // `i` also indexes the 2-D membership matrix, so iterate `texts` by
+    // enumeration (keeps `i` for `membership` while satisfying needless_range_loop).
     let mut clusters: Vec<Vec<String>> = vec![Vec::new(); k];
-    let mut cluster_ids: Vec<Vec<i64>> = vec![Vec::new(); k];
-    for i in 0..n {
+    for (i, text) in texts.iter().enumerate() {
         let mut argmax = 0;
         let mut best = result.membership[[i, 0]];
         for j in 1..k {
@@ -210,8 +258,7 @@ async fn build_scope_tree(
                 argmax = j;
             }
         }
-        clusters[argmax].push(texts[i].clone());
-        cluster_ids[argmax].push(ids[i]);
+        clusters[argmax].push(text.clone());
     }
 
     // Emit one level-1 summary per non-empty cluster.
@@ -220,8 +267,8 @@ async fn build_scope_tree(
         if cluster.is_empty() {
             continue;
         }
-        // Summarize via the LLM extractor's reflect path. Caps the
-        // observation count fed in to avoid prompt bloat.
+        // Summarize via the LLM extractor's reflect path. Cap the items fed in
+        // to avoid prompt bloat.
         let trimmed: Vec<String> = cluster.iter().take(20).cloned().collect();
         let summary_entities = match tokio::task::block_in_place(|| extractor.reflect(&trimmed)) {
             Ok(v) => v,
@@ -240,13 +287,11 @@ async fn build_scope_tree(
                     format!("{}: {}", e.name, head)
                 }
             })
-            .unwrap_or_else(|| format!("Cluster {} ({} observations)", j, cluster.len()));
+            .unwrap_or_else(|| format!("Cluster {} ({} items)", j, cluster.len()));
 
-        // Compute the cluster centroid in the embedding space — that's
-        // what the query path searches against.
+        // Cluster centroid in embedding space; L2-normalize so dot == cosine.
         let centroid_row = result.centroids.row(j);
         let centroid_vec: Vec<f32> = centroid_row.iter().copied().collect();
-        // L2-normalize so dot product == cosine.
         let norm: f32 = centroid_vec
             .iter()
             .map(|v| v * v)
@@ -271,11 +316,61 @@ async fn build_scope_tree(
         .context("level-1 summary insert")?;
         written += 1;
     }
-
-    debug!(
-        scope_id,
-        level_1_written = written,
-        "raptor: scope build complete"
-    );
     Ok(written)
+}
+
+/// Stage 6 — RAPTOR over the **full unified graph**. Builds a GLOBAL summary
+/// tree over *all* embedded unified-graph nodes (observations, chunks,
+/// work_items, experiments, commit_chunks, pattern_chunks, mandates — every
+/// node type carrying an embedding), so `memory_raptor_search` returns thematic
+/// summaries spanning the whole ontology, not just per-scope observations.
+/// Stored under a dedicated `__unified_graph__` scope as summary-only rows
+/// (no level-0 leaves), which satisfies the summary-tree CHECK without a schema
+/// change. Reuses [`write_cluster_summaries`].
+async fn build_unified_tree(pool: &PgPool, extractor: &dyn LlmExtractor) -> Result<usize> {
+    let scope_id = crate::db::queries::find_or_create_scope(
+        pool,
+        &crate::db::queries::ScopeSpec {
+            user_id: None,
+            agent_id: Some("__unified_graph__".to_string()),
+            session_id: None,
+            project_id: None,
+        },
+    )
+    .await
+    .context("unified scope")?;
+
+    let rows: Vec<(String, Option<Vector>)> = sqlx::query_as(
+        "SELECT label, embedding
+         FROM memory_unified_nodes
+         WHERE embedding IS NOT NULL
+         ORDER BY importance DESC
+         LIMIT $1",
+    )
+    .bind(MAX_UNIFIED_NODES)
+    .fetch_all(pool)
+    .await
+    .context("unified-node gather")?;
+    if (rows.len() as i64) < MIN_OBSERVATIONS_PER_SCOPE {
+        return Ok(0);
+    }
+
+    let n = rows.len();
+    let mut data = Array2::<f32>::zeros((n, 1024));
+    let mut texts: Vec<String> = Vec::with_capacity(n);
+    for (i, (label, emb)) in rows.iter().enumerate() {
+        texts.push(label.clone());
+        if let Some(v) = emb {
+            for (col, value) in v.as_slice().iter().take(1024).enumerate() {
+                data[[i, col]] = *value;
+            }
+        }
+    }
+
+    sqlx::query("DELETE FROM memory_summary_tree WHERE scope_id = $1")
+        .bind(scope_id)
+        .execute(pool)
+        .await
+        .context("clear prior unified tree")?;
+    write_cluster_summaries(pool, extractor, scope_id, &texts, &data).await
 }

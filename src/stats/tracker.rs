@@ -706,6 +706,23 @@ pub struct StatsTracker {
     pub telemetry_writes_failed: AtomicU64,
     /// Rows purged by the daily `telemetry-retention` cron job.
     pub telemetry_rows_purged: AtomicU64,
+    /// Number of `memory-graph-refresh` cron passes that refreshed the unified
+    /// knowledge-graph matviews (`memory_unified_nodes` + `memory_unified_edges`).
+    pub memory_graph_refreshes: AtomicU64,
+    /// `memory-concept-extract` cron passes completed (Stage 4 auto-population).
+    pub memory_concept_runs: AtomicU64,
+    /// Concept entities emitted (topic-seeded + LLM-emergent) across all passes.
+    pub memory_concepts_emitted: AtomicU64,
+    /// Concept↔concept relations emitted by the LLM-emergent pass.
+    pub memory_concept_relations: AtomicU64,
+    /// LLM concept-extraction passes that errored (logged, non-fatal).
+    pub memory_concept_errors: AtomicU64,
+    /// LLM concept passes skipped because the grounding text was unchanged.
+    pub memory_concept_llm_skips: AtomicU64,
+    /// Stage-5c `trajectory-similarity` cron passes completed.
+    pub trajectory_similarity_runs: AtomicU64,
+    /// `evolves_like` edges materialized by the last trajectory-similarity pass.
+    pub trajectory_edges_emitted: AtomicU64,
     /// Channel sender to the telemetry writer task; `None` in CLI mode
     /// or before `start_telemetry_writer` has registered the writer.
     /// Wrapped in `ArcSwapOption` so the hot `instrumented_tool_wrap`
@@ -969,6 +986,14 @@ impl StatsTracker {
             telemetry_writes_dropped: AtomicU64::new(0),
             telemetry_writes_failed: AtomicU64::new(0),
             telemetry_rows_purged: AtomicU64::new(0),
+            memory_graph_refreshes: AtomicU64::new(0),
+            memory_concept_runs: AtomicU64::new(0),
+            memory_concepts_emitted: AtomicU64::new(0),
+            memory_concept_relations: AtomicU64::new(0),
+            memory_concept_errors: AtomicU64::new(0),
+            memory_concept_llm_skips: AtomicU64::new(0),
+            trajectory_similarity_runs: AtomicU64::new(0),
+            trajectory_edges_emitted: AtomicU64::new(0),
             telemetry_tx: ArcSwapOption::empty(),
             uptime_start: Instant::now(),
         }
@@ -1317,6 +1342,14 @@ impl StatsTracker {
             "telemetry_writes_dropped": self.telemetry_writes_dropped.load(Ordering::Acquire),
             "telemetry_writes_failed": self.telemetry_writes_failed.load(Ordering::Acquire),
             "telemetry_rows_purged": self.telemetry_rows_purged.load(Ordering::Acquire),
+            "memory_graph_refreshes": self.memory_graph_refreshes.load(Ordering::Acquire),
+            "memory_concept_runs": self.memory_concept_runs.load(Ordering::Acquire),
+            "memory_concepts_emitted": self.memory_concepts_emitted.load(Ordering::Acquire),
+            "memory_concept_relations": self.memory_concept_relations.load(Ordering::Acquire),
+            "memory_concept_errors": self.memory_concept_errors.load(Ordering::Acquire),
+            "memory_concept_llm_skips": self.memory_concept_llm_skips.load(Ordering::Acquire),
+            "trajectory_similarity_runs": self.trajectory_similarity_runs.load(Ordering::Acquire),
+            "trajectory_edges_emitted": self.trajectory_edges_emitted.load(Ordering::Acquire),
             "tool_invocations": serde_json::Value::Object(
                 self.tool_invocations.iter()
                     .map(|e| (e.key().clone(), serde_json::Value::from(e.value().count.load(Ordering::Relaxed))))

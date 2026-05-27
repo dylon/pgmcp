@@ -35,6 +35,16 @@ pub async fn tool_semantic_search(
         "MCP tool invoked",
     );
 
+    // Cold-start fast-fail: surface a clear, retryable signal rather than
+    // parking the request in the bounded query channel until a worker finishes
+    // loading its model. Only fires during the brief warmup window.
+    if !ctx.embed().is_ready() {
+        return Err(McpError::internal_error(
+            "embedder is still warming up (loading model); retry shortly",
+            None,
+        ));
+    }
+
     // Embed the query
     let embedding = ctx.embed().embed_query(&params.query).await.map_err(|e| {
         error!(tool = "semantic_search", error = %e, "MCP tool failed");

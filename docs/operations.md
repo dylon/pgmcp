@@ -20,6 +20,34 @@ The daemon transitions through monotonically increasing phases:
 Heavy analysis jobs gate on **Ready** to avoid competing with the initial scan for
 resources. Light maintenance jobs check only `is_stopping()`.
 
+### Cold-start readiness (liveness ≪ serving-ready ≪ fully-indexed)
+
+Three distinct startup milestones, reached in order — the first two within
+seconds of boot:
+
+| Milestone         | Means                                                     | Observable via                                                     |
+|-------------------|-----------------------------------------------------------|--------------------------------------------------------------------|
+| **Listening**     | HTTP listener bound; process is up                        | TCP connect succeeds; `recovery_times phase="listening"`           |
+| **Serving-ready** | DB migrated + ≥1 embedder worker loaded → search/RAG work | `GET /health` → 200; `recovery_times phase="ready"` (embed warmup) |
+| **Fully-indexed** | Initial file scan complete (phase → `Ready`)              | `recovery_times phase="scan_complete"`; heavy crons start          |
+
+The listener binds **right after migrations**, *before* the optional reranker /
+LLM-extractor model loads (which now load in the background and hot-swap in) and
+without waiting for the embedder workers (each loads its model in its own
+thread). So `/health` is reachable almost immediately and flips to 200 as soon as
+one embedder worker is up — even while the initial scan is still running.
+`/api/search` and the `semantic_search` / `hybrid_search` MCP tools return a fast
+503 / retryable error until an embedder worker is ready, rather than blocking.
+
+**Cold-start scan throughput (data-driven).** The initial scan runs on a
+background thread and does *not* gate listening or serving-readiness. The
+directory walk is parallelized (the `ignore` crate's `build_parallel`), but the
+walk is not the bottleneck: on a warm DB it is mostly metadata-skip `stat`s
+(~seconds for 20k+ files), and on a cold DB the cost is dominated by **embedding
+throughput** — already parallel across `embeddings.pool_size` workers and bounded
+by GPU VRAM. To make a cold full-index finish sooner, raise
+`embeddings.pool_size` / `embeddings.batch_size` (VRAM permitting), not the walk.
+
 ### Cron Jobs
 
 pgmcp runs eight automated jobs via a lock-free cron state machine:

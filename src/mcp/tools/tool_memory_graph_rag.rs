@@ -110,6 +110,64 @@ pub async fn tool_memory_neighbors(
     json_result(json!(result))
 }
 
+/// `graph_neighbors` — friendly-ref wrapper over `memory_neighbors`. Resolves a
+/// human node reference (`work_item:WI-12`, `file:src/foo.rs`, `project:pgmcp`,
+/// `experiment:slug`, `topic:auth`, `symbol:Foo`, `commit:<sha>`, `agent:<id>`,
+/// or numeric `chunk:123`) to the composite `node_id`, then traverses the
+/// unified knowledge graph. The traversal itself is generic, so this is purely
+/// an ergonomic resolver + delegate.
+pub async fn tool_graph_neighbors(
+    ctx: &SystemContext,
+    params: crate::mcp::server::GraphNeighborsParams,
+) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "graph_neighbors", "MCP tool invoked");
+    let start = Instant::now();
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    let pool = raw_pool(ctx)?;
+    let (node_type, key) = params.node_ref.split_once(':').ok_or_else(|| {
+        McpError::invalid_params(
+            "node_ref must be '<type>:<key>' — e.g. 'work_item:WI-12', 'file:src/foo.rs', \
+             'project:pgmcp', 'experiment:my-slug', 'topic:auth', 'symbol:MyType', 'agent:codex', \
+             or numeric 'chunk:123'",
+            None,
+        )
+    })?;
+    if !crate::db::ontology::is_registered_node_type(node_type) {
+        let valid: Vec<&str> = crate::db::ontology::NODE_TYPES
+            .iter()
+            .map(|n| n.key)
+            .collect();
+        return Err(McpError::invalid_params(
+            format!(
+                "unknown node type '{node_type}'; valid types: {}",
+                valid.join(", ")
+            ),
+            None,
+        ));
+    }
+    let node_id = queries::resolve_graph_node_id(pool, node_type, key)
+        .await
+        .map_err(|e| McpError::internal_error(format!("resolve failed: {}", e), None))?
+        .ok_or_else(|| McpError::invalid_params(format!("no {node_type} matches '{key}'"), None))?;
+    let depth = params.depth.unwrap_or(1);
+    let max_nodes = params.max_nodes.unwrap_or(200);
+    let result = queries::memory_neighbors(
+        pool,
+        &node_id,
+        depth,
+        params.edge_filter.as_deref(),
+        max_nodes,
+    )
+    .await
+    .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
+    enforce_latency_cap(ctx, "graph_neighbors", start.elapsed().as_millis() as u64);
+    json_result(json!({
+        "node_ref": params.node_ref,
+        "resolved_node_id": node_id,
+        "neighbors": result,
+    }))
+}
+
 pub async fn tool_memory_path_search(
     ctx: &SystemContext,
     params: MemoryPathSearchParams,
@@ -132,6 +190,16 @@ pub async fn tool_memory_path_search(
         .prune_jaccard
         .unwrap_or(cfg.memory.graph_rag.path_search_prune_jaccard) as f64;
     let k = params.k.unwrap_or(10);
+    // Stage 5b: optional point-in-time (RFC3339) + recency half-life (default 90d).
+    let as_of = match params.as_of.as_deref() {
+        Some(s) => Some(
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map_err(|e| McpError::invalid_params(format!("as_of must be RFC3339: {e}"), None))?
+                .with_timezone(&chrono::Utc),
+        ),
+        None => None,
+    };
+    let half_life_days = params.half_life_days.unwrap_or(90.0).max(0.001);
     let result = queries::memory_path_search(
         pool,
         &embedding,
@@ -141,6 +209,8 @@ pub async fn tool_memory_path_search(
         k,
         prune,
         ef,
+        as_of,
+        half_life_days,
     )
     .await
     .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;

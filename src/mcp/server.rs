@@ -3389,6 +3389,22 @@ pub struct TrajectorySimilarityParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RecognizeTrajectoryParams {
+    #[schemars(
+        description = "Record type to match against: 'work_item' (progress-% series) or 'file' (weekly churn series)."
+    )]
+    pub node_type: String,
+    #[schemars(
+        description = "The partial / in-progress numeric trajectory (ordered f64 samples)."
+    )]
+    pub series: Vec<f64>,
+    #[schemars(description = "Number of nearest references to return (1..=50, default 5).")]
+    pub k: Option<i32>,
+    #[schemars(description = "MSM split/merge cost c (default 0.1).")]
+    pub msm_c: Option<f64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DocumentedTechDebtParams {
     #[schemars(description = "Project name (required)")]
     pub project: String,
@@ -3817,6 +3833,10 @@ pub struct MemoryAnchorEntityParams {
     pub file_id: Option<i64>,
     pub chunk_id: Option<i64>,
     pub topic_id: Option<i64>,
+    #[schemars(description = "Anchor to a file_symbols.id (unified-graph symbol node).")]
+    pub symbol_id: Option<i64>,
+    #[schemars(description = "Anchor to a projects.id (unified-graph project node).")]
+    pub project_id: Option<i32>,
     pub anchor_type: String,
 }
 
@@ -3836,6 +3856,10 @@ pub struct MemoryFindEntitiesForCodeParams {
     pub file_id: Option<i64>,
     pub chunk_id: Option<i64>,
     pub topic_id: Option<i64>,
+    #[schemars(description = "Find entities anchored to this file_symbols.id.")]
+    pub symbol_id: Option<i64>,
+    #[schemars(description = "Find entities anchored to this projects.id.")]
+    pub project_id: Option<i32>,
 }
 
 // ----------------------------------------------------------------------------
@@ -3862,6 +3886,22 @@ pub struct MemoryNeighborsParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GraphNeighborsParams {
+    #[schemars(
+        description = "Friendly node reference '<type>:<key>' — key is a natural id (file path, \
+project/topic name, work_item public_id, experiment slug, commit sha, symbol name, agent id) or \
+a numeric pk. E.g. 'work_item:WI-12', 'file:src/foo.rs', 'project:pgmcp', 'agent:codex', 'chunk:42'."
+    )]
+    pub node_ref: String,
+    #[schemars(description = "Traversal depth (default 1, max 4).")]
+    pub depth: Option<i32>,
+    #[schemars(description = "Optional edge_type filter (e.g. 'validated_by', 'in_project').")]
+    pub edge_filter: Option<String>,
+    #[schemars(description = "Hard cap on total nodes returned (default 200, max 500).")]
+    pub max_nodes: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MemoryPathSearchParams {
     pub query: String,
     pub seed_node_types: Option<Vec<String>>,
@@ -3870,6 +3910,16 @@ pub struct MemoryPathSearchParams {
     pub k: Option<i32>,
     #[schemars(description = "PathRAG prune threshold; paths with Jaccard ≥ this are pruned.")]
     pub prune_jaccard: Option<f32>,
+    #[schemars(
+        description = "Stage 5b: as-of point-in-time (RFC3339, e.g. '2026-01-01T00:00:00Z') — \
+restrict traversal to edges valid at that time (the graph as it was). Omit for the current graph."
+    )]
+    pub as_of: Option<String>,
+    #[schemars(
+        description = "Stage 5b: recency half-life in days (default 90) — recent edges are \
+up-weighted in path scoring; timeless structural edges are never decayed."
+    )]
+    pub half_life_days: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -4921,6 +4971,29 @@ max_nodes ≤ 500."
             &_ctx,
             &summarize_debug(&params),
             super::tools::tool_memory_graph_rag::tool_memory_neighbors(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Unified knowledge-graph BFS by *friendly* node reference. Accepts \
+'<type>:<key>' where key is a natural id (file path, project/topic name, work_item public_id, \
+experiment slug, commit sha, symbol name, agent id) or a numeric pk; resolves it and traverses \
+the heterogeneous graph (depth ≤ 4, max_nodes ≤ 500). Valid types: file, project, work_item, \
+experiment, topic, symbol, commit, agent, chunk, observation, memory_entity."
+    )]
+    async fn graph_neighbors(
+        &self,
+        Parameters(params): Parameters<GraphNeighborsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "graph_neighbors",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_memory_graph_rag::tool_graph_neighbors(self.ctx(), params),
         )
         .await
     }
@@ -8194,6 +8267,28 @@ failure. Powers the 'learn which decomposition worked' loop."
         .await
     }
 
+    #[tool(
+        description = "Stage 5d online recognition: match a partial / in-progress numeric \
+trajectory ('work_item' progress-% or 'file' weekly-churn) against the live record cohort via \
+Move-Split-Merge (which aligns different-length sequences), returning the nearest known \
+trajectories. Feed an unfolding series for early-warning / outcome prediction."
+    )]
+    async fn recognize_trajectory(
+        &self,
+        Parameters(params): Parameters<RecognizeTrajectoryParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "recognize_trajectory",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_trajectory_similarity::tool_recognize_trajectory(self.ctx(), params),
+        )
+        .await
+    }
+
     // ========================================================================
     // SOTA Phase 2 — Graph algorithms
     // ========================================================================
@@ -10551,6 +10646,7 @@ impl McpServer {
                 // Memory-server Phase 6 graph-enhanced retrieval.
                 "memory_unified_search"         => memory_unified_search(MemoryUnifiedSearchParams) in tool_memory_graph_rag,
                 "memory_neighbors"              => memory_neighbors(MemoryNeighborsParams) in tool_memory_graph_rag,
+                "graph_neighbors"               => graph_neighbors(GraphNeighborsParams) in tool_memory_graph_rag,
                 "memory_path_search"            => memory_path_search(MemoryPathSearchParams) in tool_memory_graph_rag,
                 "memory_ppr_search"             => memory_ppr_search(MemoryPprSearchParams) in tool_memory_graph_rag,
                 "memory_raptor_search"          => memory_raptor_search(MemoryRaptorSearchParams) in tool_memory_graph_rag,
@@ -10693,6 +10789,7 @@ impl McpServer {
                 "work_item_link_experiment" => work_item_link_experiment(WorkItemLinkExperimentParams) in work_items,
                 "a2a_pattern_recursive"  => a2a_pattern_recursive(A2aPatternRecursiveParams),
                 "trajectory_similarity"  => trajectory_similarity(TrajectorySimilarityParams),
+                "recognize_trajectory"   => recognize_trajectory(RecognizeTrajectoryParams) in tool_trajectory_similarity,
                 // SOTA Phase 2 — graph algorithms
                 "kcore_analysis"         => kcore_analysis(KcoreAnalysisParams),
                 "ktruss_analysis"        => ktruss_analysis(KtrussAnalysisParams),

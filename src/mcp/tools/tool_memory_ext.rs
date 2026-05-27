@@ -242,6 +242,8 @@ pub async fn tool_memory_anchor_entity(
         params.file_id,
         params.chunk_id,
         params.topic_id,
+        params.symbol_id,
+        params.project_id,
         &params.anchor_type,
     )
     .await
@@ -301,6 +303,8 @@ pub async fn tool_memory_find_entities_for_code(
         params.file_id,
         params.chunk_id,
         params.topic_id,
+        params.symbol_id,
+        params.project_id,
     )
     .await
     .map_err(|e| match &e {

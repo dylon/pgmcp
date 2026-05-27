@@ -24,6 +24,7 @@ mod v2_shadow_asr;
 mod v3_cross_language_signatures;
 mod v4_work_items;
 mod v5_work_items_collab;
+mod v6_unified_graph;
 mod versioning;
 use schema_introspect::*;
 use versioning::*;
@@ -516,6 +517,63 @@ async fn ensure_experiment_hnsw_index(
     Ok(())
 }
 
+// This migration-lock-retry cluster is reached only from the daemon startup
+// path (`cli::daemon`, via `run_migrations_with_lock_retry` at startup step 1),
+// never from a `#[cfg(test)]` test. In the `bin pgmcp test` target the harness
+// replaces `main`, so code reachable only through `main` is flagged `dead_code`
+// there even though it is live in the running daemon — hence the targeted
+// allows (the lib build keeps these reachable via the `pub` API).
+/// Number of times [`run_migrations_with_lock_retry`] retries on a
+/// `lock_timeout` before giving up.
+#[allow(dead_code)]
+const MIGRATION_LOCK_RETRIES: u32 = 6;
+/// Backoff between migration retries. Roughly one `lock_timeout` window, so each
+/// retry re-waits about as long as the failed lock attempt did.
+#[allow(dead_code)]
+const MIGRATION_LOCK_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// True if `e` is PostgreSQL `lock_not_available` (SQLSTATE 55P03) — a statement
+/// cancelled by `lock_timeout` while waiting for a lock.
+#[allow(dead_code)] // live only in the daemon path; see the cluster note above
+fn is_lock_timeout(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("55P03"))
+}
+
+/// [`run_migrations`], retried on transient lock contention.
+///
+/// Startup migrations take ACCESS EXCLUSIVE locks (table / column DDL). If a
+/// previous daemon instance was killed mid-query, its orphaned backend can still
+/// hold ACCESS SHARE on a table our DDL needs — so the first attempt may hit
+/// `lock_timeout` (SQLSTATE 55P03). Rather than abort startup, we retry: the
+/// orphan is reaped by `client_connection_check_interval` (or finishes), the
+/// lock frees, and a later attempt succeeds. `run_migrations` is idempotent
+/// (IF NOT EXISTS + version gates + nullability / constraint guards), so
+/// re-running from the top is safe. Non-lock errors propagate immediately.
+#[allow(dead_code)] // live only in the daemon path; see the cluster note above
+pub async fn run_migrations_with_lock_retry(
+    pool: &PgPool,
+    vector_config: &VectorConfig,
+) -> Result<(), sqlx::Error> {
+    let mut attempt = 0u32;
+    loop {
+        match run_migrations(pool, vector_config).await {
+            Ok(()) => return Ok(()),
+            Err(e) if is_lock_timeout(&e) && attempt < MIGRATION_LOCK_RETRIES => {
+                attempt += 1;
+                tracing::warn!(
+                    attempt,
+                    max = MIGRATION_LOCK_RETRIES,
+                    backoff_secs = MIGRATION_LOCK_RETRY_BACKOFF.as_secs(),
+                    error = %e,
+                    "startup migrations hit lock contention (lock_timeout); retrying after backoff"
+                );
+                tokio::time::sleep(MIGRATION_LOCK_RETRY_BACKOFF).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Run all migrations to set up the schema.
 pub async fn run_migrations(
     pool: &PgPool,
@@ -626,9 +684,17 @@ pub async fn run_migrations(
 
     // Migration: allow content_hash to be NULL (deferred commit for resume-safety).
     // Existing databases may have NOT NULL; this is metadata-only in PostgreSQL.
-    sqlx::query("ALTER TABLE indexed_files ALTER COLUMN content_hash DROP NOT NULL")
-        .execute(pool)
-        .await?;
+    //
+    // Guarded on current nullability. `ALTER … DROP NOT NULL` has no `IF` form and
+    // takes ACCESS EXCLUSIVE on `indexed_files`; this block re-runs on every boot,
+    // so issuing it unconditionally meant a restart landing while a long analytic
+    // query (e.g. semantic-edges) held ACCESS SHARE would block on the lock and
+    // abort startup at `lock_timeout`. Skip the no-op ALTER on the common path.
+    if !column_is_nullable(pool, "indexed_files", "content_hash").await? {
+        sqlx::query("ALTER TABLE indexed_files ALTER COLUMN content_hash DROP NOT NULL")
+            .execute(pool)
+            .await?;
+    }
 
     // Migration: content-based dedup + rename detection.
     //
@@ -1227,17 +1293,17 @@ pub async fn run_migrations(
         sqlx::query(idx_sql).execute(pool).await?;
     }
 
-    // Idempotent CHECK install — Postgres has no `ADD CONSTRAINT IF NOT EXISTS`
-    // so we DROP-then-ADD inside a single transaction to make re-runs cheap.
-    sqlx::query(
-        "ALTER TABLE code_graph_edges DROP CONSTRAINT IF EXISTS cge_call_needs_source_symbol",
+    // Idempotent CHECK install. `ensure_named_constraint` skips the
+    // ACCESS-EXCLUSIVE DROP+ADD (which revalidates every `code_graph_edges` row)
+    // when the constraint is already installed with this exact definition, so the
+    // per-boot re-run is a single catalog read. See its doc for the restart-time
+    // lock-collision rationale.
+    ensure_named_constraint(
+        pool,
+        "code_graph_edges",
+        "cge_call_needs_source_symbol",
+        "CHECK (edge_type <> 'call' OR source_symbol_id IS NOT NULL)",
     )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "ALTER TABLE code_graph_edges ADD CONSTRAINT cge_call_needs_source_symbol CHECK (edge_type <> 'call' OR source_symbol_id IS NOT NULL)",
-    )
-    .execute(pool)
     .await?;
 
     // Re-tighten the source_symbol_id FK from ON DELETE SET NULL to ON DELETE
@@ -1589,17 +1655,12 @@ pub async fn run_migrations(
     .execute(pool)
     .await?;
 
-    sqlx::query(
-        "ALTER TABLE software_patterns DROP CONSTRAINT IF EXISTS software_patterns_kind_check",
+    ensure_named_constraint(
+        pool,
+        "software_patterns",
+        "software_patterns_kind_check",
+        "CHECK (kind IN ('pattern', 'anti_pattern', 'principle', 'code_smell'))",
     )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "ALTER TABLE software_patterns
-            ADD CONSTRAINT software_patterns_kind_check
-            CHECK (kind IN ('pattern', 'anti_pattern', 'principle', 'code_smell'))",
-    )
-    .execute(pool)
     .await?;
 
     ensure_software_pattern_hnsw_index(pool, vector_config).await?;
@@ -1711,44 +1772,30 @@ pub async fn run_migrations(
         sqlx::query(idx_sql).execute(pool).await?;
     }
 
-    // Idempotent CHECK-constraint installs (DROP IF EXISTS + ADD).
-    sqlx::query(
-        "ALTER TABLE session_mandates DROP CONSTRAINT IF EXISTS session_mandates_polarity_check",
+    // Idempotent CHECK-constraint installs (see `ensure_named_constraint`): these
+    // re-run every boot, so each skips its ACCESS-EXCLUSIVE DROP+ADD unless the
+    // definition actually changed (e.g. a new mandate polarity is added).
+    ensure_named_constraint(
+        pool,
+        "session_mandates",
+        "session_mandates_polarity_check",
+        "CHECK (polarity IN ('always','never','prefer','avoid','remember','from_now_on',\
+         'correction','permission','constraint','mandate','process_rule','project_rule'))",
     )
-    .execute(pool)
     .await?;
-    sqlx::query(
-        "ALTER TABLE session_mandates
-            ADD CONSTRAINT session_mandates_polarity_check
-            CHECK (polarity IN ('always','never','prefer','avoid','remember','from_now_on',
-                                'correction','permission','constraint','mandate',
-                                'process_rule','project_rule'))",
+    ensure_named_constraint(
+        pool,
+        "session_mandates",
+        "session_mandates_status_check",
+        "CHECK (status IN ('active','superseded','retired','promoted'))",
     )
-    .execute(pool)
     .await?;
-    sqlx::query(
-        "ALTER TABLE session_mandates DROP CONSTRAINT IF EXISTS session_mandates_status_check",
+    ensure_named_constraint(
+        pool,
+        "durable_mandates",
+        "durable_mandates_scope_check",
+        "CHECK (scope IN ('project','workspace'))",
     )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "ALTER TABLE session_mandates
-            ADD CONSTRAINT session_mandates_status_check
-            CHECK (status IN ('active','superseded','retired','promoted'))",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "ALTER TABLE durable_mandates DROP CONSTRAINT IF EXISTS durable_mandates_scope_check",
-    )
-    .execute(pool)
-    .await?;
-    sqlx::query(
-        "ALTER TABLE durable_mandates
-            ADD CONSTRAINT durable_mandates_scope_check
-            CHECK (scope IN ('project','workspace'))",
-    )
-    .execute(pool)
     .await?;
 
     ensure_session_prompts_hnsw_index(pool, vector_config).await?;
@@ -1866,12 +1913,10 @@ pub async fn run_migrations(
     // absent in a partial install.
     ensure_work_item_experiment_bridge(pool).await?;
 
-    // ================================================================
-    // Memory-server Phase 6.3: heterogeneous-node graph view
-    // (NodeRAG-inspired). UNION ALL projection across the existing
-    // node-typed tables. See `docs/memory-server/05-schema.md` §12.3.
-    // ================================================================
-    ensure_memory_unified_views(pool, vector_config).await?;
+    // (memory_unified_views is built LAST — after all numbered migration steps
+    // — because its node/edge arms reference columns/tables added by v6
+    // (work_items.observation_id, experiment_relations, memory_code_anchor
+    // .symbol_id/.project_id). See the call after the v6 step below.)
 
     // Record the baseline. From this point on, future migration steps
     // can call `apply_step(pool, N, ...)`-style logic to land changes
@@ -1990,9 +2035,47 @@ pub async fn run_migrations(
         );
     }
 
+    // ================================================================
+    // Migration step 6 — unified_graph_v1
+    // Unified knowledge-graph foundation: work_items.observation_id,
+    // experiment_relations (inter-experiment DAG), memory_code_anchor
+    // +symbol_id/+project_id (relaxed CHECK), and the 'auto_index'
+    // memory_source value. The work_item_experiment bridge already exists
+    // (ensure_work_item_experiment_bridge); Stage 2 wires it into the views.
+    // See `src/db/migrations/v6_unified_graph.rs`.
+    // ================================================================
+    if !version_applied(pool, v6_unified_graph::UNIFIED_GRAPH_V1).await? {
+        v6_unified_graph::apply(pool).await?;
+        record_version(
+            pool,
+            v6_unified_graph::UNIFIED_GRAPH_V1,
+            v6_unified_graph::UNIFIED_GRAPH_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v6_unified_graph::UNIFIED_GRAPH_V1,
+            "unified_graph_v1 migration applied"
+        );
+    }
+
     // Build/refresh the work_items HNSW index (unconditional; the table exists
     // after the v4 step on fresh installs and already exists on upgrades).
     ensure_work_items_hnsw_index(pool, vector_config).await?;
+
+    // Stage 5c: trajectory-similarity edge store (must exist before the edges
+    // view, which UNIONs it as the `evolves_like` arm).
+    ensure_trajectory_similarities(pool).await?;
+
+    // ================================================================
+    // Memory-server Phase 6.3 + unified-graph: the heterogeneous node/edge
+    // graph views. Built LAST so every node/edge arm's source table/column
+    // exists — including the v6 additions (work_items.observation_id,
+    // experiment_relations, memory_code_anchor.symbol_id/.project_id) and the
+    // collaboration tables (work_item_claims, agent_presence, agent_identity).
+    // Hash-gated (MEMORY_UNIFIED_VIEWS_HASH_KEY): rebuilds only when the SQL
+    // consts change. See `docs/memory-server/05-schema.md` §12.3.
+    // ================================================================
+    ensure_memory_unified_views(pool, vector_config).await?;
 
     Ok(())
 }
@@ -2010,7 +2093,7 @@ pub async fn run_migrations(
 /// of truth for the rebuild-gate hash. Edits propagate transparently
 /// — the hash changes, the next restart rebuilds, the new hash is
 /// upserted into `pgmcp_metadata['memory_unified_views_def_hash']`.
-const MEMORY_UNIFIED_NODES_SQL: &str = "CREATE MATERIALIZED VIEW memory_unified_nodes AS
+pub(crate) const MEMORY_UNIFIED_NODES_SQL: &str = "CREATE MATERIALIZED VIEW memory_unified_nodes AS
     SELECT 'memory_entity:' || id::TEXT AS node_id,
            'memory_entity'::TEXT AS node_type,
            name AS label,
@@ -2052,43 +2135,287 @@ const MEMORY_UNIFIED_NODES_SQL: &str = "CREATE MATERIALIZED VIEW memory_unified_
     SELECT 'pattern_chunk:' || id::TEXT, 'pattern_chunk',
            LEFT(content, 200), embedding_v2, 0.6
       FROM software_pattern_chunks
-      WHERE embedding_v2 IS NOT NULL";
+      WHERE embedding_v2 IS NOT NULL
+    UNION ALL
+    SELECT 'file:' || id::TEXT, 'file',
+           relative_path, NULL::VECTOR(1024), 0.4
+      FROM indexed_files
+    UNION ALL
+    SELECT 'project:' || id::TEXT, 'project',
+           name, NULL::VECTOR(1024), 0.8
+      FROM projects
+    UNION ALL
+    SELECT 'symbol:' || s.id::TEXT, 'symbol',
+           s.name, NULL::VECTOR(1024), 0.45
+      FROM file_symbols s
+      WHERE s.visibility = 'public'
+         OR EXISTS (SELECT 1 FROM memory_code_anchor mca WHERE mca.symbol_id = s.id)
+         OR EXISTS (SELECT 1 FROM work_item_code_anchor wca WHERE wca.symbol_id = s.id)
+    UNION ALL
+    SELECT 'work_item:' || id::TEXT, 'work_item',
+           title, embedding, LEAST(1.0, 0.4 + priority / 200.0)
+      FROM work_items
+      WHERE status NOT IN ('cancelled','deferred')
+    UNION ALL
+    SELECT 'experiment:' || id::TEXT, 'experiment',
+           title, embedding, 0.6
+      FROM experiments WHERE valid_to IS NULL
+    UNION ALL
+    SELECT 'agent:' || aid, 'agent',
+           aid, NULL::VECTOR(1024), 0.5
+      FROM (
+        SELECT agent_id AS aid FROM agent_presence
+        UNION SELECT agent_id FROM work_item_claims
+        UNION SELECT to_agent_id FROM work_item_claims WHERE to_agent_id IS NOT NULL
+        UNION SELECT claimed_by FROM work_items WHERE claimed_by IS NOT NULL
+      ) agents
+      WHERE aid IS NOT NULL AND aid <> ''";
 
 /// Edges-view definition. Same single-source-of-truth posture as
 /// `MEMORY_UNIFIED_NODES_SQL` — F9's hash-gate covers both.
-const MEMORY_UNIFIED_EDGES_SQL: &str = "CREATE VIEW memory_unified_edges AS
+pub(crate) const MEMORY_UNIFIED_EDGES_SQL: &str = "CREATE MATERIALIZED VIEW memory_unified_edges AS
+    -- memory entity ↔ entity (typed relations). Columns 7/8 = temporal validity
+    -- interval (Stage 5a): bitemporal cols where available, created/computed
+    -- timestamps elsewhere, NULL for timeless structural edges.
     SELECT 'memory_entity:' || from_entity_id::TEXT AS from_id,
            'memory_entity'::TEXT AS from_type,
            'memory_entity:' || to_entity_id::TEXT AS to_id,
            'memory_entity'::TEXT AS to_type,
            relation_type AS edge_type,
-           importance::DOUBLE PRECISION AS weight
+           importance::DOUBLE PRECISION AS weight,
+           valid_from AS valid_from, valid_to AS valid_to
       FROM memory_relations WHERE valid_to IS NULL
     UNION ALL
+    -- memory entity → code anchor (file/chunk/topic/symbol/project; v6 columns).
+    -- NOTE: file_id now maps to 'file:' (was mislabeled 'chunk:').
     SELECT 'memory_entity:' || entity_id::TEXT,
            'memory_entity',
            CASE
-             WHEN file_id IS NOT NULL THEN 'chunk:' || file_id::TEXT
+             WHEN file_id    IS NOT NULL THEN 'file:'    || file_id::TEXT
+             WHEN chunk_id   IS NOT NULL THEN 'chunk:'   || chunk_id::TEXT
+             WHEN topic_id   IS NOT NULL THEN 'topic:'   || topic_id::TEXT
+             WHEN symbol_id  IS NOT NULL THEN 'symbol:'  || symbol_id::TEXT
+             ELSE 'project:' || project_id::TEXT
+           END,
+           CASE
+             WHEN file_id    IS NOT NULL THEN 'file'
+             WHEN chunk_id   IS NOT NULL THEN 'chunk'
+             WHEN topic_id   IS NOT NULL THEN 'topic'
+             WHEN symbol_id  IS NOT NULL THEN 'symbol'
+             ELSE 'project'
+           END,
+           anchor_type,
+           1.0::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM memory_code_anchor
+    UNION ALL
+    -- chunk → topic membership
+    SELECT 'chunk:' || chunk_id::TEXT, 'chunk',
+           'topic:' || topic_id::TEXT, 'topic',
+           'belongs_to', membership_score::DOUBLE PRECISION,
+           NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
+      FROM chunk_topic_assignments WHERE membership_score >= 0.05
+    UNION ALL
+    -- chunk → file containment
+    SELECT 'chunk:' || id::TEXT, 'chunk',
+           'file:' || file_id::TEXT, 'file',
+           'in_file', 1.0::DOUBLE PRECISION,
+           NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
+      FROM file_chunks WHERE file_id IS NOT NULL
+    UNION ALL
+    -- file → project containment
+    SELECT 'file:' || id::TEXT, 'file',
+           'project:' || project_id::TEXT, 'project',
+           'in_project', 1.0::DOUBLE PRECISION,
+           indexed_at, NULL::TIMESTAMPTZ
+      FROM indexed_files WHERE project_id IS NOT NULL
+    UNION ALL
+    -- symbol → file (defined_in); gated to the same set as the symbol node arm
+    SELECT 'symbol:' || s.id::TEXT, 'symbol',
+           'file:' || s.file_id::TEXT, 'file',
+           'defined_in', 1.0::DOUBLE PRECISION,
+           NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
+      FROM file_symbols s
+      WHERE s.visibility = 'public'
+         OR EXISTS (SELECT 1 FROM memory_code_anchor mca WHERE mca.symbol_id = s.id)
+         OR EXISTS (SELECT 1 FROM work_item_code_anchor wca WHERE wca.symbol_id = s.id)
+    UNION ALL
+    -- symbol → parent symbol (containment), same gate
+    SELECT 'symbol:' || s.id::TEXT, 'symbol',
+           'symbol:' || s.parent_id::TEXT, 'symbol',
+           'parent_of', 1.0::DOUBLE PRECISION,
+           NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
+      FROM file_symbols s
+      WHERE s.parent_id IS NOT NULL
+        AND (s.visibility = 'public'
+         OR EXISTS (SELECT 1 FROM memory_code_anchor mca WHERE mca.symbol_id = s.id)
+         OR EXISTS (SELECT 1 FROM work_item_code_anchor wca WHERE wca.symbol_id = s.id))
+    UNION ALL
+    -- file ↔ file: import / co_change / call (passthrough edge_type)
+    SELECT 'file:' || source_file_id::TEXT, 'file',
+           'file:' || target_file_id::TEXT, 'file',
+           edge_type, LEAST(1.0, GREATEST(0.0, COALESCE(weight, 1.0)))::DOUBLE PRECISION,
+           computed_at, NULL::TIMESTAMPTZ
+      FROM code_graph_edges WHERE target_file_id IS NOT NULL
+    UNION ALL
+    -- chunk ↔ chunk cross-project similarity (near-duplicate threshold)
+    SELECT 'chunk:' || chunk_id_a::TEXT, 'chunk',
+           'chunk:' || chunk_id_b::TEXT, 'chunk',
+           'similar_to', chunk_similarity::DOUBLE PRECISION,
+           computed_at, NULL::TIMESTAMPTZ
+      FROM cross_project_similarities WHERE chunk_similarity >= 0.80
+    UNION ALL
+    -- commit_chunk → commit
+    SELECT 'commit_chunk:' || id::TEXT, 'commit_chunk',
+           'commit:' || commit_id::TEXT, 'commit',
+           'in_commit', 1.0::DOUBLE PRECISION,
+           NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
+      FROM git_commit_chunks WHERE commit_id IS NOT NULL
+    UNION ALL
+    -- commit → file (touches): join file_path → indexed_files.relative_path per project
+    SELECT 'commit:' || gc.id::TEXT, 'commit',
+           'file:' || f.id::TEXT, 'file',
+           'touches', 1.0::DOUBLE PRECISION,
+           gc.author_date, NULL::TIMESTAMPTZ
+      FROM git_commit_files gcf
+      JOIN git_commits gc ON gc.id = gcf.commit_id
+      JOIN indexed_files f
+        ON f.project_id = gc.project_id AND f.relative_path = gcf.file_path
+    UNION ALL
+    -- work_item decomposition tree (parent → child)
+    SELECT 'work_item:' || parent_id::TEXT, 'work_item',
+           'work_item:' || id::TEXT, 'work_item',
+           'parent_of', 1.0::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM work_items WHERE parent_id IS NOT NULL
+    UNION ALL
+    -- work_item ↔ work_item relations (DAG, passthrough type)
+    SELECT 'work_item:' || from_item_id::TEXT, 'work_item',
+           'work_item:' || to_item_id::TEXT, 'work_item',
+           relation_type, 0.8::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM item_relations
+    UNION ALL
+    -- work_item → code anchors (file/chunk/symbol)
+    SELECT 'work_item:' || item_id::TEXT, 'work_item',
+           CASE
+             WHEN file_id   IS NOT NULL THEN 'file:'   || file_id::TEXT
+             WHEN chunk_id  IS NOT NULL THEN 'chunk:'  || chunk_id::TEXT
+             ELSE 'symbol:' || symbol_id::TEXT
+           END,
+           CASE
+             WHEN file_id   IS NOT NULL THEN 'file'
+             WHEN chunk_id  IS NOT NULL THEN 'chunk'
+             ELSE 'symbol'
+           END,
+           anchor_type, 1.0::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM work_item_code_anchor
+    UNION ALL
+    -- work_item → experiment (the existing Phase-10 bridge)
+    SELECT 'work_item:' || work_item_id::TEXT, 'work_item',
+           'experiment:' || experiment_id::TEXT, 'experiment',
+           'validated_by', 1.0::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM work_item_experiment
+    UNION ALL
+    -- work_item → observation (memory-graph link, v6)
+    SELECT 'work_item:' || id::TEXT, 'work_item',
+           'observation:' || observation_id::TEXT, 'observation',
+           'evidenced_by', 1.0::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM work_items WHERE observation_id IS NOT NULL
+    UNION ALL
+    -- work_item → project
+    SELECT 'work_item:' || id::TEXT, 'work_item',
+           'project:' || project_id::TEXT, 'project',
+           'in_project', 0.5::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM work_items WHERE project_id IS NOT NULL
+    UNION ALL
+    -- experiment → code anchors (file/chunk/topic)
+    SELECT 'experiment:' || experiment_id::TEXT, 'experiment',
+           CASE
+             WHEN file_id  IS NOT NULL THEN 'file:'  || file_id::TEXT
              WHEN chunk_id IS NOT NULL THEN 'chunk:' || chunk_id::TEXT
              ELSE 'topic:' || topic_id::TEXT
            END,
            CASE
-             WHEN file_id IS NOT NULL THEN 'chunk'
+             WHEN file_id  IS NOT NULL THEN 'file'
              WHEN chunk_id IS NOT NULL THEN 'chunk'
              ELSE 'topic'
            END,
-           anchor_type,
-           1.0::DOUBLE PRECISION
-      FROM memory_code_anchor
+           anchor_type, 1.0::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM experiment_code_anchor
     UNION ALL
-    SELECT 'chunk:' || chunk_id::TEXT,
-           'chunk',
-           'topic:' || topic_id::TEXT,
-           'topic',
-           'belongs_to',
-           membership_score
-      FROM chunk_topic_assignments
-      WHERE membership_score >= 0.05";
+    -- experiment → observation
+    SELECT 'experiment:' || id::TEXT, 'experiment',
+           'observation:' || observation_id::TEXT, 'observation',
+           'evidenced_by', 1.0::DOUBLE PRECISION,
+           valid_from, valid_to
+      FROM experiments WHERE observation_id IS NOT NULL AND valid_to IS NULL
+    UNION ALL
+    -- experiment → project
+    SELECT 'experiment:' || id::TEXT, 'experiment',
+           'project:' || project_id::TEXT, 'project',
+           'in_project', 0.5::DOUBLE PRECISION,
+           valid_from, valid_to
+      FROM experiments WHERE project_id IS NOT NULL AND valid_to IS NULL
+    UNION ALL
+    -- experiment supersession (a different experiment supersedes another)
+    SELECT 'experiment:' || superseded_by::TEXT, 'experiment',
+           'experiment:' || id::TEXT, 'experiment',
+           'supersedes', 0.9::DOUBLE PRECISION,
+           valid_from, valid_to
+      FROM experiments WHERE superseded_by IS NOT NULL
+    UNION ALL
+    -- experiment ↔ experiment relations (DAG, passthrough type)
+    SELECT 'experiment:' || from_experiment_id::TEXT, 'experiment',
+           'experiment:' || to_experiment_id::TEXT, 'experiment',
+           relation_type, 0.8::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM experiment_relations
+    UNION ALL
+    -- collaboration: work_item → current claimant agent
+    SELECT 'work_item:' || id::TEXT, 'work_item',
+           'agent:' || claimed_by, 'agent',
+           'claimed_by', 0.7::DOUBLE PRECISION,
+           claimed_at, NULL::TIMESTAMPTZ
+      FROM work_items WHERE claimed_by IS NOT NULL AND claimed_by <> ''
+    UNION ALL
+    -- collaboration: agent → work_item currently focused on (presence)
+    SELECT 'agent:' || agent_id, 'agent',
+           'work_item:' || current_work_item_id::TEXT, 'work_item',
+           'working_on', 0.6::DOUBLE PRECISION,
+           last_active_at, NULL::TIMESTAMPTZ
+      FROM agent_presence WHERE current_work_item_id IS NOT NULL
+    UNION ALL
+    -- collaboration: work_item ↔ agent claim history (distinct item/agent/action)
+    SELECT DISTINCT 'work_item:' || work_item_id::TEXT, 'work_item',
+           'agent:' || agent_id, 'agent',
+           action, 0.5::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM work_item_claims WHERE agent_id IS NOT NULL AND agent_id <> ''
+    UNION ALL
+    -- collaboration: agent → agent handoffs
+    SELECT DISTINCT 'agent:' || agent_id, 'agent',
+           'agent:' || to_agent_id, 'agent',
+           'handoff', 0.5::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM work_item_claims WHERE to_agent_id IS NOT NULL AND to_agent_id <> ''
+    UNION ALL
+    -- Stage 5c: MSM trajectory similarity — how records evolved over time (numeric)
+    SELECT from_node_id, from_type, to_node_id, to_type,
+           'evolves_like', weight,
+           computed_at, NULL::TIMESTAMPTZ
+      FROM trajectory_similarities WHERE edge_kind = 'evolves_like'
+    UNION ALL
+    -- Stage 5e: WFST/edit-distance workflow similarity — categorical event-sequence affinity
+    SELECT from_node_id, from_type, to_node_id, to_type,
+           'workflow_like', weight,
+           computed_at, NULL::TIMESTAMPTZ
+      FROM trajectory_similarities WHERE edge_kind = 'workflow_like'";
 
 /// `pgmcp_metadata` key storing the xxh3 hash of the combined matview
 /// and edges-view CREATE SQL. F9 gate skips the rebuild when the stored
@@ -2102,6 +2429,37 @@ const MEMORY_UNIFIED_VIEWS_HASH_KEY: &str = "memory_unified_views_def_hash";
 /// `MEMORY_UNIFIED_EDGES_SQL`) has changed since the last successful
 /// rebuild. The hash is keyed in `pgmcp_metadata` so schema changes
 /// still take effect on the next restart automatically.
+/// Stage 5c: persistent MSM trajectory-similarity edges (`evolves_like`) — *how
+/// records evolved over time*, captured by Move-Split-Merge over per-record
+/// numeric trajectories (work-item progress %, file churn, experiment metrics).
+/// Populated by the `trajectory-similarity` cron and surfaced as edges by
+/// `memory_unified_edges`. Idempotent.
+async fn ensure_trajectory_similarities(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS trajectory_similarities (
+            id           BIGSERIAL PRIMARY KEY,
+            from_node_id TEXT NOT NULL,
+            from_type    TEXT NOT NULL,
+            to_node_id   TEXT NOT NULL,
+            to_type      TEXT NOT NULL,
+            weight       DOUBLE PRECISION NOT NULL,
+            msm_distance DOUBLE PRECISION NOT NULL,
+            edge_kind    TEXT NOT NULL DEFAULT 'evolves_like',
+            computed_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE (from_node_id, to_node_id, edge_kind)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    for idx in [
+        "CREATE INDEX IF NOT EXISTS idx_traj_sim_from ON trajectory_similarities(from_node_id)",
+        "CREATE INDEX IF NOT EXISTS idx_traj_sim_to ON trajectory_similarities(to_node_id)",
+    ] {
+        sqlx::query(idx).execute(pool).await?;
+    }
+    Ok(())
+}
+
 async fn ensure_memory_unified_views(
     pool: &PgPool,
     config: &VectorConfig,
@@ -2131,13 +2489,23 @@ async fn ensure_memory_unified_views(
         stored, current_hash
     );
 
-    // Drop the matview if it already exists so we can rebuild against
-    // the latest column shapes. Order matters: drop the view first
-    // (it depends on the matview indirectly through underlying tables
-    // only, but explicit drops keep refresh semantics simple).
-    sqlx::query("DROP VIEW IF EXISTS memory_unified_edges")
-        .execute(pool)
-        .await?;
+    // Drop the existing graph views so we can rebuild against the latest
+    // column shapes. `memory_unified_edges` was a plain VIEW before Stage 2 and
+    // is a MATERIALIZED VIEW after; a DO-block drops whichever form exists — a
+    // bare `DROP MATERIALIZED VIEW IF EXISTS` ERRORs on a plain view (and
+    // vice-versa) because IF EXISTS only suppresses "missing", not "wrong kind".
+    sqlx::query(
+        "DO $$
+         BEGIN
+            IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'memory_unified_edges' AND relkind = 'v') THEN
+                DROP VIEW memory_unified_edges;
+            ELSIF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'memory_unified_edges' AND relkind = 'm') THEN
+                DROP MATERIALIZED VIEW memory_unified_edges;
+            END IF;
+         END $$;",
+    )
+    .execute(pool)
+    .await?;
     sqlx::query("DROP MATERIALIZED VIEW IF EXISTS memory_unified_nodes")
         .execute(pool)
         .await?;
@@ -2167,6 +2535,19 @@ async fn ensure_memory_unified_views(
     .await?;
 
     sqlx::query(MEMORY_UNIFIED_EDGES_SQL).execute(pool).await?;
+    // Edge-traversal indexes: the recursive-CTE walks
+    // (`memory_neighbors`/`memory_path_search`) filter on
+    // `from_id = current OR to_id = current`, so both endpoints need an index.
+    // The edges view is materialized now, so without these a BFS hop would
+    // seq-scan the entire edge set.
+    for idx in [
+        "CREATE INDEX IF NOT EXISTS idx_memory_unified_edges_from ON memory_unified_edges (from_id)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_unified_edges_to ON memory_unified_edges (to_id)",
+        // Stage 5a: as-of / recency interval pruning on edge validity.
+        "CREATE INDEX IF NOT EXISTS idx_memory_unified_edges_valid ON memory_unified_edges (valid_from, valid_to)",
+    ] {
+        sqlx::query(idx).execute(pool).await?;
+    }
 
     sqlx::query(
         "INSERT INTO pgmcp_metadata (key, value)

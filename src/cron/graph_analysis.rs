@@ -558,6 +558,11 @@ async fn compute_and_store_cochange_edges(
     sqlx::query("SET LOCAL statement_timeout = '10min'")
         .execute(&mut *tx)
         .await?;
+    // Label this heavy transaction for the graceful-shutdown sweep
+    // (db::admin::terminate_heavy_backends).
+    sqlx::query("SET LOCAL application_name = 'pgmcp:heavy:graph-analysis'")
+        .execute(&mut *tx)
+        .await?;
 
     // Compute Jaccard similarity from git_commit_files
     let pairs = sqlx::query_as::<_, CoChangePairDb>(

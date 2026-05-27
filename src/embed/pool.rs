@@ -125,9 +125,26 @@ pub struct QueryEmbedResult {
 #[derive(Clone)]
 pub struct QueryEmbedder {
     tx: Sender<EmbedQueryRequest>,
+    /// Shared with the pool so callers can gate on embedder readiness. Reads
+    /// `embed_workers_alive` — the count of workers that have finished loading
+    /// their model and are in their serve loop.
+    stats: Arc<StatsTracker>,
 }
 
 impl QueryEmbedder {
+    /// True once at least one pool worker has finished loading its model and is
+    /// serving — so a query is embedded promptly rather than parked in the
+    /// bounded query channel until a worker warms up. Backs the daemon's
+    /// serving-readiness gate (`/health` 200; `/api/search` 503-until-ready).
+    pub fn is_ready(&self) -> bool {
+        self.ready_workers() >= 1
+    }
+
+    /// Number of pool workers that have loaded their model and are serving.
+    pub fn ready_workers(&self) -> u64 {
+        self.stats.embed_workers_alive.load(Ordering::Acquire)
+    }
+
     /// Embed a single query string. Returns the dense embedding vector.
     /// Blocks until a pool worker processes the request.
     pub async fn embed_query(&self, text: String) -> Result<Vec<f32>> {
@@ -207,6 +224,9 @@ pub struct EmbeddingPool {
     monitor: Option<JoinHandle<()>>,
     /// Shutdown flag shared with workers + monitor.
     shutdown: Arc<AtomicBool>,
+    /// Stats handle, retained so `query_embedder()` can hand callers a
+    /// readiness view via `embed_workers_alive`.
+    stats: Arc<StatsTracker>,
 }
 
 impl EmbeddingPool {
@@ -264,6 +284,7 @@ impl EmbeddingPool {
             workers,
             monitor: Some(monitor),
             shutdown,
+            stats,
         })
     }
 
@@ -281,6 +302,7 @@ impl EmbeddingPool {
     pub fn query_embedder(&self) -> QueryEmbedder {
         QueryEmbedder {
             tx: self.query_tx.clone(),
+            stats: Arc::clone(&self.stats),
         }
     }
 

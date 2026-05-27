@@ -108,6 +108,40 @@ pub async fn tool_trajectory_similarity(
     }))
 }
 
+/// Stage 5d: online recognition of a partial / in-progress trajectory against
+/// the live record cohorts (work_item progress, file churn) via MSM. Feed the
+/// unfolding series; get the nearest known trajectories for early-warning.
+pub async fn tool_recognize_trajectory(
+    ctx: &SystemContext,
+    params: crate::mcp::server::RecognizeTrajectoryParams,
+) -> Result<CallToolResult, McpError> {
+    tracing::debug!(tool = "recognize_trajectory", "MCP tool invoked");
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    let pool = pool_or_err(ctx)?;
+    if params.series.is_empty() {
+        return Err(McpError::invalid_params("series must be non-empty", None));
+    }
+    let k = params.k.unwrap_or(5).clamp(1, 50) as usize;
+    let msm_c = params.msm_c.unwrap_or(0.1);
+    let nearest = crate::cron::trajectory_similarity::recognize_partial_trajectory(
+        pool,
+        &params.node_type,
+        &params.series,
+        k,
+        msm_c,
+    )
+    .await
+    .map_err(|e| McpError::internal_error(format!("recognize failed: {e}"), None))?;
+    json_result(&json!({
+        "node_type": params.node_type,
+        "partial_len": params.series.len(),
+        "nearest": nearest
+            .iter()
+            .map(|(id, d)| json!({"node_id": id, "msm_distance": d}))
+            .collect::<Vec<_>>(),
+    }))
+}
+
 async fn load_cohort(pool: &PgPool, success: bool) -> Result<Vec<(i64, Vec<f64>)>, sqlx::Error> {
     sqlx::query_as(
         "SELECT id, encoded_series FROM agent_trajectories

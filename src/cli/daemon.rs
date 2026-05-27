@@ -170,7 +170,9 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
 
     // 1. Initialize database
     let db_pool = db::pool::create_pool(&config_snapshot.database).await?;
-    db::migrations::run_migrations(&db_pool, &config_snapshot.vector).await?;
+    // Retry on transient lock contention (e.g. an orphaned backend from a killed
+    // prior instance still holding ACCESS SHARE) instead of aborting startup.
+    db::migrations::run_migrations_with_lock_retry(&db_pool, &config_snapshot.vector).await?;
     info!("Database initialized");
 
     // 1b. Log the active embedding signature for operator visibility. The
@@ -339,31 +341,42 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     // Memory-server Phase 4: construct the optional LLM extractor per
     // config. Disabled by default; logged-and-skipped on construction
     // failure so the daemon never crashes over an optional path.
-    let llm_extractor: Option<std::sync::Arc<dyn crate::llm::LlmExtractor>> = {
-        let cfg = config.load();
-        let backend_str = cfg.memory.extractor.backend.clone();
-        match crate::llm::parse_backend_choice(&backend_str) {
-            Ok(choice) => match crate::llm::make_extractor(choice) {
-                Ok(opt) => opt.map(std::sync::Arc::from),
-                Err(e) => {
-                    tracing::warn!(
+    // Build the optional LLM extractor in the BACKGROUND and hot-swap it in, so a
+    // heavy model load (e.g. Qwen3) never blocks the listener bind. Disabled by
+    // default. Readers (memory_reflect, session-observe Stage B, the a2a-reflect
+    // and memory-concept crons) see `None` until the load completes — a brief
+    // startup window they already handle cleanly, and the crons have minute-scale
+    // initial delays that are well past warmup.
+    let llm_extractor: Arc<
+        parking_lot::RwLock<Option<std::sync::Arc<dyn crate::llm::LlmExtractor>>>,
+    > = Arc::new(parking_lot::RwLock::new(None));
+    {
+        let backend_str = config.load().memory.extractor.backend.clone();
+        let slot = Arc::clone(&llm_extractor);
+        tokio::task::spawn_blocking(
+            move || match crate::llm::parse_backend_choice(&backend_str) {
+                Ok(choice) => match crate::llm::make_extractor(choice) {
+                    Ok(Some(e)) => {
+                        let e: std::sync::Arc<dyn crate::llm::LlmExtractor> =
+                            std::sync::Arc::from(e);
+                        tracing::info!(backend = %backend_str, "LLM extractor loaded (background)");
+                        *slot.write() = Some(e);
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
                         error = %e,
                         backend = %backend_str,
                         "LLM extractor construction failed; Stage B + memory_reflect disabled"
-                    );
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
+                    ),
+                },
+                Err(e) => tracing::warn!(
                     error = %e,
                     backend = %backend_str,
                     "LLM extractor backend invalid; Stage B + memory_reflect disabled"
-                );
-                None
-            }
-        }
-    };
+                ),
+            },
+        );
+    }
 
     // 9. Build the SystemContext bundle. One context, shared by the
     // indexer, MCP server, and REST API — Arc-clone per field, no deep copy.
@@ -478,10 +491,80 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         cron_handle.schedule_recurring(60_000, interval_ms, "a2a-reflect", move || {
             let pool = pool.clone();
             let stats = Arc::clone(&stats_for_a2a);
-            let extractor = extractor_for_a2a.clone();
+            let extractor = extractor_for_a2a.read().clone();
             let cfg = a2a_cfg.clone();
             rt_for_a2a.spawn(async move {
                 cron::a2a_reflect::run_or_log(Arc::new(pool), stats, extractor, cfg).await;
+            });
+            true
+        });
+    }
+
+    // 11e. Schedule the memory-graph-refresh cron: keep the unified
+    // knowledge-graph matviews (memory_unified_nodes + memory_unified_edges)
+    // current with the indexed corpus so the traversal tools see fresh nodes/
+    // edges. Cheap UNION-ALL projections; default 6h. Set the interval to 0 to
+    // disable. (Fixes the previously-never-called refresh path.)
+    if config_snapshot.cron.memory_graph_refresh_interval_secs > 0
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let stats_for_graph = Arc::clone(&stats_tracker);
+        let interval_ms = config_snapshot
+            .cron
+            .memory_graph_refresh_interval_secs
+            .saturating_mul(1000);
+        let rt_for_graph = tokio::runtime::Handle::current();
+        // 90s initial delay: after the boot-time hash-gated rebuild + warmup.
+        cron_handle.schedule_recurring(90_000, interval_ms, "memory-graph-refresh", move || {
+            let pool = pool.clone();
+            let stats = Arc::clone(&stats_for_graph);
+            rt_for_graph.spawn(async move {
+                cron::memory_graph_refresh::run_or_log(Arc::new(pool), stats).await;
+            });
+            true
+        });
+    }
+
+    // 11f. Schedule the memory-concept-extract cron (Stage 4 auto-population).
+    // Off by default ([memory.concepts] cron_enabled = false). Seeds concept
+    // entities from code topics (deterministic) + optional LLM-emergent concepts
+    // when an extractor is present; refreshes the unified graph at the end.
+    if config_snapshot.memory.concepts.cron_enabled
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let stats_for_concepts = Arc::clone(&stats_tracker);
+        let concepts_cfg = config_snapshot.memory.concepts.clone();
+        let extractor_for_concepts = llm_extractor.clone();
+        let interval_ms = concepts_cfg.cron_interval_secs.saturating_mul(1000);
+        let rt_for_concepts = tokio::runtime::Handle::current();
+        // 120s initial delay so it runs after the boot-time graph rebuild.
+        cron_handle.schedule_recurring(120_000, interval_ms, "memory-concept-extract", move || {
+            let pool = pool.clone();
+            let stats = Arc::clone(&stats_for_concepts);
+            let cfg = concepts_cfg.clone();
+            let extractor = extractor_for_concepts.read().clone();
+            rt_for_concepts.spawn(async move {
+                cron::memory_concepts::run_or_log(Arc::new(pool), stats, cfg, extractor).await;
+            });
+            true
+        });
+    }
+
+    // 11g. Schedule the trajectory-similarity cron (Stage 5c MSM evolves_like).
+    // Off by default ([cron.trajectory_similarity] cron_enabled = false).
+    if config_snapshot.cron.trajectory_similarity.cron_enabled
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let stats_for_traj = Arc::clone(&stats_tracker);
+        let traj_cfg = config_snapshot.cron.trajectory_similarity.clone();
+        let interval_ms = traj_cfg.cron_interval_secs.saturating_mul(1000);
+        let rt_for_traj = tokio::runtime::Handle::current();
+        cron_handle.schedule_recurring(150_000, interval_ms, "trajectory-similarity", move || {
+            let pool = pool.clone();
+            let stats = Arc::clone(&stats_for_traj);
+            let cfg = traj_cfg.clone();
+            rt_for_traj.spawn(async move {
+                cron::trajectory_similarity::run_or_log(Arc::new(pool), stats, cfg).await;
             });
             true
         });
@@ -541,28 +624,32 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         // [api] rerank_hook is set (the BGE-reranker model is VRAM-exclusive
         // with the Qwen3 extractor). A load failure degrades to RRF-only — the
         // hook still works — so we warn rather than abort.
-        let api_reranker: Option<Arc<dyn crate::reranker::Reranker>> =
-            if config.load().api.rerank_hook {
+        // Load the reranker in the BACKGROUND and hot-swap it in, so the
+        // (VRAM-exclusive, slow-loading) cross-encoder never blocks the listener
+        // bind. Until populated, /api/search uses RRF-only — the existing
+        // fallback; a load failure also stays RRF-only.
+        let api_reranker: Arc<parking_lot::RwLock<Option<Arc<dyn crate::reranker::Reranker>>>> =
+            Arc::new(parking_lot::RwLock::new(None));
+        if config.load().api.rerank_hook {
+            let slot = Arc::clone(&api_reranker);
+            tokio::task::spawn_blocking(move || {
                 match crate::reranker::make_reranker(crate::reranker::RerankerChoice::BgeV2M3) {
                     Ok(Some(r)) => {
+                        let r: Arc<dyn crate::reranker::Reranker> = Arc::from(r);
                         tracing::info!(
                             reranker = r.name(),
-                            "/api/search hook: cross-encoder reranker loaded"
+                            "/api/search hook: cross-encoder reranker loaded (background)"
                         );
-                        Some(Arc::from(r))
+                        *slot.write() = Some(r);
                     }
-                    Ok(None) => None,
-                    Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "/api/search hook: reranker load failed; falling back to RRF-only"
-                        );
-                        None
-                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        error = %e,
+                        "/api/search hook: reranker load failed; staying RRF-only"
+                    ),
                 }
-            } else {
-                None
-            };
+            });
+        }
 
         // REST API state (shares query_embedder, db, and stats with MCP server)
         let api_state = api::ApiState {
@@ -610,6 +697,17 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         if is_daemon {
             daemon::notify_ready();
         }
+        // Time-to-bind marker for the recovery-times harness. The listener is up
+        // here; per-request serving-readiness (DB + ≥1 embedder worker) is gated
+        // separately (`/health` 200, `/api/search` 503-until-ready), and the
+        // initial scan continues in the background (see the `scan_complete`
+        // marker). Optional reranker/extractor models load in the background too.
+        info!(
+            target: "pgmcp::recovery_times",
+            phase = "listening",
+            addr = %bind_addr,
+            "HTTP listener bound — accepting requests"
+        );
 
         // Serve until shutdown signal, with a 5s timeout so SSE connections
         // don't prevent shutdown indefinitely.
@@ -662,6 +760,27 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     shutdown.signal_shutdown();
 
     let component_timeout = Duration::from_secs(5);
+
+    // Reap in-flight heavy-cron backends so they release their table locks NOW,
+    // rather than running on (server-side, holding ACCESS SHARE) until
+    // statement_timeout after we drop the tokio runtime — which previously
+    // orphaned a backend that blocked the *next* daemon's startup migrations
+    // (`canceling statement due to lock timeout`). Done before draining the work
+    // pools so terminating the query also unblocks the heavy cron's
+    // `rt.block_on` worker, letting the drain below finish inside its budget. The
+    // pool is still open here (closed further down). Ungraceful death is covered
+    // by `client_connection_check_interval` instead; see src/db/admin.rs.
+    match tokio::time::timeout(
+        component_timeout,
+        db::admin::terminate_heavy_backends(&db_pool),
+    )
+    .await
+    {
+        Ok(Ok(n)) if n > 0 => info!(terminated = n, "Reaped in-flight heavy-cron backends"),
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "Heavy-backend shutdown sweep failed"),
+        Err(_) => tracing::warn!("Heavy-backend shutdown sweep did not complete within 5s"),
+    }
 
     // Stop config watcher (must drop before indexer to close watcher_cmd channel)
     drop(_config_watcher_handle);

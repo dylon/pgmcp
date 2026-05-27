@@ -551,11 +551,13 @@ async fn eval_multihop_ppr_finds_indirect_neighbor() {
     .execute(pool)
     .await
     .unwrap();
+    queries::refresh_memory_unified_nodes(pool).await.unwrap();
+    queries::refresh_memory_unified_edges(pool).await.unwrap();
     let result = queries::memory_ppr_search(pool, &v, 10, 0.85, 5, 64)
         .await
         .expect("ppr");
-    let hit_ids: Vec<i64> = result.hits.iter().map(|h| h.entity_id).collect();
-    assert!(hit_ids.contains(&b));
+    let hit_ids: Vec<String> = result.hits.iter().map(|h| h.node_id.clone()).collect();
+    assert!(hit_ids.contains(&format!("memory_entity:{b}")));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -599,7 +601,8 @@ async fn eval_multihop_path_search_emits_paths() {
     .await
     .unwrap();
     queries::refresh_memory_unified_nodes(pool).await.unwrap();
-    let result = queries::memory_path_search(pool, &v, None, None, 2, 5, 0.7, 64)
+    queries::refresh_memory_unified_edges(pool).await.unwrap();
+    let result = queries::memory_path_search(pool, &v, None, None, 2, 5, 0.7, 64, None, 90.0)
         .await
         .expect("path");
     assert!(!result.paths.is_empty());
@@ -638,17 +641,26 @@ async fn eval_crossgraph_anchor_round_trip() {
     .fetch_one(pool)
     .await
     .unwrap();
-    let anchor_id =
-        queries::memory_anchor_entity(pool, entity, Some(file_id), None, None, "implements")
-            .await
-            .unwrap();
+    let anchor_id = queries::memory_anchor_entity(
+        pool,
+        entity,
+        Some(file_id),
+        None,
+        None,
+        None,
+        None,
+        "implements",
+    )
+    .await
+    .unwrap();
     let anchors = queries::memory_find_code_for_entity(pool, entity, None)
         .await
         .unwrap();
     assert_eq!(anchors.len(), 1);
-    let reverse = queries::memory_find_entities_for_code(pool, Some(file_id), None, None)
-        .await
-        .unwrap();
+    let reverse =
+        queries::memory_find_entities_for_code(pool, Some(file_id), None, None, None, None)
+            .await
+            .unwrap();
     assert!(reverse.iter().any(|a| a.entity_id == entity));
     assert!(
         queries::memory_unanchor_entity(pool, anchor_id)
@@ -661,7 +673,7 @@ async fn eval_crossgraph_anchor_round_trip() {
 async fn eval_crossgraph_reverse_lookup_requires_exactly_one_target() {
     let db = require_test_db!();
     let pool = db.pool();
-    let err = queries::memory_find_entities_for_code(pool, None, None, None)
+    let err = queries::memory_find_entities_for_code(pool, None, None, None, None, None)
         .await
         .unwrap_err();
     assert!(format!("{err}").contains("exactly one"));

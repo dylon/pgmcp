@@ -1,0 +1,381 @@
+//! Single source of truth for the **unified knowledge-graph vocabulary** that
+//! `super::migrations::{MEMORY_UNIFIED_NODES_SQL, MEMORY_UNIFIED_EDGES_SQL}`
+//! materialize and the `memory_neighbors` / `memory_path_search` traversals (in
+//! `super::queries`) walk.
+//!
+//! - **node_type is CLOSED** — every node arm in the nodes matview has an entry
+//!   in [`NODE_TYPES`]; the golden test below enforces parity in both
+//!   directions (registry⇄SQL) and asserts arm-count == registry-len.
+//! - **edge_type has a CLOSED structural core** ([`EDGE_TYPES_CORE`]) — the
+//!   edge_type *literals* the edges matview emits (`in_file`, `parent_of`, …) —
+//!   **plus a documented free-form passthrough channel** ([`FREEFORM_EDGE_SOURCES`])
+//!   for relation strings sourced from columns (`memory_relations.relation_type`,
+//!   `item_relations.relation_type`, `code_graph_edges.edge_type`, the
+//!   `*_code_anchor.anchor_type` columns, `work_item_claims.action`). Those are
+//!   intentionally open because they belong to other subsystems' vocabularies.
+
+/// Metadata for one node type in `memory_unified_nodes`.
+// Registry metadata: `display`/`source_table`/`has_embedding` are consumed by
+// the Stage-3 `graph_neighbors` tool (parameter docs + filter validation) and
+// the golden test below; not all are read in non-test builds yet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct NodeTypeMeta {
+    /// The `node_type` value and the `node_id` prefix (e.g. `"work_item"` ⇒
+    /// node ids `work_item:<pk>`).
+    pub key: &'static str,
+    /// Human-readable display name.
+    pub display: &'static str,
+    /// A source table the node arm SELECTs `FROM` (used by the golden test to
+    /// confirm the arm exists; the `agent` arm UNIONs several sources and lists
+    /// its primary one here).
+    pub source_table: &'static str,
+    /// Whether the arm carries a non-NULL embedding ⇒ participates in
+    /// `memory_unified_search` vector seeding (NULL-embedding nodes are
+    /// graph-traversable but not vector-seeded).
+    pub has_embedding: bool,
+}
+
+/// Metadata for one structural (literal) edge type in `memory_unified_edges`.
+// Registry metadata: `display`/`directed` are consumed by the Stage-3
+// `graph_neighbors` tool docs; not all are read in non-test builds yet.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy)]
+pub struct EdgeTypeMeta {
+    /// The literal `edge_type` value (e.g. `"in_file"`).
+    pub key: &'static str,
+    /// Human-readable display name.
+    pub display: &'static str,
+    /// Whether the edge is conceptually directed. Documents intent; the
+    /// traversal CTEs currently walk all edges undirected.
+    pub directed: bool,
+}
+
+/// CLOSED node-type vocabulary. Adding a node arm to `MEMORY_UNIFIED_NODES_SQL`
+/// requires adding an entry here (and vice-versa) — the golden test fails on drift.
+pub const NODE_TYPES: &[NodeTypeMeta] = &[
+    NodeTypeMeta {
+        key: "memory_entity",
+        display: "Memory Entity",
+        source_table: "memory_entities",
+        has_embedding: false,
+    },
+    NodeTypeMeta {
+        key: "observation",
+        display: "Observation",
+        source_table: "memory_observations",
+        has_embedding: true,
+    },
+    NodeTypeMeta {
+        key: "chunk",
+        display: "Code Chunk",
+        source_table: "file_chunks",
+        has_embedding: true,
+    },
+    NodeTypeMeta {
+        key: "topic",
+        display: "Topic",
+        source_table: "code_topics",
+        has_embedding: false,
+    },
+    NodeTypeMeta {
+        key: "durable_mandate",
+        display: "Durable Mandate",
+        source_table: "durable_mandates",
+        has_embedding: true,
+    },
+    NodeTypeMeta {
+        key: "session_mandate",
+        display: "Session Mandate",
+        source_table: "session_mandates",
+        has_embedding: true,
+    },
+    NodeTypeMeta {
+        key: "commit",
+        display: "Git Commit",
+        source_table: "git_commits",
+        has_embedding: false,
+    },
+    NodeTypeMeta {
+        key: "commit_chunk",
+        display: "Commit Chunk",
+        source_table: "git_commit_chunks",
+        has_embedding: true,
+    },
+    NodeTypeMeta {
+        key: "pattern_chunk",
+        display: "Pattern Chunk",
+        source_table: "software_pattern_chunks",
+        has_embedding: true,
+    },
+    NodeTypeMeta {
+        key: "file",
+        display: "File",
+        source_table: "indexed_files",
+        has_embedding: false,
+    },
+    NodeTypeMeta {
+        key: "project",
+        display: "Project",
+        source_table: "projects",
+        has_embedding: false,
+    },
+    NodeTypeMeta {
+        key: "symbol",
+        display: "Symbol",
+        source_table: "file_symbols",
+        has_embedding: false,
+    },
+    NodeTypeMeta {
+        key: "work_item",
+        display: "Work Item",
+        source_table: "work_items",
+        has_embedding: true,
+    },
+    NodeTypeMeta {
+        key: "experiment",
+        display: "Experiment",
+        source_table: "experiments",
+        has_embedding: true,
+    },
+    NodeTypeMeta {
+        key: "agent",
+        display: "Agent",
+        source_table: "agent_presence",
+        has_embedding: false,
+    },
+];
+
+/// CLOSED structural edge-type core: the edge_type *literals* emitted by
+/// `MEMORY_UNIFIED_EDGES_SQL`. Relation strings piped through from columns are
+/// NOT here — see [`FREEFORM_EDGE_SOURCES`].
+pub const EDGE_TYPES_CORE: &[EdgeTypeMeta] = &[
+    EdgeTypeMeta {
+        key: "belongs_to",
+        display: "Belongs To (chunk→topic)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "in_file",
+        display: "In File (chunk→file)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "in_project",
+        display: "In Project",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "defined_in",
+        display: "Defined In (symbol→file)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "parent_of",
+        display: "Parent Of (tree)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "similar_to",
+        display: "Similar To (cross-project)",
+        directed: false,
+    },
+    EdgeTypeMeta {
+        key: "in_commit",
+        display: "In Commit (commit_chunk→commit)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "touches",
+        display: "Touches (commit→file)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "validated_by",
+        display: "Validated By (work_item→experiment)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "evidenced_by",
+        display: "Evidenced By (→observation)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "supersedes",
+        display: "Supersedes (experiment)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "claimed_by",
+        display: "Claimed By (work_item→agent)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "working_on",
+        display: "Working On (agent→work_item)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "handoff",
+        display: "Handoff (agent→agent)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "evolves_like",
+        display: "Evolves Like (MSM trajectory)",
+        directed: false,
+    },
+    EdgeTypeMeta {
+        key: "workflow_like",
+        display: "Workflow Like (event-sequence)",
+        directed: false,
+    },
+];
+
+/// Columns whose runtime *values* become `edge_type` and are intentionally
+/// free-form (an open passthrough channel, not enumerated in [`EDGE_TYPES_CORE`]).
+#[allow(dead_code)] // consumed by the Stage-3 graph_neighbors tool documentation.
+pub const FREEFORM_EDGE_SOURCES: &[&str] = &[
+    "memory_relations.relation_type",
+    "item_relations.relation_type",
+    "experiment_relations.relation_type",
+    "code_graph_edges.edge_type",
+    "memory_code_anchor.anchor_type",
+    "work_item_code_anchor.anchor_type",
+    "experiment_code_anchor.anchor_type",
+    "work_item_claims.action",
+];
+
+/// Whether `s` is a registered unified-graph node type. Used by the Stage-3
+/// `graph_neighbors` tool to validate caller-supplied `node_type` filters and
+/// to populate tool-parameter documentation.
+#[allow(dead_code)]
+pub fn is_registered_node_type(s: &str) -> bool {
+    NODE_TYPES.iter().any(|n| n.key == s)
+}
+
+/// Whether `s` is a registered structural (core) edge type.
+#[allow(dead_code)]
+pub fn is_core_edge_type(s: &str) -> bool {
+    EDGE_TYPES_CORE.iter().any(|e| e.key == s)
+}
+
+/// Look up a node type's metadata by key.
+#[allow(dead_code)]
+pub fn node_type(key: &str) -> Option<&'static NodeTypeMeta> {
+    NODE_TYPES.iter().find(|n| n.key == key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::migrations::{MEMORY_UNIFIED_EDGES_SQL, MEMORY_UNIFIED_NODES_SQL};
+    use regex::Regex;
+    use std::collections::HashSet;
+
+    /// Node-id literals look like `'work_item:'` — a lowercase word + colon.
+    fn node_id_prefixes(sql: &str) -> HashSet<String> {
+        let re = Regex::new(r"'([a-z_]+):'").expect("valid regex");
+        re.captures_iter(sql).map(|c| c[1].to_string()).collect()
+    }
+
+    #[test]
+    fn every_registered_node_type_has_an_arm() {
+        for n in NODE_TYPES {
+            assert!(
+                MEMORY_UNIFIED_NODES_SQL.contains(&format!("'{}:'", n.key)),
+                "node type '{}' registered but has no '{}:' node-id prefix in NODES SQL",
+                n.key,
+                n.key
+            );
+            assert!(
+                MEMORY_UNIFIED_NODES_SQL.contains(&format!("FROM {}", n.source_table)),
+                "node type '{}' source_table '{}' not found as a FROM in NODES SQL",
+                n.key,
+                n.source_table
+            );
+        }
+    }
+
+    #[test]
+    fn node_arm_count_matches_registry() {
+        // Top-level arms are separated by `UNION ALL` (the agent arm's inner
+        // `UNION` de-dup does not count). N arms ⇒ N-1 `UNION ALL`.
+        let arms = MEMORY_UNIFIED_NODES_SQL.matches("UNION ALL").count() + 1;
+        assert_eq!(
+            arms,
+            NODE_TYPES.len(),
+            "NODES SQL has {} arms but NODE_TYPES has {} entries — registry drift",
+            arms,
+            NODE_TYPES.len()
+        );
+    }
+
+    #[test]
+    fn nodes_sql_emits_only_registered_node_types() {
+        for p in node_id_prefixes(MEMORY_UNIFIED_NODES_SQL) {
+            assert!(
+                is_registered_node_type(&p),
+                "NODES SQL emits unregistered node type '{p}'"
+            );
+        }
+    }
+
+    #[test]
+    fn edges_connect_only_registered_node_types() {
+        for p in node_id_prefixes(MEMORY_UNIFIED_EDGES_SQL) {
+            assert!(
+                is_registered_node_type(&p),
+                "EDGES SQL references unregistered node type '{p}'"
+            );
+        }
+    }
+
+    #[test]
+    fn every_core_edge_type_is_emitted() {
+        for e in EDGE_TYPES_CORE {
+            assert!(
+                MEMORY_UNIFIED_EDGES_SQL.contains(&format!("'{}'", e.key)),
+                "structural edge type '{}' registered but not emitted in EDGES SQL",
+                e.key
+            );
+        }
+    }
+
+    #[test]
+    fn has_embedding_flags_match_sql() {
+        // Non-embedding node arms select `NULL::VECTOR(1024)`; embedding arms
+        // select a real embedding column. The count of NULL-embedding arms must
+        // equal the count of `has_embedding == false` registry entries.
+        let null_arms = MEMORY_UNIFIED_NODES_SQL
+            .matches("NULL::VECTOR(1024)")
+            .count();
+        let non_embedding = NODE_TYPES.iter().filter(|n| !n.has_embedding).count();
+        assert_eq!(
+            null_arms, non_embedding,
+            "NODES SQL has {null_arms} NULL-embedding arms but {non_embedding} node types \
+             are marked has_embedding=false — registry/SQL drift"
+        );
+    }
+
+    #[test]
+    fn freeform_edge_sources_are_used_in_edges_sql() {
+        // Each documented passthrough column must actually feed an edge_type in
+        // the EDGES SQL (as a bare identifier in the edge_type position).
+        for src in FREEFORM_EDGE_SOURCES {
+            let col = src.split('.').next_back().expect("table.column");
+            assert!(
+                MEMORY_UNIFIED_EDGES_SQL.contains(col),
+                "FREEFORM_EDGE_SOURCES lists '{src}' but column '{col}' is not used in EDGES SQL"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_keys_are_unique() {
+        let nset: HashSet<&str> = NODE_TYPES.iter().map(|n| n.key).collect();
+        assert_eq!(nset.len(), NODE_TYPES.len(), "duplicate node-type key");
+        let eset: HashSet<&str> = EDGE_TYPES_CORE.iter().map(|e| e.key).collect();
+        assert_eq!(eset.len(), EDGE_TYPES_CORE.len(), "duplicate edge-type key");
+    }
+}

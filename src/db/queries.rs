@@ -1646,6 +1646,59 @@ pub struct EntityRow {
 /// scope. Returns the inserted entity ids in input order. Idempotent on
 /// `(name, entity_type)` when an active row exists — re-using the prior
 /// id and appending observations.
+/// Stage-4 auto-population: upsert an auto-derived `concept` entity. Reuses any
+/// active row with the same (name, entity_type) WITHOUT modifying it — so a
+/// user/agent/LLM-authored entity is never clobbered (the caller can still link
+/// to the returned id) — and inserts a fresh `source='auto_index'` entity only
+/// when none exists. Returns `(entity_id, created_new)`.
+pub async fn memory_upsert_auto_entity(
+    pool: &PgPool,
+    name: &str,
+    entity_type: &str,
+) -> Result<(i64, bool), sqlx::Error> {
+    if let Some(id) = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM memory_entities
+         WHERE name = $1 AND entity_type = $2 AND valid_to IS NULL
+         LIMIT 1",
+    )
+    .bind(name)
+    .bind(entity_type)
+    .fetch_optional(pool)
+    .await?
+    {
+        return Ok((id, false));
+    }
+    let id: i64 = sqlx::query_scalar(
+        "INSERT INTO memory_entities (name, entity_type, importance, source)
+         VALUES ($1, $2, 0.5, 'auto_index'::memory_source)
+         RETURNING id",
+    )
+    .bind(name)
+    .bind(entity_type)
+    .fetch_one(pool)
+    .await?;
+    Ok((id, true))
+}
+
+/// Stage-4: candidate topics for concept seeding — labeled topics with at least
+/// `min_chunks` member chunks, most-populous first.
+pub async fn concept_seed_topics(
+    pool: &PgPool,
+    min_chunks: i64,
+    limit: i64,
+) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, label FROM code_topics
+         WHERE chunk_count >= $1 AND label IS NOT NULL AND btrim(label) <> ''
+         ORDER BY chunk_count DESC
+         LIMIT $2",
+    )
+    .bind(min_chunks)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 pub async fn memory_create_entities(
     pool: &PgPool,
     inputs: &[NewEntityInput],
@@ -2559,33 +2612,47 @@ pub struct MemoryCodeAnchorRow {
     pub file_id: Option<i64>,
     pub chunk_id: Option<i64>,
     pub topic_id: Option<i64>,
+    pub symbol_id: Option<i64>,
+    pub project_id: Option<i32>,
     pub anchor_type: String,
     pub created_at: DateTime<Utc>,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn memory_anchor_entity(
     pool: &PgPool,
     entity_id: i64,
     file_id: Option<i64>,
     chunk_id: Option<i64>,
     topic_id: Option<i64>,
+    symbol_id: Option<i64>,
+    project_id: Option<i32>,
     anchor_type: &str,
 ) -> Result<i64, sqlx::Error> {
-    if file_id.is_none() && chunk_id.is_none() && topic_id.is_none() {
+    if file_id.is_none()
+        && chunk_id.is_none()
+        && topic_id.is_none()
+        && symbol_id.is_none()
+        && project_id.is_none()
+    {
         return Err(sqlx::Error::Protocol(
-            "memory_anchor_entity: at least one of file_id/chunk_id/topic_id is required".into(),
+            "memory_anchor_entity: at least one of file_id/chunk_id/topic_id/symbol_id/project_id \
+             is required"
+                .into(),
         ));
     }
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO memory_code_anchor
-            (entity_id, file_id, chunk_id, topic_id, anchor_type)
-         VALUES ($1, $2, $3, $4, $5)
+            (entity_id, file_id, chunk_id, topic_id, symbol_id, project_id, anchor_type)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
          RETURNING id",
     )
     .bind(entity_id)
     .bind(file_id)
     .bind(chunk_id)
     .bind(topic_id)
+    .bind(symbol_id)
+    .bind(project_id)
     .bind(anchor_type)
     .fetch_one(pool)
     .await?;
@@ -2606,7 +2673,7 @@ pub async fn memory_find_code_for_entity(
     anchor_type: Option<&str>,
 ) -> Result<Vec<MemoryCodeAnchorRow>, sqlx::Error> {
     sqlx::query_as::<_, MemoryCodeAnchorRow>(
-        "SELECT id, entity_id, file_id, chunk_id, topic_id, anchor_type, created_at
+        "SELECT id, entity_id, file_id, chunk_id, topic_id, symbol_id, project_id, anchor_type, created_at
          FROM memory_code_anchor
          WHERE entity_id = $1
            AND ($2::text IS NULL OR anchor_type = $2)
@@ -2623,27 +2690,41 @@ pub async fn memory_find_entities_for_code(
     file_id: Option<i64>,
     chunk_id: Option<i64>,
     topic_id: Option<i64>,
+    symbol_id: Option<i64>,
+    project_id: Option<i32>,
 ) -> Result<Vec<MemoryCodeAnchorRow>, sqlx::Error> {
-    let provided = [file_id.is_some(), chunk_id.is_some(), topic_id.is_some()]
-        .iter()
-        .filter(|b| **b)
-        .count();
+    let provided = [
+        file_id.is_some(),
+        chunk_id.is_some(),
+        topic_id.is_some(),
+        symbol_id.is_some(),
+        project_id.is_some(),
+    ]
+    .iter()
+    .filter(|b| **b)
+    .count();
     if provided != 1 {
         return Err(sqlx::Error::Protocol(
-            "memory_find_entities_for_code: pass exactly one of file_id, chunk_id, topic_id".into(),
+            "memory_find_entities_for_code: pass exactly one of file_id, chunk_id, topic_id, \
+             symbol_id, project_id"
+                .into(),
         ));
     }
     sqlx::query_as::<_, MemoryCodeAnchorRow>(
-        "SELECT id, entity_id, file_id, chunk_id, topic_id, anchor_type, created_at
+        "SELECT id, entity_id, file_id, chunk_id, topic_id, symbol_id, project_id, anchor_type, created_at
          FROM memory_code_anchor
          WHERE ($1::bigint IS NOT NULL AND file_id  = $1)
             OR ($2::bigint IS NOT NULL AND chunk_id = $2)
             OR ($3::bigint IS NOT NULL AND topic_id = $3)
+            OR ($4::bigint IS NOT NULL AND symbol_id = $4)
+            OR ($5::int    IS NOT NULL AND project_id = $5)
          ORDER BY created_at DESC",
     )
     .bind(file_id)
     .bind(chunk_id)
     .bind(topic_id)
+    .bind(symbol_id)
+    .bind(project_id)
     .fetch_all(pool)
     .await
 }
@@ -2710,6 +2791,17 @@ pub async fn refresh_memory_unified_nodes(pool: &PgPool) -> Result<(), sqlx::Err
     Ok(())
 }
 
+/// Unified-graph (Stage 2): refresh the materialized **edges** view. Like
+/// [`refresh_memory_unified_nodes`], a UNION ALL over indexed tables — promoted
+/// to MATERIALIZED so the traversal CTEs can use `(from_id)`/`(to_id)` indexes.
+/// Called from the `memory-graph-refresh` cron (Stage 3) or on-demand.
+pub async fn refresh_memory_unified_edges(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("REFRESH MATERIALIZED VIEW memory_unified_edges")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Phase 6.3: BFS neighbors of a typed node over `memory_unified_edges`.
 /// Returns the reachable nodes up to `depth` plus the edges that connect
 /// them.
@@ -2735,6 +2827,76 @@ pub struct UnifiedNeighborhood {
     pub seed: String,
     pub nodes: Vec<UnifiedNeighborNode>,
     pub edges: Vec<UnifiedEdge>,
+}
+
+/// Resolve a friendly graph node reference `<node_type>:<key>` to the composite
+/// `node_id` used by `memory_unified_nodes` (`<node_type>:<pk>`). Numeric keys
+/// (and `agent`, whose key *is* its free-text id) pass through unchanged; other
+/// types are looked up by their natural key (file path, project/topic name,
+/// work-item public_id, experiment slug, commit hash, symbol name). Returns
+/// `None` when no row matches. Used by the `graph_neighbors` tool.
+pub async fn resolve_graph_node_id(
+    pool: &PgPool,
+    node_type: &str,
+    key: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    if node_type == "agent" || key.parse::<i64>().is_ok() {
+        return Ok(Some(format!("{node_type}:{key}")));
+    }
+    let id: Option<i64> =
+        match node_type {
+            "file" => {
+                sqlx::query_scalar(
+                    "SELECT id FROM indexed_files WHERE relative_path = $1 OR path = $1 LIMIT 1",
+                )
+                .bind(key)
+                .fetch_optional(pool)
+                .await?
+            }
+            "project" => {
+                sqlx::query_scalar(
+                    "SELECT id::bigint FROM projects WHERE name = $1 OR path = $1 LIMIT 1",
+                )
+                .bind(key)
+                .fetch_optional(pool)
+                .await?
+            }
+            "work_item" => {
+                sqlx::query_scalar("SELECT id FROM work_items WHERE public_id = $1 LIMIT 1")
+                    .bind(key)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            "experiment" => {
+                sqlx::query_scalar(
+                    "SELECT id FROM experiments WHERE slug = $1 AND valid_to IS NULL LIMIT 1",
+                )
+                .bind(key)
+                .fetch_optional(pool)
+                .await?
+            }
+            "topic" => {
+                sqlx::query_scalar("SELECT id FROM code_topics WHERE label = $1 LIMIT 1")
+                    .bind(key)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            "commit" => sqlx::query_scalar(
+                "SELECT id FROM git_commits WHERE commit_hash = $1 OR commit_hash LIKE $1 || '%' \
+                 ORDER BY author_date DESC LIMIT 1",
+            )
+            .bind(key)
+            .fetch_optional(pool)
+            .await?,
+            "symbol" => {
+                sqlx::query_scalar("SELECT id FROM file_symbols WHERE name = $1 LIMIT 1")
+                    .bind(key)
+                    .fetch_optional(pool)
+                    .await?
+            }
+            _ => None,
+        };
+    Ok(id.map(|pk| format!("{node_type}:{pk}")))
 }
 
 pub async fn memory_neighbors(
@@ -2836,6 +2998,12 @@ pub async fn memory_path_search(
     k: i32,
     prune_jaccard: f64,
     ef_search: i32,
+    // Stage 5b: optional point-in-time filter (only edges valid at `as_of`) and
+    // recency half-life (days) folded into the per-edge weight so recent edges
+    // score higher. `as_of = None` ⇒ current graph; timeless structural edges
+    // (NULL validity) are always included and never decayed.
+    as_of: Option<DateTime<Utc>>,
+    half_life_days: f64,
 ) -> Result<MemoryPathSearchResult, sqlx::Error> {
     let hop_cap = max_hops.clamp(1, 5);
     let k = k.clamp(1, 100);
@@ -2872,7 +3040,11 @@ pub async fn memory_path_search(
                     CASE WHEN e.from_id = w.current_id THEN e.to_type ELSE e.from_type END,
                     e.edge_type,
                     CASE WHEN e.from_id = w.current_id THEN e.to_type ELSE e.from_type END,
-                    w.weight_product * e.weight,
+                    w.weight_product * e.weight
+                        * (CASE WHEN e.valid_from IS NULL THEN 1.0
+                                ELSE exp(-0.6931471805599453
+                                         * GREATEST(0.0, EXTRACT(EPOCH FROM (now() - e.valid_from)) / 86400.0)
+                                         / GREATEST($5::float8, 0.001)) END),
                     w.hops + 1,
                     w.path_nodes || (CASE WHEN e.from_id = w.current_id THEN e.to_id ELSE e.from_id END),
                     w.path_edges || e.edge_type
@@ -2884,6 +3056,8 @@ pub async fn memory_path_search(
                    CASE WHEN e.from_id = w.current_id THEN e.to_id ELSE e.from_id END
                        = ANY(w.path_nodes)
                )
+               AND ($4::timestamptz IS NULL OR e.valid_from IS NULL
+                    OR (e.valid_from <= $4 AND (e.valid_to IS NULL OR e.valid_to > $4)))
          )
          SELECT start_id, current_id, current_type, last_edge, last_to_type,
                 weight_product, hops
@@ -2896,6 +3070,8 @@ pub async fn memory_path_search(
     .bind(&seed_ids)
     .bind(hop_cap)
     .bind(target_node_types)
+    .bind(as_of)
+    .bind(half_life_days)
     .fetch_all(pool)
     .await?;
     let considered = rows.len() as i64;
@@ -2912,7 +3088,11 @@ pub async fn memory_path_search(
              UNION
              SELECT w.start_id,
                     CASE WHEN e.from_id = w.current_id THEN e.to_id ELSE e.from_id END,
-                    w.weight_product * e.weight,
+                    w.weight_product * e.weight
+                        * (CASE WHEN e.valid_from IS NULL THEN 1.0
+                                ELSE exp(-0.6931471805599453
+                                         * GREATEST(0.0, EXTRACT(EPOCH FROM (now() - e.valid_from)) / 86400.0)
+                                         / GREATEST($5::float8, 0.001)) END),
                     w.hops + 1,
                     w.path_nodes || (CASE WHEN e.from_id = w.current_id THEN e.to_id ELSE e.from_id END),
                     w.path_edges || e.edge_type
@@ -2924,6 +3104,8 @@ pub async fn memory_path_search(
                    CASE WHEN e.from_id = w.current_id THEN e.to_id ELSE e.from_id END
                        = ANY(w.path_nodes)
                )
+               AND ($4::timestamptz IS NULL OR e.valid_from IS NULL
+                    OR (e.valid_from <= $4 AND (e.valid_to IS NULL OR e.valid_to > $4)))
          ),
          filtered AS (
              SELECT path_nodes, path_edges, weight_product, hops
@@ -2940,6 +3122,8 @@ pub async fn memory_path_search(
     .bind(&seed_ids)
     .bind(hop_cap)
     .bind(target_node_types)
+    .bind(as_of)
+    .bind(half_life_days)
     .fetch_all(pool)
     .await?;
 
@@ -3006,25 +3190,26 @@ pub async fn memory_path_search(
     })
 }
 
-/// Phase 6.2 HippoRAG-style PPR result row.
+/// HippoRAG-style PPR result row over the unified graph (Stage 6: any node
+/// type, keyed by composite `node_id`, not just memory entities).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PprHit {
-    pub entity_id: i64,
-    pub entity_name: String,
-    pub entity_type: String,
+    pub node_id: String,
+    pub node_type: String,
+    pub label: String,
     pub ppr_score: f64,
-    pub top_observation: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PprSearchResult {
-    pub seeds: Vec<i64>,
+    pub seeds: Vec<String>,
     pub hits: Vec<PprHit>,
 }
 
-/// Phase 6.2: HippoRAG-style Personalized PageRank over `memory_relations`.
-/// Seeds are the top-k entities by cosine similarity of their best
-/// observation against the query embedding.
+/// Stage 6: HippoRAG-style Personalized PageRank over the **whole unified
+/// graph** (`memory_unified_edges`), spanning every record type. Seeds are the
+/// top-k unified nodes by vector similarity to the query embedding; PPR then
+/// diffuses from them across the heterogeneous edge set.
 pub async fn memory_ppr_search(
     pool: &PgPool,
     embedding: &[f32],
@@ -3033,40 +3218,11 @@ pub async fn memory_ppr_search(
     max_seeds: i32,
     ef_search: i32,
 ) -> Result<PprSearchResult, sqlx::Error> {
-    if embedding.len() != 1024 {
-        return Err(sqlx::Error::Protocol(format!(
-            "memory_ppr_search: expected 1024d embedding, got {}",
-            embedding.len()
-        )));
-    }
-    let v = pgvector::Vector::from(embedding.to_vec());
-    let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
-
-    // 1. Resolve seed entities by best-per-entity cosine of their
-    // observations against the query embedding.
-    #[derive(sqlx::FromRow)]
-    struct Seed {
-        entity_id: i64,
-        sim: Option<f64>,
-    }
-    let seeds: Vec<Seed> = sqlx::query_as(
-        "SELECT DISTINCT ON (e.id) e.id AS entity_id, 1 - (o.embedding <=> $1) AS sim
-         FROM memory_observations o
-         JOIN memory_entities e ON e.id = o.entity_id AND e.valid_to IS NULL
-         WHERE o.embedding IS NOT NULL AND o.valid_to IS NULL
-         ORDER BY e.id, o.embedding <=> $1
-         LIMIT $2",
-    )
-    .bind(&v)
-    .bind(max_seeds.clamp(1, 100))
-    .fetch_all(&mut *tx)
-    .await?;
-    tx.commit().await?;
-
-    let seed_ids: Vec<i64> = seeds.iter().map(|s| s.entity_id).collect();
+    // 1. Seeds: top-k unified-graph nodes by vector similarity (string node_ids),
+    // spanning every record type — not just memory entities (Stage 6).
+    let seeds =
+        memory_unified_search(pool, embedding, None, max_seeds.clamp(1, 100), ef_search).await?;
+    let seed_ids: Vec<String> = seeds.iter().map(|s| s.node_id.clone()).collect();
     if seed_ids.is_empty() {
         return Ok(PprSearchResult {
             seeds: Vec::new(),
@@ -3074,41 +3230,38 @@ pub async fn memory_ppr_search(
         });
     }
 
-    // 2. Load the relation graph into a petgraph.
-    let edges: Vec<(i64, i64, f32)> = sqlx::query_as(
-        "SELECT from_entity_id, to_entity_id, importance
-         FROM memory_relations
-         WHERE valid_to IS NULL",
-    )
-    .fetch_all(pool)
-    .await?;
-    let mut node_to_idx: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
-    let mut idx_to_node: Vec<i64> = Vec::new();
+    // 2. Load the unified edge graph (string node_ids) into adjacency.
+    let edges: Vec<(String, String, f64)> =
+        sqlx::query_as("SELECT from_id, to_id, weight FROM memory_unified_edges")
+            .fetch_all(pool)
+            .await?;
+    let mut node_to_idx: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut idx_to_node: Vec<String> = Vec::new();
     let mut adjacency: Vec<Vec<(usize, f64)>> = Vec::new();
-    let ensure_idx = |n: i64,
-                      node_to_idx: &mut std::collections::HashMap<i64, usize>,
-                      idx_to_node: &mut Vec<i64>,
+    let ensure_idx = |n: &str,
+                      node_to_idx: &mut std::collections::HashMap<String, usize>,
+                      idx_to_node: &mut Vec<String>,
                       adj: &mut Vec<Vec<(usize, f64)>>|
      -> usize {
-        if let Some(&idx) = node_to_idx.get(&n) {
+        if let Some(&idx) = node_to_idx.get(n) {
             return idx;
         }
         let idx = idx_to_node.len();
-        node_to_idx.insert(n, idx);
-        idx_to_node.push(n);
+        node_to_idx.insert(n.to_string(), idx);
+        idx_to_node.push(n.to_string());
         adj.push(Vec::new());
         idx
     };
     for (from, to, w) in edges {
-        let fi = ensure_idx(from, &mut node_to_idx, &mut idx_to_node, &mut adjacency);
-        let ti = ensure_idx(to, &mut node_to_idx, &mut idx_to_node, &mut adjacency);
-        let w = w as f64;
+        let fi = ensure_idx(&from, &mut node_to_idx, &mut idx_to_node, &mut adjacency);
+        let ti = ensure_idx(&to, &mut node_to_idx, &mut idx_to_node, &mut adjacency);
         adjacency[fi].push((ti, w));
         adjacency[ti].push((fi, w));
     }
-    // Make sure every seed is present in the graph (some may have no
-    // outgoing relations; they're still valid restart nodes for PPR).
-    for &sid in &seed_ids {
+    // Ensure every seed is a node (some may have no edges; still valid restart
+    // nodes for the PPR diffusion).
+    for sid in &seed_ids {
         ensure_idx(sid, &mut node_to_idx, &mut idx_to_node, &mut adjacency);
     }
 
@@ -3125,7 +3278,7 @@ pub async fn memory_ppr_search(
     let mut restart = vec![0.0_f64; n];
     let seed_indices: Vec<usize> = seed_ids
         .iter()
-        .filter_map(|&id| node_to_idx.get(&id).copied())
+        .filter_map(|id| node_to_idx.get(id).copied())
         .collect();
     let restart_mass = 1.0 / seed_indices.len() as f64;
     for &si in &seed_indices {
@@ -3156,35 +3309,36 @@ pub async fn memory_ppr_search(
         rank = next;
     }
 
-    // 4. Take top-k by PR score, attach entity metadata + top observation.
+    // 4. Take top-k by PR score; enrich from memory_unified_nodes (type + label).
     let mut ranked: Vec<(usize, f64)> = rank.iter().enumerate().map(|(i, r)| (i, *r)).collect();
     ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     ranked.truncate(k.clamp(1, 200) as usize);
 
-    let top_ids: Vec<i64> = ranked.iter().map(|(i, _)| idx_to_node[*i]).collect();
+    let top_ids: Vec<String> = ranked
+        .iter()
+        .map(|(i, _)| idx_to_node[*i].clone())
+        .collect();
     let mut hits: Vec<PprHit> = Vec::with_capacity(top_ids.len());
     if !top_ids.is_empty() {
-        let rows: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
-            "SELECT e.id, e.name, e.entity_type,
-                    (SELECT o.content FROM memory_observations o
-                     WHERE o.entity_id = e.id AND o.valid_to IS NULL
-                     ORDER BY o.importance DESC, o.created_at DESC
-                     LIMIT 1)
-             FROM memory_entities e
-             WHERE e.id = ANY($1) AND e.valid_to IS NULL",
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT node_id, node_type, label
+             FROM memory_unified_nodes
+             WHERE node_id = ANY($1)",
         )
         .bind(&top_ids)
         .fetch_all(pool)
         .await?;
-        let score_map: std::collections::HashMap<i64, f64> =
-            ranked.iter().map(|(i, r)| (idx_to_node[*i], *r)).collect();
-        for (id, name, etype, top_obs) in rows {
+        let score_map: std::collections::HashMap<String, f64> = ranked
+            .iter()
+            .map(|(i, r)| (idx_to_node[*i].clone(), *r))
+            .collect();
+        for (node_id, node_type, label) in rows {
+            let ppr_score = *score_map.get(&node_id).unwrap_or(&0.0);
             hits.push(PprHit {
-                entity_id: id,
-                entity_name: name,
-                entity_type: etype,
-                ppr_score: *score_map.get(&id).unwrap_or(&0.0),
-                top_observation: top_obs,
+                node_id,
+                node_type,
+                label,
+                ppr_score,
             });
         }
         hits.sort_by(|a, b| {
@@ -4275,6 +4429,11 @@ pub async fn batch_find_cross_project_neighbors(
     // (HNSW scan × 500-row batches). Raise the ceiling for this
     // transaction only.
     sqlx::query("SET LOCAL statement_timeout = '5min'")
+        .execute(&mut *tx)
+        .await?;
+    // Label this heavy transaction so the graceful-shutdown sweep
+    // (db::admin::terminate_heavy_backends) can terminate it and free its locks.
+    sqlx::query("SET LOCAL application_name = 'pgmcp:heavy:similarity-scan'")
         .execute(&mut *tx)
         .await?;
 
@@ -6440,6 +6599,11 @@ pub async fn load_chunk_topic_assignments_for_files(
     sqlx::query("SET LOCAL statement_timeout = '2min'")
         .execute(&mut *tx)
         .await?;
+    // Label this heavy transaction for the graceful-shutdown sweep
+    // (db::admin::terminate_heavy_backends).
+    sqlx::query("SET LOCAL application_name = 'pgmcp:heavy:topic-clustering'")
+        .execute(&mut *tx)
+        .await?;
     let results = if let Some(proj) = project {
         sqlx::query_as::<_, FileTopicRow>(
             "SELECT f.path, p.name as project_name, ct.label as topic_label,
@@ -7763,6 +7927,11 @@ pub async fn resolve_symbol_reference_targets(
     sqlx::query("SET LOCAL statement_timeout = '300s'")
         .execute(&mut *tx)
         .await?;
+    // Label this heavy transaction for the graceful-shutdown sweep
+    // (db::admin::terminate_heavy_backends).
+    sqlx::query("SET LOCAL application_name = 'pgmcp:heavy:symbol-extraction'")
+        .execute(&mut *tx)
+        .await?;
 
     // Phase 1: exact_in_file. Same source file, same name.
     let phase1 = sqlx::query(
@@ -8420,6 +8589,11 @@ pub async fn compute_semantic_file_edges(
     // on large indexes; raise the ceiling for this transaction only (mirrors
     // `batch_find_cross_project_neighbors`).
     sqlx::query("SET LOCAL statement_timeout = '5min'")
+        .execute(&mut *tx)
+        .await?;
+    // Label this heavy transaction so the graceful-shutdown sweep
+    // (db::admin::terminate_heavy_backends) can terminate it and free its locks.
+    sqlx::query("SET LOCAL application_name = 'pgmcp:heavy:semantic-edges'")
         .execute(&mut *tx)
         .await?;
     let col = crate::embed::signature::read_active_signature(pool)

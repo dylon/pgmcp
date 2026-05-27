@@ -44,6 +44,16 @@ pub async fn tool_hybrid_search(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().hybrid_searches.fetch_add(1, Ordering::Relaxed);
 
+    // Cold-start fast-fail: surface a clear, retryable signal rather than
+    // parking the request in the bounded query channel until a worker finishes
+    // loading its model. Only fires during the brief warmup window.
+    if !ctx.embed().is_ready() {
+        return Err(McpError::internal_error(
+            "embedder is still warming up (loading model); retry shortly",
+            None,
+        ));
+    }
+
     let limit = params.limit.unwrap_or(20);
     let bm25_weight = params.bm25_weight.unwrap_or(0.5);
     let semantic_weight = params.semantic_weight.unwrap_or(0.5);

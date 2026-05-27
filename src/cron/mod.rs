@@ -23,7 +23,11 @@ pub mod k_selector;
 #[allow(dead_code)]
 pub mod latent_pipeline_quality;
 #[allow(dead_code)]
+pub mod memory_concepts;
+#[allow(dead_code)]
 pub mod memory_eval;
+#[allow(dead_code)]
+pub mod memory_graph_refresh;
 #[allow(dead_code)]
 pub mod memory_raptor;
 #[allow(dead_code)]
@@ -51,4 +55,6 @@ pub mod topic_clustering_online;
 pub mod topic_dendrogram;
 #[allow(dead_code)]
 pub mod topic_hierarchy;
+#[allow(dead_code)]
+pub mod trajectory_similarity;
 pub mod work_item_presence;

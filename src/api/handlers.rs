@@ -9,7 +9,6 @@ use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use super::ApiState;
-use crate::daemon_state::DaemonPhase;
 use crate::db::queries::{StatusSnapshot, status_snapshot};
 
 // ============================================================================
@@ -22,16 +21,28 @@ use crate::db::queries::{StatusSnapshot, status_snapshot};
 /// inject pgmcp context). Reads only an atomic phase from the
 /// `DaemonLifecycle` — does not touch the DB or any worker pool.
 ///
-/// 200 OK with `{"phase": "ready"}` when the daemon is in the `Ready`
-/// phase. 503 SERVICE_UNAVAILABLE with `{"phase": "<label>"}` for any
-/// other phase (Initializing/Scanning/Terminating/Defunct).
+/// 200 OK when the daemon is **serving-ready** — the DB pool is up (migrations
+/// ran before the listener bound) AND ≥1 embedder worker has loaded its model —
+/// else 503 SERVICE_UNAVAILABLE. Serving-readiness is deliberately decoupled
+/// from the `Ready` *phase* (which means the initial file scan has finished):
+/// search and RAG can be answered as soon as the service is able to, during the
+/// initial scan, rather than waiting the whole scan out. The body reports
+/// `phase` for index-progress visibility plus the readiness breakdown.
 ///
 /// Intended to be polled at high frequency. Distinct from `/api/status`,
 /// which returns a rich snapshot but issues ~10 SQL `COUNT(*)` queries.
 pub async fn health(State(state): State<ApiState>) -> impl IntoResponse {
-    let phase = state.lifecycle.current();
-    let body = Json(serde_json::json!({ "phase": phase.label() }));
-    if phase == DaemonPhase::Ready {
+    let db_ready = state.db.pool().is_some();
+    let embedder_ready = state.query_embedder.is_ready();
+    let serving_ready = db_ready && embedder_ready;
+    let body = Json(serde_json::json!({
+        "phase": state.lifecycle.current().label(),
+        "serving_ready": serving_ready,
+        "db_ready": db_ready,
+        "embedder_ready": embedder_ready,
+        "ready_workers": state.query_embedder.ready_workers(),
+    }));
+    if serving_ready {
         (StatusCode::OK, body)
     } else {
         (StatusCode::SERVICE_UNAVAILABLE, body)
@@ -161,6 +172,18 @@ pub async fn search(
 ) -> Result<Json<SearchResponse>, (StatusCode, String)> {
     let limit = req.limit.unwrap_or(5);
 
+    // Cold-start fast-fail: if no embedder worker has finished loading its model
+    // yet, return 503 immediately rather than parking the request in the bounded
+    // query channel until one warms up — which would blow the RAG hook's
+    // ~300ms–3s budget. The hook treats 503 as "skip pgmcp this turn" and falls
+    // back cleanly.
+    if !state.query_embedder.is_ready() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "embedder warming up".to_string(),
+        ));
+    }
+
     // Embed the query — dense + (when the backbone has a sparse head) the
     // BGE-M3 learned-sparse vector that feeds the optional sparse RRF leg.
     let query_rep = state
@@ -196,7 +219,7 @@ pub async fn search(
         (
             cfg.vector.ef_search,
             cfg.api.rerank_candidates.max(limit),
-            cfg.api.rerank_hook && state.reranker.is_some(),
+            cfg.api.rerank_hook && state.reranker.read().is_some(),
             cfg.api.colbert_rerank,
             cfg.api.colbert_candidates.max(limit),
             cfg.api.mmr_lambda,
@@ -312,9 +335,12 @@ pub async fn search(
     // to the RRF order — the hook must never hard-fail on a rerank error.
     let mut rerank_hits: Vec<crate::reranker::RerankHit> = Vec::new();
     let mut rerank_used = false;
+    // Snapshot the hot-swappable reranker handle, releasing the RwLock guard
+    // before the spawn_blocking await below so the handler future stays Send.
+    let reranker_opt = state.reranker.read().clone();
     if rerank_enabled
         && results.len() > 1
-        && let Some(reranker) = state.reranker.clone()
+        && let Some(reranker) = reranker_opt
     {
         let query = req.query.clone();
         let cands: Vec<String> = results.iter().map(|r| r.chunk_content.clone()).collect();
@@ -588,7 +614,10 @@ pub async fn session_observe(
     // background. Does NOT block the HTTP response — the inline path
     // (mandates + RAG) returns to the caller immediately while the
     // extractor runs on the runtime's blocking-pool thread.
-    if let Some(extractor) = state.llm_extractor.clone() {
+    // Snapshot the hot-swappable extractor handle, releasing the RwLock guard
+    // before any await so the handler future stays Send.
+    let extractor_opt = state.llm_extractor.read().clone();
+    if let Some(extractor) = extractor_opt {
         let pool_clone = pool.clone();
         let stats_clone = Arc::clone(&state.stats);
         let debounce_clone = Arc::clone(&state.extractor_debounce);

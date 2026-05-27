@@ -1,6 +1,8 @@
+pub mod admin;
 #[allow(dead_code)]
 pub mod client;
 pub mod migrations;
+pub mod ontology;
 pub mod patterns;
 #[allow(dead_code)]
 pub mod pool;

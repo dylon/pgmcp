@@ -80,4 +80,16 @@ impl EmbedSource {
             Self::Backend(b) => b.embed_one(text).await,
         }
     }
+
+    /// True when a query will be embedded promptly. The daemon `Pool` variant
+    /// gates on worker readiness — so search surfaces can 503 / early-return
+    /// during cold-start warmup instead of parking the request in the bounded
+    /// query channel until a worker loads its model. The CLI `Lazy` and direct
+    /// `Backend` variants embed inline and are always ready.
+    pub fn is_ready(&self) -> bool {
+        match self {
+            Self::Pool(embedder) => embedder.is_ready(),
+            Self::Lazy { .. } | Self::Backend(_) => true,
+        }
+    }
 }

@@ -63,11 +63,12 @@ pub struct SystemContext {
     /// internally `Arc<AtomicU8>` + `Arc<Subject>`, so we hold by value
     /// and rely on its derived `Clone` for cheap propagation.
     lifecycle: DaemonLifecycle,
-    /// Memory-server Phase 4+5 LLM extractor. `None` = extraction
-    /// disabled (operator hasn't opted in or construction failed). MCP
-    /// tools that need the extractor (currently `memory_reflect`)
-    /// refuse cleanly when this is `None`.
-    llm_extractor: Option<Arc<dyn LlmExtractor>>,
+    /// Memory-server Phase 4+5 LLM extractor. Empty = extraction disabled
+    /// (operator hasn't opted in or construction failed) OR still loading — the
+    /// daemon builds it in the background and hot-swaps it in, so readers see
+    /// `None` only briefly during startup. MCP tools that need the extractor
+    /// (currently `memory_reflect`) refuse cleanly while it is absent.
+    llm_extractor: Arc<parking_lot::RwLock<Option<Arc<dyn LlmExtractor>>>>,
     /// Serializes any caller that performs a mass-delete reindex (the
     /// MCP `reindex` tool, future cron equivalents, etc.). Held for the
     /// duration of the destructive operation so two reindexes cannot
@@ -111,7 +112,7 @@ impl SystemContext {
             log_broadcaster,
             task_store,
             lifecycle,
-            llm_extractor: None,
+            llm_extractor: Arc::new(parking_lot::RwLock::new(None)),
             reindex_lock: Arc::new(tokio::sync::Mutex::new(())),
             phonetics: Arc::new(DashMap::new()),
             default_phonetics: Arc::new(OnceLock::new()),
@@ -130,7 +131,7 @@ impl SystemContext {
         log_broadcaster: Arc<LogBroadcaster>,
         task_store: Arc<TaskStore>,
         lifecycle: DaemonLifecycle,
-        llm_extractor: Option<Arc<dyn LlmExtractor>>,
+        llm_extractor: Arc<parking_lot::RwLock<Option<Arc<dyn LlmExtractor>>>>,
     ) -> Self {
         Self {
             db,
@@ -227,11 +228,12 @@ impl SystemContext {
         &self.lifecycle
     }
 
-    /// Returns the optional LLM extractor handle. `None` when the
-    /// operator hasn't opted in (or construction failed at daemon
-    /// startup).
-    pub fn llm_extractor(&self) -> Option<&Arc<dyn LlmExtractor>> {
-        self.llm_extractor.as_ref()
+    /// Returns the current LLM extractor handle (owned `Arc`), or `None` when
+    /// the operator hasn't opted in, construction failed, or it is still loading
+    /// in the background at startup. Cheap atomic load; call per use rather than
+    /// caching so a late background swap-in is picked up.
+    pub fn llm_extractor(&self) -> Option<Arc<dyn LlmExtractor>> {
+        self.llm_extractor.read().clone()
     }
 }
 

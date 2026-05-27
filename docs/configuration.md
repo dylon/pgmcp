@@ -54,6 +54,20 @@ user = "pgmcp"
 # password via PGMCP_DB_PASSWORD env var or:
 # password = "secret"
 max_connections = 40
+# Per-session server-side timeouts (milliseconds), applied to every pooled
+# connection. Long-running cron queries raise their own ceiling via
+# `SET LOCAL` inside a transaction.
+statement_timeout_ms = 30000            # cancel any single query after this
+idle_in_transaction_timeout_ms = 60000  # cancel a transaction idle this long
+lock_timeout_ms = 5000                  # cap any single lock-acquisition wait
+# PostgreSQL >= 14 only (silently ignored on older servers). While a backend is
+# running a long query it otherwise never notices that its client has gone, so a
+# daemon that is killed / crashes mid-query leaves an *orphaned backend* holding
+# its locks until `statement_timeout` fires (minutes). With this set, the backend
+# polls the client socket every interval and self-terminates once the client is
+# gone — releasing its locks so a restarted daemon's startup migrations don't
+# collide with the dead instance and abort at `lock_timeout`. 0 disables it.
+client_connection_check_interval_ms = 10000
 
 [embeddings]
 model = "all-MiniLM-L6-v2"

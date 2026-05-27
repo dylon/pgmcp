@@ -286,80 +286,91 @@ pub(crate) fn scan_single_workspace(
         let _ = override_builder.add(&format!("!{}", pattern));
     }
 
-    // Walk the directory tree
-    for entry in builder.build() {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(e) => {
-                tracing::warn!(error = %e, "Error walking directory");
-                continue;
-            }
-        };
-
-        let path = entry.path();
-
-        // Detect project roots (directories whose `.git` is either a
-        // directory — the main checkout — or a regular file — a
-        // `git worktree`'s pointer to the shared `.git/worktrees/<name>/`
-        // directory). Both kinds are valid project roots; without the
-        // file-check, sibling worktrees of a repo are never discovered
-        // and the worktree-aware analytics filter has nothing to scope
-        // (only the main checkout would be indexed).
-        if path.is_dir() {
-            let dot_git = path.join(".git");
-            if dot_git.is_dir() || dot_git.is_file() {
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "unknown".into());
-
-                project_roots.insert(
-                    path.to_path_buf(),
-                    ProjectRoot {
-                        workspace_path: workspace_path.to_string(),
-                        name,
-                    },
-                );
-
-                // Load project override if .pgmcp.toml exists
-                if let Some(override_config) = config::ProjectOverride::load(path) {
-                    project_overrides.insert(path.to_path_buf(), override_config);
+    // Walk the directory tree in PARALLEL. The `ignore` crate fans the
+    // traversal + gitignore matching across threads; project-root detection
+    // (DashMap) and file submission (crossbeam Sender) are thread-safe, and the
+    // downstream consumer applies the per-file metadata skip independently of
+    // order. NOTE (data-driven): the walk is not the cold-start bottleneck —
+    // embedding throughput (`embeddings.pool_size` × GPU batch) is — and the
+    // walk already runs off the request/bind path on a background thread. This
+    // parallelism trims the traversal/stat phase; it does not change time-to-
+    // serving-ready. See docs/operations.md.
+    builder.build_parallel().run(|| {
+        Box::new(|entry| {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(error = %e, "Error walking directory");
+                    return ignore::WalkState::Continue;
                 }
+            };
 
-                debug!(path = %path.display(), "Discovered project root");
+            let path = entry.path();
+
+            // Detect project roots (directories whose `.git` is either a
+            // directory — the main checkout — or a regular file — a
+            // `git worktree`'s pointer to the shared `.git/worktrees/<name>/`
+            // directory). Both kinds are valid project roots; without the
+            // file-check, sibling worktrees of a repo are never discovered
+            // and the worktree-aware analytics filter has nothing to scope
+            // (only the main checkout would be indexed).
+            if path.is_dir() {
+                let dot_git = path.join(".git");
+                if dot_git.is_dir() || dot_git.is_file() {
+                    let name = path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "unknown".into());
+
+                    project_roots.insert(
+                        path.to_path_buf(),
+                        ProjectRoot {
+                            workspace_path: workspace_path.to_string(),
+                            name,
+                        },
+                    );
+
+                    // Load project override if .pgmcp.toml exists
+                    if let Some(override_config) = config::ProjectOverride::load(path) {
+                        project_overrides.insert(path.to_path_buf(), override_config);
+                    }
+
+                    debug!(path = %path.display(), "Discovered project root");
+                }
+                return ignore::WalkState::Continue;
             }
-            continue;
-        }
 
-        // Skip non-files
-        if !path.is_file() {
-            continue;
-        }
-
-        // Check if this file type is configured
-        if !is_configured_path(config, path) {
-            continue;
-        }
-
-        // Check exclude patterns
-        let path_str = path.to_string_lossy();
-        let excluded = config.indexer.exclude_patterns.iter().any(|pattern| {
-            if let Some(suffix) = pattern.strip_prefix('*') {
-                path_str.ends_with(suffix)
-            } else {
-                path_str.contains(pattern)
+            // Skip non-files
+            if !path.is_file() {
+                return ignore::WalkState::Continue;
             }
-        });
 
-        if excluded {
-            continue;
-        }
+            // Check if this file type is configured
+            if !is_configured_path(config, path) {
+                return ignore::WalkState::Continue;
+            }
 
-        // Submit for indexing
-        if file_tx.send(path.to_path_buf()).is_err() {
-            break; // Channel closed
-        }
-    }
+            // Check exclude patterns
+            let path_str = path.to_string_lossy();
+            let excluded = config.indexer.exclude_patterns.iter().any(|pattern| {
+                if let Some(suffix) = pattern.strip_prefix('*') {
+                    path_str.ends_with(suffix)
+                } else {
+                    path_str.contains(pattern)
+                }
+            });
+
+            if excluded {
+                return ignore::WalkState::Continue;
+            }
+
+            // Submit for indexing
+            if file_tx.send(path.to_path_buf()).is_err() {
+                return ignore::WalkState::Quit; // Channel closed
+            }
+            ignore::WalkState::Continue
+        })
+    });
 }
 
 /// Scan `~/.claude/` with hardcoded noise excludes. Files are submitted directly

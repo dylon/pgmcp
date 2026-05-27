@@ -92,10 +92,11 @@ pub async fn tool_trigger_cron(
                 .pool()
                 .ok_or_else(|| McpError::internal_error("no pool available", None))?;
             let cfg = ctx.config().load().a2a.reflection.clone();
+            let extractor = ctx.llm_extractor();
             let report = crate::a2a::best_practices::run_cross_agent_reflection(
                 pool,
                 stats,
-                ctx.llm_extractor().map(|e| &**e),
+                extractor.as_deref(),
                 &cfg,
             )
             .await
