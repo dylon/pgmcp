@@ -1438,11 +1438,18 @@ pub fn schedule_maintenance_jobs(
                         stats = stats,
                     );
                     let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
+                    // Capture RSS + thread count around the run. `threads_delta`
+                    // is the regression signal for the persistent-trie
+                    // daemon-thread leak: a healthy run returns to ~0; a
+                    // steadily-climbing delta means handles aren't being
+                    // reclaimed.
+                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                    let threads_start = crate::stats::rss::current_thread_count().unwrap_or(0);
                     let t0 = Instant::now();
                     if let Some(pool) = db.pool().cloned() {
                         let stats_ref = Arc::clone(&stats);
-                        rt.block_on(async move {
-                            match crate::cron::fuzzy_sync::run_fuzzy_sync(
+                        let result = rt.block_on(async move {
+                            crate::cron::fuzzy_sync::run_fuzzy_sync(
                                 &pool,
                                 &data_dir,
                                 max_disk_bytes,
@@ -1450,23 +1457,31 @@ pub fn schedule_maintenance_jobs(
                                 stats_ref,
                             )
                             .await
-                            {
-                                Ok(report) => tracing::info!(
-                                    job = "fuzzy-sync",
-                                    symbols = report.symbols_synced,
-                                    paths = report.paths_synced,
-                                    commits = report.commits_synced,
-                                    durable_mandates = report.durable_mandates_synced,
-                                    elapsed_s = t0.elapsed().as_secs_f64(),
-                                    "fuzzy-sync run complete"
-                                ),
-                                Err(e) => tracing::error!(
-                                    job = "fuzzy-sync",
-                                    error = %e,
-                                    "fuzzy-sync run failed"
-                                ),
-                            }
                         });
+                        let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
+                        let threads_end = crate::stats::rss::current_thread_count().unwrap_or(0);
+                        match result {
+                            Ok(report) => tracing::info!(
+                                job = "fuzzy-sync",
+                                symbols = report.symbols_synced,
+                                paths = report.paths_synced,
+                                commits = report.commits_synced,
+                                durable_mandates = report.durable_mandates_synced,
+                                rss_mb_start = rss_start >> 20,
+                                rss_mb_end = rss_end >> 20,
+                                rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
+                                threads_start,
+                                threads_end,
+                                threads_delta = threads_end as i64 - threads_start as i64,
+                                elapsed_s = t0.elapsed().as_secs_f64(),
+                                "fuzzy-sync run complete"
+                            ),
+                            Err(e) => tracing::error!(
+                                job = "fuzzy-sync",
+                                error = %e,
+                                "fuzzy-sync run failed"
+                            ),
+                        }
                     } else {
                         tracing::warn!(job = "fuzzy-sync", "skipping run: DbClient has no pool");
                     }

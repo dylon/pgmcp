@@ -11,6 +11,8 @@
 //! `tool_hybrid_search::try_third_leg` all consume these to avoid
 //! rebuilding a transient `DynamicDawgChar` per call.
 
+use std::sync::Arc;
+
 use rmcp::ErrorData as McpError;
 use sqlx::PgPool;
 
@@ -126,10 +128,18 @@ pub async fn rebuild_commits(
 pub async fn open_symbol_trie(
     ctx: &SystemContext,
     project_name: &str,
-) -> Result<FuzzyIndex<SymbolValue>, McpError> {
+) -> Result<Arc<FuzzyIndex<SymbolValue>>, McpError> {
     let data_dir = ctx.config().load().fuzzy.data_dir.clone();
     let slug = crate::cron::fuzzy_sync::slugify(project_name);
     let path = crate::cron::fuzzy_sync::trie_path(&data_dir, "symbols", &slug);
+
+    // Reuse a cached handle if the on-disk trie is unchanged since it was opened
+    // (the cron bumps the file's mtime when it rebuilds). Opening a handle spawns
+    // three daemon threads, so reuse avoids per-call thread churn.
+    if let Some(idx) = ctx.fuzzy_cache().get_symbols(&slug, &path) {
+        return Ok(idx);
+    }
+
     let fresh = !path.exists();
     let (idx, _recovery) = FuzzyIndex::<SymbolValue>::open_or_create(&path)
         .map_err(|e| McpError::internal_error(format!("fuzzy symbol trie open: {e}"), None))?;
@@ -146,7 +156,7 @@ pub async fn open_symbol_trie(
             "fuzzy symbol trie lazy-warmed from PG"
         );
     }
-    Ok(idx)
+    Ok(ctx.fuzzy_cache().insert_symbols(&slug, &path, idx))
 }
 
 /// Open (or create + lazy-warm from PG) the per-project path
@@ -155,10 +165,15 @@ pub async fn open_symbol_trie(
 pub async fn open_path_trie(
     ctx: &SystemContext,
     project_name: &str,
-) -> Result<FuzzyIndex<PathValue>, McpError> {
+) -> Result<Arc<FuzzyIndex<PathValue>>, McpError> {
     let data_dir = ctx.config().load().fuzzy.data_dir.clone();
     let slug = crate::cron::fuzzy_sync::slugify(project_name);
     let path = crate::cron::fuzzy_sync::trie_path(&data_dir, "paths", &slug);
+
+    if let Some(idx) = ctx.fuzzy_cache().get_paths(&slug, &path) {
+        return Ok(idx);
+    }
+
     let fresh = !path.exists();
     let (idx, _recovery) = FuzzyIndex::<PathValue>::open_or_create(&path)
         .map_err(|e| McpError::internal_error(format!("fuzzy path trie open: {e}"), None))?;
@@ -175,7 +190,7 @@ pub async fn open_path_trie(
             "fuzzy path trie lazy-warmed from PG"
         );
     }
-    Ok(idx)
+    Ok(ctx.fuzzy_cache().insert_paths(&slug, &path, idx))
 }
 
 /// Rebuild the durable-mandate index from `durable_mandates`.

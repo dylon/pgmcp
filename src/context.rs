@@ -92,6 +92,12 @@ pub struct SystemContext {
     /// overrides), loaded once lazily on first access. Backs the per-client
     /// `list_tools` description overrides and the `pgmcp_client_profile` tool.
     client_profiles: Arc<OnceLock<Arc<ClientProfileRegistry>>>,
+    /// Bounded cache of open per-project fuzzy-trie handles (symbols + paths).
+    /// Lets the fuzzy MCP tools reuse one `PersistentARTrieChar` handle across
+    /// calls instead of opening one (and spawning three daemon threads) per
+    /// query; entries self-invalidate when the `fuzzy-sync` cron rewrites the
+    /// on-disk `.artrie` (mtime change). See `crate::fuzzy::cache::FuzzyCache`.
+    fuzzy_cache: Arc<crate::fuzzy::cache::FuzzyCache>,
 }
 
 impl SystemContext {
@@ -122,6 +128,7 @@ impl SystemContext {
             phonetics: Arc::new(DashMap::new()),
             default_phonetics: Arc::new(OnceLock::new()),
             client_profiles: Arc::new(OnceLock::new()),
+            fuzzy_cache: Arc::new(crate::fuzzy::cache::FuzzyCache::new()),
         }
     }
 
@@ -152,7 +159,15 @@ impl SystemContext {
             phonetics: Arc::new(DashMap::new()),
             default_phonetics: Arc::new(OnceLock::new()),
             client_profiles: Arc::new(OnceLock::new()),
+            fuzzy_cache: Arc::new(crate::fuzzy::cache::FuzzyCache::new()),
         }
+    }
+
+    /// Shared, bounded cache of open per-project fuzzy-trie handles (see
+    /// [`crate::fuzzy::cache::FuzzyCache`]). The fuzzy MCP query tools use it to
+    /// reuse trie handles across calls rather than reopening one per query.
+    pub fn fuzzy_cache(&self) -> &crate::fuzzy::cache::FuzzyCache {
+        &self.fuzzy_cache
     }
 
     /// P14.4 — clone the per-project phonetics registry Arc. The

@@ -25,6 +25,20 @@ pub fn current_rss_bytes() -> Option<u64> {
     Some(resident_pages * page_size)
 }
 
+/// Current OS thread count of this process, via `/proc/self/task`.
+///
+/// Returns `None` on non-Linux or if the directory can't be read. Heavy cron
+/// jobs log a per-run `threads_delta` from this so a background-thread leak
+/// (e.g. the persistent-trie daemon-thread leak) shows up as a steadily
+/// climbing thread count rather than silently as RSS growth.
+pub fn current_thread_count() -> Option<u64> {
+    let count = fs::read_dir("/proc/self/task")
+        .ok()?
+        .filter(|e| e.is_ok())
+        .count();
+    Some(count as u64)
+}
+
 /// System-wide available memory in bytes, via `/proc/meminfo:MemAvailable`.
 /// Returns `None` on non-Linux or if the field isn't present.
 pub fn mem_available_bytes() -> Option<u64> {
