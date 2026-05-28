@@ -500,6 +500,29 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         });
     }
 
+    // 11d-bis. Schedule the CSM auto-conformance cron (ADR-009). Off by default
+    // ([a2a.csm_validate] cron_enabled = false). Validates completed
+    // a2a_pattern_* runs with no csm_run_traces row yet, feeding the MSM learner
+    // without depending on an agent calling csm_validate_run. LLM-free.
+    if config_snapshot.a2a.csm_validate.cron_enabled
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let stats_for_csm = Arc::clone(&stats_tracker);
+        let csm_cfg = config_snapshot.a2a.csm_validate.clone();
+        let interval_ms = csm_cfg.cron_interval_secs.saturating_mul(1000);
+        let rt_for_csm = tokio::runtime::Handle::current();
+        // 75s initial delay so we don't run during the startup window.
+        cron_handle.schedule_recurring(75_000, interval_ms, "csm-validate", move || {
+            let pool = pool.clone();
+            let stats = Arc::clone(&stats_for_csm);
+            let cfg = csm_cfg.clone();
+            rt_for_csm.spawn(async move {
+                cron::csm_validate::run_or_log(Arc::new(pool), stats, cfg).await;
+            });
+            true
+        });
+    }
+
     // 11e. Schedule the memory-graph-refresh cron: keep the unified
     // knowledge-graph matviews (memory_unified_nodes + memory_unified_edges)
     // current with the indexed corpus so the traversal tools see fresh nodes/

@@ -6,6 +6,7 @@ pub mod call_graph;
 pub mod code_raptor;
 #[allow(dead_code)]
 pub mod cross_language_signatures;
+pub mod csm_validate;
 #[allow(dead_code)]
 pub mod embedding_migration;
 #[allow(dead_code)]

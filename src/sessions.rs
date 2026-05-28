@@ -663,23 +663,18 @@ fn detect_scope_hint(prompt: &str, cwd: Option<&str>) -> Option<String> {
     }
 }
 
-/// Tiered heuristic extractor. Pure function. Optionally takes the session
-/// cwd for `cwd_prefix` scope-hint detection.
-pub fn extract_mandates(prompt: &str, cwd: Option<&str>) -> Vec<ExtractedMandate> {
-    if prompt.trim().is_empty() {
-        return Vec::new();
-    }
-
-    // Apply exclusion filters first (drop the matched span). We approximate
-    // by masking matched spans with spaces so positions stay aligned.
+/// Mask code blocks / quoted spans with spaces (preserving byte offsets and
+/// newlines) so cue and tool-family regexes don't fire on quoted text. Shared
+/// by [`extract_mandates`] and [`classify_tool_suggestion`].
+fn mask_exclusions(prompt: &str) -> String {
     let mut masked = prompt.to_string();
     for re in compiled_exclusions() {
         // Collect ranges first to avoid borrow issues.
         let ranges: Vec<(usize, usize)> =
             re.find_iter(prompt).map(|m| (m.start(), m.end())).collect();
         for (s, e) in ranges {
-            // Replace with spaces of the same length (byte-wise) to preserve byte positions
-            // for downstream regex offsets that reference `prompt`.
+            // Replace with spaces of the same length (byte-wise) to preserve byte
+            // positions for downstream regex offsets that reference `prompt`.
             if let Some(slice) = masked.get_mut(s..e) {
                 for b in unsafe { slice.as_bytes_mut() } {
                     if *b != b'\n' {
@@ -689,6 +684,18 @@ pub fn extract_mandates(prompt: &str, cwd: Option<&str>) -> Vec<ExtractedMandate
             }
         }
     }
+    masked
+}
+
+/// Tiered heuristic extractor. Pure function. Optionally takes the session
+/// cwd for `cwd_prefix` scope-hint detection.
+pub fn extract_mandates(prompt: &str, cwd: Option<&str>) -> Vec<ExtractedMandate> {
+    if prompt.trim().is_empty() {
+        return Vec::new();
+    }
+
+    // Mask code blocks / quoted spans first (see `mask_exclusions`).
+    let masked = mask_exclusions(prompt);
 
     let scope_hint = detect_scope_hint(prompt, cwd);
     let mut out: Vec<ExtractedMandate> = Vec::new();
@@ -731,6 +738,254 @@ pub fn extract_mandates(prompt: &str, cwd: Option<&str>) -> Vec<ExtractedMandate
     }
 
     out
+}
+
+// ============================================================================
+// Tool-suggestion classifier (JIT adoption nudges)
+// ============================================================================
+
+/// Under-used tool families the prompt classifier can suggest. A long-context
+/// prompt maps to RLM (`a2a_pattern_recursive`); a collaboration prompt to the
+/// A2A patterns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolFamily {
+    Collaboration,
+    LargeContext,
+    MemoryWrite,
+    MemoryRead,
+    WorkItem,
+}
+
+struct ToolCue {
+    pattern: &'static str,
+    family: ToolFamily,
+    weight: f32,
+}
+
+const TOOL_CUES: &[ToolCue] = &[
+    ToolCue {
+        pattern: r"(?i)\b(second opinion|another (?:agent|model|perspective)|sanity[- ]?check|peer[- ]?review|red[- ]?team|adversarial|brainstorm|critique this|get .{0,30}? to (?:review|check|weigh in))\b",
+        family: ToolFamily::Collaboration,
+        weight: 3.0,
+    },
+    ToolCue {
+        pattern: r"(?i)\b(whole (?:file|repo|repository|module|codebase|project)|entire (?:file|repo|repository|module|codebase|project)|across the (?:whole|entire)|too (?:long|large|big) to (?:fit|read|process)|summari[sz]e the (?:repo|repository|codebase|whole (?:file|module)))\b",
+        family: ToolFamily::LargeContext,
+        weight: 3.0,
+    },
+    ToolCue {
+        pattern: r"(?i)\b(remember (?:that|this|to)|from now on|note that|keep in mind|for future reference|don'?t forget|make a note)\b",
+        family: ToolFamily::MemoryWrite,
+        weight: 3.0,
+    },
+    ToolCue {
+        pattern: r"(?i)\b(have we (?:done|tried|decided|discussed)|did we (?:decide|discuss|do)|what did we|last time|previously|prior (?:decision|discussion|work)|as we (?:discussed|agreed)|do you (?:recall|remember))\b",
+        family: ToolFamily::MemoryRead,
+        weight: 3.0,
+    },
+    ToolCue {
+        pattern: r"(?i)\b(track (?:this|these|it|the .{0,20}?work)|create (?:a |an )?(?:plan|task|backlog|epic|work item|milestone)|break (?:this|it|them) (?:down|into (?:tasks|steps|subtasks))|to[- ]?do list|work items?|hand (?:this |it )?off)\b",
+        family: ToolFamily::WorkItem,
+        weight: 3.0,
+    },
+];
+
+fn compiled_tool_cues() -> &'static [(Regex, ToolFamily, f32)] {
+    static CELL: OnceLock<Vec<(Regex, ToolFamily, f32)>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        TOOL_CUES
+            .iter()
+            .map(|c| {
+                (
+                    Regex::new(c.pattern).expect("tool-cue regex compiles"),
+                    c.family,
+                    c.weight,
+                )
+            })
+            .collect()
+    })
+}
+
+lazy_regex!(fenced_code_re, r"(?s)```.*?```");
+lazy_regex!(inline_code_re, r"`[^`]*`");
+
+/// Blank fenced and inline code spans so the classifier doesn't fire on pasted
+/// code that happens to contain a trigger word (e.g. a code block mentioning
+/// "remember"). Offsets need not be preserved — the classifier only `is_match`es.
+/// (Distinct from the mandate extractor's `mask_exclusions`, which must NOT strip
+/// inline `code` — that would drop its back-tick target capture.)
+fn strip_code(text: &str) -> String {
+    let no_fences = fenced_code_re().replace_all(text, " ");
+    inline_code_re().replace_all(&no_fences, " ").into_owned()
+}
+
+/// Classify a prompt into AT MOST ONE tool-family suggestion (the highest-weight
+/// match; ties broken by `TOOL_CUES` order). Regex-only — same cost class as
+/// [`extract_mandates`]. Returns `None` when no cue fires. Fenced / inline code
+/// spans are stripped first so the classifier doesn't trigger on pasted code.
+pub fn classify_tool_suggestion(prompt: &str) -> Option<ToolFamily> {
+    if prompt.trim().is_empty() {
+        return None;
+    }
+    let masked = strip_code(prompt);
+    let mut best: Option<(f32, ToolFamily)> = None;
+    for (re, family, weight) in compiled_tool_cues() {
+        if re.is_match(&masked) {
+            let better = best.is_none_or(|(w, _)| *weight > w);
+            if better {
+                best = Some((*weight, *family));
+            }
+        }
+    }
+    best.map(|(_, f)| f)
+}
+
+/// The single nudge line appended to `additional_context` for a classified
+/// family. `brief` (codex) trades the rationale for tokens. Uses geometric
+/// glyphs, not emoji, per the rendering policy.
+pub fn tool_suggestion_nudge(family: ToolFamily, brief: bool) -> String {
+    match (family, brief) {
+        (ToolFamily::Collaboration, false) => "▸ Looks collaborative — consider a2a_pattern_deliberation (hard problems, iterate), a2a_pattern_mixture (parallel specialists), or a2a_send_task to delegate to a peer; csm_validate_run(task_id) after a pattern run.".to_string(),
+        (ToolFamily::Collaboration, true) => "▸ a2a_pattern_* / a2a_send_task available for multi-agent work.".to_string(),
+        (ToolFamily::LargeContext, false) => "▸ Beyond one pass — a2a_pattern_recursive decomposes a whole file/module/repo and stitches the answer (rlm_depth / rlm_budget tunable).".to_string(),
+        (ToolFamily::LargeContext, true) => "▸ a2a_pattern_recursive for whole-file/repo questions.".to_string(),
+        (ToolFamily::MemoryWrite, false) => "▸ Persist this durably — memory_create_entities + memory_add_observations (survives across sessions; recall later with memory_unified_search).".to_string(),
+        (ToolFamily::MemoryWrite, true) => "▸ memory_add_observations to persist durable facts.".to_string(),
+        (ToolFamily::MemoryRead, false) => "▸ Recall prior context first — memory_unified_search / recall_prompts / search_mandates before re-deriving.".to_string(),
+        (ToolFamily::MemoryRead, true) => "▸ memory_unified_search / recall_prompts to recall prior context.".to_string(),
+        (ToolFamily::WorkItem, false) => "▸ Track multi-step work — work_item_create (or work_item_ingest_plan to ingest a plan), work_item_claim_next / work_item_handoff for cross-agent.".to_string(),
+        (ToolFamily::WorkItem, true) => "▸ work_item_create / work_item_ingest_plan to track multi-step work.".to_string(),
+    }
+}
+
+/// Stable lowercase key for a family (used in the `nudge_emissions` log and the
+/// per-(session, family) rate limit).
+pub fn tool_family_key(family: ToolFamily) -> &'static str {
+    match family {
+        ToolFamily::Collaboration => "collaboration",
+        ToolFamily::LargeContext => "large_context",
+        ToolFamily::MemoryWrite => "memory_write",
+        ToolFamily::MemoryRead => "memory_read",
+        ToolFamily::WorkItem => "work_item",
+    }
+}
+
+/// True if `(session_id, family)` was nudged within the last `ttl_secs`.
+pub async fn recently_nudged(
+    pool: &PgPool,
+    session_id: &str,
+    family: &str,
+    ttl_secs: i64,
+) -> Result<bool, sqlx::Error> {
+    let found: Option<i64> = sqlx::query_scalar(
+        "SELECT 1 FROM nudge_emissions
+         WHERE session_id = $1 AND family = $2
+           AND ts > now() - ($3::bigint * interval '1 second')
+         LIMIT 1",
+    )
+    .bind(session_id)
+    .bind(family)
+    .bind(ttl_secs.max(0))
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.is_some())
+}
+
+/// Lifetime count of nudges of `family` emitted in this session.
+pub async fn session_nudge_count(
+    pool: &PgPool,
+    session_id: &str,
+    family: &str,
+) -> Result<i64, sqlx::Error> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::int8 FROM nudge_emissions WHERE session_id = $1 AND family = $2",
+    )
+    .bind(session_id)
+    .bind(family)
+    .fetch_one(pool)
+    .await?;
+    Ok(n)
+}
+
+/// Record a nudge emission (for rate-limiting + the Phase-3 conversion metric).
+pub async fn insert_nudge_emission(
+    pool: &PgPool,
+    session_id: &str,
+    prompt_id: Option<i64>,
+    family: &str,
+    channel: &str,
+    client_name: Option<&str>,
+    project_id: Option<i32>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO nudge_emissions
+            (session_id, prompt_id, family, channel, client_name, project_id)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(session_id)
+    .bind(prompt_id)
+    .bind(family)
+    .bind(channel)
+    .bind(client_name)
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tool_suggestion_tests {
+    use super::*;
+
+    #[test]
+    fn classifies_representative_prompts() {
+        assert_eq!(
+            classify_tool_suggestion("Can you get a second opinion on this design?"),
+            Some(ToolFamily::Collaboration)
+        );
+        assert_eq!(
+            classify_tool_suggestion("summarize the whole repo for me"),
+            Some(ToolFamily::LargeContext)
+        );
+        assert_eq!(
+            classify_tool_suggestion("Remember that we use BF16 for inference from now on"),
+            Some(ToolFamily::MemoryWrite)
+        );
+        assert_eq!(
+            classify_tool_suggestion("have we done this migration before?"),
+            Some(ToolFamily::MemoryRead)
+        );
+        assert_eq!(
+            classify_tool_suggestion("break this down into tasks and track it"),
+            Some(ToolFamily::WorkItem)
+        );
+    }
+
+    #[test]
+    fn no_false_positive_on_plain_prompts() {
+        assert_eq!(classify_tool_suggestion("fix the typo in line 42"), None);
+        assert_eq!(classify_tool_suggestion(""), None);
+        assert_eq!(
+            classify_tool_suggestion("run the tests and show me the output"),
+            None
+        );
+    }
+
+    #[test]
+    fn quoted_text_is_masked() {
+        // The cue sits inside a fenced code block → masked → no suggestion.
+        let p = "here is code:\n```\nremember that x = 1 from now on\n```\nplease format it";
+        assert_eq!(classify_tool_suggestion(p), None);
+    }
+
+    #[test]
+    fn nudge_text_is_per_client() {
+        let full = tool_suggestion_nudge(ToolFamily::Collaboration, false);
+        let brief = tool_suggestion_nudge(ToolFamily::Collaboration, true);
+        assert!(full.len() > brief.len());
+        assert!(full.contains("a2a_pattern_deliberation"));
+        assert!(brief.contains("a2a_"));
+    }
 }
 
 // ============================================================================

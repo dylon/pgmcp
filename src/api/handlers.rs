@@ -707,6 +707,53 @@ pub async fn session_observe(
         additional_context.push_str(&bp);
     }
 
+    // JIT adoption nudge (Claude-only — only clients running the observe hook
+    // reach this path). A single, deduplicated, budget-bounded suggestion toward
+    // an under-used tool family; logged to nudge_emissions for the Phase-3
+    // conversion metric and the per-(session, family) rate limit. Off unless
+    // [nudges] enabled = true.
+    let nudges_cfg = state.config.load().nudges.clone();
+    if nudges_cfg.enabled
+        && let Some(family) = crate::sessions::classify_tool_suggestion(&req.prompt)
+        && let Some(pool) = state.system_ctx.db().pool()
+    {
+        let session_key = req.session_id.to_string();
+        let family_key = crate::sessions::tool_family_key(family);
+        let brief = req
+            .agent_id
+            .as_deref()
+            .map(|a| a.contains("codex"))
+            .unwrap_or(false);
+        let nudge = crate::sessions::tool_suggestion_nudge(family, brief);
+        let fits = additional_context.len() + nudge.len() + 1 < 2048;
+        let recently =
+            crate::sessions::recently_nudged(pool, &session_key, family_key, nudges_cfg.ttl_secs as i64)
+                .await
+                .unwrap_or(false);
+        let count = crate::sessions::session_nudge_count(pool, &session_key, family_key)
+            .await
+            .unwrap_or(i64::MAX);
+        if fits && !recently && count < nudges_cfg.max_per_session as i64 {
+            additional_context.push('\n');
+            additional_context.push_str(&nudge);
+            // Fire-and-forget so the emission log never blocks the response.
+            let pool = pool.clone();
+            let client = req.agent_id.clone();
+            tokio::spawn(async move {
+                let _ = crate::sessions::insert_nudge_emission(
+                    &pool,
+                    &session_key,
+                    Some(prompt_id),
+                    family_key,
+                    "prompt",
+                    client.as_deref(),
+                    project_id,
+                )
+                .await;
+            });
+        }
+    }
+
     Ok(Json(ObserveResponse {
         session_id: req.session_id,
         prompt_id,

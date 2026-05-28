@@ -33,6 +33,7 @@ pub mod role;
 pub mod store;
 pub mod trajectory;
 pub mod transition;
+pub mod validate;
 
 #[cfg(test)]
 mod golden_tests {

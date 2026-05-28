@@ -92,6 +92,44 @@ pub async fn insert_run_trace(
     Ok(id)
 }
 
+/// Idempotent variant of [`insert_run_trace`] for the `csm-validate` cron: an
+/// atomic guarded insert that creates the row only if the task has no trace
+/// yet. Returns `Ok(None)` when a trace already exists, so concurrent cron
+/// ticks — or a cron tick racing a manual `csm_validate_run` — never produce a
+/// duplicate (the WHERE NOT EXISTS is evaluated atomically with the insert). The
+/// manual tool keeps the unconditional [`insert_run_trace`], which intentionally
+/// permits re-validation.
+pub async fn insert_run_trace_if_absent(
+    pool: &PgPool,
+    task_id: Uuid,
+    protocol_name: &str,
+    conformant: bool,
+    conformance_error: Option<&str>,
+    events: &[Event],
+    encoded: &[f64],
+    trajectory_id: Option<i64>,
+) -> Result<Option<i64>, sqlx::Error> {
+    let events_json = serde_json::to_value(events).unwrap_or_else(|_| Value::Array(Vec::new()));
+    let id: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO csm_run_traces
+            (task_id, protocol_name, conformant, conformance_error, events,
+             encoded_series, trajectory_id)
+         SELECT $1, $2, $3, $4, $5, $6, $7
+         WHERE NOT EXISTS (SELECT 1 FROM csm_run_traces WHERE task_id = $1)
+         RETURNING id",
+    )
+    .bind(task_id)
+    .bind(protocol_name)
+    .bind(conformant)
+    .bind(conformance_error)
+    .bind(events_json)
+    .bind(encoded)
+    .bind(trajectory_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id)
+}
+
 /// Load prior validated runs of a protocol as MSM cohorts:
 /// `(conformant_rows, non_conformant_rows)`, each `(run_trace_id, encoded_series)`,
 /// skipping empty series. Feeds `trajectory_index::classify_trend`.

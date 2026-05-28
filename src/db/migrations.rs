@@ -21,6 +21,7 @@ use sqlx::PgPool;
 
 mod schema_introspect;
 mod v10_fk_index_hardening;
+mod v11_nudge_emissions;
 mod v2_shadow_asr;
 mod v3_cross_language_signatures;
 mod v4_work_items;
@@ -2205,6 +2206,22 @@ pub async fn run_migrations(
         info!(
             version = v10_fk_index_hardening::FK_INDEX_HARDENING_V1,
             "fk_index_hardening_v1 migration applied"
+        );
+    }
+
+    // Step 11: nudge_emissions (JIT adoption-nudge log + rate-limit source).
+    // Registered before the unconditional ensure_* steps below.
+    if !version_applied(pool, v11_nudge_emissions::NUDGE_EMISSIONS_V1).await? {
+        v11_nudge_emissions::apply(pool).await?;
+        record_version(
+            pool,
+            v11_nudge_emissions::NUDGE_EMISSIONS_V1,
+            v11_nudge_emissions::NUDGE_EMISSIONS_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v11_nudge_emissions::NUDGE_EMISSIONS_V1,
+            "nudge_emissions_v1 migration applied"
         );
     }
 

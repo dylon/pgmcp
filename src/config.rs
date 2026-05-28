@@ -49,6 +49,9 @@ pub struct Config {
     /// fields default off/inert so a stock pgmcp install behaves as before.
     #[serde(default)]
     pub a2a: A2aConfig,
+    /// `[nudges]` — JIT adoption-nudge tuning (observe pipeline). Off by default.
+    #[serde(default)]
+    pub nudges: NudgesConfig,
     /// `[experiments]` — scientific-experiment subsystem defaults (acceptance
     /// α, statistical test, power target, ledger rendering, CPU-governor
     /// enforcement). All read per-call via the live `ArcSwap<Config>`.
@@ -187,6 +190,8 @@ pub struct A2aConfig {
     pub rlm: A2aRlmConfig,
     #[serde(default)]
     pub recursion: A2aRecursionConfig,
+    #[serde(default)]
+    pub csm_validate: A2aCsmValidateConfig,
 }
 
 /// `[a2a.recursion]` — Tier-2 Recursive-TextMAS defaults (ADR-009). Off by
@@ -264,6 +269,73 @@ impl Default for A2aReflectionConfig {
             write_to_file: false,
         }
     }
+}
+
+/// `[a2a.csm_validate]` — the CSM auto-conformance cron (ADR-009). Scans
+/// completed `a2a_pattern_*` runs with no `csm_run_traces` row yet and validates
+/// them, closing the learning loop without depending on an agent calling
+/// `csm_validate_run`. Off by default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct A2aCsmValidateConfig {
+    /// Whether the periodic `csm-validate` cron runs.
+    #[serde(default)]
+    pub cron_enabled: bool,
+    #[serde(default = "default_csm_validate_interval")]
+    pub cron_interval_secs: u64,
+    /// Max runs validated per cron tick (bounds the first-enable backlog).
+    #[serde(default = "default_csm_validate_batch")]
+    pub batch_limit: i64,
+}
+
+impl Default for A2aCsmValidateConfig {
+    fn default() -> Self {
+        Self {
+            cron_enabled: false,
+            cron_interval_secs: default_csm_validate_interval(),
+            batch_limit: default_csm_validate_batch(),
+        }
+    }
+}
+
+fn default_csm_validate_interval() -> u64 {
+    1800
+}
+fn default_csm_validate_batch() -> i64 {
+    200
+}
+
+/// `[nudges]` — JIT adoption-nudge tuning for the `/api/session/observe`
+/// pipeline (Claude-only — only clients running the observe hook reach it).
+/// Off by default so a stock install stays inert.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NudgesConfig {
+    /// Whether the prompt classifier appends a single tool-family nudge to
+    /// `additional_context`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Suppress re-nudging the same `(session, family)` within this many seconds.
+    #[serde(default = "default_nudge_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Lifetime cap on nudges of a given family per session.
+    #[serde(default = "default_nudge_max_per_session")]
+    pub max_per_session: u32,
+}
+
+impl Default for NudgesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ttl_secs: default_nudge_ttl_secs(),
+            max_per_session: default_nudge_max_per_session(),
+        }
+    }
+}
+
+fn default_nudge_ttl_secs() -> u64 {
+    180
+}
+fn default_nudge_max_per_session() -> u32 {
+    3
 }
 
 fn default_a2a_reflection_interval() -> u64 {
