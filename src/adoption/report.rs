@@ -29,6 +29,28 @@ pub struct ClientStat {
     pub families: Vec<FamilyStat>,
 }
 
+/// Nudge→adoption conversion for one (family, channel): of the nudges emitted,
+/// how many were followed by a same-client call into that family within the
+/// correlation window. Correlated by `client_name` + time-window — NOT by
+/// session: the observe-hook `session_id` and the MCP transport `mcp_session_id`
+/// are different id spaces, so a per-session join is not possible.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversionStat {
+    pub family: String,
+    pub channel: String,
+    pub nudges: i64,
+    pub converted: i64,
+    pub conversion_pct: f64,
+}
+
+/// CSM conformance health over the window (bonus signal from `csm_run_traces`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CsmConformance {
+    pub total: i64,
+    pub conformant: i64,
+    pub conformant_pct: f64,
+}
+
 /// The full adoption report over a time window.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AdoptionReport {
@@ -37,6 +59,10 @@ pub struct AdoptionReport {
     pub clients: Vec<ClientStat>,
     pub overall: Vec<FamilyStat>,
     pub overall_total_calls: i64,
+    /// Nudge→adoption conversion per (family, channel). Empty until nudges fire.
+    pub conversion: Vec<ConversionStat>,
+    /// CSM run conformance over the window.
+    pub csm_conformance: CsmConformance,
     pub note: String,
 }
 
@@ -65,6 +91,18 @@ impl AdoptionReport {
                 "total_sessions": c.total_sessions,
                 "families": c.families.iter().map(FamilyStat::to_json).collect::<Vec<_>>(),
             })).collect::<Vec<_>>(),
+            "conversion": self.conversion.iter().map(|c| json!({
+                "family": c.family,
+                "channel": c.channel,
+                "nudges": c.nudges,
+                "converted": c.converted,
+                "conversion_pct": round2(c.conversion_pct),
+            })).collect::<Vec<_>>(),
+            "csm_conformance": {
+                "total": self.csm_conformance.total,
+                "conformant": self.csm_conformance.conformant,
+                "conformant_pct": round2(self.csm_conformance.conformant_pct),
+            },
             "note": self.note,
         })
     }
@@ -88,6 +126,22 @@ impl AdoptionReport {
             ));
             push_family_table(&mut out, &client.families);
         }
+        if !self.conversion.is_empty() {
+            out.push_str("\n### Nudge → adoption conversion (client + 10-min window)\n\n");
+            out.push_str("| Family | Channel | Nudges | Converted | Rate |\n|---|---|--:|--:|--:|\n");
+            for c in &self.conversion {
+                out.push_str(&format!(
+                    "| {} | {} | {} | {} | {:.1}% |\n",
+                    c.family, c.channel, c.nudges, c.converted, c.conversion_pct
+                ));
+            }
+        }
+        out.push_str(&format!(
+            "\n### CSM conformance\n\n{} / {} runs conformant ({:.1}%)\n",
+            self.csm_conformance.conformant,
+            self.csm_conformance.total,
+            self.csm_conformance.conformant_pct
+        ));
         out.push_str(&format!("\n> {}\n", self.note));
         out
     }

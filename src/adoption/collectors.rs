@@ -2,7 +2,9 @@
 
 use sqlx::{PgPool, Row};
 
-use crate::adoption::report::{AdoptionReport, ClientStat, FamilyStat};
+use crate::adoption::report::{
+    AdoptionReport, ClientStat, ConversionStat, CsmConformance, FamilyStat,
+};
 
 /// Connecting clients whose calls count as real adoption. pgmcp's own CLI
 /// dispatch records `client_name = "cli"`, `extract_caller` falls back to
@@ -189,12 +191,22 @@ pub async fn collect(pool: &PgPool, window_minutes: i64) -> Result<AdoptionRepor
         })
         .collect();
 
+    // Conversion + CSM conformance are best-effort: on a DB where the v11
+    // nudge_emissions table hasn't been applied yet (pre-restart) the conversion
+    // query errors → empty, never failing the whole report.
+    let conversion = conversion(pool, window_minutes).await.unwrap_or_default();
+    let csm_conformance = csm_conformance(pool, window_minutes)
+        .await
+        .unwrap_or_default();
+
     Ok(AdoptionReport {
         window_minutes,
         allowlist,
         clients,
         overall,
         overall_total_calls,
+        conversion,
+        csm_conformance,
         note: NOTE.to_string(),
     })
 }
@@ -205,6 +217,86 @@ fn share_pct(part: i64, whole: i64) -> f64 {
     } else {
         (part as f64) * 100.0 / (whole as f64)
     }
+}
+
+/// Correlation window: a nudge "converts" if the same client calls a tool in
+/// the nudged family within this many minutes after the nudge.
+const CONVERSION_WINDOW_MINUTES: i64 = 10;
+
+/// Nudge→adoption conversion per (family, channel), correlated by `client_name`
+/// and a time-window — the only viable correlation, since the observe-hook
+/// `session_id` and the MCP transport `mcp_session_id` are different id spaces.
+/// Restricted to the real-client allowlist. The CASE maps each nudge family key
+/// to the tool predicate for the family it steers toward (collaboration→a2a,
+/// large_context→RLM, memory_*→memory, work_item→work-items).
+pub async fn conversion(
+    pool: &PgPool,
+    window_minutes: i64,
+) -> Result<Vec<ConversionStat>, sqlx::Error> {
+    let allowlist: Vec<String> = REAL_CLIENTS.iter().map(|s| s.to_string()).collect();
+    let rows = sqlx::query(
+        r"SELECT n.family, n.channel, COUNT(*) AS nudges,
+            COUNT(*) FILTER (WHERE EXISTS (
+              SELECT 1 FROM mcp_tool_calls c
+              WHERE c.client_name = n.client_name
+                AND c.ts > n.ts
+                AND c.ts <= n.ts + ($3::int * interval '1 minute')
+                AND (CASE n.family
+                      WHEN 'collaboration' THEN c.tool LIKE 'a2a\_%'
+                      WHEN 'large_context' THEN c.tool = 'a2a_pattern_recursive'
+                      WHEN 'memory_write'  THEN (c.tool LIKE 'memory\_%' OR c.tool IN ('recall_prompts','search_mandates','graph_neighbors'))
+                      WHEN 'memory_read'   THEN (c.tool LIKE 'memory\_%' OR c.tool IN ('recall_prompts','search_mandates','graph_neighbors'))
+                      WHEN 'work_item'     THEN (c.tool LIKE 'work\_item%' OR c.tool LIKE 'tag\_%')
+                      ELSE false END)
+            )) AS converted
+          FROM nudge_emissions n
+          WHERE n.ts > now() - ($1::int * interval '1 minute')
+            AND n.client_name = ANY($2::text[])
+          GROUP BY n.family, n.channel
+          ORDER BY n.family, n.channel",
+    )
+    .bind(window_minutes as i32)
+    .bind(&allowlist)
+    .bind(CONVERSION_WINDOW_MINUTES as i32)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let nudges: i64 = r.get("nudges");
+            let converted: i64 = r.get("converted");
+            ConversionStat {
+                family: r.get("family"),
+                channel: r.get("channel"),
+                nudges,
+                converted,
+                conversion_pct: share_pct(converted, nudges),
+            }
+        })
+        .collect())
+}
+
+/// CSM run conformance over the window (bonus signal from `csm_run_traces`).
+pub async fn csm_conformance(
+    pool: &PgPool,
+    window_minutes: i64,
+) -> Result<CsmConformance, sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS total, COUNT(*) FILTER (WHERE conformant) AS conformant
+         FROM csm_run_traces
+         WHERE created_at > now() - ($1::int * interval '1 minute')",
+    )
+    .bind(window_minutes as i32)
+    .fetch_one(pool)
+    .await?;
+    let total: i64 = row.get("total");
+    let conformant: i64 = row.get("conformant");
+    Ok(CsmConformance {
+        total,
+        conformant,
+        conformant_pct: share_pct(conformant, total),
+    })
 }
 
 #[cfg(test)]
@@ -255,5 +347,31 @@ mod tests {
             assert!(q.contains(&format!("{}_sessions", family.key())));
         }
         assert!(q.contains("client_name = ANY($2::text[])"));
+    }
+
+    /// The conversion CASE must handle every nudge family key the observe
+    /// pipeline can emit, so no nudged family silently falls into `ELSE false`.
+    #[test]
+    fn conversion_case_covers_all_classifier_families() {
+        use crate::sessions::{ToolFamily, tool_family_key};
+        let handled = [
+            "collaboration",
+            "large_context",
+            "memory_write",
+            "memory_read",
+            "work_item",
+        ];
+        for fam in [
+            ToolFamily::Collaboration,
+            ToolFamily::LargeContext,
+            ToolFamily::MemoryWrite,
+            ToolFamily::MemoryRead,
+            ToolFamily::WorkItem,
+        ] {
+            assert!(
+                handled.contains(&tool_family_key(fam)),
+                "family {fam:?} not handled in the conversion CASE"
+            );
+        }
     }
 }
