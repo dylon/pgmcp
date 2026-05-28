@@ -166,10 +166,51 @@ pub struct A2aConfig {
     /// `additional_context` (Part A read-before-act).
     #[serde(default)]
     pub inject_best_practices: bool,
+    /// When true, the linear collaboration patterns (sequential / mixture /
+    /// distillation) drive their peer calls from the CFSM/MPST protocol via the
+    /// `csm::driver::ProtocolDriver` (ADR-009 Phase 6) instead of the hardcoded
+    /// async order — conformant by construction. Default off: the hardcoded
+    /// path is unchanged.
+    #[serde(default)]
+    pub protocol_interpreter: bool,
     #[serde(default)]
     pub reflection: A2aReflectionConfig,
     #[serde(default)]
     pub rlm: A2aRlmConfig,
+    #[serde(default)]
+    pub recursion: A2aRecursionConfig,
+}
+
+/// `[a2a.recursion]` — Tier-2 Recursive-TextMAS defaults (ADR-009). Off by
+/// default (`default_rounds = 1` ⇒ single pass); per-call params override.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct A2aRecursionConfig {
+    #[serde(default = "default_a2a_recursion_rounds")]
+    pub default_rounds: u32,
+    #[serde(default = "default_a2a_recursion_carry")]
+    pub carry: String,
+    #[serde(default = "default_a2a_recursion_marker")]
+    pub converge_marker: String,
+}
+
+impl Default for A2aRecursionConfig {
+    fn default() -> Self {
+        Self {
+            default_rounds: default_a2a_recursion_rounds(),
+            carry: default_a2a_recursion_carry(),
+            converge_marker: default_a2a_recursion_marker(),
+        }
+    }
+}
+
+fn default_a2a_recursion_rounds() -> u32 {
+    1
+}
+fn default_a2a_recursion_carry() -> String {
+    "final_answer_only".to_string()
+}
+fn default_a2a_recursion_marker() -> String {
+    "CONVERGED".to_string()
 }
 
 /// `[a2a.reflection]` — cross-agent consensus reflection + promotion

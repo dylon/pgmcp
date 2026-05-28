@@ -110,6 +110,9 @@ pub async fn tool_a2a_pattern_sequential(
         final_text = solver_text;
     }
 
+    // Persist the structured transcript so the CSM observer (csm_validate_run)
+    // can lift this run and check it against its protocol (ADR-009). Best-effort.
+    let _ = crate::csm::store::record_transcript_values(pool, parent_task_id, &transcript).await;
     mark_parent_completed(pool, parent_task_id).await?;
 
     // Best-practice write-back (Part A): distill the Solver's final answer
@@ -143,7 +146,13 @@ pub async fn tool_a2a_pattern_sequential(
     })
     .await;
 
+    let protocol_report = crate::csm::driver::driver_report(
+        crate::csm::registry::ProtocolId::Sequential,
+        &transcript,
+        ctx.config().load().a2a.protocol_interpreter,
+    );
     json_result(&json!({
+        "protocol": protocol_report,
         "effect_breakdown": effect_breakdown,
         "pattern": "sequential",
         "parent_task_id": parent_task_id,

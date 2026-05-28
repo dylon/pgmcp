@@ -23,6 +23,7 @@ mod code_analysis;
 mod config;
 mod context;
 mod cron;
+mod csm;
 mod daemon;
 mod daemon_state;
 mod db;
@@ -46,6 +47,7 @@ mod parsing;
 mod patterns;
 mod reactive;
 mod reranker;
+mod rmas;
 mod sessions;
 mod shutdown;
 mod stats;
@@ -217,6 +219,96 @@ enum Commands {
         #[command(subcommand)]
         sub: cli::ledger::LedgerCmd,
     },
+    /// Train a RecursiveLink (R_in) from pre-extracted (hidden, gold) pairs
+    /// (JSONL) and write the safetensors. Wires the latent trainer (ADR-009 R2);
+    /// pairs are pre-extracted, so this runs without a backbone.
+    TrainLink {
+        /// JSONL file: one {"hidden":[..],"gold":[..]} object per line.
+        #[arg(long)]
+        pairs: PathBuf,
+        /// Backbone hidden size (R_in dimension; hidden & gold must match it).
+        #[arg(long)]
+        hidden_size: usize,
+        /// Output safetensors path for the trained link.
+        #[arg(long)]
+        output: PathBuf,
+        /// Training epochs (default 3).
+        #[arg(long, default_value = "3")]
+        epochs: usize,
+        /// AdamW learning rate (default 5e-4).
+        #[arg(long, default_value = "0.0005")]
+        learning_rate: f64,
+        /// RNG seed (default 0).
+        #[arg(long, default_value = "0")]
+        seed: u64,
+        /// Link architecture signature stamped into the safetensors.
+        #[arg(long, default_value = "rlv1-2layer-gelu-residual")]
+        signature: String,
+    },
+    /// Run a homogeneous RecursiveMAS latent loop on one resident Qwen3 backbone
+    /// (ADR-009 R3, Tier-3 v1). Intermediate roles stay latent; only the final
+    /// round's last role decodes to text. Hardware-gated: without CUDA / VRAM /
+    /// the backbone GGUF the loop is unavailable and the command reports the
+    /// degradation (exit 0), pointing at the Tier-2 text path.
+    RmasLoop {
+        /// Collaboration pattern: sequential | mixture | distillation | deliberation.
+        #[arg(long)]
+        pattern: String,
+        /// The query to run through the latent loop.
+        #[arg(long)]
+        query: String,
+        /// Backbone variant: 8b | 4b (default 8b).
+        #[arg(long, default_value = "8b")]
+        backbone: String,
+        /// Recursion rounds (A₁→…→Aₙ→A₁ repeated; default 2).
+        #[arg(long, default_value = "2")]
+        rounds: usize,
+        /// Specialist count for the mixture pattern (clamped 1..=8; default 3).
+        #[arg(long, default_value = "3")]
+        n_specialists: usize,
+        /// Directory of per-role link safetensors (`rin__<role>.safetensors`);
+        /// roles with no file get a residual-identity passthrough link.
+        #[arg(long)]
+        link_dir: PathBuf,
+        /// Max tokens the final round decodes (default 512).
+        #[arg(long, default_value = "512")]
+        max_new_tokens: usize,
+        /// Per-role backbones (CSV, e.g. "4b,8b,4b") to run the *heterogeneous*
+        /// engine — one entry per pattern role, cross-dim outer-link hops. Omit
+        /// for the homogeneous engine on a single `--backbone`.
+        #[arg(long)]
+        backbones: Option<String>,
+    },
+    /// Train an OuterLink (`R_out`) from pre-extracted (hidden_src, gold_tgt)
+    /// pairs (JSONL) and write the safetensors (ADR-009 R4). The cross-dim
+    /// analogue of `train-link`; pairs are pre-extracted, so it runs without a
+    /// backbone (the frozen Q4 backbones' through-autograd is blocked).
+    TrainOuterLink {
+        /// JSONL file: one {"hidden_src":[..],"gold_tgt":[..]} object per line.
+        #[arg(long)]
+        pairs: PathBuf,
+        /// Source backbone hidden size (`hidden_src` width).
+        #[arg(long)]
+        src_size: usize,
+        /// Target backbone hidden size (`gold_tgt` width).
+        #[arg(long)]
+        tgt_size: usize,
+        /// Output safetensors path for the trained outer link.
+        #[arg(long)]
+        output: PathBuf,
+        /// Training epochs (default 3).
+        #[arg(long, default_value = "3")]
+        epochs: usize,
+        /// AdamW learning rate (default 5e-4).
+        #[arg(long, default_value = "0.0005")]
+        learning_rate: f64,
+        /// RNG seed (default 0).
+        #[arg(long, default_value = "0")]
+        seed: u64,
+        /// Link architecture signature stamped into the safetensors.
+        #[arg(long, default_value = "rout-v1-3layer-gelu-residual")]
+        signature: String,
+    },
 }
 
 /// Cap the number of glibc malloc thread arenas BEFORE the tokio runtime
@@ -298,5 +390,69 @@ async fn async_main() -> anyhow::Result<()> {
             register_with,
         } => cli::a2a_adapter::run(kind, port, name, register_with).await,
         Commands::Status { model, json } => cli::status::run(cfg, model, json).await,
+        Commands::TrainLink {
+            pairs,
+            hidden_size,
+            output,
+            epochs,
+            learning_rate,
+            seed,
+            signature,
+        } => {
+            cli::train_link::run(
+                pairs,
+                hidden_size,
+                output,
+                epochs,
+                learning_rate,
+                seed,
+                signature,
+            )
+            .await
+        }
+        Commands::RmasLoop {
+            pattern,
+            query,
+            backbone,
+            rounds,
+            n_specialists,
+            link_dir,
+            max_new_tokens,
+            backbones,
+        } => {
+            cli::rmas_loop::run(
+                pattern,
+                query,
+                backbone,
+                rounds,
+                n_specialists,
+                link_dir,
+                max_new_tokens,
+                backbones,
+            )
+            .await
+        }
+        Commands::TrainOuterLink {
+            pairs,
+            src_size,
+            tgt_size,
+            output,
+            epochs,
+            learning_rate,
+            seed,
+            signature,
+        } => {
+            cli::train_outer_link::run(
+                pairs,
+                src_size,
+                tgt_size,
+                output,
+                epochs,
+                learning_rate,
+                seed,
+                signature,
+            )
+            .await
+        }
     }
 }

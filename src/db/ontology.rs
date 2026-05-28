@@ -144,6 +144,19 @@ pub const NODE_TYPES: &[NodeTypeMeta] = &[
         source_table: "agent_presence",
         has_embedding: false,
     },
+    // ADR-009 — CSM/MPST coordination protocols + their per-role projections.
+    NodeTypeMeta {
+        key: "protocol",
+        display: "CSM Protocol",
+        source_table: "csm_protocols",
+        has_embedding: false,
+    },
+    NodeTypeMeta {
+        key: "protocol_role",
+        display: "CSM Protocol Role (G ↾ r)",
+        source_table: "csm_projections",
+        has_embedding: false,
+    },
 ];
 
 /// CLOSED structural edge-type core: the edge_type *literals* emitted by
@@ -153,6 +166,12 @@ pub const EDGE_TYPES_CORE: &[EdgeTypeMeta] = &[
     EdgeTypeMeta {
         key: "belongs_to",
         display: "Belongs To (chunk→topic)",
+        directed: true,
+    },
+    // ADR-009 — protocol → its per-role projection.
+    EdgeTypeMeta {
+        key: "projects_to",
+        display: "Projects To (protocol→role)",
         directed: true,
     },
     EdgeTypeMeta {

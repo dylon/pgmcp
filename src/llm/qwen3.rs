@@ -32,7 +32,7 @@ use crate::llm::{ExtractionRequest, ExtractionResult, LlmExtractor, NewEntity};
 
 /// Which variant to load. The 4B model is the fallback for tighter
 /// VRAM configurations per `docs/memory-server/04-hardware.md`.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Qwen3Variant {
     Eight,
     Four,

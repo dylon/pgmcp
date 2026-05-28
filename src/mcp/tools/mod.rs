@@ -256,6 +256,12 @@ pub mod tool_a2a_register_agent;
 pub mod tool_a2a_report_outcome;
 pub mod tool_a2a_send_task;
 pub mod tool_a2a_subscribe_task;
+pub mod tool_csm_infer_peer_fsm;
+pub mod tool_csm_list_protocols;
+pub mod tool_csm_protocol_of_pattern;
+pub mod tool_csm_protocol_plan;
+pub mod tool_csm_show_projection;
+pub mod tool_csm_validate_run;
 pub mod tool_experiments;
 pub use tool_experiments::{
     tool_experiment_decide, tool_experiment_get, tool_experiment_list,

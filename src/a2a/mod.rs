@@ -25,6 +25,7 @@ pub mod best_practices;
 pub mod client;
 pub mod dispatcher;
 pub mod handlers;
+pub mod recursion;
 pub mod rlm;
 pub mod server;
 pub mod skills;

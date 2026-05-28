@@ -87,6 +87,13 @@ pub async fn tool_a2a_pattern_distillation(
     let learner_latency_ms = t_learner_start.elapsed().as_millis() as u64;
     let learner_text = task_to_text(&learner_task);
 
+    // CSM observer transcript (ADR-009): Expert then Learner. Best-effort.
+    let distill_transcript = vec![
+        serde_json::json!({"round": 0, "role": "Expert", "output": expert_text.clone()}),
+        serde_json::json!({"round": 0, "role": "Learner", "output": learner_text.clone()}),
+    ];
+    let _ = crate::csm::store::record_transcript_values(pool, parent_task_id, &distill_transcript)
+        .await;
     mark_parent_completed(pool, parent_task_id).await?;
 
     // Best-practice write-back (Part A): distill the Learner's distilled
@@ -120,7 +127,13 @@ pub async fn tool_a2a_pattern_distillation(
     })
     .await;
 
+    let protocol_report = crate::csm::driver::driver_report(
+        crate::csm::registry::ProtocolId::Distillation,
+        &distill_transcript,
+        ctx.config().load().a2a.protocol_interpreter,
+    );
     json_result(&json!({
+        "protocol": protocol_report,
         "effect_breakdown": effect_breakdown,
         "pattern": "distillation",
         "parent_task_id": parent_task_id,

@@ -2516,6 +2516,48 @@ pub struct A2aPatternDeliberationParams {
     pub max_rounds: Option<u32>,
 }
 
+// ── CSM / MPST coordination observer tools (ADR-009) ──────────────────────────
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CsmListProtocolsParams {}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CsmProtocolOfPatternParams {
+    #[schemars(
+        description = "Pattern name or a2a skill_id (\"deliberation\" or \"a2a_pattern_deliberation\")"
+    )]
+    pub pattern: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CsmShowProjectionParams {
+    #[schemars(description = "Pattern name or a2a skill_id")]
+    pub protocol: String,
+    #[schemars(
+        description = "Optional role to show (e.g. \"O\", \"R\", \"T\"); omit for all roles"
+    )]
+    pub role: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CsmValidateRunParams {
+    #[schemars(description = "The a2a_tasks UUID of a completed a2a_pattern_* run")]
+    pub task_id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CsmProtocolPlanParams {
+    #[schemars(description = "Pattern name or a2a skill_id")]
+    pub pattern: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CsmInferPeerFsmParams {
+    #[schemars(description = "Pattern name or a2a skill_id whose recorded runs to infer from")]
+    pub protocol: String,
+    #[schemars(description = "Minimum observed runs required to infer (default 1)")]
+    pub min_support: Option<u32>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct A2aReportOutcomeParams {
     #[schemars(
@@ -7033,6 +7075,132 @@ RecursiveMAS Table 1 Deliberation Style."
     }
 
     #[tool(
+        description = "List the CSM/MPST coordination protocols (the five RecursiveMAS patterns) \
+with participants and well-formedness. ADR-009."
+    )]
+    async fn csm_list_protocols(
+        &self,
+        Parameters(params): Parameters<CsmListProtocolsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "csm_list_protocols",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_csm_list_protocols::tool_csm_list_protocols(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Show one coordination pattern's global type (the MPST AST), participants, \
+and well-formedness. ADR-009."
+    )]
+    async fn csm_protocol_of_pattern(
+        &self,
+        Parameters(params): Parameters<CsmProtocolOfPatternParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "csm_protocol_of_pattern",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_csm_protocol_of_pattern::tool_csm_protocol_of_pattern(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Show the per-role local machines a coordination pattern projects to \
+(G ↾ role); a role that does not project surfaces its projection error. ADR-009."
+    )]
+    async fn csm_show_projection(
+        &self,
+        Parameters(params): Parameters<CsmShowProjectionParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "csm_show_projection",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_csm_show_projection::tool_csm_show_projection(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Validate a completed a2a_pattern_* run against its coordination protocol: \
+lift the recorded transcript into a trace, check conformance, and persist the verdict to \
+csm_run_traces. ADR-009."
+    )]
+    async fn csm_validate_run(
+        &self,
+        Parameters(params): Parameters<CsmValidateRunParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "csm_validate_run",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_csm_validate_run::tool_csm_validate_run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Show the protocol interpreter's prescribed orchestrator communication order \
+for a pattern (the ProtocolDriver plan). Linear patterns (sequential/mixture/distillation/recursive) \
+are drivable; Deliberation is not (runtime choice). ADR-009 Phase 6."
+    )]
+    async fn csm_protocol_plan(
+        &self,
+        Parameters(params): Parameters<CsmProtocolPlanParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "csm_protocol_plan",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_csm_protocol_plan::tool_csm_protocol_plan(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Infer a peer's behaviour FSM from a protocol's accumulated run traces \
+(passive prefix-tree automaton with observation counts) and diff it against the declared protocol — \
+novel symbols flag off-protocol behaviour. ADR-009 Phase 8."
+    )]
+    async fn csm_infer_peer_fsm(
+        &self,
+        Parameters(params): Parameters<CsmInferPeerFsmParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "csm_infer_peer_fsm",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_csm_infer_peer_fsm::tool_csm_infer_peer_fsm(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Report that an approach worked / failed for a kind of task. Records it to the \
 shared best-practice memory graph (agent_outcomes + a mirrored observation) so peer agents can learn \
 what works and what does not. Part A cross-agent best-practice exchange."
@@ -10729,6 +10897,13 @@ impl McpServer {
                     => a2a_pattern_distillation(A2aPatternDistillationParams),
                 "a2a_pattern_deliberation"
                     => a2a_pattern_deliberation(A2aPatternDeliberationParams),
+                // CSM / MPST coordination observer tools (ADR-009)
+                "csm_list_protocols"      => csm_list_protocols(CsmListProtocolsParams),
+                "csm_protocol_of_pattern" => csm_protocol_of_pattern(CsmProtocolOfPatternParams),
+                "csm_show_projection"     => csm_show_projection(CsmShowProjectionParams),
+                "csm_validate_run"        => csm_validate_run(CsmValidateRunParams),
+                "csm_protocol_plan"       => csm_protocol_plan(CsmProtocolPlanParams),
+                "csm_infer_peer_fsm"      => csm_infer_peer_fsm(CsmInferPeerFsmParams),
                 "a2a_report_outcome"     => a2a_report_outcome(A2aReportOutcomeParams),
                 // Scientific-experiment subsystem (share the tool_experiments module).
                 "experiment_open"               => experiment_open(ExperimentOpenParams) in tool_experiments,

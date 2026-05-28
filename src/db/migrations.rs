@@ -26,6 +26,7 @@ mod v4_work_items;
 mod v5_work_items_collab;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
+mod v8_csm_protocols;
 mod versioning;
 use schema_introspect::*;
 use versioning::*;
@@ -2150,6 +2151,24 @@ pub async fn run_migrations(
         );
     }
 
+    // ================================================================
+    // Step 8: CSM / MPST coordination tables (ADR-009).
+    // See src/db/migrations/v8_csm_protocols.rs.
+    // ================================================================
+    if !version_applied(pool, v8_csm_protocols::CSM_PROTOCOLS_V1).await? {
+        v8_csm_protocols::apply(pool).await?;
+        record_version(
+            pool,
+            v8_csm_protocols::CSM_PROTOCOLS_V1,
+            v8_csm_protocols::CSM_PROTOCOLS_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v8_csm_protocols::CSM_PROTOCOLS_V1,
+            "csm_protocols_v1 migration applied"
+        );
+    }
+
     // Build/refresh the work_items HNSW index (unconditional; the table exists
     // after the v4 step on fresh installs and already exists on upgrades).
     ensure_work_items_hnsw_index(pool, vector_config).await?;
@@ -2261,7 +2280,15 @@ pub(crate) const MEMORY_UNIFIED_NODES_SQL: &str = "CREATE MATERIALIZED VIEW memo
         UNION SELECT to_agent_id FROM work_item_claims WHERE to_agent_id IS NOT NULL
         UNION SELECT claimed_by FROM work_items WHERE claimed_by IS NOT NULL
       ) agents
-      WHERE aid IS NOT NULL AND aid <> ''";
+      WHERE aid IS NOT NULL AND aid <> ''
+    UNION ALL
+    SELECT 'protocol:' || id::TEXT, 'protocol',
+           name, NULL::VECTOR(1024), 0.6
+      FROM csm_protocols
+    UNION ALL
+    SELECT 'protocol_role:' || id::TEXT, 'protocol_role',
+           role, NULL::VECTOR(1024), 0.4
+      FROM csm_projections";
 
 /// Edges-view definition. Same single-source-of-truth posture as
 /// `MEMORY_UNIFIED_NODES_SQL` — F9's hash-gate covers both.
@@ -2507,7 +2534,14 @@ pub(crate) const MEMORY_UNIFIED_EDGES_SQL: &str = "CREATE MATERIALIZED VIEW memo
     SELECT from_node_id, from_type, to_node_id, to_type,
            'workflow_like', weight,
            computed_at, NULL::TIMESTAMPTZ
-      FROM trajectory_similarities WHERE edge_kind = 'workflow_like'";
+      FROM trajectory_similarities WHERE edge_kind = 'workflow_like'
+    UNION ALL
+    -- ADR-009: protocol → its per-role projection (the MPST G ↾ role)
+    SELECT 'protocol:' || protocol_id::TEXT, 'protocol',
+           'protocol_role:' || id::TEXT, 'protocol_role',
+           'projects_to', 1.0::DOUBLE PRECISION,
+           NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
+      FROM csm_projections";
 
 /// `pgmcp_metadata` key storing the xxh3 hash of the combined matview
 /// and edges-view CREATE SQL. F9 gate skips the rebuild when the stored

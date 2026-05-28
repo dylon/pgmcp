@@ -2,6 +2,8 @@
 /.fastembed_cache/
 **/.fastembed_cache/
 /.claude/
+*.cache
+*.log
 
 # Rocq compilation artifacts (P13.5). The proof source
 # (`docs/formal/rocq/*.v`) is committed; `coqc` outputs (`*.vo`,
