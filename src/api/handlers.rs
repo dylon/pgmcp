@@ -726,10 +726,14 @@ pub async fn session_observe(
             .unwrap_or(false);
         let nudge = crate::sessions::tool_suggestion_nudge(family, brief);
         let fits = additional_context.len() + nudge.len() + 1 < 2048;
-        let recently =
-            crate::sessions::recently_nudged(pool, &session_key, family_key, nudges_cfg.ttl_secs as i64)
-                .await
-                .unwrap_or(false);
+        let recently = crate::sessions::recently_nudged(
+            pool,
+            &session_key,
+            family_key,
+            nudges_cfg.ttl_secs as i64,
+        )
+        .await
+        .unwrap_or(false);
         let count = crate::sessions::session_nudge_count(pool, &session_key, family_key)
             .await
             .unwrap_or(i64::MAX);

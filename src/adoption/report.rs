@@ -128,7 +128,9 @@ impl AdoptionReport {
         }
         if !self.conversion.is_empty() {
             out.push_str("\n### Nudge → adoption conversion (client + 10-min window)\n\n");
-            out.push_str("| Family | Channel | Nudges | Converted | Rate |\n|---|---|--:|--:|--:|\n");
+            out.push_str(
+                "| Family | Channel | Nudges | Converted | Rate |\n|---|---|--:|--:|--:|\n",
+            );
             for c in &self.conversion {
                 out.push_str(&format!(
                     "| {} | {} | {} | {} | {:.1}% |\n",

@@ -11196,7 +11196,17 @@ impl McpServer {
                 "pattern_catalog_stats" => pattern_catalog_stats in tool_software_patterns,
             })
         };
-        instrumented_tool_run(self.stats(), name, None, caller, &params_summary, None, None, fut).await
+        instrumented_tool_run(
+            self.stats(),
+            name,
+            None,
+            caller,
+            &params_summary,
+            None,
+            None,
+            fut,
+        )
+        .await
     }
 }
 

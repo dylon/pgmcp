@@ -92,7 +92,10 @@ impl Family {
             families.push(Family::Csm);
         }
         if tool.starts_with("memory_")
-            || matches!(tool, "recall_prompts" | "search_mandates" | "graph_neighbors")
+            || matches!(
+                tool,
+                "recall_prompts" | "search_mandates" | "graph_neighbors"
+            )
         {
             families.push(Family::Memory);
         }
@@ -307,7 +310,10 @@ mod tests {
     /// family, so the SQL predicates (which mirror it) measure the right tools.
     #[test]
     fn classify_matches_live_tool_names() {
-        assert_eq!(Family::classify("a2a_pattern_sequential"), vec![Family::A2a]);
+        assert_eq!(
+            Family::classify("a2a_pattern_sequential"),
+            vec![Family::A2a]
+        );
         assert_eq!(Family::classify("a2a_send_task"), vec![Family::A2a]);
         // RLM is a strict subset of A2A.
         assert_eq!(
