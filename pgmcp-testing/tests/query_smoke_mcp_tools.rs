@@ -474,3 +474,36 @@ async fn tool_upsert_pattern_source_against_seeded_catalog() {
         .await
         .expect("upsert_pattern_source must not error");
 }
+
+// =============================================================================
+// adoption_report — the independent telemetry collector (src/adoption) over
+// mcp_tool_calls (+ nudge_emissions / csm_run_traces). Smoke-test that the
+// per-family aggregation, the nudge→adoption conversion CASE, and the CSM
+// conformance query all execute against a real schema (data may be empty).
+// =============================================================================
+#[tokio::test]
+async fn tool_adoption_report_executes_against_real_schema() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let server = server_with_pool(pool);
+
+    let result = server
+        .call_tool_cli("adoption_report", json!({ "format": "json" }))
+        .await
+        .expect("adoption_report must not error against the real schema");
+
+    let v: serde_json::Value =
+        serde_json::from_str(&text_of(&result)).expect("adoption_report body must be JSON");
+
+    // Envelope shape — required keys present (the data itself may be empty on a
+    // fresh DB; we are checking the SQL executes and the report assembles).
+    assert!(v["window_minutes"].is_number());
+    assert!(v["allowlist"].is_array(), "allowlist must be an array");
+    assert!(v["overall"].is_array(), "overall must be an array");
+    assert!(v["clients"].is_array(), "clients must be an array");
+    assert!(v["conversion"].is_array(), "conversion must be an array");
+    assert!(
+        v["csm_conformance"].is_object(),
+        "csm_conformance must be an object"
+    );
+}
