@@ -21,14 +21,13 @@ use rmcp::model::CallToolResult;
 use serde_json::json;
 
 use crate::context::SystemContext;
-use crate::mcp::client_profile::ClientProfileRegistry;
 use crate::mcp::server::PgmcpClientProfileParams;
 
 /// Resolve the on-disk profiles path. Defaults to `assets/client_profiles.toml`
 /// relative to the binary's working directory. Overridable via
 /// `PGMCP_CLIENT_PROFILES_PATH` for tests / production deployments
 /// that ship the asset elsewhere.
-fn profiles_path() -> PathBuf {
+pub(crate) fn profiles_path() -> PathBuf {
     if let Ok(p) = std::env::var("PGMCP_CLIENT_PROFILES_PATH") {
         return PathBuf::from(p);
     }
@@ -42,7 +41,9 @@ pub async fn tool_pgmcp_client_profile(
     tracing::debug!(tool = "pgmcp_client_profile", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
 
-    let registry = ClientProfileRegistry::load_or_builtin(&profiles_path());
+    // Use the registry cached on SystemContext (loaded once) rather than
+    // re-reading the TOML on every call.
+    let registry = ctx.client_profiles();
 
     if params.list_all.unwrap_or(false) {
         let profiles: Vec<&_> = registry.all();

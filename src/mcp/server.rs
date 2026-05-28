@@ -15,7 +15,7 @@ use rmcp::model::*;
 use rmcp::schemars;
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
-use rmcp::{tool, tool_handler, tool_router};
+use rmcp::{tool, tool_router};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -11298,7 +11298,11 @@ mod social_banner_tests {
     }
 }
 
-#[tool_handler]
+// NOTE: `#[tool_handler]` is intentionally NOT used here. We hand-write its three
+// generated methods so `list_tools` can apply per-client `description_overrides`:
+// `call_tool` and `get_tool` are copied verbatim from the macro expansion
+// (rmcp-macros-1.1.0/src/tool_handler.rs); `list_tools` is customized. Keep the
+// two verbatim methods in sync if rmcp 1.1.0 is upgraded.
 impl ServerHandler for McpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(
@@ -11412,6 +11416,43 @@ impl ServerHandler for McpServer {
         let base = info.instructions.take().unwrap_or_default();
         info.instructions = Some(compose_instructions(&base, &client_name));
         Ok(info)
+    }
+
+    // ── Tool dispatch (hand-written replacement for `#[tool_handler]`) ─────
+
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
+    }
+
+    async fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<ListToolsResult, McpError> {
+        let mut tools = self.tool_router.list_all();
+        // Per-client tool-description overrides (e.g. terser descriptions for
+        // codex). `peer_info()` is set by `initialize` before `tools/list`, so
+        // `extract_caller` yields the real client name here. Unknown clients fall
+        // through to the `generic` profile (no overrides).
+        let client = extract_caller(&context).client_name;
+        self.ctx()
+            .client_profiles()
+            .for_client(&client)
+            .apply_description_overrides(&mut tools);
+        Ok(ListToolsResult {
+            tools,
+            meta: None,
+            next_cursor: None,
+        })
+    }
+
+    fn get_tool(&self, name: &str) -> Option<Tool> {
+        self.tool_router.get(name).cloned()
     }
 
     // ── Lifecycle ────────────────────────────────────────────────────────

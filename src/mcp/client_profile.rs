@@ -105,6 +105,23 @@ impl Default for ClientProfile {
     }
 }
 
+impl ClientProfile {
+    /// Apply this profile's per-tool description overrides to `tools` in place.
+    /// No-op when the profile has no overrides (e.g. claude-code / generic).
+    /// Extracted from the hand-written `ServerHandler::list_tools` so the rewrite
+    /// is unit-testable without an rmcp peer.
+    pub fn apply_description_overrides(&self, tools: &mut [rmcp::model::Tool]) {
+        if self.description_overrides.is_empty() {
+            return;
+        }
+        for tool in tools.iter_mut() {
+            if let Some(ov) = self.description_overrides.get(tool.name.as_ref()) {
+                tool.description = Some(ov.clone().into());
+            }
+        }
+    }
+}
+
 /// Built-in fallback profiles. Always available; overridden by
 /// `assets/client_profiles.toml` when present.
 fn builtin_profiles() -> Vec<ClientProfile> {
@@ -286,5 +303,34 @@ mod tests {
         let p = reg.for_client("custom-client");
         assert_eq!(p.output_format, OutputFormat::CompactJson);
         assert!(p.default_brief);
+    }
+
+    #[test]
+    fn apply_description_overrides_rewrites_only_matching_tools() {
+        use std::sync::Arc;
+        let mut overrides = HashMap::new();
+        overrides.insert("grep".to_string(), "terse grep".to_string());
+        let codex = ClientProfile {
+            name: "codex-mcp-client".into(),
+            output_format: OutputFormat::CompactJson,
+            default_brief: true,
+            include_provenance: false,
+            description_overrides: overrides,
+        };
+        let schema: Arc<serde_json::Map<String, serde_json::Value>> =
+            Arc::new(serde_json::Map::new());
+        let mut tools = vec![
+            rmcp::model::Tool::new("grep", "original grep desc", schema.clone()),
+            rmcp::model::Tool::new("semantic_search", "original ss desc", schema.clone()),
+        ];
+        codex.apply_description_overrides(&mut tools);
+        assert_eq!(tools[0].description.as_deref(), Some("terse grep"));
+        // Non-overridden tools keep their base description.
+        assert_eq!(tools[1].description.as_deref(), Some("original ss desc"));
+
+        // A profile with no overrides (claude-code / generic) is a no-op.
+        let before = tools[0].description.clone();
+        ClientProfile::default().apply_description_overrides(&mut tools);
+        assert_eq!(tools[0].description, before);
     }
 }

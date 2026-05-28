@@ -33,6 +33,21 @@ output_format = "compact_json"
 default_brief = true
 include_provenance = false
 
+# Terse per-tool descriptions for codex (token-efficient tools/list). claude-code
+# keeps the full base descriptions (no overrides). Applied by the hand-written
+# ServerHandler::list_tools per-client override.
+[profiles.description_overrides]
+"a2a_pattern_sequential" = "Staged Planner→Critic→Solver (ordered; each critiques the last). Parallel instead? a2a_pattern_mixture."
+"a2a_pattern_mixture" = "N specialists in parallel → summarizer (breadth). Ordered instead? a2a_pattern_sequential."
+"a2a_pattern_deliberation" = "Reflector↔Tool-Caller loop to convergence (hard problems; higher latency)."
+"a2a_pattern_distillation" = "Expert→Learner; returns both for a compact rationale."
+"a2a_pattern_recursive" = "RLM: decompose a whole file/repo, recurse, stitch (beyond one context window)."
+"csm_validate_run" = "Validate a completed a2a_pattern_* run vs its protocol; feeds the learner."
+"memory_unified_search" = "Start here for recall: vector search over all memory node types."
+"memory_semantic_search" = "Memory observations, vector only (use memory_unified_search for the full graph)."
+"memory_hybrid_search" = "Memory observations, vector+keyword RRF."
+"adoption_report" = "Per-family tool-adoption call-share + nudge conversion, by client."
+
 [[profiles]]
 name = "generic"
 output_format = "markdown"

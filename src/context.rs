@@ -33,6 +33,7 @@ use crate::db::DbClient;
 use crate::embed::EmbedSource;
 use crate::fuzzy::phonetic::PgmcpPhonetics;
 use crate::llm::LlmExtractor;
+use crate::mcp::client_profile::ClientProfileRegistry;
 use crate::mcp::logging::LogBroadcaster;
 use crate::mcp::tasks::TaskStore;
 use crate::stats::tracker::StatsTracker;
@@ -87,6 +88,10 @@ pub struct SystemContext {
     /// per-project entry (no `project` param supplied, or the
     /// project's `.pgmcp.toml` has no `phonetics.rules_path`).
     default_phonetics: Arc<OnceLock<Arc<PgmcpPhonetics>>>,
+    /// Client-profile registry (per-client output format + tool-description
+    /// overrides), loaded once lazily on first access. Backs the per-client
+    /// `list_tools` description overrides and the `pgmcp_client_profile` tool.
+    client_profiles: Arc<OnceLock<Arc<ClientProfileRegistry>>>,
 }
 
 impl SystemContext {
@@ -116,6 +121,7 @@ impl SystemContext {
             reindex_lock: Arc::new(tokio::sync::Mutex::new(())),
             phonetics: Arc::new(DashMap::new()),
             default_phonetics: Arc::new(OnceLock::new()),
+            client_profiles: Arc::new(OnceLock::new()),
         }
     }
 
@@ -145,6 +151,7 @@ impl SystemContext {
             reindex_lock: Arc::new(tokio::sync::Mutex::new(())),
             phonetics: Arc::new(DashMap::new()),
             default_phonetics: Arc::new(OnceLock::new()),
+            client_profiles: Arc::new(OnceLock::new()),
         }
     }
 
@@ -187,6 +194,18 @@ impl SystemContext {
             self.default_phonetics
                 .get_or_init(|| Arc::new(PgmcpPhonetics::default_english())),
         )
+    }
+
+    /// The client-profile registry, loaded once lazily (built-ins layered with
+    /// `assets/client_profiles.toml`). Backs per-client `list_tools` description
+    /// overrides and the `pgmcp_client_profile` tool. Deref-coerces the cached
+    /// `&Arc<ClientProfileRegistry>` to `&ClientProfileRegistry`.
+    pub fn client_profiles(&self) -> &ClientProfileRegistry {
+        self.client_profiles.get_or_init(|| {
+            Arc::new(ClientProfileRegistry::load_or_builtin(
+                &crate::mcp::tools::tool_client_profile::profiles_path(),
+            ))
+        })
     }
 
     pub fn db(&self) -> &Arc<dyn DbClient> {
