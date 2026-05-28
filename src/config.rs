@@ -173,6 +173,14 @@ pub struct A2aConfig {
     /// path is unchanged.
     #[serde(default)]
     pub protocol_interpreter: bool,
+    /// When true, the daemon auto-spawns in-process claude + codex A2A leaf
+    /// adapters at startup (ports 3201 / 3202) and self-registers them, so the
+    /// peer registry is non-empty and `a2a_pattern_*` /
+    /// `a2a_find_agents_by_specialty` resolve out of the box. The leaf children
+    /// run with pgmcp's MCP disabled (see the adapter commands), so they cannot
+    /// re-enter the pattern tools. Default off (stock install stays inert).
+    #[serde(default)]
+    pub autostart_adapters: bool,
     #[serde(default)]
     pub reflection: A2aReflectionConfig,
     #[serde(default)]

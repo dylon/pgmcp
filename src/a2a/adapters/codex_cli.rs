@@ -10,9 +10,17 @@ pub struct CodexCliAdapter {
 }
 
 impl CodexCliAdapter {
+    /// The leaf runs with MCP servers DISABLED (`-c mcp_servers={}` — Codex's
+    /// verified config-override flag, clearing the `[mcp_servers]` table) so a
+    /// spawned `codex` leaf cannot reconnect to the daemon and re-enter the
+    /// `a2a_pattern_*` tools — structurally preventing unbounded cross-agent
+    /// recursion. Matches the adapter's "stateless leaf" contract.
     pub fn new() -> Self {
         Self {
-            inner: GenericSubprocessAdapter::new("codex", vec!["{{message}}".into()]),
+            inner: GenericSubprocessAdapter::new(
+                "codex",
+                vec!["-c".into(), "mcp_servers={}".into(), "{{message}}".into()],
+            ),
         }
     }
 

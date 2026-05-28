@@ -63,10 +63,16 @@ pub async fn tool_a2a_send_task(
     })
     .await;
 
+    let next_hint = format!(
+        "Track this task: a2a_subscribe_task(task_id='{}') for streaming updates, or \
+         a2a_get_task(task_id='{}') to poll.",
+        task.id, task.id
+    );
     json_result(&json!({
         "effect_breakdown": effect_breakdown,
         "target_agent": params.target_agent,
         "task_id": task.id,
+        "next": next_hint,
         "status": serde_json::to_value(&task.status).unwrap_or(json!({})),
         "artifacts": task.artifacts,
         "recursion_rounds": task.recursion_rounds,

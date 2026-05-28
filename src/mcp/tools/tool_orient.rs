@@ -42,6 +42,12 @@ pub async fn tool_orient(
 
     let project_name = params.project.as_str();
 
+    // Social-tool availability envelope (workspace-global). Rendered for both
+    // the found and not-found paths so the nudge to use the A2A / CSM / memory /
+    // work-item families reaches an agent even from an unindexed cwd. All counts
+    // are best-effort — a missing table or query error yields 0, never fails.
+    let social = social_envelope(pool).await;
+
     // Project metadata
     let project_meta: Option<crate::db::queries::ProjectInfo> = sqlx::query_as(
         "SELECT p.id, p.workspace_path, p.path, p.name,
@@ -62,6 +68,7 @@ pub async fn tool_orient(
             "found": false,
             "project_name": project_name,
             "hint": "Project not found in pgmcp index. Use list_projects to see indexed projects.",
+            "social": social.clone(),
         });
         return Ok(CallToolResult::success(vec![Content::text(
             body.to_string(),
@@ -212,6 +219,7 @@ pub async fn tool_orient(
             "member_count": t.member_count,
         })).collect::<Vec<_>>(),
         "mandates": crate::mandates::compact_sources(&mandates),
+        "social": social,
         "health": {
             "phase": phase_label,
             "graph_stale": graph_stale,
@@ -235,4 +243,70 @@ pub async fn tool_orient(
     Ok(CallToolResult::success(vec![Content::text(
         body.to_string(),
     )]))
+}
+
+/// Workspace-global availability of the under-adopted tool families, with a
+/// short `suggested_next` that adapts to whether peers/memory/work-items exist.
+/// Surfaced in `orient` (which both Claude Code and Codex call first) so these
+/// families get discovered through the one tool agents already reach for. Every
+/// count is best-effort: a query error yields 0 so `orient` never fails on it.
+async fn social_envelope(pool: &sqlx::PgPool) -> serde_json::Value {
+    async fn count(pool: &sqlx::PgPool, sql: &str) -> i64 {
+        let n: Result<i64, _> = sqlx::query_scalar(sql).fetch_one(pool).await;
+        n.unwrap_or(0)
+    }
+
+    let a2a_peers = count(pool, "SELECT COUNT(*)::int8 FROM a2a_agents").await;
+    let memory_entities = count(pool, "SELECT COUNT(*)::int8 FROM memory_entities").await;
+    let memory_observations = count(pool, "SELECT COUNT(*)::int8 FROM memory_observations").await;
+    let open_work_items = count(
+        pool,
+        "SELECT COUNT(*)::int8 FROM work_items \
+         WHERE status NOT IN ('verified', 'cancelled', 'deferred')",
+    )
+    .await;
+
+    let mut suggested_next: Vec<&str> = Vec::with_capacity(3);
+    if a2a_peers == 0 {
+        suggested_next.push(
+            "No A2A peers registered — run `pgmcp a2a-adapter --kind claude --register-with \
+             http://localhost:3100` (or enable [a2a] autostart_adapters) to unlock a2a_pattern_* \
+             multi-agent collaboration.",
+        );
+    } else {
+        suggested_next.push(
+            "A2A peers available — a2a_find_agents_by_specialty + a2a_pattern_* for second \
+             opinions / parallel specialists; csm_validate_run(task_id) after a pattern run.",
+        );
+    }
+    if memory_observations == 0 {
+        suggested_next.push(
+            "Memory empty — memory_create_entities / memory_add_observations to persist durable \
+             facts as you learn them.",
+        );
+    } else {
+        suggested_next.push(
+            "Memory populated — memory_unified_search to recall prior decisions before \
+             re-deriving them.",
+        );
+    }
+    if open_work_items > 0 {
+        suggested_next.push(
+            "Open work items exist — work_item_list / work_item_tree to review; \
+             work_item_claim_next to pick one up.",
+        );
+    } else {
+        suggested_next.push(
+            "No open work items — work_item_create / work_item_ingest_plan to track multi-step \
+             work spanning more than one session.",
+        );
+    }
+
+    json!({
+        "a2a_peers_registered": a2a_peers,
+        "memory_entities": memory_entities,
+        "memory_observations": memory_observations,
+        "open_work_items": open_work_items,
+        "suggested_next": suggested_next,
+    })
 }

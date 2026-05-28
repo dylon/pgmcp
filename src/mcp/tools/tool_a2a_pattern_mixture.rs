@@ -188,6 +188,7 @@ pub async fn tool_a2a_pattern_mixture(
         "effect_breakdown": effect_breakdown,
         "pattern": "mixture",
         "parent_task_id": parent_task_id,
+        "next": format!("Feed the conformance learner: csm_validate_run(task_id='{parent_task_id}')"),
         "specialists": transcript,
         "summarizer": {
             "agent": params.summarizer_agent,

@@ -133,6 +133,7 @@ pub async fn tool_a2a_pattern_recursive(
     json_result(&json!({
         "pattern": "recursive",
         "parent_task_id": parent_task_id,
+        "next": format!("Feed the conformance learner: csm_validate_run(task_id='{parent_task_id}')"),
         "trajectory_id": trajectory_id,
         "strategy": outcome.strategy,
         "chunks": outcome.chunks,

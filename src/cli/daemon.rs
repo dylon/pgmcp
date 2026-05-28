@@ -697,6 +697,35 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         if is_daemon {
             daemon::notify_ready();
         }
+
+        // `[a2a] autostart_adapters`: spawn in-process claude + codex A2A leaf
+        // adapters so the peer registry is non-empty out of the box (otherwise
+        // a2a_list_agents / a2a_pattern_* find nothing). They self-register with
+        // this daemon (bounded retry handles the serve-start race); their leaf
+        // children run with pgmcp's MCP disabled (see the adapter commands), so
+        // they cannot re-enter the pattern tools. Default off.
+        if config_snapshot.a2a.autostart_adapters {
+            let daemon_url = format!("http://127.0.0.1:{}", config_snapshot.mcp.port);
+            for (kind, adapter_port) in [("claude", 3201u16), ("codex", 3202u16)] {
+                let url = daemon_url.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::cli::a2a_adapter::run_embedded(
+                        kind.to_string(),
+                        adapter_port,
+                        None,
+                        Some(url),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            kind, port = adapter_port, error = %e,
+                            "autostart a2a-adapter exited"
+                        );
+                    }
+                });
+            }
+            info!("autostart_adapters: spawned claude (:3201) + codex (:3202) A2A leaf adapters");
+        }
         // Time-to-bind marker for the recovery-times harness. The listener is up
         // here; per-request serving-readiness (DB + ≥1 embedder worker) is gated
         // separately (`/health` 200, `/api/search` 503-until-ready), and the

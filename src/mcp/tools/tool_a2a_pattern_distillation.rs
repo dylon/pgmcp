@@ -137,6 +137,7 @@ pub async fn tool_a2a_pattern_distillation(
         "effect_breakdown": effect_breakdown,
         "pattern": "distillation",
         "parent_task_id": parent_task_id,
+        "next": format!("Feed the conformance learner: csm_validate_run(task_id='{parent_task_id}')"),
         "expert": {
             "agent": params.expert_agent,
             "task_id": expert_task.id,

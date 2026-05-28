@@ -104,6 +104,23 @@ pub(crate) fn extract_caller(ctx: &RequestContext<RoleServer>) -> CallerInfo {
     }
 }
 
+/// Extract the MCP session id from the streamable-HTTP transport. rmcp's
+/// tower layer injects the originating `http::request::Parts` into the
+/// request `extensions`; the `mcp-session-id` header lives there. Returns
+/// `None` for transports without a session (the stdio debug path) and for
+/// CLI dispatch (`call_tool_cli`), which has no `RequestContext` at all.
+/// Both target clients (Claude Code, Codex) connect over HTTP, so this is
+/// populated for real tool calls and lets adoption telemetry aggregate per
+/// session rather than only per client.
+pub(crate) fn extract_mcp_session_id(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    let parts = ctx.extensions.get::<axum::http::request::Parts>()?;
+    parts
+        .headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+}
+
 /// Time, identify, and record a tool invocation, then forward through
 /// `timeout_wrap` so the timeout behavior is preserved verbatim. Replaces
 /// the older `self.stats().record_tool_call(name)` + `timeout_wrap(...)`
@@ -132,6 +149,7 @@ where
 {
     let caller = extract_caller(ctx);
     let request_id = Some(format!("{:?}", ctx.id));
+    let mcp_session_id = extract_mcp_session_id(ctx);
     instrumented_tool_run(
         stats,
         name,
@@ -139,6 +157,7 @@ where
         caller,
         params_summary,
         request_id,
+        mcp_session_id,
         fut,
     )
     .await
@@ -156,6 +175,7 @@ pub(crate) async fn instrumented_tool_run<F>(
     caller: CallerInfo,
     params_summary: &str,
     request_id: Option<String>,
+    mcp_session_id: Option<String>,
     fut: F,
 ) -> Result<CallToolResult, McpError>
 where
@@ -224,7 +244,7 @@ where
         client_name: caller.client_name.clone(),
         client_version: Some(caller.client_version.clone()),
         protocol_version: Some(caller.protocol_version.clone()),
-        mcp_session_id: None,
+        mcp_session_id,
         project: None,
         cwd: None,
         duration_ms: (duration_ns / 1_000_000).min(i32::MAX as u64) as i32,
@@ -3677,6 +3697,16 @@ pub struct McpToolTelemetryParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AdoptionReportParams {
+    #[schemars(
+        description = "Lookback window in minutes (default 43200 = 30 days, max 44640 = 31 days)."
+    )]
+    pub since_minutes: Option<i32>,
+    #[schemars(description = "Output format: json (default) | markdown.")]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MandateContextParams {
     #[schemars(
         description = "Project name (as shown by list_projects). Takes precedence over cwd."
@@ -4844,9 +4874,10 @@ observations and incoming/outgoing relations. Drop-in compatible with \
     // ============================================================================
 
     #[tool(
-        description = "Memory-server: BGE-M3 vector search over memory_observations \
-(scope/tier filtered). The pgmcp extension to the official-compat `memory_search_nodes` — \
-embeds the query with the active embedder and ranks observations by cosine similarity."
+        description = "Memory-server: BGE-M3 vector search over memory_observations (scope/tier \
+filtered) — vector similarity ONLY. Use `memory_hybrid_search` to also match keywords, or \
+`memory_unified_search` to search entities/chunks/topics/mandates/commits too. The pgmcp extension \
+to the official-compat `memory_search_nodes`."
     )]
     async fn memory_semantic_search(
         &self,
@@ -4866,7 +4897,8 @@ embeds the query with the active embedder and ranks observations by cosine simil
 
     #[tool(
         description = "Memory-server: hybrid search over memory_observations — RRF fusion of \
-Postgres FTS and BGE-M3 vector cosine, optionally scope/tier filtered."
+Postgres FTS and BGE-M3 vector cosine (scope/tier filtered). Use WHEN both keywords and concepts \
+matter; for the broader heterogeneous graph use `memory_unified_search`."
     )]
     async fn memory_hybrid_search(
         &self,
@@ -5004,9 +5036,11 @@ Pass exactly one of file_id, chunk_id, topic_id."
     }
 
     #[tool(
-        description = "Memory-server Phase 6.3: vector retrieval over the heterogeneous \
-unified-nodes view (memory_entity / observation / chunk / topic / durable_mandate / \
-commit). Optionally filter to a subset of node_types."
+        description = "Use WHEN you need prior project knowledge before acting — START HERE for \
+memory retrieval: vector search over the heterogeneous unified-nodes view (memory_entity / \
+observation / chunk / topic / durable_mandate / commit; optionally filter node_types). Narrower \
+alternatives: `memory_semantic_search` (observations, vector only), `memory_hybrid_search` \
+(observations, vector + keyword)."
     )]
     async fn memory_unified_search(
         &self,
@@ -5358,6 +5392,7 @@ Default lookback is 60 minutes; pass `since_minutes` up to 44640 (31 days) to wi
         // so the central tracing events still fire while skipping `timeout_wrap`.
         let caller = extract_caller(&_ctx);
         let request_id = Some(format!("{:?}", _ctx.id));
+        let mcp_session_id = extract_mcp_session_id(&_ctx);
         instrumented_tool_run(
             self.stats(),
             "reindex",
@@ -5365,6 +5400,7 @@ Default lookback is 60 minutes; pass `since_minutes` up to 44640 (31 days) to wi
             caller,
             "",
             request_id,
+            mcp_session_id,
             super::tools::tool_reindex::tool_reindex(self.ctx()),
         )
         .await
@@ -7013,9 +7049,10 @@ Useful before invoking a collaboration pattern so you can pick the right peer fo
     }
 
     #[tool(
-        description = "Sequential collaboration pattern: Planner → Critic → Solver. \
-Threads three peer agents in order; each round's output conditions the next. \
-RecursiveMAS Table 1 Sequential Style."
+        description = "Use WHEN work has clear ordered stages and each stage should critique the \
+last: Planner → Critic → Solver, each peer's output conditioning the next. DO NOT USE for \
+independent parallel subtasks — use `a2a_pattern_mixture`. Returns the run with an inline protocol \
+verdict; feed the learner afterward with `csm_validate_run(task_id)`. (RecursiveMAS Table 1 Sequential.)"
     )]
     async fn a2a_pattern_sequential(
         &self,
@@ -7037,8 +7074,9 @@ RecursiveMAS Table 1 Sequential Style."
     }
 
     #[tool(
-        description = "Mixture collaboration pattern: fan out to N specialist peers in parallel + Summarizer aggregation. \
-RecursiveMAS Table 1 Mixture Style."
+        description = "Use WHEN you want breadth: fan the same question out to N specialist peers in \
+parallel, then a Summarizer aggregates their takes. DO NOT USE when each step depends on the \
+previous — use `a2a_pattern_sequential`. (RecursiveMAS Table 1 Mixture.)"
     )]
     async fn a2a_pattern_mixture(
         &self,
@@ -7057,8 +7095,10 @@ RecursiveMAS Table 1 Mixture Style."
     }
 
     #[tool(
-        description = "Distillation collaboration pattern: Expert → Learner pair with latency / compression comparison. \
-RecursiveMAS Table 1 Distillation Style."
+        description = "Use WHEN you have a thorough answer and want a compact, teachable rationale: \
+Expert → Learner, returning both for a latency/quality comparison (e.g. to write a durable note or \
+doc). DO NOT USE for multi-stage problem solving — use `a2a_pattern_sequential`. (RecursiveMAS \
+Table 1 Distillation.)"
     )]
     async fn a2a_pattern_distillation(
         &self,
@@ -7080,8 +7120,10 @@ RecursiveMAS Table 1 Distillation Style."
     }
 
     #[tool(
-        description = "Deliberation collaboration pattern: Reflector ↔ Tool-Caller iterative loop until convergence. \
-RecursiveMAS Table 1 Deliberation Style."
+        description = "Use WHEN a problem is hard and benefits from iterate-and-check loops: \
+Reflector proposes next sub-tasks, Tool-Caller executes/verifies, repeating until convergence. \
+Higher latency — reserve for genuinely hard problems; for breadth use `a2a_pattern_mixture`, for \
+ordered stages `a2a_pattern_sequential`. (RecursiveMAS Table 1 Deliberation.)"
     )]
     async fn a2a_pattern_deliberation(
         &self,
@@ -9988,6 +10030,31 @@ refresh_crons to force them)."
         .await
     }
 
+    #[tool(
+        description = "Adoption telemetry: how often each under-used tool family \
+(A2A, CSM coordination-conformance, memory, RLM, work-items) is actually called, by client and \
+(where available) by session, read straight from mcp_tool_calls. \
+USE WHEN you want to baseline or measure lift in adoption of the social/coordination/memory/\
+recursive/work-tracking tools. Restricted to real clients (claude-code, codex-mcp-client, \
+claude-cli); pgmcp's own CLI self-calls are excluded. Per-session rates only populate for calls \
+made after the mcp_session_id telemetry fix. format=json (default) | markdown."
+    )]
+    async fn adoption_report(
+        &self,
+        Parameters(params): Parameters<AdoptionReportParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "adoption_report",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_adoption_report::tool_adoption_report(self.ctx(), params),
+        )
+        .await
+    }
+
     // ========================================================================
     // Phase D2b — new shadow-ASR-native tools (6)
     // ========================================================================
@@ -11095,6 +11162,7 @@ impl McpServer {
                 "quality_report"         => quality_report(QualityReportParams),
                 // Telemetry
                 "mcp_tool_telemetry"     => mcp_tool_telemetry(McpToolTelemetryParams),
+                "adoption_report"        => adoption_report(AdoptionReportParams),
                 // Orientation / multi-axis tools previously omitted from the
                 // dispatch — added so `call_tool_cli` can drive every #[tool]
                 // method from harness tests. See `query_smoke_mcp_tools.rs`.
@@ -11128,7 +11196,105 @@ impl McpServer {
                 "pattern_catalog_stats" => pattern_catalog_stats in tool_software_patterns,
             })
         };
-        instrumented_tool_run(self.stats(), name, None, caller, &params_summary, None, fut).await
+        instrumented_tool_run(self.stats(), name, None, caller, &params_summary, None, None, fut).await
+    }
+}
+
+/// Full social-tool banner appended to the instructions catalog for claude-*
+/// clients (claude-code, claude-cli). Surfaces the under-adopted tool families
+/// with trigger-led "when to use" framing. See the adoption plan
+/// `how-can-the-agents-replicated-lighthouse.md`.
+const FULL_SOCIAL_BANNER: &str = "### Collaboration, memory, coordination & tracking (often under-used)\n\n\
+COLLABORATION (A2A): when a task benefits from a second opinion, parallel specialists, or an \
+adversarial check, delegate to peer agents — `a2a_pattern_sequential` (staged Planner→Critic→Solver), \
+`a2a_pattern_mixture` (breadth: N specialists→summary), `a2a_pattern_deliberation` (hard problems, \
+iterate to converge), `a2a_pattern_distillation` (compact teachable rationale). Discover peers with \
+`a2a_list_agents` / `a2a_find_agents_by_specialty` (peers must be registered — run `pgmcp a2a-adapter` \
+or enable `[a2a] autostart_adapters`); dispatch one-off work with `a2a_send_task` (+`a2a_subscribe_task`); \
+record what worked with `a2a_report_outcome`.\n\n\
+COORDINATION CONFORMANCE (CSM): after running an `a2a_pattern_*` tool, call `csm_validate_run(task_id)` \
+to check the run against its coordination protocol and feed the learner; inspect contracts with \
+`csm_list_protocols` / `csm_protocol_of_pattern` / `csm_show_projection`.\n\n\
+MEMORY: before re-deriving project facts, query `memory_unified_search` / `memory_semantic_search` / \
+`memory_hybrid_search`; persist durable facts (\"remember\", \"from now on\") with `memory_create_entities` \
++ `memory_add_observations`; trace relationships with `memory_neighbors` / `memory_path_search`; recall \
+prior prompts and decisions with `recall_prompts` / `search_mandates`.\n\n\
+LARGE-CONTEXT (RLM): when a question spans a whole file, module, or repo beyond one pass, use \
+`a2a_pattern_recursive` (decompose → recurse → stitch; `rlm_depth` / `rlm_budget` tunable).\n\n\
+WORK-ITEM TRACKER: track multi-step work — `work_item_create` (epic/story/task, parentable), \
+`work_item_ingest_plan` (turn a plan into a tracked tree), `work_item_list` / `work_item_tree`, \
+`work_item_set_status` (gated transitions), `work_item_record_progress`; for cross-agent work, \
+`work_item_claim` / `claim_next` / `handoff`. Prefer this over ad-hoc TODOs for anything spanning \
+more than one session.";
+
+/// Terse social-tool banner for codex* clients (token-efficient — codex runs
+/// with compact_json / default_brief).
+const TERSE_SOCIAL_BANNER: &str = "### Under-used tool families\n\n\
+Collaboration: `a2a_pattern_{sequential,mixture,deliberation,distillation}` + `a2a_send_task` / \
+`a2a_find_agents_by_specialty` (peers need `pgmcp a2a-adapter` running). After a pattern run: \
+`csm_validate_run(task_id)`. Memory: `memory_unified_search` to recall; `memory_create_entities` + \
+`memory_add_observations` to persist durable facts. Large context: `a2a_pattern_recursive`. \
+Multi-step work: `work_item_create` / `work_item_ingest_plan` / `work_item_claim` / `handoff`.";
+
+/// The per-client social banner appended to the base instructions by the
+/// `initialize` override. claude-* → full; codex* → terse; everything else
+/// (generic / unknown) → none (catalog only). Both target clients reach this
+/// via the MCP `initialize` handshake (the only per-client instruction surface
+/// that reaches Codex, which has no prompt hook).
+pub(crate) fn social_banner_for(client_name: &str) -> &'static str {
+    let n = client_name.to_lowercase();
+    if n.contains("claude") {
+        FULL_SOCIAL_BANNER
+    } else if n.contains("codex") {
+        TERSE_SOCIAL_BANNER
+    } else {
+        ""
+    }
+}
+
+/// Compose per-client instructions: the base catalog (from `get_info`) followed
+/// by the social banner, if any. Kept pure so the composition (catalog
+/// preservation + per-client variance) is unit-testable without an rmcp peer.
+pub(crate) fn compose_instructions(base: &str, client_name: &str) -> String {
+    let social = social_banner_for(client_name);
+    if social.is_empty() {
+        base.to_string()
+    } else {
+        format!("{base}\n\n{social}")
+    }
+}
+
+#[cfg(test)]
+mod social_banner_tests {
+    use super::{compose_instructions, social_banner_for};
+
+    #[test]
+    fn banner_is_per_client() {
+        assert!(social_banner_for("claude-code").contains("COLLABORATION (A2A)"));
+        assert!(social_banner_for("claude-cli").contains("COLLABORATION (A2A)"));
+        assert!(social_banner_for("Claude Code").contains("COLLABORATION (A2A)"));
+        assert!(social_banner_for("codex-mcp-client").contains("a2a_pattern_recursive"));
+        assert!(social_banner_for("codex").contains("a2a_pattern_recursive"));
+        assert!(social_banner_for("cursor").is_empty());
+        assert!(social_banner_for("generic").is_empty());
+        // The terse codex banner is shorter than the full claude banner.
+        assert!(social_banner_for("codex").len() < social_banner_for("claude-code").len());
+    }
+
+    #[test]
+    fn compose_preserves_catalog_and_varies_by_client() {
+        let base = "BASE-CATALOG-MARKER";
+        let claude = compose_instructions(base, "claude-code");
+        let codex = compose_instructions(base, "codex-mcp-client");
+        let generic = compose_instructions(base, "cursor");
+        // (b) the base catalog survives for every client.
+        assert!(claude.contains(base));
+        assert!(codex.contains(base));
+        assert!(generic.contains(base));
+        // (a) per-client variance; generic/unknown gets catalog only.
+        assert!(claude.contains("COLLABORATION (A2A)"));
+        assert!(claude.len() > codex.len());
+        assert_eq!(generic, base);
     }
 }
 
@@ -11222,6 +11388,30 @@ impl ServerHandler for McpServer {
              legacy usages of a modern reference file via kNN + age filter, recommends \
              merge_files / move_function).",
         )
+    }
+
+    /// Per-client `initialize`. Captures peer info first — mirroring the rmcp
+    /// `ServerHandler::initialize` default (`handler/server.rs`), which is
+    /// REQUIRED: without `set_peer_info`, `peer_info()` stays `None` and
+    /// `extract_caller` zeroes `client_name` in ALL telemetry. Then returns
+    /// instructions composed of the base catalog (from `get_info`) plus a
+    /// client-tailored social-tool banner (claude → full, codex → terse, else
+    /// catalog-only). This is the only per-client instruction surface that
+    /// reaches Codex (which has no prompt hook).
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<InitializeResult, McpError> {
+        // Read the name before `set_peer_info` consumes the request by value.
+        let client_name = request.client_info.name.clone();
+        if context.peer.peer_info().is_none() {
+            context.peer.set_peer_info(request);
+        }
+        let mut info = self.get_info();
+        let base = info.instructions.take().unwrap_or_default();
+        info.instructions = Some(compose_instructions(&base, &client_name));
+        Ok(info)
     }
 
     // ── Lifecycle ────────────────────────────────────────────────────────

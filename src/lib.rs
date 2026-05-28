@@ -22,6 +22,7 @@
 // No `extern crate blas_src;` — there is no stub-provider crate involved.
 
 pub mod a2a;
+pub mod adoption;
 pub mod api;
 pub mod cli;
 #[allow(dead_code)]

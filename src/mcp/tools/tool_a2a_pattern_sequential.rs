@@ -156,6 +156,7 @@ pub async fn tool_a2a_pattern_sequential(
         "effect_breakdown": effect_breakdown,
         "pattern": "sequential",
         "parent_task_id": parent_task_id,
+        "next": format!("Feed the conformance learner: csm_validate_run(task_id='{parent_task_id}')"),
         "rounds": rounds,
         "transcript": transcript,
         "final_answer": final_text,

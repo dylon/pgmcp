@@ -34,7 +34,8 @@ struct AdapterState {
     name: Arc<String>,
 }
 
-/// Entry point for the `a2a-adapter` subcommand.
+/// Entry point for the `a2a-adapter` subcommand (initializes CLI logging,
+/// then serves).
 pub async fn run(
     kind: String,
     port: u16,
@@ -42,7 +43,27 @@ pub async fn run(
     register_with: Option<String>,
 ) -> Result<()> {
     crate::logging::init_cli_with_config(None);
+    serve_adapter(kind, port, name, register_with).await
+}
 
+/// Embedded entry point for daemon autostart (`[a2a] autostart_adapters`).
+/// Identical to `run` but skips logging init — the daemon already initialized
+/// tracing. Meant to be `tokio::spawn`ed; serves until the process exits.
+pub async fn run_embedded(
+    kind: String,
+    port: u16,
+    name: Option<String>,
+    register_with: Option<String>,
+) -> Result<()> {
+    serve_adapter(kind, port, name, register_with).await
+}
+
+async fn serve_adapter(
+    kind: String,
+    port: u16,
+    name: Option<String>,
+    register_with: Option<String>,
+) -> Result<()> {
     let (inner, default_name, description) = match kind.as_str() {
         "claude" => (
             crate::a2a::adapters::ClaudeCodeAdapter::new().inner,
@@ -237,20 +258,27 @@ async fn self_register(daemon_url: &str, name: &str, port: u16, description: &st
         "specialty": ["reasoning", "planning"],
         "recommendedRole": "Solver",
     });
-    match reqwest::Client::new()
-        .post(&endpoint)
-        .json(&payload)
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => {
-            tracing::info!(agent = name, endpoint = %endpoint, "self-registered with daemon")
+    let client = reqwest::Client::new();
+    // Bounded retry: when autostarted in-process, the daemon's HTTP server may
+    // not be accepting yet at the instant we register. Best-effort and never
+    // fatal — the operator can always register manually via `a2a_register_agent`.
+    for attempt in 1..=5u32 {
+        match client.post(&endpoint).json(&payload).send().await {
+            Ok(r) if r.status().is_success() => {
+                tracing::info!(agent = name, endpoint = %endpoint, "self-registered with daemon");
+                return;
+            }
+            Ok(r) => tracing::warn!(
+                status = %r.status(), attempt, endpoint = %endpoint, "self-register non-success"
+            ),
+            Err(e) => tracing::warn!(
+                error = %e, attempt, endpoint = %endpoint, "self-register failed"
+            ),
         }
-        Ok(r) => {
-            tracing::warn!(status = %r.status(), endpoint = %endpoint, "self-register non-success (continuing)")
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, endpoint = %endpoint, "self-register failed (continuing)")
-        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
+    tracing::warn!(
+        agent = name, endpoint = %endpoint,
+        "self-register gave up after retries; register manually via a2a_register_agent"
+    );
 }

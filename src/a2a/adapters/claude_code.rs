@@ -10,10 +10,26 @@ pub struct ClaudeCodeAdapter {
 }
 
 impl ClaudeCodeAdapter {
-    /// Build with default args. Customize via `with_args` if needed.
+    /// Build with default args. The leaf runs with pgmcp's MCP server DISABLED
+    /// (`--strict-mcp-config --mcp-config '{"mcpServers":{}}'` — verified Claude
+    /// Code flags: "only use MCP servers from --mcp-config, ignoring all other
+    /// MCP configurations") so a spawned `claude -p` leaf cannot reconnect to
+    /// the daemon and re-enter the `a2a_pattern_*` tools. This structurally
+    /// prevents unbounded cross-agent recursion and matches the adapter's
+    /// "stateless leaf (string in → string out)" contract. Customize via
+    /// `with_args` if needed.
     pub fn new() -> Self {
         Self {
-            inner: GenericSubprocessAdapter::new("claude", vec!["-p".into(), "{{message}}".into()]),
+            inner: GenericSubprocessAdapter::new(
+                "claude",
+                vec![
+                    "-p".into(),
+                    "--strict-mcp-config".into(),
+                    "--mcp-config".into(),
+                    r#"{"mcpServers":{}}"#.into(),
+                    "{{message}}".into(),
+                ],
+            ),
         }
     }
 

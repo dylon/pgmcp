@@ -13,8 +13,22 @@ output_format = "markdown"
 default_brief = false
 include_provenance = true
 
+# Claude Code's CLI also connects as `claude-cli` (seen in telemetry).
+[[profiles]]
+name = "claude-cli"
+output_format = "markdown"
+default_brief = false
+include_provenance = true
+
+# Codex's MCP client identifies as `codex-mcp-client`; `codex` is an alias.
 [[profiles]]
 name = "codex"
+output_format = "compact_json"
+default_brief = true
+include_provenance = false
+
+[[profiles]]
+name = "codex-mcp-client"
 output_format = "compact_json"
 default_brief = true
 include_provenance = false

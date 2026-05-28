@@ -29,6 +29,7 @@ pub mod sota_helpers;
 pub mod sota_regex_scan;
 
 pub mod tool_adoption_lag;
+pub mod tool_adoption_report;
 pub mod tool_anomaly_detection;
 pub mod tool_architecture_dsm;
 pub mod tool_architecture_quality;

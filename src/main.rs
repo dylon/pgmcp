@@ -16,6 +16,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod a2a;
+mod adoption;
 mod api;
 mod cli;
 #[allow(dead_code)]

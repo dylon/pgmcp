@@ -116,8 +116,26 @@ fn builtin_profiles() -> Vec<ClientProfile> {
             include_provenance: true,
             description_overrides: HashMap::new(),
         },
+        // Claude Code's CLI also identifies as `claude-cli` (confirmed in
+        // mcp_tool_calls telemetry); same posture as claude-code.
+        ClientProfile {
+            name: "claude-cli".into(),
+            output_format: OutputFormat::Markdown,
+            default_brief: false,
+            include_provenance: true,
+            description_overrides: HashMap::new(),
+        },
+        // Codex's MCP client identifies as `codex-mcp-client` (confirmed in
+        // telemetry, v0.133.0); `codex` is kept as an alias for older builds.
         ClientProfile {
             name: "codex".into(),
+            output_format: OutputFormat::CompactJson,
+            default_brief: true,
+            include_provenance: false,
+            description_overrides: HashMap::new(),
+        },
+        ClientProfile {
+            name: "codex-mcp-client".into(),
             output_format: OutputFormat::CompactJson,
             default_brief: true,
             include_provenance: false,
