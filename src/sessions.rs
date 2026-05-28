@@ -933,61 +933,6 @@ pub async fn insert_nudge_emission(
     Ok(())
 }
 
-#[cfg(test)]
-mod tool_suggestion_tests {
-    use super::*;
-
-    #[test]
-    fn classifies_representative_prompts() {
-        assert_eq!(
-            classify_tool_suggestion("Can you get a second opinion on this design?"),
-            Some(ToolFamily::Collaboration)
-        );
-        assert_eq!(
-            classify_tool_suggestion("summarize the whole repo for me"),
-            Some(ToolFamily::LargeContext)
-        );
-        assert_eq!(
-            classify_tool_suggestion("Remember that we use BF16 for inference from now on"),
-            Some(ToolFamily::MemoryWrite)
-        );
-        assert_eq!(
-            classify_tool_suggestion("have we done this migration before?"),
-            Some(ToolFamily::MemoryRead)
-        );
-        assert_eq!(
-            classify_tool_suggestion("break this down into tasks and track it"),
-            Some(ToolFamily::WorkItem)
-        );
-    }
-
-    #[test]
-    fn no_false_positive_on_plain_prompts() {
-        assert_eq!(classify_tool_suggestion("fix the typo in line 42"), None);
-        assert_eq!(classify_tool_suggestion(""), None);
-        assert_eq!(
-            classify_tool_suggestion("run the tests and show me the output"),
-            None
-        );
-    }
-
-    #[test]
-    fn quoted_text_is_masked() {
-        // The cue sits inside a fenced code block → masked → no suggestion.
-        let p = "here is code:\n```\nremember that x = 1 from now on\n```\nplease format it";
-        assert_eq!(classify_tool_suggestion(p), None);
-    }
-
-    #[test]
-    fn nudge_text_is_per_client() {
-        let full = tool_suggestion_nudge(ToolFamily::Collaboration, false);
-        let brief = tool_suggestion_nudge(ToolFamily::Collaboration, true);
-        assert!(full.len() > brief.len());
-        assert!(full.contains("a2a_pattern_deliberation"));
-        assert!(brief.contains("a2a_"));
-    }
-}
-
 // ============================================================================
 // Markdown rendering
 // ============================================================================
@@ -1372,6 +1317,58 @@ mod tests {
 
     fn polarities(ms: &[ExtractedMandate]) -> Vec<MandatePolarity> {
         ms.iter().map(|m| m.polarity).collect()
+    }
+
+    // ── Tool-suggestion classifier ──────────────────────────────────────
+
+    #[test]
+    fn classifies_representative_prompts() {
+        assert_eq!(
+            classify_tool_suggestion("Can you get a second opinion on this design?"),
+            Some(ToolFamily::Collaboration)
+        );
+        assert_eq!(
+            classify_tool_suggestion("summarize the whole repo for me"),
+            Some(ToolFamily::LargeContext)
+        );
+        assert_eq!(
+            classify_tool_suggestion("Remember that we use BF16 for inference from now on"),
+            Some(ToolFamily::MemoryWrite)
+        );
+        assert_eq!(
+            classify_tool_suggestion("have we done this migration before?"),
+            Some(ToolFamily::MemoryRead)
+        );
+        assert_eq!(
+            classify_tool_suggestion("break this down into tasks and track it"),
+            Some(ToolFamily::WorkItem)
+        );
+    }
+
+    #[test]
+    fn no_false_positive_on_plain_prompts() {
+        assert_eq!(classify_tool_suggestion("fix the typo in line 42"), None);
+        assert_eq!(classify_tool_suggestion(""), None);
+        assert_eq!(
+            classify_tool_suggestion("run the tests and show me the output"),
+            None
+        );
+    }
+
+    #[test]
+    fn quoted_text_is_masked() {
+        // The cue sits inside a fenced code block → masked → no suggestion.
+        let p = "here is code:\n```\nremember that x = 1 from now on\n```\nplease format it";
+        assert_eq!(classify_tool_suggestion(p), None);
+    }
+
+    #[test]
+    fn nudge_text_is_per_client() {
+        let full = tool_suggestion_nudge(ToolFamily::Collaboration, false);
+        let brief = tool_suggestion_nudge(ToolFamily::Collaboration, true);
+        assert!(full.len() > brief.len());
+        assert!(full.contains("a2a_pattern_deliberation"));
+        assert!(brief.contains("a2a_"));
     }
 
     #[test]

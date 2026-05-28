@@ -11274,40 +11274,6 @@ pub(crate) fn compose_instructions(base: &str, client_name: &str) -> String {
     }
 }
 
-#[cfg(test)]
-mod social_banner_tests {
-    use super::{compose_instructions, social_banner_for};
-
-    #[test]
-    fn banner_is_per_client() {
-        assert!(social_banner_for("claude-code").contains("COLLABORATION (A2A)"));
-        assert!(social_banner_for("claude-cli").contains("COLLABORATION (A2A)"));
-        assert!(social_banner_for("Claude Code").contains("COLLABORATION (A2A)"));
-        assert!(social_banner_for("codex-mcp-client").contains("a2a_pattern_recursive"));
-        assert!(social_banner_for("codex").contains("a2a_pattern_recursive"));
-        assert!(social_banner_for("cursor").is_empty());
-        assert!(social_banner_for("generic").is_empty());
-        // The terse codex banner is shorter than the full claude banner.
-        assert!(social_banner_for("codex").len() < social_banner_for("claude-code").len());
-    }
-
-    #[test]
-    fn compose_preserves_catalog_and_varies_by_client() {
-        let base = "BASE-CATALOG-MARKER";
-        let claude = compose_instructions(base, "claude-code");
-        let codex = compose_instructions(base, "codex-mcp-client");
-        let generic = compose_instructions(base, "cursor");
-        // (b) the base catalog survives for every client.
-        assert!(claude.contains(base));
-        assert!(codex.contains(base));
-        assert!(generic.contains(base));
-        // (a) per-client variance; generic/unknown gets catalog only.
-        assert!(claude.contains("COLLABORATION (A2A)"));
-        assert!(claude.len() > codex.len());
-        assert_eq!(generic, base);
-    }
-}
-
 // NOTE: `#[tool_handler]` is intentionally NOT used here. We hand-write its three
 // generated methods so `list_tools` can apply per-client `description_overrides`:
 // `call_tool` and `get_tool` are copied verbatim from the macro expansion
@@ -11822,6 +11788,40 @@ impl ServerHandler for McpServer {
                 None,
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod social_banner_tests {
+    use super::{compose_instructions, social_banner_for};
+
+    #[test]
+    fn banner_is_per_client() {
+        assert!(social_banner_for("claude-code").contains("COLLABORATION (A2A)"));
+        assert!(social_banner_for("claude-cli").contains("COLLABORATION (A2A)"));
+        assert!(social_banner_for("Claude Code").contains("COLLABORATION (A2A)"));
+        assert!(social_banner_for("codex-mcp-client").contains("a2a_pattern_recursive"));
+        assert!(social_banner_for("codex").contains("a2a_pattern_recursive"));
+        assert!(social_banner_for("cursor").is_empty());
+        assert!(social_banner_for("generic").is_empty());
+        // The terse codex banner is shorter than the full claude banner.
+        assert!(social_banner_for("codex").len() < social_banner_for("claude-code").len());
+    }
+
+    #[test]
+    fn compose_preserves_catalog_and_varies_by_client() {
+        let base = "BASE-CATALOG-MARKER";
+        let claude = compose_instructions(base, "claude-code");
+        let codex = compose_instructions(base, "codex-mcp-client");
+        let generic = compose_instructions(base, "cursor");
+        // (b) the base catalog survives for every client.
+        assert!(claude.contains(base));
+        assert!(codex.contains(base));
+        assert!(generic.contains(base));
+        // (a) per-client variance; generic/unknown gets catalog only.
+        assert!(claude.contains("COLLABORATION (A2A)"));
+        assert!(claude.len() > codex.len());
+        assert_eq!(generic, base);
     }
 }
 
