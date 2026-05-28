@@ -266,6 +266,11 @@ criterion = { version = "0.7", features = ["async_tokio"] }
 name = "mcp_tool_latency"
 path = "benches/mcp_tool_latency.rs"
 harness = false
+
+[[bench]]
+name = "time_series_nearest"
+path = "benches/time_series_nearest.rs"
+harness = false
 # Note: `pgmcp-testing` is intentionally NOT a dev-dependency of this crate.
 # Cargo cannot resolve the cycle pgmcp ↔ pgmcp-testing without two separate
 # compilations of `pgmcp`. Cross-crate tests that exercise pgmcp's public API

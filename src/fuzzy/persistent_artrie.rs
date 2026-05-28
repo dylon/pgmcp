@@ -261,4 +261,42 @@ mod tests {
         let hits = idx.query("recieve", 2);
         assert!(hits.iter().any(|(t, _, _)| t == "receive"));
     }
+
+    #[test]
+    fn query_descends_after_reopen() {
+        // Mirrors the daemon: the `fuzzy-sync` cron writes + checkpoints the trie
+        // in one process, and a later tool process reopens it (mmap-attach, with
+        // children swizzled to disk) and queries. Before the libdictenstein
+        // swizzle-aware DictionaryNode fix, `FuzzyIndex::query` returned ZERO hits
+        // here even for an exact match — `len()`/`iter_strings()` were correct but
+        // the transducer could not descend past the resident root. This is the
+        // exact production failure observed via `fuzzy_symbol_search`.
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("reopen.artrie");
+        {
+            let (idx, _) = FuzzyIndex::<i64>::open_or_create(&path).expect("create");
+            idx.upsert("receive", 10).unwrap();
+            idx.upsert("decide", 20).unwrap();
+            idx.upsert("recipe", 30).unwrap();
+            idx.checkpoint().expect("checkpoint");
+        } // drop -> in-memory node boxes released; only the on-disk image remains
+
+        let (idx2, report) = FuzzyIndex::<i64>::open_or_create(&path).expect("reopen");
+        assert!(report.is_some(), "reopen should run recovery");
+        assert_eq!(idx2.len(), 3);
+
+        // Exact (distance 0) and fuzzy (one transposition) must both descend the
+        // reopened persistent trie; the value must survive through the faulted
+        // node (`MappedDictionaryNode::value`).
+        let exact = idx2.query("receive", 0);
+        assert!(
+            exact.iter().any(|(t, _, v)| t == "receive" && *v == 10),
+            "exact query lost after reopen: {exact:?}"
+        );
+        let fuzzy = idx2.query("recieve", 2);
+        assert!(
+            fuzzy.iter().any(|(t, _, _)| t == "receive"),
+            "fuzzy query lost after reopen: {fuzzy:?}"
+        );
+    }
 }

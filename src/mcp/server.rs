@@ -3590,6 +3590,34 @@ pub struct EngineeringScorecardParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct QualityReportParams {
+    #[schemars(description = "Project name (e.g. 'f1r3node-rust', 'pgmcp')")]
+    pub project: String,
+    #[schemars(
+        description = "Output format: markdown (default) | org | latex | html | text | json. 'json' emits the structured report (computed grades inlined) for automated tooling."
+    )]
+    pub format: Option<String>,
+    #[schemars(description = "Include the enumerated findings sections (default true)")]
+    pub include_findings: Option<bool>,
+    #[schemars(
+        description = "Minimum severity to display: low|medium|high|critical (default low)"
+    )]
+    pub min_severity: Option<String>,
+    #[schemars(description = "Include RecommendedFix blocks per finding (default true)")]
+    pub include_recommended_fixes: Option<bool>,
+    #[schemars(
+        description = "Return a JSON envelope {rendered, report} so callers get both the rendered text and the structured report (default false)"
+    )]
+    pub include_underlying_json: Option<bool>,
+    #[schemars(description = "Recent GPA history points in the trend strip (default 12, 0 = off)")]
+    pub trend_points: Option<usize>,
+    #[schemars(
+        description = "Cron job names to force-refresh before aggregating (e.g. [\"symbol-extraction\",\"call-graph\",\"function-metrics\"]); default none"
+    )]
+    pub refresh_crons: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadFileParams {
     #[schemars(description = "Absolute path of the file to read")]
     pub path: String,
@@ -9928,6 +9956,38 @@ Aggregates dependency analysis + architecture quality + design smells + test/doc
         .await
     }
 
+    #[tool(
+        description = "Graded, three-pillar (Engineering / Architecture / Security) quality report \
+that enumerates every issue pgmcp's analysis tools find for a project, rendered as GitHub Markdown \
+(default), Org-mode, LaTeX, HTML, plain text, or JSON. \
+USE WHEN: you want a single human-readable audit of a project's overall soundness, a graded \
+scorecard with enumerated findings, a shareable report (LaTeX/HTML), or machine-readable findings \
+(format=json) for tooling. \
+DO NOT USE WHEN: you only need one analysis — call that tool directly (e.g. secret_detection, \
+complexity_hotspots). \
+Aggregates ~44 finding collectors + both scorecards into pillar GPAs (A-F), a worst-files roll-up, \
+a per-pillar GPA trend, and an appendix of which tools ran. Best after the graph-analysis, \
+symbol-extraction, function-metrics, and topic-clustering crons have populated metrics (pass \
+refresh_crons to force them)."
+    )]
+    async fn quality_report(
+        &self,
+        Parameters(params): Parameters<QualityReportParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // Outer budget of 600s (NOT the scorecards' 30s): this tool fans out
+        // over ~44 collectors, each with its own inner per-tool timeout.
+        instrumented_tool_wrap(
+            self.stats(),
+            "quality_report",
+            600,
+            &_ctx,
+            &summarize_debug(&params),
+            super::tools::tool_quality_report::tool_quality_report(self.ctx(), params),
+        )
+        .await
+    }
+
     // ========================================================================
     // Phase D2b — new shadow-ASR-native tools (6)
     // ========================================================================
@@ -11032,6 +11092,7 @@ impl McpServer {
                 // Advanced
                 "code_summarize"         => code_summarize(CodeSummarizeParams),
                 "engineering_scorecard"  => engineering_scorecard(EngineeringScorecardParams),
+                "quality_report"         => quality_report(QualityReportParams),
                 // Telemetry
                 "mcp_tool_telemetry"     => mcp_tool_telemetry(McpToolTelemetryParams),
                 // Orientation / multi-axis tools previously omitted from the

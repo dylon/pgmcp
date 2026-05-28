@@ -166,6 +166,7 @@ fn dispatched_tool_names() -> Vec<&'static str> {
         "documented_tech_debt",
         "code_summarize",
         "engineering_scorecard",
+        "quality_report",
         "mcp_tool_telemetry",
         "internal_dry",
         // Recommendation
@@ -404,6 +405,7 @@ fn tag_and_specialty_for(id: &str) -> (Vec<String>, Vec<String>, Option<String>)
 
     // Quality / architecture review.
     if id == "engineering_scorecard"
+        || id == "quality_report"
         || id == "architecture_quality"
         || id == "architecture_violations"
         || id == "design_metrics"

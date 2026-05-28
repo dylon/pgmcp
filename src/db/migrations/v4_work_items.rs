@@ -540,26 +540,29 @@ async fn stamp_metadata(pool: &PgPool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
-/// Install a named CHECK constraint idempotently (DROP IF EXISTS + ADD), the
-/// `session_mandates` idiom (`src/db/migrations.rs`). Lets an evolvable
+/// Install a named CHECK constraint idempotently, letting an evolvable
 /// vocabulary be swapped on re-run without recreating the table.
+///
+/// Delegates to [`ensure_named_constraint`], which stamps the definition into
+/// the constraint's `COMMENT` and short-circuits to a single catalog read when
+/// it is unchanged — so the every-boot `install_work_items_checks` reconcile no
+/// longer pays an ACCESS-EXCLUSIVE `DROP`+`ADD` (and full-table CHECK
+/// re-validation) on each start. A genuine vocabulary change still re-stamps and
+/// re-installs. `predicate` is the inner CHECK expression (e.g.
+/// `"kind IN ('bug', …)"`); it is wrapped into a full `CHECK (…)` definition.
 async fn install_check(
     pool: &PgPool,
     table: &str,
     constraint: &str,
     predicate: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(&format!(
-        "ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint}"
-    ))
-    .execute(pool)
-    .await?;
-    sqlx::query(&format!(
-        "ALTER TABLE {table} ADD CONSTRAINT {constraint} CHECK ({predicate})"
-    ))
-    .execute(pool)
-    .await?;
-    Ok(())
+    super::schema_introspect::ensure_named_constraint(
+        pool,
+        table,
+        constraint,
+        &format!("CHECK ({predicate})"),
+    )
+    .await
 }
 
 #[cfg(test)]

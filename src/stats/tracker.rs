@@ -536,6 +536,7 @@ pub struct StatsTracker {
 
     // Scorecard counters
     pub scorecard_scans: AtomicU64,
+    pub quality_report_scans: AtomicU64,
 
     // DRY tier (Tier 2) counters — recommendation-shaped tools producing
     // typed `RecommendedFix` actions; see `src/mcp/tools/fix_actions.rs`.
@@ -908,6 +909,7 @@ impl StatsTracker {
             hybrid_searches: AtomicU64::new(0),
             summarize_scans: AtomicU64::new(0),
             scorecard_scans: AtomicU64::new(0),
+            quality_report_scans: AtomicU64::new(0),
             chunk_cluster_scans: AtomicU64::new(0),
             extraction_candidate_reports: AtomicU64::new(0),
             boilerplate_scans: AtomicU64::new(0),
@@ -1264,6 +1266,7 @@ impl StatsTracker {
             "hybrid_searches": self.hybrid_searches.load(Ordering::Acquire),
             "summarize_scans": self.summarize_scans.load(Ordering::Acquire),
             "scorecard_scans": self.scorecard_scans.load(Ordering::Acquire),
+            "quality_report_scans": self.quality_report_scans.load(Ordering::Acquire),
             "chunk_cluster_scans": self.chunk_cluster_scans.load(Ordering::Acquire),
             "extraction_candidate_reports": self.extraction_candidate_reports.load(Ordering::Acquire),
             "boilerplate_scans": self.boilerplate_scans.load(Ordering::Acquire),

@@ -20,6 +20,7 @@
 use sqlx::PgPool;
 
 mod schema_introspect;
+mod v10_fk_index_hardening;
 mod v2_shadow_asr;
 mod v3_cross_language_signatures;
 mod v4_work_items;
@@ -27,6 +28,7 @@ mod v5_work_items_collab;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
 mod v8_csm_protocols;
+mod v9_quality_report_history;
 mod versioning;
 use schema_introspect::*;
 use versioning::*;
@@ -2169,6 +2171,43 @@ pub async fn run_migrations(
         );
     }
 
+    // ================================================================
+    // Step 9: quality_report GPA history (trend strip).
+    // See src/db/migrations/v9_quality_report_history.rs.
+    // ================================================================
+    if !version_applied(pool, v9_quality_report_history::QUALITY_REPORT_HISTORY_V1).await? {
+        v9_quality_report_history::apply(pool).await?;
+        record_version(
+            pool,
+            v9_quality_report_history::QUALITY_REPORT_HISTORY_V1,
+            v9_quality_report_history::QUALITY_REPORT_HISTORY_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v9_quality_report_history::QUALITY_REPORT_HISTORY_V1,
+            "quality_report_history_v1 migration applied"
+        );
+    }
+
+    // ================================================================
+    // Step 10: FK child-column index hardening + memory_observations
+    // source FK ON DELETE SET NULL. See src/db/migrations/v10_fk_index_hardening.rs.
+    // All base tables it touches exist by now (created in the version-1 body).
+    // ================================================================
+    if !version_applied(pool, v10_fk_index_hardening::FK_INDEX_HARDENING_V1).await? {
+        v10_fk_index_hardening::apply(pool).await?;
+        record_version(
+            pool,
+            v10_fk_index_hardening::FK_INDEX_HARDENING_V1,
+            v10_fk_index_hardening::FK_INDEX_HARDENING_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v10_fk_index_hardening::FK_INDEX_HARDENING_V1,
+            "fk_index_hardening_v1 migration applied"
+        );
+    }
+
     // Build/refresh the work_items HNSW index (unconditional; the table exists
     // after the v4 step on fresh installs and already exists on upgrades).
     ensure_work_items_hnsw_index(pool, vector_config).await?;
@@ -2293,6 +2332,24 @@ pub(crate) const MEMORY_UNIFIED_NODES_SQL: &str = "CREATE MATERIALIZED VIEW memo
 /// Edges-view definition. Same single-source-of-truth posture as
 /// `MEMORY_UNIFIED_NODES_SQL` — F9's hash-gate covers both.
 pub(crate) const MEMORY_UNIFIED_EDGES_SQL: &str = "CREATE MATERIALIZED VIEW memory_unified_edges AS
+    -- Outer GROUP BY collapses parallel edges of the SAME type between the SAME
+    -- pair into one row, so (from_id, to_id, edge_type) is UNIQUE — the unique
+    -- index that REFRESH ... CONCURRENTLY requires. Several inner arms emit
+    -- duplicate triples (code_graph_edges 'call' edges differing only by
+    -- target_raw; work_item_claims handoff/claim rows differing only by
+    -- created_at; the *_code_anchor arms; multiple active memory_relations), so
+    -- a per-arm DISTINCT is insufficient. from_type/to_type are functionally
+    -- determined by the *_id prefix (every arm builds '<type>:<pk>' and emits the
+    -- matching literal type; trajectory_similarities stores both consistently),
+    -- so grouping by them never splits a (from_id,to_id,edge_type) key into two
+    -- rows — the unique index is safe. weight = MAX (bounded representative;
+    -- also avoids PPR double-counting parallel edges); validity = earliest
+    -- valid_from and an open (NULL) valid_to if ANY contributing edge is open.
+    SELECT from_id, from_type, to_id, to_type, edge_type,
+           MAX(weight) AS weight,
+           MIN(valid_from) AS valid_from,
+           CASE WHEN bool_or(valid_to IS NULL) THEN NULL ELSE MAX(valid_to) END AS valid_to
+      FROM (
     -- memory entity ↔ entity (typed relations). Columns 7/8 = temporal validity
     -- interval (Stage 5a): bitemporal cols where available, created/computed
     -- timestamps elsewhere, NULL for timeless structural edges.
@@ -2541,7 +2598,9 @@ pub(crate) const MEMORY_UNIFIED_EDGES_SQL: &str = "CREATE MATERIALIZED VIEW memo
            'protocol_role:' || id::TEXT, 'protocol_role',
            'projects_to', 1.0::DOUBLE PRECISION,
            NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
-      FROM csm_projections";
+      FROM csm_projections
+      ) e
+     GROUP BY from_id, from_type, to_id, to_type, edge_type";
 
 /// `pgmcp_metadata` key storing the xxh3 hash of the combined matview
 /// and edges-view CREATE SQL. F9 gate skips the rebuild when the stored
@@ -2637,6 +2696,15 @@ async fn ensure_memory_unified_views(
         .await?;
 
     sqlx::query(MEMORY_UNIFIED_NODES_SQL).execute(pool).await?;
+    // Unique index on the synthetic node_id ('<type>:<pk>', globally unique
+    // across arms). REQUIRED for REFRESH MATERIALIZED VIEW CONCURRENTLY
+    // (see refresh_memory_unified_nodes), and a useful point-lookup besides.
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_unified_nodes_uq
+            ON memory_unified_nodes (node_id)",
+    )
+    .execute(pool)
+    .await?;
     // Lookup index by (node_type, node_id-suffix prefix) for the
     // neighbors / search paths. Cheap b-tree; the HNSW would be on
     // `embedding` but a matview supports HNSW only if pgvector is
@@ -2661,6 +2729,17 @@ async fn ensure_memory_unified_views(
     .await?;
 
     sqlx::query(MEMORY_UNIFIED_EDGES_SQL).execute(pool).await?;
+    // Unique index on the edge key. REQUIRED for REFRESH MATERIALIZED VIEW
+    // CONCURRENTLY (see refresh_memory_unified_edges); the outer GROUP BY in
+    // MEMORY_UNIFIED_EDGES_SQL guarantees (from_id, to_id, edge_type) is unique.
+    // If a future edit reintroduces a duplicate triple, THIS build fails loudly
+    // at boot — before any concurrent refresh can hit the duplicate.
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_unified_edges_uq
+            ON memory_unified_edges (from_id, to_id, edge_type)",
+    )
+    .execute(pool)
+    .await?;
     // Edge-traversal indexes: the recursive-CTE walks
     // (`memory_neighbors`/`memory_path_search`) filter on
     // `from_id = current OR to_id = current`, so both endpoints need an index.

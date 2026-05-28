@@ -2781,11 +2781,17 @@ pub async fn memory_unified_search(
     Ok(rows)
 }
 
-/// Phase 6.3: refresh the materialized view. Cheap relative to topic
-/// clustering — a UNION ALL over indexed tables. Called from
-/// `similarity-scan` cadence or on-demand by the operator.
+/// Phase 6.3: refresh the materialized view. A UNION ALL over indexed tables.
+/// Called from the `similarity-scan` / `memory-graph-refresh` crons or on-demand.
+///
+/// `CONCURRENTLY` so graph-RAG reads (neighbors / PPR / RAPTOR) are NOT blocked
+/// by an `ACCESS EXCLUSIVE` lock during the refresh — it relies on the unique
+/// index `idx_memory_unified_nodes_uq (node_id)` built in `ensure_memory_unified_views`.
+/// Must NOT be wrapped in a transaction (CONCURRENTLY is illegal in one); the
+/// matview is populated at boot via `CREATE … WITH DATA`, so the first cron
+/// refresh already has data to diff against.
 pub async fn refresh_memory_unified_nodes(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query("REFRESH MATERIALIZED VIEW memory_unified_nodes")
+    sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY memory_unified_nodes")
         .execute(pool)
         .await?;
     Ok(())
@@ -2795,8 +2801,13 @@ pub async fn refresh_memory_unified_nodes(pool: &PgPool) -> Result<(), sqlx::Err
 /// [`refresh_memory_unified_nodes`], a UNION ALL over indexed tables — promoted
 /// to MATERIALIZED so the traversal CTEs can use `(from_id)`/`(to_id)` indexes.
 /// Called from the `memory-graph-refresh` cron (Stage 3) or on-demand.
+///
+/// `CONCURRENTLY` (non-blocking) via the unique index
+/// `idx_memory_unified_edges_uq (from_id, to_id, edge_type)`; the outer GROUP BY
+/// in `MEMORY_UNIFIED_EDGES_SQL` guarantees that key is unique. Same no-transaction
+/// / populated-at-boot constraints as the nodes refresh above.
 pub async fn refresh_memory_unified_edges(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query("REFRESH MATERIALIZED VIEW memory_unified_edges")
+    sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY memory_unified_edges")
         .execute(pool)
         .await?;
     Ok(())
