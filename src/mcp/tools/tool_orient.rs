@@ -164,8 +164,16 @@ pub async fn tool_orient(
     // entry_points + non-zero file_count suggests graph-analysis has
     // not yet run.
     let phase_label = ctx.lifecycle().current().label();
-    let graph_stale = entry_points.is_empty() && project.file_count.unwrap_or(0) > 0;
-    let topics_stale = topics.is_empty();
+    // Real staleness: signature + corpus-freshness comparison, not a mere
+    // "is the result set empty?" check. The old emptiness test reported ancient,
+    // degenerate topics (computed by pre-stopword code) as "current"; the
+    // signature leg of `topics_global_stale` now flags exactly that case.
+    let graph_stale = crate::db::queries::graph_stale(pool, project.id).await;
+    let topics_stale = crate::db::queries::topics_global_stale(
+        pool,
+        crate::cron::topic_clustering::TOPICS_ALGO_SIGNATURE,
+    )
+    .await;
     let config = ctx.config().load();
     let mandates = crate::mandates::resolve_effective_mandates(&config, Some(&project));
 

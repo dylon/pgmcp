@@ -207,6 +207,25 @@ impl DbClient for PgPool {
         queries::text_search(self, query, limit, language, dedupe_worktrees).await
     }
 
+    async fn text_search_bounded(
+        &self,
+        query: &str,
+        limit: i32,
+        language: Option<&str>,
+        dedupe_worktrees: bool,
+        statement_timeout_ms: u32,
+    ) -> Result<Vec<TextSearchResult>, sqlx::Error> {
+        queries::text_search_bounded(
+            self,
+            query,
+            limit,
+            language,
+            dedupe_worktrees,
+            statement_timeout_ms,
+        )
+        .await
+    }
+
     async fn grep_search(
         &self,
         pattern: &str,

@@ -16,8 +16,8 @@ a lifecycle. The only write paths (`memory_*`, `session_mandates`) model *facts*
 and *directives*, not *work*.
 
 This ADR records the design of a tracker that lets users and agents record
-tasks/todos/fixmes/ideas/brainstorms/notes/questions/action-items/goals/epics/
-plans/sub-tasks/nice-to-haves/experiments (14 kinds) in an **arbitrary-depth
+tasks/todos/fixmes/bugs/ideas/brainstorms/notes/questions/action-items/goals/
+epics/plans/sub-tasks/nice-to-haves/experiments (15 kinds) in an **arbitrary-depth
 tree**, validate
 plans against reusable definitions, gate "done → verified" on machine-checkable
 evidence an agent **cannot fabricate**, auto-ingest agent plans into the tree,
@@ -29,8 +29,10 @@ activity feed.
 An agent's word is not trusted. This is enforced *structurally*, not by
 convention, in `src/tracker/transition.rs`:
 
-- Status lifecycle (10 states): `pending → ready → in_progress → claimed_done →
-  verifying → verified`, plus `blocked`, `rejected`, `deferred`, `cancelled`.
+- Status lifecycle (12 states): `pending → ready → in_progress → claimed_done →
+  verifying → verified`, plus `blocked`, `rejected`, `deferred`, `cancelled`, and
+  the bug-triage states `triage → confirmed` (a reported bug awaits a user-token
+  confirmation before it is actionable; see "Bug tracking" below).
 - `claimed_done` is the agent's self-report and is **explicitly not trusted**;
   `verified` is the only "done" the roll-up counts.
 - `check_transition(from, to, actor, ctx)` is the single chokepoint, called by
@@ -44,6 +46,10 @@ convention, in `src/tracker/transition.rs`:
      agent cannot self-defer.
   3. **`→rejected` is `Gatekeeper`-only** (failing evidence) — an agent cannot
      mark its own work rejected to dodge re-verification.
+  4. **`→confirmed` (bug triage) is `User`-only** — an agent may *report* a bug
+     (`→triage`) and propose a severity, but confirming it real is a human
+     judgment (token-gated `work_item_triage`, the same authority mechanism as
+     `defer`); there is no `Agent` arm into `confirmed`.
 
 Actors: `User | Agent | Gatekeeper | System`. The `Gatekeeper`/`System` arms are
 reachable only server-side (CI/Stop-hook/auditor/experiment engine via the
@@ -75,6 +81,15 @@ Two versioned migrations + one guarded late bridge:
 - **`ensure_work_item_experiment_bridge`** — late inline `ensure_*` (after
   `ensure_experiment_tables`), guarded by a `to_regclass` preflight so a partial
   install of either subsystem can't break migrations.
+- **`v12_bug_tracker`** (`BUG_TRACKER_V1 = 12`) — first-class bug tracking: a
+  nullable `severity` column on the `work_items` spine and a 1:1
+  `work_item_bug_details` sidecar (reproduction / expected-vs-actual /
+  environment / affected & fixed version / root cause / regression flag / triage
+  attribution / resolution). The severity CHECK is reconciled into
+  `install_work_items_checks` (column-guarded, since the every-boot reconcile
+  runs before this migration on a fresh install) so a future severity-vocabulary
+  edit propagates like kind/status; the `idx_work_items_active` partial index is
+  dropped + recreated widened to include `triage`/`confirmed`.
 
 Closed dimensions are `TEXT` + `CHECK` + a closed Rust enum (ADR-003 idiom;
 `src/tracker/kind.rs`, `status.rs`); the CHECK is built from the enum's
@@ -156,10 +171,38 @@ the normal gatekeeper path (`work_item_link_experiment` seeds the
 `experiment_verdict` criterion). A `rejected`/`inconclusive` verdict records
 `fail`/`unknown` — the investigation is *concluded* but not *verified*.
 
+## Bug tracking (v12)
+
+A `kind='bug'` is the first-class defect type, distinct from `fixme` by
+*provenance*: `fixme` is a code-anchored marker auto-promoted from a
+`FIXME:`/`TODO:` comment, whereas a `bug` is an **observed** defect with a
+reporter, a severity, and a reproduction. A bug carries two orthogonal axes —
+**`severity`** (impact: `critical | high | medium | low`, the closed `Severity`
+enum in `src/tracker/severity.rs`) and the existing **`priority`** (urgency);
+setting a severity with no explicit priority seeds a default urgency (and never
+clobbers an explicit one).
+
+Lifecycle: a bug is born in **`triage`**. The user-token **`work_item_triage`**
+tool confirms it (`triage → confirmed`), **requiring** a severity and
+reproduction to be present — then it flows through the normal `in_progress →
+claimed_done → verifying → verified` path (a fix is verified by the same
+un-fakeable gatekeeper+evidence gate as any other work). Closing a bug *without*
+a fix is the user-token **`work_item_resolve`** tool: it records a categorized
+**`resolution`** (`wont_fix | duplicate | cannot_reproduce | by_design`, the
+closed `BugResolution` enum; `duplicate` also records a `duplicates` relation) and
+transitions `→ cancelled` via the same `scope_negotiations` path as `defer`.
+`fixed` is *not* settable via `resolve` — it is reached only through the verified
+path. `triage`/`confirmed` are *open* states (they dilute a parent's verified
+fraction like `pending`); only `deferred`/`cancelled` are roll-up-excluded.
+Embed-on-write and the cron drain fold the bug-detail text (reproduction /
+expected-vs-actual / root cause) so "find similar bugs" semantic search sees it,
+and structured bug fields are checkable by `required_field` definition rules
+(`applies_to_kind='bug'`).
+
 ## MCP tool surface
 
-~46 tools under `src/mcp/tools/work_items/` (crud, lifecycle, tags, progress,
-analysis, definitions, verify, ingestion, collab, visibility, relations,
+~48 tools under `src/mcp/tools/work_items/` (crud, lifecycle, tags, progress,
+analysis, definitions, verify, bugs, ingestion, collab, visibility, relations,
 reporting, experiment_link). Each = a `<Name>Params` struct + a `#[tool]` method
 forwarding via `instrumented_tool_wrap` + a `dispatch_tool!` arm in
 `call_tool_cli` + a smoke test (enforced by `query_inventory_vs_coverage`).
@@ -171,7 +214,10 @@ forwarding via `instrumented_tool_wrap` + a `dispatch_tool!` arm in
 - CUDA stays mandatory; no cargo features; migrations stay idempotent; the
   trust boundary is structural and property-tested.
 - Embedding-on-write degrades to NULL on transient GPU OOM (non-fatal); the
-  embedding-migration cron backfills.
+  embedding-migration cron now backfills `work_items` too (a previously-missing
+  drain — every tracker semantic search filters `WHERE embedding IS NOT NULL`, so
+  a failed write had silently dropped the item from search), folding the
+  bug-detail sidecar text to match the bug-aware embed-on-write recipe.
 
 ## Alternatives rejected
 

@@ -60,7 +60,7 @@ pub async fn tool_work_item_link_experiment(
                 .filter(|s| !s.is_empty())
                 .unwrap_or(&exp.title);
             let public_id = gen_public_id(title);
-            let embedding = super::embed_title_body(ctx, title, Some(&exp.question)).await;
+            let embedding = super::embed_title_body(ctx, title, Some(&exp.question), None).await;
             let new_item = NewWorkItem {
                 public_id: &public_id,
                 kind: "experiment",

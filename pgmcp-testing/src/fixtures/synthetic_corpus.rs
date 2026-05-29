@@ -321,11 +321,11 @@ async fn seed_topic_chunks(
             let cid = insert_chunk_with_embedding(
                 pool,
                 file_id,
-                chunk_n as i32,
+                chunk_n,
                 &topic_content(topic_name, global_idx as usize),
                 &basis_with_noise(basis_idx, global_idx as usize),
-                (chunk_n as i32) * 10 + 1,
-                (chunk_n as i32) * 10 + 9,
+                chunk_n * 10 + 1,
+                chunk_n * 10 + 9,
             )
             .await;
             chunk_ids.push(cid);
@@ -443,8 +443,8 @@ async fn seed_merge_candidates(pool: &PgPool, project_id: i32) -> (i64, i64) {
                 chunk_n,
                 &topic_content("database", jit + chunk_n as usize),
                 &basis_with_noise(1, jit + chunk_n as usize),
-                (chunk_n as i32) * 5 + 1,
-                (chunk_n as i32) * 5 + 4,
+                chunk_n * 5 + 1,
+                chunk_n * 5 + 4,
             )
             .await;
         }

@@ -36,6 +36,34 @@ pub fn rrf_score(weight: f64, k: f64, rank: usize) -> f64 {
     weight / (k + rank as f64 + 1.0)
 }
 
+/// Per-leg outcome, reported in the `leg_status` response field so a caller
+/// can see when `hybrid_search` degraded. A single leg's `Error`/`Timeout`
+/// no longer fails the whole tool — it contributes nothing and the surviving
+/// legs' results are still fused and returned.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LegStatus {
+    /// The leg ran and contributed its ranked list.
+    Ok,
+    /// The leg was not run — its weight was 0, or an optional precondition
+    /// (e.g. a per-project HybridLM model) was absent.
+    Skipped,
+    /// The leg returned an error (e.g. a database error) and contributed nothing.
+    Error,
+    /// The leg exceeded its time budget and contributed nothing.
+    Timeout,
+}
+
+impl LegStatus {
+    fn label(self) -> &'static str {
+        match self {
+            LegStatus::Ok => "ok",
+            LegStatus::Skipped => "skipped",
+            LegStatus::Error => "error",
+            LegStatus::Timeout => "timeout",
+        }
+    }
+}
+
 pub async fn tool_hybrid_search(
     ctx: &SystemContext,
     params: HybridSearchParams,
@@ -74,53 +102,105 @@ pub async fn tool_hybrid_search(
     );
 
     let dedupe_worktrees = params.dedupe_worktrees.unwrap_or(false);
-
-    // Run text search
-    let text_results = ctx
-        .db()
-        .text_search(
-            &params.query,
-            limit * 2, // fetch more for fusion
-            params.language.as_deref(),
-            dedupe_worktrees,
-        )
-        .await
-        .map_err(|e| McpError::internal_error(format!("Text search failed: {}", e), None))?;
-
-    // Run semantic search
-    let embedding = ctx
-        .embed()
-        .embed_query(&params.query)
-        .await
-        .map_err(|e| McpError::internal_error(format!("Embedding failed: {}", e), None))?;
-
     let ef_search = ctx.config().load().vector.ef_search;
-    let semantic_results = ctx
-        .db()
-        .semantic_search(
-            &embedding,
-            limit * 2,
-            params.language.as_deref(),
-            params.project.as_deref(),
-            ef_search,
-            dedupe_worktrees,
+    let text_leg_timeout_ms = ctx.config().load().database.hybrid_text_leg_timeout_ms;
+
+    // A leg runs only when its weight is > 0 (a zero-weight leg contributes
+    // nothing to the RRF). The text and semantic legs run CONCURRENTLY via
+    // `tokio::join!` — deliberately NOT `try_join!`, which would short-circuit
+    // on the first error. Each leg owns its failure handling: on error or
+    // timeout it logs and yields an empty ranked list plus a `LegStatus`, so
+    // the tool degrades to whatever succeeded instead of failing wholesale.
+    // (The previous fail-fast `?` on either leg aborted the entire tool when a
+    // single leg hit a Postgres `statement_timeout` — the bug being fixed.)
+    let run_text = bm25_weight > 0.0;
+    let run_semantic = semantic_weight > 0.0;
+
+    let text_fut = async {
+        if !run_text {
+            return (Vec::new(), LegStatus::Skipped);
+        }
+        // The bounded variant scopes a tight `SET LOCAL statement_timeout` to
+        // its own transaction so a cold / write-contended GIN index can't burn
+        // the daemon-wide 30s ceiling. The outer `tokio::time::timeout` (SQL
+        // budget + 1s margin) also bounds connection-acquire / network stalls.
+        let wall = std::time::Duration::from_millis(u64::from(text_leg_timeout_ms) + 1_000);
+        match tokio::time::timeout(
+            wall,
+            ctx.db().text_search_bounded(
+                &params.query,
+                limit * 2, // fetch more for fusion
+                params.language.as_deref(),
+                dedupe_worktrees,
+                text_leg_timeout_ms,
+            ),
         )
         .await
-        .map_err(|e| McpError::internal_error(format!("Semantic search failed: {}", e), None))?;
+        {
+            Ok(Ok(r)) => (r, LegStatus::Ok),
+            Ok(Err(e)) => {
+                warn!(leg = "text", error = %e, "hybrid_search text leg failed; degrading");
+                (Vec::new(), LegStatus::Error)
+            }
+            Err(_) => {
+                warn!(
+                    leg = "text",
+                    timeout_ms = text_leg_timeout_ms,
+                    "hybrid_search text leg timed out; degrading"
+                );
+                (Vec::new(), LegStatus::Timeout)
+            }
+        }
+    };
+
+    let semantic_fut = async {
+        if !run_semantic {
+            return (Vec::new(), LegStatus::Skipped);
+        }
+        let embedding = match ctx.embed().embed_query(&params.query).await {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(leg = "semantic", error = %e, "hybrid_search embedding failed; degrading");
+                return (Vec::new(), LegStatus::Error);
+            }
+        };
+        match ctx
+            .db()
+            .semantic_search(
+                &embedding,
+                limit * 2,
+                params.language.as_deref(),
+                params.project.as_deref(),
+                ef_search,
+                dedupe_worktrees,
+            )
+            .await
+        {
+            Ok(r) => (r, LegStatus::Ok),
+            Err(e) => {
+                warn!(leg = "semantic", error = %e, "hybrid_search semantic leg failed; degrading");
+                (Vec::new(), LegStatus::Error)
+            }
+        }
+    };
+
+    let ((text_results, text_status), (semantic_results, semantic_status)) =
+        tokio::join!(text_fut, semantic_fut);
 
     // Third RRF leg — WFST lattice + per-project HybridLM rescoring.
     //
     // Activates iff: (a) the user did not opt out via wfst_lm_weight=0;
     // (b) a project name is supplied; (c) the per-project HybridLM model
     // file exists on disk (populated by the `ngram-lm-train` cron).
-    // When any precondition fails we fall through to legacy 2-leg
-    // fusion — this preserves the "no per-project model" baseline.
-    let (wfst_rewritten_results, wfst_rewritten_query, legs_fused) =
+    // It is best-effort: any miss falls through to legacy 2-leg fusion and is
+    // reported as `skipped` (never an error — this preserves the "no
+    // per-project model" baseline). It runs after the join because it depends
+    // on neither leg's results.
+    let (wfst_rewritten_results, wfst_rewritten_query, legs_fused, wfst_status) =
         if wfst_lm_weight > 0.0 && params.project.is_some() {
             match try_third_leg(
                 ctx,
                 &params,
-                &embedding,
                 limit,
                 ef_search,
                 dedupe_worktrees,
@@ -130,13 +210,19 @@ pub async fn tool_hybrid_search(
             .await
             {
                 Some((results, rewritten_query)) if !results.is_empty() => {
-                    (results, Some(rewritten_query), 3u8)
+                    (results, Some(rewritten_query), 3u8, LegStatus::Ok)
                 }
-                _ => (Vec::new(), None, 2u8),
+                _ => (Vec::new(), None, 2u8, LegStatus::Skipped),
             }
         } else {
-            (Vec::new(), None, 2u8)
+            (Vec::new(), None, 2u8, LegStatus::Skipped)
         };
+
+    // A text/semantic leg error or timeout degrades the result (the tool still
+    // returns the surviving legs' hits) rather than failing. The optional WFST
+    // leg never counts as degraded.
+    let degraded = matches!(text_status, LegStatus::Error | LegStatus::Timeout)
+        || matches!(semantic_status, LegStatus::Error | LegStatus::Timeout);
 
     let semantic_rewritten_weight = if legs_fused == 3 {
         semantic_weight
@@ -272,13 +358,21 @@ pub async fn tool_hybrid_search(
         "wfst_rewritten_results": wfst_rewritten_results.len(),
         "wfst_rewritten_query": wfst_rewritten_query,
         "legs_fused": legs_fused,
+        "degraded": degraded,
+        "leg_status": {
+            "text": text_status.label(),
+            "semantic": semantic_status.label(),
+            "wfst": wfst_status.label(),
+        },
         "fused_count": fused.len(),
         "results": fused,
         "guidance": "RRF combines keyword precision with semantic recall. \
                      Increase bm25_weight for exact-match queries (error messages, function names). \
                      Increase semantic_weight for conceptual queries (design patterns, workflows). \
                      A third leg (WFST lattice + HybridLM-rescored query) activates when \
-                     wfst_lm_weight > 0 and the per-project HybridLM model file is present.",
+                     wfst_lm_weight > 0 and the per-project HybridLM model file is present. \
+                     Legs run independently: when `degraded` is true a leg errored or timed out \
+                     (see `leg_status`) and the results are partial — retry shortly.",
     });
 
     let json = serde_json::to_string_pretty(&result)
@@ -304,7 +398,6 @@ pub async fn tool_hybrid_search(
 async fn try_third_leg(
     ctx: &SystemContext,
     params: &crate::mcp::server::HybridSearchParams,
-    _embedding: &[f32],
     limit: i32,
     ef_search: i32,
     dedupe_worktrees: bool,

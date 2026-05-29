@@ -23,6 +23,26 @@ they do not replace the full verification gate.
   and skip credentials, encrypted payloads, reasoning internals, cache/state,
   and oversized tool output.
 
+## Work-item / bug tracking
+
+`src/tracker/` + `src/db/queries/work_items.rs` + `src/mcp/tools/work_items/`
+implement a hierarchical work-item tracker (15 kinds) with an evidence-gated
+trust boundary: an agent can self-report `claimed_done` but **cannot
+self-verify, self-defer, or self-confirm** — those transitions have no `Agent`
+arm in `src/tracker/transition.rs`. Full design:
+`docs/decisions/004-work-item-tracker.md`.
+
+Bugs are first-class. Create with `kind='bug'` — it is born in `triage` and
+carries a `severity` (`critical | high | medium | low`) plus structured
+reproduction / expected-vs-actual / environment fields. A human confirms a bug
+with the user-token `work_item_triage` (`triage → confirmed`; requires a severity
+and reproduction to be present); `work_item_resolve` closes one *without* a fix
+(`→ cancelled`) with a categorized `resolution` (`wont_fix | duplicate |
+cannot_reproduce | by_design`, `duplicate` recording a `duplicates` relation). A
+*fix* is verified through the normal gatekeeper+evidence path (`fixed` is not
+settable by hand). `work_item_triage` / `work_item_resolve` / `work_item_defer`
+require `[tracker] user_token`; agents do not have it.
+
 ## Session-level mandates
 
 `src/sessions.rs` extracts imperative directives from user prompts via a

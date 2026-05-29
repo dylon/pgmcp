@@ -148,21 +148,61 @@ pub(crate) async fn collect_engineering_analysis(
     .flatten();
     let coupling_score = (1.0 - avg_coupling.unwrap_or(0.0).min(20.0) / 20.0) * 100.0;
 
-    // === Dimension 8: Complexity ===
-    let high_complexity_count: i64 = sqlx::query_scalar(
+    // === Dimension 8: Complexity (real per-function cyclomatic) ===
+    // A file is "overly complex" when its worst function exceeds an absolute
+    // McCabe high-risk threshold (cyclomatic > 15) — criterion-referenced, not a
+    // per-project curve. When per-function metrics have not been computed yet,
+    // the dimension is N/A (absent) rather than silently falling back to a
+    // line-count proxy presented as if it were real complexity.
+    #[derive(sqlx::FromRow)]
+    struct CycStats {
+        files_with_fns: i64,
+        complex_files: i64,
+    }
+    let cyc = sqlx::query_as::<_, CycStats>(
+        "SELECT
+            COUNT(DISTINCT fm.file_id) AS files_with_fns,
+            COUNT(DISTINCT fm.file_id) FILTER (WHERE fm.cyclomatic > 15) AS complex_files
+         FROM function_metrics fm
+         JOIN indexed_files f ON f.id = fm.file_id
+         WHERE f.project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(CycStats {
+        files_with_fns: 0,
+        complex_files: 0,
+    });
+    let complexity_dim = if cyc.files_with_fns == 0 {
+        DimensionScore::absent(
+            "complexity",
+            "Absence of high-cyclomatic functions — N/A (per-function metrics not computed)",
+        )
+    } else {
+        let score = (1.0 - cyc.complex_files as f64 / cyc.files_with_fns as f64).max(0.0) * 100.0;
+        DimensionScore::present(
+            "complexity",
+            "Absence of functions with high cyclomatic complexity (>15)",
+            score,
+        )
+    };
+
+    // God-file detection (ORR gate `no_god_files`): an absolute size-outlier bar.
+    // The old gate (`>=5 files over 500 lines`) was unachievable for any sizable
+    // repo and did not identify genuine outliers. A single grossly oversized file
+    // (>2000 lines) is the signal; the gate passes only when none exceed it.
+    const GOD_FILE_LINES: i64 = 2000;
+    let god_file_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM indexed_files f
          JOIN projects p ON f.project_id = p.id
-         WHERE p.name = $1 AND f.line_count > 500",
+         WHERE p.name = $1 AND f.line_count > $2",
     )
     .bind(project_name)
+    .bind(GOD_FILE_LINES)
     .fetch_one(pool)
     .await
     .unwrap_or(0);
-    let complexity_score = if stats.file_count > 0 {
-        (1.0 - high_complexity_count as f64 / stats.file_count as f64).max(0.0) * 100.0
-    } else {
-        100.0
-    };
 
     // === Dimension 9: Team Distribution ===
     let avg_authors: Option<f64> = sqlx::query_scalar(
@@ -203,11 +243,7 @@ pub(crate) async fn collect_engineering_analysis(
         DimensionScore::present("code_stability", "Low change churn rate", churn_score),
         DimensionScore::present("bug_fix_ratio", "Low proportion of fix commits", fix_score),
         DimensionScore::present("coupling", "Low inter-module coupling", coupling_score),
-        DimensionScore::present(
-            "complexity",
-            "Absence of overly complex files",
-            complexity_score,
-        ),
+        complexity_dim,
         DimensionScore::present("team_distribution", "Multi-author bus factor", team_score),
         DimensionScore::present("freshness", "Recent activity on files", freshness_score),
     ];
@@ -235,8 +271,11 @@ pub(crate) async fn collect_engineering_analysis(
         },
         OrrGate {
             name: "no_god_files".into(),
-            pass: high_complexity_count < 5,
+            pass: god_file_count == 0,
         },
+        // Process/maintenance gate (honest, absolute): a solo repo legitimately
+        // scores low here — it is a real continuity signal, kept (not exempted or
+        // curved) per the reliability mandate.
         OrrGate {
             name: "bus_factor_ok".into(),
             pass: avg_authors.unwrap_or(1.0) >= 1.5,
@@ -277,24 +316,32 @@ pub async fn tool_engineering_scorecard(
     let project_id = project_id_or_err(ctx, &params.project).await?;
     let analysis = collect_engineering_analysis(ctx, project_id, &params.project).await?;
 
-    let gpa: f64 = analysis
-        .dimensions
-        .iter()
-        .filter_map(|d| d.gpa())
-        .sum::<f64>()
-        / analysis.dimensions.len().max(1) as f64;
+    // Average only the scorable dimensions' continuous GPAs; data-absent dims
+    // (e.g. complexity before per-function metrics exist) are N/A and excluded
+    // from the denominator rather than counted as 0.
+    let dim_gpas: Vec<f64> = analysis.dimensions.iter().filter_map(|d| d.gpa()).collect();
+    let gpa: f64 = if dim_gpas.is_empty() {
+        0.0
+    } else {
+        dim_gpas.iter().sum::<f64>() / dim_gpas.len() as f64
+    };
 
     let dim_json: Vec<serde_json::Value> = analysis
         .dimensions
         .iter()
-        .map(|d| {
-            let score = d.score.unwrap_or(0.0);
-            json!({
+        .map(|d| match d.score {
+            Some(score) => json!({
                 "dimension": d.name,
                 "score": format!("{:.1}", score),
                 "grade": letter_grade(score),
                 "description": d.description,
-            })
+            }),
+            None => json!({
+                "dimension": d.name,
+                "score": "N/A",
+                "grade": "N/A",
+                "description": d.description,
+            }),
         })
         .collect();
 

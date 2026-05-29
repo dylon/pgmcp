@@ -49,6 +49,10 @@ pub struct WorkItemRow {
     pub verified_at: Option<DateTime<Utc>>,
     pub due_at: Option<DateTime<Utc>>,
     pub snooze_until: Option<DateTime<Utc>>,
+    /// Bug impact axis (v12 bug-tracker); NULL for non-bug kinds. See
+    /// [`crate::tracker::severity::Severity`].
+    #[sqlx(default)]
+    pub severity: Option<String>,
     // Claim/lease state (v5 collaboration layer; NULL until claimed).
     #[sqlx(default)]
     pub claimed_by: Option<String>,
@@ -65,7 +69,7 @@ const WORK_ITEM_COLS: &str = "id, public_id, parent_id, project_id, definition_i
      kind, status, title, body, parametric, parametric_corpus, parametric_expected, \
      priority, weight, computed_score, claimed_percent, origin, created_by, \
      created_at, updated_at, started_at, completed_at, verified_at, due_at, snooze_until, \
-     claimed_by, claimed_at, lease_expires_at, claim_count";
+     severity, claimed_by, claimed_at, lease_expires_at, claim_count";
 
 /// One row of the append-only transition audit.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
@@ -132,6 +136,8 @@ pub struct NewWorkItem<'a> {
     pub parametric_expected: Option<i32>,
     pub origin: &'a str,
     pub created_by: Option<&'a str>,
+    /// Bug impact axis (v12); NULL for non-bug kinds.
+    pub severity: Option<&'a str>,
     pub embedding: Option<Vector>,
 }
 
@@ -153,6 +159,7 @@ impl<'a> Default for NewWorkItem<'a> {
             parametric_expected: None,
             origin: "user_explicit",
             created_by: None,
+            severity: None,
             embedding: None,
         }
     }
@@ -166,10 +173,10 @@ pub async fn insert_work_item(pool: &PgPool, item: NewWorkItem<'_>) -> Result<i6
         "INSERT INTO work_items
             (public_id, parent_id, project_id, definition_id, root_id, kind, status,
              title, body, priority, weight, parametric, parametric_corpus,
-             parametric_expected, origin, created_by, embedding)
+             parametric_expected, origin, created_by, embedding, severity)
          VALUES ($1, $2, $3, $4,
              (SELECT COALESCE(p.root_id, p.id) FROM work_items p WHERE p.id = $2),
-             $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+             $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
          RETURNING id",
     )
     .bind(item.public_id)
@@ -188,6 +195,7 @@ pub async fn insert_work_item(pool: &PgPool, item: NewWorkItem<'_>) -> Result<i6
     .bind(item.origin)
     .bind(item.created_by)
     .bind(item.embedding)
+    .bind(item.severity)
     .fetch_one(pool)
     .await
 }
@@ -279,6 +287,7 @@ pub async fn update_work_item_fields(
     clear_due: bool,
     snooze_until: Option<DateTime<Utc>>,
     clear_snooze: bool,
+    severity: Option<&str>,
 ) -> Result<WorkItemRow, WorkItemOpError> {
     let row = sqlx::query_as::<_, WorkItemRow>(&format!(
         "UPDATE work_items SET
@@ -288,6 +297,7 @@ pub async fn update_work_item_fields(
             weight = COALESCE($5, weight),
             due_at = CASE WHEN $7 THEN NULL ELSE COALESCE($6, due_at) END,
             snooze_until = CASE WHEN $9 THEN NULL ELSE COALESCE($8, snooze_until) END,
+            severity = COALESCE($10, severity),
             updated_at = NOW()
          WHERE id = $1
          RETURNING {WORK_ITEM_COLS}"
@@ -301,9 +311,134 @@ pub async fn update_work_item_fields(
     .bind(clear_due)
     .bind(snooze_until)
     .bind(clear_snooze)
+    .bind(severity)
     .fetch_optional(pool)
     .await?;
     row.ok_or(WorkItemOpError::NotFound)
+}
+
+/// The 1:1 bug-detail sidecar (v12 bug-tracker) for `kind='bug'` items.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct BugDetailsRow {
+    pub item_id: i64,
+    pub reproduction_steps: Option<String>,
+    pub expected_behavior: Option<String>,
+    pub actual_behavior: Option<String>,
+    pub environment: Option<String>,
+    pub affected_version: Option<String>,
+    pub fixed_in_version: Option<String>,
+    pub root_cause: Option<String>,
+    pub is_regression: bool,
+    pub reported_by: Option<String>,
+    pub reported_at: DateTime<Utc>,
+    pub triaged_by: Option<String>,
+    pub triaged_at: Option<DateTime<Utc>>,
+    pub resolution: Option<String>,
+}
+
+const BUG_DETAIL_COLS: &str = "item_id, reproduction_steps, expected_behavior, actual_behavior, \
+     environment, affected_version, fixed_in_version, root_cause, is_regression, reported_by, \
+     reported_at, triaged_by, triaged_at, resolution";
+
+/// Input for [`upsert_bug_details`] — COALESCE semantics (a `None` field leaves
+/// the stored value unchanged). `set_triaged_at` stamps `triaged_at = NOW()`
+/// (the triage milestone). The caller validates `severity`/`resolution`
+/// vocabularies (`Severity::parse` / `BugResolution::parse`) before persisting.
+#[derive(Debug, Default)]
+pub struct BugDetailFields<'a> {
+    pub reproduction_steps: Option<&'a str>,
+    pub expected_behavior: Option<&'a str>,
+    pub actual_behavior: Option<&'a str>,
+    pub environment: Option<&'a str>,
+    pub affected_version: Option<&'a str>,
+    pub fixed_in_version: Option<&'a str>,
+    pub root_cause: Option<&'a str>,
+    pub is_regression: Option<bool>,
+    pub reported_by: Option<&'a str>,
+    pub triaged_by: Option<&'a str>,
+    pub set_triaged_at: bool,
+    pub resolution: Option<&'a str>,
+}
+
+impl BugDetailFields<'_> {
+    /// True when no field carries a value — lets create/update skip touching the
+    /// sidecar for a non-bug item that supplied no bug fields.
+    pub fn is_empty(&self) -> bool {
+        self.reproduction_steps.is_none()
+            && self.expected_behavior.is_none()
+            && self.actual_behavior.is_none()
+            && self.environment.is_none()
+            && self.affected_version.is_none()
+            && self.fixed_in_version.is_none()
+            && self.root_cause.is_none()
+            && self.is_regression.is_none()
+            && self.reported_by.is_none()
+            && self.triaged_by.is_none()
+            && !self.set_triaged_at
+            && self.resolution.is_none()
+    }
+}
+
+/// Insert-or-update the 1:1 bug-detail sidecar for an item. On conflict (the
+/// row already exists) each supplied field COALESCE-overwrites and the rest are
+/// left intact; `reported_at`/`created_at` keep their original values and
+/// `updated_at` is refreshed.
+pub async fn upsert_bug_details(
+    pool: &PgPool,
+    item_id: i64,
+    f: &BugDetailFields<'_>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO work_item_bug_details
+            (item_id, reproduction_steps, expected_behavior, actual_behavior, environment,
+             affected_version, fixed_in_version, root_cause, is_regression, reported_by,
+             triaged_by, triaged_at, resolution)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, COALESCE($9, FALSE), $10, $11,
+             CASE WHEN $12 THEN NOW() ELSE NULL END, $13)
+         ON CONFLICT (item_id) DO UPDATE SET
+            reproduction_steps = COALESCE($2, work_item_bug_details.reproduction_steps),
+            expected_behavior  = COALESCE($3, work_item_bug_details.expected_behavior),
+            actual_behavior    = COALESCE($4, work_item_bug_details.actual_behavior),
+            environment        = COALESCE($5, work_item_bug_details.environment),
+            affected_version   = COALESCE($6, work_item_bug_details.affected_version),
+            fixed_in_version   = COALESCE($7, work_item_bug_details.fixed_in_version),
+            root_cause         = COALESCE($8, work_item_bug_details.root_cause),
+            is_regression      = COALESCE($9, work_item_bug_details.is_regression),
+            reported_by        = COALESCE($10, work_item_bug_details.reported_by),
+            triaged_by         = COALESCE($11, work_item_bug_details.triaged_by),
+            triaged_at         = CASE WHEN $12 THEN NOW() ELSE work_item_bug_details.triaged_at END,
+            resolution         = COALESCE($13, work_item_bug_details.resolution),
+            updated_at         = NOW()",
+    )
+    .bind(item_id)
+    .bind(f.reproduction_steps)
+    .bind(f.expected_behavior)
+    .bind(f.actual_behavior)
+    .bind(f.environment)
+    .bind(f.affected_version)
+    .bind(f.fixed_in_version)
+    .bind(f.root_cause)
+    .bind(f.is_regression)
+    .bind(f.reported_by)
+    .bind(f.triaged_by)
+    .bind(f.set_triaged_at)
+    .bind(f.resolution)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch the bug-detail sidecar for an item, if present.
+pub async fn fetch_bug_details(
+    pool: &PgPool,
+    item_id: i64,
+) -> Result<Option<BugDetailsRow>, sqlx::Error> {
+    sqlx::query_as::<_, BugDetailsRow>(&format!(
+        "SELECT {BUG_DETAIL_COLS} FROM work_item_bug_details WHERE item_id = $1"
+    ))
+    .bind(item_id)
+    .fetch_optional(pool)
+    .await
 }
 
 /// Compute the transition authorization context for an item from the DB:
@@ -590,7 +725,7 @@ pub async fn reprioritize_work_items(
                     GREATEST(extract(epoch FROM (NOW() - w.updated_at)) / 86400.0, 0.0) / $2)
                 + 5.0::float8 * (COALESCE((SELECT count(*) FROM item_relations r
                         WHERE r.from_item_id = w.id AND r.relation_type = 'blocks'), 0))::float8
-            WHERE w.status IN ('pending','ready','in_progress','blocked')
+            WHERE w.status IN ('pending','confirmed','ready','in_progress','blocked')
               AND ($1::int IS NULL OR w.project_id = $1)
             RETURNING {cols}
          )
@@ -813,6 +948,15 @@ struct ValidationFacetRow {
     parametric: bool,
     has_universal_criterion: bool,
     depth: i32,
+    // Bug metadata (v12): severity on the spine, the rest from the sidecar.
+    severity: Option<String>,
+    bd_reproduction_steps: Option<String>,
+    bd_expected_behavior: Option<String>,
+    bd_actual_behavior: Option<String>,
+    bd_environment: Option<String>,
+    bd_affected_version: Option<String>,
+    bd_fixed_in_version: Option<String>,
+    bd_root_cause: Option<String>,
 }
 
 /// Gather the validation facets of an instance subtree (kind, parent, field
@@ -825,11 +969,11 @@ pub async fn fetch_validation_facets(
     let rows = sqlx::query_as::<_, ValidationFacetRow>(
         "WITH RECURSIVE subtree AS (
             SELECT w.id, w.public_id, w.parent_id, w.kind, w.title, w.body, w.due_at,
-                   w.parametric, 0 AS depth
+                   w.parametric, w.severity, 0 AS depth
               FROM work_items w WHERE w.id = $1
             UNION ALL
             SELECT c.id, c.public_id, c.parent_id, c.kind, c.title, c.body, c.due_at,
-                   c.parametric, s.depth + 1
+                   c.parametric, c.severity, s.depth + 1
               FROM work_items c JOIN subtree s ON c.parent_id = s.id
          )
          SELECT s.public_id,
@@ -843,25 +987,54 @@ pub async fn fetch_validation_facets(
             COALESCE((SELECT bool_or(ac.coverage_mode = 'universal')
                         FROM acceptance_criteria ac WHERE ac.item_id = s.id), FALSE)
                 AS has_universal_criterion,
-            s.depth
-         FROM subtree s",
+            s.depth,
+            s.severity,
+            bd.reproduction_steps AS bd_reproduction_steps,
+            bd.expected_behavior  AS bd_expected_behavior,
+            bd.actual_behavior    AS bd_actual_behavior,
+            bd.environment        AS bd_environment,
+            bd.affected_version   AS bd_affected_version,
+            bd.fixed_in_version   AS bd_fixed_in_version,
+            bd.root_cause         AS bd_root_cause
+         FROM subtree s
+         LEFT JOIN work_item_bug_details bd ON bd.item_id = s.id",
     )
     .bind(root_id)
     .fetch_all(pool)
     .await?;
     Ok(rows
         .into_iter()
-        .map(|r| crate::tracker::validate::ItemFacet {
-            public_id: r.public_id,
-            parent_public_id: r.parent_public_id,
-            kind: r.kind,
-            title: r.title,
-            has_body: r.has_body,
-            has_due: r.has_due,
-            acceptance_count: r.acceptance_count,
-            parametric: r.parametric,
-            has_universal_criterion: r.has_universal_criterion,
-            depth: r.depth,
+        .map(|r| {
+            // Collect the names of present (non-blank) bug-detail fields for
+            // `required_field` rules that target bug metadata.
+            let mut bug_fields: Vec<String> = Vec::with_capacity(8);
+            for (name, val) in [
+                ("severity", &r.severity),
+                ("reproduction_steps", &r.bd_reproduction_steps),
+                ("expected_behavior", &r.bd_expected_behavior),
+                ("actual_behavior", &r.bd_actual_behavior),
+                ("environment", &r.bd_environment),
+                ("affected_version", &r.bd_affected_version),
+                ("fixed_in_version", &r.bd_fixed_in_version),
+                ("root_cause", &r.bd_root_cause),
+            ] {
+                if val.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) {
+                    bug_fields.push(name.to_string());
+                }
+            }
+            crate::tracker::validate::ItemFacet {
+                public_id: r.public_id,
+                parent_public_id: r.parent_public_id,
+                kind: r.kind,
+                title: r.title,
+                has_body: r.has_body,
+                has_due: r.has_due,
+                acceptance_count: r.acceptance_count,
+                parametric: r.parametric,
+                has_universal_criterion: r.has_universal_criterion,
+                depth: r.depth,
+                bug_fields,
+            }
         })
         .collect())
 }
@@ -1139,7 +1312,7 @@ pub async fn claim_work_item(
     let row = sqlx::query_as::<_, WorkItemRow>(&format!(
         "UPDATE work_items w SET
             claimed_by = $2,
-            status = CASE WHEN w.status IN ('pending','ready','blocked') THEN 'in_progress' ELSE w.status END,
+            status = CASE WHEN w.status IN ('pending','confirmed','ready','blocked') THEN 'in_progress' ELSE w.status END,
             claimed_at = NOW(),
             lease_expires_at = NOW() + make_interval(secs => $3),
             claim_count = w.claim_count + 1,
@@ -1147,7 +1320,7 @@ pub async fn claim_work_item(
             updated_at = NOW()
          WHERE w.id = $1
            AND (w.claimed_by IS NULL OR w.claimed_by = $2 OR w.lease_expires_at < NOW())
-           AND w.status IN ('pending','ready','in_progress','blocked')
+           AND w.status IN ('pending','confirmed','ready','in_progress','blocked')
            AND {NOT_BLOCKED}
          RETURNING {WORK_ITEM_COLS}"
     ))
@@ -1191,7 +1364,7 @@ pub async fn claim_next_work_item(
          )
          SELECT w.id FROM work_items w
          WHERE w.claimed_by IS NULL
-           AND w.status IN ('pending','ready')
+           AND w.status IN ('pending','confirmed','ready')
            AND ($1::bigint IS NULL OR w.id IN (SELECT id FROM subtree))
            AND {NOT_BLOCKED}
          ORDER BY w.priority DESC, w.computed_score DESC NULLS LAST, w.id

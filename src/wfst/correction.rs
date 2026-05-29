@@ -22,7 +22,7 @@ pub struct CorrectionResult {
     pub input: String,
     /// Corrected query (whitespace-joined Viterbi best).
     pub corrected: String,
-    /// True iff `corrected != input.to_lowercase()`.
+    /// True iff the corrector altered the (whitespace-normalized) query.
     pub changed: bool,
     /// Confidence proxy in `[0, 1]`. Tiering: `1.0` when the path is
     /// unchanged (identity wins); `0.5` when LM rescoring was applied;
@@ -130,5 +130,28 @@ mod tests {
         assert_eq!(r.corrected, "receive");
         assert!(r.changed);
         assert_eq!(r.confidence, 0.25);
+    }
+
+    #[test]
+    fn oov_corrects_no_lm_quarter_confidence_production_weight() {
+        // The real default path: edit_weight = 1.0, no LM. An OOV typo is
+        // corrected and tagged edit-only confidence (0.25).
+        let (_tmp, idx) = trie_with(&["receive"]);
+        let r = correct_query_single("recieve", 2, 1.0, 0.0, 0.0, 3.0, &idx, None);
+        assert_eq!(r.corrected, "receive");
+        assert!(r.changed);
+        assert!(!r.used_lm);
+        assert_eq!(r.confidence, 0.25);
+    }
+
+    #[test]
+    fn in_vocab_unchanged_full_confidence() {
+        // A valid in-vocab token is not over-corrected to a distance-1
+        // neighbor; unchanged → full confidence (1.0).
+        let (_tmp, idx) = trie_with(&["chunker", "chunked"]);
+        let r = correct_query_single("chunked", 2, 1.0, 0.0, 0.0, 3.0, &idx, None);
+        assert_eq!(r.corrected, "chunked");
+        assert!(!r.changed);
+        assert_eq!(r.confidence, 1.0);
     }
 }

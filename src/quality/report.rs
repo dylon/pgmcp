@@ -74,8 +74,17 @@ impl DimensionScore {
         self.score.map(letter_grade)
     }
 
+    /// 4-point GPA on a *continuous* linear map from the 0..100 score
+    /// (`score / 25`, clamped to 0..4) — deliberately NOT the lossy
+    /// score→letter→`grade_gpa` bucketing, which collapsed distinct scores
+    /// (e.g. 59 and 24 both → F → 0.0) and, combined with `gpa_letter`'s
+    /// `gpa × 25` re-projection, made a pillar's letter contradict its GPA.
+    /// With this map the pillar/overall GPA stays proportional to the
+    /// underlying scores and `gpa_letter(mean gpa) == letter_grade(mean score)`
+    /// — a single absolute scale (90/80/70/60), no curve. `None` (data-absent)
+    /// is preserved and excluded from the pillar mean.
     pub fn gpa(&self) -> Option<f64> {
-        self.grade().map(grade_gpa)
+        self.score.map(|s| (s / 25.0).clamp(0.0, 4.0))
     }
 }
 
@@ -334,11 +343,27 @@ pub fn finding_density(findings: &[Finding], pillar: Pillar, file_count: i64) ->
     if file_count <= 0 {
         return 100.0;
     }
-    let weighted: f64 = findings
-        .iter()
-        .filter(|f| f.category.pillar() == pillar)
-        .map(|f| f.severity.weight())
-        .sum();
+    // De-duplicate by file: a file flagged by several collectors counts ONCE, at
+    // its worst severity, so a ranking-style collector that touches many files
+    // can no longer saturate the density (the artifact that floored Engineering
+    // to 0.0). Project-/cluster-level findings (no location) are genuinely
+    // distinct cross-cutting issues and each contribute.
+    use std::collections::HashMap;
+    let mut worst_per_file: HashMap<&str, f64> = HashMap::new();
+    let mut unlocated_weight: f64 = 0.0;
+    for f in findings.iter().filter(|f| f.category.pillar() == pillar) {
+        let w = f.severity.weight();
+        match &f.location {
+            Some(loc) => {
+                let slot = worst_per_file.entry(loc.path.as_str()).or_insert(0.0);
+                if w > *slot {
+                    *slot = w;
+                }
+            }
+            None => unlocated_weight += w,
+        }
+    }
+    let weighted: f64 = worst_per_file.values().sum::<f64>() + unlocated_weight;
     100.0 * (1.0 - (weighted / file_count as f64).clamp(0.0, 1.0))
 }
 
@@ -376,12 +401,13 @@ mod tests {
         let p = PillarReport {
             pillar: Pillar::Architecture,
             dimensions: vec![
-                DimensionScore::present("a", "", 95.0), // A = 4.0
+                DimensionScore::present("a", "", 95.0), // 95/25 = 3.8
                 DimensionScore::absent("b", ""),        // ignored
-                DimensionScore::present("c", "", 85.0), // B = 3.0
+                DimensionScore::present("c", "", 85.0), // 85/25 = 3.4
             ],
         };
-        assert_eq!(p.gpa(), Some(3.5));
+        // Continuous GPA: mean(3.8, 3.4) = 3.6 (not the old letter-bucketed 3.5).
+        assert!((p.gpa().unwrap() - 3.6).abs() < 1e-9);
         assert_eq!(p.weakest().map(|d| d.name.as_str()), Some("c"));
     }
 

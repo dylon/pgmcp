@@ -42,20 +42,29 @@ pub async fn collect_complexity_hotspots(
     .await
     .map_err(|e| McpError::internal_error(format!("complexity query failed: {e}"), None))?;
 
-    let max_size = rows.iter().map(|r| r.line_count).max().unwrap_or(1).max(1) as f64;
-    let max_coup = rows.iter().map(|r| r.coupling).max().unwrap_or(1).max(1) as f64;
-    let max_cyc = rows.iter().map(|r| r.cyc_max).max().unwrap_or(1).max(1) as f64;
-
     let mut out = Vec::with_capacity(rows.len());
     for r in &rows {
-        let composite = 0.40 * (r.cyc_max as f64 / max_cyc)
-            + 0.30 * (r.line_count as f64 / max_size)
-            + 0.30 * (r.coupling as f64 / max_coup);
-        let severity = match composite {
-            c if c >= 0.75 => Severity::High,
-            c if c >= 0.50 => Severity::Medium,
-            _ => Severity::Low,
+        // Absolute, criterion-referenced severity (McCabe cyclomatic bands +
+        // file-size bands), NOT normalized against the project's own max — a
+        // codebase must not be graded against itself (no curve), and only
+        // genuine outliers are findings. Files below the Medium bar are healthy
+        // and produce NO finding (this is what stops the collector flagging all
+        // 814 files and saturating finding_density to 0). cyc_max contributes
+        // once function_metrics is populated; line_count is the always-available
+        // absolute signal in the meantime.
+        let severity = if r.cyc_max >= 20 || r.line_count >= 1000 {
+            Severity::High
+        } else if r.cyc_max >= 10 || r.line_count >= 500 {
+            Severity::Medium
+        } else {
+            continue;
         };
+        // Descriptive composite against FIXED ceilings (absolute) — used only to
+        // rank the surfaced outliers, never to assign severity.
+        let composite = ((r.cyc_max as f64 / 30.0)
+            + (r.line_count as f64 / 2000.0)
+            + (r.coupling as f64 / 60.0))
+            / 3.0;
         out.push(
             Finding::new(
                 "complexity_hotspots",
@@ -124,15 +133,16 @@ pub async fn collect_bug_prediction(
             + coupling * 0.05
             + (authors - 1.0).max(0.0) * 0.1)
             .max(0.0);
+        // Absolute defect-proneness bands: only files that cross the Medium bar
+        // are findings. The previous `>= 0.05` floor emitted a Low finding for
+        // almost every file (780/814), which — summed by finding_density — was a
+        // primary cause of the saturated 0.0 grade. Healthy files are not
+        // findings; this is criterion-referenced, not a per-project curve.
         let severity = match bug_score {
             s if s >= 0.7 => Severity::High,
             s if s >= 0.4 => Severity::Medium,
-            _ => Severity::Low,
+            _ => continue,
         };
-        // Only surface files with a non-trivial signal; a flat 0 isn't a finding.
-        if bug_score < 0.05 {
-            continue;
-        }
         out.push(
             Finding::new(
                 "bug_prediction",

@@ -25,6 +25,8 @@ mod definitions;
 pub use definitions::*;
 mod verify;
 pub use verify::*;
+mod bugs;
+pub use bugs::*;
 mod ingestion;
 pub use ingestion::*;
 mod collab;
@@ -70,6 +72,13 @@ pub(crate) fn gen_public_id(title: &str) -> String {
     )
 }
 
+/// Non-empty trimmed view of an optional string param: `None`/blank → `None`,
+/// else the trimmed `&str`. Shared by the create/update/triage/resolve bodies so
+/// "was a value actually supplied?" is decided uniformly.
+pub(crate) fn nonblank(opt: &Option<String>) -> Option<&str> {
+    opt.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
 /// Embed an item's title (+ body) on write so semantic backlog search works
 /// immediately, without waiting for a backfill. Failures are non-fatal —
 /// `None` leaves the `work_items.embedding` column NULL (mirrors the
@@ -78,11 +87,19 @@ pub(crate) async fn embed_title_body(
     ctx: &crate::context::SystemContext,
     title: &str,
     body: Option<&str>,
+    extra: Option<&str>,
 ) -> Option<pgvector::Vector> {
     let mut text = title.to_string();
     if let Some(b) = body.filter(|b| !b.trim().is_empty()) {
         text.push('\n');
         text.push_str(b);
+    }
+    // Bug items fold their reproduction / expected-vs-actual / root-cause text
+    // here so "find similar bugs" semantic search sees it (the cron's
+    // work_items backfill composes the same fields from the sidecar).
+    if let Some(e) = extra.filter(|e| !e.trim().is_empty()) {
+        text.push('\n');
+        text.push_str(e);
     }
     if text.trim().is_empty() {
         return None;

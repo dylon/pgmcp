@@ -1,0 +1,754 @@
+//! Search readers: dense semantic, hybrid RRF, full-text, grep, prompt
+//! recall, and mandate FTS. Extracted from `queries.rs` (god-file split).
+#![allow(unused_imports)]
+
+use crate::db::queries::*;
+use chrono::{DateTime, Utc};
+use sqlx::PgPool;
+
+// ============================================================================
+// Search queries
+// ============================================================================
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct SearchResult {
+    pub path: String,
+    pub relative_path: String,
+    pub language: String,
+    pub chunk_content: String,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub score: Option<f64>,
+    pub project_name: String,
+    /// Chunk id, surfaced by `hybrid_search_chunks` so the API handler can fetch
+    /// per-candidate features (embedding, blame_date) for MMR diversity +
+    /// recency re-ranking (Phase 4.2). `#[sqlx(default)]` ⇒ other SearchResult
+    /// queries (semantic_search) that don't select it default to None.
+    #[sqlx(default)]
+    pub chunk_id: Option<i64>,
+}
+
+/// Semantic search using vector similarity.
+///
+/// Sets `hnsw.ef_search` on the connection for improved recall before executing
+/// the k-NN query. Supports optional filtering by language and/or project name.
+///
+/// `dedupe_worktrees=true` collapses cross-worktree duplicates of the
+/// same `(repo, relative_path)` to a single canonical (lowest-id-project)
+/// hit. `dedupe_worktrees=false` (the default) preserves every hit.
+pub async fn semantic_search(
+    pool: &PgPool,
+    embedding: &[f32],
+    limit: i32,
+    language: Option<&str>,
+    project: Option<&str>,
+    ef_search: i32,
+    dedupe_worktrees: bool,
+) -> Result<Vec<SearchResult>, sqlx::Error> {
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+
+    // BGE-M3-only: the query runs against the 1024-d `embedding_v2`
+    // column. A non-1024 query embedding is a configuration error and
+    // surfaces a clear protocol error.
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "semantic_search: expected a 1024-dimension BGE-M3 query embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let col = "embedding_v2";
+
+    // Acquire a dedicated connection so ef_search applies to our query.
+    // Using SET LOCAL within a transaction keeps it scoped to this operation.
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+
+    // Build the query dynamically based on which filters are present.
+    // The dedup clause's `$N` index is determined by how many other
+    // params come before it in the bind order.
+    let results = match (language, project) {
+        (Some(lang), Some(proj)) => {
+            // $1=embedding, $2=limit, $3=lang, $4=proj, $5=dedupe
+            sqlx::query_as::<_, SearchResult>(&format!(
+                "SELECT f.path, f.relative_path, f.language,
+                        c.content as chunk_content, c.start_line, c.end_line,
+                        1 - (c.{col} <=> $1) as score,
+                        p.name as project_name
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 WHERE f.language = $3 AND p.name = $4
+                   AND c.{col} IS NOT NULL
+                   AND {dedup}
+                 ORDER BY c.{col} <=> $1
+                 LIMIT $2",
+                col = col,
+                dedup = worktree_dedup_clause(5)
+            ))
+            .bind(&embedding_vec)
+            .bind(limit)
+            .bind(lang)
+            .bind(proj)
+            .bind(dedupe_worktrees)
+            .fetch_all(&mut *tx)
+            .await?
+        }
+        (Some(lang), None) => {
+            // $1=embedding, $2=limit, $3=lang, $4=dedupe
+            sqlx::query_as::<_, SearchResult>(&format!(
+                "SELECT f.path, f.relative_path, f.language,
+                        c.content as chunk_content, c.start_line, c.end_line,
+                        1 - (c.{col} <=> $1) as score,
+                        p.name as project_name
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 WHERE f.language = $3
+                   AND c.{col} IS NOT NULL
+                   AND {dedup}
+                 ORDER BY c.{col} <=> $1
+                 LIMIT $2",
+                col = col,
+                dedup = worktree_dedup_clause(4)
+            ))
+            .bind(&embedding_vec)
+            .bind(limit)
+            .bind(lang)
+            .bind(dedupe_worktrees)
+            .fetch_all(&mut *tx)
+            .await?
+        }
+        (None, Some(proj)) => {
+            // $1=embedding, $2=limit, $3=proj, $4=dedupe
+            sqlx::query_as::<_, SearchResult>(&format!(
+                "SELECT f.path, f.relative_path, f.language,
+                        c.content as chunk_content, c.start_line, c.end_line,
+                        1 - (c.{col} <=> $1) as score,
+                        p.name as project_name
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 WHERE p.name = $3
+                   AND c.{col} IS NOT NULL
+                   AND {dedup}
+                 ORDER BY c.{col} <=> $1
+                 LIMIT $2",
+                col = col,
+                dedup = worktree_dedup_clause(4)
+            ))
+            .bind(&embedding_vec)
+            .bind(limit)
+            .bind(proj)
+            .bind(dedupe_worktrees)
+            .fetch_all(&mut *tx)
+            .await?
+        }
+        (None, None) => {
+            // $1=embedding, $2=limit, $3=dedupe
+            sqlx::query_as::<_, SearchResult>(&format!(
+                "SELECT f.path, f.relative_path, f.language,
+                        c.content as chunk_content, c.start_line, c.end_line,
+                        1 - (c.{col} <=> $1) as score,
+                        p.name as project_name
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 WHERE c.{col} IS NOT NULL
+                   AND {dedup}
+                 ORDER BY c.{col} <=> $1
+                 LIMIT $2",
+                col = col,
+                dedup = worktree_dedup_clause(3)
+            ))
+            .bind(&embedding_vec)
+            .bind(limit)
+            .bind(dedupe_worktrees)
+            .fetch_all(&mut *tx)
+            .await?
+        }
+    };
+
+    tx.commit().await?;
+
+    Ok(results)
+}
+
+/// Chunk-level hybrid search: dense ANN + BM25 full-text, fused by Reciprocal
+/// Rank Fusion (Cormack et al. 2009) entirely in SQL, with optional language /
+/// project filters applied to both legs. Returns chunk-level `SearchResult`s
+/// ordered by RRF score (carried in `score`). Backs the `/api/search` hook,
+/// which then optionally cross-encoder-reranks the top results.
+///
+/// `candidates` bounds each leg's contribution (per-leg `LIMIT`); `limit` is
+/// the fused output size. Uses the same `SET LOCAL hnsw.ef_search` discipline
+/// as `semantic_search` so the ANN leg honours the configured recall budget.
+#[allow(clippy::too_many_arguments)]
+pub async fn hybrid_search_chunks(
+    pool: &PgPool,
+    query_text: &str,
+    embedding: &[f32],
+    limit: i32,
+    candidates: i32,
+    language: Option<&str>,
+    project: Option<&str>,
+    ef_search: i32,
+    query_sparse: Option<&pgvector::SparseVector>,
+) -> Result<Vec<SearchResult>, sqlx::Error> {
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "hybrid_search_chunks: expected a 1024-dimension BGE-M3 query embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let col = "embedding_v2";
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+
+    // Optional filters collapse into one query via `($n IS NULL OR …)`.
+    // RRF constant 60.0 mirrors `tool_hybrid_search::RRF_K`. The dense + lexical
+    // CTEs are shared; the BGE-M3 sparse leg (Phase 2.3) is added as a third RRF
+    // leg only when a query sparse vector is supplied AND the chunk has
+    // `sparse_v2` (NULL-tolerant — un-backfilled chunks just miss this leg).
+    // $1=embedding, $2=query_text, $3=candidates, $4=language, $5=project, $6=limit, $7=sparse
+    let dense_lexical = format!(
+        "dense AS (
+            SELECT chunk_id, ROW_NUMBER() OVER (ORDER BY dist) AS rnk FROM (
+                SELECT c.id AS chunk_id, (c.{col} <=> $1) AS dist
+                FROM file_chunks c
+                JOIN indexed_files f ON f.id = c.file_id
+                JOIN projects p ON p.id = f.project_id
+                WHERE c.{col} IS NOT NULL
+                  AND ($4::text IS NULL OR f.language = $4)
+                  AND ($5::text IS NULL OR p.name = $5)
+                ORDER BY c.{col} <=> $1
+                LIMIT $3
+            ) dd
+        ),
+        lexical AS (
+            SELECT chunk_id, ROW_NUMBER() OVER (ORDER BY rank DESC) AS rnk FROM (
+                SELECT c.id AS chunk_id,
+                       ts_rank(c.content_tsv, plainto_tsquery('english', $2)) AS rank
+                FROM file_chunks c
+                JOIN indexed_files f ON f.id = c.file_id
+                JOIN projects p ON p.id = f.project_id
+                WHERE c.content_tsv @@ plainto_tsquery('english', $2)
+                  AND ($4::text IS NULL OR f.language = $4)
+                  AND ($5::text IS NULL OR p.name = $5)
+                ORDER BY rank DESC
+                LIMIT $3
+            ) ll
+        )",
+        col = col
+    );
+    let select_tail = "SELECT f.path, f.relative_path, f.language,
+               c.content AS chunk_content, c.start_line, c.end_line,
+               fused.rrf AS score,
+               p.name AS project_name,
+               c.id AS chunk_id
+        FROM fused
+        JOIN file_chunks c ON c.id = fused.chunk_id
+        JOIN indexed_files f ON f.id = c.file_id
+        JOIN projects p ON p.id = f.project_id
+        ORDER BY fused.rrf DESC
+        LIMIT $6";
+
+    let results = if let Some(sparse) = query_sparse {
+        let sql = format!(
+            "WITH {dense_lexical},
+            sparse AS (
+                SELECT chunk_id, ROW_NUMBER() OVER (ORDER BY dist) AS rnk FROM (
+                    SELECT c.id AS chunk_id, (c.sparse_v2 <#> $7) AS dist
+                    FROM file_chunks c
+                    JOIN indexed_files f ON f.id = c.file_id
+                    JOIN projects p ON p.id = f.project_id
+                    WHERE c.sparse_v2 IS NOT NULL
+                      AND ($4::text IS NULL OR f.language = $4)
+                      AND ($5::text IS NULL OR p.name = $5)
+                    ORDER BY c.sparse_v2 <#> $7
+                    LIMIT $3
+                ) ss
+            ),
+            fused AS (
+                SELECT COALESCE(d.chunk_id, l.chunk_id, s.chunk_id) AS chunk_id,
+                       COALESCE(1.0 / (60.0 + d.rnk), 0.0)
+                     + COALESCE(1.0 / (60.0 + l.rnk), 0.0)
+                     + COALESCE(1.0 / (60.0 + s.rnk), 0.0) AS rrf
+                FROM dense d
+                FULL OUTER JOIN lexical l ON d.chunk_id = l.chunk_id
+                FULL OUTER JOIN sparse s ON COALESCE(d.chunk_id, l.chunk_id) = s.chunk_id
+            )
+            {select_tail}"
+        );
+        sqlx::query_as::<_, SearchResult>(&sql)
+            .bind(&embedding_vec)
+            .bind(query_text)
+            .bind(candidates)
+            .bind(language)
+            .bind(project)
+            .bind(limit)
+            .bind(sparse)
+            .fetch_all(&mut *tx)
+            .await?
+    } else {
+        let sql = format!(
+            "WITH {dense_lexical},
+            fused AS (
+                SELECT COALESCE(d.chunk_id, l.chunk_id) AS chunk_id,
+                       COALESCE(1.0 / (60.0 + d.rnk), 0.0)
+                     + COALESCE(1.0 / (60.0 + l.rnk), 0.0) AS rrf
+                FROM dense d
+                FULL OUTER JOIN lexical l ON d.chunk_id = l.chunk_id
+            )
+            {select_tail}"
+        );
+        sqlx::query_as::<_, SearchResult>(&sql)
+            .bind(&embedding_vec)
+            .bind(query_text)
+            .bind(candidates)
+            .bind(language)
+            .bind(project)
+            .bind(limit)
+            .fetch_all(&mut *tx)
+            .await?
+    };
+
+    tx.commit().await?;
+    Ok(results)
+}
+
+/// Full-text search using PostgreSQL tsvector/tsquery over per-chunk
+/// FTS. Returns one row per matching file with `content` set to the
+/// best-ranked chunk's body (not the whole file); this preserves the
+/// previous result shape while supporting plain-text files whose
+/// `indexed_files.content` is `NULL` (asymmetric-storage policy —
+/// see `upsert_file`).
+///
+/// `dedupe_worktrees=true` collapses cross-worktree duplicates of the
+/// same `(repo, relative_path)` to a single canonical hit. See the
+/// `worktree_dedup_clause` helper for the filter shape.
+/// Core BM25/full-text query, generic over the sqlx executor so the pooled
+/// [`text_search`] and the transaction-scoped [`text_search_bounded`] share a
+/// single source of truth for the SQL (no drift). Ranks via the stored
+/// `file_chunks.content_tsv` generated column (v13 migration) so the heavy
+/// `to_tsvector` is precomputed at write time rather than recomputed per row
+/// on every query — this is what keeps the BM25 leg fast under load.
+async fn run_text_search_query<'e, E>(
+    executor: E,
+    query: &str,
+    limit: i32,
+    language: Option<&str>,
+    dedupe_worktrees: bool,
+) -> Result<Vec<TextSearchResult>, sqlx::Error>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    // Strategy: rank every chunk that matches, then DISTINCT ON file_id
+    // keeping the top-ranked chunk per file. `ORDER BY file_id, rank
+    // DESC` lets DISTINCT ON pick the best chunk per file; the outer
+    // SELECT re-sorts by rank globally and applies the limit. Chunks
+    // hang off `COALESCE(duplicate_of_file_id, id)` so duplicates point
+    // at canonical chunks.
+    let results = if let Some(lang) = language {
+        // $1=query, $2=limit, $3=lang, $4=dedupe
+        sqlx::query_as::<_, TextSearchResult>(&format!(
+            "SELECT path, relative_path, language, content, rank FROM (
+                SELECT DISTINCT ON (f.id)
+                    f.path,
+                    f.relative_path,
+                    f.language,
+                    c.content,
+                    ts_rank(c.content_tsv, plainto_tsquery('english', $1)) AS rank
+                FROM file_chunks c
+                JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+                WHERE c.content_tsv @@ plainto_tsquery('english', $1)
+                  AND f.language = $3
+                  AND {}
+                ORDER BY f.id, rank DESC
+             ) per_file
+             ORDER BY rank DESC
+             LIMIT $2",
+            worktree_dedup_clause(4)
+        ))
+        .bind(query)
+        .bind(limit)
+        .bind(lang)
+        .bind(dedupe_worktrees)
+        .fetch_all(executor)
+        .await?
+    } else {
+        // $1=query, $2=limit, $3=dedupe
+        sqlx::query_as::<_, TextSearchResult>(&format!(
+            "SELECT path, relative_path, language, content, rank FROM (
+                SELECT DISTINCT ON (f.id)
+                    f.path,
+                    f.relative_path,
+                    f.language,
+                    c.content,
+                    ts_rank(c.content_tsv, plainto_tsquery('english', $1)) AS rank
+                FROM file_chunks c
+                JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+                WHERE c.content_tsv @@ plainto_tsquery('english', $1)
+                  AND {}
+                ORDER BY f.id, rank DESC
+             ) per_file
+             ORDER BY rank DESC
+             LIMIT $2",
+            worktree_dedup_clause(3)
+        ))
+        .bind(query)
+        .bind(limit)
+        .bind(dedupe_worktrees)
+        .fetch_all(executor)
+        .await?
+    };
+
+    Ok(results)
+}
+
+pub async fn text_search(
+    pool: &PgPool,
+    query: &str,
+    limit: i32,
+    language: Option<&str>,
+    dedupe_worktrees: bool,
+) -> Result<Vec<TextSearchResult>, sqlx::Error> {
+    run_text_search_query(pool, query, limit, language, dedupe_worktrees).await
+}
+
+/// Same as [`text_search`], but caps the query with a per-call
+/// `SET LOCAL statement_timeout` scoped to an explicit transaction. A cold or
+/// write-contended GIN index can otherwise exceed the daemon-wide 30s ceiling;
+/// the tighter bound lets the caller (`hybrid_search`'s text leg) give up fast
+/// and degrade instead of failing. `SET LOCAL` reverts at commit/rollback, so
+/// it never leaks onto the pooled connection.
+pub async fn text_search_bounded(
+    pool: &PgPool,
+    query: &str,
+    limit: i32,
+    language: Option<&str>,
+    dedupe_worktrees: bool,
+    statement_timeout_ms: u32,
+) -> Result<Vec<TextSearchResult>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // `statement_timeout_ms` is a u32 → digits only, no injection surface.
+    sqlx::query(&format!(
+        "SET LOCAL statement_timeout = {statement_timeout_ms}"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    let results = run_text_search_query(&mut *tx, query, limit, language, dedupe_worktrees).await?;
+    tx.commit().await?;
+    Ok(results)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct TextSearchResult {
+    pub path: String,
+    pub relative_path: String,
+    pub language: String,
+    pub content: Option<String>,
+    pub rank: Option<f32>,
+}
+
+/// Regex grep search across file contents.
+///
+/// `dedupe_worktrees=true` collapses cross-worktree duplicates of the
+/// same `(repo, relative_path)` to a single canonical hit. See the
+/// `worktree_dedup_clause` helper for the filter shape.
+/// Regex grep across per-chunk content. Returns one row per matching
+/// file with `content` set to the first matching chunk's body (not the
+/// whole file); plain-text files whose `indexed_files.content` is NULL
+/// remain searchable because chunks always carry the text.
+///
+/// `dedupe_worktrees=true` collapses cross-worktree duplicates of the
+/// same `(repo, relative_path)` to a single canonical hit. See
+/// `worktree_dedup_clause` for the filter shape.
+pub async fn grep_search(
+    pool: &PgPool,
+    pattern: &str,
+    glob: Option<&str>,
+    limit: i32,
+    dedupe_worktrees: bool,
+) -> Result<Vec<GrepResult>, sqlx::Error> {
+    let results = if let Some(glob_pattern) = glob {
+        // Convert glob to SQL LIKE pattern.
+        // $1=pattern, $2=limit, $3=like, $4=dedupe
+        let like_pattern = glob_pattern.replace('*', "%").replace('?', "_");
+        sqlx::query_as::<_, GrepResult>(&format!(
+            "SELECT DISTINCT ON (f.id)
+                f.path,
+                f.relative_path,
+                f.language,
+                c.content
+             FROM file_chunks c
+             JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+             WHERE c.content ~ $1
+               AND f.relative_path LIKE $3
+               AND {}
+             ORDER BY f.id, c.chunk_index
+             LIMIT $2",
+            worktree_dedup_clause(4)
+        ))
+        .bind(pattern)
+        .bind(limit)
+        .bind(&like_pattern)
+        .bind(dedupe_worktrees)
+        .fetch_all(pool)
+        .await?
+    } else {
+        // $1=pattern, $2=limit, $3=dedupe
+        sqlx::query_as::<_, GrepResult>(&format!(
+            "SELECT DISTINCT ON (f.id)
+                f.path,
+                f.relative_path,
+                f.language,
+                c.content
+             FROM file_chunks c
+             JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+             WHERE c.content ~ $1
+               AND {}
+             ORDER BY f.id, c.chunk_index
+             LIMIT $2",
+            worktree_dedup_clause(3)
+        ))
+        .bind(pattern)
+        .bind(limit)
+        .bind(dedupe_worktrees)
+        .fetch_all(pool)
+        .await?
+    };
+
+    Ok(results)
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct GrepResult {
+    pub path: String,
+    pub relative_path: String,
+    pub language: String,
+    pub content: Option<String>,
+}
+
+// ============================================================================
+// Memory-server Phase 0 queries
+// ============================================================================
+//
+// `recall_prompts_semantic` exposes the already-embedded `session_prompts`
+// archive via vector similarity. The column has been populated on every
+// prompt since the session-mandates feature shipped but had zero readers
+// before this; surfacing it as an MCP tool is the cheapest possible
+// memory-server feature (no schema change, HNSW index already exists).
+//
+// `search_mandates_fts` adds a search surface to `durable_mandates`, which
+// previously had a single reader (project-scope dump). Postgres full-text
+// over `imperative || ' ' || target` is the Phase 0 mode; semantic search
+// adds a `durable_mandates.embedding` column after Phase 1 cutover (the
+// 1024d BGE-M3 column).
+
+/// Vector-similarity search over `session_prompts`. Returns the top-k most
+/// similar historical prompts, reading from the 1024-d BGE-M3
+/// `embedding_v2` column.
+///
+/// `project_name` and `session_id` are independent filters; both may be
+/// `None`. `limit` is clamped to [1, 200] by the caller.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct PromptRecallResult {
+    pub id: i64,
+    pub session_id: uuid::Uuid,
+    pub project_name: Option<String>,
+    pub ts: DateTime<Utc>,
+    pub prompt_text: String,
+    pub similarity: Option<f64>,
+}
+
+pub async fn recall_prompts_semantic(
+    pool: &PgPool,
+    embedding: &[f32],
+    project_name: Option<&str>,
+    session_id: Option<uuid::Uuid>,
+    limit: i32,
+    ef_search: i32,
+) -> Result<Vec<PromptRecallResult>, sqlx::Error> {
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+
+    // BGE-M3-only: read from the 1024-d `embedding_v2` column. A
+    // non-1024 query embedding is rejected here so an accidental
+    // misconfiguration surfaces as a clear error instead of as
+    // wrong-shape vector arithmetic at the pgvector layer.
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "recall_prompts: expected a 1024-dimension BGE-M3 query embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let column = "embedding_v2";
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+
+    // Column-name interpolation is safe — it's chosen from a closed
+    // whitelist above, not from user input.
+    let sql = format!(
+        "SELECT sp.id,
+                sp.session_id,
+                p.name AS project_name,
+                sp.ts,
+                sp.prompt_text,
+                1 - (sp.{col} <=> $1) AS similarity
+         FROM session_prompts sp
+         JOIN sessions s ON s.id = sp.session_id
+         LEFT JOIN projects p ON p.id = s.project_id
+         WHERE sp.{col} IS NOT NULL
+           AND ($2::text IS NULL OR p.name = $2)
+           AND ($3::uuid IS NULL OR sp.session_id = $3)
+         ORDER BY sp.{col} <=> $1
+         LIMIT $4",
+        col = column,
+    );
+
+    let rows = sqlx::query_as::<_, PromptRecallResult>(&sql)
+        .bind(&embedding_vec)
+        .bind(project_name)
+        .bind(session_id)
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+    Ok(rows)
+}
+
+/// Full-text search over `durable_mandates`. Phase 0 surface — adds a
+/// semantic mode after Phase 1 cutover provisions a 1024d embedding
+/// column.
+///
+/// `query_text` is matched against `imperative || ' ' || COALESCE(target,'')`
+/// using `plainto_tsquery('english', $1)`. `polarity` and `scope` are
+/// optional exact-match filters.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct MandateSearchResult {
+    pub id: i64,
+    pub scope: String,
+    pub project_id: Option<i32>,
+    pub project_name: Option<String>,
+    pub polarity: String,
+    pub imperative: String,
+    pub target: Option<String>,
+    pub promoted_at: DateTime<Utc>,
+    pub file_path: Option<String>,
+    pub rank: Option<f32>,
+}
+
+pub async fn search_mandates_fts(
+    pool: &PgPool,
+    query_text: &str,
+    polarity: Option<&str>,
+    scope: Option<&str>,
+    project_id: Option<i32>,
+    limit: i32,
+) -> Result<Vec<MandateSearchResult>, sqlx::Error> {
+    sqlx::query_as::<_, MandateSearchResult>(
+        "SELECT m.id, m.scope, m.project_id, p.name AS project_name,
+                m.polarity, m.imperative, m.target, m.promoted_at, m.file_path,
+                ts_rank_cd(
+                  to_tsvector('english', m.imperative || ' ' || COALESCE(m.target, '')),
+                  plainto_tsquery('english', $1)
+                ) AS rank
+         FROM durable_mandates m
+         LEFT JOIN projects p ON p.id = m.project_id
+         WHERE to_tsvector('english', m.imperative || ' ' || COALESCE(m.target, ''))
+               @@ plainto_tsquery('english', $1)
+           AND ($2::text IS NULL OR m.polarity = $2)
+           AND ($3::text IS NULL OR m.scope = $3)
+           AND ($4::int  IS NULL OR m.project_id = $4 OR m.scope = 'workspace')
+         ORDER BY rank DESC NULLS LAST, m.promoted_at DESC
+         LIMIT $5",
+    )
+    .bind(query_text)
+    .bind(polarity)
+    .bind(scope)
+    .bind(project_id)
+    .bind(limit.clamp(1, 200))
+    .fetch_all(pool)
+    .await
+}
+
+/// Chunk-anchored grep match. Returned by the per-chunk variant of
+/// `grep_search`. The chunk metadata lets the tool body (or the agent)
+/// expand context lines on demand without re-querying the full file.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct GrepChunkResult {
+    pub project_name: String,
+    pub path: String,
+    pub relative_path: String,
+    pub language: String,
+    pub chunk_index: i32,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub content: String,
+}
+
+/// Per-chunk grep: returns the matching `file_chunks` rows for `pattern`,
+/// optionally filtered by project name / language / glob and with case
+/// insensitivity. Unlike `grep_search` (which returns whole files), this
+/// helper anchors each match to a specific `(chunk_index, start_line,
+/// end_line)` so the caller can return a small slice — typically ~500
+/// tokens per hit instead of an entire file's worth.
+pub async fn grep_search_chunks(
+    pool: &PgPool,
+    pattern: &str,
+    project: Option<&str>,
+    language: Option<&str>,
+    glob: Option<&str>,
+    case_insensitive: bool,
+    limit: i32,
+    dedupe_worktrees: bool,
+) -> Result<Vec<GrepChunkResult>, sqlx::Error> {
+    let regex_op = if case_insensitive { "~*" } else { "~" };
+    let like_pattern = glob.map(|g| g.replace('*', "%").replace('?', "_"));
+    // Param layout: $1=pattern, $2=project, $3=language, $4=like (or NULL),
+    // $5=dedupe, $6=limit.
+    let sql = format!(
+        "SELECT
+            p.name AS project_name,
+            f.path,
+            f.relative_path,
+            f.language,
+            c.chunk_index,
+            c.start_line,
+            c.end_line,
+            c.content
+         FROM file_chunks c
+         JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+         JOIN projects p ON p.id = f.project_id
+         WHERE c.content {regex_op} $1
+           AND ($2::text IS NULL OR p.name = $2)
+           AND ($3::text IS NULL OR f.language = $3)
+           AND ($4::text IS NULL OR f.relative_path LIKE $4)
+           AND {dedup}
+         ORDER BY f.path, c.chunk_index
+         LIMIT $6",
+        regex_op = regex_op,
+        dedup = worktree_dedup_clause(5),
+    );
+
+    let rows = sqlx::query_as::<_, GrepChunkResult>(&sql)
+        .bind(pattern)
+        .bind(project)
+        .bind(language)
+        .bind(like_pattern)
+        .bind(dedupe_worktrees)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+    Ok(rows)
+}

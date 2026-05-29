@@ -8,6 +8,7 @@
 //!    daemon-wide ceiling, so legitimate long analytic queries succeed.
 
 use pgmcp::config::DatabaseConfig;
+use pgmcp::db::DbClient;
 use pgmcp::db::pool;
 use pgmcp_testing::require_test_db;
 
@@ -58,6 +59,65 @@ async fn set_local_statement_timeout_overrides_default() {
         .await
         .expect("pg_sleep(1) under SET LOCAL 10s must succeed despite daemon-wide 500ms cap");
     tx.commit().await.expect("COMMIT");
+}
+
+#[tokio::test]
+async fn text_search_bounded_finds_content_via_stored_tsv() {
+    // Proves (a) the v13 `content_tsv` stored column exists in the migrated
+    // schema and (b) `text_search_bounded` — the transaction + `SET LOCAL`
+    // wrapper hybrid_search's text leg uses — returns correct results under a
+    // generous per-call statement_timeout. `content_tsv` is GENERATED, so it
+    // auto-populates from `content` (no explicit insert of the tsvector).
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+
+    let project_id: i32 = sqlx::query_scalar(
+        "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3) \
+         ON CONFLICT (path) DO UPDATE SET workspace_path = $1 RETURNING id",
+    )
+    .bind("/ws/tsb")
+    .bind("/ws/tsb/p")
+    .bind("tsb_proj")
+    .fetch_one(&pool)
+    .await
+    .expect("project");
+    let file_id: i64 = sqlx::query_scalar(
+        "INSERT INTO indexed_files (project_id, path, relative_path, language, size_bytes, content, content_hash, line_count, modified_at) \
+         VALUES ($1, $2, $3, 'rust', $4, $5, $6, $7, NOW()) \
+         ON CONFLICT (path) DO UPDATE SET content = $5 RETURNING id",
+    )
+    .bind(project_id)
+    .bind("/ws/tsb/p/src/lib.rs")
+    .bind("src/lib.rs")
+    .bind(64_i64)
+    .bind("the quick brown fox jumps")
+    .bind(4242_i64)
+    .bind(1_i32)
+    .fetch_one(&pool)
+    .await
+    .expect("file");
+    // Mirror the known-good chunk-insert shape (embedding columns are nullable
+    // but populated here exactly as the production indexer would).
+    let embedding = pgvector::Vector::from(vec![0.0_f32; 1024]);
+    sqlx::query(
+        "INSERT INTO file_chunks (file_id, chunk_index, content, start_line, end_line, embedding_v2, embedding_signature) \
+         VALUES ($1, 0, $2, 1, 1, $3, 'bge-m3-v1')",
+    )
+    .bind(file_id)
+    .bind("the quick brown fox jumps over the lazy dog")
+    .bind(embedding)
+    .execute(&pool)
+    .await
+    .expect("chunk");
+
+    let hits = pool
+        .text_search_bounded("brown fox", 10, None, false, 5_000)
+        .await
+        .expect("text_search_bounded must succeed under a 5s budget");
+    assert!(
+        hits.iter().any(|h| h.relative_path == "src/lib.rs"),
+        "stored-tsv full-text search must find the seeded chunk; got {hits:?}"
+    );
 }
 
 fn database_config_from_url(url: &str) -> DatabaseConfig {

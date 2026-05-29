@@ -90,6 +90,7 @@ pub struct MigrationPassReport {
     pub experiment_hypotheses_migrated: u64,
     pub experiment_results_migrated: u64,
     pub experiment_artifacts_migrated: u64,
+    pub work_items_migrated: u64,
     /// Phase 2.3: file_chunks whose BGE-M3 learned-sparse vector was backfilled.
     pub file_chunks_sparse_backfilled: u64,
     /// Phase 2.4: file_chunks re-embedded with a contextual-retrieval prefix.
@@ -410,6 +411,41 @@ pub async fn run_embedding_migration_pass(
         }
     }
 
+    // Boy-Scout fix (tracker): drain work_items. Embed-on-write at
+    // work_item_create is the primary path, but a transient embed failure left
+    // the vector NULL with no backfill — and every tracker semantic-search leg
+    // filters `WHERE embedding IS NOT NULL`, so a failed write silently dropped
+    // the item from search forever. The text folds the bug-detail sidecar
+    // (reproduction / expected-vs-actual / root cause) so re-embedded bugs match
+    // the bug-aware embed-on-write recipe.
+    for _ in 0..config.max_batches {
+        match migrate_embedding_table_batch(
+            pool,
+            &embedder,
+            config.batch_size,
+            "work_items",
+            "concat_ws(' ', title, body, (SELECT concat_ws(' ', b.reproduction_steps, \
+             b.expected_behavior, b.actual_behavior, b.root_cause) \
+             FROM work_item_bug_details b WHERE b.item_id = work_items.id))",
+        )
+        .await
+        {
+            Ok(n) if n > 0 => {
+                report.work_items_migrated += n;
+                report.batches_completed += 1;
+            }
+            Ok(_) => break,
+            Err(e) => {
+                warn!(error = %e, "work_items embedding backfill batch failed");
+                report.errors += 1;
+                stats
+                    .embeddings_migration_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+
     if report.file_chunks_migrated > 0
         || report.session_prompts_migrated > 0
         || report.git_commit_chunks_migrated > 0
@@ -421,6 +457,7 @@ pub async fn run_embedding_migration_pass(
         || report.experiment_hypotheses_migrated > 0
         || report.experiment_results_migrated > 0
         || report.experiment_artifacts_migrated > 0
+        || report.work_items_migrated > 0
     {
         info!(
             file_chunks = report.file_chunks_migrated,
@@ -434,6 +471,7 @@ pub async fn run_embedding_migration_pass(
             experiment_hypotheses = report.experiment_hypotheses_migrated,
             experiment_results = report.experiment_results_migrated,
             experiment_artifacts = report.experiment_artifacts_migrated,
+            work_items = report.work_items_migrated,
             batches = report.batches_completed,
             errors = report.errors,
             "embedding-migration pass complete",
@@ -1020,6 +1058,7 @@ pub struct BacklogCounts {
     pub experiment_hypotheses: i64,
     pub experiment_results: i64,
     pub experiment_artifacts: i64,
+    pub work_items: i64,
 }
 
 impl BacklogCounts {
@@ -1035,13 +1074,14 @@ impl BacklogCounts {
             + self.experiment_hypotheses
             + self.experiment_results
             + self.experiment_artifacts
+            + self.work_items
     }
 }
 
 /// Read the per-table backlog. One round trip via UNION ALL of eleven
 /// COUNT(*) probes.
 pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::Error> {
-    let row: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+    let row: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT
             (SELECT COUNT(*) FROM file_chunks            WHERE embedding_v2 IS NULL),
             (SELECT COUNT(*) FROM session_prompts        WHERE embedding_v2 IS NULL),
@@ -1053,7 +1093,8 @@ pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::E
             (SELECT COUNT(*) FROM experiments            WHERE embedding    IS NULL),
             (SELECT COUNT(*) FROM experiment_hypotheses  WHERE embedding    IS NULL),
             (SELECT COUNT(*) FROM experiment_results     WHERE embedding    IS NULL),
-            (SELECT COUNT(*) FROM experiment_artifacts   WHERE embedding    IS NULL)",
+            (SELECT COUNT(*) FROM experiment_artifacts   WHERE embedding    IS NULL),
+            (SELECT COUNT(*) FROM work_items             WHERE embedding    IS NULL)",
     )
     .fetch_one(pool)
     .await?;
@@ -1069,6 +1110,7 @@ pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::E
         experiment_hypotheses: row.8,
         experiment_results: row.9,
         experiment_artifacts: row.10,
+        work_items: row.11,
     })
 }
 

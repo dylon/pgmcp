@@ -51,6 +51,28 @@ pub(crate) async fn collect_architecture_dimensions(
     .unwrap_or(None)
     .flatten();
     let soc_score = (1.0 - (avg_topics.unwrap_or(1.0) - 1.0).max(0.0) / 10.0).max(0.0) * 100.0;
+    // Topic-derived: trustworthy only when the global topic model is fresh and
+    // non-degenerate. When topics are absent or stale (e.g. computed by an older
+    // tokenizer/label pipeline, the case that produced the `the/and/dylon`
+    // stopword labels), this dimension is reported N/A and excluded from the
+    // pillar mean — never scored a misleading 0.0.
+    let topics_stale = crate::db::queries::topics_global_stale(
+        pool,
+        crate::cron::topic_clustering::TOPICS_ALGO_SIGNATURE,
+    )
+    .await;
+    let soc_dim = if avg_topics.is_none() || topics_stale {
+        DimensionScore::absent(
+            "separation_of_concerns",
+            "Avg distinct topics per file — N/A (topic model absent or stale)",
+        )
+    } else {
+        DimensionScore::present(
+            "separation_of_concerns",
+            "Avg distinct topics per file (lower is better)",
+            soc_score,
+        )
+    };
 
     // 2. Loose coupling: avg afferent+efferent coupling.
     let avg_coupling: Option<f64> = sqlx::query_scalar(
@@ -190,11 +212,7 @@ pub(crate) async fn collect_architecture_dimensions(
     let org_score = (1.0 - (avg_coupling.unwrap_or(0.0) / 30.0).clamp(0.0, 1.0)) * 100.0;
 
     Ok(vec![
-        DimensionScore::present(
-            "separation_of_concerns",
-            "Avg distinct topics per file (lower is better)",
-            soc_score,
-        ),
+        soc_dim,
         DimensionScore::present(
             "loose_coupling",
             "Avg afferent+efferent coupling",
@@ -256,21 +274,28 @@ pub async fn tool_architecture_quality(
     let project_id = project_id_or_err(ctx, &params.project).await?;
     let dimensions = collect_architecture_dimensions(ctx, project_id).await?;
 
-    let overall = if dimensions.is_empty() {
+    // Average only the *scorable* dimensions; data-absent dims (e.g. a stale
+    // topic model) are N/A and must not be counted as 0 in the denominator.
+    let present: Vec<f64> = dimensions.iter().filter_map(|d| d.score).collect();
+    let overall = if present.is_empty() {
         0.0
     } else {
-        dimensions.iter().filter_map(|d| d.score).sum::<f64>() / dimensions.len() as f64
+        present.iter().sum::<f64>() / present.len() as f64
     };
 
     let dim_json: Vec<serde_json::Value> = dimensions
         .iter()
-        .map(|d| {
-            let score = d.score.unwrap_or(0.0);
-            json!({
+        .map(|d| match d.score {
+            Some(score) => json!({
                 "dimension": d.name,
                 "score": format!("{:.1}", score),
                 "grade": letter_grade(score),
-            })
+            }),
+            None => json!({
+                "dimension": d.name,
+                "score": "N/A",
+                "grade": "N/A",
+            }),
         })
         .collect();
 

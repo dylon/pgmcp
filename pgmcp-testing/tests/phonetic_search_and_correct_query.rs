@@ -163,8 +163,77 @@ async fn correct_query_corrects_against_project_vocab() {
         Some(false),
         "no model present → used_lm must be false"
     );
-    // With an aggressive correction the corrected token should resolve to the
-    // real symbol; at minimum the corrector must run and echo the input.
+    assert_eq!(
+        val["model_available"].as_bool(),
+        Some(false),
+        "no trained model on disk for this project"
+    );
     assert_eq!(val["input"].as_str(), Some("recieve"));
-    assert!(val.get("corrected").is_some());
+    // The no-LM edit/phonetic path must COMMIT the correction to the real
+    // seeded symbol (the Bug-1 fix), not merely echo the input back.
+    assert_eq!(
+        val["corrected"].as_str(),
+        Some("receive"),
+        "OOV typo must be corrected to the seeded symbol without an LM"
+    );
+    assert_eq!(val["changed"].as_bool(), Some(true));
+    assert_eq!(
+        val["confidence"].as_f64(),
+        Some(0.25),
+        "edit-only correction → 0.25 confidence tier"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn correct_query_does_not_overcorrect_valid_symbol() {
+    let testdb = require_test_db!();
+    seed_symbols(testdb.pool(), "correct_q_guard", &["chunker", "chunked"]).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ctx = build_ctx(Arc::new(testdb.pool().clone()), tmp.path().to_path_buf());
+
+    // "chunked" IS a seeded symbol; it must not be nudged to its distance-1
+    // neighbor "chunker" (over-correction guard).
+    let result = tool_correct_query::run(
+        &ctx,
+        CorrectQueryParams {
+            query: "chunked".to_string(),
+            project: "correct_q_guard".to_string(),
+            max_distance: Some(2),
+            lm_weight: Some(0.0),
+        },
+    )
+    .await
+    .expect("correct_query");
+    let val: serde_json::Value = serde_json::from_str(&result_text(&result)).expect("json");
+    assert_eq!(val["corrected"].as_str(), Some("chunked"));
+    assert_eq!(val["changed"].as_bool(), Some(false));
+    assert_eq!(val["confidence"].as_f64(), Some(1.0));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn correct_query_corrects_mixedcase_symbol() {
+    let testdb = require_test_db!();
+    seed_symbols(testdb.pool(), "correct_q_case", &["ChunkerInput"]).await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ctx = build_ctx(Arc::new(testdb.pool().clone()), tmp.path().to_path_buf());
+
+    // Regression for the camelCase repro: the trie is queried in the original
+    // case, so "ChunkerInpt" is distance 1 from the seeded "ChunkerInput" and
+    // is corrected (a lowercasing query path would miss it at max_distance=2).
+    let result = tool_correct_query::run(
+        &ctx,
+        CorrectQueryParams {
+            query: "ChunkerInpt".to_string(),
+            project: "correct_q_case".to_string(),
+            max_distance: Some(2),
+            lm_weight: Some(0.0),
+        },
+    )
+    .await
+    .expect("correct_query");
+    let val: serde_json::Value = serde_json::from_str(&result_text(&result)).expect("json");
+    assert_eq!(val["corrected"].as_str(), Some("ChunkerInput"));
+    assert_eq!(val["changed"].as_bool(), Some(true));
 }

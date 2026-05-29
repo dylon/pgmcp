@@ -74,8 +74,16 @@ pub fn rewrite_query<V>(
 where
     V: DictionaryValue + Clone + Send + Sync + 'static,
 {
-    let tokens = tokenize_query(query);
-    if tokens.is_empty() {
+    // Split on whitespace WITHOUT lowercasing. The persistent symbol trie
+    // stores symbols in their original case and matches case-sensitively,
+    // so the trie must be queried with the original surface form — mirroring
+    // `fuzzy_symbol_search`. Lowercasing first (as the generic
+    // `tokenize_query` does) would inflate the edit distance of every case
+    // difference and hide a mixed-case symbol behind `max_distance` (e.g.
+    // lowercased "chunkerinpt" is distance 3 from "ChunkerInput", so it is
+    // dropped at the default max_distance=2 and never corrected).
+    let surface_tokens: Vec<&str> = query.split_whitespace().collect();
+    if surface_tokens.is_empty() {
         return RewrittenQuery {
             original: query.to_string(),
             rewritten: query.to_string(),
@@ -88,9 +96,9 @@ where
     // Per-token candidates come straight from the persistent trie.
     // When the trie is empty the query returns Vec::new() → no
     // candidates → identity path wins.
-    let candidates_per_token: Vec<Vec<TokenCandidate>> = tokens
+    let candidates_per_token: Vec<Vec<TokenCandidate>> = surface_tokens
         .iter()
-        .map(|tok| {
+        .map(|&tok| {
             fuzzy_idx
                 .query(tok, max_distance)
                 .into_iter()
@@ -109,13 +117,16 @@ where
         })
         .collect();
 
-    let token_refs: Vec<&str> = tokens.iter().map(|s| s.as_str()).collect();
+    // `oov_autocorrect = true`: commit edit/phonetic corrections for genuine
+    // out-of-vocabulary typos even when no LM rescores the lattice (in-vocab
+    // tokens are never over-corrected). See `build_correction_lattice`.
     let base_lattice = build_correction_lattice(
-        &token_refs,
+        &surface_tokens,
         &candidates_per_token,
         edit_weight,
         phonetic_cost_weight,
         phonetic_max_total_cost,
+        true,
     );
 
     let (lattice, used_lm) = match (lm, lm_weight > 0.0) {
@@ -133,19 +144,19 @@ where
                 original: query.to_string(),
                 rewritten: query.to_string(),
                 changed: false,
-                token_count: tokens.len(),
+                token_count: surface_tokens.len(),
                 used_lm,
             };
         }
     };
 
     let rewritten = out.viterbi_path.join(" ");
-    let changed = rewritten != tokens.join(" ");
+    let changed = rewritten != surface_tokens.join(" ");
     RewrittenQuery {
         original: query.to_string(),
         rewritten,
         changed,
-        token_count: tokens.len(),
+        token_count: surface_tokens.len(),
         used_lm,
     }
 }
@@ -230,5 +241,39 @@ mod tests {
         );
         assert!(tokenize_query("").is_empty());
         assert!(tokenize_query("    ").is_empty());
+    }
+
+    #[test]
+    fn oov_token_corrects_with_default_weight() {
+        // The default (production) edit_weight = 1.0 with no LM must still
+        // correct an OOV typo — the Bug-1 fix at the rewrite_query layer.
+        let (_tmp, idx) = trie_with(&["receive"]);
+        let out = rewrite_query("recieve", 2, 1.0, 0.0, 0.0, 3.0, &idx, None);
+        assert_eq!(out.rewritten, "receive");
+        assert!(out.changed);
+    }
+
+    #[test]
+    fn correctly_typed_mixedcase_not_changed() {
+        // A correctly-typed mixed-case symbol is in-vocab (distance-0 exact
+        // match) → not over-corrected. Also proves the trie is queried in
+        // original case (Option A): a lowercasing query path would never see
+        // a distance-0 match here.
+        let (_tmp, idx) = trie_with(&["ChunkerInput"]);
+        let out = rewrite_query("ChunkerInput", 2, 1.0, 0.0, 0.0, 3.0, &idx, None);
+        assert_eq!(out.rewritten, "ChunkerInput");
+        assert!(!out.changed);
+    }
+
+    #[test]
+    fn oov_mixedcase_corrects() {
+        // Regression for the camelCase repro: "ChunkerInpt" is distance 1
+        // from "ChunkerInput" ONLY when queried in original case. The fix
+        // queries the trie with the original surface, so the candidate is
+        // found and committed.
+        let (_tmp, idx) = trie_with(&["ChunkerInput"]);
+        let out = rewrite_query("ChunkerInpt", 2, 1.0, 0.0, 0.0, 3.0, &idx, None);
+        assert_eq!(out.rewritten, "ChunkerInput");
+        assert!(out.changed);
     }
 }

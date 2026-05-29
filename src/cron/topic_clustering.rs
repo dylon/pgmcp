@@ -289,6 +289,19 @@ fn degenerate_result(n: usize, d: usize, k: usize) -> FcmResult {
 // c-TF-IDF topic labeling
 // ============================================================================
 
+/// Algorithm/representation signature of the code-topic labels this binary
+/// produces. Persisted to `pgmcp_metadata['topics_algo_signature']` at the end
+/// of a successful global scan and compared by the staleness check
+/// (`db::queries::topics_global_stale`). Bump it whenever the tokenizer,
+/// stopword tiers, or keyword-extraction logic change so that topics computed by
+/// older code are reported stale (and recomputed) rather than trusted — the same
+/// idiom as the `pgmcp-pattern-embedding-v3` pattern-catalog signature.
+///
+/// `v2` = stopword-tiered c-TF-IDF with identifier splitting + embedding-based
+/// (KeyBERT/MMR) keyword refinement. Topics carrying no signature (NULL) were
+/// computed by pre-signature code and are always treated as stale.
+pub const TOPICS_ALGO_SIGNATURE: &str = "pgmcp-topics-v2";
+
 // Stopword tiers for c-TF-IDF topic labeling.
 //
 // Originally only programming-language keywords were filtered; topic
@@ -518,37 +531,90 @@ fn code_stopwords() -> HashSet<&'static str> {
     set
 }
 
-/// Per-installation extras read once from `PGMCP_TOPIC_STOPWORDS_EXTRA`
-/// (comma-separated). Each entry is lower-cased and filtered for short
-/// or non-alphanumeric tokens. Cached so the env var only parses on
-/// first call. Returns an empty set if the variable is unset or empty.
+/// Per-installation extras, computed once and cached. Sources:
+///   1. the host **username**, auto-derived from `$USER` / `$LOGNAME` / the
+///      basename of `$HOME` — this is what suppresses the `dylon`-style token
+///      that bleeds in from `/home/<user>/...` path strings WITHOUT requiring
+///      any manual configuration (the prior leak that produced degenerate
+///      labels); and
+///   2. `PGMCP_TOPIC_STOPWORDS_EXTRA` (comma-separated) for any additional
+///      site-specific tokens.
+///
+/// Each entry is lower-cased and short/empty tokens are dropped.
 fn user_stopwords() -> &'static HashSet<String> {
     use std::sync::OnceLock;
     static CACHE: OnceLock<HashSet<String>> = OnceLock::new();
     CACHE.get_or_init(|| {
+        let mut set: HashSet<String> = HashSet::new();
+
+        // (1) Host username from the environment (covers `/home/<user>/...`).
+        let username = std::env::var("USER")
+            .or_else(|_| std::env::var("LOGNAME"))
+            .ok()
+            .or_else(|| {
+                std::env::var("HOME").ok().and_then(|h| {
+                    std::path::Path::new(&h)
+                        .file_name()
+                        .map(|s| s.to_string_lossy().into_owned())
+                })
+            });
+        if let Some(u) = username {
+            let u = u.trim().to_lowercase();
+            if !u.is_empty() {
+                set.insert(u);
+            }
+        }
+
+        // (2) Explicit per-installation extras.
         let raw = std::env::var("PGMCP_TOPIC_STOPWORDS_EXTRA").unwrap_or_default();
-        raw.split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect()
+        set.extend(
+            raw.split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty()),
+        );
+        set
     })
 }
 
-/// Tokenize content for c-TF-IDF: split on non-alphanumeric, lowercase, filter.
+/// Split a raw identifier into concept sub-tokens so multi-word identifiers
+/// surface their constituent concepts as topic keywords (a BERTopic-class
+/// preprocessing step): snake_case on `_`, and camelCase / PascalCase / acronym
+/// runs on letter-case boundaries. Lowercases each sub-token and appends to
+/// `out`. Examples: `tokenize_query` → [tokenize, query];
+/// `parseHTTPResponse` → [parse, http, response]; `FcmBackend` → [fcm, backend].
+/// Digit runs are NOT split off (so `utf8`, `bge3` stay intact).
+fn split_identifier(raw: &str, out: &mut Vec<String>) {
+    for part in raw.split('_') {
+        if part.is_empty() {
+            continue;
+        }
+        let chars: Vec<char> = part.chars().collect();
+        let mut start = 0usize;
+        for i in 1..chars.len() {
+            let prev = chars[i - 1];
+            let cur = chars[i];
+            // Boundary BEFORE `cur` when: a lowercase/digit is followed by an
+            // uppercase (camelCase), or an acronym run ends — an uppercase
+            // followed by an uppercase that begins a new word (next is lower):
+            // `HTTPResponse` → `HTTP` | `Response`.
+            let camel = !prev.is_uppercase() && cur.is_uppercase();
+            let acronym_end = prev.is_uppercase()
+                && cur.is_uppercase()
+                && chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+            if camel || acronym_end {
+                out.push(chars[start..i].iter().collect::<String>().to_lowercase());
+                start = i;
+            }
+        }
+        out.push(chars[start..].iter().collect::<String>().to_lowercase());
+    }
+}
+
+/// Tokenize content for c-TF-IDF. Delegates to [`tokenize_into`].
 fn tokenize(content: &str) -> Vec<String> {
-    let stopwords = code_stopwords();
-    let user_extras = user_stopwords();
-    content
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .map(|s| s.to_lowercase())
-        .filter(|s| {
-            s.len() >= 3
-                && s.len() <= 50
-                && !s.chars().all(|c| c.is_ascii_digit())
-                && !stopwords.contains(s.as_str())
-                && !user_extras.contains(s)
-        })
-        .collect()
+    let mut buf = Vec::new();
+    tokenize_into(content, &mut buf);
+    buf
 }
 
 /// A single topic's keyword with its score.
@@ -559,20 +625,29 @@ pub struct TopicKeyword {
 }
 
 /// Tokenize content into a reused scratch buffer to avoid allocating a new
-/// `Vec<String>` per chunk. Clears the buffer before writing.
+/// `Vec<String>` per chunk. Splits on non-alphanumeric, then splits each raw
+/// identifier into concept sub-tokens ([`split_identifier`]), lowercases, and
+/// applies the length / all-digit / stopword filters. Clears `buf` first.
 fn tokenize_into(content: &str, buf: &mut Vec<String>) {
     buf.clear();
     let stopwords = code_stopwords();
     let user_extras = user_stopwords();
-    for s in content.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        let lower = s.to_lowercase();
-        if lower.len() >= 3
-            && lower.len() <= 50
-            && !lower.chars().all(|c| c.is_ascii_digit())
-            && !stopwords.contains(lower.as_str())
-            && !user_extras.contains(&lower)
-        {
-            buf.push(lower);
+    let mut subtoks: Vec<String> = Vec::new();
+    for raw in content.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if raw.is_empty() {
+            continue;
+        }
+        subtoks.clear();
+        split_identifier(raw, &mut subtoks);
+        for lower in subtoks.drain(..) {
+            if lower.len() >= 3
+                && lower.len() <= 50
+                && !lower.chars().all(|c| c.is_ascii_digit())
+                && !stopwords.contains(lower.as_str())
+                && !user_extras.contains(&lower)
+            {
+                buf.push(lower);
+            }
         }
     }
 }
@@ -642,10 +717,21 @@ pub fn compute_ctf_idf(
     // Compute c-TF-IDF score for each word in each topic
     let mut results: Vec<Vec<TopicKeyword>> = Vec::with_capacity(k);
 
+    // Max document-frequency cutoff: with >= 5 topics, drop words that appear in
+    // more than 40% of topics — near-ubiquitous terms that the idf factor only
+    // partially suppresses and that blur topic separation (classic TF-IDF df
+    // pruning). Disabled for < 5 topics (too few for the fraction to mean much).
+    let df_cap: usize = if k >= 5 {
+        ((k as f64) * 0.4).ceil() as usize
+    } else {
+        usize::MAX
+    };
+
     for t in 0..k {
         let total = topic_total_tokens[t].max(1.0);
         let mut scored: Vec<TopicKeyword> = topic_word_counts[t]
             .iter()
+            .filter(|(word, _)| *word_topic_freq.get(*word).unwrap_or(&1) <= df_cap)
             .map(|(word, &count)| {
                 let tf = count / total;
                 let df = *word_topic_freq.get(word).unwrap_or(&1) as f64;
@@ -1938,11 +2024,21 @@ async fn compute_ctf_idf_streaming(
         }
     }
 
+    // Same max-document-frequency cutoff as the in-memory `compute_ctf_idf`:
+    // drop words appearing in > 40% of topics (>= 5 topics) so the global
+    // (streaming) labels are as discriminative as the in-memory ones.
+    let df_cap: usize = if k >= 5 {
+        ((k as f64) * 0.4).ceil() as usize
+    } else {
+        usize::MAX
+    };
+
     (0..k)
         .map(|t| {
             let total = topic_total_tokens[t].max(1.0);
             let mut scored: Vec<TopicKeyword> = topic_word_counts[t]
                 .iter()
+                .filter(|(word, _)| *word_topic_freq.get(*word).unwrap_or(&1) <= df_cap)
                 .map(|(word, &count)| {
                     let tf = count / total;
                     let df = *word_topic_freq.get(word).unwrap_or(&1) as f64;
@@ -1957,6 +2053,7 @@ async fn compute_ctf_idf_streaming(
                 b.score
                     .partial_cmp(&a.score)
                     .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.word.cmp(&b.word))
             });
             scored.truncate(top_k);
             scored
@@ -3142,12 +3239,36 @@ mod tests {
         // "42" is numeric only
         // "ab" is < 3 chars
         // "xyz" should remain (lowercased)
-        assert!(tokens.contains(&"hello_world".to_string()));
+        // "hello_world" is SPLIT into concept sub-tokens by `split_identifier`,
+        // so the compound token no longer appears — its parts do.
+        assert!(!tokens.contains(&"hello_world".to_string()));
+        assert!(tokens.contains(&"hello".to_string()));
+        assert!(tokens.contains(&"world".to_string()));
         assert!(tokens.contains(&"database".to_string()));
         assert!(tokens.contains(&"xyz".to_string()));
         assert!(!tokens.contains(&"fn".to_string()));
         assert!(!tokens.contains(&"42".to_string()));
         assert!(!tokens.contains(&"ab".to_string()));
+    }
+
+    #[test]
+    fn test_split_identifier_concept_tokens() {
+        let mut out = Vec::new();
+        split_identifier("tokenize_query", &mut out);
+        assert_eq!(out, vec!["tokenize", "query"]);
+
+        out.clear();
+        split_identifier("parseHTTPResponse", &mut out);
+        assert_eq!(out, vec!["parse", "http", "response"]);
+
+        out.clear();
+        split_identifier("FcmBackend", &mut out);
+        assert_eq!(out, vec!["fcm", "backend"]);
+
+        // Digit runs are NOT split off; plain words pass through unchanged.
+        out.clear();
+        split_identifier("utf8", &mut out);
+        assert_eq!(out, vec!["utf8"]);
     }
 
     #[test]

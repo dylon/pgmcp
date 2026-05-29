@@ -63,6 +63,28 @@ Prompts are persisted locally in `session_prompts` (sha256-deduped,
 embedded for cross-session retrieval); same privacy posture as
 `file_chunks` — purely local, no remote shipping.
 
+## Work-item / bug tracking (`src/tracker/`)
+
+`src/tracker/` + `src/db/queries/work_items.rs` + `src/mcp/tools/work_items/`
+implement a hierarchical work-item tracker (15 kinds) whose trust boundary is
+*structural*: an agent can self-report `claimed_done` but **cannot self-verify,
+self-defer, or self-confirm** — those transitions have no `Agent` arm in the
+`src/tracker/transition.rs` matrix (property-tested). Full design and rationale:
+`docs/decisions/004-work-item-tracker.md`.
+
+Bugs are a first-class kind (`kind='bug'`, distinct from the code-marker
+`fixme`). A bug is born in `triage` and carries a `severity`
+(`critical | high | medium | low`; closed `Severity` enum, `src/tracker/severity.rs`)
+plus a 1:1 `work_item_bug_details` sidecar (reproduction / expected-vs-actual /
+environment / versions / root cause / resolution). A human confirms a bug with
+the user-token `work_item_triage` (`triage → confirmed`, requiring severity +
+reproduction); `work_item_resolve` closes one without a fix (`→ cancelled`) with
+a categorized `resolution` (closed `BugResolution` enum). `work_item_triage` /
+`work_item_resolve` / `work_item_defer` require `[tracker] user_token` — agents
+do not have it. Closed vocabularies follow the ADR-003 idiom (TEXT + CHECK built
+from the Rust enum's `sql_in_list()` + a golden test pinning the set); the v12
+migration is `src/db/migrations/v12_bug_tracker.rs`.
+
 ## Software pattern catalog (`src/patterns/`)
 
 The curated catalog ships ~810 entries across 14 paradigms in 21 per-family

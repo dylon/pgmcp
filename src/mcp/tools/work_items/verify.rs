@@ -170,20 +170,23 @@ pub async fn tool_work_item_attempt_verify(
 }
 
 /// Check the configured tracker user-token. This is the user-authority gate for
-/// defer/reinstate: the user passes the token (from their local config); the
-/// agent does not have it, so an agent cannot self-defer.
-fn check_user_token(ctx: &SystemContext, provided: &str) -> Result<(), McpError> {
+/// every user-only operation (defer / reinstate / triage-confirm / resolve): the
+/// user passes the token (from their local config); the agent does not have it,
+/// so an agent cannot perform these. Shared with `bugs::tool_work_item_triage`
+/// and `bugs::tool_work_item_resolve`.
+pub(crate) fn check_user_token(ctx: &SystemContext, provided: &str) -> Result<(), McpError> {
     let cfg = ctx.config().load();
     match cfg.tracker.user_token.as_deref() {
         None => Err(McpError::invalid_params(
-            "defer/reinstate is disabled: set [tracker] user_token in config and pass it as \
-             user_token (this is a user-authority op — agents cannot self-defer)",
+            "this user-authority operation is disabled: set [tracker] user_token in config and \
+             pass it as user_token (agents do not have it, so they cannot self-defer / confirm / \
+             resolve)",
             None,
         )),
         Some(tok) if tok == provided => Ok(()),
         Some(_) => Err(McpError::invalid_params(
-            "invalid user_token: defer/reinstate is a user-authority operation (agents cannot \
-             self-defer / scope-cut)",
+            "invalid user_token: this is a user-authority operation (agents cannot self-defer / \
+             scope-cut / confirm / resolve)",
             None,
         )),
     }

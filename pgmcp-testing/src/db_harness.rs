@@ -84,16 +84,16 @@ impl TestDbConfig {
         if let Ok(url) = std::env::var("PGMCP_TEST_DATABASE_URL") {
             return Self::from_url(&url);
         }
-        if let Some(path) = test_config_path() {
-            if path.exists() {
-                let raw = std::fs::read_to_string(&path).map_err(|e| {
-                    TestDbUnavailable::BadConfig(format!("read {}: {}", path.display(), e))
-                })?;
-                let cfg: Config = toml::from_str(&raw).map_err(|e| {
-                    TestDbUnavailable::BadConfig(format!("parse {}: {}", path.display(), e))
-                })?;
-                return Self::from_database_config(&cfg.database);
-            }
+        if let Some(path) = test_config_path()
+            && path.exists()
+        {
+            let raw = std::fs::read_to_string(&path).map_err(|e| {
+                TestDbUnavailable::BadConfig(format!("read {}: {}", path.display(), e))
+            })?;
+            let cfg: Config = toml::from_str(&raw).map_err(|e| {
+                TestDbUnavailable::BadConfig(format!("parse {}: {}", path.display(), e))
+            })?;
+            return Self::from_database_config(&cfg.database);
         }
         Err(TestDbUnavailable::NotConfigured)
     }

@@ -49,9 +49,8 @@ pub struct LatticeRescoreOutput {
 /// candidate sets.
 ///
 /// For each token i, an edge from position i → i+1 is added per
-/// candidate. The identity token (matching the input verbatim) is
-/// always added at cost 0 so the "no correction" path is always
-/// available; candidate edges carry cost
+/// candidate plus an identity edge (matching the input verbatim).
+/// Candidate edges carry cost
 /// `distance * edit_weight + phonetic_cost * phonetic_cost_weight`.
 ///
 /// `edit_weight` lets the caller dial how aggressively to prefer
@@ -63,14 +62,32 @@ pub struct LatticeRescoreOutput {
 /// distance into the edge cost (0.0 disables the phonetic term →
 /// pure edit-distance behavior). `phonetic_max_total_cost`, when
 /// positive, drops candidates whose blended cost exceeds the cap; the
-/// identity edge (cost 0) always survives, so the no-correction path is
-/// never pruned.
+/// identity edge survives the cap, so the no-correction path is never
+/// pruned.
+///
+/// `oov_autocorrect` controls the identity-edge cost, which decides
+/// whether a genuine typo is committed when no language model is
+/// available to rescore the lattice:
+/// - `false` → the identity edge is always free (cost 0.0); Viterbi
+///   keeps the original token unless a candidate is cheaper (only
+///   possible with a negative `edit_weight` or an LM layer). Legacy
+///   behavior.
+/// - `true` → for a token that is itself out-of-vocabulary (no
+///   distance-0 self-match among its candidates) and has at least one
+///   in-budget candidate, the identity edge is priced strictly above
+///   every candidate (`max_candidate_cost + 1.0`), so Viterbi commits
+///   the lowest-cost real correction even with a positive `edit_weight`
+///   and no LM. A token that is itself in-vocabulary, or that has no
+///   candidates, keeps the free identity edge — so correctly-spelled
+///   symbols are never over-corrected and the lattice always has a
+///   well-formed path.
 pub fn build_correction_lattice(
     tokens: &[&str],
     candidates_per_token: &[Vec<TokenCandidate>],
     edit_weight: f64,
     phonetic_cost_weight: f64,
     phonetic_max_total_cost: f64,
+    oov_autocorrect: bool,
 ) -> Lattice<TropicalWeight, HashMapBackend> {
     debug_assert_eq!(tokens.len(), candidates_per_token.len());
     let backend = HashMapBackend::new();
@@ -85,28 +102,27 @@ pub fn build_correction_lattice(
     );
 
     for (i, (tok, cands)) in tokens.iter().zip(candidates_per_token.iter()).enumerate() {
-        // Identity edge always present at cost 0.
-        builder.add_correction(
-            i,
-            i + 1,
-            tok,
-            TropicalWeight::new(0.0),
-            EdgeMetadata::original(),
-        );
+        // First pass: collect the candidate edges we will add (applying
+        // the identity-dupe skip and the phonetic-cost cap), tracking the
+        // maximum accepted cost and whether the token is itself a
+        // vocabulary entry (a distance-0 self-match).
+        let mut accepted: Vec<(&str, f64, u8)> = Vec::with_capacity(cands.len());
+        let mut max_candidate_cost = f64::NEG_INFINITY;
+        let mut in_vocab = false;
 
         for cand in cands {
-            // Skip identity dupes — adding the same surface form twice
-            // would only inflate the lattice with no benefit (Viterbi
-            // would pick the cheaper edge anyway, but the de-dupe
-            // keeps the n-best list cleaner).
-            if cand.term == *tok && cand.distance == 0 {
+            // A distance-0 self-match means the token IS a real vocabulary
+            // entry — record that (it suppresses OOV auto-correction below)
+            // and skip the dupe edge: adding the same surface form twice
+            // would only inflate the lattice / n-best with no benefit.
+            if cand.distance == 0 && cand.term == *tok {
+                in_vocab = true;
                 continue;
             }
             let cost =
                 (cand.distance as f64) * edit_weight + cand.phonetic_cost * phonetic_cost_weight;
             // Drop candidates whose blended cost exceeds the configured cap
-            // (a positive cap activates this; 0.0 disables it). The identity
-            // edge above is unaffected, so the no-correction path survives.
+            // (a positive cap activates this; 0.0 disables it).
             if phonetic_max_total_cost > 0.0 && cost > phonetic_max_total_cost {
                 continue;
             }
@@ -114,10 +130,37 @@ pub fn build_correction_lattice(
             // representable per-edge); saturate at u8::MAX for the
             // pathological "huge distance" case rather than wrap.
             let dist_u8 = u8::try_from(cand.distance).unwrap_or(u8::MAX);
+            accepted.push((cand.term.as_str(), cost, dist_u8));
+            if cost > max_candidate_cost {
+                max_candidate_cost = cost;
+            }
+        }
+
+        // Identity-edge cost. Free (0.0) by default so the "no correction"
+        // path is always available. When OOV auto-correction is enabled and
+        // the token is a genuine typo (not in-vocab) with at least one
+        // in-budget candidate, price identity strictly above every candidate
+        // so Viterbi must commit the lowest-cost real correction — the base
+        // edit/phonetic correction behavior that applies even with no LM to
+        // rescore the lattice.
+        let identity_cost = if oov_autocorrect && !in_vocab && !accepted.is_empty() {
+            max_candidate_cost + 1.0
+        } else {
+            0.0
+        };
+        builder.add_correction(
+            i,
+            i + 1,
+            tok,
+            TropicalWeight::new(identity_cost),
+            EdgeMetadata::original(),
+        );
+
+        for (term, cost, dist_u8) in accepted {
             builder.add_correction(
                 i,
                 i + 1,
-                cand.term.as_str(),
+                term,
                 TropicalWeight::new(cost),
                 EdgeMetadata::correction(dist_u8),
             );
@@ -204,7 +247,7 @@ mod tests {
     fn identity_path_is_zero_cost_without_lm() {
         let tokens = ["hello", "world"];
         let cands = vec![Vec::<TokenCandidate>::new(), Vec::new()];
-        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0);
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0, false);
         let out = viterbi_best(&lat).expect("viterbi");
         assert_eq!(
             out.viterbi_path,
@@ -224,7 +267,7 @@ mod tests {
         // of the test is to exercise multi-edge case without LM.
         let tokens = ["hello"];
         let cands = vec![vec![cand("hello", 0, 0.0)]];
-        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0);
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0, false);
         let out = viterbi_best(&lat).expect("viterbi");
         assert_eq!(out.viterbi_path, vec!["hello".to_string()]);
     }
@@ -233,7 +276,7 @@ mod tests {
     fn higher_distance_costs_more() {
         let tokens = ["recieve"];
         let cands = vec![vec![cand("receive", 2, 0.0)]];
-        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0);
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0, false);
         let out = viterbi_best(&lat).expect("viterbi");
         // Identity path (cost 0) beats the correction (cost 2).
         assert_eq!(out.viterbi_path, vec!["recieve".to_string()]);
@@ -247,7 +290,7 @@ mod tests {
         // (In practice edit_weight stays positive and the LM layer
         // produces the preference; this test just verifies the
         // mechanism.)
-        let lat = build_correction_lattice(tokens.as_ref(), &cands, -1.0, 0.0, 0.0);
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, -1.0, 0.0, 0.0, false);
         let out = viterbi_best(&lat).expect("viterbi");
         assert_eq!(out.viterbi_path, vec!["receive".to_string()]);
     }
@@ -259,7 +302,7 @@ mod tests {
         // phonetic_cost) must win once phonetic_cost_weight > 0.
         let tokens = ["kat"];
         let cands = vec![vec![cand("cat", 1, 0.05), cand("bat", 1, 0.9)]];
-        let lat = build_correction_lattice(tokens.as_ref(), &cands, -1.0, 1.0, 0.0);
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, -1.0, 1.0, 0.0, false);
         let out = viterbi_best(&lat).expect("viterbi");
         assert_eq!(out.viterbi_path, vec!["cat".to_string()]);
     }
@@ -271,8 +314,81 @@ mod tests {
         let tokens = ["xyz"];
         let cands = vec![vec![cand("receive", 2, 5.0)]];
         // blended cost = 2 * 1.0 + 5.0 * 1.0 = 7.0 > cap 3.0 → dropped.
-        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 1.0, 3.0);
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 1.0, 3.0, false);
         let out = viterbi_best(&lat).expect("viterbi");
         assert_eq!(out.viterbi_path, vec!["xyz".to_string()]);
+    }
+
+    #[test]
+    fn oov_token_with_candidate_is_corrected_without_lm() {
+        // The canonical Bug-1 regression: at the production edit_weight (1.0)
+        // and with NO LM, an out-of-vocabulary typo must be corrected to its
+        // nearest real candidate. (Fails before the OOV-aware identity cost:
+        // the free identity edge would win.)
+        let tokens = ["recieve"];
+        let cands = vec![vec![cand("receive", 1, 0.0)]];
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0, true);
+        let out = viterbi_best(&lat).expect("viterbi");
+        assert_eq!(out.viterbi_path, vec!["receive".to_string()]);
+    }
+
+    #[test]
+    fn in_vocab_token_not_overcorrected() {
+        // A token that is itself in-vocabulary (distance-0 self-match) must
+        // NOT be nudged to a distance-1 neighbor, even with OOV auto-correct
+        // enabled — the over-correction guard.
+        let tokens = ["chunked"];
+        let cands = vec![vec![cand("chunked", 0, 0.0), cand("chunker", 1, 0.0)]];
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0, true);
+        let out = viterbi_best(&lat).expect("viterbi");
+        assert_eq!(out.viterbi_path, vec!["chunked".to_string()]);
+    }
+
+    #[test]
+    fn zero_candidate_token_passes_through_with_autocorrect() {
+        // No candidates within budget → the lattice keeps a free identity
+        // edge and the token passes through unchanged (well-formed path).
+        let tokens = ["xyzzy"];
+        let cands = vec![Vec::<TokenCandidate>::new()];
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0, true);
+        let out = viterbi_best(&lat).expect("viterbi");
+        assert_eq!(out.viterbi_path, vec!["xyzzy".to_string()]);
+    }
+
+    #[test]
+    fn multi_token_mixed_invocab_and_oov() {
+        // Per-token independence: an in-vocab token is preserved while an
+        // OOV typo in the same query is corrected.
+        let tokens = ["decode", "recieve"];
+        let cands = vec![vec![cand("decode", 0, 0.0)], vec![cand("receive", 1, 0.0)]];
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0, true);
+        let out = viterbi_best(&lat).expect("viterbi");
+        assert_eq!(
+            out.viterbi_path,
+            vec!["decode".to_string(), "receive".to_string()]
+        );
+    }
+
+    #[test]
+    fn oov_autocorrect_false_preserves_legacy_passthrough() {
+        // With the flag off, the legacy behavior holds: a positive edit_weight
+        // keeps the free identity edge winning over a real candidate.
+        let tokens = ["recieve"];
+        let cands = vec![vec![cand("receive", 1, 0.0)]];
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 0.0, 0.0, false);
+        let out = viterbi_best(&lat).expect("viterbi");
+        assert_eq!(out.viterbi_path, vec!["recieve".to_string()]);
+    }
+
+    #[test]
+    fn phonetic_breaks_tie_among_oov_candidates_positive_weight() {
+        // OOV auto-correct composes with the phonetic tiebreak at the
+        // production positive edit_weight: two equal-edit candidates, the
+        // phonetically-closer one wins.
+        let tokens = ["kat"];
+        let cands = vec![vec![cand("cat", 1, 0.05), cand("bat", 1, 0.9)]];
+        let lat = build_correction_lattice(tokens.as_ref(), &cands, 1.0, 1.0, 0.0, true);
+        let out = viterbi_best(&lat).expect("viterbi");
+        assert_eq!(out.viterbi_path, vec!["cat".to_string()]);
     }
 }

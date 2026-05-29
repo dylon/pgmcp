@@ -20,7 +20,7 @@ fn cand(term: &str, distance: usize) -> TokenCandidate {
 
 #[test]
 fn empty_lattice_returns_empty_path_zero_cost() {
-    let lat = build_correction_lattice(&[], &[], 1.0, 0.0, 0.0);
+    let lat = build_correction_lattice(&[], &[], 1.0, 0.0, 0.0, false);
     let out = viterbi_best(&lat).expect("viterbi");
     assert!(out.viterbi_path.is_empty());
     assert!((out.viterbi_cost - 0.0).abs() < 1e-9);
@@ -30,7 +30,7 @@ fn empty_lattice_returns_empty_path_zero_cost() {
 fn identity_path_preserves_input_tokens() {
     let tokens: [&str; 3] = ["alpha", "beta", "gamma"];
     let cands = vec![Vec::<TokenCandidate>::new(), Vec::new(), Vec::new()];
-    let lat = build_correction_lattice(&tokens, &cands, 1.0, 0.0, 0.0);
+    let lat = build_correction_lattice(&tokens, &cands, 1.0, 0.0, 0.0, false);
     let out = viterbi_best(&lat).expect("viterbi");
     assert_eq!(
         out.viterbi_path,
@@ -47,7 +47,7 @@ fn cheaper_candidate_displaces_identity() {
     // (cost 0). This exercises the min-selection path; in production
     // the same effect is produced by the LM layer driving correction
     // edges to lower scores than identity.
-    let lat = build_correction_lattice(&tokens, &cands, -1.0, 0.0, 0.0);
+    let lat = build_correction_lattice(&tokens, &cands, -1.0, 0.0, 0.0, false);
     let out = viterbi_best(&lat).expect("viterbi");
     assert_eq!(
         out.viterbi_path,
@@ -61,8 +61,8 @@ fn cheaper_candidate_displaces_identity() {
 fn viterbi_is_deterministic_for_identical_calls() {
     let tokens: [&str; 2] = ["foo", "bar"];
     let cands = vec![vec![cand("fooz", 1)], vec![cand("barr", 1)]];
-    let lat1 = build_correction_lattice(&tokens, &cands, 1.0, 0.0, 0.0);
-    let lat2 = build_correction_lattice(&tokens, &cands, 1.0, 0.0, 0.0);
+    let lat1 = build_correction_lattice(&tokens, &cands, 1.0, 0.0, 0.0, false);
+    let lat2 = build_correction_lattice(&tokens, &cands, 1.0, 0.0, 0.0, false);
     let out1 = viterbi_best(&lat1).expect("viterbi-1");
     let out2 = viterbi_best(&lat2).expect("viterbi-2");
     assert_eq!(out1.viterbi_path, out2.viterbi_path);

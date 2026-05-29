@@ -9,6 +9,8 @@
 //! - [`kind`] — the closed `WorkItemKind` taxonomy (single source of truth for
 //!   the `work_items.kind` CHECK vocabulary).
 //! - [`status`] — the closed `WorkItemStatus` lifecycle vocabulary.
+//! - [`severity`] — the closed `Severity` (bug impact) and `BugResolution`
+//!   vocabularies, orthogonal to the `priority` (urgency) axis.
 //! - [`transition`] — the legal-transition matrix + actor-capability gate that
 //!   makes "an agent self-verifies / self-defers" structurally impossible.
 //!
@@ -19,6 +21,7 @@
 pub mod ingest;
 pub mod kind;
 pub mod rollup;
+pub mod severity;
 pub mod status;
 pub mod transition;
 pub mod validate;

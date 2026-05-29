@@ -23,8 +23,21 @@ pub enum WorkItemKind {
     SubTask,
     /// A small actionable item.
     Todo,
-    /// A defect to fix.
+    /// A code-anchored maintenance marker — promoted from a source `FIXME:` /
+    /// `TODO:` comment by [`crate::tracker::ingest`] (the `promote_marker` path).
+    /// Internal code-hygiene; no reporter / severity / reproduction.
+    ///
+    /// Distinct from [`WorkItemKind::Bug`] by *provenance*: if it has observed
+    /// wrong behavior **and** a severity, it is a `Bug`; a bare code-hygiene note
+    /// is a `Fixme`.
     Fixme,
+    /// An observed behavioral defect: carries a reporter, a [`Severity`], and a
+    /// reproduction, and is the first-class subject of the
+    /// `triage → confirmed → fixed/verified` lifecycle. See `Fixme` for the
+    /// provenance rule that separates the two.
+    ///
+    /// [`Severity`]: crate::tracker::severity::Severity
+    Bug,
     /// A suggestion / possibility.
     Idea,
     /// A brainstorming session: a container that groups loosely-captured
@@ -53,6 +66,7 @@ impl WorkItemKind {
         Self::SubTask,
         Self::Todo,
         Self::Fixme,
+        Self::Bug,
         Self::Idea,
         Self::Brainstorm,
         Self::Note,
@@ -71,6 +85,7 @@ impl WorkItemKind {
             Self::SubTask => "sub_task",
             Self::Todo => "todo",
             Self::Fixme => "fixme",
+            Self::Bug => "bug",
             Self::Idea => "idea",
             Self::Brainstorm => "brainstorm",
             Self::Note => "note",
@@ -117,6 +132,7 @@ mod tests {
             "sub_task",
             "todo",
             "fixme",
+            "bug",
             "idea",
             "brainstorm",
             "note",
@@ -131,8 +147,8 @@ mod tests {
             got, expected,
             "WorkItemKind vocabulary drifted from pinned set"
         );
-        assert_eq!(WorkItemKind::ALL.len(), 14);
-        assert_eq!(got.len(), 14, "duplicate as_str() value in WorkItemKind");
+        assert_eq!(WorkItemKind::ALL.len(), 15);
+        assert_eq!(got.len(), 15, "duplicate as_str() value in WorkItemKind");
     }
 
     #[test]

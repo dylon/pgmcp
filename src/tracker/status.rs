@@ -12,6 +12,15 @@ use crate::tracker::kind::join_quoted;
 pub enum WorkItemStatus {
     /// Created, not yet actionable (e.g. unmet dependencies / not groomed).
     Pending,
+    /// A reported bug awaiting triage; not yet actionable. Agents may report
+    /// (move an item here) and propose a severity, but only a token-bearing
+    /// user may confirm it real via `work_item_triage`. Counts as open for the
+    /// completion roll-up (an untriaged bug dilutes its parent).
+    Triage,
+    /// A bug that has been triaged and accepted — reproduced, severity set,
+    /// ready to be worked. Reached only via the user-token-gated
+    /// `work_item_triage` tool. Counts as open for the completion roll-up.
+    Confirmed,
     /// All `depends_on` satisfied; eligible to start.
     Ready,
     /// Actively being worked.
@@ -39,6 +48,8 @@ impl WorkItemStatus {
     /// Canonical ordering; also the source of the DB CHECK vocabulary.
     pub const ALL: &'static [WorkItemStatus] = &[
         Self::Pending,
+        Self::Triage,
+        Self::Confirmed,
         Self::Ready,
         Self::InProgress,
         Self::Blocked,
@@ -53,6 +64,8 @@ impl WorkItemStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::Triage => "triage",
+            Self::Confirmed => "confirmed",
             Self::Ready => "ready",
             Self::InProgress => "in_progress",
             Self::Blocked => "blocked",
@@ -97,6 +110,8 @@ mod tests {
         let got: HashSet<&str> = WorkItemStatus::ALL.iter().map(|s| s.as_str()).collect();
         let expected: HashSet<&str> = [
             "pending",
+            "triage",
+            "confirmed",
             "ready",
             "in_progress",
             "blocked",
@@ -113,8 +128,8 @@ mod tests {
             got, expected,
             "WorkItemStatus vocabulary drifted from pinned set"
         );
-        assert_eq!(WorkItemStatus::ALL.len(), 10);
-        assert_eq!(got.len(), 10, "duplicate as_str() value in WorkItemStatus");
+        assert_eq!(WorkItemStatus::ALL.len(), 12);
+        assert_eq!(got.len(), 12, "duplicate as_str() value in WorkItemStatus");
     }
 
     #[test]

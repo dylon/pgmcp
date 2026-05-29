@@ -1684,6 +1684,14 @@ pub struct DatabaseConfig {
     #[serde(default = "default_statement_timeout_ms")]
     pub statement_timeout_ms: u32,
 
+    /// Per-leg `statement_timeout` (ms) for `hybrid_search`'s BM25/full-text
+    /// leg, scoped via `SET LOCAL` inside that query's own transaction. Much
+    /// tighter than `statement_timeout_ms` so a cold / write-contended GIN
+    /// index makes the leg give up fast and degrade (the tool still returns
+    /// the other legs' hits) rather than burning the daemon-wide ceiling.
+    #[serde(default = "default_hybrid_text_leg_timeout_ms")]
+    pub hybrid_text_leg_timeout_ms: u32,
+
     /// Server-side `idle_in_transaction_session_timeout`. Caps the window
     /// during which a misbehaving caller can keep a transaction open
     /// without doing work — Postgres terminates the session past this.
@@ -1740,6 +1748,7 @@ impl Default for DatabaseConfig {
             password: None,
             max_connections: default_max_connections(),
             statement_timeout_ms: default_statement_timeout_ms(),
+            hybrid_text_leg_timeout_ms: default_hybrid_text_leg_timeout_ms(),
             idle_in_transaction_timeout_ms: default_idle_in_transaction_timeout_ms(),
             lock_timeout_ms: default_lock_timeout_ms(),
             client_connection_check_interval_ms: default_client_connection_check_interval_ms(),
@@ -1802,6 +1811,9 @@ fn default_max_connections() -> u32 {
 }
 fn default_statement_timeout_ms() -> u32 {
     30_000
+}
+fn default_hybrid_text_leg_timeout_ms() -> u32 {
+    3_000
 }
 fn default_idle_in_transaction_timeout_ms() -> u32 {
     60_000

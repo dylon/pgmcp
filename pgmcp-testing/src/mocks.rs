@@ -107,6 +107,13 @@ pub struct MockDbClient {
     pub file_line_counts: Vec<(i64, i32)>,
     pub semantic_search_results: Vec<SearchResult>,
     pub text_search_results: Vec<TextSearchResult>,
+    /// When true, `text_search_bounded` returns an `Err` (simulating a
+    /// statement_timeout cancellation) so graceful-degradation tests can
+    /// exercise the "one leg fails" path deterministically.
+    pub text_search_bounded_fails: bool,
+    /// When true, `semantic_search` returns an `Err` so degradation tests can
+    /// simulate both search legs failing at once.
+    pub semantic_search_fails: bool,
     pub grep_search_results: Vec<GrepResult>,
     /// Override for the chunk-aware grep tool. When non-empty, the
     /// `grep_search_chunks` mock returns these verbatim instead of
@@ -391,6 +398,9 @@ impl DbClient for MockDbClient {
         _ef_search: i32,
         _dedupe_worktrees: bool,
     ) -> Result<Vec<SearchResult>, sqlx::Error> {
+        if self.semantic_search_fails {
+            return Err(sqlx::Error::PoolTimedOut);
+        }
         Ok(self.semantic_search_results.clone())
     }
 
@@ -401,6 +411,20 @@ impl DbClient for MockDbClient {
         _language: Option<&str>,
         _dedupe_worktrees: bool,
     ) -> Result<Vec<TextSearchResult>, sqlx::Error> {
+        Ok(self.text_search_results.clone())
+    }
+
+    async fn text_search_bounded(
+        &self,
+        _query: &str,
+        _limit: i32,
+        _language: Option<&str>,
+        _dedupe_worktrees: bool,
+        _statement_timeout_ms: u32,
+    ) -> Result<Vec<TextSearchResult>, sqlx::Error> {
+        if self.text_search_bounded_fails {
+            return Err(sqlx::Error::PoolTimedOut);
+        }
         Ok(self.text_search_results.clone())
     }
 
@@ -479,8 +503,7 @@ impl DbClient for MockDbClient {
         let synthesized: Vec<pgmcp::db::queries::GrepChunkResult> = self
             .grep_search_results
             .iter()
-            .enumerate()
-            .map(|(i, r)| pgmcp::db::queries::GrepChunkResult {
+            .map(|r| pgmcp::db::queries::GrepChunkResult {
                 project_name: "mock".into(),
                 path: r.path.clone(),
                 relative_path: r.relative_path.clone(),
@@ -488,7 +511,7 @@ impl DbClient for MockDbClient {
                 chunk_index: 0,
                 start_line: 1,
                 end_line: 1,
-                content: r.content.clone().unwrap_or_default() + if i > 0 { "" } else { "" },
+                content: r.content.clone().unwrap_or_default(),
             })
             .collect();
         Ok(synthesized)
@@ -679,10 +702,10 @@ impl DbClient for MockDbClient {
         let calls = self
             .batch_neighbors_call_count
             .fetch_add(1, Ordering::SeqCst);
-        if let Some(threshold) = self.batch_neighbors_pool_closed_after {
-            if calls >= threshold {
-                return Err(sqlx::Error::PoolClosed);
-            }
+        if let Some(threshold) = self.batch_neighbors_pool_closed_after
+            && calls >= threshold
+        {
+            return Err(sqlx::Error::PoolClosed);
         }
         Ok(self.batch_neighbors.clone())
     }

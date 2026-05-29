@@ -208,6 +208,29 @@ pub(super) async fn install_work_items_checks(pool: &PgPool) -> Result<(), sqlx:
         "origin IN ('user_explicit','agent_write','ingest_plan','ingest_marker','migration')",
     )
     .await?;
+    // `severity` is added by the v12 bug-tracker migration; on a fresh install
+    // this every-boot reconcile runs (migrate() line ~2088) before that column
+    // exists, so guard on its presence. Once present, the CHECK is built from
+    // the closed `Severity` enum, so a future severity-vocabulary edit
+    // propagates to existing installs exactly like kind/status (ADR-003).
+    let has_severity = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+         WHERE table_name = 'work_items' AND column_name = 'severity')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if has_severity {
+        install_check(
+            pool,
+            "work_items",
+            "work_items_severity_check",
+            &format!(
+                "severity IS NULL OR severity IN ({})",
+                crate::tracker::severity::sql_in_list()
+            ),
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -550,7 +573,7 @@ async fn stamp_metadata(pool: &PgPool) -> Result<(), sqlx::Error> {
 /// re-validation) on each start. A genuine vocabulary change still re-stamps and
 /// re-installs. `predicate` is the inner CHECK expression (e.g.
 /// `"kind IN ('bug', …)"`); it is wrapped into a full `CHECK (…)` definition.
-async fn install_check(
+pub(super) async fn install_check(
     pool: &PgPool,
     table: &str,
     constraint: &str,

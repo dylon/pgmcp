@@ -12,17 +12,19 @@ use serde_json::json;
 
 use crate::context::SystemContext;
 use crate::db::queries::{
-    self, NewWorkItem, WorkItemFilter, WorkItemOpError, get_work_item, get_work_item_by_public_id,
-    get_work_item_subtree, insert_work_item, list_work_items, reparent_work_item,
-    resolve_project_id, update_work_item_fields,
+    self, BugDetailFields, NewWorkItem, WorkItemFilter, WorkItemOpError, fetch_bug_details,
+    get_work_item, get_work_item_by_public_id, get_work_item_subtree, insert_work_item,
+    list_work_items, reparent_work_item, resolve_project_id, update_work_item_fields,
+    upsert_bug_details,
 };
 use crate::mcp::server::{
     WorkItemCreateParams, WorkItemGetParams, WorkItemListParams, WorkItemReparentParams,
     WorkItemTreeParams, WorkItemUpdateParams,
 };
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err};
-use crate::mcp::tools::work_items::gen_public_id;
+use crate::mcp::tools::work_items::{gen_public_id, nonblank};
 use crate::tracker::kind::WorkItemKind;
+use crate::tracker::severity::Severity;
 
 /// Map a fallible-tracker-op error to the right MCP error class: a refused
 /// transition or a missing item is a caller mistake (`invalid_params`); a raw
@@ -125,27 +127,90 @@ pub async fn tool_work_item_create(
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| gen_public_id(title));
 
-    // Embed title+body on write so semantic backlog search works immediately
-    // (a transient embed failure is non-fatal — the column stays NULL).
-    let embedding = super::embed_title_body(ctx, title, params.body.as_deref()).await;
+    // Bug fields. Severity is validated against the closed vocabulary; a bug is
+    // born in `triage` (awaiting a user-token confirmation); and a severity with
+    // no explicit priority seeds a default urgency (never clobbering an explicit
+    // priority).
+    let severity = match nonblank(&params.severity) {
+        Some(s) => Some(Severity::parse(s).ok_or_else(|| {
+            McpError::invalid_params(
+                format!(
+                    "unknown severity '{s}'; expected one of {}",
+                    crate::tracker::severity::sql_in_list()
+                ),
+                None,
+            )
+        })?),
+        None => None,
+    };
+    let is_bug = kind == WorkItemKind::Bug;
+    let status = if is_bug { "triage" } else { "pending" };
+    let priority = params
+        .priority
+        .or_else(|| severity.map(Severity::default_priority))
+        .unwrap_or(0);
+
+    // Fold the descriptive bug text into the embedding input so "find similar
+    // bugs" semantic search sees reproduction / expected-vs-actual. (root_cause
+    // is set later, during triage; the cron's work_items backfill composes it
+    // from the sidecar.)
+    let bug_embed_extra: Option<String> = {
+        let parts: Vec<&str> = [
+            nonblank(&params.reproduction_steps),
+            nonblank(&params.expected_behavior),
+            nonblank(&params.actual_behavior),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        (!parts.is_empty()).then(|| parts.join("\n"))
+    };
+    let embedding = super::embed_title_body(
+        ctx,
+        title,
+        params.body.as_deref(),
+        bug_embed_extra.as_deref(),
+    )
+    .await;
 
     let new_item = NewWorkItem {
         public_id: &public_id,
         parent_id,
         project_id,
         kind: kind.as_str(),
+        status,
         title,
         body: params.body.as_deref(),
-        priority: params.priority.unwrap_or(0),
+        priority,
         weight: params.weight.unwrap_or(1.0),
         parametric: params.parametric.unwrap_or(false),
         parametric_corpus: params.parametric_corpus.as_deref(),
         origin: "agent_write",
+        severity: severity.map(Severity::as_str),
         embedding,
         ..Default::default()
     };
 
     let new_id = insert_work_item(pool, new_item).await.map_err(map_db_err)?;
+
+    // Persist the structured bug-detail sidecar when this is a bug or any bug
+    // field was supplied.
+    let bug_fields = BugDetailFields {
+        reproduction_steps: nonblank(&params.reproduction_steps),
+        expected_behavior: nonblank(&params.expected_behavior),
+        actual_behavior: nonblank(&params.actual_behavior),
+        environment: nonblank(&params.environment),
+        affected_version: nonblank(&params.affected_version),
+        is_regression: params.is_regression,
+        reported_by: nonblank(&params.reported_by),
+        ..Default::default()
+    };
+    if is_bug || !bug_fields.is_empty() {
+        upsert_bug_details(pool, new_id, &bug_fields)
+            .await
+            .map_err(map_db_err)?;
+    }
+
     let row = get_work_item(pool, new_id)
         .await
         .map_err(map_db_err)?
@@ -175,13 +240,15 @@ pub async fn tool_work_item_get(
             McpError::invalid_params(format!("no work item '{}'", params.public_id), None)
         })?;
 
+    // Include the bug-detail sidecar (NULL for non-bug items).
+    let bug_details = fetch_bug_details(pool, row.id).await.map_err(map_db_err)?;
     if params.include_subtree.unwrap_or(false) {
         let subtree = get_work_item_subtree(pool, row.id, 10_000)
             .await
             .map_err(map_db_err)?;
-        json_result(&json!({ "item": row, "subtree": subtree }))
+        json_result(&json!({ "item": row, "bug_details": bug_details, "subtree": subtree }))
     } else {
-        json_result(&json!({ "item": row }))
+        json_result(&json!({ "item": row, "bug_details": bug_details }))
     }
 }
 
@@ -199,6 +266,18 @@ pub async fn tool_work_item_update(
     let id = id_of_public(pool, &params.public_id).await?;
     let (due_at, clear_due) = parse_schedule_field(&params.due_at, "due_at")?;
     let (snooze_until, clear_snooze) = parse_schedule_field(&params.snooze_until, "snooze_until")?;
+    let severity = match nonblank(&params.severity) {
+        Some(s) => Some(Severity::parse(s).ok_or_else(|| {
+            McpError::invalid_params(
+                format!(
+                    "unknown severity '{s}'; expected one of {}",
+                    crate::tracker::severity::sql_in_list()
+                ),
+                None,
+            )
+        })?),
+        None => None,
+    };
     let row = update_work_item_fields(
         pool,
         id,
@@ -210,9 +289,28 @@ pub async fn tool_work_item_update(
         clear_due,
         snooze_until,
         clear_snooze,
+        severity.map(Severity::as_str),
     )
     .await
     .map_err(map_op_err)?;
+
+    // Fill in any structured bug fields supplied alongside the update.
+    let bug_fields = BugDetailFields {
+        reproduction_steps: nonblank(&params.reproduction_steps),
+        expected_behavior: nonblank(&params.expected_behavior),
+        actual_behavior: nonblank(&params.actual_behavior),
+        environment: nonblank(&params.environment),
+        affected_version: nonblank(&params.affected_version),
+        fixed_in_version: nonblank(&params.fixed_in_version),
+        root_cause: nonblank(&params.root_cause),
+        is_regression: params.is_regression,
+        ..Default::default()
+    };
+    if !bug_fields.is_empty() {
+        upsert_bug_details(pool, id, &bug_fields)
+            .await
+            .map_err(map_db_err)?;
+    }
 
     json_result(&row)
 }

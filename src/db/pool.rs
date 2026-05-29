@@ -40,8 +40,28 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<PgPool, sqlx::Error>
                 // `pg_stat_activity`; heavy cron transactions override it with
                 // `SET LOCAL application_name = 'pgmcp:heavy:<job>'` so the
                 // graceful-shutdown sweep can target them (see src/db/admin.rs).
+                //
+                // `client_min_messages = warning` raises the floor below which the
+                // server does not send messages to us. PostgreSQL emits a stream
+                // of benign NOTICE-level messages that sqlx otherwise surfaces at
+                // INFO and floods the logs — they are informational, not problems:
+                //   • "word is too long to be indexed" — `to_tsvector` (the
+                //     `file_chunks.content_tsv` GENERATED column + the GIN FTS
+                //     indexes) skips any single lexeme over PostgreSQL's ~2 KB
+                //     limit (minified lines, base64/hex blobs, long no-whitespace
+                //     tokens). The row is still stored and embedded; only that
+                //     over-long token is omitted from the full-text index, which
+                //     is correct — such blobs are not meaningful FTS terms.
+                //   • "relation/column ... already exists, skipping" — emitted by
+                //     the idempotent `CREATE ... IF NOT EXISTS` / `ADD COLUMN IF
+                //     NOT EXISTS` migrations on every startup.
+                // Genuine WARNING/ERROR messages (e.g. pgvector's
+                // "hnsw graph no longer fits into maintenance_work_mem") are at or
+                // above WARNING and still surface. Suppressing at the source means
+                // the server never sends them, so there is nothing for sqlx to log.
                 let base = format!(
                     "SET application_name = 'pgmcp'; \
+                     SET client_min_messages = warning; \
                      SET statement_timeout = {statement_timeout_ms}; \
                      SET idle_in_transaction_session_timeout = {idle_in_tx_timeout_ms}; \
                      SET lock_timeout = {lock_timeout_ms};"

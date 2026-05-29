@@ -50,6 +50,30 @@ versioned migration.
 | `code_graph_edges`           | Import, co-change, and semantic edges              | `source_file_id`, `target_file_id`, `edge_type`, `weight`                    |
 | `file_metrics`               | Precomputed per-file graph and quality metrics     | `pagerank`, `betweenness`, `instability`, `bug_proneness`, `tech_debt_score` |
 
+### Work-Item Tracker Tables (v4 / v5 / v12)
+
+The work-item / plan / bug tracker; full design in
+`docs/decisions/004-work-item-tracker.md`. Closed dimensions (`kind`, `status`,
+`severity`, `resolution`, …) are `TEXT` + `CHECK` built from closed Rust enums in
+`src/tracker/` (the enum is the single source of truth).
+
+| Table                                          | Purpose                                              | Key Columns                                                                                          |
+|------------------------------------------------|------------------------------------------------------|------------------------------------------------------------------------------------------------------|
+| `work_items`                                   | Item spine (self-FK tree)                            | `public_id`, `parent_id`/`root_id`, `kind`, `status`, `priority`, `severity` (v12), `weight`, `embedding` (1024), claim cols (v5) |
+| `work_item_bug_details`                        | 1:1 bug sidecar (v12; `kind='bug'`)                  | `item_id` (UQ), `reproduction_steps`, `expected_behavior`, `actual_behavior`, `environment`, `affected_version`, `fixed_in_version`, `root_cause`, `is_regression`, `triaged_at`, `resolution` |
+| `work_item_status_history`                     | Append-only transition audit                         | `item_id`, `from_status`, `to_status`, `actor_kind`, `evidence_id`                                   |
+| `acceptance_criteria` + `verification_evidence`| Machine-checkable spec + un-fakeable proof ledger    | `criterion_kind`, `coverage_mode`; `verdict`, `source` (`manual` = untrusted)                        |
+| `scope_negotiations`                           | User-only defer/cancel audit                         | `item_id`, `action`, `actor_kind='user'`, `reason`                                                   |
+| `item_relations`                               | Typed DAG edges                                      | `from/to_item_id`, `relation_type` (blocks/depends_on/duplicates/…)                                  |
+| `tags` + `work_item_tags`                      | Open-catalog tagging                                 | `slug`; `(item_id, tag_id)`                                                                           |
+| `plan_definitions` + `definition_rules`        | Reusable plan-shape validation                       | `slug`, `body_toml`; `rule_kind`, `applies_to_kind`, `field_name`                                    |
+| `work_item_claims` + `agent_presence`          | A2A claim ledger + presence decay (v5)               | `agent_id`, `action`, `lease_expires_at`                                                             |
+
+Closed vocabularies (Rust enum → CHECK): `kind` (15, incl. `bug`), `status` (12:
+…`triage` → `confirmed` → … alongside the verify lifecycle), `severity`
+(`critical | high | medium | low`), `resolution` (`fixed | wont_fix | duplicate |
+cannot_reproduce | by_design`).
+
 ### Indices
 
 | Index                             | Type                             | Purpose                                   |

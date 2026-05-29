@@ -153,6 +153,18 @@ pub trait DbClient: Send + Sync {
         language: Option<&str>,
         dedupe_worktrees: bool,
     ) -> Result<Vec<TextSearchResult>, sqlx::Error>;
+    /// Like [`DbClient::text_search`] but with a tight per-call
+    /// `statement_timeout` (ms) so `hybrid_search`'s text leg can give up fast
+    /// and degrade instead of failing the whole tool. See
+    /// `queries::text_search_bounded`.
+    async fn text_search_bounded(
+        &self,
+        query: &str,
+        limit: i32,
+        language: Option<&str>,
+        dedupe_worktrees: bool,
+        statement_timeout_ms: u32,
+    ) -> Result<Vec<TextSearchResult>, sqlx::Error>;
     async fn grep_search(
         &self,
         pattern: &str,

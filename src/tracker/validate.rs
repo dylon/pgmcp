@@ -39,6 +39,10 @@ pub struct ItemFacet {
     pub parametric: bool,
     pub has_universal_criterion: bool,
     pub depth: i32,
+    /// Names of the bug-detail fields (severity / reproduction_steps / …) that
+    /// are present (non-blank) on this item, for `required_field` rules that
+    /// target bug metadata. Empty for non-bug items.
+    pub bug_fields: Vec<String>,
 }
 
 /// One validation finding.
@@ -202,6 +206,21 @@ fn check_child_count(items: &[ItemFacet], rule: &RuleSpec, is_min: bool, out: &m
     }
 }
 
+/// Bug-detail field names a `required_field` rule may target (severity lives on
+/// the work_items spine, the rest on the `work_item_bug_details` sidecar). Any
+/// other unknown field name is skipped (treated as present), matching the
+/// pre-bug behavior.
+const BUG_FIELD_NAMES: &[&str] = &[
+    "severity",
+    "reproduction_steps",
+    "expected_behavior",
+    "actual_behavior",
+    "environment",
+    "affected_version",
+    "fixed_in_version",
+    "root_cause",
+];
+
 fn check_required_field(items: &[ItemFacet], rule: &RuleSpec, out: &mut Vec<Violation>) {
     let Some(field) = &rule.field_name else {
         return;
@@ -211,6 +230,7 @@ fn check_required_field(items: &[ItemFacet], rule: &RuleSpec, out: &mut Vec<Viol
             "body" => item.has_body,
             "due_at" => item.has_due,
             "title" => !item.title.trim().is_empty(),
+            f if BUG_FIELD_NAMES.contains(&f) => item.bug_fields.iter().any(|p| p == f),
             _ => true, // unknown field: not checkable here, skip
         };
         if !present {
@@ -350,6 +370,7 @@ mod tests {
             parametric: false,
             has_universal_criterion: false,
             depth: 0,
+            bug_fields: Vec::new(),
         }
     }
 
@@ -446,6 +467,36 @@ mod tests {
             1,
             "uppercase public_id fails the lowercase pattern"
         );
+    }
+
+    #[test]
+    fn required_field_flags_missing_bug_metadata() {
+        // A definition can dictate `required_field(applies_to_kind='bug',
+        // field_name='severity')`; an absent severity is flagged, a present one
+        // passes. Mirrors the hard gate in work_item_triage.
+        let mut bug = facet("b", "bug", None);
+        let mut r = rule("required_field");
+        r.applies_to_kind = Some("bug".to_string());
+        r.field_name = Some("severity".to_string());
+        let v = validate(&[bug.clone()], std::slice::from_ref(&r));
+        assert_eq!(v.len(), 1, "bug missing severity is flagged");
+        assert_eq!(v[0].item_public_id.as_deref(), Some("b"));
+
+        bug.bug_fields.push("severity".to_string());
+        assert!(
+            validate(&[bug], &[r]).is_empty(),
+            "bug with severity present passes"
+        );
+    }
+
+    #[test]
+    fn required_field_unknown_field_is_skipped() {
+        // A field name the facet does not track (and isn't a known bug field) is
+        // treated as present (skip), preserving pre-bug behavior.
+        let item = facet("x", "task", None);
+        let mut r = rule("required_field");
+        r.field_name = Some("nonexistent_field".to_string());
+        assert!(validate(&[item], &[r]).is_empty());
     }
 
     #[test]

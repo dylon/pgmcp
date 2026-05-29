@@ -187,6 +187,26 @@ mod tests {
     }
 
     #[test]
+    fn triage_and_confirmed_dilute_like_pending() {
+        // An open bug (triage or confirmed) is countable but not verified — it
+        // dilutes a parent's verified_fraction exactly like `pending`, and is
+        // NOT excluded the way deferred/cancelled are.
+        assert!(!Triage.is_excluded_from_rollup());
+        assert!(!Confirmed.is_excluded_from_rollup());
+        let r = aggregate(&[leaf(Verified, 1.0), leaf(Triage, 1.0), leaf(Confirmed, 1.0)]);
+        assert!(
+            (r.verified_fraction - 1.0 / 3.0).abs() < 1e-9,
+            "triage/confirmed dilute the verified fraction"
+        );
+        assert_eq!(r.leaf_count, 3, "all three are countable");
+        assert_eq!(r.verified_leaves, 1);
+        assert_eq!(
+            r.claimed_leaves, 1,
+            "triage/confirmed are not even agent-claimed"
+        );
+    }
+
+    #[test]
     fn parametric_needs_universal_coverage_not_status() {
         // A parametric leaf whose status is Verified but coverage incomplete is
         // NOT done (anti-single-case).

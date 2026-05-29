@@ -22,6 +22,8 @@ use sqlx::PgPool;
 mod schema_introspect;
 mod v10_fk_index_hardening;
 mod v11_nudge_emissions;
+mod v12_bug_tracker;
+mod v13_fts_stored_tsv;
 mod v2_shadow_asr;
 mod v3_cross_language_signatures;
 mod v4_work_items;
@@ -758,10 +760,15 @@ pub async fn run_migrations(
 
     // Create indexes (IF NOT EXISTS for idempotency)
     let indexes = [
-        // Per-chunk FTS replaces the dropped per-file index. Chunk
-        // content is bounded above by TSVECTOR_SAFE_CHUNK_BYTES (900 KiB)
-        // so every chunk fits comfortably under the 1 MiB tsvector cap.
-        "CREATE INDEX IF NOT EXISTS idx_file_chunks_fts ON file_chunks USING gin(to_tsvector('english', content))",
+        // The per-chunk full-text index lives on the stored
+        // `file_chunks.content_tsv` generated column and is created by the v13
+        // migration (`idx_file_chunks_content_tsv`, fastupdate=off) — NOT here.
+        // That column is added later in the boot by the gated v13 step, so it
+        // cannot be indexed from this unconditional initial-schema block; and
+        // creating the legacy `idx_file_chunks_fts` here would resurrect it
+        // every boot after v13 drops it. Chunk content is bounded above by
+        // TSVECTOR_SAFE_CHUNK_BYTES (900 KiB) so every chunk's tsvector fits
+        // comfortably under the 1 MiB cap.
         "CREATE INDEX IF NOT EXISTS idx_files_path_trgm ON indexed_files USING gin(relative_path gin_trgm_ops)",
         "CREATE INDEX IF NOT EXISTS idx_files_content_hash ON indexed_files(content_hash)",
         "CREATE INDEX IF NOT EXISTS idx_files_project ON indexed_files(project_id)",
@@ -2222,6 +2229,39 @@ pub async fn run_migrations(
         info!(
             version = v11_nudge_emissions::NUDGE_EMISSIONS_V1,
             "nudge_emissions_v1 migration applied"
+        );
+    }
+
+    // Step 12: bug_tracker (severity column + work_item_bug_details sidecar +
+    // triage/confirmed lifecycle states). Gated; the unconditional
+    // install_work_items_checks reconcile (above) already picked up the new
+    // kind/status vocab on existing installs, and v12::apply installs the
+    // severity CHECK once the column exists.
+    if !version_applied(pool, v12_bug_tracker::BUG_TRACKER_V1).await? {
+        v12_bug_tracker::apply(pool).await?;
+        record_version(
+            pool,
+            v12_bug_tracker::BUG_TRACKER_V1,
+            v12_bug_tracker::BUG_TRACKER_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v12_bug_tracker::BUG_TRACKER_V1,
+            "bug_tracker_v1 migration applied"
+        );
+    }
+
+    if !version_applied(pool, v13_fts_stored_tsv::FTS_STORED_TSV_V1).await? {
+        v13_fts_stored_tsv::apply(pool).await?;
+        record_version(
+            pool,
+            v13_fts_stored_tsv::FTS_STORED_TSV_V1,
+            v13_fts_stored_tsv::FTS_STORED_TSV_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v13_fts_stored_tsv::FTS_STORED_TSV_V1,
+            "fts_stored_tsv_v1 migration applied"
         );
     }
 

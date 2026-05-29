@@ -141,8 +141,8 @@ impl TransitionError {
 
 use Actor::{Agent, Gatekeeper, System, User};
 use WorkItemStatus::{
-    Blocked, Cancelled, ClaimedDone, Deferred, InProgress, Pending, Ready, Rejected, Verified,
-    Verifying,
+    Blocked, Cancelled, ClaimedDone, Confirmed, Deferred, InProgress, Pending, Ready, Rejected,
+    Triage, Verified, Verifying,
 };
 
 // Reusable actor sets (kept as slices so the matrix reads like the plan's
@@ -163,8 +163,23 @@ pub fn legal_actors(from: WorkItemStatus, to: WorkItemStatus) -> &'static [Actor
         (Pending, Ready) => UAS,
         (Pending, InProgress) => UA,
         (Pending, Blocked) => UA,
+        (Pending, Triage) => UA,
         (Pending, Deferred) => U,
         (Pending, Cancelled) => U,
+        // triage (bug intake): agents may report (→ triage) and propose a
+        // severity, but → confirmed (acceptance) is user-only — the
+        // `work_item_triage` tool checks the user token before acting as `User`,
+        // exactly as `defer` does. There is no agent arm into `confirmed`.
+        (Triage, Confirmed) => U,
+        (Triage, Blocked) => UA,
+        (Triage, Deferred) => U,
+        (Triage, Cancelled) => U,
+        // confirmed (triaged & accepted): re-enters the normal work lifecycle.
+        (Confirmed, InProgress) => UA,
+        (Confirmed, Ready) => UAS,
+        (Confirmed, Blocked) => UAS,
+        (Confirmed, Deferred) => U,
+        (Confirmed, Cancelled) => U,
         // ready
         (Ready, InProgress) => UA,
         (Ready, Blocked) => UAS,
@@ -194,8 +209,9 @@ pub fn legal_actors(from: WorkItemStatus, to: WorkItemStatus) -> &'static [Actor
         (Verifying, Rejected) => G,
         (Verifying, Deferred) => U,
         (Verifying, Cancelled) => U,
-        // verified (re-open allowed)
+        // verified (re-open allowed; → triage re-reports a regression)
         (Verified, InProgress) => UA,
+        (Verified, Triage) => UA,
         (Verified, Cancelled) => U,
         // rejected (re-work)
         (Rejected, InProgress) => UA,
@@ -207,8 +223,9 @@ pub fn legal_actors(from: WorkItemStatus, to: WorkItemStatus) -> &'static [Actor
         // deferred (reinstate is user-only)
         (Deferred, InProgress) => U,
         (Deferred, Cancelled) => U,
-        // cancelled (re-open is user-only)
+        // cancelled (re-open is user-only; → triage re-opens a closed bug)
         (Cancelled, InProgress) => U,
+        (Cancelled, Triage) => U,
         // everything else is forbidden
         _ => &[],
     }
@@ -389,5 +406,47 @@ mod tests {
         // but the agent hands off to the gatekeeper for the verdict
         assert!(check_transition(Verifying, Verified, Agent, c).is_err());
         assert!(check_transition(Verifying, Verified, Gatekeeper, c).is_ok());
+    }
+
+    #[test]
+    fn confirmed_is_user_only() {
+        // Reaching `confirmed` (triage acceptance) is a human judgment about a
+        // bug an agent may then fix — the same family as self-verify. No
+        // agent/gatekeeper/system arm may enter `confirmed` from any state;
+        // the `work_item_triage` tool checks the user token before acting as
+        // `User`.
+        for from in WorkItemStatus::ALL {
+            for actor in ACTORS {
+                if legal_actors(*from, Confirmed).contains(&actor) {
+                    assert_eq!(
+                        actor, User,
+                        "only user may confirm a bug, from {from:?} via {actor:?}"
+                    );
+                }
+            }
+        }
+        // The intake gate exists and is user-only.
+        assert!(check_transition(Triage, Confirmed, User, full_ctx()).is_ok());
+        assert!(matches!(
+            check_transition(Triage, Confirmed, Agent, full_ctx()),
+            Err(TransitionError::Unauthorized { .. })
+        ));
+    }
+
+    #[test]
+    fn bug_happy_path() {
+        let c = full_ctx();
+        // report → triage → (user) confirm → work → claim → verify gate
+        assert!(check_transition(Pending, Triage, Agent, c).is_ok());
+        assert!(check_transition(Triage, Confirmed, User, c).is_ok());
+        assert!(check_transition(Confirmed, InProgress, Agent, c).is_ok());
+        assert!(check_transition(InProgress, ClaimedDone, Agent, c).is_ok());
+        assert!(check_transition(ClaimedDone, Verifying, Agent, c).is_ok());
+        // the fix verdict is still gatekeeper-only — an agent cannot self-verify
+        // its own bug fix.
+        assert!(check_transition(Verifying, Verified, Agent, c).is_err());
+        assert!(check_transition(Verifying, Verified, Gatekeeper, c).is_ok());
+        // a verified bug can be re-reported as a regression.
+        assert!(check_transition(Verified, Triage, Agent, c).is_ok());
     }
 }
