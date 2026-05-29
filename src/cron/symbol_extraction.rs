@@ -282,6 +282,14 @@ async fn extract_and_persist_file(
         });
     }
 
+    // Temporal effect-drift (v15): snapshot the file's current effect sets
+    // BEFORE the destructive re-extraction below, keyed by (kind, name), so we
+    // can diff against the freshly-extracted sets and append gained/lost
+    // transitions to symbol_effect_history once the new rows are persisted.
+    let old_effect_sets = queries::effect_sets_for_file(pool, file_id)
+        .await
+        .unwrap_or_default();
+
     // Per-file transaction.
     let mut tx = pool.begin().await?;
     // Per-file cap — see the scrub path above for rationale.
@@ -317,6 +325,47 @@ async fn extract_and_persist_file(
     if !nonzero_ids.is_empty() {
         queries::bulk_insert_symbol_parameters(pool, &nonzero_ids, &nonzero_syms).await?;
         queries::bulk_insert_symbol_effects(pool, &nonzero_ids, &nonzero_syms).await?;
+    }
+
+    // Temporal effect-drift (v15): diff the freshly-extracted effect sets
+    // against the pre-extraction snapshot and append gained/lost transitions.
+    // Keyed by (kind, name) so a symbol that merely moved lines isn't reported
+    // as lost+gained. Non-fatal: a drift-recording failure must not abort the
+    // extraction. Unchanged files (old == new) produce zero rows, so steady
+    // state writes nothing.
+    {
+        use std::collections::{HashMap, HashSet};
+        let mut new_effect_sets: HashMap<(String, String), HashSet<String>> = HashMap::new();
+        for sym in &symbols {
+            let entry = new_effect_sets
+                .entry((sym.kind.as_db_str().to_string(), sym.name.clone()))
+                .or_default();
+            for eff in &sym.effects {
+                entry.insert(eff.clone());
+            }
+        }
+        let mut drift: Vec<(String, String, String, &'static str)> = Vec::new();
+        for ((kind, name), new_set) in &new_effect_sets {
+            let old_set = old_effect_sets.get(&(kind.clone(), name.clone()));
+            for eff in new_set {
+                if !old_set.map(|s| s.contains(eff)).unwrap_or(false) {
+                    drift.push((kind.clone(), name.clone(), eff.clone(), "gained"));
+                }
+            }
+        }
+        for ((kind, name), old_set) in &old_effect_sets {
+            let new_set = new_effect_sets.get(&(kind.clone(), name.clone()));
+            for eff in old_set {
+                if !new_set.map(|s| s.contains(eff)).unwrap_or(false) {
+                    drift.push((kind.clone(), name.clone(), eff.clone(), "lost"));
+                }
+            }
+        }
+        if !drift.is_empty()
+            && let Err(e) = queries::record_effect_drift(pool, file_id, &drift).await
+        {
+            warn!(file_id, error = %e, "effect-drift recording failed (non-fatal)");
+        }
     }
 
     // In-Rust parent_id resolution — for each Function whose start_line falls

@@ -32,6 +32,7 @@ pub mod lean;
 pub mod metta;
 pub mod python;
 pub mod registry;
+pub mod resolution_kind;
 pub mod rholang;
 pub mod rust;
 pub mod scala;

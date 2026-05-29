@@ -4,6 +4,7 @@
 #![allow(unused_imports)]
 
 use crate::db::queries::*;
+use crate::parsing::resolution_kind::ResolutionKind;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 
@@ -404,6 +405,116 @@ pub async fn bulk_insert_symbol_effects(
     Ok(sids.len() as u64)
 }
 
+// ============================================================================
+// Temporal effect-drift ledger (v15 symbol_effect_history)
+// ============================================================================
+
+/// Current effect sets for a file, keyed by the stable `(symbol_kind,
+/// symbol_name)` identity the drift ledger uses (line numbers move; kind+name
+/// is what a human means by "this function"). Read BEFORE the symbol-extraction
+/// cron rewrites a file's `symbol_effects`, so the cron can diff it against the
+/// freshly-extracted set and record `gained` / `lost` transitions.
+pub async fn effect_sets_for_file(
+    pool: &PgPool,
+    file_id: i64,
+) -> Result<
+    std::collections::HashMap<(String, String), std::collections::HashSet<String>>,
+    sqlx::Error,
+> {
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT fs.kind, fs.name, se.effect
+         FROM file_symbols fs
+         JOIN symbol_effects se ON se.symbol_id = fs.id
+         WHERE fs.file_id = $1",
+    )
+    .bind(file_id)
+    .fetch_all(pool)
+    .await?;
+    let mut map: std::collections::HashMap<(String, String), std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for (kind, name, effect) in rows {
+        map.entry((kind, name)).or_default().insert(effect);
+    }
+    Ok(map)
+}
+
+/// Append `gained` / `lost` effect-drift rows for a file. Each tuple is
+/// `(symbol_kind, symbol_name, effect, change)` where `change` is `"gained"` or
+/// `"lost"`. Append-only — never updates or deletes existing history.
+pub async fn record_effect_drift(
+    pool: &PgPool,
+    file_id: i64,
+    rows: &[(String, String, String, &'static str)],
+) -> Result<u64, sqlx::Error> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let kinds: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+    let names: Vec<String> = rows.iter().map(|r| r.1.clone()).collect();
+    let effects: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
+    let changes: Vec<String> = rows.iter().map(|r| r.3.to_string()).collect();
+    let res = sqlx::query(
+        "INSERT INTO symbol_effect_history
+             (file_id, symbol_kind, symbol_name, effect, change)
+         SELECT $1, u.kind, u.name, u.effect, u.change
+         FROM UNNEST($2::text[], $3::text[], $4::text[], $5::text[])
+              AS u(kind, name, effect, change)",
+    )
+    .bind(file_id)
+    .bind(&kinds)
+    .bind(&names)
+    .bind(&effects)
+    .bind(&changes)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// One row of the effect-drift ledger, enriched with project + path. Returned
+/// by [`query_effect_drift`] for the `effect_drift` MCP tool.
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct EffectDriftRow {
+    pub relative_path: String,
+    pub project_name: String,
+    pub symbol_kind: String,
+    pub symbol_name: String,
+    pub effect: String,
+    pub change: String,
+    pub observed_at: DateTime<Utc>,
+}
+
+/// Query the effect-drift ledger newest-first, with optional project / effect /
+/// change (`gained`|`lost`) / recency filters.
+pub async fn query_effect_drift(
+    pool: &PgPool,
+    project: Option<&str>,
+    effect: Option<&str>,
+    change: Option<&str>,
+    since: Option<DateTime<Utc>>,
+    limit: i64,
+) -> Result<Vec<EffectDriftRow>, sqlx::Error> {
+    sqlx::query_as::<_, EffectDriftRow>(
+        "SELECT f.relative_path, p.name AS project_name,
+                h.symbol_kind, h.symbol_name, h.effect, h.change, h.observed_at
+         FROM symbol_effect_history h
+         JOIN indexed_files f ON f.id = h.file_id
+         JOIN projects p ON p.id = f.project_id
+         WHERE ($1::text IS NULL OR p.name = $1)
+           AND ($2::text IS NULL OR h.effect = $2)
+           AND ($3::text IS NULL OR h.change = $3)
+           AND ($4::timestamptz IS NULL OR h.observed_at >= $4)
+         ORDER BY h.observed_at DESC, h.id DESC
+         LIMIT $5",
+    )
+    .bind(project)
+    .bind(effect)
+    .bind(change)
+    .bind(since)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Apply resolution metadata to existing `symbol_references` rows. Pairs
 /// align with rows by `(source_file_id, source_line, target_raw,
 /// ref_kind)` — the same composite key the cron uses to identify them.
@@ -532,19 +643,24 @@ pub async fn resolve_symbol_reference_targets(
     pool: &PgPool,
     project_id: i32,
 ) -> Result<u64, sqlx::Error> {
-    // Resolution pass v2: three-phase walk that populates not only
+    // Resolution pass v2: a four-phase walk that populates not only
     // `target_symbol_id` (legacy) but also `target_path`,
     // `resolution_kind`, and `resolution_confidence`. The phases are
     // ordered by precision so each phase only touches rows the earlier
-    // ones couldn't resolve.
+    // ones couldn't resolve. Every tier string + confidence is sourced from
+    // the closed `ResolutionKind` enum (see `src/parsing/resolution_kind.rs`)
+    // so the writer and the `chk_symbol_refs_resolution_kind` CHECK
+    // (`v14_resolution_kind_vocab`) cannot drift — the exact failure that
+    // previously rolled this whole transaction back.
     //
     //   1. exact_in_file        — name matches a symbol in the same file
     //                            (confidence 1.0).
-    //   2. exact_via_import     — name matches a symbol whose `scope_path`
-    //                            corresponds to an import's `target_raw`
-    //                            within the same project (confidence 0.95).
-    //   3. bare_name_in_project — name matches some symbol elsewhere in the
-    //                            project (confidence 0.5).
+    //   2. exact_via_import     — name matches a symbol reachable through an
+    //                            `import` edge within the project (0.95).
+    //   3a. bare_name_unique    — exactly one project-wide same-name candidate
+    //                            (0.7); 3b. bare_name_ambiguous — multiple
+    //                            candidates, the DB picks one but it's an
+    //                            unreliable guess (0.3).
     //   4. unresolved           — final mark for everything else
     //                            (confidence 0.0, target_symbol_id NULL).
     //
@@ -570,14 +686,17 @@ pub async fn resolve_symbol_reference_targets(
         .execute(&mut *tx)
         .await?;
 
-    // Phase 1: exact_in_file. Same source file, same name.
-    let phase1 = sqlx::query(
+    // Phase 1: exact_in_file. Same source file, same name. Tier string +
+    // confidence come from the closed `ResolutionKind` enum so the values
+    // written here cannot drift from the `chk_symbol_refs_resolution_kind`
+    // CHECK (built from the same enum in `v14_resolution_kind_vocab`).
+    let phase1_sql = format!(
         "UPDATE symbol_references sr
          SET target_symbol_id = fs.id,
              target_file_id = fs.file_id,
              target_path = fs.scope_path,
-             resolution_kind = 'exact_in_file',
-             resolution_confidence = 1.0
+             resolution_kind = '{kind}',
+             resolution_confidence = {conf}
          FROM file_symbols fs
          WHERE fs.file_id = sr.source_file_id
            AND sr.target_raw = fs.name
@@ -586,10 +705,13 @@ pub async fn resolve_symbol_reference_targets(
                SELECT 1 FROM indexed_files f
                 WHERE f.id = sr.source_file_id AND f.project_id = $1
            )",
-    )
-    .bind(project_id)
-    .execute(&mut *tx)
-    .await?;
+        kind = ResolutionKind::ExactInFile.as_db_str(),
+        conf = ResolutionKind::ExactInFile.confidence(),
+    );
+    let phase1 = sqlx::query(&phase1_sql)
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
 
     // Phase 2: exact_via_import. The reference's source file imports a
     // module/symbol whose `target_raw` ends with `::<name>` (or `.<name>`
@@ -602,13 +724,13 @@ pub async fn resolve_symbol_reference_targets(
     // entry for table "sr"`. The `e.source_file_id = sr.source_file_id`
     // correlation belongs in WHERE, not in the JOIN ON. See plan
     // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md F2.
-    let phase2 = sqlx::query(
+    let phase2_sql = format!(
         "UPDATE symbol_references sr
          SET target_symbol_id = fs.id,
              target_file_id = fs.file_id,
              target_path = fs.scope_path,
-             resolution_kind = 'exact_via_import',
-             resolution_confidence = 0.95
+             resolution_kind = '{kind}',
+             resolution_confidence = {conf}
          FROM file_symbols fs
          JOIN indexed_files tgt_f ON tgt_f.id = fs.file_id
          JOIN code_graph_edges e
@@ -622,10 +744,13 @@ pub async fn resolve_symbol_reference_targets(
                SELECT 1 FROM indexed_files f
                 WHERE f.id = sr.source_file_id AND f.project_id = $1
            )",
-    )
-    .bind(project_id)
-    .execute(&mut *tx)
-    .await?;
+        kind = ResolutionKind::ExactViaImport.as_db_str(),
+        conf = ResolutionKind::ExactViaImport.confidence(),
+    );
+    let phase2 = sqlx::query(&phase2_sql)
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
 
     // Phase 3: bare-name match within the project, now CONFIDENCE-GRADED by
     // ambiguity (graph-roadmap Phase 4.1). The legacy single 0.5 tier matched
@@ -640,7 +765,7 @@ pub async fn resolve_symbol_reference_targets(
     // (Full receiver-type resolution — resolving `recv.method()` against the
     // receiver's inferred type — is the per-language extractor follow-up; it
     // needs a `receiver_type` the symbol extractors don't yet emit.)
-    let phase3 = sqlx::query(
+    let phase3_sql = format!(
         "WITH cand AS (
              SELECT sr.id AS ref_id,
                     (SELECT COUNT(*)
@@ -656,9 +781,9 @@ pub async fn resolve_symbol_reference_targets(
              target_file_id = fs.file_id,
              target_path = fs.scope_path,
              resolution_kind = CASE WHEN cand.n_cand = 1
-                                    THEN 'bare_name_unique'
-                                    ELSE 'bare_name_ambiguous' END,
-             resolution_confidence = CASE WHEN cand.n_cand = 1 THEN 0.7 ELSE 0.3 END
+                                    THEN '{uniq}'
+                                    ELSE '{ambig}' END,
+             resolution_confidence = CASE WHEN cand.n_cand = 1 THEN {uniq_conf} ELSE {ambig_conf} END
          FROM file_symbols fs
          JOIN indexed_files tgt_f ON tgt_f.id = fs.file_id,
               cand
@@ -670,26 +795,34 @@ pub async fn resolve_symbol_reference_targets(
            AND cand.ref_id = sr.id
            AND sr.target_raw = fs.name
            AND sr.resolution_kind IS NULL",
-    )
-    .bind(project_id)
-    .execute(&mut *tx)
-    .await?;
+        uniq = ResolutionKind::BareNameUnique.as_db_str(),
+        ambig = ResolutionKind::BareNameAmbiguous.as_db_str(),
+        uniq_conf = ResolutionKind::BareNameUnique.confidence(),
+        ambig_conf = ResolutionKind::BareNameAmbiguous.confidence(),
+    );
+    let phase3 = sqlx::query(&phase3_sql)
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
 
     // Phase 4: anything still unresolved within the project's references is
     // marked `unresolved` so tools can distinguish "we tried" from "not yet
     // processed".
-    let phase4 = sqlx::query(
+    let phase4_sql = format!(
         "UPDATE symbol_references sr
-         SET resolution_kind = 'unresolved',
-             resolution_confidence = 0.0
+         SET resolution_kind = '{kind}',
+             resolution_confidence = {conf}
          FROM indexed_files f
          WHERE sr.source_file_id = f.id
            AND f.project_id = $1
            AND sr.resolution_kind IS NULL",
-    )
-    .bind(project_id)
-    .execute(&mut *tx)
-    .await?;
+        kind = ResolutionKind::Unresolved.as_db_str(),
+        conf = ResolutionKind::Unresolved.confidence(),
+    );
+    let phase4 = sqlx::query(&phase4_sql)
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
 
     let resolved = phase1.rows_affected()
         + phase2.rows_affected()

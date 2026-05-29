@@ -111,6 +111,9 @@ async fn legs_fused_two_when_wfst_lm_weight_is_zero() {
         // Explicit opt-out → third leg must NOT fire.
         wfst_lm_weight: Some(0.0),
         max_query_edit_distance: Some(2),
+        return_type_tags: None,
+        effects: None,
+        scope_kind: None,
     };
     let result = tool_hybrid_search(&ctx, params).await.expect("call");
     let json = extract_text(&result);
@@ -153,6 +156,9 @@ async fn legs_fused_two_when_no_lm_model_file_present() {
         // Caller opts IN, but no model file exists.
         wfst_lm_weight: Some(1.0),
         max_query_edit_distance: Some(2),
+        return_type_tags: None,
+        effects: None,
+        scope_kind: None,
     };
     let result = tool_hybrid_search(&ctx, params).await.expect("call");
     let json = extract_text(&result);

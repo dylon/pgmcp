@@ -322,6 +322,22 @@ pub async fn tool_hybrid_search(
             .unwrap_or(0.0);
         sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
     });
+    // Shadow-ASR Pattern D facet filter (same helper as semantic_search /
+    // text_search / grep): drop fused hits whose enclosing symbol doesn't match
+    // the requested return_type_tags / effects / scope_kind. Applied BEFORE
+    // truncation so `limit` bounds the filtered set. No-op when no facet is set.
+    // Semantic + WFST-rewritten legs carry start_line + project_name, so they are
+    // symbol-resolved and filtered; BM25-only (text-leg) hits carry no line anchor
+    // and are retained as-is (they can't be mapped to an enclosing symbol — the
+    // helper keeps any row it can't evaluate rather than drop it).
+    let mut fused = crate::mcp::tools::sema_helpers::filters::enclosing_symbol_filter_pass(
+        ctx.db().pool(),
+        fused,
+        params.return_type_tags.as_deref(),
+        params.effects.as_deref(),
+        params.scope_kind.as_deref(),
+    )
+    .await;
     fused.truncate(limit as usize);
 
     // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.

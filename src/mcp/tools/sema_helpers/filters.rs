@@ -8,7 +8,10 @@
 //! Also exposes [`enclosing_symbol_filter_pass`], which post-filters a
 //! generic search-result list against the enclosing symbol's
 //! return_type_tags / effects / scope_kind. Each result must serialize
-//! to a JSON object containing at least `file_id` and `start_line`.
+//! to a JSON object containing `start_line` plus EITHER `file_id` OR the
+//! pair (`relative_path`, `project_name`) — the latter is how the
+//! `SearchResult`-based tools (semantic/text/hybrid search) are resolved,
+//! since that struct carries no `file_id`.
 
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -42,11 +45,36 @@ where
                 continue;
             }
         };
-        let file_id = value.get("file_id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let mut file_id = value.get("file_id").and_then(|v| v.as_i64()).unwrap_or(0);
         let start_line = value
             .get("start_line")
             .and_then(|v| v.as_i64())
             .unwrap_or(0) as i32;
+        // SearchResult-based tools (semantic_search / text_search / hybrid_search)
+        // don't carry `file_id`; resolve it from the `relative_path` +
+        // `project_name` they DO carry. Without this fallback the filter keyed on
+        // an always-absent `file_id`, so the effects/return_type_tags/scope_kind
+        // facets silently kept every row (a no-op). project_name disambiguates the
+        // worktree case where the same relative_path exists in sibling clones.
+        if file_id == 0
+            && let (Some(rp), Some(pn)) = (
+                value.get("relative_path").and_then(|v| v.as_str()),
+                value.get("project_name").and_then(|v| v.as_str()),
+            )
+        {
+            file_id = sqlx::query_scalar::<_, i64>(
+                "SELECT f.id FROM indexed_files f
+                 JOIN projects p ON p.id = f.project_id
+                 WHERE f.relative_path = $1 AND p.name = $2
+                 LIMIT 1",
+            )
+            .bind(rp)
+            .bind(pn)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None)
+            .unwrap_or(0);
+        }
         if file_id == 0 {
             keep.push(r);
             continue;

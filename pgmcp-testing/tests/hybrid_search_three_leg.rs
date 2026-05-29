@@ -157,6 +157,9 @@ async fn third_leg_activates_with_trained_lm_and_misspelled_query() {
         dedupe_worktrees: Some(false),
         wfst_lm_weight: Some(1.0),
         max_query_edit_distance: Some(2),
+        return_type_tags: None,
+        effects: None,
+        scope_kind: None,
     };
     let result = tool_hybrid_search(&ctx, params)
         .await

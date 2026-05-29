@@ -112,6 +112,30 @@ or 'what does this entry point ultimately do?'."
     }
 
     #[tool(
+        description = "Temporal effect-drift: which symbols recently GAINED or LOST a shadow-ASR \
+effect (unsafe / async / may_panic / blocking_io / …) over time. USE WHEN: 'what just became \
+unsafe?', auditing when async crept into a module, or tracking semantic API-contract changes. \
+Reads the append-only symbol_effect_history ledger the symbol-extraction cron maintains by \
+diffing each file's freshly-extracted effect set against the prior one. Filter by project / \
+effect / change (gained|lost) / since_days; newest first."
+    )]
+    async fn effect_drift(
+        &self,
+        Parameters(params): Parameters<EffectDriftParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "effect_drift",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_effect_drift::tool_effect_drift(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "List the type-tag and effect vocabularies with per-tag usage counts \
 and descriptions. USE WHEN: orienting to the tag schema before formulating \
 queries, or auditing which tags actually appear in this project's code."

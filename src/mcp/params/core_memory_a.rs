@@ -50,6 +50,23 @@ pub struct HybridSearchParams {
                        candidates for the third-leg lattice. Default 2."
     )]
     pub max_query_edit_distance: Option<usize>,
+    // Shadow-ASR facet filters (Pattern D), same semantics as semantic_search /
+    // text_search / grep: post-filter fused hits by their enclosing symbol.
+    #[schemars(
+        description = "Shadow-ASR filter: restrict hits to chunks whose enclosing symbol's \
+                       return_type_tags contains ALL of these tags. Optional."
+    )]
+    pub return_type_tags: Option<Vec<String>>,
+    #[schemars(
+        description = "Shadow-ASR filter: restrict hits to chunks whose enclosing symbol carries \
+                       at least one of these effects (e.g. ['unsafe','may_panic']). Optional."
+    )]
+    pub effects: Option<Vec<String>>,
+    #[schemars(
+        description = "Shadow-ASR filter: restrict hits to chunks whose enclosing symbol kind \
+                       matches (e.g. \"function\", \"trait\", \"class\"). Optional."
+    )]
+    pub scope_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

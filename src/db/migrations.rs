@@ -24,6 +24,8 @@ mod v10_fk_index_hardening;
 mod v11_nudge_emissions;
 mod v12_bug_tracker;
 mod v13_fts_stored_tsv;
+mod v14_resolution_kind_vocab;
+mod v15_symbol_effect_history;
 mod v2_shadow_asr;
 mod v3_cross_language_signatures;
 mod v4_work_items;
@@ -2265,6 +2267,34 @@ pub async fn run_migrations(
         );
     }
 
+    if !version_applied(pool, v14_resolution_kind_vocab::RESOLUTION_KIND_VOCAB_V1).await? {
+        v14_resolution_kind_vocab::apply(pool).await?;
+        record_version(
+            pool,
+            v14_resolution_kind_vocab::RESOLUTION_KIND_VOCAB_V1,
+            v14_resolution_kind_vocab::RESOLUTION_KIND_VOCAB_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v14_resolution_kind_vocab::RESOLUTION_KIND_VOCAB_V1,
+            "resolution_kind_vocab_v1 migration applied"
+        );
+    }
+
+    if !version_applied(pool, v15_symbol_effect_history::SYMBOL_EFFECT_HISTORY_V1).await? {
+        v15_symbol_effect_history::apply(pool).await?;
+        record_version(
+            pool,
+            v15_symbol_effect_history::SYMBOL_EFFECT_HISTORY_V1,
+            v15_symbol_effect_history::SYMBOL_EFFECT_HISTORY_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v15_symbol_effect_history::SYMBOL_EFFECT_HISTORY_V1,
+            "symbol_effect_history_v1 migration applied"
+        );
+    }
+
     // Build/refresh the work_items HNSW index (unconditional; the table exists
     // after the v4 step on fresh installs and already exists on upgrades).
     ensure_work_items_hnsw_index(pool, vector_config).await?;
@@ -2384,7 +2414,20 @@ pub(crate) const MEMORY_UNIFIED_NODES_SQL: &str = "CREATE MATERIALIZED VIEW memo
     UNION ALL
     SELECT 'protocol_role:' || id::TEXT, 'protocol_role',
            role, NULL::VECTOR(1024), 0.4
-      FROM csm_projections";
+      FROM csm_projections
+    UNION ALL
+    -- effect catalog as graph nodes (shadow-ASR): lets PPR/RAPTOR cluster code
+    -- by effect and lets traversal filter on effect membership. No embedding —
+    -- effects are categorical hubs reached via `has_effect` edges, not seeded.
+    SELECT 'effect:' || name, 'effect',
+           name, NULL::VECTOR(1024), 0.3
+      FROM effect_catalog
+    UNION ALL
+    -- type-tag catalog as graph nodes (shadow-ASR): the structural type vocabulary,
+    -- reached via `has_type` edges from symbols' parameter / return tags.
+    SELECT 'type_tag:' || name, 'type_tag',
+           name, NULL::VECTOR(1024), 0.3
+      FROM type_tag_catalog";
 
 /// Edges-view definition. Same single-source-of-truth posture as
 /// `MEMORY_UNIFIED_NODES_SQL` — F9's hash-gate covers both.
@@ -2483,6 +2526,64 @@ pub(crate) const MEMORY_UNIFIED_EDGES_SQL: &str = "CREATE MATERIALIZED VIEW memo
         AND (s.visibility = 'public'
          OR EXISTS (SELECT 1 FROM memory_code_anchor mca WHERE mca.symbol_id = s.id)
          OR EXISTS (SELECT 1 FROM work_item_code_anchor wca WHERE wca.symbol_id = s.id))
+    UNION ALL
+    -- symbol → symbol resolved CALL edges (shadow-ASR), weighted by resolution
+    -- confidence. Both endpoints are gated to the symbol-node set (public/anchored,
+    -- identical to the node arm) so no edge dangles, and the matview stays bounded.
+    -- The 0.5 confidence floor keeps exact_in_file / exact_via_import /
+    -- bare_name_unique and drops the 0.3 ambiguous guesses and 0.0 unresolved.
+    -- Deep reachability through private helpers remains the domain of
+    -- effect_propagation / dead_code_reachability over the full symbol_references
+    -- graph; this arm contributes the public-API call structure to the unified graph.
+    SELECT 'symbol:' || sr.source_symbol_id::TEXT, 'symbol',
+           'symbol:' || sr.target_symbol_id::TEXT, 'symbol',
+           'calls', sr.resolution_confidence::DOUBLE PRECISION,
+           NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
+      FROM symbol_references sr
+      JOIN file_symbols src ON src.id = sr.source_symbol_id
+      JOIN file_symbols tgt ON tgt.id = sr.target_symbol_id
+      WHERE sr.target_symbol_id IS NOT NULL
+        AND sr.resolution_confidence >= 0.5
+        AND (src.visibility = 'public'
+             OR EXISTS (SELECT 1 FROM memory_code_anchor m WHERE m.symbol_id = src.id)
+             OR EXISTS (SELECT 1 FROM work_item_code_anchor w WHERE w.symbol_id = src.id))
+        AND (tgt.visibility = 'public'
+             OR EXISTS (SELECT 1 FROM memory_code_anchor m WHERE m.symbol_id = tgt.id)
+             OR EXISTS (SELECT 1 FROM work_item_code_anchor w WHERE w.symbol_id = tgt.id))
+    UNION ALL
+    -- symbol → effect membership (shadow-ASR); symbol gated to the node set.
+    SELECT 'symbol:' || se.symbol_id::TEXT, 'symbol',
+           'effect:' || se.effect, 'effect',
+           'has_effect', 1.0::DOUBLE PRECISION,
+           NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
+      FROM symbol_effects se
+      JOIN file_symbols s ON s.id = se.symbol_id
+      WHERE s.visibility = 'public'
+         OR EXISTS (SELECT 1 FROM memory_code_anchor m WHERE m.symbol_id = s.id)
+         OR EXISTS (SELECT 1 FROM work_item_code_anchor w WHERE w.symbol_id = s.id)
+    UNION ALL
+    -- symbol → type_tag (return-type tags, shadow-ASR); symbol gated to the node set.
+    SELECT 'symbol:' || s.id::TEXT, 'symbol',
+           'type_tag:' || tag, 'type_tag',
+           'has_type', 1.0::DOUBLE PRECISION,
+           NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
+      FROM file_symbols s
+      CROSS JOIN LATERAL unnest(s.return_type_tags) AS tag
+      WHERE s.visibility = 'public'
+         OR EXISTS (SELECT 1 FROM memory_code_anchor m WHERE m.symbol_id = s.id)
+         OR EXISTS (SELECT 1 FROM work_item_code_anchor w WHERE w.symbol_id = s.id)
+    UNION ALL
+    -- symbol → type_tag (parameter tags, shadow-ASR); symbol gated to the node set.
+    SELECT 'symbol:' || sp.symbol_id::TEXT, 'symbol',
+           'type_tag:' || tag, 'type_tag',
+           'has_type', 1.0::DOUBLE PRECISION,
+           NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
+      FROM symbol_parameters sp
+      JOIN file_symbols s ON s.id = sp.symbol_id
+      CROSS JOIN LATERAL unnest(sp.type_tags) AS tag
+      WHERE s.visibility = 'public'
+         OR EXISTS (SELECT 1 FROM memory_code_anchor m WHERE m.symbol_id = s.id)
+         OR EXISTS (SELECT 1 FROM work_item_code_anchor w WHERE w.symbol_id = s.id)
     UNION ALL
     -- file ↔ file: import / co_change / call (passthrough edge_type)
     SELECT 'file:' || source_file_id::TEXT, 'file',

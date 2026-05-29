@@ -20,8 +20,12 @@
 //!     (defined in file2).
 //!   - Phase 2 (`exact_via_import`): ref in file1 → `target_func`
 //!     (resolved via the import edge to file2).
-//!   - Phase 3 (`bare_name_in_project`): ref in file3 → `target_func`
-//!     (no import edge; matches by name within the project).
+//!   - Phase 3 (`bare_name_unique`): ref in file3 → `target_func`
+//!     (no import edge; matches by name within the project; `target_func` has
+//!     exactly one project-wide definition ⇒ the *unique* bare-name tier). The
+//!     confidence-graded split (`bare_name_unique` / `bare_name_ambiguous`)
+//!     replaced the legacy single `bare_name_in_project` tier; the
+//!     `bare_name_ambiguous` branch has its own test below.
 //!   - Phase 4 (`unresolved`): ref in file1 → `nonexistent_symbol`.
 //!
 //! Asserts no error from the four UPDATE chain calls and that the
@@ -191,8 +195,9 @@ async fn resolution_pass_runs_all_four_phases_without_sr_scope_error() {
         by_key
             .get(&(file3, "target_func".to_string()))
             .map(String::as_str),
-        Some("bare_name_in_project"),
-        "Phase 3: file3's ref to target_func (no import) should bare-match"
+        Some("bare_name_unique"),
+        "Phase 3: file3's ref to target_func (no import, lone candidate) \
+         should be the unique bare-name tier"
     );
     assert_eq!(
         by_key
@@ -200,5 +205,101 @@ async fn resolution_pass_runs_all_four_phases_without_sr_scope_error() {
             .map(String::as_str),
         Some("unresolved"),
         "Phase 4: file1's ref to nonexistent_symbol should be unresolved"
+    );
+}
+
+/// Phase 3 ambiguity grading: a bare-name reference whose target name has
+/// *multiple* project-wide definitions (and no import edge to disambiguate)
+/// lands in `bare_name_ambiguous` at low confidence, not `bare_name_unique`.
+/// This is the branch the v14 vocabulary fix unblocked — pre-fix, Phase 3
+/// violated the stale CHECK and rolled back the whole resolution transaction.
+#[tokio::test(flavor = "multi_thread")]
+async fn phase3_multiple_candidates_grade_ambiguous() {
+    let testdb = require_test_db!();
+    let pool = testdb.pool();
+
+    let project_id: i32 = sqlx::query_scalar(
+        "INSERT INTO projects (workspace_path, path, name)
+         VALUES ('/ws/p14_ambig', '/ws/p14_ambig/p', 'p14_ambig_test')
+         ON CONFLICT (path) DO UPDATE SET workspace_path = EXCLUDED.workspace_path
+         RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("project");
+
+    // Two files each define `dup`; a third file references it with no import
+    // edge → two project-wide candidates → ambiguous.
+    let mut file_ids: Vec<i64> = Vec::with_capacity(3);
+    for (rel, hash) in [
+        ("src/a.rs", 2001_i64),
+        ("src/b.rs", 2002_i64),
+        ("src/c.rs", 2003_i64),
+    ] {
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO indexed_files
+                 (project_id, path, relative_path, language, size_bytes,
+                  content, content_hash, line_count, modified_at)
+             VALUES ($1, $2, $3, 'rust', 64, 'unused', $4, 1, NOW())
+             ON CONFLICT (path) DO UPDATE SET content_hash = EXCLUDED.content_hash
+             RETURNING id",
+        )
+        .bind(project_id)
+        .bind(format!("/ws/p14_ambig/p/{rel}"))
+        .bind(rel)
+        .bind(hash)
+        .fetch_one(pool)
+        .await
+        .expect("file");
+        file_ids.push(id);
+    }
+    let (file_a, file_b, file_c) = (file_ids[0], file_ids[1], file_ids[2]);
+
+    for fid in [file_a, file_b] {
+        sqlx::query(
+            "INSERT INTO file_symbols (file_id, name, kind, start_line, end_line)
+             VALUES ($1, 'dup', 'function', 1, 1)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(fid)
+        .execute(pool)
+        .await
+        .expect("file_symbols insert");
+    }
+
+    sqlx::query(
+        "INSERT INTO symbol_references
+             (source_file_id, target_raw, ref_kind, source_line)
+         VALUES ($1, 'dup', 'call', 1)
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(file_c)
+    .execute(pool)
+    .await
+    .expect("symbol_references insert");
+
+    queries::resolve_symbol_reference_targets(pool, project_id)
+        .await
+        .expect("resolution must succeed end-to-end");
+
+    let row: (Option<String>, Option<f32>) = sqlx::query_as(
+        "SELECT resolution_kind, resolution_confidence
+           FROM symbol_references
+          WHERE source_file_id = $1 AND target_raw = 'dup'",
+    )
+    .bind(file_c)
+    .fetch_one(pool)
+    .await
+    .expect("fetch resolution");
+
+    assert_eq!(
+        row.0.as_deref(),
+        Some("bare_name_ambiguous"),
+        "two same-name candidates with no import edge ⇒ ambiguous tier"
+    );
+    assert_eq!(
+        row.1,
+        Some(0.3_f32),
+        "ambiguous tier carries the low (0.3) confidence"
     );
 }

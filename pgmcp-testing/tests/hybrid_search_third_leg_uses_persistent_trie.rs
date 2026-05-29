@@ -173,6 +173,9 @@ async fn third_leg_pulls_candidates_from_persistent_trie() {
         dedupe_worktrees: Some(false),
         wfst_lm_weight: Some(1.0),
         max_query_edit_distance: Some(3),
+        return_type_tags: None,
+        effects: None,
+        scope_kind: None,
     };
     let result = tool_hybrid_search(&ctx, params).await.expect("call");
     let json_text = result

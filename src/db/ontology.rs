@@ -157,6 +157,21 @@ pub const NODE_TYPES: &[NodeTypeMeta] = &[
         source_table: "csm_projections",
         has_embedding: false,
     },
+    // Shadow-ASR semantic layer (v2_shadow_asr): the effect + type-tag
+    // vocabularies as graph nodes, reached via `has_effect` / `has_type` edges.
+    // No embedding — categorical hubs, graph-traversable but not vector-seeded.
+    NodeTypeMeta {
+        key: "effect",
+        display: "Effect (shadow-ASR)",
+        source_table: "effect_catalog",
+        has_embedding: false,
+    },
+    NodeTypeMeta {
+        key: "type_tag",
+        display: "Type Tag (shadow-ASR)",
+        source_table: "type_tag_catalog",
+        has_embedding: false,
+    },
 ];
 
 /// CLOSED structural edge-type core: the edge_type *literals* emitted by
@@ -248,6 +263,24 @@ pub const EDGE_TYPES_CORE: &[EdgeTypeMeta] = &[
         key: "workflow_like",
         display: "Workflow Like (event-sequence)",
         directed: false,
+    },
+    // Shadow-ASR semantic edges (v2_shadow_asr). `calls` is weighted by
+    // resolution_confidence; `has_effect` / `has_type` attach a symbol to its
+    // effect / type-tag vocabulary nodes. All gated to the symbol-node set.
+    EdgeTypeMeta {
+        key: "calls",
+        display: "Calls (symbol→symbol, resolved)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "has_effect",
+        display: "Has Effect (symbol→effect)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "has_type",
+        display: "Has Type (symbol→type_tag)",
+        directed: true,
     },
 ];
 

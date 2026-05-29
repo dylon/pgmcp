@@ -236,6 +236,29 @@ pub struct EffectPropagationParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EffectDriftParams {
+    #[schemars(
+        description = "Filter to a single project by name. Optional (omit = all projects)."
+    )]
+    pub project: Option<String>,
+    #[schemars(
+        description = "Filter to a single effect (e.g. 'unsafe', 'async', 'blocking_io', \
+                       'may_panic'). Optional."
+    )]
+    pub effect: Option<String>,
+    #[schemars(
+        description = "Filter to 'gained' or 'lost' transitions only. Optional (omit = both)."
+    )]
+    pub change: Option<String>,
+    #[schemars(
+        description = "Only transitions observed within the last N days. Optional (omit = all time)."
+    )]
+    pub since_days: Option<i64>,
+    #[schemars(description = "Maximum rows to return, newest first (default 50, max 500).")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TypeTagDictionaryParams {
     // No filter parameters — this tool is a self-documenting introspection
     // surface for the vocabulary catalogs. The empty struct keeps the

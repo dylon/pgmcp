@@ -74,6 +74,9 @@ fn params() -> HybridSearchParams {
         // isolating the text/semantic degradation behavior under test.
         wfst_lm_weight: Some(0.0),
         max_query_edit_distance: Some(2),
+        return_type_tags: None,
+        effects: None,
+        scope_kind: None,
     }
 }
 
