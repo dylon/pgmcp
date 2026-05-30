@@ -48,6 +48,38 @@ throughput** — already parallel across `embeddings.pool_size` workers and boun
 by GPU VRAM. To make a cold full-index finish sooner, raise
 `embeddings.pool_size` / `embeddings.batch_size` (VRAM permitting), not the walk.
 
+### Logs
+
+The daemon writes structured JSON logs to the file named by `[logging] file`
+(default `~/.local/share/pgmcp/pgmcp.log`). The level is `[logging] level`
+(default `info`); `RUST_LOG` overrides it. One-shot CLI subcommands log to stderr
+*and* append to the same file.
+
+**Rotation.** `[logging] rotation` (default `daily`) rotates by **renaming** the
+active file to `pgmcp.log.<period>` — `<period>` is a **UTC** calendar date
+(`2026-05-30`) for `daily`, or `…-HH` for `hourly` — then opens a fresh
+`pgmcp.log`. `[logging] max_log_files` (default 7) bounds how many rotated files
+are retained. Rotation is keyed to **UTC** so the rotated-file date suffix lines
+up with the UTC timestamps inside the log.
+
+**Watch the live log with `tail -F`, not `tail -f`.** Rotation renames the inode,
+and `tail -f` follows the open *descriptor* — so it silently freezes on the
+now-rotated file the instant the log rolls over (UTC midnight for `daily`); the
+log then *looks* stuck even though the daemon is happily writing to the new
+`pgmcp.log` inode. `-F` follows the *path* and re-opens across the rename:
+
+```sh
+tail -F ~/.local/share/pgmcp/pgmcp.log          # survives rotation
+tail -F ~/.local/share/pgmcp/pgmcp.log | jq .   # pretty-print the JSON lines
+```
+
+A long, fully-blocking startup **migration** (e.g. a `GENERATED … STORED` column
+add that rewrites a large table) can take minutes during which the daemon emits
+nothing else and the HTTP listener is not yet bound — the migration runner now
+logs a `"starting migration step"` line (with the version) before each step and a
+`"migration step applied"` line with `elapsed_ms` after, so a long step reads as
+*in progress* rather than as a hang.
+
 ### Cron Jobs
 
 pgmcp runs eight automated jobs via a lock-free cron state machine:

@@ -279,6 +279,12 @@ pub use tool_experiments::{
 // (`crud` + `lifecycle`) mirrors the tracker's domain split.
 pub mod work_items;
 
+// JSON data tables (client-defined tables of observation rows). Submodule
+// layout (`ddl` / `dml` / `analysis` / `search`) mirrors SQL DDL/DML + the
+// analysis & discovery surface. Domain in `crate::datatable`, queries in
+// `crate::db::queries::data_tables`, schema in the v19 migration.
+pub mod data_tables;
+
 pub use tool_adoption_lag::tool_adoption_lag;
 pub use tool_anomaly_detection::tool_anomaly_detection;
 pub use tool_architecture_dsm::tool_architecture_dsm;

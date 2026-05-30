@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
-use chrono::Local;
+use chrono::Utc;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::fmt::MakeWriter;
@@ -46,16 +46,16 @@ enum RotationPeriod {
 /// that was current when the file was opened.
 struct AppenderState {
     file: File,
-    /// `None` when rotation is `Never`; otherwise the period string
+    /// `None` when rotation is `Never`; otherwise the UTC period string
     /// (e.g. `"2026-03-09"` or `"2026-03-09-14"`) at the time the file was opened.
     current_period: Option<String>,
 }
 
 /// A rotating file appender that always writes to `{dir}/{filename}`.
 ///
-/// On rotation boundary (daily/hourly) the current file is renamed to
-/// `{filename}.{period}` and a fresh `{filename}` is opened.  Old rotated
-/// files beyond `max_files` are pruned.
+/// On rotation boundary (daily/hourly, computed in UTC) the current file is
+/// renamed to `{filename}.{period}` and a fresh `{filename}` is opened.  Old
+/// rotated files beyond `max_files` are pruned.
 ///
 /// Implements [`MakeWriter`] so it can be used directly with
 /// `tracing_subscriber`.
@@ -101,12 +101,17 @@ impl RotatingFileAppender {
         })
     }
 
-    /// Return the period string for the current local time, or `None` for
-    /// `Never` rotation.
+    /// Return the period string for the current UTC time, or `None` for
+    /// `Never` rotation. UTC — not local time — keeps the rotation boundary and
+    /// the rotated-file date suffix aligned with the UTC timestamps the log
+    /// lines themselves carry. (Using `Local::now()` here is what let a daemon
+    /// started at 23:45 local cross into the next UTC… er, local day mid-run and
+    /// rename `pgmcp.log` out from under a `tail -f`; see
+    /// `~/.claude/plans/pgmcp-has-not-logged-structured-sprout.md`.)
     fn period_string_for(rotation: &RotationPeriod) -> Option<String> {
         match rotation {
-            RotationPeriod::Daily => Some(Local::now().format("%Y-%m-%d").to_string()),
-            RotationPeriod::Hourly => Some(Local::now().format("%Y-%m-%d-%H").to_string()),
+            RotationPeriod::Daily => Some(Utc::now().format("%Y-%m-%d").to_string()),
+            RotationPeriod::Hourly => Some(Utc::now().format("%Y-%m-%d-%H").to_string()),
             RotationPeriod::Never => None,
         }
     }
@@ -419,4 +424,45 @@ fn expand_tilde(path: &str) -> String {
         return home.join(rest).to_string_lossy().into_owned();
     }
     path.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The daily rotation period must be the **UTC** calendar date so the
+    /// rotated-file suffix (`pgmcp.log.<date>`) and the rotation boundary line up
+    /// with the UTC timestamps the log lines carry — and so a daemon started near
+    /// local midnight does not rename `pgmcp.log` out from under a `tail -f`
+    /// mid-run. Computing the expected date *around* the call (before/after)
+    /// dodges the once-a-day midnight tick without flaking.
+    #[test]
+    fn daily_period_is_utc_date() {
+        let before = Utc::now().format("%Y-%m-%d").to_string();
+        let period = RotatingFileAppender::period_string_for(&RotationPeriod::Daily)
+            .expect("Daily rotation yields a period string");
+        let after = Utc::now().format("%Y-%m-%d").to_string();
+        assert!(
+            period == before || period == after,
+            "daily period {period} is not the current UTC date ({before} / {after})"
+        );
+        assert_eq!(period.len(), 10, "expected YYYY-MM-DD, got {period}");
+    }
+
+    #[test]
+    fn hourly_period_is_utc_hour() {
+        let before = Utc::now().format("%Y-%m-%d-%H").to_string();
+        let period = RotatingFileAppender::period_string_for(&RotationPeriod::Hourly)
+            .expect("Hourly rotation yields a period string");
+        let after = Utc::now().format("%Y-%m-%d-%H").to_string();
+        assert!(
+            period == before || period == after,
+            "hourly period {period} is not the current UTC hour ({before} / {after})"
+        );
+    }
+
+    #[test]
+    fn never_rotation_has_no_period() {
+        assert!(RotatingFileAppender::period_string_for(&RotationPeriod::Never).is_none());
+    }
 }

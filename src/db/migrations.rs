@@ -29,6 +29,8 @@ mod v15_symbol_effect_history;
 mod v16_assignee;
 mod v17_git_links;
 mod v18_digest_emissions;
+mod v19_data_tables;
+mod v20_unresolved_ref_index;
 mod v2_shadow_asr;
 mod v3_cross_language_signatures;
 mod v4_work_items;
@@ -123,6 +125,51 @@ async fn ensure_work_items_hnsw_index(
             config,
             &format!(
                 "CREATE INDEX IF NOT EXISTS idx_work_items_embedding ON work_items \
+                 USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
+                config.hnsw_m, config.hnsw_ef_construction
+            ),
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value) VALUES ($1, $2)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(meta_key)
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// HNSW index on `data_tables.embedding` (1024-d BGE-M3) for semantic table
+/// discovery (`data_table_search`). Drop + rebuild only when the configured
+/// (m, ef_construction) change — the same params-tracking discipline as
+/// `ensure_work_items_hnsw_index`. Called unconditionally after the v19 step so
+/// the table exists on both fresh and existing installs.
+async fn ensure_data_tables_hnsw_index(
+    pool: &PgPool,
+    config: &VectorConfig,
+) -> Result<(), sqlx::Error> {
+    let current_params = format!(
+        "m={},ef_construction={}",
+        config.hnsw_m, config.hnsw_ef_construction
+    );
+    let meta_key = "data_tables_hnsw_params";
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT value FROM pgmcp_metadata WHERE key = $1")
+            .bind(meta_key)
+            .fetch_optional(pool)
+            .await?;
+    if stored.as_deref() != Some(&current_params) {
+        sqlx::query("DROP INDEX IF EXISTS idx_data_tables_embedding")
+            .execute(pool)
+            .await?;
+        build_hnsw_index(
+            pool,
+            config,
+            &format!(
+                "CREATE INDEX IF NOT EXISTS idx_data_tables_embedding ON data_tables \
                  USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
                 config.hnsw_m, config.hnsw_ef_construction
             ),
@@ -586,6 +633,46 @@ pub async fn run_migrations_with_lock_retry(
     }
 }
 
+/// Apply one version-gated migration step with uniform progress logging.
+///
+/// Emits an INFO `"starting migration step"` line *before* `body` runs and an
+/// INFO `"migration step applied"` line carrying `elapsed_ms` after the version
+/// is recorded. A long step — e.g. v13's `GENERATED ALWAYS … STORED` column add
+/// that rewrites `file_chunks` and can run for tens of minutes — is then legible
+/// as *in progress* in the log instead of looking like a hung daemon (the
+/// failure mode investigated in
+/// `~/.claude/plans/pgmcp-has-not-logged-structured-sprout.md`). Steps already
+/// at or past `version` are skipped silently, exactly as the previous
+/// `if !version_applied { … }` blocks did.
+async fn apply_step<F, Fut>(
+    pool: &PgPool,
+    version: i32,
+    name: &str,
+    body: F,
+) -> Result<(), sqlx::Error>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), sqlx::Error>>,
+{
+    if version_applied(pool, version).await? {
+        return Ok(());
+    }
+    info!(
+        version,
+        name, "starting migration step (large-table rewrites can take minutes)"
+    );
+    let started = std::time::Instant::now();
+    body().await?;
+    record_version(pool, version, name).await?;
+    info!(
+        version,
+        name,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "migration step applied"
+    );
+    Ok(())
+}
+
 /// Run all migrations to set up the schema.
 pub async fn run_migrations(
     pool: &PgPool,
@@ -596,6 +683,12 @@ pub async fn run_migrations(
     // that has already been performed.
     ensure_schema_versions_table(pool).await?;
     let initial_schema_done = version_applied(pool, INITIAL_SCHEMA_VERSION).await?;
+    if !initial_schema_done {
+        info!(
+            "starting initial schema bootstrap (first run creates every base table \
+             and index; on a large pre-existing corpus this can take several minutes)"
+        );
+    }
     // Create extensions
     sqlx::query("CREATE EXTENSION IF NOT EXISTS vector")
         .execute(pool)
@@ -2023,19 +2116,13 @@ pub async fn run_migrations(
     // symbol_parameters, symbol_effects, additive columns on file_symbols
     // and symbol_references. See ADR-003 and `src/db/migrations/v2_shadow_asr.rs`.
     // ================================================================
-    if !version_applied(pool, v2_shadow_asr::SHADOW_ASR_V1).await? {
-        v2_shadow_asr::apply(pool).await?;
-        record_version(
-            pool,
-            v2_shadow_asr::SHADOW_ASR_V1,
-            v2_shadow_asr::SHADOW_ASR_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v2_shadow_asr::SHADOW_ASR_V1,
-            "shadow_asr_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v2_shadow_asr::SHADOW_ASR_V1,
+        v2_shadow_asr::SHADOW_ASR_V1_NAME,
+        || v2_shadow_asr::apply(pool),
+    )
+    .await?;
 
     // ================================================================
     // Migration step 3 — cross_language_signatures_v1
@@ -2043,24 +2130,13 @@ pub async fn run_migrations(
     // `mcp__pgmcp__cross_language_api_equivalents` and downstream
     // similarity tools.
     // ================================================================
-    if !version_applied(
+    apply_step(
         pool,
         v3_cross_language_signatures::CROSS_LANGUAGE_SIGNATURES_V1,
+        v3_cross_language_signatures::CROSS_LANGUAGE_SIGNATURES_V1_NAME,
+        || v3_cross_language_signatures::apply(pool),
     )
-    .await?
-    {
-        v3_cross_language_signatures::apply(pool).await?;
-        record_version(
-            pool,
-            v3_cross_language_signatures::CROSS_LANGUAGE_SIGNATURES_V1,
-            v3_cross_language_signatures::CROSS_LANGUAGE_SIGNATURES_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v3_cross_language_signatures::CROSS_LANGUAGE_SIGNATURES_V1,
-            "cross_language_signatures_v1 migration applied"
-        );
-    }
+    .await?;
 
     // ================================================================
     // Migration step 4 — work_items_v1
@@ -2072,19 +2148,13 @@ pub async fn run_migrations(
     // `src/db/migrations/v4_work_items.rs` and the plan
     // `~/.claude/plans/plan-mcp-support-for-moonlit-dongarra.md`.
     // ================================================================
-    if !version_applied(pool, v4_work_items::WORK_ITEMS_V1).await? {
-        v4_work_items::apply(pool).await?;
-        record_version(
-            pool,
-            v4_work_items::WORK_ITEMS_V1,
-            v4_work_items::WORK_ITEMS_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v4_work_items::WORK_ITEMS_V1,
-            "work_items_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v4_work_items::WORK_ITEMS_V1,
+        v4_work_items::WORK_ITEMS_V1_NAME,
+        || v4_work_items::apply(pool),
+    )
+    .await?;
 
     // Re-apply the work_items kind/status/origin vocabulary CHECKs
     // UNCONDITIONALLY on every startup (idempotent DROP+ADD). The vocabulary is
@@ -2106,19 +2176,13 @@ pub async fn run_migrations(
     // work_item_claims ledger, agent_presence, agent_identity view.
     // Runs after v4 (work_items) and the initial schema (a2a_agents).
     // ================================================================
-    if !version_applied(pool, v5_work_items_collab::WORK_ITEMS_COLLAB_V1).await? {
-        v5_work_items_collab::apply(pool).await?;
-        record_version(
-            pool,
-            v5_work_items_collab::WORK_ITEMS_COLLAB_V1,
-            v5_work_items_collab::WORK_ITEMS_COLLAB_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v5_work_items_collab::WORK_ITEMS_COLLAB_V1,
-            "work_items_collab_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v5_work_items_collab::WORK_ITEMS_COLLAB_V1,
+        v5_work_items_collab::WORK_ITEMS_COLLAB_V1_NAME,
+        || v5_work_items_collab::apply(pool),
+    )
+    .await?;
 
     // ================================================================
     // Migration step 6 — unified_graph_v1
@@ -2129,19 +2193,13 @@ pub async fn run_migrations(
     // (ensure_work_item_experiment_bridge); Stage 2 wires it into the views.
     // See `src/db/migrations/v6_unified_graph.rs`.
     // ================================================================
-    if !version_applied(pool, v6_unified_graph::UNIFIED_GRAPH_V1).await? {
-        v6_unified_graph::apply(pool).await?;
-        record_version(
-            pool,
-            v6_unified_graph::UNIFIED_GRAPH_V1,
-            v6_unified_graph::UNIFIED_GRAPH_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v6_unified_graph::UNIFIED_GRAPH_V1,
-            "unified_graph_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v6_unified_graph::UNIFIED_GRAPH_V1,
+        v6_unified_graph::UNIFIED_GRAPH_V1_NAME,
+        || v6_unified_graph::apply(pool),
+    )
+    .await?;
 
     // ================================================================
     // Migration step 7 — cge_orphan_cleanup_v1
@@ -2152,197 +2210,145 @@ pub async fn run_migrations(
     // the old behavior already left behind. Runs after every table exists.
     // See src/db/migrations/v7_cge_orphan_cleanup.rs.
     // ================================================================
-    if !version_applied(pool, v7_cge_orphan_cleanup::CGE_ORPHAN_CLEANUP_V1).await? {
-        v7_cge_orphan_cleanup::apply(pool).await?;
-        record_version(
-            pool,
-            v7_cge_orphan_cleanup::CGE_ORPHAN_CLEANUP_V1,
-            v7_cge_orphan_cleanup::CGE_ORPHAN_CLEANUP_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v7_cge_orphan_cleanup::CGE_ORPHAN_CLEANUP_V1,
-            "cge_orphan_cleanup_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v7_cge_orphan_cleanup::CGE_ORPHAN_CLEANUP_V1,
+        v7_cge_orphan_cleanup::CGE_ORPHAN_CLEANUP_V1_NAME,
+        || v7_cge_orphan_cleanup::apply(pool),
+    )
+    .await?;
 
     // ================================================================
     // Step 8: CSM / MPST coordination tables (ADR-009).
     // See src/db/migrations/v8_csm_protocols.rs.
     // ================================================================
-    if !version_applied(pool, v8_csm_protocols::CSM_PROTOCOLS_V1).await? {
-        v8_csm_protocols::apply(pool).await?;
-        record_version(
-            pool,
-            v8_csm_protocols::CSM_PROTOCOLS_V1,
-            v8_csm_protocols::CSM_PROTOCOLS_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v8_csm_protocols::CSM_PROTOCOLS_V1,
-            "csm_protocols_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v8_csm_protocols::CSM_PROTOCOLS_V1,
+        v8_csm_protocols::CSM_PROTOCOLS_V1_NAME,
+        || v8_csm_protocols::apply(pool),
+    )
+    .await?;
 
     // ================================================================
     // Step 9: quality_report GPA history (trend strip).
     // See src/db/migrations/v9_quality_report_history.rs.
     // ================================================================
-    if !version_applied(pool, v9_quality_report_history::QUALITY_REPORT_HISTORY_V1).await? {
-        v9_quality_report_history::apply(pool).await?;
-        record_version(
-            pool,
-            v9_quality_report_history::QUALITY_REPORT_HISTORY_V1,
-            v9_quality_report_history::QUALITY_REPORT_HISTORY_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v9_quality_report_history::QUALITY_REPORT_HISTORY_V1,
-            "quality_report_history_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v9_quality_report_history::QUALITY_REPORT_HISTORY_V1,
+        v9_quality_report_history::QUALITY_REPORT_HISTORY_V1_NAME,
+        || v9_quality_report_history::apply(pool),
+    )
+    .await?;
 
     // ================================================================
     // Step 10: FK child-column index hardening + memory_observations
     // source FK ON DELETE SET NULL. See src/db/migrations/v10_fk_index_hardening.rs.
     // All base tables it touches exist by now (created in the version-1 body).
     // ================================================================
-    if !version_applied(pool, v10_fk_index_hardening::FK_INDEX_HARDENING_V1).await? {
-        v10_fk_index_hardening::apply(pool).await?;
-        record_version(
-            pool,
-            v10_fk_index_hardening::FK_INDEX_HARDENING_V1,
-            v10_fk_index_hardening::FK_INDEX_HARDENING_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v10_fk_index_hardening::FK_INDEX_HARDENING_V1,
-            "fk_index_hardening_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v10_fk_index_hardening::FK_INDEX_HARDENING_V1,
+        v10_fk_index_hardening::FK_INDEX_HARDENING_V1_NAME,
+        || v10_fk_index_hardening::apply(pool),
+    )
+    .await?;
 
     // Step 11: nudge_emissions (JIT adoption-nudge log + rate-limit source).
     // Registered before the unconditional ensure_* steps below.
-    if !version_applied(pool, v11_nudge_emissions::NUDGE_EMISSIONS_V1).await? {
-        v11_nudge_emissions::apply(pool).await?;
-        record_version(
-            pool,
-            v11_nudge_emissions::NUDGE_EMISSIONS_V1,
-            v11_nudge_emissions::NUDGE_EMISSIONS_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v11_nudge_emissions::NUDGE_EMISSIONS_V1,
-            "nudge_emissions_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v11_nudge_emissions::NUDGE_EMISSIONS_V1,
+        v11_nudge_emissions::NUDGE_EMISSIONS_V1_NAME,
+        || v11_nudge_emissions::apply(pool),
+    )
+    .await?;
 
     // Step 12: bug_tracker (severity column + work_item_bug_details sidecar +
     // triage/confirmed lifecycle states). Gated; the unconditional
     // install_work_items_checks reconcile (above) already picked up the new
     // kind/status vocab on existing installs, and v12::apply installs the
     // severity CHECK once the column exists.
-    if !version_applied(pool, v12_bug_tracker::BUG_TRACKER_V1).await? {
-        v12_bug_tracker::apply(pool).await?;
-        record_version(
-            pool,
-            v12_bug_tracker::BUG_TRACKER_V1,
-            v12_bug_tracker::BUG_TRACKER_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v12_bug_tracker::BUG_TRACKER_V1,
-            "bug_tracker_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v12_bug_tracker::BUG_TRACKER_V1,
+        v12_bug_tracker::BUG_TRACKER_V1_NAME,
+        || v12_bug_tracker::apply(pool),
+    )
+    .await?;
 
-    if !version_applied(pool, v13_fts_stored_tsv::FTS_STORED_TSV_V1).await? {
-        v13_fts_stored_tsv::apply(pool).await?;
-        record_version(
-            pool,
-            v13_fts_stored_tsv::FTS_STORED_TSV_V1,
-            v13_fts_stored_tsv::FTS_STORED_TSV_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v13_fts_stored_tsv::FTS_STORED_TSV_V1,
-            "fts_stored_tsv_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v13_fts_stored_tsv::FTS_STORED_TSV_V1,
+        v13_fts_stored_tsv::FTS_STORED_TSV_V1_NAME,
+        || v13_fts_stored_tsv::apply(pool),
+    )
+    .await?;
 
-    if !version_applied(pool, v14_resolution_kind_vocab::RESOLUTION_KIND_VOCAB_V1).await? {
-        v14_resolution_kind_vocab::apply(pool).await?;
-        record_version(
-            pool,
-            v14_resolution_kind_vocab::RESOLUTION_KIND_VOCAB_V1,
-            v14_resolution_kind_vocab::RESOLUTION_KIND_VOCAB_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v14_resolution_kind_vocab::RESOLUTION_KIND_VOCAB_V1,
-            "resolution_kind_vocab_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v14_resolution_kind_vocab::RESOLUTION_KIND_VOCAB_V1,
+        v14_resolution_kind_vocab::RESOLUTION_KIND_VOCAB_V1_NAME,
+        || v14_resolution_kind_vocab::apply(pool),
+    )
+    .await?;
 
-    if !version_applied(pool, v15_symbol_effect_history::SYMBOL_EFFECT_HISTORY_V1).await? {
-        v15_symbol_effect_history::apply(pool).await?;
-        record_version(
-            pool,
-            v15_symbol_effect_history::SYMBOL_EFFECT_HISTORY_V1,
-            v15_symbol_effect_history::SYMBOL_EFFECT_HISTORY_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v15_symbol_effect_history::SYMBOL_EFFECT_HISTORY_V1,
-            "symbol_effect_history_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v15_symbol_effect_history::SYMBOL_EFFECT_HISTORY_V1,
+        v15_symbol_effect_history::SYMBOL_EFFECT_HISTORY_V1_NAME,
+        || v15_symbol_effect_history::apply(pool),
+    )
+    .await?;
 
-    if !version_applied(pool, v16_assignee::WORK_ITEM_ASSIGNEE_V1).await? {
-        v16_assignee::apply(pool).await?;
-        record_version(
-            pool,
-            v16_assignee::WORK_ITEM_ASSIGNEE_V1,
-            v16_assignee::WORK_ITEM_ASSIGNEE_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v16_assignee::WORK_ITEM_ASSIGNEE_V1,
-            "work_item_assignee_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v16_assignee::WORK_ITEM_ASSIGNEE_V1,
+        v16_assignee::WORK_ITEM_ASSIGNEE_V1_NAME,
+        || v16_assignee::apply(pool),
+    )
+    .await?;
 
-    if !version_applied(pool, v17_git_links::GIT_LINKS_V1).await? {
-        v17_git_links::apply(pool).await?;
-        record_version(
-            pool,
-            v17_git_links::GIT_LINKS_V1,
-            v17_git_links::GIT_LINKS_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v17_git_links::GIT_LINKS_V1,
-            "git_links_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v17_git_links::GIT_LINKS_V1,
+        v17_git_links::GIT_LINKS_V1_NAME,
+        || v17_git_links::apply(pool),
+    )
+    .await?;
 
-    if !version_applied(pool, v18_digest_emissions::DIGEST_EMISSIONS_V1).await? {
-        v18_digest_emissions::apply(pool).await?;
-        record_version(
-            pool,
-            v18_digest_emissions::DIGEST_EMISSIONS_V1,
-            v18_digest_emissions::DIGEST_EMISSIONS_V1_NAME,
-        )
-        .await?;
-        info!(
-            version = v18_digest_emissions::DIGEST_EMISSIONS_V1,
-            "digest_emissions_v1 migration applied"
-        );
-    }
+    apply_step(
+        pool,
+        v18_digest_emissions::DIGEST_EMISSIONS_V1,
+        v18_digest_emissions::DIGEST_EMISSIONS_V1_NAME,
+        || v18_digest_emissions::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v19_data_tables::DATA_TABLES_V1,
+        v19_data_tables::DATA_TABLES_V1_NAME,
+        || v19_data_tables::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v20_unresolved_ref_index::UNRESOLVED_REF_INDEX_V1,
+        v20_unresolved_ref_index::UNRESOLVED_REF_INDEX_V1_NAME,
+        || v20_unresolved_ref_index::apply(pool),
+    )
+    .await?;
 
     // Build/refresh the work_items HNSW index (unconditional; the table exists
     // after the v4 step on fresh installs and already exists on upgrades).
     ensure_work_items_hnsw_index(pool, vector_config).await?;
+
+    // Build/refresh the data_tables HNSW index (semantic table discovery via
+    // `data_table_search`); same params-tracked rebuild discipline.
+    ensure_data_tables_hnsw_index(pool, vector_config).await?;
 
     // Stage 5c: trajectory-similarity edge store (must exist before the edges
     // view, which UNIONs it as the `evolves_like` arm).

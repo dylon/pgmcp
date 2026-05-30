@@ -33,6 +33,7 @@ pub mod cron;
 pub mod csm;
 pub mod daemon;
 pub mod daemon_state;
+pub mod datatable;
 pub mod db;
 pub mod digest;
 pub mod embed;

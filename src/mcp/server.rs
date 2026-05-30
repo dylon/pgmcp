@@ -41,6 +41,8 @@ mod handlers_core_advanced;
 mod handlers_csm;
 #[path = "server/handlers/data_eng.rs"]
 mod handlers_data_eng;
+#[path = "server/handlers/data_tables.rs"]
+mod handlers_data_tables;
 #[path = "server/handlers/experiments.rs"]
 mod handlers_experiments;
 #[path = "server/handlers/fuzzy.rs"]
@@ -367,6 +369,7 @@ impl McpServer {
             + Self::router_experiments()
             + Self::router_work_items_a()
             + Self::router_work_items_b()
+            + Self::router_data_tables()
             + Self::router_trajectory()
             + Self::router_graph_advanced()
             + Self::router_infotheory()
@@ -672,6 +675,19 @@ impl McpServer {
                 "experiment_timeline"           => experiment_timeline(ExperimentTimelineParams) in tool_experiments,
                 "experiment_log_artifact"       => experiment_log_artifact(ExperimentLogArtifactParams) in tool_experiments,
                 "experiment_render_ledger"      => experiment_render_ledger(ExperimentRenderLedgerParams) in tool_experiments,
+                // JSON data tables (share the data_tables module).
+                "data_table_create"      => data_table_create(DataTableCreateParams) in data_tables,
+                "data_table_alter"       => data_table_alter(DataTableAlterParams) in data_tables,
+                "data_table_drop"        => data_table_drop(DataTableDropParams) in data_tables,
+                "data_table_list"        => data_table_list(DataTableListParams) in data_tables,
+                "data_table_describe"    => data_table_describe(DataTableDescribeParams) in data_tables,
+                "data_table_insert"      => data_table_insert(DataTableInsertParams) in data_tables,
+                "data_table_select"      => data_table_select(DataTableSelectParams) in data_tables,
+                "data_table_update"      => data_table_update(DataTableUpdateParams) in data_tables,
+                "data_table_delete"      => data_table_delete(DataTableDeleteParams) in data_tables,
+                "data_table_aggregate"   => data_table_aggregate(DataTableAggregateParams) in data_tables,
+                "data_table_report"      => data_table_report(DataTableReportParams) in data_tables,
+                "data_table_search"      => data_table_search(DataTableSearchParams) in data_tables,
                 // Work-item / plan tracker subsystem (share the work_items module).
                 "work_item_create"       => work_item_create(WorkItemCreateParams) in work_items,
                 "work_item_get"          => work_item_get(WorkItemGetParams) in work_items,

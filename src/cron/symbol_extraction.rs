@@ -145,11 +145,27 @@ async fn extract_project_symbols(
             .await?;
 
     if metas.is_empty() {
-        info!(
-            project = %project_name,
-            watermark = ?watermark,
-            "Symbol extraction: no files to process"
-        );
+        // No new/changed files — but an earlier pass may have left references
+        // unresolved (e.g. a resolution that timed out and returned *before* this
+        // watermark advanced, stranding NULL rows that a later no-files run then
+        // skipped right past — the residual the Phase-3 timeout left behind).
+        // Resolution is idempotent and near-free when there is nothing to do (its
+        // EXISTS backlog guard short-circuits), so run it to DRAIN any such
+        // backlog instead of skipping straight to the watermark bump.
+        let drained = queries::resolve_symbol_reference_targets(pool, project_id).await?;
+        if drained > 0 {
+            info!(
+                project = %project_name,
+                drained_targets = drained,
+                "Symbol extraction: no new files; drained unresolved-reference backlog"
+            );
+        } else {
+            info!(
+                project = %project_name,
+                watermark = ?watermark,
+                "Symbol extraction: no files to process"
+            );
+        }
         // Still bump the watermark so subsequent no-op runs are cheap.
         queries::set_symbol_extraction_watermark(pool, project_id, Utc::now()).await?;
         return Ok(ProjectExtractionStats::default());

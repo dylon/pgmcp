@@ -18,6 +18,10 @@ pub use queries_experiments::*;
 mod queries_work_items;
 pub use queries_work_items::*;
 
+#[path = "queries/data_tables.rs"]
+mod queries_data_tables;
+pub use queries_data_tables::*;
+
 #[path = "queries/dedup.rs"]
 mod queries_dedup;
 pub(crate) use queries_dedup::*;

@@ -91,6 +91,9 @@ pub struct MigrationPassReport {
     pub experiment_results_migrated: u64,
     pub experiment_artifacts_migrated: u64,
     pub work_items_migrated: u64,
+    /// JSON data tables (name+description vector). Embed-on-write at
+    /// data_table_create/_alter is the primary path; this is the net.
+    pub data_tables_migrated: u64,
     /// Phase 2.3: file_chunks whose BGE-M3 learned-sparse vector was backfilled.
     pub file_chunks_sparse_backfilled: u64,
     /// Phase 2.4: file_chunks re-embedded with a contextual-retrieval prefix.
@@ -446,6 +449,27 @@ pub async fn run_embedding_migration_pass(
         }
     }
 
+    // JSON data tables: NULL-embedding backfill for the name+description vector
+    // (embed-on-write at data_table_create/_alter is the primary path; this is
+    // the robustness net for embed failures).
+    for _ in 0..config.max_batches {
+        match migrate_data_tables_batch(pool, &embedder, config.batch_size).await {
+            Ok(n) if n > 0 => {
+                report.data_tables_migrated += n;
+                report.batches_completed += 1;
+            }
+            Ok(_) => break,
+            Err(e) => {
+                warn!(error = %e, "data_tables embedding backfill batch failed");
+                report.errors += 1;
+                stats
+                    .embeddings_migration_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+
     if report.file_chunks_migrated > 0
         || report.session_prompts_migrated > 0
         || report.git_commit_chunks_migrated > 0
@@ -458,6 +482,7 @@ pub async fn run_embedding_migration_pass(
         || report.experiment_results_migrated > 0
         || report.experiment_artifacts_migrated > 0
         || report.work_items_migrated > 0
+        || report.data_tables_migrated > 0
     {
         info!(
             file_chunks = report.file_chunks_migrated,
@@ -472,6 +497,7 @@ pub async fn run_embedding_migration_pass(
             experiment_results = report.experiment_results_migrated,
             experiment_artifacts = report.experiment_artifacts_migrated,
             work_items = report.work_items_migrated,
+            data_tables = report.data_tables_migrated,
             batches = report.batches_completed,
             errors = report.errors,
             "embedding-migration pass complete",
@@ -1006,6 +1032,53 @@ async fn migrate_embedding_table_batch(
     Ok(count)
 }
 
+/// NULL-`embedding` backfill for `data_tables` (the name+description vector
+/// powering `data_table_search`). Synchronous embed-on-write at
+/// `data_table_create`/`_alter` is the primary path; this is the robustness net
+/// for embed failures. Stamps the `data-table-v1` signature to match
+/// embed-on-write — a feature tag distinct from `bge-m3-v1` only in name; the
+/// model and dimensionality are identical. Same SKIP LOCKED batch shape as the
+/// mandate/observation backfills.
+async fn migrate_data_tables_batch(
+    pool: &PgPool,
+    embedder: &Arc<Embedder>,
+    batch_size: usize,
+) -> Result<u64, sqlx::Error> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, coalesce(name,'') || ' ' || coalesce(description,'') AS t
+         FROM data_tables
+         WHERE embedding IS NULL
+         ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED",
+    )
+    .bind(batch_size as i64)
+    .fetch_all(pool)
+    .await?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let texts: Vec<&str> = rows.iter().map(|(_, c)| c.as_str()).collect();
+    let vectors = match embedder.embed(&texts) {
+        Ok(v) => v,
+        Err(e) => return Err(sqlx::Error::Configuration(e.to_string().into())),
+    };
+    let mut tx = pool.begin().await?;
+    let mut count = 0_u64;
+    for ((id, _), vec) in rows.into_iter().zip(vectors) {
+        let v = Vector::from(vec);
+        sqlx::query(
+            "UPDATE data_tables SET embedding = $1, embedding_signature = $2 WHERE id = $3",
+        )
+        .bind(&v)
+        .bind("data-table-v1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        count += 1;
+    }
+    tx.commit().await?;
+    Ok(count)
+}
+
 /// Daemon-facing entry point. Logs and swallows errors so a single bad
 /// tick doesn't kill the cron thread.
 pub async fn run_or_log(
@@ -1045,7 +1118,7 @@ pub async fn migration_complete(pool: &PgPool) -> Result<bool, sqlx::Error> {
 /// Per-table backlog counts. Gives a row-level picture of how many
 /// `embedding_v2` columns the cron still has to fill; `migration_complete`
 /// is the cheap boolean wrapper around `total() == 0`.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy, sqlx::FromRow)]
 pub struct BacklogCounts {
     pub file_chunks: i64,
     pub session_prompts: i64,
@@ -1059,6 +1132,7 @@ pub struct BacklogCounts {
     pub experiment_results: i64,
     pub experiment_artifacts: i64,
     pub work_items: i64,
+    pub data_tables: i64,
 }
 
 impl BacklogCounts {
@@ -1075,43 +1149,30 @@ impl BacklogCounts {
             + self.experiment_results
             + self.experiment_artifacts
             + self.work_items
+            + self.data_tables
     }
 }
 
-/// Read the per-table backlog. One round trip via UNION ALL of eleven
-/// COUNT(*) probes.
+/// Read the per-table backlog. One round trip via thirteen COUNT(*) probes.
 pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::Error> {
-    let row: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+    sqlx::query_as::<_, BacklogCounts>(
         "SELECT
-            (SELECT COUNT(*) FROM file_chunks            WHERE embedding_v2 IS NULL),
-            (SELECT COUNT(*) FROM session_prompts        WHERE embedding_v2 IS NULL),
-            (SELECT COUNT(*) FROM git_commit_chunks      WHERE embedding_v2 IS NULL),
-            (SELECT COUNT(*) FROM software_pattern_chunks WHERE embedding_v2 IS NULL),
-            (SELECT COUNT(*) FROM durable_mandates       WHERE embedding    IS NULL),
-            (SELECT COUNT(*) FROM session_mandates       WHERE embedding    IS NULL),
-            (SELECT COUNT(*) FROM memory_observations    WHERE embedding    IS NULL AND valid_to IS NULL),
-            (SELECT COUNT(*) FROM experiments            WHERE embedding    IS NULL),
-            (SELECT COUNT(*) FROM experiment_hypotheses  WHERE embedding    IS NULL),
-            (SELECT COUNT(*) FROM experiment_results     WHERE embedding    IS NULL),
-            (SELECT COUNT(*) FROM experiment_artifacts   WHERE embedding    IS NULL),
-            (SELECT COUNT(*) FROM work_items             WHERE embedding    IS NULL)",
+            (SELECT COUNT(*) FROM file_chunks            WHERE embedding_v2 IS NULL) AS file_chunks,
+            (SELECT COUNT(*) FROM session_prompts        WHERE embedding_v2 IS NULL) AS session_prompts,
+            (SELECT COUNT(*) FROM git_commit_chunks      WHERE embedding_v2 IS NULL) AS git_commit_chunks,
+            (SELECT COUNT(*) FROM software_pattern_chunks WHERE embedding_v2 IS NULL) AS software_pattern_chunks,
+            (SELECT COUNT(*) FROM durable_mandates       WHERE embedding    IS NULL) AS durable_mandates,
+            (SELECT COUNT(*) FROM session_mandates       WHERE embedding    IS NULL) AS session_mandates,
+            (SELECT COUNT(*) FROM memory_observations    WHERE embedding    IS NULL AND valid_to IS NULL) AS memory_observations,
+            (SELECT COUNT(*) FROM experiments            WHERE embedding    IS NULL) AS experiments,
+            (SELECT COUNT(*) FROM experiment_hypotheses  WHERE embedding    IS NULL) AS experiment_hypotheses,
+            (SELECT COUNT(*) FROM experiment_results     WHERE embedding    IS NULL) AS experiment_results,
+            (SELECT COUNT(*) FROM experiment_artifacts   WHERE embedding    IS NULL) AS experiment_artifacts,
+            (SELECT COUNT(*) FROM work_items             WHERE embedding    IS NULL) AS work_items,
+            (SELECT COUNT(*) FROM data_tables            WHERE embedding    IS NULL) AS data_tables",
     )
     .fetch_one(pool)
-    .await?;
-    Ok(BacklogCounts {
-        file_chunks: row.0,
-        session_prompts: row.1,
-        git_commit_chunks: row.2,
-        software_pattern_chunks: row.3,
-        durable_mandates: row.4,
-        session_mandates: row.5,
-        memory_observations: row.6,
-        experiments: row.7,
-        experiment_hypotheses: row.8,
-        experiment_results: row.9,
-        experiment_artifacts: row.10,
-        work_items: row.11,
-    })
+    .await
 }
 
 /// Count `file_chunks` still needing a contextual re-embed (graph-roadmap

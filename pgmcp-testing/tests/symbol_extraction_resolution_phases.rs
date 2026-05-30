@@ -303,3 +303,29 @@ async fn phase3_multiple_candidates_grade_ambiguous() {
         "ambiguous tier carries the low (0.3) confidence"
     );
 }
+
+/// Resolution is idempotent and cheap to re-run: once every reference is
+/// classified, a second pass resolves nothing — the EXISTS backlog guard
+/// short-circuits before the phase UPDATEs. This is what makes it safe for the
+/// symbol-extraction cron to call resolution on a "no new files" cycle purely to
+/// DRAIN a stranded backlog (references the pre-fix Phase-3 timeout left NULL,
+/// then a later no-files run skipped past by advancing the watermark).
+#[tokio::test(flavor = "multi_thread")]
+async fn resolution_is_idempotent_second_pass_drains_nothing() {
+    let testdb = require_test_db!();
+    let pool = testdb.pool();
+    let (project_id, _f1, _f2, _f3) = seed(pool).await;
+
+    let first = queries::resolve_symbol_reference_targets(pool, project_id)
+        .await
+        .expect("first resolution pass");
+    assert_eq!(first, 4, "first pass classifies all 4 seeded references");
+
+    let second = queries::resolve_symbol_reference_targets(pool, project_id)
+        .await
+        .expect("second resolution pass must succeed (no-op)");
+    assert_eq!(
+        second, 0,
+        "fully-resolved project: second pass drains nothing (backlog guard short-circuits)"
+    );
+}

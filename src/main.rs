@@ -27,6 +27,7 @@ mod cron;
 mod csm;
 mod daemon;
 mod daemon_state;
+mod datatable;
 mod db;
 mod digest;
 mod embed;

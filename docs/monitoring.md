@@ -1,8 +1,9 @@
 # pgmcp Monitoring
 
 Prometheus metrics, the adaptive thread-pool tuner, and the indexing
-pipeline observability surface. For daemon operations see
-[operations.md](operations.md).
+pipeline observability surface. For daemon operations — including the
+**log file, daily UTC rotation, and how to tail it safely (`tail -F`)** —
+see [operations.md](operations.md#logs).
 
 
 ### Prometheus Metrics

@@ -635,6 +635,37 @@ pub async fn bulk_insert_symbol_references(
     Ok(res.rows_affected())
 }
 
+/// Run one resolution phase in its own short transaction.
+///
+/// Splitting the four-phase walk into one transaction *per phase* (rather than a
+/// single transaction spanning all four) makes partial progress durable: if a
+/// later phase still hits the per-statement timeout, the phases that already
+/// committed are not rolled back, so the project converges over successive cron
+/// runs instead of looping forever. This is safe because every phase only
+/// updates rows with `resolution_kind IS NULL` and marks them non-NULL, so a
+/// committed phase is never re-touched by a subsequent one. The `'300s'`
+/// `SET LOCAL` lifts the 30s pool default (`DatabaseConfig::statement_timeout_ms`)
+/// for this heavy, project-wide UPDATE — it reverts when the connection returns
+/// to the pool — and the `application_name` labels the backend for the
+/// graceful-shutdown sweep (`db::admin::terminate_heavy_backends`). See
+/// `~/.claude/plans/pgmcp-has-not-logged-structured-sprout.md`.
+async fn run_resolution_phase(
+    pool: &PgPool,
+    project_id: i32,
+    sql: &str,
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '300s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL application_name = 'pgmcp:heavy:symbol-extraction'")
+        .execute(&mut *tx)
+        .await?;
+    let res = sqlx::query(sql).bind(project_id).execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(res.rows_affected())
+}
+
 /// Per-project second pass — resolve `target_symbol_id` and `target_file_id`
 /// for any unresolved `symbol_references` rows by joining `target_raw` against
 /// `file_symbols.name` within the project. Multi-match by name picks one
@@ -667,24 +698,34 @@ pub async fn resolve_symbol_reference_targets(
     // Each UPDATE is gated by `resolution_kind IS NULL` so the earlier-tier
     // assignments stick even when a later phase would also match.
 
-    // Heavy project-wide resolution. Bump the per-statement timeout above the
-    // pool default (`DatabaseConfig::statement_timeout_ms`, 30s) so a large
-    // project's resolution pass isn't cancelled mid-flight — that cancellation
-    // `?`-propagates out of `extract_project_symbols` and aborts the entire
-    // symbol-extraction run ("Symbol extraction failed for project"). `SET
-    // LOCAL` is scoped to this transaction, so the pool default returns when
-    // the connection is released; running every phase on the same `tx` is what
-    // makes the override stick (a bare `SET` on a pooled `.execute(pool)` would
-    // land on an arbitrary connection).
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET LOCAL statement_timeout = '300s'")
-        .execute(&mut *tx)
-        .await?;
-    // Label this heavy transaction for the graceful-shutdown sweep
-    // (db::admin::terminate_heavy_backends).
-    sqlx::query("SET LOCAL application_name = 'pgmcp:heavy:symbol-extraction'")
-        .execute(&mut *tx)
-        .await?;
+    // Cheap backlog guard: if the project has no unresolved references, skip the
+    // whole pass — including phase 3's project-wide aggregation. This makes it
+    // safe (and near-free, via the partial `idx_symbol_refs_unresolved` index
+    // from v20) to call resolution unconditionally — e.g. on a symbol-extraction
+    // cron cycle that found no new files but must still DRAIN a backlog stranded
+    // by an earlier interrupted pass. Without the guard, every such call would
+    // rebuild phase 3's `proj_counts` CTE for nothing.
+    let has_unresolved: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM symbol_references sr
+             JOIN indexed_files f ON f.id = sr.source_file_id
+             WHERE f.project_id = $1 AND sr.resolution_kind IS NULL
+         )",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await?;
+    if !has_unresolved {
+        return Ok(0);
+    }
+
+    // Each phase below runs in its OWN short transaction via
+    // `run_resolution_phase`, which lifts the per-statement timeout to 300s and
+    // commits independently. Per-phase commits make partial progress durable: a
+    // later phase that still hits the timeout no longer rolls back the phases
+    // that already succeeded — the permanent-failure loop that 300s-cancelled
+    // the bare-name phase on large projects ("Symbol extraction failed for
+    // project") and `?`-propagated out of `extract_project_symbols`.
 
     // Phase 1: exact_in_file. Same source file, same name. Tier string +
     // confidence come from the closed `ResolutionKind` enum so the values
@@ -708,10 +749,7 @@ pub async fn resolve_symbol_reference_targets(
         kind = ResolutionKind::ExactInFile.as_db_str(),
         conf = ResolutionKind::ExactInFile.confidence(),
     );
-    let phase1 = sqlx::query(&phase1_sql)
-        .bind(project_id)
-        .execute(&mut *tx)
-        .await?;
+    let phase1 = run_resolution_phase(pool, project_id, &phase1_sql).await?;
 
     // Phase 2: exact_via_import. The reference's source file imports a
     // module/symbol whose `target_raw` ends with `::<name>` (or `.<name>`
@@ -747,10 +785,7 @@ pub async fn resolve_symbol_reference_targets(
         kind = ResolutionKind::ExactViaImport.as_db_str(),
         conf = ResolutionKind::ExactViaImport.confidence(),
     );
-    let phase2 = sqlx::query(&phase2_sql)
-        .bind(project_id)
-        .execute(&mut *tx)
-        .await?;
+    let phase2 = run_resolution_phase(pool, project_id, &phase2_sql).await?;
 
     // Phase 3: bare-name match within the project, now CONFIDENCE-GRADED by
     // ambiguity (graph-roadmap Phase 4.1). The legacy single 0.5 tier matched
@@ -765,45 +800,52 @@ pub async fn resolve_symbol_reference_targets(
     // (Full receiver-type resolution — resolving `recv.method()` against the
     // receiver's inferred type — is the per-language extractor follow-up; it
     // needs a `receiver_type` the symbol extractors don't yet emit.)
+    // De-correlated: a single `proj_counts` pre-aggregation replaces the original
+    // per-row correlated `COUNT(*)` (one project-wide count per *unresolved ref*),
+    // which on large projects (`default`, `Documents`) blew the 300s
+    // statement_timeout and rolled the whole pass back every run. The grouped CTE
+    // is one pass over the project's symbols (O(symbols)); the UPDATE then
+    // hash-joins refs → candidates (O(refs)). Semantics are unchanged:
+    // `n_cand = 1` → `bare_name_unique`, else `bare_name_ambiguous`, and a
+    // multi-candidate name still resolves to an arbitrary same-name symbol.
+    //
+    // `proj_counts pc` is a FROM-list member correlated to the UPDATE target in
+    // WHERE (`pc.nm = sr.target_raw`), NOT in a JOIN ... ON — Postgres rejects
+    // `sr` references inside FROM-list JOIN predicates (the same trap noted in
+    // phase 2). The source-in-project guard uses the EXISTS idiom from phase 1.
     let phase3_sql = format!(
-        "WITH cand AS (
-             SELECT sr.id AS ref_id,
-                    (SELECT COUNT(*)
-                       FROM file_symbols fs2
-                       JOIN indexed_files tf2 ON tf2.id = fs2.file_id
-                      WHERE tf2.project_id = $1 AND fs2.name = sr.target_raw) AS n_cand
-             FROM symbol_references sr
-             JOIN indexed_files src_f ON src_f.id = sr.source_file_id
-             WHERE src_f.project_id = $1 AND sr.resolution_kind IS NULL
+        "WITH proj_counts AS (
+             SELECT fs2.name AS nm, COUNT(*) AS n_cand
+             FROM file_symbols fs2
+             JOIN indexed_files tf2 ON tf2.id = fs2.file_id
+             WHERE tf2.project_id = $1
+             GROUP BY fs2.name
          )
          UPDATE symbol_references sr
          SET target_symbol_id = fs.id,
              target_file_id = fs.file_id,
              target_path = fs.scope_path,
-             resolution_kind = CASE WHEN cand.n_cand = 1
+             resolution_kind = CASE WHEN pc.n_cand = 1
                                     THEN '{uniq}'
                                     ELSE '{ambig}' END,
-             resolution_confidence = CASE WHEN cand.n_cand = 1 THEN {uniq_conf} ELSE {ambig_conf} END
+             resolution_confidence = CASE WHEN pc.n_cand = 1 THEN {uniq_conf} ELSE {ambig_conf} END
          FROM file_symbols fs
          JOIN indexed_files tgt_f ON tgt_f.id = fs.file_id,
-              cand
+              proj_counts pc
          WHERE tgt_f.project_id = $1
-           -- correlate cand to the UPDATE target in WHERE, not a JOIN ON:
-           -- Postgres rejects `sr` refs in FROM-list JOIN predicates (the same
-           -- trap fixed in phase 2) -> invalid reference to FROM-clause entry
-           -- for table \"sr\".
-           AND cand.ref_id = sr.id
+           AND pc.nm = sr.target_raw
            AND sr.target_raw = fs.name
-           AND sr.resolution_kind IS NULL",
+           AND sr.resolution_kind IS NULL
+           AND EXISTS (
+               SELECT 1 FROM indexed_files f
+                WHERE f.id = sr.source_file_id AND f.project_id = $1
+           )",
         uniq = ResolutionKind::BareNameUnique.as_db_str(),
         ambig = ResolutionKind::BareNameAmbiguous.as_db_str(),
         uniq_conf = ResolutionKind::BareNameUnique.confidence(),
         ambig_conf = ResolutionKind::BareNameAmbiguous.confidence(),
     );
-    let phase3 = sqlx::query(&phase3_sql)
-        .bind(project_id)
-        .execute(&mut *tx)
-        .await?;
+    let phase3 = run_resolution_phase(pool, project_id, &phase3_sql).await?;
 
     // Phase 4: anything still unresolved within the project's references is
     // marked `unresolved` so tools can distinguish "we tried" from "not yet
@@ -819,17 +861,9 @@ pub async fn resolve_symbol_reference_targets(
         kind = ResolutionKind::Unresolved.as_db_str(),
         conf = ResolutionKind::Unresolved.confidence(),
     );
-    let phase4 = sqlx::query(&phase4_sql)
-        .bind(project_id)
-        .execute(&mut *tx)
-        .await?;
+    let phase4 = run_resolution_phase(pool, project_id, &phase4_sql).await?;
 
-    let resolved = phase1.rows_affected()
-        + phase2.rows_affected()
-        + phase3.rows_affected()
-        + phase4.rows_affected();
-    tx.commit().await?;
-    Ok(resolved)
+    Ok(phase1 + phase2 + phase3 + phase4)
 }
 
 /// Read the symbol-extraction watermark for a project.

@@ -15,6 +15,7 @@
 
 pub mod a2a_csm;
 pub mod core_memory_a;
+pub mod data_tables;
 pub mod graph_arch;
 pub mod memory_sema;
 pub mod recommend;
@@ -25,6 +26,7 @@ pub mod work_items_b;
 
 pub use a2a_csm::*;
 pub use core_memory_a::*;
+pub use data_tables::*;
 pub use graph_arch::*;
 pub use memory_sema::*;
 pub use recommend::*;
