@@ -309,6 +309,86 @@ pub struct WorkItemLinkExperimentParams {
     pub seed_criterion: Option<bool>,
 }
 
+// ── Phase 2 — tracker ergonomics & next-action (views, assign, history, bulk) ──
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemViewParams {
+    #[schemars(
+        description = "Smart-view name (closed set): my-work | needs-triage | overdue | blocked | next-actionable. my-work filters on the durable assignee (the caller's agent id when assignee is omitted)."
+    )]
+    pub view: String,
+    #[schemars(
+        description = "For my-work: the assignee to scope to (auto-filled from the MCP client name when omitted)."
+    )]
+    pub assignee: Option<String>,
+    #[schemars(description = "Max rows (default 50, clamped 1..=1000)")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemNextActionableParams {
+    #[schemars(
+        description = "Restrict to the subtree under this plan public_id (omit = workspace-wide)."
+    )]
+    pub plan_public_id: Option<String>,
+    #[schemars(description = "Restrict to items owned by this durable assignee (optional).")]
+    pub assignee: Option<String>,
+    #[schemars(description = "Max rows (default 50, clamped 1..=1000)")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemAssignParams {
+    #[schemars(description = "The item's public_id to (re)assign or unassign.")]
+    pub public_id: String,
+    #[schemars(
+        description = "The durable owner agent id. Omit (or pass empty) to UNASSIGN. assignee is durable ownership intent (1:1, never auto-cleared) — distinct from the ephemeral claimed_by execution lease."
+    )]
+    pub assignee: Option<String>,
+    #[schemars(
+        description = "Who performed the assignment (auto-filled from the MCP client name)."
+    )]
+    pub assigned_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemHistoryParams {
+    #[schemars(description = "The item's public_id whose unified timeline to fetch.")]
+    pub public_id: String,
+    #[schemars(description = "Max events (default 100, clamped 1..=1000)")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemBulkParams {
+    #[schemars(
+        description = "Bulk operation (closed set): set_status | tag | untag | reprioritize | assign. set_status loops through the per-item transition chokepoint (legality + auto-unblock fire per item)."
+    )]
+    pub op: String,
+    #[schemars(
+        description = "Explicit target public_ids. Either this OR `view` must select targets (capped at 500)."
+    )]
+    pub public_ids: Option<Vec<String>>,
+    #[schemars(
+        description = "Alternatively, select targets by smart-view (my-work | needs-triage | overdue | blocked | next-actionable). Ignored when public_ids is given."
+    )]
+    pub view: Option<String>,
+    #[schemars(description = "For op=set_status: the target status to transition each item to.")]
+    pub status: Option<String>,
+    #[schemars(description = "For op=tag/untag: the tag label/slug.")]
+    pub tag: Option<String>,
+    #[schemars(
+        description = "For op=assign: the durable owner agent id (omit/empty to unassign each)."
+    )]
+    pub assignee: Option<String>,
+    #[schemars(description = "For op=reprioritize: the new priority to set on each item.")]
+    pub priority: Option<i32>,
+    #[schemars(
+        description = "For op=set_status: an optional reason recorded in the append-only status history."
+    )]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct A2aPatternRecursiveParams {
     #[schemars(description = "The long-context question to answer")]
@@ -414,6 +494,24 @@ pub struct TriggerCronParams {
         description = "Cron job name: \"symbol-extraction\" | \"call-graph\" | \"function-metrics\" | \"fuzzy-sync\" | \"a2a-reflect\" | \"msm-calibrate\". Use symbol-extraction first to populate file_symbols (needed by dead_code_reachability and naming_consistency), then call-graph to populate symbol_references edges, then function-metrics for cyclomatic/cognitive/Halstead/NPath/MI. fuzzy-sync rebuilds the per-project symbol/path/commit/mandate fuzzy tries from PG. Workspace-wide; per-project scoping happens through the project filter on the underlying queries."
     )]
     pub job: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemLinkCommitParams {
+    #[schemars(description = "The item's public_id to link to a commit / PR / branch")]
+    pub public_id: String,
+    #[schemars(
+        description = "The reference value: a commit SHA (full or unique prefix), a PR number, or a branch name"
+    )]
+    pub ref_value: String,
+    #[schemars(
+        description = "Link type: commit | pr | branch. Omit to infer from ref_value shape (hex≥7 ⇒ commit, digits ⇒ pr, else branch)."
+    )]
+    pub link_type: Option<String>,
+    #[schemars(
+        description = "Project name to scope a commit lookup against (defaults to the item's own project)"
+    )]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

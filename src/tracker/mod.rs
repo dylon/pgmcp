@@ -13,11 +13,21 @@
 //!   vocabularies, orthogonal to the `priority` (urgency) axis.
 //! - [`transition`] — the legal-transition matrix + actor-capability gate that
 //!   makes "an agent self-verifies / self-defers" structurally impossible.
+//! - [`git_link`] — the closed `GitLinkType` / `FindingSource` vocabularies for
+//!   the Phase-3 git/PR close-the-loop layer.
+//! - [`commit_ref`] — pure parsing of the `#<public_id>` / `fixes <public_id>`
+//!   commit-message convention (shared by the indexer + REST).
+//! - [`auto_transition`] — the pure agent-grade policy mapping a commit/PR
+//!   reference to the status to advance to; structurally incapable of reaching
+//!   a judgment status (the Phase-3 trust pin).
 //!
 //! Later phases add `rollup` (completion CTE helpers), `ingest` (plan→tree
 //! parser), `validate` (definition rule checkers), and `definition` (TOML
 //! (de)serialization) to this module.
 
+pub mod auto_transition;
+pub mod commit_ref;
+pub mod git_link;
 pub mod ingest;
 pub mod kind;
 pub mod rollup;
@@ -25,3 +35,4 @@ pub mod severity;
 pub mod status;
 pub mod transition;
 pub mod validate;
+pub mod views;

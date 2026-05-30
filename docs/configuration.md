@@ -131,6 +131,22 @@ topic_min_cluster_size = 5
 # topic_num_clusters = auto  # omit for auto K estimation
 topic_fuzziness = 2.0
 graph_analysis_interval_secs = 7200
+quality_history_interval_secs = 21600    # snapshot quality GPAs (trend/forecast); 0 disables
+findings_promotion_interval_secs = 21600 # auto-promote findings → items (opted-in projects); 0 disables
+
+# Proactive digest — OFF by default (local-first). Rides the SessionStart
+# `pgmcp context` CLI and the UserPromptSubmit observe `additional_context`.
+[digest]
+enabled = false              # master switch; nothing is composed/appended unless true
+session_start = true         # append to the SessionStart `pgmcp context` output
+prompt = true                # append to the UserPromptSubmit observe additional_context
+ttl_secs = 1800              # dedup window: suppress an identical digest to a session within this
+max_per_session = 10         # lifetime cap on emissions per session (across channels)
+max_bytes = 1024             # byte budget for the rendered block (most-severe items survive truncation)
+include_trends = true        # include the TREND (GPA slope/forecast) section
+webhook_url = ""             # empty = no outbound POST (opt-in)
+webhook_min_severity = "high" # min max_severity to POST: info|notice|high|critical
+pg_notify = false            # emit pg_notify('pgmcp_digest', …); reserved seam, no consumer built
 ```
 
 ### Configuration Reference
@@ -184,6 +200,18 @@ graph_analysis_interval_secs = 7200
 | `cron`       | `topic_min_cluster_size`          | `5`                                 | Minimum chunks per topic                       |
 | `cron`       | `topic_fuzziness`                 | `2.0`                               | FCM fuzziness exponent                         |
 | `cron`       | `graph_analysis_interval_secs`    | `7200`                              | Graph analysis interval                        |
+| `cron`       | `quality_history_interval_secs`   | `21600`                             | Quality-GPA snapshot interval (trend/forecast); 0 disables |
+| `cron`       | `findings_promotion_interval_secs`| `21600`                             | Findings→work-item promotion interval (opted-in projects only); 0 disables globally |
+| `digest`     | `enabled`                         | `false`                             | Master switch for the proactive digest         |
+| `digest`     | `session_start`                   | `true`                              | Append digest to the SessionStart `pgmcp context` output |
+| `digest`     | `prompt`                          | `true`                              | Append digest to the UserPromptSubmit observe `additional_context` |
+| `digest`     | `ttl_secs`                        | `1800`                              | Dedup window for an identical digest per session |
+| `digest`     | `max_per_session`                 | `10`                                | Lifetime cap on digest emissions per session   |
+| `digest`     | `max_bytes`                       | `1024`                              | Byte budget for the rendered digest block      |
+| `digest`     | `include_trends`                  | `true`                              | Include the TREND (GPA slope/forecast) section |
+| `digest`     | `webhook_url`                     | `""`                                | Optional outbound webhook (empty = off)        |
+| `digest`     | `webhook_min_severity`            | `high`                              | Min `max_severity` to POST (`info`/`notice`/`high`/`critical`) |
+| `digest`     | `pg_notify`                       | `false`                             | Emit `pg_notify('pgmcp_digest', …)` (reserved seam; no consumer) |
 
 ### Per-Project Configuration (`.pgmcp.toml`)
 
@@ -194,7 +222,10 @@ global settings and enable project-specific features.
 
 - **`[indexer]`** -- override `exclude_patterns`, `file_types`, and
   `max_file_size_bytes` for this project only
-- **`[git]`** -- enable git history indexing for this project
+- **`[git]`** -- enable git history indexing (`index_history`) and commit→work-item
+  auto-linkage (`auto_link_items`) for this project
+- **`[tracker]`** -- opt this project into the `findings-promotion` cron
+  (`auto_promote_findings`, default **OFF**) and tune its bug-score threshold
 
 **Example `.pgmcp.toml`:**
 
@@ -205,7 +236,33 @@ max_file_size_bytes = 2097152
 
 [git]
 index_history = true
+# Auto-link commits whose message references a work item (`#<public_id>` or
+# `fixes|closes|resolves|implements|refs <public_id>`) and run the agent-grade
+# auto-transition (at most → a verify *candidate*, NEVER → verified). Omit for
+# the default: ON when `index_history` is on. Set `false` to index history
+# without touching the tracker.
+auto_link_items = true
+
+[tracker]
+# Opt this project into the `findings-promotion` cron: idempotently materialize
+# high-confidence `bug_prediction` files (→ `pending` `bug`) and high-severity
+# `documented_tech_debt` markers (→ `pending` `fixme`) into the tracker. Default
+# OFF — promotion is a write-side action a project opts into explicitly. Promoted
+# items land in `pending`, never pre-`confirmed` (confirmation is user-only).
+auto_promote_findings = false
+# Minimum `bug_prediction` score for a file to be promoted (only consulted when
+# `auto_promote_findings` is on).
+findings_bug_score_threshold = 0.6
 ```
+
+**Per-project keys:**
+
+| Section     | Key                            | Default                  | Description                                                                 |
+|·············|································|··························|·····························································................|
+| `git`       | `index_history`                | `false`                  | Index commit messages + diffs for this project                              |
+| `git`       | `auto_link_items`              | (= `index_history`)      | Auto-link + agent-grade auto-transition referenced work items; explicit value wins |
+| `tracker`   | `auto_promote_findings`        | `false`                  | Opt into the `findings-promotion` cron for this project                     |
+| `tracker`   | `findings_bug_score_threshold` | `0.6`                    | Min `bug_prediction` score to promote a file (when promotion is on)         |
 
 **Managing `.pgmcp.toml`:**
 
@@ -215,6 +272,35 @@ pgmcp init-project --cwd DIR    # Create .pgmcp.toml in DIR
 pgmcp upgrade-project           # Merge new defaults into existing .pgmcp.toml
 pgmcp upgrade-project --cwd DIR # Merge new defaults in DIR
 ```
+
+### Proactive digest (`[digest]`)
+
+The digest turns pgmcp's *pull* surface into *push*: it composes a compact,
+severity-sorted block from live **TRACKER** (overdue / blocked / needs-triage /
+next-actionable), **HEALTH** (index staleness, embedding backlog, recently-panicked
+crons), and **TREND** (Phase-1 GPA slope + forecast) signals, and appends it to
+the two channels agents already read — the **SessionStart** `pgmcp context` CLI
+output (`session_start`) and the **UserPromptSubmit** `/api/session/observe`
+`additional_context` (`prompt`). It is **structurally read-only**: only `SELECT`s
+plus one INSERT into its own `digest_emissions` rate-limit ledger (which stores a
+content fingerprint + item count, never the digest body or prompt text).
+
+**Local-first defaults:** the whole section is `enabled = false`, so a stock
+install never composes or appends a digest. `webhook_url` is empty (no outbound
+POST), and `pg_notify` is `false` (the `pg_notify('pgmcp_digest', …)` seam is
+wired but has no consumer in the single-user setup). To turn it on:
+
+```toml
+[digest]
+enabled = true     # the only switch needed for the in-session channels
+# session_start / prompt default true; max_per_session=10, ttl_secs=1800 dedup.
+# Opt into the outbound webhook by setting a URL (gated by webhook_min_severity):
+# webhook_url = "https://hooks.example.com/pgmcp"
+```
+
+The TREND section additionally depends on the **`quality-history`** cron having
+populated `quality_report_history` (so set `[cron] quality_history_interval_secs`
+> 0, the default); with no history the digest simply carries TRACKER + HEALTH.
 
 ### Environment Variables
 

@@ -184,6 +184,11 @@ pub async fn index_git_history(
 
     let mut newest_sha: Option<String> = None;
 
+    // Phase 3: per-project gate on commit→work-item auto-linkage. Defaults ON
+    // when `index_history` is on; an explicit `[git] auto_link_items = false`
+    // opts out while still indexing history.
+    let auto_link = is_auto_link_items_enabled(project_root);
+
     for commit in &commits {
         // Track the newest commit (first in output, since git log is reverse chronological)
         if newest_sha.is_none() {
@@ -244,6 +249,23 @@ pub async fn index_git_history(
         if let Err(e) = index_commit_files(db.as_ref(), project_root, commit_id, &commit.hash).await
         {
             debug!(hash = %commit.hash, error = %e, "Failed to index commit files");
+        }
+
+        // Phase 3 auto-linkage: scan the commit subject+body for #<public_id> /
+        // `fixes <public_id>` references, link each (project-scope-guarded), and
+        // run the AGENT-grade auto-transition (at most → verify candidate, never
+        // → verified). Best-effort: a failure here never aborts indexing.
+        if auto_link {
+            auto_link_commit(
+                db,
+                project_id,
+                commit_id,
+                &commit.hash,
+                &commit.subject,
+                &commit.body,
+                stats,
+            )
+            .await;
         }
 
         // Submit for embedding
@@ -342,6 +364,135 @@ pub fn is_git_history_enabled(project_root: &Path) -> bool {
         .and_then(|o| o.git)
         .map(|g| g.index_history)
         .unwrap_or(false)
+}
+
+/// Check if a project has commit→work-item auto-linkage enabled (Phase 3).
+/// Defaults to ON when `index_history` is on (see
+/// [`crate::config::GitConfig::auto_link_items_enabled`]); an explicit
+/// `[git] auto_link_items = false` opts out.
+fn is_auto_link_items_enabled(project_root: &Path) -> bool {
+    ProjectOverride::load(project_root)
+        .and_then(|o| o.git)
+        .map(|g| g.auto_link_items_enabled())
+        .unwrap_or(false)
+}
+
+/// Phase 3 commit→work-item auto-linkage for one commit. Scans the commit
+/// subject+body for `#<public_id>` / `fixes <public_id>` references, links each
+/// referenced item to this commit (`detected_by='auto_scan'`, idempotent), and
+/// runs the AGENT-grade auto-transition.
+///
+/// TRUST BOUNDARY: every status change here runs as
+/// [`crate::tracker::transition::Actor::Agent`] through `set_work_item_status` →
+/// `check_transition`. The matrix has **no `Agent` arm into `verified`**, and
+/// [`crate::tracker::auto_transition::next_auto_status`] never proposes one — so
+/// a commit can advance an item at most to `claimed_done` (a verify candidate),
+/// never to `verified`. A closing verb (`fixes`) → `claimed_done`; a bare `#id`
+/// → `in_progress`; terminal / in-review / `triage` states → no-op.
+///
+/// PROJECT SCOPE GUARD: a referenced item is linked only when it belongs to the
+/// same project as the commit (`row.project_id == Some(project_id)`) or is
+/// workspace-global (`project_id IS NULL`). This stops a commit in repo A from
+/// hijacking an identically-named id in repo B.
+///
+/// Best-effort: any DB error is logged and skipped; `db.pool()` being `None`
+/// (a non-PgPool DbClient, e.g. in some tests) silently skips the whole step.
+async fn auto_link_commit(
+    db: &Arc<dyn DbClient>,
+    project_id: i32,
+    commit_id: i64,
+    commit_hash: &str,
+    subject: &str,
+    body: &str,
+    stats: &StatsTracker,
+) {
+    let Some(pool) = db.pool() else {
+        return; // non-PgPool client — nothing to link against
+    };
+    let text = format!("{subject}\n{body}");
+    let ids = crate::tracker::commit_ref::extract_public_ids(&text);
+    if ids.is_empty() {
+        return;
+    }
+    for public_id in &ids {
+        let item = match crate::db::queries::get_work_item_by_public_id(pool, public_id).await {
+            Ok(Some(row)) => row,
+            Ok(None) => continue, // a #token that is not a real work item
+            Err(e) => {
+                debug!(public_id, error = %e, "auto-link: lookup failed");
+                continue;
+            }
+        };
+        // Project-scope guard: same project, or workspace-global (NULL).
+        if !(item.project_id == Some(project_id) || item.project_id.is_none()) {
+            debug!(
+                public_id,
+                item_project = ?item.project_id,
+                commit_project = project_id,
+                "auto-link: skipping cross-project reference"
+            );
+            continue;
+        }
+
+        // Record the commit↔item link (idempotent via the UNIQUE constraint).
+        match crate::db::queries::insert_git_link(
+            pool,
+            item.id,
+            item.project_id,
+            crate::tracker::git_link::GitLinkType::Commit.as_str(),
+            commit_hash,
+            Some(commit_id),
+            "auto_scan",
+            None,
+        )
+        .await
+        {
+            Ok((_, created)) => {
+                if created {
+                    stats
+                        .git_items_auto_linked
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                debug!(public_id, error = %e, "auto-link: insert_git_link failed");
+                continue;
+            }
+        }
+
+        // Agent-grade auto-transition (NEVER verified). next_auto_status only
+        // proposes Agent-legal, non-judgment targets; set_work_item_status
+        // re-checks via check_transition, so a refused/illegal move is a no-op.
+        let from = match crate::tracker::status::WorkItemStatus::parse(&item.status) {
+            Some(s) => s,
+            None => continue,
+        };
+        let is_closing = crate::tracker::commit_ref::is_closing_ref(&text, public_id);
+        let Some(to) = crate::tracker::auto_transition::next_auto_status(from, is_closing) else {
+            continue; // no advancement for this state
+        };
+        let reason = if is_closing {
+            "git: closing-verb commit reference"
+        } else {
+            "git: commit reference"
+        };
+        if let Err(e) = crate::db::queries::set_work_item_status(
+            pool,
+            item.id,
+            to,
+            crate::tracker::transition::Actor::Agent,
+            Some("git-indexer"),
+            Some(reason),
+            None,
+            None,
+        )
+        .await
+        {
+            // A refused transition (e.g. a concurrent change moved the item) is
+            // expected and benign — the link is already recorded.
+            debug!(public_id, from = ?from, to = ?to, error = ?e, "auto-link: transition not applied");
+        }
+    }
 }
 
 /// Extract files changed in a commit using `git diff-tree` and store them.

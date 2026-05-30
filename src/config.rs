@@ -52,6 +52,12 @@ pub struct Config {
     /// `[nudges]` — JIT adoption-nudge tuning (observe pipeline). Off by default.
     #[serde(default)]
     pub nudges: NudgesConfig,
+    /// `[digest]` — proactive-surfacing digest (Phase 4). Rides the SessionStart
+    /// `pgmcp context` CLI and the UserPromptSubmit observe `additional_context`
+    /// to push tracker/health/trend state. Read-only (SELECTs + its own
+    /// rate-limit ledger insert). Off by default (local-first).
+    #[serde(default)]
+    pub digest: DigestConfig,
     /// `[experiments]` — scientific-experiment subsystem defaults (acceptance
     /// α, statistical test, power target, ledger rendering, CPU-governor
     /// enforcement). All read per-call via the live `ArcSwap<Config>`.
@@ -336,6 +342,90 @@ fn default_nudge_ttl_secs() -> u64 {
 }
 fn default_nudge_max_per_session() -> u32 {
     3
+}
+
+/// `[digest]` — proactive-surfacing digest tuning (Phase 4). The digest rides
+/// the two channels agents already read — the SessionStart `pgmcp context` CLI
+/// and the UserPromptSubmit `/api/session/observe` `additional_context` — and
+/// surfaces tracker state (overdue / blocked / needs-triage / next-actionable),
+/// pgmcp health (index staleness, embedding backlog, cron failures), and quality
+/// trends. It is structurally read-only: only `SELECT`s plus a single insert
+/// into its own `digest_emissions` rate-limit ledger. Off by default so a stock
+/// install stays inert; `webhook_url` is empty (no outbound) by default.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DigestConfig {
+    /// Master switch. When false the digest is never composed or appended on any
+    /// channel (the local-first default).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Append the digest to the SessionStart `pgmcp context` CLI output.
+    #[serde(default = "default_true_digest")]
+    pub session_start: bool,
+    /// Append the digest to the UserPromptSubmit observe `additional_context`.
+    #[serde(default = "default_true_digest")]
+    pub prompt: bool,
+    /// Suppress re-emitting an identical digest (same `content_sha256`) to the
+    /// same session within this many seconds (dedup window).
+    #[serde(default = "default_digest_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Lifetime cap on digest emissions per session (across channels).
+    #[serde(default = "default_digest_max_per_session")]
+    pub max_per_session: u32,
+    /// Byte budget for the rendered digest Markdown block. Severity-sorted items
+    /// are dropped once the budget is hit.
+    #[serde(default = "default_digest_max_bytes")]
+    pub max_bytes: usize,
+    /// Include the TREND section (Phase-1 GPA slope / forecast). When false the
+    /// digest carries only TRACKER + HEALTH.
+    #[serde(default = "default_true_digest")]
+    pub include_trends: bool,
+    /// Optional outbound webhook. Empty (the default) = no outbound POST. When
+    /// set, the daemon fires the digest (fire-and-forget) on the observe path,
+    /// gated on `max_severity() >= webhook_min_severity`.
+    #[serde(default)]
+    pub webhook_url: String,
+    /// Minimum digest `max_severity()` to POST to `webhook_url` (one of
+    /// `info|notice|high|critical`).
+    #[serde(default = "default_digest_webhook_min_severity")]
+    pub webhook_min_severity: String,
+    /// Emit a `pg_notify('pgmcp_digest', …)` on the daemon path when a digest is
+    /// composed. Off by default; reserved wiring point (no SSE consumer is built
+    /// in the single-user setup — see `src/digest/mod.rs`).
+    #[serde(default)]
+    pub pg_notify: bool,
+}
+
+impl Default for DigestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            session_start: default_true_digest(),
+            prompt: default_true_digest(),
+            ttl_secs: default_digest_ttl_secs(),
+            max_per_session: default_digest_max_per_session(),
+            max_bytes: default_digest_max_bytes(),
+            include_trends: default_true_digest(),
+            webhook_url: String::new(),
+            webhook_min_severity: default_digest_webhook_min_severity(),
+            pg_notify: false,
+        }
+    }
+}
+
+fn default_true_digest() -> bool {
+    true
+}
+fn default_digest_ttl_secs() -> u64 {
+    1800
+}
+fn default_digest_max_per_session() -> u32 {
+    10
+}
+fn default_digest_max_bytes() -> usize {
+    1024
+}
+fn default_digest_webhook_min_severity() -> String {
+    "high".to_string()
 }
 
 fn default_a2a_reflection_interval() -> u64 {
@@ -2257,6 +2347,19 @@ pub struct CronConfig {
     #[serde(default = "default_embedding_migration_interval")]
     pub embedding_migration_interval_secs: u64,
 
+    /// Interval for the quality-history snapshot cron (seconds). 0 disables.
+    /// Default 6h. Snapshots each project's quality GPAs into
+    /// `quality_report_history` so the trend/forecast tools + digest have a
+    /// trajectory rather than a single point.
+    #[serde(default = "default_quality_history_interval")]
+    pub quality_history_interval_secs: u64,
+
+    /// `findings-promotion` cron interval (seconds, default 6h). The cron only
+    /// acts on projects that opt in via `[tracker] auto_promote_findings = true`
+    /// in their `.pgmcp.toml`; a global interval of 0 disables it entirely.
+    #[serde(default = "default_findings_promotion_interval")]
+    pub findings_promotion_interval_secs: u64,
+
     /// Batch size for the embedding-migration cron (default 64).
     #[serde(default = "default_embedding_migration_batch_size")]
     pub embedding_migration_batch_size: usize,
@@ -2459,6 +2562,8 @@ impl Default for CronConfig {
             topic_dendrogram_interval_secs: default_topic_dendrogram_interval(),
             subtree_mining_interval_secs: default_subtree_mining_interval(),
             embedding_migration_interval_secs: default_embedding_migration_interval(),
+            quality_history_interval_secs: default_quality_history_interval(),
+            findings_promotion_interval_secs: default_findings_promotion_interval(),
             embedding_migration_batch_size: default_embedding_migration_batch_size(),
             embedding_migration_max_batches: default_embedding_migration_max_batches(),
             topic_max_mem_fraction: default_topic_max_mem_fraction(),
@@ -2647,6 +2752,14 @@ fn default_topic_dendrogram_interval() -> u64 {
 fn default_subtree_mining_interval() -> u64 {
     43200
 } // 12 h
+fn default_quality_history_interval() -> u64 {
+    21_600 // 6h
+}
+
+fn default_findings_promotion_interval() -> u64 {
+    21_600 // 6h
+}
+
 fn default_embedding_migration_interval() -> u64 {
     0
 } // disabled by default; operator enables via config when ready to migrate
@@ -2827,6 +2940,31 @@ pub struct ProjectOverride {
     /// simply skipped (purely additive). (graph-roadmap Phase 3.2)
     #[serde(default)]
     pub architecture: Option<ArchitectureRules>,
+    /// Per-project tracker behavior (Phase 3). Controls the opt-in
+    /// `findings-promotion` cron for this project.
+    #[serde(default)]
+    pub tracker: Option<ProjectTrackerOverride>,
+}
+
+/// Per-project tracker override (`[tracker]` in `.pgmcp.toml`). All knobs are
+/// **default OFF** — auto-promotion of analytic findings into work items is a
+/// write-side action that a project opts into explicitly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ProjectTrackerOverride {
+    /// Enable the `findings-promotion` cron for this project: idempotently
+    /// materialize high-confidence `bug_prediction` files and high-severity
+    /// `documented_tech_debt` markers into `pending` work items. Default
+    /// `false` (the cron skips every project that has not opted in).
+    #[serde(default)]
+    pub auto_promote_findings: bool,
+    /// Minimum `bug_prediction` score for a file to be promoted (default 0.6).
+    /// Only consulted when `auto_promote_findings` is on.
+    #[serde(default = "default_findings_bug_score_threshold")]
+    pub findings_bug_score_threshold: f64,
+}
+
+fn default_findings_bug_score_threshold() -> f64 {
+    0.6
 }
 
 /// Declared layered-architecture rules for reflexion conformance (Phase 3.2).
@@ -2911,6 +3049,22 @@ pub struct GitConfig {
     /// Enable git history indexing (commit messages + diffs) for this project.
     #[serde(default)]
     pub index_history: bool,
+    /// Auto-link work items referenced in commit messages (`#<public_id>` /
+    /// `fixes <public_id>`) and run the agent-grade auto-transition (at most to
+    /// a verify *candidate* — never `verified`). `None` (default) means "on when
+    /// `index_history` is on"; set `false` explicitly to opt out while still
+    /// indexing history. Consult via [`GitConfig::auto_link_items_enabled`].
+    #[serde(default)]
+    pub auto_link_items: Option<bool>,
+}
+
+impl GitConfig {
+    /// Whether commit→work-item auto-linkage is enabled. Defaults to ON when
+    /// `index_history` is on (auto-linkage needs the indexed commits) and OFF
+    /// otherwise; an explicit `auto_link_items` always wins.
+    pub fn auto_link_items_enabled(&self) -> bool {
+        self.auto_link_items.unwrap_or(self.index_history)
+    }
 }
 
 impl ProjectOverride {
@@ -2955,6 +3109,10 @@ impl ProjectOverride {
             git: Some(GitConfig::default()),
             phonetics: None,
             architecture: None,
+            // Opt-in (default OFF) — omitted from the default .pgmcp.toml so a
+            // fresh project does not auto-promote findings until it sets
+            // `[tracker] auto_promote_findings = true`.
+            tracker: None,
         };
         toml::to_string_pretty(&default).expect("Failed to serialize default project override")
     }

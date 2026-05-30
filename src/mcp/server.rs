@@ -703,6 +703,12 @@ impl McpServer {
                 "work_item_reinstate"    => work_item_reinstate(WorkItemReinstateParams) in work_items,
                 "work_item_triage"       => work_item_triage(WorkItemTriageParams) in work_items,
                 "work_item_resolve"      => work_item_resolve(WorkItemResolveParams) in work_items,
+                // Work-item tracker Phase 2 — smart-views, next-action, assign, history, bulk.
+                "work_item_view"            => work_item_view(WorkItemViewParams) in work_items,
+                "work_item_next_actionable" => work_item_next_actionable(WorkItemNextActionableParams) in work_items,
+                "work_item_assign"          => work_item_assign(WorkItemAssignParams) in work_items,
+                "work_item_history"         => work_item_history(WorkItemHistoryParams) in work_items,
+                "work_item_bulk"            => work_item_bulk(WorkItemBulkParams) in work_items,
                 "work_item_ingest_plan"  => work_item_ingest_plan(WorkItemIngestPlanParams) in work_items,
                 "work_item_promote_marker" => work_item_promote_marker(WorkItemPromoteMarkerParams) in work_items,
                 "work_item_claim"        => work_item_claim(WorkItemClaimParams) in work_items,
@@ -717,6 +723,7 @@ impl McpServer {
                 "work_item_unlink"       => work_item_unlink(WorkItemUnlinkParams) in work_items,
                 "work_item_cycles"       => work_item_cycles(WorkItemCyclesParams) in work_items,
                 "work_item_anchor_code"  => work_item_anchor_code(WorkItemAnchorCodeParams) in work_items,
+                "work_item_link_commit"  => work_item_link_commit(WorkItemLinkCommitParams) in work_items,
                 "work_item_burndown"     => work_item_burndown(WorkItemBurndownParams) in work_items,
                 "work_item_export"       => work_item_export(WorkItemExportParams) in work_items,
                 "work_item_link_experiment" => work_item_link_experiment(WorkItemLinkExperimentParams) in work_items,
@@ -791,6 +798,9 @@ impl McpServer {
                 "code_summarize"         => code_summarize(CodeSummarizeParams),
                 "engineering_scorecard"  => engineering_scorecard(EngineeringScorecardParams),
                 "quality_report"         => quality_report(QualityReportParams),
+                // Phase 1 — trends & forecasting (quality-history trajectory)
+                "quality_trend"          => quality_trend(QualityTrendParams),
+                "quality_forecast"       => quality_forecast(QualityForecastParams),
                 // Telemetry
                 "mcp_tool_telemetry"     => mcp_tool_telemetry(McpToolTelemetryParams),
                 "adoption_report"        => adoption_report(AdoptionReportParams),

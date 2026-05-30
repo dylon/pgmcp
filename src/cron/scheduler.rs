@@ -625,6 +625,7 @@ pub fn schedule_maintenance_jobs(
     lifecycle: DaemonLifecycle,
     cron_pool: Arc<crate::work_pool::pool::WorkPool>,
     general_pool: Option<Arc<crate::work_pool::pool::WorkPool>>,
+    system_ctx: crate::context::SystemContext,
 ) {
     // Stats aggregation (light — runs unconditionally)
     let stats_clone = Arc::clone(&stats);
@@ -721,6 +722,37 @@ pub fn schedule_maintenance_jobs(
             true
         },
     );
+
+    // findings-promotion (Phase 3): idempotently materialize high-confidence
+    // bug_prediction / high-severity documented_tech_debt findings into
+    // `pending` work items, for projects that opt in via
+    // `[tracker] auto_promote_findings`. Light job (bounded per-project queries
+    // + the shared scan/scoring primitives) — runs on the runtime like the
+    // presence sweep, no heavy-cron gate. Interval-gated (0 disables globally).
+    if config.findings_promotion_interval_secs > 0 {
+        let db_clone_fp = Arc::clone(&db);
+        let rt_clone_fp = rt.clone();
+        let stats_clone_fp = Arc::clone(&stats);
+        let lc_fp = lifecycle.clone();
+        let fp_interval = config.findings_promotion_interval_secs;
+        handle.schedule_recurring(
+            staggered_initial_delay_ms("findings-promotion", fp_interval * 1000),
+            fp_interval * 1000,
+            "findings-promotion",
+            move || {
+                if lc_fp.is_stopping() {
+                    return false;
+                }
+                let stats = Arc::clone(&stats_clone_fp);
+                if let Some(pool) = db_clone_fp.pool().cloned() {
+                    rt_clone_fp.spawn(async move {
+                        crate::cron::findings_promotion::run_or_log(pool, stats).await;
+                    });
+                }
+                true
+            },
+        );
+    }
 
     // Integrity check: clean up files with incomplete indexing (NULL content_hash).
     // These are files where pgmcp was killed between upsert and embedding completion.
@@ -1500,6 +1532,57 @@ pub fn schedule_maintenance_jobs(
     // (ADR-005): the schema is pinned to `bge-m3-v1` at migration time,
     // so there is no separate cutover step — this cron just fills any
     // 1024d columns still left NULL.
+    // quality-history (heavy — snapshots each project's quality GPAs into
+    // `quality_report_history` so the trend/forecast tools + digest read a
+    // trajectory, not a single point; it fans out the quality collectors via
+    // `quality::aggregate`). Interval-gated like embedding-migration.
+    if config.quality_history_interval_secs > 0 {
+        let rt_clone_qh = rt.clone();
+        let stats_for_qh = Arc::clone(&stats);
+        let qh_interval = config.quality_history_interval_secs;
+        let cron_pool_qh = Arc::clone(&cron_pool);
+        let lc_qh = lifecycle.clone();
+        let lock_qh = Arc::clone(&heavy_cron_lock);
+        let ready_qh: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+        let qh_ready_delay = Duration::from_secs(120);
+        let ctx_qh = system_ctx.clone();
+        handle.schedule_recurring(
+            staggered_initial_delay_ms("quality-history", qh_interval * 1000),
+            qh_interval * 1000,
+            "quality-history",
+            move || {
+                if lc_qh.is_stopping() {
+                    return false;
+                }
+                let lc = lc_qh.clone();
+                let lock = Arc::clone(&lock_qh);
+                let ready = Arc::clone(&ready_qh);
+                let stats = Arc::clone(&stats_for_qh);
+                let rt = rt_clone_qh.clone();
+                let ctx = ctx_qh.clone();
+                cron_pool_qh.submit(
+                    move || {
+                        let _guard = heavy_gate_or_skip!(
+                            job = "quality-history",
+                            lc = lc,
+                            ready = ready,
+                            cooldown = qh_ready_delay,
+                            lock = lock,
+                            stats = stats,
+                        );
+                        let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
+                        let stats_run = Arc::clone(&stats);
+                        rt.block_on(async move {
+                            crate::cron::quality_history::run_or_log(ctx, stats_run).await;
+                        });
+                    },
+                    crate::work_pool::pool::Priority::Low,
+                );
+                true
+            },
+        );
+    }
+
     if config.embedding_migration_interval_secs > 0 {
         let db_clone_mig = Arc::clone(&db);
         let rt_clone_mig = rt.clone();

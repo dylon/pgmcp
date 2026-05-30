@@ -10,6 +10,8 @@ pub mod csm_validate;
 #[allow(dead_code)]
 pub mod embedding_migration;
 #[allow(dead_code)]
+pub mod findings_promotion;
+#[allow(dead_code)]
 pub mod function_metrics;
 #[allow(dead_code)]
 pub mod fuzzy_sync;
@@ -37,6 +39,8 @@ pub mod memory_reflect;
 pub mod memory_retention;
 #[allow(dead_code)]
 pub mod ngram_lm_train;
+#[allow(dead_code)]
+pub mod quality_history;
 #[allow(dead_code)]
 pub mod scheduler;
 #[allow(dead_code)]

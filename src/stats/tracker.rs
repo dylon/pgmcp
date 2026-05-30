@@ -660,6 +660,15 @@ pub struct StatsTracker {
     pub presence_sweeps: AtomicU64,
     /// Work-item leases expired by the presence cron.
     pub work_item_leases_expired: AtomicU64,
+    /// quality-history cron: number of sweeps + GPA snapshots written.
+    pub quality_history_runs: AtomicU64,
+    pub quality_history_snapshots: AtomicU64,
+    /// Phase-3 git auto-linkage: work_item_git_links rows created by the git
+    /// indexer's commit-message scan (`detected_by='auto_scan'`).
+    pub git_items_auto_linked: AtomicU64,
+    /// findings-promotion cron: work items materialized from high-confidence
+    /// bug_prediction / high-severity documented_tech_debt findings.
+    pub findings_promoted: AtomicU64,
 
     /// Currently-connected Streamable HTTP MCP sessions. Incremented when
     /// a peer issues an `initialize` and a session is created in the
@@ -977,6 +986,10 @@ impl StatsTracker {
             work_item_handoffs: AtomicU64::new(0),
             agent_heartbeats: AtomicU64::new(0),
             presence_sweeps: AtomicU64::new(0),
+            quality_history_runs: AtomicU64::new(0),
+            quality_history_snapshots: AtomicU64::new(0),
+            git_items_auto_linked: AtomicU64::new(0),
+            findings_promoted: AtomicU64::new(0),
             work_item_leases_expired: AtomicU64::new(0),
             http_mcp_sessions: AtomicU64::new(0),
             peak_rss_bytes: AtomicU64::new(0),
@@ -1339,6 +1352,10 @@ impl StatsTracker {
             "work_item_handoffs": self.work_item_handoffs.load(Ordering::Acquire),
             "agent_heartbeats": self.agent_heartbeats.load(Ordering::Acquire),
             "presence_sweeps": self.presence_sweeps.load(Ordering::Acquire),
+            "quality_history_runs": self.quality_history_runs.load(Ordering::Acquire),
+            "quality_history_snapshots": self.quality_history_snapshots.load(Ordering::Acquire),
+            "git_items_auto_linked": self.git_items_auto_linked.load(Ordering::Acquire),
+            "findings_promoted": self.findings_promoted.load(Ordering::Acquire),
             "work_item_leases_expired": self.work_item_leases_expired.load(Ordering::Acquire),
             "http_mcp_sessions": self.http_mcp_sessions.load(Ordering::Acquire),
             "telemetry_rows_written": self.telemetry_rows_written.load(Ordering::Acquire),

@@ -130,6 +130,65 @@ refresh_crons to force them)."
         .await
     }
 
+    // ========================================================================
+    // Phase 1: Trends & forecasting (quality-history trajectory)
+    // ========================================================================
+
+    #[tool(
+        description = "Quality TREND: the per-pillar GPA trajectory (Engineering / Architecture / \
+Security / overall) over a lookback window, read from quality_report_history (populated by the \
+`quality-history` cron). \
+USE WHEN: you want to see how a project's health is MOVING — is tech-debt rising, is the \
+Architecture GPA recovering — rather than a single snapshot (`engineering_scorecard` / \
+`quality_report`). \
+DO NOT USE WHEN: you only need the current grade (call `engineering_scorecard`) or a forward \
+projection of when it crosses a threshold (call `quality_forecast`). \
+Returns the timestamped samples, an EWMA-smoothed overall line (so a single stale-cron run is \
+not a spike), and the first→last delta per pillar. Needs at least two snapshots for a delta."
+    )]
+    async fn quality_trend(
+        &self,
+        Parameters(params): Parameters<QualityTrendParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "quality_trend",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_quality_trend::tool_quality_trend(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Quality FORECAST: fit an OLS slope over the overall-GPA history and project \
+when, on that trajectory, the project crosses a GPA threshold (default 2.0 = the C-grade floor). \
+USE WHEN: you want a forward-looking 'debt hits a C in N weeks' signal to prioritize cleanup, or \
+to confirm a declining trend will (or won't) cross a line. \
+DO NOT USE WHEN: you only need the current grade (`engineering_scorecard`) or the raw series \
+(`quality_trend`). \
+Returns current_overall, slope_per_day, slope_per_week, weeks_to_threshold (null when flat / \
+improving / already past, with an explanatory note), and the threshold. Degrades gracefully on \
+short/empty history — never errors on a thin series."
+    )]
+    async fn quality_forecast(
+        &self,
+        Parameters(params): Parameters<QualityForecastParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "quality_forecast",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_quality_forecast::tool_quality_forecast(self.ctx(), params),
+        )
+        .await
+    }
+
     #[tool(
         description = "Adoption telemetry: how often each under-used tool family \
 (A2A, CSM coordination-conformance, memory, RLM, work-items) is actually called, by client and \

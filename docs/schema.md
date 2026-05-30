@@ -50,29 +50,53 @@ versioned migration.
 | `code_graph_edges`           | Import, co-change, and semantic edges              | `source_file_id`, `target_file_id`, `edge_type`, `weight`                    |
 | `file_metrics`               | Precomputed per-file graph and quality metrics     | `pagerank`, `betweenness`, `instability`, `bug_proneness`, `tech_debt_score` |
 
-### Work-Item Tracker Tables (v4 / v5 / v12)
+### Work-Item Tracker Tables (v4 / v5 / v12 / v16 / v17 / v18)
 
 The work-item / plan / bug tracker; full design in
-`docs/decisions/004-work-item-tracker.md`. Closed dimensions (`kind`, `status`,
-`severity`, `resolution`, …) are `TEXT` + `CHECK` built from closed Rust enums in
-`src/tracker/` (the enum is the single source of truth).
+`docs/decisions/004-work-item-tracker.md` (the zazzy-galaxy addendum covers
+v16/v17/v18). Closed dimensions (`kind`, `status`, `severity`, `resolution`,
+`link_type`, `finding_source`, `channel`, …) are `TEXT` + `CHECK` built from
+closed Rust enums in `src/tracker/` and `src/digest/` (the enum is the single
+source of truth).
 
 | Table                                          | Purpose                                              | Key Columns                                                                                          |
 |------------------------------------------------|------------------------------------------------------|------------------------------------------------------------------------------------------------------|
-| `work_items`                                   | Item spine (self-FK tree)                            | `public_id`, `parent_id`/`root_id`, `kind`, `status`, `priority`, `severity` (v12), `weight`, `embedding` (1024), claim cols (v5) |
+| `work_items`                                   | Item spine (self-FK tree)                            | `public_id`, `parent_id`/`root_id`, `kind`, `status`, `priority`, `severity` (v12), `weight`, `embedding` (1024), claim cols (v5), `assignee`/`assigned_at`/`assigned_by` (v16) |
 | `work_item_bug_details`                        | 1:1 bug sidecar (v12; `kind='bug'`)                  | `item_id` (UQ), `reproduction_steps`, `expected_behavior`, `actual_behavior`, `environment`, `affected_version`, `fixed_in_version`, `root_cause`, `is_regression`, `triaged_at`, `resolution` |
 | `work_item_status_history`                     | Append-only transition audit                         | `item_id`, `from_status`, `to_status`, `actor_kind`, `evidence_id`                                   |
-| `acceptance_criteria` + `verification_evidence`| Machine-checkable spec + un-fakeable proof ledger    | `criterion_kind`, `coverage_mode`; `verdict`, `source` (`manual` = untrusted)                        |
+| `acceptance_criteria` + `verification_evidence`| Machine-checkable spec + un-fakeable proof ledger    | `criterion_kind`, `coverage_mode`; `verdict`, `source` (`manual` = untrusted, `ci` = trusted)        |
 | `scope_negotiations`                           | User-only defer/cancel audit                         | `item_id`, `action`, `actor_kind='user'`, `reason`                                                   |
 | `item_relations`                               | Typed DAG edges                                      | `from/to_item_id`, `relation_type` (blocks/depends_on/duplicates/…)                                  |
 | `tags` + `work_item_tags`                      | Open-catalog tagging                                 | `slug`; `(item_id, tag_id)`                                                                           |
 | `plan_definitions` + `definition_rules`        | Reusable plan-shape validation                       | `slug`, `body_toml`; `rule_kind`, `applies_to_kind`, `field_name`                                    |
 | `work_item_claims` + `agent_presence`          | A2A claim ledger + presence decay (v5)               | `agent_id`, `action`, `lease_expires_at`                                                             |
+| `work_item_git_links`                          | Item ↔ commit/PR/branch join (v17)                   | `item_id`, `link_type` (CHECK), `ref_value`, `commit_id` (FK→`git_commits`, SET NULL), `detected_by` (`manual`/`auto_scan`); **UNIQUE(`item_id`,`link_type`,`ref_value`)** |
+| `work_item_finding_provenance`                 | Idempotency ledger for cron auto-promotion (v17)     | **`provenance_key` (UNIQUE)**, `item_id`, `finding_source` (CHECK), `first_seen_at`/`last_seen_at`   |
+| `digest_emissions`                             | Proactive-digest rate-limit ledger (v18)             | `session_id`, `channel` (CHECK), `project_id`, `content_sha256`, `item_count`, `ts` (fingerprint-only — no digest body) |
+
+The v16 columns add a **durable ownership** axis to the spine
+(`assignee`/`assigned_at`/`assigned_by`, all nullable free-text, set via
+`work_item_assign`, never auto-cleared), deliberately distinct from the v5
+**ephemeral lease** (`claimed_by`, which auto-expires and clears on
+release/handoff/expiry). The partial index `idx_work_items_assignee
+(assignee, priority DESC) WHERE assignee IS NOT NULL` serves the `my-work` queue.
 
 Closed vocabularies (Rust enum → CHECK): `kind` (15, incl. `bug`), `status` (12:
 …`triage` → `confirmed` → … alongside the verify lifecycle), `severity`
 (`critical | high | medium | low`), `resolution` (`fixed | wont_fix | duplicate |
-cannot_reproduce | by_design`).
+cannot_reproduce | by_design`); `work_item_git_links.link_type`
+(`commit | pr | branch`, `GitLinkType`), `work_item_finding_provenance.
+finding_source` (`bug_prediction | documented_tech_debt`, `FindingSource`),
+`digest_emissions.channel` (`session_start | prompt | webhook`, `DigestChannel`).
+The `SmartView` (`my-work | needs-triage | overdue | blocked | next-actionable`)
+and `BulkOp` (`set_status | tag | untag | reprioritize | assign`) enums in
+`src/tracker/views.rs` are **request-shaping** params, not stored columns, so
+they back no DB CHECK.
+
+`quality_report_history` (v9) is now populated by the **`quality-history`** cron
+(`src/cron/quality_history.rs`) — it snapshots each project's pillar GPAs every
+tick so the trend/forecast tools (`quality_trend`/`quality_forecast`) and the
+proactive digest read a *trajectory* rather than a single point.
 
 ### Indices
 

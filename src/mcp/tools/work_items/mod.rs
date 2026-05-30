@@ -27,6 +27,8 @@ mod verify;
 pub use verify::*;
 mod bugs;
 pub use bugs::*;
+mod git_link;
+pub use git_link::*;
 mod ingestion;
 pub use ingestion::*;
 mod collab;
@@ -39,6 +41,10 @@ mod reporting;
 pub use reporting::*;
 mod experiment_link;
 pub use experiment_link::*;
+mod views;
+pub use views::*;
+mod bulk;
+pub use bulk::*;
 
 /// Derive a kebab-case slug from a title (copied from `tool_experiments` so the
 /// two subsystems share an identical slugging rule without a cross-module dep).

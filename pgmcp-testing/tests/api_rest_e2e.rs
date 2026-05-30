@@ -57,7 +57,15 @@ fn parse_postgres_url(raw: &str) -> (String, u16, String, Option<String>, String
     (host, port, user, password, dbname.to_string())
 }
 
-fn write_daemon_config(home: &Path, db_url: &str, mcp_port: u16) -> PathBuf {
+/// Write a daemon `config.toml`. `digest_enabled` adds a `[digest]` section;
+/// when true the proactive digest rides the observe `additional_context`
+/// (Phase 4).
+fn write_daemon_config_ext(
+    home: &Path,
+    db_url: &str,
+    mcp_port: u16,
+    digest_enabled: bool,
+) -> PathBuf {
     let (db_host, db_port, db_user, db_pass, db_name) = parse_postgres_url(db_url);
     let cfg_dir = home.join(".config").join("pgmcp");
     std::fs::create_dir_all(&cfg_dir).expect("mkdir");
@@ -81,6 +89,9 @@ fn write_daemon_config(home: &Path, db_url: &str, mcp_port: u16) -> PathBuf {
     toml.push_str("topic_scan_interval_secs = 0\n");
     toml.push_str("graph_analysis_interval_secs = 0\n");
     toml.push_str("git_history_index_interval_secs = 0\n");
+    if digest_enabled {
+        toml.push_str("\n[digest]\nenabled = true\nprompt = true\n");
+    }
     let path = cfg_dir.join("config.toml");
     std::fs::write(&path, toml).expect("write config");
     path
@@ -106,10 +117,19 @@ impl Drop for DaemonHandle {
 }
 
 fn spawn_daemon(db_url: &str) -> Option<DaemonHandle> {
+    spawn_daemon_ext(db_url, false)
+}
+
+/// Spawn a daemon with the proactive digest enabled (`[digest] enabled=true`).
+fn spawn_daemon_with_digest(db_url: &str) -> Option<DaemonHandle> {
+    spawn_daemon_ext(db_url, true)
+}
+
+fn spawn_daemon_ext(db_url: &str, digest_enabled: bool) -> Option<DaemonHandle> {
     let binary = find_pgmcp_binary()?;
     let home = TempDir::new().expect("tempdir");
     let port = ephemeral_port();
-    let config_path = write_daemon_config(home.path(), db_url, port);
+    let config_path = write_daemon_config_ext(home.path(), db_url, port, digest_enabled);
 
     let mut cmd = Command::new(&binary);
     cmd.arg("-c")
@@ -482,6 +502,77 @@ async fn rest_api_search_returns_chunks_with_seeded_data() {
     assert!(
         body.contains("a.rs") || body.contains("println") || body.contains("api-chunks"),
         "api/search did not surface seeded chunk:\n{body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn observe_carries_digest_block_when_enabled() {
+    let db = require_test_db!();
+    // Seed a project + an overdue work item so the digest's TRACKER section has
+    // a High-severity signal to surface.
+    let project_id: i32 = sqlx::query_scalar(
+        "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind("/ws")
+    .bind("/ws/digest-e2e/")
+    .bind("digest-e2e")
+    .fetch_one(db.pool())
+    .await
+    .expect("seed project");
+    let item_id: i64 = sqlx::query_scalar(
+        "INSERT INTO work_items (public_id, project_id, kind, status, title, priority, weight, origin)
+         VALUES ($1, $2, 'task', 'pending', 'overdue e2e task', 50, 1.0, 'test') RETURNING id",
+    )
+    .bind("dg-e2e-overdue")
+    .bind(project_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("seed work item");
+    sqlx::query("UPDATE work_items SET due_at = now() - interval '3 days' WHERE id = $1")
+        .bind(item_id)
+        .execute(db.pool())
+        .await
+        .expect("set past due_at");
+
+    // Spawn with [digest] enabled = true.
+    let daemon = match spawn_daemon_with_digest(&db.connection_url()) {
+        Some(h) => h,
+        None => {
+            eprintln!("SKIPPED: pgmcp binary not found");
+            return;
+        }
+    };
+    wait_for_listen(daemon.port, Duration::from_secs(20)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "http://127.0.0.1:{}/api/session/observe",
+            daemon.port
+        ))
+        .json(&serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-0000000000d1",
+            "cwd": "/ws/digest-e2e",
+            "prompt": "what should I work on next in this project?",
+            "include_rag": false
+        }))
+        .send()
+        .await
+        .expect("send");
+    assert!(
+        resp.status().is_success(),
+        "observe should return 2xx, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("observe body JSON");
+    let ctx = body["additional_context"].as_str().unwrap_or("");
+    assert!(
+        ctx.contains("pgmcp digest"),
+        "observe additional_context must carry the digest block when [digest] enabled=true:\n{ctx}"
+    );
+    assert!(
+        ctx.contains("dg-e2e-overdue") || ctx.contains("overdue"),
+        "digest should surface the seeded overdue item:\n{ctx}"
     );
 }
 

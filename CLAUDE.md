@@ -85,6 +85,50 @@ do not have it. Closed vocabularies follow the ADR-003 idiom (TEXT + CHECK built
 from the Rust enum's `sql_in_list()` + a golden test pinning the set); the v12
 migration is `src/db/migrations/v12_bug_tracker.rs`.
 
+The zazzy-galaxy roadmap (4 phases; addendum in
+`docs/decisions/004-work-item-tracker.md`) added trajectories, ergonomics,
+close-the-loop, and push:
+
+- **Ergonomics (v16, `src/tracker/views.rs`).** `work_item_view` (smart-views:
+  `my-work` / `needs-triage` / `overdue` / `blocked` / `next-actionable`),
+  `work_item_next_actionable`, `work_item_assign` (durable `assignee` /
+  `assigned_at` / `assigned_by` — owns, vs. the ephemeral `claimed_by` lease;
+  never auto-cleared), `work_item_history`, `work_item_bulk` (`BulkOp`:
+  `set_status`/`tag`/`untag`/`reprioritize`/`assign`, per-item chokepoint). `SmartView`
+  / `BulkOp` are request-shaping enums (no DB CHECK). **Auto-unblock cascade**
+  (`src/db/queries/work_items.rs`): verifying an item moves dependents `blocked →
+  ready` as `Actor::System` in-tx via `check_transition` — System has no
+  judgment-state arm (`system_absent_from_judgment_columns`), so it unblocks but
+  cannot complete.
+- **Git/PR close-the-loop (v17, `src/tracker/{git_link,commit_ref,auto_transition}.rs`).**
+  Commit/PR convention: `#<public_id>` (touch → `in_progress`) or
+  `fixes|closes|resolves|implements|refs <public_id>` (close → `claimed_done`).
+  The git indexer auto-links + agent-grade auto-transitions (per-project `[git]
+  auto_link_items`, default on with `index_history`); `work_item_link_commit` is
+  the manual link (`GitLinkType` = `commit`/`pr`/`branch`). **THE TRUST
+  BOUNDARY:** a commit/merge runs as `Actor::Agent` and can NEVER reach `verified`
+  (no `Agent` arm; `next_auto_status` is exhaustively tested to never return a
+  judgment status); it stops at a `verifying` *candidate*. Only CI-posted
+  `source='ci'` evidence (`POST /api/tracker/ci_evidence`) flips → `verified` via
+  the gatekeeper; `POST /api/tracker/pr_event` stages a merge candidate. The
+  `findings-promotion` cron (`src/cron/findings_promotion.rs`,
+  `FindingSource`=`bug_prediction`/`documented_tech_debt`) idempotently promotes
+  findings → `pending` items (opt-in `[tracker] auto_promote_findings`, default
+  OFF; provenance-keyed for idempotency; never pre-`confirmed`).
+- **Trajectories (Phase 1).** `quality_trend` / `quality_forecast` +
+  `work_item_burndown`'s `slope_per_day` / `regression_eta_days`, over
+  `quality_report_history` now filled by the `quality-history` cron
+  (`[cron] quality_history_interval_secs`, default 6h). Math:
+  `src/quality/forecast.rs` (`ols_slope` / `weeks_to_threshold` / `pct_change`).
+- **Proactive digest (v18, `src/digest/`).** Off by default; `[digest] enabled =
+  true` surfaces TRACKER+HEALTH+TREND in the SessionStart `pgmcp context` and the
+  UserPromptSubmit `additional_context` (channels `session_start`/`prompt`;
+  optional `webhook`). **Read-only by construction** — only `SELECT`s plus one
+  INSERT into `digest_emissions`; `pgmcp-testing/tests/digest_trust_boundary.rs`
+  bans `set_work_item_status`/`Actor::` from `src/digest/`. The
+  `pg_notify('pgmcp_digest', …)` seam is wired but off (`[digest] pg_notify`,
+  no consumer built).
+
 ## Software pattern catalog (`src/patterns/`)
 
 The curated catalog ships ~810 entries across 14 paradigms in 21 per-family

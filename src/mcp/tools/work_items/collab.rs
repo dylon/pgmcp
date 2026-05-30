@@ -18,10 +18,12 @@ use serde_json::json;
 use crate::context::SystemContext;
 use crate::db::queries;
 use crate::mcp::server::{
-    WorkItemClaimNextParams, WorkItemClaimParams, WorkItemHandoffParams, WorkItemReleaseParams,
+    WorkItemAssignParams, WorkItemClaimNextParams, WorkItemClaimParams, WorkItemHandoffParams,
+    WorkItemReleaseParams,
 };
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err};
-use crate::mcp::tools::work_items::crud::{id_of_public, map_db_err};
+use crate::mcp::tools::work_items::crud::{id_of_public, map_db_err, map_op_err};
+use crate::mcp::tools::work_items::nonblank;
 
 /// Resolve the effective agent id (non-empty, else a sentinel).
 pub(crate) fn agent_of(opt: &Option<String>) -> &str {
@@ -160,4 +162,29 @@ pub async fn tool_work_item_handoff(
             None,
         )),
     }
+}
+
+/// `work_item_assign` — set (or clear) an item's DURABLE `assignee`.
+///
+/// `assignee` is durable ownership intent (1:1, never auto-expires, surfaced by
+/// the `my-work` smart-view); it is ORTHOGONAL to `claimed_by`, the ephemeral
+/// execution lease taken by `work_item_claim`. Assignment is NOT a status
+/// transition — `assign_work_item` only writes the assignee columns. An empty
+/// or omitted `assignee` UNASSIGNS the item.
+pub async fn tool_work_item_assign(
+    ctx: &SystemContext,
+    params: WorkItemAssignParams,
+) -> Result<CallToolResult, McpError> {
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    let pool = pool_or_err(ctx)?;
+
+    let id = id_of_public(pool, &params.public_id).await?;
+    // Empty/None ⇒ unassign (assign_work_item clears assigned_at when NULL).
+    let assignee = nonblank(&params.assignee);
+    let assigned_by = nonblank(&params.assigned_by);
+
+    let row = queries::assign_work_item(pool, id, assignee, assigned_by)
+        .await
+        .map_err(map_op_err)?;
+    json_result(&json!({ "assigned": assignee.is_some(), "item": row }))
 }

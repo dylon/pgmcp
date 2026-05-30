@@ -34,6 +34,7 @@ pub mod csm;
 pub mod daemon;
 pub mod daemon_state;
 pub mod db;
+pub mod digest;
 pub mod embed;
 pub mod error;
 pub mod experiment;

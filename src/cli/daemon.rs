@@ -315,22 +315,11 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     // Transition lifecycle: initialization complete, about to start scanning
     lifecycle.transition(daemon_state::DaemonPhase::Scanning);
 
-    // Schedule cron jobs (heavy jobs gate on lifecycle.is_at_least(Ready))
+    // embed_sender + cron_db are defined here because the indexer (below) also
+    // consumes them; the cron scheduler is invoked after the SystemContext is
+    // built (step 9), since the quality-history cron snapshots GPAs through it.
     let embed_sender = embed_pool.sender();
     let cron_db: Arc<dyn db::DbClient> = Arc::new(db_pool.clone());
-    cron::scheduler::schedule_maintenance_jobs(
-        &cron_handle,
-        Arc::clone(&cron_db),
-        Arc::clone(&stats_tracker),
-        &config_snapshot.cron,
-        &config_snapshot.fuzzy,
-        &config_snapshot.embeddings,
-        tokio::runtime::Handle::current(),
-        embed_sender.clone(),
-        lifecycle.clone(),
-        Arc::clone(&cron_pool),
-        Some(Arc::clone(&general_pool)),
-    );
 
     // 8. MCP logging broadcaster + task store (constructed early so the
     // SystemContext below can include them; both are needed by the indexer's
@@ -389,6 +378,24 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         Arc::clone(&task_store),
         lifecycle.clone(),
         llm_extractor.clone(),
+    );
+
+    // Schedule cron jobs (heavy jobs gate on lifecycle.is_at_least(Ready)).
+    // Invoked after the SystemContext build so the quality-history cron can
+    // snapshot project GPAs through the shared context.
+    cron::scheduler::schedule_maintenance_jobs(
+        &cron_handle,
+        Arc::clone(&cron_db),
+        Arc::clone(&stats_tracker),
+        &config_snapshot.cron,
+        &config_snapshot.fuzzy,
+        &config_snapshot.embeddings,
+        tokio::runtime::Handle::current(),
+        embed_sender.clone(),
+        lifecycle.clone(),
+        Arc::clone(&cron_pool),
+        Some(Arc::clone(&general_pool)),
+        system_ctx.clone(),
     );
 
     // 10. Start file watcher + scanner
@@ -710,6 +717,14 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             .route(
                 "/api/tracker/record_evidence",
                 axum::routing::post(api::handlers::tracker_record_evidence),
+            )
+            .route(
+                "/api/tracker/ci_evidence",
+                axum::routing::post(api::handlers::tracker_ci_evidence),
+            )
+            .route(
+                "/api/tracker/pr_event",
+                axum::routing::post(api::handlers::tracker_pr_event),
             )
             .merge(crate::a2a::a2a_router())
             .with_state(api_state);

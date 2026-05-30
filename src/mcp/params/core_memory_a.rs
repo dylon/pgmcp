@@ -133,6 +133,37 @@ pub struct QualityReportParams {
     pub refresh_crons: Option<Vec<String>>,
 }
 
+// === Phase 1 (trends & forecasting): trajectory tool parameter types ===
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct QualityTrendParams {
+    #[schemars(description = "Project name (as shown by list_projects)")]
+    pub project: String,
+    #[schemars(
+        description = "Lookback window in days over `quality_report_history` (default 90, \
+                       clamped 1..=3650). The cron snapshots GPAs every 6h, so 90d ≈ \
+                       360 points."
+    )]
+    pub days: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct QualityForecastParams {
+    #[schemars(description = "Project name (as shown by list_projects)")]
+    pub project: String,
+    #[schemars(
+        description = "Lookback window in days used to fit the overall-GPA slope \
+                       (default 90, clamped 1..=3650)."
+    )]
+    pub days: Option<i64>,
+    #[schemars(
+        description = "GPA threshold to project the crossing of (default 2.0 = the \
+                       C-grade floor). The forecast reports how many weeks until the \
+                       overall GPA, on its current slope, reaches this value."
+    )]
+    pub threshold: Option<f64>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ReadFileParams {
     #[schemars(description = "Absolute path of the file to read")]

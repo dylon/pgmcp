@@ -23,30 +23,11 @@ use crate::context::SystemContext;
 use crate::mcp::server::DocumentedTechDebtParams;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 
-/// 17 comment markers, severity-classified.
+/// 17 comment markers, severity-classified. Delegates to the shared catalog in
+/// `crate::code_analysis::findings` so the `documented_tech_debt` tool and the
+/// `findings-promotion` cron never disagree about the marker set or tiers.
 fn comment_markers() -> Vec<(&'static str, &'static str)> {
-    vec![
-        // high
-        ("FIXME", "high"),
-        ("BUG", "high"),
-        ("HACK", "high"),
-        ("KLUDGE", "high"),
-        ("WTF", "high"),
-        ("XXX", "high"),
-        // medium
-        ("TODO", "medium"),
-        ("TBD", "medium"),
-        ("WORKAROUND", "medium"),
-        ("REVIEW", "medium"),
-        ("SMELL", "medium"),
-        ("REFACTOR", "medium"),
-        ("DEPRECATED", "medium"),
-        // low
-        ("NOTE", "low"),
-        ("OPTIMIZE", "low"),
-        ("TEMP", "low"),
-        ("DEBUG", "low"),
-    ]
+    crate::code_analysis::findings::comment_markers()
 }
 
 /// Code-stub macro patterns per language.
@@ -639,13 +620,7 @@ fn guidance() -> &'static str {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(max).collect();
-        out.push('…');
-        out
-    }
+    crate::code_analysis::findings::truncate(s, max)
 }
 
 /// Wrapper holding a compiled regex; needed so we don't repeatedly compile in

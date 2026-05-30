@@ -26,6 +26,9 @@ mod v12_bug_tracker;
 mod v13_fts_stored_tsv;
 mod v14_resolution_kind_vocab;
 mod v15_symbol_effect_history;
+mod v16_assignee;
+mod v17_git_links;
+mod v18_digest_emissions;
 mod v2_shadow_asr;
 mod v3_cross_language_signatures;
 mod v4_work_items;
@@ -2292,6 +2295,48 @@ pub async fn run_migrations(
         info!(
             version = v15_symbol_effect_history::SYMBOL_EFFECT_HISTORY_V1,
             "symbol_effect_history_v1 migration applied"
+        );
+    }
+
+    if !version_applied(pool, v16_assignee::WORK_ITEM_ASSIGNEE_V1).await? {
+        v16_assignee::apply(pool).await?;
+        record_version(
+            pool,
+            v16_assignee::WORK_ITEM_ASSIGNEE_V1,
+            v16_assignee::WORK_ITEM_ASSIGNEE_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v16_assignee::WORK_ITEM_ASSIGNEE_V1,
+            "work_item_assignee_v1 migration applied"
+        );
+    }
+
+    if !version_applied(pool, v17_git_links::GIT_LINKS_V1).await? {
+        v17_git_links::apply(pool).await?;
+        record_version(
+            pool,
+            v17_git_links::GIT_LINKS_V1,
+            v17_git_links::GIT_LINKS_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v17_git_links::GIT_LINKS_V1,
+            "git_links_v1 migration applied"
+        );
+    }
+
+    if !version_applied(pool, v18_digest_emissions::DIGEST_EMISSIONS_V1).await? {
+        v18_digest_emissions::apply(pool).await?;
+        record_version(
+            pool,
+            v18_digest_emissions::DIGEST_EMISSIONS_V1,
+            v18_digest_emissions::DIGEST_EMISSIONS_V1_NAME,
+        )
+        .await?;
+        info!(
+            version = v18_digest_emissions::DIGEST_EMISSIONS_V1,
+            "digest_emissions_v1 migration applied"
         );
     }
 

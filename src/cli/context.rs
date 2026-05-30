@@ -74,6 +74,11 @@ async fn run_context_command(
             println!();
             print!("{}", crate::mandates::render_mandates_markdown(&mandates));
 
+            // Phase 4: proactive digest (tracker / health / trend). Off unless
+            // [digest] enabled = true. DB-only HEALTH (the CLI has no live
+            // StatsTracker), project-scoped tracker + trend.
+            emit_session_start_digest(pool, config, Some(project.id), &cwd_normalized).await;
+
             println!();
             println!("### Available pgmcp tools");
             println!(
@@ -104,6 +109,12 @@ async fn run_context_command(
             let mandates = crate::mandates::resolve_effective_mandates(config, None);
             println!();
             print!("{}", crate::mandates::render_mandates_markdown(&mandates));
+
+            // Phase 4: proactive digest, project-agnostic (no project resolved
+            // for this cwd → cross-project HEALTH only; tracker/trend no-op
+            // without a project scope). Off unless [digest] enabled = true.
+            emit_session_start_digest(pool, config, None, &cwd_normalized).await;
+
             println!();
             println!("### Available pgmcp tools");
             println!(
@@ -117,4 +128,48 @@ async fn run_context_command(
     }
 
     Ok(())
+}
+
+/// Compose and print the proactive digest on the SessionStart channel, gated by
+/// `[digest] enabled && session_start`. The CLI has no live `StatsTracker` (so
+/// HEALTH omits the cron-failure signal — `None`) and no client session id, so a
+/// synthetic per-cwd key drives the [`maybe_emit`](crate::digest::maybe_emit)
+/// dedup/rate-limit (re-running `pgmcp context` in the same directory within the
+/// TTL won't re-print an identical digest). Best-effort: a DB error simply omits
+/// the block rather than failing the context command.
+async fn emit_session_start_digest(
+    pool: &sqlx::PgPool,
+    config: &Config,
+    project_id: Option<i32>,
+    cwd_normalized: &str,
+) {
+    let cfg = &config.digest;
+    if !cfg.enabled || !cfg.session_start {
+        return;
+    }
+    let digest = crate::digest::compose_digest(pool, project_id, None, cfg).await;
+    if digest.is_empty() {
+        return;
+    }
+    // Synthetic, stable per-cwd session key (the CLI has no client session id).
+    let session_key = format!(
+        "session-start:{}",
+        crate::sessions::prompt_sha256(cwd_normalized)
+    );
+    if crate::digest::maybe_emit(
+        pool,
+        &session_key,
+        crate::digest::DigestChannel::SessionStart,
+        project_id,
+        cfg,
+        &digest,
+    )
+    .await
+    {
+        let block = digest.render_markdown(cfg.max_bytes);
+        if !block.is_empty() {
+            println!();
+            print!("{block}");
+        }
+    }
 }

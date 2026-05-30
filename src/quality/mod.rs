@@ -7,6 +7,8 @@
 //! - [`report`] — the graded [`QualityReport`] tree + grade arithmetic.
 //! - [`aggregate`] — fans the analysis tools out and assembles a report.
 //! - [`history`] — persists per-pillar GPAs for trend rendering.
+//! - [`forecast`] — pure trend/slope/threshold math over a metric series
+//!   (snapshots → trajectories), reused by the trend tools and the digest.
 //!
 //! Much of this surface is exercised only through the `quality_report` MCP tool
 //! (registered via the `#[tool_router]` macro), which defeats the compiler's
@@ -16,6 +18,7 @@
 pub mod aggregate;
 pub mod collectors;
 pub mod findings;
+pub mod forecast;
 pub mod history;
 pub mod report;
 

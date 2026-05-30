@@ -13,7 +13,7 @@ use serde_json::json;
 
 use crate::context::SystemContext;
 use crate::db::queries::{self, WorkItemRow};
-use crate::mcp::server::{WorkItemBurndownParams, WorkItemExportParams};
+use crate::mcp::server::{WorkItemBurndownParams, WorkItemExportParams, WorkItemHistoryParams};
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err};
 use crate::mcp::tools::work_items::crud::{id_of_public, map_db_err};
 
@@ -48,6 +48,30 @@ pub async fn tool_work_item_burndown(
     } else {
         None
     };
+
+    // Trajectory (Phase 1): an OLS slope over the *cumulative* verified curve
+    // gives a smoothed completion velocity (items/day) that, unlike the flat
+    // `velocity_per_day` average, weights the actual day-to-day shape of the
+    // window. The series only carries days that had ≥1 verification, so the
+    // x-axis is the calendar-day offset from the first such day (gaps honored),
+    // and y is the running cumulative count. `regression_eta_days` projects the
+    // remaining items onto that fitted slope.
+    let mut cumulative = 0i64;
+    let mut day0: Option<chrono::NaiveDate> = None;
+    let mut fit_points: Vec<(f64, f64)> = Vec::with_capacity(series.len());
+    for d in &series {
+        cumulative += d.verified;
+        if let Ok(date) = chrono::NaiveDate::parse_from_str(&d.day, "%Y-%m-%d") {
+            let base = *day0.get_or_insert(date);
+            let x = (date - base).num_days() as f64;
+            fit_points.push((x, cumulative as f64));
+        }
+    }
+    let slope_per_day = crate::quality::forecast::ols_slope(&fit_points);
+    let regression_eta_days = match slope_per_day {
+        Some(s) if s > 0.0 => Some((remaining as f64 / s).ceil()),
+        _ => None,
+    };
     let eta_date = eta_days.map(|d| (Utc::now() + Duration::days(d as i64)).to_rfc3339());
     let verified_fraction = if summary.total > 0 {
         summary.verified as f64 / summary.total as f64
@@ -68,7 +92,37 @@ pub async fn tool_work_item_burndown(
         "verified_in_window": verified_in_window,
         "eta_days": eta_days,
         "eta_date": eta_date,
+        "slope_per_day": slope_per_day,
+        "regression_eta_days": regression_eta_days,
         "series": series,
+    }))
+}
+
+/// `work_item_history` — the full per-item unified timeline: a chronological
+/// merge of status transitions, progress notes, claim/handoff events,
+/// verification evidence, and scope negotiations. Read-only. The auto-unblock
+/// cascade surfaces here as an `actor_kind='system'` `blocked → ready` status
+/// event on the unblocked dependent.
+pub async fn tool_work_item_history(
+    ctx: &SystemContext,
+    params: WorkItemHistoryParams,
+) -> Result<CallToolResult, McpError> {
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    ctx.stats()
+        .work_item_queries
+        .fetch_add(1, Ordering::Relaxed);
+    let pool = pool_or_err(ctx)?;
+
+    let item_id = id_of_public(pool, &params.public_id).await?;
+    let limit = params.limit.unwrap_or(100);
+    let timeline = queries::work_item_timeline(pool, item_id, limit)
+        .await
+        .map_err(map_db_err)?;
+
+    json_result(&json!({
+        "public_id": params.public_id,
+        "events": timeline.len(),
+        "timeline": timeline,
     }))
 }
 

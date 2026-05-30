@@ -43,6 +43,37 @@ cannot_reproduce | by_design`, `duplicate` recording a `duplicates` relation). A
 settable by hand). `work_item_triage` / `work_item_resolve` / `work_item_defer`
 require `[tracker] user_token`; agents do not have it.
 
+**Ergonomics (v16).** `work_item_view` runs a fixed smart-view (`my-work` /
+`needs-triage` / `overdue` / `blocked` / `next-actionable`);
+`work_item_next_actionable` returns the single best workable-now item;
+`work_item_assign` sets the **durable** `assignee` (distinct from the ephemeral
+`claimed_by` lease — owns vs. actively-executing; never auto-cleared);
+`work_item_history` is one item's full timeline; `work_item_bulk` applies a
+`BulkOp` (`set_status`/`tag`/`untag`/`reprioritize`/`assign`) over a resolved set
+through the per-item chokepoint. **Auto-unblock:** verifying an item moves
+dependents that were `blocked` solely on it `blocked → ready` as `Actor::System`
+in-tx (System has no judgment-state arm, so it can unblock but never complete).
+
+**Git/PR close-the-loop (v17).** Reference an item from a commit/PR with
+`#<public_id>` (a touch → `in_progress`) or `fixes|closes|resolves|implements|refs
+<public_id>` (a close → `claimed_done`). The git indexer auto-links + auto-transitions
+referenced items (per-project `[git] auto_link_items`, default on with
+`index_history`); `work_item_link_commit` is the manual link. **Trust boundary:** a
+commit/merge is *agent-grade* (`Actor::Agent`) and can NEVER reach `verified` — the
+git→`verifying` candidate and a green build are different things. Only a CI-posted
+`source='ci'` evidence row (`POST /api/tracker/ci_evidence`) flips an item to
+`verified` through the gatekeeper; `POST /api/tracker/pr_event` only stages a merge
+as a `verifying` candidate. The `findings-promotion` cron can materialize
+high-confidence findings into `pending` items (opt-in: `[tracker]
+auto_promote_findings`, default OFF).
+
+**Proactive digest.** Off by default; set `[digest] enabled = true` to surface
+tracker/health/trend state in the SessionStart `pgmcp context` and the
+UserPromptSubmit `additional_context`. It is read-only (a source-grep test bans
+transition symbols from `src/digest/`). Trends/forecasts come from
+`quality_trend`/`quality_forecast` (and `work_item_burndown`'s `slope_per_day` /
+`regression_eta_days`), fed by the `quality-history` cron.
+
 ## Session-level mandates
 
 `src/sessions.rs` extracts imperative directives from user prompts via a

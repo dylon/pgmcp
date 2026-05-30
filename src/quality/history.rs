@@ -1,6 +1,7 @@
 //! Per-pillar GPA history — one row per `quality_report` run, read back as the
 //! trend strip. The only persisted artifact (findings are recomputed each run).
 
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::warn;
 
@@ -103,4 +104,72 @@ pub async fn recent_gpas(pool: &PgPool, project_id: i32, n: usize) -> Vec<Pillar
         });
     }
     out
+}
+
+/// One timestamped quality-history sample, for the trend/forecast tools and the
+/// digest. Unlike [`recent_gpas`] (which collapses to per-pillar `PillarTrend`
+/// strips), this keeps the `computed_at` axis so a slope/forecast can be fit.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GpaPoint {
+    pub at: DateTime<Utc>,
+    pub engineering: Option<f32>,
+    pub architecture: Option<f32>,
+    pub security: Option<f32>,
+    pub overall: Option<f32>,
+}
+
+/// All quality-history samples for a project within the last `days`, oldest →
+/// newest. Empty (not an error) if the table is missing/empty — same
+/// best-effort posture as [`recent_gpas`].
+pub async fn gpa_series_since(pool: &PgPool, project_id: i32, days: i64) -> Vec<GpaPoint> {
+    let days = days.clamp(1, 3650);
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        computed_at: DateTime<Utc>,
+        engineering_gpa: Option<f32>,
+        architecture_gpa: Option<f32>,
+        security_gpa: Option<f32>,
+        overall_gpa: Option<f32>,
+    }
+    let rows: Result<Vec<Row>, _> = sqlx::query_as::<_, Row>(
+        "SELECT computed_at, engineering_gpa, architecture_gpa, security_gpa, overall_gpa
+         FROM quality_report_history
+         WHERE project_id = $1 AND computed_at >= NOW() - make_interval(days => $2::int)
+         ORDER BY computed_at ASC",
+    )
+    .bind(project_id)
+    .bind(days)
+    .fetch_all(pool)
+    .await;
+    match rows {
+        Ok(rows) => rows
+            .into_iter()
+            .map(|r| GpaPoint {
+                at: r.computed_at,
+                engineering: r.engineering_gpa,
+                architecture: r.architecture_gpa,
+                security: r.security_gpa,
+                overall: r.overall_gpa,
+            })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Fit a per-day OLS slope of the `overall` GPA over a [`GpaPoint`] series
+/// (days measured from the first sample). `None` if fewer than two overall-GPA
+/// points exist. Shared by the forecast tool and the digest's "GPA trending …"
+/// line so they agree on the number.
+pub fn overall_gpa_slope_per_day(series: &[GpaPoint]) -> Option<f64> {
+    let t0 = series.first()?.at;
+    let pts: Vec<(f64, f64)> = series
+        .iter()
+        .filter_map(|p| {
+            p.overall.map(|g| {
+                let days = (p.at - t0).num_seconds() as f64 / 86_400.0;
+                (days, g as f64)
+            })
+        })
+        .collect();
+    crate::quality::forecast::ols_slope(&pts)
 }

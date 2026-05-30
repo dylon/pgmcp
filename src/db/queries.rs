@@ -77,3 +77,9 @@ pub use queries_status::*;
 #[path = "queries/advisories.rs"]
 mod queries_advisories;
 pub use queries_advisories::*;
+
+// The digest rate-limit ledger keeps its own namespace (`queries::digest::*`)
+// rather than being flattened with `pub use`, so the digest's sole write
+// surface stays obviously distinct from the read queries. See `src/digest/`.
+#[path = "queries/digest.rs"]
+pub mod digest;

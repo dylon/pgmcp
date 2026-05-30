@@ -451,6 +451,29 @@ and change-impact surfaces."
     }
 
     #[tool(
+        description = "Link a work item to a commit / PR / branch (the #<public_id> convention, made \
+explicit). Pass ref_value (a commit SHA / PR number / branch name); link_type is inferred from its shape \
+when omitted. For a commit, the SHA is resolved to an indexed git_commits row when available. This is a \
+LINK only — it does NOT change status (repo activity advances items via the indexer's agent-grade \
+auto-transition, and →verified still needs CI evidence). Idempotent on re-link."
+    )]
+    async fn work_item_link_commit(
+        &self,
+        Parameters(params): Parameters<WorkItemLinkCommitParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_link_commit",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::work_items::tool_work_item_link_commit(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Burndown/velocity for a plan: verified-vs-remaining counts, realized velocity \
 (items verified/day over the window), and a naive ETA. USE WHEN reporting plan progress or estimating \
 completion. Reads the append-only status history — reflects evidence-verified completion, not agent claims."
@@ -509,6 +532,124 @@ evidence that auto-verifies the task. USE WHEN you want an experiment tracked + 
             &_ctx,
             &summarize_debug(&params),
             crate::mcp::tools::work_items::tool_work_item_link_experiment(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List one of the five built-in smart-view queues: my-work | needs-triage | overdue | \
+blocked | next-actionable. my-work scopes to YOUR durable assignee (auto-filled from the MCP client name). \
+USE WHEN you want a focused worklist instead of an unfiltered work_item_list. Read-only. Returns \
+{view, count, items}."
+    )]
+    async fn work_item_view(
+        &self,
+        Parameters(mut params): Parameters<WorkItemViewParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // my-work scopes to the caller; fill the assignee from the client name
+        // when omitted (mirrors how claim fills agent_id).
+        if params.assignee.is_none() {
+            params.assignee = Some(extract_caller(&_ctx).client_name);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_view",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::work_items::tool_work_item_view(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "The read-only 'what can I do now' frontier: actionable-status items (pending/confirmed/\
+ready) whose every blocker is cleared, ranked like claim_next but WITHOUT claiming. Optionally scoped to a \
+plan subtree and/or a durable assignee. USE WHEN deciding what to pick up next. Returns {count, actionable}."
+    )]
+    async fn work_item_next_actionable(
+        &self,
+        Parameters(params): Parameters<WorkItemNextActionableParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_next_actionable",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::work_items::tool_work_item_next_actionable(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Set (or clear) an item's DURABLE assignee — durable ownership intent (1:1, never \
+auto-expires, surfaced by the my-work view), ORTHOGONAL to the ephemeral claimed_by execution lease taken by \
+work_item_claim. Assignment is NOT a status transition. Omit/empty assignee to UNASSIGN. USE WHEN recording \
+who owns an item long-term (vs who is actively working it right now)."
+    )]
+    async fn work_item_assign(
+        &self,
+        Parameters(mut params): Parameters<WorkItemAssignParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.assigned_by.is_none() {
+            params.assigned_by = Some(extract_caller(&_ctx).client_name);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_assign",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::work_items::tool_work_item_assign(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "The full per-item unified timeline: a chronological merge of status transitions, \
+progress notes, claim/handoff events, verification evidence, and scope negotiations. Read-only. USE WHEN \
+auditing an item's history — the auto-unblock cascade appears here as an actor_kind='system' blocked→ready \
+event. Returns {public_id, events, timeline}."
+    )]
+    async fn work_item_history(
+        &self,
+        Parameters(params): Parameters<WorkItemHistoryParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_history",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::work_items::tool_work_item_history(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Apply one operation to many items at once: set_status | tag | untag | reprioritize | \
+assign. Select targets by explicit public_ids OR a smart-view (capped at 500). set_status loops through the \
+per-item transition chokepoint as Actor::Agent — so each item gets full transition-legality (an illegal \
+move lands in `failed`) AND the auto-unblock cascade. Partial-success: returns \
+{op, attempted, succeeded, failed:[{public_id, error}]}."
+    )]
+    async fn work_item_bulk(
+        &self,
+        Parameters(params): Parameters<WorkItemBulkParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_bulk",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::work_items::tool_work_item_bulk(self.ctx(), params),
         )
         .await
     }

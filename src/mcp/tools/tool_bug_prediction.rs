@@ -73,87 +73,49 @@ pub async fn tool_bug_prediction(
     // history — features = process/structural metrics, label = "touched by a
     // bug-fix commit" (fix_commit_ratio > 0). fix_commit_ratio is NOT a feature
     // (no label leakage). Falls back to the hand-weighted heuristic on cold
-    // start (one class only / too little history).
-    let feature_rows: Vec<Vec<f64>> = rows
+    // start (one class only / too little history). The scoring is the shared
+    // `code_analysis::findings::score_bug_files` primitive, so this tool and the
+    // `findings-promotion` cron compute identical scores. The per-file metric
+    // fields (commit/author/coupling) are looked up alongside for the output.
+    use crate::code_analysis::findings::BugFeatures;
+    let features: Vec<BugFeatures> = rows
         .iter()
-        .map(|r| {
-            vec![
-                r.churn_rate.unwrap_or(0.0),
-                r.commit_count.unwrap_or(0) as f64,
-                r.author_count.unwrap_or(0) as f64,
-                r.in_degree.unwrap_or(0) as f64,
-                r.out_degree.unwrap_or(0) as f64,
-                r.line_count as f64,
-            ]
+        .map(|r| BugFeatures {
+            relative_path: r.relative_path.clone(),
+            language: r.language.clone(),
+            line_count: r.line_count,
+            churn_rate: r.churn_rate,
+            fix_commit_ratio: r.fix_commit_ratio,
+            commit_count: r.commit_count,
+            author_count: r.author_count,
+            in_degree: r.in_degree,
+            out_degree: r.out_degree,
         })
         .collect();
-    let labels: Vec<f64> = rows
+    let (ranked, score_kind_enum) = crate::code_analysis::findings::score_bug_files(&features);
+    let score_kind = score_kind_enum.as_str();
+
+    // Re-attach the raw metric fields (by path) for the rendered output.
+    let by_path: std::collections::HashMap<&str, &BugRow> =
+        rows.iter().map(|r| (r.relative_path.as_str(), r)).collect();
+    let mut scored: Vec<serde_json::Value> = ranked
         .iter()
-        .map(|r| {
-            if r.fix_commit_ratio.unwrap_or(0.0) > 0.0 {
-                1.0
-            } else {
-                0.0
-            }
-        })
-        .collect();
-    let model =
-        crate::code_analysis::defect_model::LogisticModel::fit(&feature_rows, &labels, 2000, 0.3);
-    let score_kind = if model.is_some() {
-        "trained_logreg"
-    } else {
-        "heuristic"
-    };
-
-    let mut scored: Vec<serde_json::Value> = rows
-        .iter()
-        .enumerate()
-        .map(|(i, r)| {
-            let churn = r.churn_rate.unwrap_or(0.0);
-            let fix_ratio = r.fix_commit_ratio.unwrap_or(0.0);
-            let coupling = (r.in_degree.unwrap_or(0) + r.out_degree.unwrap_or(0)) as f64;
-            let size_factor = (r.line_count as f64 / 100.0).min(10.0);
-            let authors = r.author_count.unwrap_or(1) as f64;
-
-            // Trained probability when a model fit; else the hand-weighted score.
-            let bug_score = match &model {
-                Some(m) => m.predict(&feature_rows[i]),
-                None => (churn * 0.3
-                    + fix_ratio * 3.0
-                    + size_factor * 0.2
-                    + coupling * 0.05
-                    + (authors - 1.0).max(0.0) * 0.1)
-                    .max(0.0),
-            };
-
+        .map(|s| {
+            let r = by_path.get(s.relative_path.as_str());
             serde_json::json!({
-                "path": r.relative_path,
-                "language": r.language,
-                "bug_score": format!("{:.4}", bug_score),
+                "path": s.relative_path,
+                "language": s.language,
+                "bug_score": format!("{:.4}", s.bug_score),
                 "score_kind": score_kind,
-                "churn_rate": format!("{:.2}", churn),
-                "fix_ratio": format!("{:.2}", fix_ratio),
-                "line_count": r.line_count,
-                "commit_count": r.commit_count.unwrap_or(0),
-                "author_count": r.author_count.unwrap_or(0),
-                "coupling": r.in_degree.unwrap_or(0) + r.out_degree.unwrap_or(0),
+                "churn_rate": format!("{:.2}", r.and_then(|r| r.churn_rate).unwrap_or(0.0)),
+                "fix_ratio": format!("{:.2}", s.fix_ratio),
+                "line_count": s.line_count,
+                "commit_count": r.and_then(|r| r.commit_count).unwrap_or(0),
+                "author_count": r.and_then(|r| r.author_count).unwrap_or(0),
+                "coupling": r.map(|r| r.in_degree.unwrap_or(0) + r.out_degree.unwrap_or(0)).unwrap_or(0),
             })
         })
         .collect();
-
-    scored.sort_by(|a, b| {
-        let sa: f64 = a["bug_score"]
-            .as_str()
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0.0);
-        let sb: f64 = b["bug_score"]
-            .as_str()
-            .unwrap_or("0")
-            .parse()
-            .unwrap_or(0.0);
-        sb.partial_cmp(&sa).unwrap_or(std::cmp::Ordering::Equal)
-    });
     scored.truncate(limit as usize);
 
     // Shadow-ASR channel: bug-prone-effect symbols (unsafe / may_panic /
@@ -189,13 +151,14 @@ pub async fn tool_bug_prediction(
         Vec::new()
     };
 
-    let model_info = match &model {
-        Some(m) => serde_json::json!({
+    let model_info = match score_kind_enum {
+        crate::code_analysis::findings::ScoreKind::TrainedLogreg => serde_json::json!({
             "kind": "logistic_regression",
-            "n_samples": m.n_samples,
-            "n_positive": m.n_positive,
+            "n_samples": features.len(),
         }),
-        None => serde_json::json!({ "kind": "heuristic_fallback" }),
+        crate::code_analysis::findings::ScoreKind::Heuristic => {
+            serde_json::json!({ "kind": "heuristic_fallback" })
+        }
     };
 
     let result = serde_json::json!({

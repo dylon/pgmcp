@@ -449,4 +449,23 @@ mod tests {
         // a verified bug can be re-reported as a regression.
         assert!(check_transition(Verified, Triage, Agent, c).is_ok());
     }
+
+    #[test]
+    fn system_absent_from_judgment_columns() {
+        // The auto-unblock cascade (queries::set_work_item_status) moves
+        // dependents `Blocked → Ready` as `Actor::System`. Guard the safety
+        // invariant it relies on: `System` can NEVER reach a judgment state from
+        // ANY source, so a cascade bug can at worst mis-`ready` an item — never
+        // fabricate a verification / rejection / deferral / confirmation.
+        for from in WorkItemStatus::ALL {
+            for to in [Verified, Rejected, Deferred, Confirmed] {
+                assert!(
+                    !legal_actors(*from, to).contains(&System),
+                    "System must not reach {to:?} (from {from:?})"
+                );
+            }
+        }
+        // …and the one move the cascade performs IS legal for System.
+        assert!(legal_actors(Blocked, Ready).contains(&System));
+    }
 }

@@ -62,6 +62,15 @@ pub struct WorkItemRow {
     pub lease_expires_at: Option<DateTime<Utc>>,
     #[sqlx(default)]
     pub claim_count: i32,
+    /// Durable ownership intent (v16); distinct from the ephemeral `claimed_by`
+    /// lease — set via `work_item_assign`, never auto-cleared. `my-work` filters
+    /// on it.
+    #[sqlx(default)]
+    pub assignee: Option<String>,
+    #[sqlx(default)]
+    pub assigned_at: Option<DateTime<Utc>>,
+    #[sqlx(default)]
+    pub assigned_by: Option<String>,
 }
 
 /// Explicit column list (no `embedding`) shared by every `SELECT`.
@@ -69,7 +78,8 @@ const WORK_ITEM_COLS: &str = "id, public_id, parent_id, project_id, definition_i
      kind, status, title, body, parametric, parametric_corpus, parametric_expected, \
      priority, weight, computed_score, claimed_percent, origin, created_by, \
      created_at, updated_at, started_at, completed_at, verified_at, due_at, snooze_until, \
-     severity, claimed_by, claimed_at, lease_expires_at, claim_count";
+     severity, claimed_by, claimed_at, lease_expires_at, claim_count, \
+     assignee, assigned_at, assigned_by";
 
 /// One row of the append-only transition audit.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
@@ -236,6 +246,13 @@ pub struct WorkItemFilter<'a> {
     /// When false (default), hide currently-snoozed items (snooze_until in the
     /// future).
     pub include_snoozed: bool,
+    /// Restrict to items owned by this assignee (the `my-work` view).
+    pub assignee: Option<&'a str>,
+    /// Restrict to bugs awaiting triage (`kind='bug' AND status='triage'`).
+    pub needs_triage: bool,
+    /// Restrict to workable-now items (actionable status AND no unresolved
+    /// blocker) — the `next-actionable` view.
+    pub next_actionable: bool,
     pub limit: i64,
 }
 
@@ -246,7 +263,7 @@ pub async fn list_work_items(
 ) -> Result<Vec<WorkItemRow>, sqlx::Error> {
     let limit = f.limit.clamp(1, 1000);
     sqlx::query_as::<_, WorkItemRow>(&format!(
-        "SELECT {WORK_ITEM_COLS} FROM work_items
+        "SELECT {WORK_ITEM_COLS} FROM work_items w
          WHERE ($1::int IS NULL OR project_id = $1)
            AND ($2::text IS NULL OR kind = $2)
            AND ($3::text IS NULL OR status = $3)
@@ -255,6 +272,9 @@ pub async fn list_work_items(
                  due_at IS NOT NULL AND due_at < NOW()
                  AND status NOT IN ('verified','cancelled','deferred')))
            AND ($7::bool IS TRUE OR snooze_until IS NULL OR snooze_until <= NOW())
+           AND ($8::text IS NULL OR assignee = $8)
+           AND ($9::bool IS NOT TRUE OR (kind = 'bug' AND status = 'triage'))
+           AND ($10::bool IS NOT TRUE OR (status IN ('pending','confirmed','ready') AND {NOT_BLOCKED}))
          ORDER BY priority DESC, computed_score DESC NULLS LAST, created_at DESC
          LIMIT $5"
     ))
@@ -265,6 +285,9 @@ pub async fn list_work_items(
     .bind(limit)
     .bind(f.overdue)
     .bind(f.include_snoozed)
+    .bind(f.assignee)
+    .bind(f.needs_triage)
+    .bind(f.next_actionable)
     .fetch_all(pool)
     .await
 }
@@ -540,8 +563,202 @@ pub async fn set_work_item_status(
     .execute(&mut *tx)
     .await?;
 
+    // Auto-unblock cascade: when an item reaches `verified`, dependents that
+    // were `blocked` solely on it may now be actionable. In the SAME tx, move
+    // each such dependent `blocked → ready` as `Actor::System` — legal
+    // (System is in the Blocked→Ready actor set) and provably incapable of
+    // reaching a judgment state (System has NO arm into verified/rejected/
+    // deferred/confirmed; see `transition.rs::system_absent_from_judgment_columns`).
+    // Routed through `check_transition` so the gate is never bypassed.
+    if to == WorkItemStatus::Verified {
+        let candidates: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT w.id FROM work_items w
+             JOIN item_relations r ON (
+                 (r.relation_type = 'depends_on' AND r.from_item_id = w.id AND r.to_item_id = $1)
+                 OR (r.relation_type = 'blocks' AND r.to_item_id = w.id AND r.from_item_id = $1))
+             WHERE w.status = 'blocked'",
+        )
+        .bind(id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for dep_id in candidates {
+            // Still blocked iff an UNRESOLVED blocker remains (the inverse of the
+            // NOT_BLOCKED predicate, evaluated within this tx so the just-verified
+            // row counts as cleared).
+            let still_blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM item_relations r JOIN work_items b ON (
+                        (r.relation_type = 'depends_on' AND r.from_item_id = $1 AND b.id = r.to_item_id)
+                        OR (r.relation_type = 'blocks' AND r.to_item_id = $1 AND b.id = r.from_item_id))
+                    WHERE b.status NOT IN ('verified','claimed_done','deferred','cancelled'))",
+            )
+            .bind(dep_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if still_blocked {
+                continue;
+            }
+            // Trust gate: System may perform ONLY Blocked → Ready.
+            check_transition(
+                WorkItemStatus::Blocked,
+                WorkItemStatus::Ready,
+                Actor::System,
+                TransitionContext::default(),
+            )
+            .map_err(WorkItemOpError::Transition)?;
+            sqlx::query(
+                "UPDATE work_items SET status = 'ready', updated_at = NOW()
+                 WHERE id = $1 AND status = 'blocked'",
+            )
+            .bind(dep_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO work_item_status_history
+                    (item_id, from_status, to_status, actor_kind, actor_id, reason)
+                 VALUES ($1, 'blocked', 'ready', 'system', 'system',
+                         'auto-unblocked: last blocker verified')",
+            )
+            .bind(dep_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+
     tx.commit().await?;
     Ok(updated)
+}
+
+/// Set (or clear) an item's durable `assignee` (v16). `assignee=None` unassigns
+/// (also clears `assigned_at`). Orthogonal to the runtime `claimed_by` lease —
+/// no status transition is involved (assignment ≠ execution).
+pub async fn assign_work_item(
+    pool: &PgPool,
+    id: i64,
+    assignee: Option<&str>,
+    assigned_by: Option<&str>,
+) -> Result<WorkItemRow, WorkItemOpError> {
+    let row = sqlx::query_as::<_, WorkItemRow>(&format!(
+        "UPDATE work_items SET
+            assignee = $2,
+            assigned_at = CASE WHEN $2 IS NULL THEN NULL ELSE NOW() END,
+            assigned_by = $3,
+            updated_at = NOW()
+         WHERE id = $1
+         RETURNING {WORK_ITEM_COLS}"
+    ))
+    .bind(id)
+    .bind(assignee)
+    .bind(assigned_by)
+    .fetch_optional(pool)
+    .await?;
+    row.ok_or(WorkItemOpError::NotFound)
+}
+
+/// Read-only "what can I do now" frontier: actionable-status items
+/// (`pending`/`confirmed`/`ready`) whose every blocker is cleared
+/// (`NOT_BLOCKED`), ranked like `claim_next` but WITHOUT claiming (no lease, no
+/// `FOR UPDATE`). Optionally scoped to a plan subtree and/or a durable assignee.
+pub async fn next_actionable_work_items(
+    pool: &PgPool,
+    plan_root_id: Option<i64>,
+    assignee: Option<&str>,
+    limit: i64,
+) -> Result<Vec<WorkItemRow>, sqlx::Error> {
+    let cap = limit.clamp(1, 1000);
+    sqlx::query_as::<_, WorkItemRow>(&format!(
+        "WITH RECURSIVE subtree AS (
+            SELECT id FROM work_items WHERE id = $1
+            UNION ALL
+            SELECT c.id FROM work_items c JOIN subtree s ON c.parent_id = s.id
+         )
+         SELECT {WORK_ITEM_COLS} FROM work_items w
+         WHERE w.status IN ('pending','confirmed','ready')
+           AND ($1::bigint IS NULL OR w.id IN (SELECT id FROM subtree))
+           AND ($3::text IS NULL OR w.assignee = $3)
+           AND {NOT_BLOCKED}
+         ORDER BY w.priority DESC, w.computed_score DESC NULLS LAST, w.id
+         LIMIT $2"
+    ))
+    .bind(plan_root_id)
+    .bind(cap)
+    .bind(assignee)
+    .fetch_all(pool)
+    .await
+}
+
+/// One chronological event in an item's unified timeline.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TimelineRow {
+    pub kind: String,
+    pub at: DateTime<Utc>,
+    pub actor: Option<String>,
+    pub summary: String,
+    pub detail: serde_json::Value,
+}
+
+/// The full per-item timeline: a chronological UNION of status transitions,
+/// progress notes, claim/handoff events, verification evidence, and scope
+/// negotiations — the `work_item_history` feed. The per-event `detail` jsonb is
+/// cast to text in SQL and re-parsed in Rust (sqlx is built without the `json`
+/// feature), keeping the decode dependency-free.
+pub async fn work_item_timeline(
+    pool: &PgPool,
+    item_id: i64,
+    limit: i64,
+) -> Result<Vec<TimelineRow>, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct Raw {
+        kind: String,
+        at: DateTime<Utc>,
+        actor: Option<String>,
+        summary: String,
+        detail_text: String,
+    }
+    let cap = limit.clamp(1, 1000);
+    let rows = sqlx::query_as::<_, Raw>(
+        "SELECT kind, at, actor, summary, detail_text FROM (
+            SELECT 'status' AS kind, created_at AS at, actor_id AS actor,
+                   (COALESCE(from_status, '∅') || ' → ' || to_status) AS summary,
+                   jsonb_build_object('from', from_status, 'to', to_status,
+                       'actor_kind', actor_kind, 'reason', reason,
+                       'evidence_id', evidence_id, 'negotiation_id', negotiation_id)::text AS detail_text
+              FROM work_item_status_history WHERE item_id = $1
+            UNION ALL
+            SELECT 'progress', created_at, actor_id, left(note, 80),
+                   jsonb_build_object('note', note, 'percent', percent, 'provenance', provenance)::text
+              FROM work_item_progress WHERE item_id = $1
+            UNION ALL
+            SELECT 'claim', created_at, agent_id, action,
+                   jsonb_build_object('action', action, 'lease_expires_at', lease_expires_at)::text
+              FROM work_item_claims WHERE work_item_id = $1
+            UNION ALL
+            SELECT 'evidence', created_at, runner_identity, (source || ' ' || verdict),
+                   jsonb_build_object('verdict', verdict, 'source', source,
+                       'exit_code', exit_code, 'criterion_id', criterion_id)::text
+              FROM verification_evidence WHERE item_id = $1
+            UNION ALL
+            SELECT 'negotiation', created_at, granted_by, action,
+                   jsonb_build_object('action', action, 'reason', reason)::text
+              FROM scope_negotiations WHERE item_id = $1
+         ) t
+         ORDER BY at ASC
+         LIMIT $2",
+    )
+    .bind(item_id)
+    .bind(cap)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| TimelineRow {
+            kind: r.kind,
+            at: r.at,
+            actor: r.actor,
+            summary: r.summary,
+            detail: serde_json::from_str(&r.detail_text).unwrap_or(serde_json::Value::Null),
+        })
+        .collect())
 }
 
 /// Return an item's subtree (the item plus all descendants via `parent_id`),
@@ -2370,4 +2587,244 @@ async fn drive_work_item_to_verified(pool: &PgPool, work_item_id: i64) {
             tracing::warn!(work_item_id, error = %e, "experiment-sync: evidence lookup failed")
         }
     }
+}
+
+// ============================================================================
+// Git/PR close-the-loop (work_item_git_links + work_item_finding_provenance)
+// — Phase 3. Free functions over &PgPool, the tracker's established design.
+// ============================================================================
+
+/// Insert (or idempotently re-affirm) a work-item ↔ repo-artifact link. The
+/// `UNIQUE (item_id, link_type, ref_value)` constraint makes a re-scan / re-link
+/// a no-op that still returns the existing row id. On conflict the optional
+/// `commit_id` and `created_by` are filled in if they were previously NULL
+/// (`COALESCE(EXCLUDED.…, existing)`), so a later indexer pass can resolve a
+/// `commit_id` for a link first made by `ref_value` alone. Returns
+/// `(id, inserted)` — `inserted=true` only for a brand-new row, via the
+/// `xmax = 0` trick (the same idiom as [`upsert_ingested_item`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_git_link(
+    pool: &PgPool,
+    item_id: i64,
+    project_id: Option<i32>,
+    link_type: &str,
+    ref_value: &str,
+    commit_id: Option<i64>,
+    detected_by: &str,
+    created_by: Option<&str>,
+) -> Result<(i64, bool), sqlx::Error> {
+    sqlx::query_as::<_, (i64, bool)>(
+        "INSERT INTO work_item_git_links
+            (item_id, project_id, link_type, ref_value, commit_id, detected_by, created_by)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (item_id, link_type, ref_value) DO UPDATE SET
+            commit_id  = COALESCE(EXCLUDED.commit_id, work_item_git_links.commit_id),
+            project_id = COALESCE(EXCLUDED.project_id, work_item_git_links.project_id),
+            created_by = COALESCE(work_item_git_links.created_by, EXCLUDED.created_by)
+         RETURNING id, (xmax = 0) AS inserted",
+    )
+    .bind(item_id)
+    .bind(project_id)
+    .bind(link_type)
+    .bind(ref_value)
+    .bind(commit_id)
+    .bind(detected_by)
+    .bind(created_by)
+    .fetch_one(pool)
+    .await
+}
+
+/// Resolve a commit SHA (full or a unique prefix) to its `git_commits.id` within
+/// a project, or `None` if it has not been indexed. Prefix-tolerant: an exact
+/// `commit_hash = $2` match wins; otherwise a `LIKE $2 || '%'` prefix match is
+/// used when it identifies exactly one commit (an ambiguous prefix yields
+/// `None` so a wrong commit is never linked).
+pub async fn resolve_commit_id(
+    pool: &PgPool,
+    project_id: i32,
+    sha: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    let sha = sha.trim();
+    if sha.is_empty() {
+        return Ok(None);
+    }
+    // Exact match first (covers the full-SHA common case cheaply).
+    if let Some(id) = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM git_commits WHERE project_id = $1 AND commit_hash = $2 LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(sha)
+    .fetch_optional(pool)
+    .await?
+    {
+        return Ok(Some(id));
+    }
+    // Prefix match — only when it is unambiguous (exactly one commit). LIMIT 2
+    // distinguishes "one" from "many" without scanning the whole prefix set.
+    let prefix = format!("{}%", sha.replace('%', "\\%").replace('_', "\\_"));
+    let matches: Vec<i64> = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM git_commits WHERE project_id = $1 AND commit_hash LIKE $2 LIMIT 2",
+    )
+    .bind(project_id)
+    .bind(&prefix)
+    .fetch_all(pool)
+    .await?;
+    match matches.as_slice() {
+        [only] => Ok(Some(*only)),
+        _ => Ok(None), // zero or ambiguous (>1) → do not guess
+    }
+}
+
+/// A code location to anchor an auto-promoted finding to (mirrors the
+/// `work_item_code_anchor` columns; at least one of the ids must be non-NULL,
+/// enforced by the table CHECK). The findings cron resolves a finding's file
+/// path to `file_id` before calling [`promote_finding`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FindingAnchor {
+    pub file_id: Option<i64>,
+    pub chunk_id: Option<i64>,
+    pub symbol_id: Option<i64>,
+}
+
+impl FindingAnchor {
+    fn is_empty(&self) -> bool {
+        self.file_id.is_none() && self.chunk_id.is_none() && self.symbol_id.is_none()
+    }
+}
+
+/// Idempotently promote a finding (a `bug_prediction` defect-prone file or a
+/// `documented_tech_debt` marker) into a `pending` work item, keyed by
+/// `provenance_key`. The whole operation is one transaction:
+///
+/// 1. INSERT the provenance row `ON CONFLICT (provenance_key) DO UPDATE SET
+///    last_seen_at = now() RETURNING item_id, (xmax = 0)`. If the key already
+///    exists (`xmax <> 0`), the existing `item_id` is returned with
+///    `created = false` and **no new item is inserted** — re-running the cron
+///    never duplicates.
+/// 2. On a fresh key, INSERT the work item from `item` (status forced to
+///    `pending` by the caller — never pre-`confirmed`), back-patch the
+///    provenance row's `item_id` to the new id, and (when an anchor is given)
+///    INSERT a `work_item_code_anchor` row.
+///
+/// Returns `(item_id, created)`. The provenance INSERT is what guarantees
+/// idempotency even under a race: the UNIQUE on `provenance_key` makes the
+/// second concurrent inserter take the conflict branch.
+pub async fn promote_finding(
+    pool: &PgPool,
+    provenance_key: &str,
+    finding_source: &str,
+    item: NewWorkItem<'_>,
+    anchor: FindingAnchor,
+) -> Result<(i64, bool), WorkItemOpError> {
+    let mut tx = pool.begin().await?;
+
+    // Step 1: claim the provenance key. A pre-existing key short-circuits with
+    // its already-promoted item_id (no dup item). The placeholder item_id 0 on
+    // a fresh insert is back-patched in step 2 (FK is deferred to commit via the
+    // same tx; we insert the item first to satisfy it — see below).
+    //
+    // We cannot reference the not-yet-inserted item id in the provenance INSERT,
+    // and the provenance.item_id FK is NOT NULL, so the order is: probe the key
+    // first; if present, return; else insert the item, then the provenance row.
+    let existing: Option<i64> = sqlx::query_scalar::<_, i64>(
+        "SELECT item_id FROM work_item_finding_provenance WHERE provenance_key = $1",
+    )
+    .bind(provenance_key)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(item_id) = existing {
+        // Refresh last_seen_at so the ledger reflects the finding still exists,
+        // then return the existing item — created=false, no dup.
+        sqlx::query(
+            "UPDATE work_item_finding_provenance SET last_seen_at = now() WHERE provenance_key = $1",
+        )
+        .bind(provenance_key)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok((item_id, false));
+    }
+
+    // Step 2: fresh finding — insert the item, the provenance row, and the
+    // optional code anchor, all in this transaction.
+    let new_id: i64 = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO work_items
+            (public_id, parent_id, project_id, definition_id, root_id, kind, status,
+             title, body, priority, weight, parametric, parametric_corpus,
+             parametric_expected, origin, created_by, embedding, severity)
+         VALUES ($1, $2, $3, $4,
+             (SELECT COALESCE(p.root_id, p.id) FROM work_items p WHERE p.id = $2),
+             $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+         RETURNING id",
+    )
+    .bind(item.public_id)
+    .bind(item.parent_id)
+    .bind(item.project_id)
+    .bind(item.definition_id)
+    .bind(item.kind)
+    .bind(item.status)
+    .bind(item.title)
+    .bind(item.body)
+    .bind(item.priority)
+    .bind(item.weight)
+    .bind(item.parametric)
+    .bind(item.parametric_corpus)
+    .bind(item.parametric_expected)
+    .bind(item.origin)
+    .bind(item.created_by)
+    .bind(item.embedding)
+    .bind(item.severity)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    // Provenance row. The UNIQUE(provenance_key) + the ON CONFLICT DO NOTHING
+    // guards the race: if a concurrent tx inserted the key between our probe and
+    // here, this yields no row — we detect that and fall back to its item_id,
+    // rolling back our just-inserted item.
+    let prov_inserted: Option<i64> = sqlx::query_scalar::<_, i64>(
+        "INSERT INTO work_item_finding_provenance (provenance_key, item_id, finding_source)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (provenance_key) DO NOTHING
+         RETURNING id",
+    )
+    .bind(provenance_key)
+    .bind(new_id)
+    .bind(finding_source)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if prov_inserted.is_none() {
+        // Lost the race: another tx promoted this finding first. Abandon our
+        // item insert (roll back) and return the winner's item_id, created=false.
+        tx.rollback().await?;
+        let winner: Option<i64> = sqlx::query_scalar::<_, i64>(
+            "SELECT item_id FROM work_item_finding_provenance WHERE provenance_key = $1",
+        )
+        .bind(provenance_key)
+        .fetch_optional(pool)
+        .await?;
+        return match winner {
+            Some(item_id) => Ok((item_id, false)),
+            // Extremely unlikely (the conflicting row vanished); surface as a
+            // not-found so the caller can retry rather than silently dropping.
+            None => Err(WorkItemOpError::NotFound),
+        };
+    }
+
+    // Optional code anchor (file / chunk / symbol). Skipped when empty.
+    if !anchor.is_empty() {
+        sqlx::query(
+            "INSERT INTO work_item_code_anchor (item_id, file_id, chunk_id, symbol_id, anchor_type)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(new_id)
+        .bind(anchor.file_id)
+        .bind(anchor.chunk_id)
+        .bind(anchor.symbol_id)
+        .bind("finding")
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
+    Ok((new_id, true))
 }

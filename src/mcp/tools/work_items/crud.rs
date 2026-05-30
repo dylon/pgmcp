@@ -342,6 +342,7 @@ pub async fn tool_work_item_list(
         overdue: params.overdue.unwrap_or(false),
         include_snoozed: params.include_snoozed.unwrap_or(false),
         limit: params.limit.unwrap_or(50),
+        ..Default::default()
     };
     let rows = list_work_items(pool, &filter).await.map_err(map_db_err)?;
 

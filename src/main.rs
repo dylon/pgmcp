@@ -28,6 +28,7 @@ mod csm;
 mod daemon;
 mod daemon_state;
 mod db;
+mod digest;
 mod embed;
 mod error;
 mod experiment;

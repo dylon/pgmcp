@@ -17,6 +17,7 @@ pub mod ck_metrics;
 pub mod coverage;
 pub mod cpg;
 pub mod defect_model;
+pub mod findings;
 pub mod isolation_forest;
 pub mod language_detect;
 pub mod lof;
