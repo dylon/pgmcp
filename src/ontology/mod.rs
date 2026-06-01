@@ -14,6 +14,7 @@
 //! `fca`, `hierarchy`, `mine`, `canonicalize`, `egglog_engine`, `export`, and the
 //! trie-accelerator submodules.
 
+pub mod classify;
 pub mod edge;
 pub mod facet;
 
