@@ -495,13 +495,49 @@ async fn rest_api_search_returns_chunks_with_seeded_data() {
         .send()
         .await
         .expect("send");
-    assert!(resp.status().is_success());
-    let body = resp.text().await.expect("body");
-    // With a real embedder + our seeded chunk, the body should contain
-    // either the chunk content or its path — pgmcp's API serializes both.
     assert!(
-        body.contains("a.rs") || body.contains("println") || body.contains("api-chunks"),
-        "api/search did not surface seeded chunk:\n{body}"
+        resp.status().is_success(),
+        "search should return 2xx, got {}",
+        resp.status()
+    );
+    let body = resp.text().await.expect("body");
+
+    // Deserialize into the REAL response shape (via `serde_json::Value` — no new
+    // Cargo dep). The dense ANN leg always ranks the seeded chunk (non-NULL
+    // embedding_v2, no filters), so the fused RRF join yields ≥1 row — which
+    // forces the fused `rrf` column to decode out of Postgres. That column is
+    // `(Σ COALESCE(1.0/(60.0+rnk),0.0))::float8 AS rrf`; without the `::float8`
+    // cast it types NUMERIC and `SearchResult.score: Option<f64>` fails to decode
+    // → the handler returns HTTP 500. Asserting a present, finite numeric
+    // `similarity` here is the end-to-end guard that would have caught the
+    // original `/api/search` regression at the HTTP layer (a status/substring
+    // check passes even on 0 rows, where the column is never decoded).
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("api/search body not SearchResponse JSON: {e}\nbody:\n{body}"));
+    let results = parsed["results"]
+        .as_array()
+        .unwrap_or_else(|| panic!("api/search response missing `results` array:\n{body}"));
+    assert!(
+        !results.is_empty(),
+        "api/search returned 0 results for a seeded chunk; the dense leg should \
+         always rank it — fused RRF row missing:\n{body}"
+    );
+    let top = &results[0];
+    let similarity = top["similarity"].as_f64().unwrap_or_else(|| {
+        panic!(
+            "fused RRF `similarity` must decode as f64 (NUMERIC→float8 regression guard):\n{top}"
+        )
+    });
+    assert!(
+        similarity.is_finite(),
+        "`similarity` must be a finite f64, got {similarity}"
+    );
+    assert!(
+        top["file_path"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("a.rs"),
+        "expected the seeded chunk's file_path to contain a.rs; got {top}"
     );
 }
 

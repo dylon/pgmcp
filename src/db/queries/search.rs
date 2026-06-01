@@ -176,46 +176,14 @@ pub async fn semantic_search(
     Ok(results)
 }
 
-/// Chunk-level hybrid search: dense ANN + BM25 full-text, fused by Reciprocal
-/// Rank Fusion (Cormack et al. 2009) entirely in SQL, with optional language /
-/// project filters applied to both legs. Returns chunk-level `SearchResult`s
-/// ordered by RRF score (carried in `score`). Backs the `/api/search` hook,
-/// which then optionally cross-encoder-reranks the top results.
-///
-/// `candidates` bounds each leg's contribution (per-leg `LIMIT`); `limit` is
-/// the fused output size. Uses the same `SET LOCAL hnsw.ef_search` discipline
-/// as `semantic_search` so the ANN leg honours the configured recall budget.
-#[allow(clippy::too_many_arguments)]
-pub async fn hybrid_search_chunks(
-    pool: &PgPool,
-    query_text: &str,
-    embedding: &[f32],
-    limit: i32,
-    candidates: i32,
-    language: Option<&str>,
-    project: Option<&str>,
-    ef_search: i32,
-    query_sparse: Option<&pgvector::SparseVector>,
-) -> Result<Vec<SearchResult>, sqlx::Error> {
-    if embedding.len() != 1024 {
-        return Err(sqlx::Error::Protocol(format!(
-            "hybrid_search_chunks: expected a 1024-dimension BGE-M3 query embedding, got {}",
-            embedding.len()
-        )));
-    }
-    let col = "embedding_v2";
-    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
-
-    let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
-
-    // Optional filters collapse into one query via `($n IS NULL OR …)`.
-    // RRF constant 60.0 mirrors `tool_hybrid_search::RRF_K`. The dense + lexical
-    // CTEs are shared; the BGE-M3 sparse leg (Phase 2.3) is added as a third RRF
-    // leg only when a query sparse vector is supplied AND the chunk has
-    // `sparse_v2` (NULL-tolerant — un-backfilled chunks just miss this leg).
+/// Build the `hybrid_search_chunks` SQL string. Pure (no DB, no I/O) so a no-DB
+/// unit test can assert the fused RRF column is cast to `float8` in BOTH the
+/// 2-leg (`with_sparse=false`) and 3-leg (`with_sparse=true`) branches. The
+/// fused RRF sum `Σ COALESCE(1.0/(60.0+rnk), 0.0)` is typed NUMERIC by Postgres;
+/// `SearchResult.score: Option<f64>` decodes FLOAT8, so the sum MUST be wrapped
+/// `( … )::float8`. Removing either the parens or the cast reintroduces the
+/// `/api/search` HTTP-500 decode bug — guarded by `hybrid_search_sql_tests`.
+pub(crate) fn hybrid_search_sql(col: &str, with_sparse: bool) -> String {
     // $1=embedding, $2=query_text, $3=candidates, $4=language, $5=project, $6=limit, $7=sparse
     let dense_lexical = format!(
         "dense AS (
@@ -259,8 +227,8 @@ pub async fn hybrid_search_chunks(
         ORDER BY fused.rrf DESC
         LIMIT $6";
 
-    let results = if let Some(sparse) = query_sparse {
-        let sql = format!(
+    if with_sparse {
+        format!(
             "WITH {dense_lexical},
             sparse AS (
                 SELECT chunk_id, ROW_NUMBER() OVER (ORDER BY dist) AS rnk FROM (
@@ -285,7 +253,63 @@ pub async fn hybrid_search_chunks(
                 FULL OUTER JOIN sparse s ON COALESCE(d.chunk_id, l.chunk_id) = s.chunk_id
             )
             {select_tail}"
-        );
+        )
+    } else {
+        format!(
+            "WITH {dense_lexical},
+            fused AS (
+                SELECT COALESCE(d.chunk_id, l.chunk_id) AS chunk_id,
+                       (COALESCE(1.0 / (60.0 + d.rnk), 0.0)
+                     + COALESCE(1.0 / (60.0 + l.rnk), 0.0))::float8 AS rrf
+                FROM dense d
+                FULL OUTER JOIN lexical l ON d.chunk_id = l.chunk_id
+            )
+            {select_tail}"
+        )
+    }
+}
+
+/// Chunk-level hybrid search: dense ANN + BM25 full-text, fused by Reciprocal
+/// Rank Fusion (Cormack et al. 2009) entirely in SQL, with optional language /
+/// project filters applied to both legs. Returns chunk-level `SearchResult`s
+/// ordered by RRF score (carried in `score`). Backs the `/api/search` hook,
+/// which then optionally cross-encoder-reranks the top results.
+///
+/// `candidates` bounds each leg's contribution (per-leg `LIMIT`); `limit` is
+/// the fused output size. Uses the same `SET LOCAL hnsw.ef_search` discipline
+/// as `semantic_search` so the ANN leg honours the configured recall budget.
+#[allow(clippy::too_many_arguments)]
+pub async fn hybrid_search_chunks(
+    pool: &PgPool,
+    query_text: &str,
+    embedding: &[f32],
+    limit: i32,
+    candidates: i32,
+    language: Option<&str>,
+    project: Option<&str>,
+    ef_search: i32,
+    query_sparse: Option<&pgvector::SparseVector>,
+) -> Result<Vec<SearchResult>, sqlx::Error> {
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "hybrid_search_chunks: expected a 1024-dimension BGE-M3 query embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let col = "embedding_v2";
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+
+    // Optional filters collapse into one query via `($n IS NULL OR …)`.
+    // SQL is built by the pure `hybrid_search_sql` helper so a no-DB unit test
+    // can pin the `::float8` cast on the fused RRF column (see that fn's docs).
+    // $1=embedding, $2=query_text, $3=candidates, $4=language, $5=project, $6=limit, $7=sparse
+    let results = if let Some(sparse) = query_sparse {
+        let sql = hybrid_search_sql(col, true);
         sqlx::query_as::<_, SearchResult>(&sql)
             .bind(&embedding_vec)
             .bind(query_text)
@@ -297,17 +321,7 @@ pub async fn hybrid_search_chunks(
             .fetch_all(&mut *tx)
             .await?
     } else {
-        let sql = format!(
-            "WITH {dense_lexical},
-            fused AS (
-                SELECT COALESCE(d.chunk_id, l.chunk_id) AS chunk_id,
-                       (COALESCE(1.0 / (60.0 + d.rnk), 0.0)
-                     + COALESCE(1.0 / (60.0 + l.rnk), 0.0))::float8 AS rrf
-                FROM dense d
-                FULL OUTER JOIN lexical l ON d.chunk_id = l.chunk_id
-            )
-            {select_tail}"
-        );
+        let sql = hybrid_search_sql(col, false);
         sqlx::query_as::<_, SearchResult>(&sql)
             .bind(&embedding_vec)
             .bind(query_text)
@@ -751,4 +765,67 @@ pub async fn grep_search_chunks(
         .fetch_all(pool)
         .await?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod hybrid_search_sql_tests {
+    use super::hybrid_search_sql;
+
+    // No DB, no async: runs under verify.sh Gate 4 (`cargo test --release --bin
+    // pgmcp`) and Gate 8. Asserting the contiguous `))::float8 AS rrf` pins BOTH
+    // the wrapping parens and the cast: dropping the cast yields `0.0) AS rrf`,
+    // and dropping the parens yields `0.0)::float8 AS rrf` (which, by `::`
+    // precedence, casts only the last term — the sum stays NUMERIC). Either
+    // regression reintroduces the /api/search HTTP-500 decode bug.
+    const CAST: &str = "))::float8 AS rrf";
+
+    #[test]
+    fn two_leg_branch_casts_fused_rrf_to_float8() {
+        let sql = hybrid_search_sql("embedding_v2", false);
+        assert!(
+            sql.contains(CAST),
+            "2-leg fused RRF must be wrapped+cast:\n{sql}"
+        );
+        assert!(
+            sql.contains("fused.rrf AS score"),
+            "missing score projection:\n{sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY fused.rrf DESC"),
+            "missing ordering:\n{sql}"
+        );
+        assert!(
+            !sql.contains("sparse_v2"),
+            "2-leg must not pull the sparse leg:\n{sql}"
+        );
+        assert!(
+            sql.contains("c.embedding_v2 <=> $1"),
+            "dense leg must use col:\n{sql}"
+        );
+    }
+
+    #[test]
+    fn three_leg_branch_casts_fused_rrf_to_float8() {
+        let sql = hybrid_search_sql("embedding_v2", true);
+        assert!(
+            sql.contains(CAST),
+            "3-leg fused RRF must be wrapped+cast:\n{sql}"
+        );
+        assert!(
+            sql.contains("fused.rrf AS score"),
+            "missing score projection:\n{sql}"
+        );
+        assert!(
+            sql.contains("ORDER BY fused.rrf DESC"),
+            "missing ordering:\n{sql}"
+        );
+        assert!(
+            sql.contains("c.sparse_v2 <#> $7"),
+            "3-leg must include the sparse leg:\n{sql}"
+        );
+        assert!(
+            sql.contains("60.0 + s.rnk"),
+            "3-leg must add the sparse RRF term:\n{sql}"
+        );
+    }
 }

@@ -128,6 +128,17 @@ pub async fn daemon(config_override: Option<&Path>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// True when `host` is a loopback bind (same-host only). Used to decide whether
+/// to emit the non-loopback security warning before binding the MCP/REST server.
+/// Extracted as a pure predicate so it is unit-testable without starting the
+/// daemon. `host` is expected pre-trimmed.
+fn is_loopback_host(host: &str) -> bool {
+    host == "127.0.0.1"
+        || host == "::1"
+        || host == "localhost"
+        || host.eq_ignore_ascii_case("ip6-localhost")
+}
+
 async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> anyhow::Result<()> {
     let shutdown = ShutdownCoordinator::new();
     let lifecycle = daemon_state::DaemonLifecycle::new();
@@ -632,11 +643,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         // deliberate choice, not an accident.
         {
             let host = config_snapshot.mcp.host.trim();
-            let is_loopback = host == "127.0.0.1"
-                || host == "::1"
-                || host == "localhost"
-                || host.eq_ignore_ascii_case("ip6-localhost");
-            if !is_loopback {
+            if !is_loopback_host(host) {
                 tracing::warn!(
                     bind = %bind_addr,
                     tracker_endpoints_gated = config_snapshot.tracker.user_token.is_some(),
@@ -992,6 +999,38 @@ fn preflight_document_tools() {
                 hint = %hint,
                 "Document extraction tool MISSING — files of these types will be skipped"
             ),
+        }
+    }
+}
+
+#[cfg(test)]
+mod is_loopback_host_tests {
+    use super::is_loopback_host;
+
+    #[test]
+    fn loopback_hosts_are_recognized() {
+        for h in [
+            "127.0.0.1",
+            "::1",
+            "localhost",
+            "ip6-localhost",
+            "IP6-LOCALHOST",
+        ] {
+            assert!(is_loopback_host(h), "{h} should be loopback");
+        }
+    }
+
+    #[test]
+    fn routable_hosts_are_not_loopback() {
+        for h in [
+            "0.0.0.0",
+            "::",
+            "192.168.1.10",
+            "10.0.0.5",
+            "example.com",
+            "",
+        ] {
+            assert!(!is_loopback_host(h), "{h} should NOT be loopback");
         }
     }
 }
