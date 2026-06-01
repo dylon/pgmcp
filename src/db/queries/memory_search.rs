@@ -770,36 +770,61 @@ pub async fn memory_unified_search(
     Ok(rows)
 }
 
-/// Phase 6.3: refresh the materialized view. A UNION ALL over indexed tables.
-/// Called from the `similarity-scan` / `memory-graph-refresh` crons or on-demand.
+/// Refresh a unified-graph materialized view `CONCURRENTLY` under a raised
+/// per-statement timeout.
 ///
-/// `CONCURRENTLY` so graph-RAG reads (neighbors / PPR / RAPTOR) are NOT blocked
-/// by an `ACCESS EXCLUSIVE` lock during the refresh — it relies on the unique
-/// index `idx_memory_unified_nodes_uq (node_id)` built in `ensure_memory_unified_views`.
-/// Must NOT be wrapped in a transaction (CONCURRENTLY is illegal in one); the
-/// matview is populated at boot via `CREATE … WITH DATA`, so the first cron
-/// refresh already has data to diff against.
-pub async fn refresh_memory_unified_nodes(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY memory_unified_nodes")
-        .execute(pool)
+/// The daemon-wide `statement_timeout` (30 s, set in `db::pool::after_connect`)
+/// is too short for these large UNION-ALL matviews (18+ arms over `file_chunks`,
+/// embeddings, etc.), so a bare `REFRESH` cancels at 30 s (SQLSTATE 57014) and
+/// the matview goes stale. This lifts the timeout via `SET LOCAL` inside a
+/// transaction — the established heavy-cron idiom (cf. `cron::graph_analysis`,
+/// `queries::similarity`). `REFRESH … CONCURRENTLY` **is** legal inside a
+/// transaction (verified against PostgreSQL; it is `CREATE INDEX CONCURRENTLY`
+/// that is not — an earlier comment here had it backwards). The `pgmcp:heavy:`
+/// `application_name` lets the graceful-shutdown sweep
+/// (`db::admin::terminate_heavy_backends`) find the backend. `view` is always an
+/// internal string literal, so the interpolation carries no injection risk.
+///
+/// `CONCURRENTLY` keeps graph-RAG reads (neighbors / PPR / RAPTOR) unblocked
+/// during the refresh; it relies on the matview's unique index and on the
+/// boot-time `CREATE … WITH DATA` population, so the first refresh has data to
+/// diff against.
+async fn refresh_matview_concurrently(
+    pool: &PgPool,
+    view: &str,
+    job_tag: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    // 10 minutes: generous headroom over the ~tens-of-seconds the refresh needs,
+    // while still bounding a runaway. Matches `cron::graph_analysis`'s literal.
+    sqlx::query("SET LOCAL statement_timeout = '600s'")
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    sqlx::query(&format!(
+        "SET LOCAL application_name = 'pgmcp:heavy:{job_tag}'"
+    ))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(&format!("REFRESH MATERIALIZED VIEW CONCURRENTLY {view}"))
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await
 }
 
-/// Unified-graph (Stage 2): refresh the materialized **edges** view. Like
-/// [`refresh_memory_unified_nodes`], a UNION ALL over indexed tables — promoted
-/// to MATERIALIZED so the traversal CTEs can use `(from_id)`/`(to_id)` indexes.
-/// Called from the `memory-graph-refresh` cron (Stage 3) or on-demand.
-///
-/// `CONCURRENTLY` (non-blocking) via the unique index
-/// `idx_memory_unified_edges_uq (from_id, to_id, edge_type)`; the outer GROUP BY
-/// in `MEMORY_UNIFIED_EDGES_SQL` guarantees that key is unique. Same no-transaction
-/// / populated-at-boot constraints as the nodes refresh above.
+/// Phase 6.3: refresh the unified **nodes** matview. A UNION ALL over indexed
+/// tables; relies on `idx_memory_unified_nodes_uq (node_id)`. Called from the
+/// `memory-graph-refresh` / `memory-concepts` crons or on-demand.
+pub async fn refresh_memory_unified_nodes(pool: &PgPool) -> Result<(), sqlx::Error> {
+    refresh_matview_concurrently(pool, "memory_unified_nodes", "memory-graph-refresh").await
+}
+
+/// Unified-graph (Stage 2): refresh the materialized **edges** view. A UNION ALL
+/// over indexed tables; relies on `idx_memory_unified_edges_uq (from_id, to_id,
+/// edge_type)` (the outer GROUP BY in `MEMORY_UNIFIED_EDGES_SQL` makes that key
+/// unique). Called from the `memory-graph-refresh` / `memory-concepts` /
+/// `trajectory-similarity` crons or on-demand.
 pub async fn refresh_memory_unified_edges(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query("REFRESH MATERIALIZED VIEW CONCURRENTLY memory_unified_edges")
-        .execute(pool)
-        .await?;
-    Ok(())
+    refresh_matview_concurrently(pool, "memory_unified_edges", "memory-graph-refresh").await
 }
 
 /// Phase 6.3: BFS neighbors of a typed node over `memory_unified_edges`.

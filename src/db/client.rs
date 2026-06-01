@@ -132,6 +132,9 @@ pub trait DbClient: Send + Sync {
     ) -> Result<queries::ChunkBatchOutcome, sqlx::Error>;
     async fn delete_file(&self, path: &str) -> Result<(), sqlx::Error>;
     async fn delete_files_batch(&self, paths: &[String]) -> Result<u64, sqlx::Error>;
+    /// Delete all indexed files of `language` (and their chunks) for targeted
+    /// re-extraction; see [`queries::delete_files_by_language`].
+    async fn delete_files_by_language(&self, language: &str) -> Result<u64, sqlx::Error>;
     async fn get_file_id_by_path(&self, path: &str) -> Result<Option<i64>, sqlx::Error>;
     async fn get_file_line_count(&self, file_id: i64) -> Result<i32, sqlx::Error>;
     async fn cleanup_stale_files(&self) -> Result<u64, sqlx::Error>;

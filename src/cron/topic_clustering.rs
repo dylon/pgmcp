@@ -300,7 +300,32 @@ fn degenerate_result(n: usize, d: usize, k: usize) -> FcmResult {
 /// `v2` = stopword-tiered c-TF-IDF with identifier splitting + embedding-based
 /// (KeyBERT/MMR) keyword refinement. Topics carrying no signature (NULL) were
 /// computed by pre-signature code and are always treated as stale.
-pub const TOPICS_ALGO_SIGNATURE: &str = "pgmcp-topics-v2";
+pub const TOPICS_ALGO_SIGNATURE: &str = "pgmcp-topics-v3";
+
+/// Maximum number of topics a single chunk is assigned to. The FCM
+/// soft-membership matrix (fuzziness m=2, K up to ~500) places non-trivial mass
+/// on many topics per chunk, so persisting every topic above the absolute
+/// `membership_threshold` (0.05) saturated per-file topic diversity to ~K — the
+/// `topic_count`≈K pathology that rendered `complexity_hotspots`' topic signal,
+/// `find_orphans`, `find_misplaced_code`, and `architecture_quality`'s
+/// `separation_of_concerns` meaningless (every file appeared to span every
+/// topic). Keeping only the strongest few topics per chunk restores a sparse,
+/// meaningful assignment. The cap is applied before BOTH the persisted
+/// `chunk_topic_assignments` rows and the per-topic member buckets used for
+/// c-TF-IDF keywords, dropping only weak (noise) memberships. The signature was
+/// bumped v2→v3 so existing assignments recompute under the cap. 4 follows the
+/// conventional BERTopic top-k.
+const MAX_MEMBERSHIPS_PER_CHUNK: usize = 4;
+
+/// Cap a chunk's topic-assignment list to the `MAX_MEMBERSHIPS_PER_CHUNK`
+/// strongest topics. Sorts by membership descending then truncates; a no-op
+/// when the list is already within the cap.
+fn cap_chunk_memberships(chunk_topics: &mut Vec<(usize, f64)>) {
+    if chunk_topics.len() > MAX_MEMBERSHIPS_PER_CHUNK {
+        chunk_topics.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        chunk_topics.truncate(MAX_MEMBERSHIPS_PER_CHUNK);
+    }
+}
 
 // Stopword tiers for c-TF-IDF topic labeling.
 //
@@ -1086,17 +1111,25 @@ where
             continue;
         }
 
-        // Add to all topics above threshold
-        let mut any_assigned = false;
+        // Collect this chunk's above-threshold topics, then cap to the top-J
+        // strongest (cap_chunk_memberships). Without the cap, diffuse FCM
+        // memberships (m=2, K≈199) put nearly every chunk in nearly every
+        // topic, saturating per-file topic diversity to ~K (the topic_count≈K
+        // bug).
+        let mut chunk_topics: Vec<(usize, f64)> = Vec::new();
         for t in 0..k {
             let mu = fcm_result.membership[[i, t]];
             if mu >= threshold_f32 {
-                topic_members.entry(t).or_default().push((i, mu as f64));
-                any_assigned = true;
+                chunk_topics.push((t, mu as f64));
             }
         }
-        if !any_assigned {
+        if chunk_topics.is_empty() {
             noise_count += 1;
+            continue;
+        }
+        cap_chunk_memberships(&mut chunk_topics);
+        for (t, score) in chunk_topics {
+            topic_members.entry(t).or_default().push((i, score));
         }
     }
 
@@ -1794,16 +1827,21 @@ async fn run_mmap_global_topic_scan(
             noise_count += 1;
             continue;
         }
-        let mut any = false;
+        let mut chunk_topics: Vec<(usize, f64)> = Vec::new();
         for t in 0..k {
             let mu = fcm_result.membership[[i, t]];
             if mu >= threshold_f32 {
-                topic_members.entry(t).or_default().push((i, mu as f64));
-                any = true;
+                chunk_topics.push((t, mu as f64));
             }
         }
-        if !any {
+        if chunk_topics.is_empty() {
             noise_count += 1;
+            continue;
+        }
+        // Top-J cap (see cap_chunk_memberships / MAX_MEMBERSHIPS_PER_CHUNK).
+        cap_chunk_memberships(&mut chunk_topics);
+        for (t, score) in chunk_topics {
+            topic_members.entry(t).or_default().push((i, score));
         }
     }
 
@@ -2384,12 +2422,19 @@ async fn run_online_global_topic_scan(
                 // be defensive in case the store survived a restart.
                 continue;
             }
+            // Collect this chunk's above-threshold topics, cap to the top-J
+            // strongest (same rule as the in-memory paths), then bucket.
+            let mut chunk_topics: Vec<(usize, f64)> = Vec::new();
             for (j, &m) in mu.iter().enumerate() {
                 if (m as f64) >= threshold {
-                    topic_chunk_ids[j].push(chunk_id);
-                    topic_memberships[j].push(m as f64);
-                    chunk_topic_pairs += 1;
+                    chunk_topics.push((j, m as f64));
                 }
+            }
+            cap_chunk_memberships(&mut chunk_topics);
+            for (j, score) in chunk_topics {
+                topic_chunk_ids[j].push(chunk_id);
+                topic_memberships[j].push(score);
+                chunk_topic_pairs += 1;
             }
         }
         info!(
@@ -3072,6 +3117,33 @@ mod tests {
                 topic1_words
             );
         }
+    }
+
+    #[test]
+    fn cap_chunk_memberships_truncates_to_top_j() {
+        // A diffuse chunk that landed in more topics than the cap allows must be
+        // reduced to the MAX_MEMBERSHIPS_PER_CHUNK strongest, in descending
+        // order — this is what stops per-file topic_count saturating to ~K.
+        let mut topics: Vec<(usize, f64)> = vec![
+            (3, 0.10),
+            (7, 0.40),
+            (1, 0.05),
+            (9, 0.30),
+            (2, 0.20),
+            (5, 0.06),
+        ];
+        cap_chunk_memberships(&mut topics);
+        assert_eq!(topics.len(), MAX_MEMBERSHIPS_PER_CHUNK);
+        assert_eq!(topics, vec![(7, 0.40), (9, 0.30), (2, 0.20), (3, 0.10)]);
+    }
+
+    #[test]
+    fn cap_chunk_memberships_noop_when_within_cap() {
+        // At or under the cap, leave the list unchanged (no spurious reorder).
+        let mut topics: Vec<(usize, f64)> = vec![(4, 0.6), (2, 0.3)];
+        let before = topics.clone();
+        cap_chunk_memberships(&mut topics);
+        assert_eq!(topics, before);
     }
 
     #[test]

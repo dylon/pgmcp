@@ -151,6 +151,28 @@ pub async fn delete_files_batch(pool: &PgPool, paths: &[String]) -> Result<u64, 
     Ok(result.rows_affected())
 }
 
+/// Delete every indexed file of a given language (and its chunks), so the
+/// background scanner re-reads and re-extracts only those files on its next
+/// pass. The narrow mechanism for re-applying an extractor change (e.g. the
+/// LaTeX pandoc→in-process cutover) WITHOUT a global rescan: every other file's
+/// Level-1 size+mtime skip is preserved. Two-step (chunks then files), mirroring
+/// `delete_file`, so correctness does not depend on a FK cascade. Index-backed
+/// by `idx_files_language`. Returns the number of file rows removed.
+pub async fn delete_files_by_language(pool: &PgPool, language: &str) -> Result<u64, sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM file_chunks WHERE file_id IN \
+         (SELECT id FROM indexed_files WHERE language = $1)",
+    )
+    .bind(language)
+    .execute(pool)
+    .await?;
+    let result = sqlx::query("DELETE FROM indexed_files WHERE language = $1")
+        .bind(language)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 /// Read a single file's content by path. Includes the asymmetric-
 /// storage flags so callers can decide whether to attempt a disk
 /// fast-path before falling back to chunk stitching.

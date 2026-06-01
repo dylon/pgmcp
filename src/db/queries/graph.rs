@@ -177,6 +177,34 @@ pub async fn set_function_metrics_watermark(
     Ok(())
 }
 
+/// True when this project has source files in a function-metrics backend
+/// language yet zero rows in `function_metrics` — the function-metrics analogue
+/// of `project_missing_import_refs`. Detects the advance-on-empty watermark trap
+/// so the caller can force a full re-scan and self-heal the empty metrics table
+/// (which otherwise leaves `complexity_hotspots` / scorecard complexity dark).
+/// `function_metrics` carries `project_id`, so this is two short-circuiting
+/// EXISTS scans.
+pub async fn project_missing_function_metrics(
+    pool: &PgPool,
+    project_id: i32,
+    languages: &[&str],
+) -> Result<bool, sqlx::Error> {
+    let langs: Vec<String> = languages.iter().map(|s| s.to_string()).collect();
+    let (needs,): (bool,) = sqlx::query_as::<_, (bool,)>(
+        "SELECT EXISTS(
+                 SELECT 1 FROM indexed_files
+                 WHERE project_id = $1 AND language = ANY($2::text[])
+             ) AND NOT EXISTS(
+                 SELECT 1 FROM function_metrics WHERE project_id = $1
+             )",
+    )
+    .bind(project_id)
+    .bind(&langs)
+    .fetch_one(pool)
+    .await?;
+    Ok(needs)
+}
+
 // ----------------------------------------------------------------------------
 // Call-graph cron support
 // ----------------------------------------------------------------------------

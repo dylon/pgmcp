@@ -138,7 +138,22 @@ async fn extract_project_symbols(
     project_name: &str,
     stats: &Arc<StatsTracker>,
 ) -> Result<ProjectExtractionStats, sqlx::Error> {
-    let watermark = queries::get_symbol_extraction_watermark(pool, project_id).await?;
+    let mut watermark = queries::get_symbol_extraction_watermark(pool, project_id).await?;
+    // Self-heal the advance-on-empty watermark trap: if the project has
+    // backend-language files but zero `import_use` refs (the pre-fix state, or
+    // an early run that advanced the watermark without persisting), an
+    // incremental run would skip it forever. Force a full re-scan so the import
+    // graph backfills automatically. Triggers at most once per project — after a
+    // successful re-scan the `import_use` rows exist and this stays false.
+    if watermark.is_some()
+        && queries::project_missing_import_refs(pool, project_id, BACKEND_LANGUAGES).await?
+    {
+        info!(
+            project = %project_name,
+            "Symbol extraction: backend files present but no import_use refs; forcing full re-scan to backfill the import graph"
+        );
+        watermark = None;
+    }
     let phase_a_start = std::time::Instant::now();
     let metas =
         queries::list_files_for_symbol_extraction(pool, project_id, BACKEND_LANGUAGES, watermark)
@@ -236,6 +251,72 @@ async fn extract_project_symbols(
     Ok(counters)
 }
 
+/// Map a backend's extracted imports into `ImportUse` symbol-references so the
+/// cron persists them alongside call/type refs.
+///
+/// KEYSTONE: without this wiring `symbol_references` carries zero `import_use`
+/// rows, so `get_imports_from_symbols` returns empty and the project import
+/// graph collapses (graph_analysis's symbol-aware path finds nothing; the regex
+/// fallback only covers files with NO symbol refs). `source_file_id`'s `0`
+/// placeholder is overwritten by `bulk_insert_symbol_references` from its
+/// `file_id` argument; `target_file_id` is resolved later by graph_analysis from
+/// `target_raw`. Backend-agnostic — every language's `extract_imports`
+/// contributes.
+fn imports_as_references(
+    imports: Vec<crate::parsing::symbols::Import>,
+) -> Vec<crate::parsing::symbols::SymbolReference> {
+    use crate::parsing::symbols::{SymbolRefKind, SymbolReference};
+    imports
+        .into_iter()
+        .map(|imp| SymbolReference {
+            source_file_id: 0,
+            source_symbol_id: None,
+            target_file_id: None,
+            target_symbol_id: None,
+            target_raw: imp.target_raw,
+            ref_kind: SymbolRefKind::ImportUse,
+            source_line: imp.source_line,
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod import_ref_tests {
+    use super::imports_as_references;
+    use crate::parsing::LanguageRegistry;
+    use crate::parsing::symbols::SymbolRefKind;
+
+    #[test]
+    fn rust_use_becomes_import_use_ref() {
+        // The keystone behavior: a Rust `use` statement must end up as an
+        // `ImportUse` reference (not be dropped), with the placeholder ids the
+        // cron/graph layers expect.
+        let backend = LanguageRegistry::for_language("rust").expect("rust backend");
+        let imports = backend.extract_imports("use crate::db::queries;\nfn main() {}");
+        assert!(!imports.is_empty(), "rust `use` should produce imports");
+        let refs = imports_as_references(imports);
+        assert!(!refs.is_empty(), "imports must map to references");
+        assert!(
+            refs.iter().all(|r| r.ref_kind == SymbolRefKind::ImportUse),
+            "every mapped reference must be ImportUse"
+        );
+        assert!(
+            refs.iter().any(|r| r.target_raw.contains("queries")),
+            "the import's target_raw must be preserved"
+        );
+        assert!(
+            refs.iter()
+                .all(|r| r.source_file_id == 0 && r.target_file_id.is_none()),
+            "placeholders: source_file_id=0 (set on insert), target_file_id=None (resolved later)"
+        );
+    }
+
+    #[test]
+    fn empty_imports_yield_no_refs() {
+        assert!(imports_as_references(Vec::new()).is_empty());
+    }
+}
+
 /// Extract + persist for a single file. Wrapped in one transaction so the
 /// DELETE + INSERT pair is atomic; rollback on FK violation (file deleted
 /// concurrently) is the cron's FK-drift mitigation.
@@ -256,6 +337,23 @@ async fn extract_and_persist_file(
     // Run the backends outside the transaction (CPU work).
     let mut symbols = backend.extract_symbols(content);
     let mut references = backend.extract_references(content);
+
+    // Imports are produced by a SEPARATE backend method. Folding them into
+    // `references` as `ImportUse` rows is load-bearing: without it
+    // `symbol_references` carries zero `import_use` rows, so
+    // `get_imports_from_symbols` returns empty and `graph_analysis` builds the
+    // import graph only from its regex fallback — which is itself gated to files
+    // with NO symbol refs (see `file_ids_with_symbol_refs`). Any file with a
+    // call/type ref therefore ends up edgeless, collapsing the project import
+    // graph to a residue (pgmcp: 14 nodes / 17 edges for 938 files) and turning
+    // `dependency_graph` / `coupling_cohesion_report` / `architecture_*` into
+    // fiction. Map each `Import` to an `ImportUse` reference; `target_file_id`
+    // is resolved later by `graph_analysis` from `target_raw`
+    // (`graph_analysis.rs`, the `imp.target_file_id.or_else(...)` path).
+    // `source_file_id` is a placeholder — `bulk_insert_symbol_references` uses
+    // the `file_id` argument. Backend-agnostic: every language's
+    // `extract_imports` now contributes.
+    references.extend(imports_as_references(backend.extract_imports(content)));
 
     if symbols.is_empty() && references.is_empty() {
         // Nothing to persist; still scrub stale rows for this file.

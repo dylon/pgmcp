@@ -237,6 +237,11 @@ lling-llang = { path = "../lling-llang", features = ["levenshtein", "lm-rerank",
 # ndarray 0.17 or the ort-side detector ships.
 libgrammstein = { path = "../libgrammstein", features = ["mimalloc-alloc", "lling-llang-integration", "wfst-export", "serde-extras", "rag", "rag-hnsw", "neural-rescore", "candle-model", "subword", "code", "code-python", "code-rust", "code-javascript", "code-rholang", "code-metta"] }
 llammer-pipeline = { path = "../llammer-pipeline", features = ["phonetic-rescore"] }
+# In-process LaTeX parser. Replaces the `pandoc` subprocess for `.tex`: pgmcp
+# consumes its error-tolerant AST (`parse` + `ast` + `lift_math`) and renders it
+# to plain text in `src/indexer/extract/latex/`. default-features off ⇒ no
+# `mathml`/`serde` (only `thiserror`, already in the tree).
+latex-parser = { path = "../latex-parser", default-features = false }
 
 # P13.3: BCP-47 language detection for per-project phonetic-rule
 # dispatch. Pinned to a direct dep so we don't depend on a version

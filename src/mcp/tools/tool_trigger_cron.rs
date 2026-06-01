@@ -191,9 +191,21 @@ pub async fn tool_trigger_cron(
                 "guidance": "Per-project symbol/path/commit + durable-mandate fuzzy tries rebuilt from PG.",
             }))
         }
+        "graph-analysis" => {
+            // Rebuild code_graph_edges (import / co-change / semantic) on demand.
+            // Run AFTER symbol-extraction so the freshly written `import_use`
+            // refs materialize into import edges — this is how the post-fix
+            // import-graph backfill is forced without a daemon restart.
+            crate::cron::graph_analysis::run_graph_analysis(db.as_ref(), stats, None).await;
+            json_result(&json!({
+                "job": params.job,
+                "status": "completed",
+                "guidance": "Import/co-change/semantic edges rebuilt from symbol_references. Repairs dependency_graph / coupling_cohesion_report / architecture_* once import_use refs exist (run symbol-extraction first).",
+            }))
+        }
         other => Err(McpError::invalid_params(
             format!(
-                "Unknown job {other:?}. Valid: symbol-extraction | call-graph | function-metrics | a2a-reflect | msm-calibrate | fuzzy-sync"
+                "Unknown job {other:?}. Valid: symbol-extraction | call-graph | function-metrics | graph-analysis | a2a-reflect | msm-calibrate | fuzzy-sync"
             ),
             None,
         )),

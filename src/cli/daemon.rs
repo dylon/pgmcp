@@ -625,6 +625,28 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             "Starting MCP server on http://{}/mcp (Streamable HTTP)",
             bind_addr
         );
+        // Security posture: the daemon serves mostly-unauthenticated REST + MCP
+        // endpoints whose threat model assumes a loopback bind (same-host only).
+        // A routable bind exposes them — and the token-gated tracker evidence
+        // endpoints — to the network. Warn loudly so a non-loopback bind is a
+        // deliberate choice, not an accident.
+        {
+            let host = config_snapshot.mcp.host.trim();
+            let is_loopback = host == "127.0.0.1"
+                || host == "::1"
+                || host == "localhost"
+                || host.eq_ignore_ascii_case("ip6-localhost");
+            if !is_loopback {
+                tracing::warn!(
+                    bind = %bind_addr,
+                    tracker_endpoints_gated = config_snapshot.tracker.user_token.is_some(),
+                    "MCP/REST server is binding a NON-loopback address; its mostly-unauthenticated \
+                     endpoints (search, context, session/observe) and the token-gated tracker \
+                     evidence endpoints become network-reachable. Bind 127.0.0.1 unless remote \
+                     access is intended and the perimeter is otherwise secured."
+                );
+            }
+        }
 
         // Wrap LocalSessionManager so create/close maintain the
         // http_mcp_sessions counter — surfaced by `pgmcp status` and

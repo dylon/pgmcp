@@ -9,6 +9,15 @@ Before declaring any code change complete, run the full verification gate:
 If any step fails, the work is not done. There are no environment-variable
 overrides or opt-outs. The script is the contract.
 
+**Run `verify.sh` ONLY after every other task in the request is complete — never
+mid-task, never to check progress.** It is the single final gate, run exactly
+once at the end (~10 min: full `build --all-targets` + clippy + release tests +
+GPU smoke). During the interim, iterate with `cargo nextest run --release --bin
+pgmcp <filters>` and targeted `cargo clippy --bin pgmcp --all-targets`, and grow
+an exhaustive test suite as you go so the final `verify.sh` is a formality, not a
+discovery step. (This timing rule governs *when* to run the contract; it is not
+an opt-out — the contract itself still has none.)
+
 `./scripts/verify.sh` is also enforced on every `git push` via the pre-push
 hook at `.githooks/pre-push`. Activate it once per clone:
 

@@ -164,6 +164,10 @@ impl DbClient for PgPool {
         queries::delete_files_batch(self, paths).await
     }
 
+    async fn delete_files_by_language(&self, language: &str) -> Result<u64, sqlx::Error> {
+        queries::delete_files_by_language(self, language).await
+    }
+
     async fn get_file_id_by_path(&self, path: &str) -> Result<Option<i64>, sqlx::Error> {
         queries::get_file_id_by_path(self, path).await
     }

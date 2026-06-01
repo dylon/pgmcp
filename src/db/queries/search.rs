@@ -277,9 +277,9 @@ pub async fn hybrid_search_chunks(
             ),
             fused AS (
                 SELECT COALESCE(d.chunk_id, l.chunk_id, s.chunk_id) AS chunk_id,
-                       COALESCE(1.0 / (60.0 + d.rnk), 0.0)
+                       (COALESCE(1.0 / (60.0 + d.rnk), 0.0)
                      + COALESCE(1.0 / (60.0 + l.rnk), 0.0)
-                     + COALESCE(1.0 / (60.0 + s.rnk), 0.0) AS rrf
+                     + COALESCE(1.0 / (60.0 + s.rnk), 0.0))::float8 AS rrf
                 FROM dense d
                 FULL OUTER JOIN lexical l ON d.chunk_id = l.chunk_id
                 FULL OUTER JOIN sparse s ON COALESCE(d.chunk_id, l.chunk_id) = s.chunk_id
@@ -301,8 +301,8 @@ pub async fn hybrid_search_chunks(
             "WITH {dense_lexical},
             fused AS (
                 SELECT COALESCE(d.chunk_id, l.chunk_id) AS chunk_id,
-                       COALESCE(1.0 / (60.0 + d.rnk), 0.0)
-                     + COALESCE(1.0 / (60.0 + l.rnk), 0.0) AS rrf
+                       (COALESCE(1.0 / (60.0 + d.rnk), 0.0)
+                     + COALESCE(1.0 / (60.0 + l.rnk), 0.0))::float8 AS rrf
                 FROM dense d
                 FULL OUTER JOIN lexical l ON d.chunk_id = l.chunk_id
             )

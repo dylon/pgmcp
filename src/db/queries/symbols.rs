@@ -883,6 +883,36 @@ pub async fn get_symbol_extraction_watermark(
     }))
 }
 
+/// True when this project has source files in a backend language yet zero
+/// `import_use` rows in `symbol_references` — the signature of the
+/// "advance-on-empty watermark" trap (or a pre-fix extraction that dropped
+/// imports). A normal incremental run would skip the project forever because
+/// the watermark is already set, so callers force a full re-scan
+/// (watermark = None) when this returns true and the import graph self-heals
+/// without a manual `pgmcp_metadata` reset. Two short-circuiting EXISTS scans.
+pub async fn project_missing_import_refs(
+    pool: &PgPool,
+    project_id: i32,
+    languages: &[&str],
+) -> Result<bool, sqlx::Error> {
+    let langs: Vec<String> = languages.iter().map(|s| s.to_string()).collect();
+    let (needs,): (bool,) = sqlx::query_as::<_, (bool,)>(
+        "SELECT EXISTS(
+                 SELECT 1 FROM indexed_files
+                 WHERE project_id = $1 AND language = ANY($2::text[])
+             ) AND NOT EXISTS(
+                 SELECT 1 FROM symbol_references sr
+                 JOIN indexed_files f ON f.id = sr.source_file_id
+                 WHERE f.project_id = $1 AND sr.ref_kind = 'import_use'
+             )",
+    )
+    .bind(project_id)
+    .bind(&langs)
+    .fetch_one(pool)
+    .await?;
+    Ok(needs)
+}
+
 /// Set the symbol-extraction watermark for a project.
 pub async fn set_symbol_extraction_watermark(
     pool: &PgPool,

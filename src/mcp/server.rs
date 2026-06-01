@@ -846,10 +846,10 @@ impl McpServer {
                 "recommend_module_split"         => recommend_module_split(RecommendModuleSplitParams),
                 "reviewer_recommender"           => reviewer_recommender(ReviewerRecommenderParams),
                 "fix_circular_dependency"        => fix_circular_dependency(FixCircularDependencyParams),
+                "reindex"                        => reindex(ReindexParams),
             }, no_params: {
                 "list_projects" => list_projects,
                 "index_stats"   => index_stats,
-                "reindex"       => reindex,
                 "pattern_catalog_stats" => pattern_catalog_stats in tool_software_patterns,
             })
         };

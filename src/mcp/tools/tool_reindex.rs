@@ -31,10 +31,14 @@ use crate::mcp::server::*;
 /// against the production schema (`(file_id, chunk_index)` index).
 const REINDEX_DELETE_BATCH: i64 = 10_000;
 
-pub async fn tool_reindex(ctx: &SystemContext) -> Result<CallToolResult, McpError> {
+pub async fn tool_reindex(
+    ctx: &SystemContext,
+    params: ReindexParams,
+) -> Result<CallToolResult, McpError> {
+    let language = params.language;
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    debug!(tool = "reindex", "MCP tool invoked");
+    debug!(tool = "reindex", language = ?language, "MCP tool invoked");
 
     // Refuse to run while another reindex is in flight. Two concurrent
     // reindexes race the embed pool's FK invariants and double the
@@ -54,6 +58,46 @@ pub async fn tool_reindex(ctx: &SystemContext) -> Result<CallToolResult, McpErro
         .db()
         .pool()
         .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>");
+
+    // Targeted re-extraction of a single language (no global wipe): invalidate
+    // only that language's index rows so the background scanner re-extracts them
+    // while every other file's Level-1 size+mtime skip is preserved. The narrow
+    // mechanism for re-applying an extractor change (e.g. the LaTeX
+    // pandoc→in-process cutover) without a self-DoS full rescan.
+    if let Some(lang) = language {
+        if ctx.lifecycle().is_stopping() {
+            return Err(McpError::internal_error(
+                "Reindex cancelled (daemon stopping)",
+                None,
+            ));
+        }
+        let files = crate::db::queries::delete_files_by_language(pool, &lang)
+            .await
+            .map_err(|e| {
+                error!(tool = "reindex", language = %lang, error = %e, "Failed to clear files by language");
+                McpError::internal_error(format!("Failed to clear {lang} files: {e}"), None)
+            })?;
+        ctx.log_broadcaster().log(
+            LoggingLevel::Info,
+            "pgmcp::reindex",
+            serde_json::json!({
+                "message": "Language index cleared via reindex tool",
+                "language": lang,
+                "deleted_files": files,
+            }),
+        );
+        debug!(
+            tool = "reindex",
+            language = %lang,
+            deleted_files = files,
+            duration_ms = start.elapsed().as_millis() as u64,
+            "MCP tool completed",
+        );
+        return Ok(CallToolResult::success(vec![Content::text(format!(
+            "Cleared {files} `{lang}` files from the index. They will be re-extracted \
+             by the background scanner (restart the daemon to force an immediate full scan)."
+        ))]));
+    }
 
     // Batched delete with a between-batch cancel check. PostgreSQL deletes
     // are atomic per statement, so we commit each batch's transaction

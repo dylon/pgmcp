@@ -1396,6 +1396,18 @@ pub async fn tracker_pr_event(
             "invalid or missing tracker token (set [tracker] user_token)".to_string(),
         ));
     }
+    // Audit the trust-boundary crossing (token never logged — only that the gate
+    // passed). A merge event stages a `verifying` candidate; CI evidence still
+    // gates the final `verified` flip.
+    tracing::info!(
+        target: "pgmcp::tracker::audit",
+        endpoint = "pr_event",
+        public_id = ?req.public_id,
+        action = %req.action,
+        pr_number = ?req.pr_number,
+        merged = ?req.merged,
+        "tracker PR event accepted (token gate passed)"
+    );
     let pool = state.db.pool().ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "raw pool unavailable".to_string(),

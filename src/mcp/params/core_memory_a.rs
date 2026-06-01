@@ -194,6 +194,16 @@ pub struct ProjectTreeParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReindexParams {
+    #[schemars(
+        description = "Optional: re-extract only files of this language (e.g. \"latex\"), \
+                       preserving every other file's incremental size+mtime skip. Omit to \
+                       clear and rebuild the entire index."
+    )]
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct OrientParams {
     #[schemars(description = "Project name (as shown by list_projects)")]
     pub project: String,

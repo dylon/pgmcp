@@ -26,11 +26,27 @@ pub async fn run_memory_graph_refresh(
     pool: &PgPool,
     stats: &StatsTracker,
 ) -> Result<(), sqlx::Error> {
-    queries::refresh_memory_unified_nodes(pool).await?;
-    queries::refresh_memory_unified_edges(pool).await?;
-    stats.memory_graph_refreshes.fetch_add(1, Ordering::Relaxed);
-    info!("memory-graph-refresh: refreshed memory_unified_nodes + memory_unified_edges");
-    Ok(())
+    // Run both refreshes independently so a failure of one (e.g. a transient
+    // lock) does not prevent the other from being refreshed.
+    let nodes = queries::refresh_memory_unified_nodes(pool).await;
+    let edges = queries::refresh_memory_unified_edges(pool).await;
+
+    if let Err(e) = &nodes {
+        warn!(view = "memory_unified_nodes", error = %e, "matview refresh failed");
+    }
+    if let Err(e) = &edges {
+        warn!(view = "memory_unified_edges", error = %e, "matview refresh failed");
+    }
+
+    if nodes.is_ok() && edges.is_ok() {
+        stats.memory_graph_refreshes.fetch_add(1, Ordering::Relaxed);
+        info!("memory-graph-refresh: refreshed memory_unified_nodes + memory_unified_edges");
+        Ok(())
+    } else {
+        // Surface the first error to `run_or_log`; the per-view warnings above
+        // already pinpoint which refresh(es) failed.
+        nodes.and(edges)
+    }
 }
 
 /// Run the refresh, logging any error rather than panicking the cron thread.

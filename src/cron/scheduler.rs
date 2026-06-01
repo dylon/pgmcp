@@ -842,6 +842,15 @@ pub fn schedule_maintenance_jobs(
     // not to scheduler start. This prevents the old pile-up where all four
     // overdue heavy crons fired within the same 60s window after Ready.
     let heavy_cron_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+    // Dedicated lock for the cheap, read-mostly quality-history snapshot. It was
+    // previously on `heavy_cron_lock`, where it lost the try_lock race to the
+    // 20-30 min GPU jobs (topic-clustering / graph-analysis) every tick and
+    // starved (observed: `quality_history_runs=1`, then perpetual
+    // `skipped:lock_busy`), leaving quality_trend / quality_forecast / burndown
+    // and the digest with an empty series. It only reads tables (MVCC-safe
+    // alongside the GPU writers) and appends to quality_report_history, so it
+    // needs to exclude only itself — its own lock decouples it from the GPU herd.
+    let quality_history_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
 
     let stats_for_git = Arc::clone(&stats);
     let lc = lifecycle.clone();
@@ -1542,7 +1551,9 @@ pub fn schedule_maintenance_jobs(
         let qh_interval = config.quality_history_interval_secs;
         let cron_pool_qh = Arc::clone(&cron_pool);
         let lc_qh = lifecycle.clone();
-        let lock_qh = Arc::clone(&heavy_cron_lock);
+        // Own lock (not heavy_cron_lock) so the cheap snapshot stops starving
+        // behind multi-minute GPU crons. See `quality_history_lock` above.
+        let lock_qh = Arc::clone(&quality_history_lock);
         let ready_qh: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
         let qh_ready_delay = Duration::from_secs(120);
         let ctx_qh = system_ctx.clone();

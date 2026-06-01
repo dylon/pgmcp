@@ -400,15 +400,20 @@ pub fn default_fix_for_violation(
         }
         "god_module" => {
             let module_name = module.unwrap_or("?");
+            // NOTE: callers pass the file list via the violation's `description`
+            // (which already carries the real count), not via `files` here —
+            // `files` is empty for god_module. Earlier code interpolated
+            // `files.len()` and so always printed "has 0 files", contradicting
+            // the description. State the rule, not a bogus count.
             Some(
                 RecommendedFix::new(FixAction::SplitFile, project)
                     .with_confidence(0.45)
                     .with_effort(EstimatedEffort::Large)
                     .add_step(format!(
-                        "Module '{}' has {} files; consider extracting cohesive sub-modules. \
-                         Invoke `recommend_module_split` (Phase 3) for a chunk-cluster→file mapping.",
-                        module_name,
-                        files.len()
+                        "Module '{}' exceeds the per-directory file-count threshold; \
+                         consider extracting cohesive sub-modules. Invoke \
+                         `recommend_module_split` (Phase 3) for a chunk-cluster→file mapping.",
+                        module_name
                     )),
             )
         }
@@ -693,6 +698,30 @@ mod tests {
 
         // Unknown type → None (defensive).
         assert!(default_fix_for_violation("unknown_xyz", "myproj", &[], None).is_none());
+    }
+
+    #[test]
+    fn god_module_fix_never_claims_zero_files() {
+        // Regression: the god_module fix used to interpolate `files.len()`, but
+        // every caller passes an empty `files` slice (the real count lives in
+        // the violation's `description`), so it always printed the contradictory
+        // "has 0 files". The step must name the module and the threshold rule —
+        // never a bogus count.
+        let fix = default_fix_for_violation("god_module", "proj", &[], Some("src/mcp"))
+            .expect("god_module yields a fix");
+        let steps = fix.steps.join(" ");
+        assert!(
+            !steps.contains("0 files"),
+            "god_module fix must not claim a bogus count; got: {steps}"
+        );
+        assert!(
+            steps.contains("src/mcp"),
+            "god_module fix should name the module; got: {steps}"
+        );
+        assert!(
+            steps.contains("file-count threshold"),
+            "god_module fix should state the rule, not a count; got: {steps}"
+        );
     }
 
     #[test]

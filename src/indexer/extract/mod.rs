@@ -36,6 +36,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+pub mod latex;
 pub mod normalize;
 pub mod ocr;
 pub mod ocr_cache;
@@ -229,9 +230,11 @@ pub fn extract_for_language_with_cache(
         "pdf" => pdf::extract_with_cache(path, opts, ocr_cache, content_hash),
         "postscript" => postscript::extract(path, opts),
         "docx" | "doc" | "rtf" | "odt" | "epub" => office::extract_office(language, path, opts),
-        // LaTeX and ORG ride pandoc to drop markup overhead at index time,
-        // delivering ~30-50% token reduction vs storing raw markup.
-        "latex" => office::extract_via_pandoc("latex", path, opts),
+        // LaTeX is rendered in-process from `latex_parser`'s error-tolerant AST
+        // (`src/indexer/extract/latex/`): never hard-fails on imperfect LaTeX (so
+        // the file is no longer skipped) and renders math to readable Unicode that
+        // pandoc's `--to plain` cannot. ORG still rides pandoc.
+        "latex" => latex::extract(path, opts),
         "org" => office::extract_via_pandoc("org", path, opts),
         "rst" | "bibtex" | "text" => utf8::read(path, opts),
         _ => Ok(None),
@@ -265,9 +268,11 @@ pub fn is_document_language(language: &str) -> bool {
 /// bibtex, text) are NOT in this set.
 #[allow(dead_code)]
 pub fn requires_external_tool(language: &str) -> bool {
+    // `latex` is NOT here: it is rendered in-process (see `latex::extract`) and
+    // can never fail with `ToolMissing`.
     matches!(
         language,
-        "pdf" | "postscript" | "docx" | "doc" | "rtf" | "odt" | "epub" | "latex" | "org"
+        "pdf" | "postscript" | "docx" | "doc" | "rtf" | "odt" | "epub" | "org"
     )
 }
 
@@ -305,9 +310,9 @@ pub const REQUIRED_TOOLS: &[(&str, &[&str], &str)] = &[
     ),
     (
         "pandoc",
-        // `doc` removed: pandoc does not support legacy DOC. The catdoc/antiword
-        // entries below cover that format.
-        &["docx", "rtf", "odt", "epub", "latex", "org"],
+        // `doc` removed: pandoc does not support legacy DOC (catdoc/antiword cover
+        // it). `latex` removed: rendered in-process by `latex::extract`.
+        &["docx", "rtf", "odt", "epub", "org"],
         "install pandoc (Arch: pacman -S pandoc-cli; \
          Debian: apt install pandoc; macOS: brew install pandoc)",
     ),
@@ -381,7 +386,9 @@ mod tests {
     #[test]
     fn requires_external_tool_excludes_passthrough() {
         assert!(requires_external_tool("pdf"));
-        assert!(requires_external_tool("latex"));
+        assert!(requires_external_tool("org")); // ORG still rides pandoc
+        // LaTeX is now rendered in-process (`latex::extract`) — no external tool.
+        assert!(!requires_external_tool("latex"));
         assert!(!requires_external_tool("rst"));
         assert!(!requires_external_tool("text"));
     }

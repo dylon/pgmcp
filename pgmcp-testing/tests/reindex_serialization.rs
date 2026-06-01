@@ -47,7 +47,8 @@ async fn tool_reindex_rejects_concurrent_invocation() {
         .try_lock()
         .expect("first try_lock must succeed on a fresh context");
 
-    let result = pgmcp::mcp::tools::tool_reindex::tool_reindex(&ctx).await;
+    let params = pgmcp::mcp::server::ReindexParams { language: None };
+    let result = pgmcp::mcp::tools::tool_reindex::tool_reindex(&ctx, params).await;
     let err = result.expect_err("reindex must refuse while the lock is held");
     let msg = err.message.to_string();
     assert!(

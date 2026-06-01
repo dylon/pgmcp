@@ -104,9 +104,16 @@ Default lookback is 60 minutes; pass `since_minutes` up to 44640 (31 days) to wi
     }
 
     #[tool(
-        description = "Trigger a full re-index of all workspaces. Clears the existing index and restarts indexing. Can be invoked as a long-running task."
+        description = "Trigger a re-index. With no `language`, clears the entire index and \
+restarts indexing (long-running task). With `language` (e.g. \"latex\"), re-extracts only that \
+language's files — the narrow way to re-apply an extractor change while preserving every other \
+file's incremental skip."
     )]
-    async fn reindex(&self, _ctx: RequestContext<RoleServer>) -> Result<CallToolResult, McpError> {
+    async fn reindex(
+        &self,
+        Parameters(params): Parameters<ReindexParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
         // No timeout: reindex can run for minutes on a large workspace.
         // Progress is reported via the MCP task store, not the immediate
         // response — wrapping in 30s would falsely fail every full reindex.
@@ -123,7 +130,7 @@ Default lookback is 60 minutes; pass `since_minutes` up to 44640 (31 days) to wi
             "",
             request_id,
             mcp_session_id,
-            crate::mcp::tools::tool_reindex::tool_reindex(self.ctx()),
+            crate::mcp::tools::tool_reindex::tool_reindex(self.ctx(), params),
         )
         .await
     }

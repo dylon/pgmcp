@@ -334,6 +334,34 @@ async fn queries_semantic_search_smoke() {
 }
 
 #[tokio::test]
+async fn queries_hybrid_search_chunks_smoke() {
+    let db = require_test_db!();
+    let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;
+
+    let emb = test_embedding();
+    // 2-leg branch (query_sparse=None) — the exact path `/api/search` takes,
+    // which regressed to HTTP 500 when the fused RRF column decoded as NUMERIC
+    // into `Option<f64>`. `.expect` fails on that decode error; `score.is_some()`
+    // confirms the `::float8` cast lets the fused RRF column decode cleanly.
+    let results =
+        queries::hybrid_search_chunks(db.pool(), "fn", &emb, 5, 20, None, None, 100, None)
+            .await
+            .expect("hybrid_search_chunks smoke (2-leg RRF must decode as float8)");
+    assert!(
+        !results.is_empty(),
+        "expected at least one fused hit for seeded corpus"
+    );
+    assert!(
+        results.iter().all(|r| r.score.is_some()),
+        "every fused RRF score must decode into Option<f64>"
+    );
+    assert!(
+        results.iter().all(|r| r.chunk_id.is_some()),
+        "hybrid_search_chunks must surface chunk_id"
+    );
+}
+
+#[tokio::test]
 async fn queries_text_search_smoke() {
     let db = require_test_db!();
     let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;

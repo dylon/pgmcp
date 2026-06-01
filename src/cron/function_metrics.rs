@@ -104,7 +104,21 @@ async fn score_project_functions(
     project_name: &str,
     stats: &Arc<StatsTracker>,
 ) -> Result<ProjectScoringStats, sqlx::Error> {
-    let watermark = queries::get_function_metrics_watermark(pool, project_id).await?;
+    let mut watermark = queries::get_function_metrics_watermark(pool, project_id).await?;
+    // Self-heal the advance-on-empty watermark trap (mirrors symbol-extraction):
+    // backend files present but `function_metrics` empty means a prior run
+    // advanced the watermark without persisting rows; force a full re-scan so
+    // per-function complexity backfills instead of staying dark forever.
+    if watermark.is_some()
+        && queries::project_missing_function_metrics(pool, project_id, FUNCTION_METRICS_LANGUAGES)
+            .await?
+    {
+        info!(
+            project = %project_name,
+            "Function-metrics: backend files present but function_metrics empty; forcing full re-scan to backfill"
+        );
+        watermark = None;
+    }
     let phase_a_start = std::time::Instant::now();
     let metas = queries::list_files_for_symbol_extraction(
         pool,

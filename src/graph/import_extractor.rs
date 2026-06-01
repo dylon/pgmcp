@@ -223,9 +223,16 @@ fn resolve_rust_import(import: &RawImport, source_relative_path: &str) -> Vec<St
     match &*import.kind {
         "use" => {
             if let Some(rest) = path.strip_prefix("crate::") {
-                // crate::db::queries -> src/db/queries.rs, src/db/queries/mod.rs
+                // `crate::` resolves relative to THIS file's crate root. For a
+                // single-crate project that is the top-level "src"; for a cargo
+                // workspace member the file lives under "<member>/src/...", so we
+                // derive the crate's src dir from the source path rather than
+                // hardcoding "src" (which left every workspace member's `crate::`
+                // imports unresolvable → empty import graph for the whole repo).
+                // e.g. crate::db::queries -> <crate_src>/db/queries.rs|/mod.rs
+                let base = rust_crate_src_root(source_relative_path);
                 let segments: Vec<&str> = rest.split("::").collect();
-                rust_path_candidates("src", &segments)
+                rust_path_candidates(&base, &segments)
             } else if let Some(rest) = path.strip_prefix("super::") {
                 // super::foo -> sibling module relative to current
                 let parent = parent_module(source_relative_path);
@@ -308,6 +315,20 @@ fn parent_module(path: &str) -> String {
     parent_dir(dir).to_string()
 }
 
+/// Derive the crate `src` root from a project-relative source path so that
+/// `crate::` imports resolve correctly in multi-crate cargo workspaces. For a
+/// single crate at the project root this is `"src"`; for a workspace member at
+/// e.g. `crates/foo/src/bar.rs` it is `crates/foo/src`. Uses the FIRST `src`
+/// path component (the outermost crate boundary from the project root) and
+/// falls back to `"src"` when no `src` component is present.
+fn rust_crate_src_root(source_relative_path: &str) -> String {
+    let parts: Vec<&str> = source_relative_path.split('/').collect();
+    match parts.iter().position(|&p| p == "src") {
+        Some(idx) => parts[..=idx].join("/"),
+        None => "src".to_string(),
+    }
+}
+
 fn rust_path_candidates(base: &str, segments: &[&str]) -> Vec<String> {
     if segments.is_empty() {
         return Vec::new();
@@ -366,6 +387,45 @@ mod tests {
             imports
                 .iter()
                 .any(|i| i.kind == "extern_crate" && i.raw_path == "serde")
+        );
+    }
+
+    #[test]
+    fn crate_src_root_single_crate_is_src() {
+        // Single-crate project: file directly under top-level src/.
+        assert_eq!(rust_crate_src_root("src/db/queries.rs"), "src");
+        assert_eq!(rust_crate_src_root("src/main.rs"), "src");
+    }
+
+    #[test]
+    fn crate_src_root_workspace_member_uses_member_src() {
+        // Cargo workspace member: crate::-imports must resolve under the
+        // member's own src/, not the repo-root src/.
+        assert_eq!(
+            rust_crate_src_root("crates/foo/src/bar.rs"),
+            "crates/foo/src"
+        );
+        assert_eq!(rust_crate_src_root("libs/x/src/a/b.rs"), "libs/x/src");
+    }
+
+    #[test]
+    fn crate_src_root_no_src_component_falls_back() {
+        assert_eq!(rust_crate_src_root("build.rs"), "src");
+        assert_eq!(rust_crate_src_root("examples/demo.rs"), "src");
+    }
+
+    #[test]
+    fn crate_use_resolves_under_workspace_member_src() {
+        // End-to-end: a `use crate::a::b;` in a workspace member resolves to
+        // candidate paths rooted at the member's src dir.
+        let imp = RawImport {
+            raw_path: "crate::a::b".to_string(),
+            kind: "use".to_string(),
+        };
+        let candidates = resolve_rust_import(&imp, "crates/foo/src/lib.rs");
+        assert!(
+            candidates.contains(&"crates/foo/src/a/b.rs".to_string()),
+            "expected member-rooted candidate, got {candidates:?}"
         );
     }
 

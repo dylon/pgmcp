@@ -114,26 +114,46 @@ impl Embedder {
                 let cfg: XlmRobertaConfig = serde_json::from_str(&cfg_json).map_err(|e| {
                     PgmcpError::Embedding(format!("xlm-roberta config.json parse: {}", e))
                 })?;
-                // Load `sparse_linear` (hidden→1) from the same checkpoint if
-                // present. Graceful: `.ok()` so a missing/odd head just leaves
-                // the sparse leg unavailable rather than failing the embedder.
-                let sparse_linear = candle_nn::linear(cfg.hidden_size, 1, vb.pp("sparse_linear"))
-                    .or_else(|_| {
-                        candle_nn::linear_no_bias(cfg.hidden_size, 1, vb.pp("sparse_linear"))
-                    })
-                    .ok();
+                // BGE-M3 publishes the learned-sparse + ColBERT projection heads
+                // as SEPARATE checkpoint files (sparse_linear.pt /
+                // colbert_linear.pt), NOT inside pytorch_model.bin. Loading them
+                // from the backbone `vb` (as the prior code did) therefore ALWAYS
+                // returned None, silently disabling the sparse RRF leg and the
+                // ColBERT MaxSim rerank even though both consumption paths are
+                // fully wired. `ensure_model_files` now fetches the two head
+                // files into `model_dir`; load each from its own file here,
+                // degrading to dense-only (with a warning) when a head is absent.
+                // The .pt stores a bare Linear state dict (`weight`,`bias`) at
+                // the root, so the per-file VarBuilder is used unprefixed.
+                let head_dtype = if device.is_cuda() {
+                    DType::BF16
+                } else {
+                    DType::F32
+                };
+                let load_head = |file: &str, in_dim: usize, out_dim: usize| -> Option<Linear> {
+                    let path = model_dir.join(file);
+                    if !path.exists() {
+                        tracing::warn!(
+                            file,
+                            "BGE-M3 head file absent; that retrieval leg degrades to dense-only"
+                        );
+                        return None;
+                    }
+                    let head_vb = match VarBuilder::from_pth(&path, head_dtype, &device) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(file, error = %e, "BGE-M3 head load failed; dense-only");
+                            return None;
+                        }
+                    };
+                    candle_nn::linear(in_dim, out_dim, head_vb.clone())
+                        .ok()
+                        .or_else(|| candle_nn::linear_no_bias(in_dim, out_dim, head_vb).ok())
+                };
+                let sparse_linear = load_head("sparse_linear.pt", cfg.hidden_size, 1);
                 let sparse_dim = cfg.vocab_size;
-                // ColBERT head (hidden→hidden); optional/graceful (Phase 2.5).
                 let colbert_linear =
-                    candle_nn::linear(cfg.hidden_size, cfg.hidden_size, vb.pp("colbert_linear"))
-                        .or_else(|_| {
-                            candle_nn::linear_no_bias(
-                                cfg.hidden_size,
-                                cfg.hidden_size,
-                                vb.pp("colbert_linear"),
-                            )
-                        })
-                        .ok();
+                    load_head("colbert_linear.pt", cfg.hidden_size, cfg.hidden_size);
                 let model = XLMRobertaModel::new(&cfg, vb)
                     .map_err(|e| PgmcpError::Embedding(format!("XLMRobertaModel::new: {}", e)))?;
                 (
@@ -144,6 +164,15 @@ impl Embedder {
                 )
             }
         };
+
+        // Surface head-load status at startup so an inert sparse/ColBERT leg is
+        // visible operationally instead of silently degrading to dense-only.
+        tracing::info!(
+            model = "bge-m3",
+            sparse_head_loaded = sparse_linear.is_some(),
+            colbert_head_loaded = colbert_linear.is_some(),
+            "BGE-M3 embedder ready; sparse RRF leg / ColBERT rerank active only when their heads loaded"
+        );
 
         let tokenizer_path = model_dir.join("tokenizer.json");
         let mut tokenizer = Tokenizer::from_file(&tokenizer_path)
@@ -645,6 +674,18 @@ fn ensure_model_files(kind: ModelKind) -> Result<PathBuf> {
             .map_err(|e| PgmcpError::Embedding(format!("hf get {}: {}", f, e)))?;
         if dir.is_none() {
             dir = path.parent().map(Path::to_path_buf);
+        }
+    }
+    // Best-effort fetch of the BGE-M3 auxiliary projection heads — separate .pt
+    // files (sparse_linear.pt / colbert_linear.pt), NOT in `model_files()`'s
+    // required set, so a model lacking them still loads (dense-only). They land
+    // in the same snapshot dir as the backbone, where `Embedder::new` loads them.
+    // Errors are non-fatal: a missing head only disables that one retrieval leg.
+    if matches!(kind, ModelKind::Bgem3) {
+        for aux in ["sparse_linear.pt", "colbert_linear.pt"] {
+            if let Err(e) = api.get(aux) {
+                tracing::warn!(file = aux, error = %e, "BGE-M3 aux head not fetched; that leg degrades to dense-only");
+            }
         }
     }
     dir.ok_or_else(|| PgmcpError::Embedding("hf cache resolution".into()))

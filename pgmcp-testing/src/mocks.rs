@@ -367,6 +367,10 @@ impl DbClient for MockDbClient {
         Ok(paths.len() as u64)
     }
 
+    async fn delete_files_by_language(&self, _language: &str) -> Result<u64, sqlx::Error> {
+        Ok(0)
+    }
+
     async fn get_file_id_by_path(&self, path: &str) -> Result<Option<i64>, sqlx::Error> {
         Ok(self
             .file_id_by_path

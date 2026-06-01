@@ -617,7 +617,22 @@ pub struct CoupledFilePair {
     pub jaccard: f64,
 }
 
+/// Maximum number of files a single commit may touch before it is excluded from
+/// co-change coupling. A commit that touches hundreds of files (a vendored-dep
+/// import, a tree-wide `cargo fmt`, a license-header sweep, or pgmcp's own
+/// 282-file "add all tools" commit) makes every pair of those files look
+/// co-changed, manufacturing phantom Jaccard coupling and "shotgun surgery"
+/// findings that reflect git mechanics, not logical coupling. 50 comfortably
+/// admits normal feature commits while dropping the bulk-commit tail. Excluded
+/// commits are removed from BOTH the pair counts and the per-file totals so the
+/// Jaccard denominator stays consistent.
+const COCHANGE_MAX_FILES_PER_COMMIT: i64 = 50;
+
 /// Find files that frequently change together in git commits (Jaccard co-change coupling).
+///
+/// Commits touching more than [`COCHANGE_MAX_FILES_PER_COMMIT`] files are
+/// ignored — see that constant for the rationale (bulk commits are not evidence
+/// of logical coupling).
 pub async fn find_coupled_files(
     pool: &PgPool,
     project: &str,
@@ -625,12 +640,22 @@ pub async fn find_coupled_files(
     min_commits: i32,
 ) -> Result<Vec<CoupledFilePair>, sqlx::Error> {
     sqlx::query_as::<_, CoupledFilePair>(
-        "WITH file_commits AS (
-            SELECT gcf.file_path, gcf.commit_id
+        "WITH commit_sizes AS (
+            SELECT gcf.commit_id, COUNT(*) AS files_in_commit
             FROM git_commit_files gcf
             JOIN git_commits gc ON gc.id = gcf.commit_id
             JOIN projects p ON p.id = gc.project_id
             WHERE p.name = $1
+            GROUP BY gcf.commit_id
+        ),
+        file_commits AS (
+            SELECT gcf.file_path, gcf.commit_id
+            FROM git_commit_files gcf
+            JOIN git_commits gc ON gc.id = gcf.commit_id
+            JOIN projects p ON p.id = gc.project_id
+            JOIN commit_sizes cs ON cs.commit_id = gcf.commit_id
+            WHERE p.name = $1
+              AND cs.files_in_commit <= $4
         ),
         pair_counts AS (
             SELECT a.file_path AS file_a, b.file_path AS file_b,
@@ -657,6 +682,7 @@ pub async fn find_coupled_files(
     .bind(project)
     .bind(min_coupling)
     .bind(min_commits)
+    .bind(COCHANGE_MAX_FILES_PER_COMMIT)
     .fetch_all(pool)
     .await
 }

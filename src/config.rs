@@ -1685,6 +1685,13 @@ fn default_exclude_patterns() -> Vec<String> {
         "*.glob".into(),         // Coq globals dump
         "*.agdai".into(),        // Agda interface files
         ".tlaplus-cache".into(), // TLA+ Toolbox cache
+        // cargo-fuzz corpora/artifacts: intentionally-malformed inputs (e.g.
+        // `latex-parser/fuzz/corpus/parse_no_panic/broken.tex`) that are pure
+        // indexing noise and guarantee extraction failures. Matched as a
+        // substring, so `fuzz/corpus` is surgical — it does NOT exclude a
+        // legitimate `tests/corpus/` (e.g. the rholang-parser semantics corpus).
+        "fuzz/corpus".into(),
+        "fuzz/artifacts".into(),
         // macOS / Windows filesystem detritus. `__MACOSX` catches both the
         // top-level `__MACOSX/` directories that unzip from macOS-created
         // archives (and contain AppleDouble `._<name>` siblings) and any
@@ -2778,13 +2785,23 @@ impl Config {
             None => Self::default_config_path(),
         };
 
-        if !config_path.exists() {
-            return Ok(Config::default());
+        let mut config = if !config_path.exists() {
+            Config::default()
+        } else {
+            let content = std::fs::read_to_string(&config_path)
+                .map_err(|e| PgmcpError::file_io(&config_path, e))?;
+            toml::from_str(&content)?
+        };
+        // The tracker trust-boundary credential. Prefer an env var over the
+        // config file: a config file may be committed to git, and pgmcp INDEXES
+        // toml config files into the searchable `file_chunks` corpus, so a token
+        // written there is retrievable via grep / semantic_search. The env
+        // override keeps the secret off disk and wins over file config.
+        if let Ok(token) = std::env::var("PGMCP_TRACKER_USER_TOKEN")
+            && !token.is_empty()
+        {
+            config.tracker.user_token = Some(token);
         }
-
-        let content = std::fs::read_to_string(&config_path)
-            .map_err(|e| PgmcpError::file_io(&config_path, e))?;
-        let config: Config = toml::from_str(&content)?;
         Ok(config)
     }
 
@@ -3156,6 +3173,42 @@ mod tests {
     fn test_default_config_parses() {
         let toml_str = Config::default_toml();
         let _config: Config = toml::from_str(&toml_str).expect("Default config should parse");
+    }
+
+    #[test]
+    fn tracker_user_token_env_override_wins_and_is_off_by_default() {
+        // The PGMCP_TRACKER_USER_TOKEN override keeps the trust-boundary secret
+        // off disk (config files are indexed into the searchable corpus). nextest
+        // runs each test in its own process, so this env mutation is isolated.
+        // Use a non-existent config path so `load` starts from Config::default()
+        // (user_token = None) and then applies the env override deterministically.
+        let missing = Path::new("/nonexistent/pgmcp/config-does-not-exist.toml");
+
+        // SAFETY: single-threaded test process (nextest), env restored below.
+        unsafe { std::env::remove_var("PGMCP_TRACKER_USER_TOKEN") };
+        let cfg = Config::load(Some(missing)).expect("load with missing path → defaults");
+        assert_eq!(
+            cfg.tracker.user_token, None,
+            "no env, no file → token must stay unset (fail-closed)"
+        );
+
+        unsafe { std::env::set_var("PGMCP_TRACKER_USER_TOKEN", "s3cret-from-env") };
+        let cfg = Config::load(Some(missing)).expect("load with env override");
+        assert_eq!(
+            cfg.tracker.user_token.as_deref(),
+            Some("s3cret-from-env"),
+            "env var must populate the tracker token"
+        );
+
+        // Empty env value must NOT set a token (treated as absent).
+        unsafe { std::env::set_var("PGMCP_TRACKER_USER_TOKEN", "") };
+        let cfg = Config::load(Some(missing)).expect("load with empty env");
+        assert_eq!(
+            cfg.tracker.user_token, None,
+            "empty env value must be treated as unset, not an empty token"
+        );
+
+        unsafe { std::env::remove_var("PGMCP_TRACKER_USER_TOKEN") };
     }
 
     #[test]
