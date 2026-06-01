@@ -15,6 +15,7 @@
 //! trie-accelerator submodules.
 
 pub mod classify;
+pub mod cluster;
 pub mod edge;
 pub mod facet;
 

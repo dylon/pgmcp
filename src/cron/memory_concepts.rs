@@ -46,6 +46,10 @@ pub async fn run_memory_concepts(
     )
     .await?;
     let mut emitted = 0u64;
+    // Phase 2: one observation per concept (batched) so the embedding-migration
+    // cron embeds it → the concept is vector-searchable via the `observation`
+    // matview arm. Deduped by content-sha, so re-runs add nothing new.
+    let mut concept_obs: Vec<queries::AddObservationInput> = Vec::with_capacity(topics.len());
     for (topic_id, label) in &topics {
         let (entity_id, created) =
             queries::memory_upsert_auto_entity(pool, label, "concept").await?;
@@ -76,6 +80,15 @@ pub async fn run_memory_concepts(
         {
             warn!(error = %e, entity_id, "ontology concept meta upsert failed");
         }
+        concept_obs.push(queries::AddObservationInput {
+            entity_name: label.clone(),
+            contents: vec![format!("{label} — code concept")],
+        });
+    }
+    if !concept_obs.is_empty()
+        && let Err(e) = queries::memory_add_observations(pool, &concept_obs, "auto_index").await
+    {
+        warn!(error = %e, "concept observation batch insert failed");
     }
     stats
         .memory_concepts_emitted
