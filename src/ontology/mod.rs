@@ -18,6 +18,7 @@ pub mod classify;
 pub mod cluster;
 pub mod edge;
 pub mod facet;
+pub mod mine;
 
 #[allow(unused_imports)] // re-exports consumed by queries/tools/crons in later phases
 pub use edge::{EvidenceKind, OntologyRelation};

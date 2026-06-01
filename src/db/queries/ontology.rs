@@ -16,6 +16,7 @@
 use serde::Serialize;
 use sqlx::PgPool;
 
+use crate::ontology::edge::EvidenceKind;
 use crate::ontology::facet::{ConceptStatus, Facet};
 use crate::tracker::transition::Actor;
 
@@ -199,4 +200,79 @@ pub async fn invariants_for_file(
     .bind(file_id)
     .fetch_all(pool)
     .await
+}
+
+/// Upsert an **invariant** concept's metadata (facet pinned to `invariant`, with
+/// constraint + rationale). Curation-safe: on conflict it refreshes the
+/// constraint/rationale only while the concept is still a `candidate`, so a
+/// human-curated invariant is never overwritten by a re-mine.
+pub async fn upsert_invariant_meta(
+    pool: &PgPool,
+    entity_id: i64,
+    constraint_text: &str,
+    rationale: &str,
+    build_method: &str,
+    project_id: Option<i32>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO ontology_concept_meta
+            (entity_id, facet, constraint_text, rationale, build_method, project_id)
+         VALUES ($1, 'invariant', $2, $3, $4, $5)
+         ON CONFLICT (entity_id) DO UPDATE
+            SET facet = 'invariant',
+                constraint_text = EXCLUDED.constraint_text,
+                rationale = EXCLUDED.rationale,
+                build_method = EXCLUDED.build_method,
+                project_id = COALESCE(ontology_concept_meta.project_id, EXCLUDED.project_id),
+                updated_at = now()
+          WHERE ontology_concept_meta.status = 'candidate'",
+    )
+    .bind(entity_id)
+    .bind(constraint_text)
+    .bind(rationale)
+    .bind(build_method)
+    .bind(project_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Insert an evidence pointer for a concept, idempotent on `provenance_key`
+/// (so re-mines add nothing new). Returns `true` if a new row was inserted.
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_concept_evidence(
+    pool: &PgPool,
+    entity_id: i64,
+    kind: EvidenceKind,
+    commit_id: Option<i64>,
+    file_id: Option<i64>,
+    mandate_ref: Option<&str>,
+    detail: Option<&str>,
+    provenance_key: &str,
+) -> Result<bool, sqlx::Error> {
+    let inserted: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO ontology_concept_evidence
+            (entity_id, evidence_kind, commit_id, file_id, mandate_ref, detail, provenance_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         ON CONFLICT (provenance_key) DO NOTHING
+         RETURNING id",
+    )
+    .bind(entity_id)
+    .bind(kind.as_str())
+    .bind(commit_id)
+    .bind(file_id)
+    .bind(mandate_ref)
+    .bind(detail)
+    .bind(provenance_key)
+    .fetch_optional(pool)
+    .await?;
+    Ok(inserted.is_some())
+}
+
+/// Count evidence rows for a concept (test/introspection helper).
+pub async fn count_concept_evidence(pool: &PgPool, entity_id: i64) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM ontology_concept_evidence WHERE entity_id = $1")
+        .bind(entity_id)
+        .fetch_one(pool)
+        .await
 }
