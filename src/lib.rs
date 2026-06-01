@@ -53,6 +53,7 @@ pub mod mcp;
 pub mod mmap_array;
 #[allow(dead_code)]
 pub mod neural;
+pub mod ontology;
 pub mod parsing;
 pub mod patterns;
 pub mod quality;

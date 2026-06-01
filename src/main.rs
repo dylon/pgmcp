@@ -47,6 +47,7 @@ mod mcp;
 mod mmap_array;
 #[allow(dead_code)]
 mod neural;
+mod ontology;
 mod parsing;
 mod patterns;
 mod quality;

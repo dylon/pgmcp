@@ -33,6 +33,7 @@ mod v19_data_tables;
 mod v20_unresolved_ref_index;
 mod v21_sync_ops;
 mod v22_concurrency_findings;
+mod v23_ontology;
 mod v2_shadow_asr;
 mod v3_cross_language_signatures;
 mod v4_work_items;
@@ -2357,6 +2358,14 @@ pub async fn run_migrations(
         v22_concurrency_findings::CONCURRENCY_FINDINGS_V1,
         v22_concurrency_findings::CONCURRENCY_FINDINGS_V1_NAME,
         || v22_concurrency_findings::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v23_ontology::ONTOLOGY_V1,
+        v23_ontology::ONTOLOGY_V1_NAME,
+        || v23_ontology::apply(pool),
     )
     .await?;
 
