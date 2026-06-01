@@ -37,6 +37,7 @@ pub mod rholang;
 pub mod rust;
 pub mod scala;
 pub mod symbols;
+pub mod sync_ops;
 pub mod tlaplus;
 pub mod type_tags;
 

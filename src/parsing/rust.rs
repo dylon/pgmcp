@@ -23,6 +23,8 @@ use syn::{
 mod helpers;
 #[path = "rust/dataflow.rs"]
 pub mod rust_dataflow;
+#[path = "rust/sync_ops.rs"]
+pub mod rust_sync_ops;
 #[path = "rust/type_mapper.rs"]
 mod type_mapper;
 use helpers::*;
@@ -118,6 +120,10 @@ impl LanguageBackend for RustBackend {
 
     fn extract_dataflow(&self, content: &str) -> Vec<crate::parsing::dataflow::FunctionDataflow> {
         rust_dataflow::extract(content)
+    }
+
+    fn extract_sync_ops(&self, content: &str) -> Vec<crate::parsing::sync_ops::FunctionSyncOps> {
+        rust_sync_ops::extract(content)
     }
 }
 

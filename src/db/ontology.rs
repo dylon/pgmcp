@@ -172,6 +172,21 @@ pub const NODE_TYPES: &[NodeTypeMeta] = &[
         source_table: "type_tag_catalog",
         has_embedding: false,
     },
+    // ADR-011 — concurrency resources as graph nodes (derived from `sync_ops`),
+    // reached via `acquires` / `sends_on` / `lock_order` edges. No embedding —
+    // categorical hubs, graph-traversable but not vector-seeded.
+    NodeTypeMeta {
+        key: "lock_resource",
+        display: "Lock Resource (concurrency)",
+        source_table: "sync_ops",
+        has_embedding: false,
+    },
+    NodeTypeMeta {
+        key: "channel",
+        display: "Channel (concurrency)",
+        source_table: "sync_ops",
+        has_embedding: false,
+    },
 ];
 
 /// CLOSED structural edge-type core: the edge_type *literals* emitted by
@@ -280,6 +295,24 @@ pub const EDGE_TYPES_CORE: &[EdgeTypeMeta] = &[
     EdgeTypeMeta {
         key: "has_type",
         display: "Has Type (symbol→type_tag)",
+        directed: true,
+    },
+    // ADR-011 — concurrency structure. `acquires` / `sends_on` are timeless
+    // (static); `lock_order` is bitemporal (valid_from/valid_to from the
+    // cron-materialized lock_order_edges) so it is `as_of`-queryable.
+    EdgeTypeMeta {
+        key: "acquires",
+        display: "Acquires (symbol→lock_resource)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "sends_on",
+        display: "Sends On (symbol→channel)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "lock_order",
+        display: "Lock Order (lock_resource→lock_resource, bitemporal)",
         directed: true,
     },
 ];

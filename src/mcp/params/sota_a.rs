@@ -249,6 +249,76 @@ pub struct DeadlockCandidatesParams {
     pub project: String,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeadlockCyclesParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Max call hops for interprocedural lock inlining (default 5, clamp 1..12)"
+    )]
+    pub max_call_depth: Option<u32>,
+    #[schemars(
+        description = "Drop lock-order edges below this resource-key confidence (default 0.3)"
+    )]
+    pub confidence_floor: Option<f32>,
+    #[schemars(description = "Max simple-cycle length to enumerate (default 6, clamp 2..12)")]
+    pub max_cycle_len: Option<u32>,
+    #[schemars(description = "Include all-read (non-deadlocking) rwlock cycles (default false)")]
+    pub include_low_confidence: Option<bool>,
+    #[schemars(description = "Max cycles to return (default 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LockOrderGraphParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max call hops for interprocedural lock inlining (default 5)")]
+    pub max_call_depth: Option<u32>,
+    #[schemars(description = "Drop edges below this resource-key confidence (default 0.3)")]
+    pub confidence_floor: Option<f32>,
+    #[schemars(description = "Restrict to the in/out neighborhood of this lock resource_key")]
+    pub resource_key: Option<String>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SyncSkeletonParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Symbol id to inspect (preferred)")]
+    pub symbol_id: Option<i64>,
+    #[schemars(description = "File relative-path (with `name`, resolves a symbol id)")]
+    pub file: Option<String>,
+    #[schemars(description = "Symbol name (with `file`, resolves a symbol id)")]
+    pub name: Option<String>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ChannelDeadlockParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max findings to return (default 50)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConcurrencyBottlenecksParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(description = "Max rows per metric (default 20, clamp 1..200)")]
+    pub top: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConcurrencyForecastParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Metric: deadlock_cycle_count | channel_cycle_count | blocked_recv_count | max_lock_contention (default deadlock_cycle_count)"
+    )]
+    pub metric: Option<String>,
+    #[schemars(description = "History window in days (default 90)")]
+    pub days: Option<i32>,
+    #[schemars(
+        description = "Threshold to forecast crossing of (default 5; 10 for max_lock_contention)"
+    )]
+    pub threshold: Option<f64>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SendSyncViolationsParams {
     #[schemars(description = "Project name (required)")]
     pub project: String,

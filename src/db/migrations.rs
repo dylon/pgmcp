@@ -31,6 +31,8 @@ mod v17_git_links;
 mod v18_digest_emissions;
 mod v19_data_tables;
 mod v20_unresolved_ref_index;
+mod v21_sync_ops;
+mod v22_concurrency_findings;
 mod v2_shadow_asr;
 mod v3_cross_language_signatures;
 mod v4_work_items;
@@ -2342,6 +2344,22 @@ pub async fn run_migrations(
     )
     .await?;
 
+    apply_step(
+        pool,
+        v21_sync_ops::SYNC_OPS_V1,
+        v21_sync_ops::SYNC_OPS_V1_NAME,
+        || v21_sync_ops::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v22_concurrency_findings::CONCURRENCY_FINDINGS_V1,
+        v22_concurrency_findings::CONCURRENCY_FINDINGS_V1_NAME,
+        || v22_concurrency_findings::apply(pool),
+    )
+    .await?;
+
     // Build/refresh the work_items HNSW index (unconditional; the table exists
     // after the v4 step on fresh installs and already exists on upgrades).
     ensure_work_items_hnsw_index(pool, vector_config).await?;
@@ -2478,7 +2496,23 @@ pub(crate) const MEMORY_UNIFIED_NODES_SQL: &str = "CREATE MATERIALIZED VIEW memo
     -- reached via `has_type` edges from symbols' parameter / return tags.
     SELECT 'type_tag:' || name, 'type_tag',
            name, NULL::VECTOR(1024), 0.3
-      FROM type_tag_catalog";
+      FROM type_tag_catalog
+    UNION ALL
+    -- lock_resource nodes (ADR-011, concurrency): distinct lock resource_keys
+    -- from the sync_ops skeleton. Categorical hubs reached via `acquires` /
+    -- `lock_order` edges; no embedding.
+    SELECT DISTINCT 'lock_resource:' || resource_key, 'lock_resource',
+           resource_key, NULL::VECTOR(1024), 0.4
+      FROM sync_ops
+      WHERE resource_kind IN ('mutex', 'rwlock', 'condvar', 'semaphore', 'once')
+        AND resource_key IS NOT NULL
+    UNION ALL
+    -- channel nodes (ADR-011): distinct message-channel resource_keys, reached
+    -- via `sends_on` edges.
+    SELECT DISTINCT 'channel:' || resource_key, 'channel',
+           resource_key, NULL::VECTOR(1024), 0.3
+      FROM sync_ops
+      WHERE resource_kind = 'channel' AND resource_key IS NOT NULL";
 
 /// Edges-view definition. Same single-source-of-truth posture as
 /// `MEMORY_UNIFIED_NODES_SQL` — F9's hash-gate covers both.
@@ -2635,6 +2669,34 @@ pub(crate) const MEMORY_UNIFIED_EDGES_SQL: &str = "CREATE MATERIALIZED VIEW memo
       WHERE s.visibility = 'public'
          OR EXISTS (SELECT 1 FROM memory_code_anchor m WHERE m.symbol_id = s.id)
          OR EXISTS (SELECT 1 FROM work_item_code_anchor w WHERE w.symbol_id = s.id)
+    UNION ALL
+    -- symbol → lock_resource: `acquires` (ADR-011). Timeless (static analysis).
+    SELECT 'symbol:' || so.symbol_id::TEXT, 'symbol',
+           'lock_resource:' || so.resource_key, 'lock_resource',
+           'acquires', so.resource_confidence::DOUBLE PRECISION,
+           NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
+      FROM sync_ops so
+      WHERE so.op_kind IN ('acquire', 'acquire_read', 'acquire_write')
+        AND so.resource_key IS NOT NULL
+    UNION ALL
+    -- symbol → channel: `sends_on` (ADR-011).
+    SELECT 'symbol:' || so.symbol_id::TEXT, 'symbol',
+           'channel:' || so.resource_key, 'channel',
+           'sends_on', so.resource_confidence::DOUBLE PRECISION,
+           NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
+      FROM sync_ops so
+      WHERE so.op_kind IN ('send', 'send_persistent')
+        AND so.resource_kind = 'channel' AND so.resource_key IS NOT NULL
+    UNION ALL
+    -- lock_resource → lock_resource: the BITEMPORAL `lock_order` edge (ADR-011),
+    -- materialized by the concurrency-scan cron. `valid_from`/`valid_to` give
+    -- each edge's analysis-history validity → `as_of`-queryable; a cycle that
+    -- reappears after a close is a visible regression.
+    SELECT 'lock_resource:' || from_key, 'lock_resource',
+           'lock_resource:' || to_key, 'lock_resource',
+           'lock_order', min_confidence::DOUBLE PRECISION,
+           valid_from, valid_to
+      FROM lock_order_edges
     UNION ALL
     -- file ↔ file: import / co_change / call (passthrough edge_type)
     SELECT 'file:' || source_file_id::TEXT, 'file',

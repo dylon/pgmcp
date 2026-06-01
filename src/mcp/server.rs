@@ -772,6 +772,16 @@ impl McpServer {
                 "unsafe_clusters"        => unsafe_clusters(UnsafeClustersParams),
                 "panic_paths"            => panic_paths(PanicPathsParams),
                 "deadlock_candidates"    => deadlock_candidates(DeadlockCandidatesParams),
+                // Shadow-ASR interprocedural concurrency (ADR-011): registered in
+                // `router_concurrency` for the MCP transport; these entries give the
+                // CLI / `call_tool_cli` path the same reach (and the coverage gate
+                // its hook). `tool_concurrency_deadlock.rs` exercises them.
+                "deadlock_cycles"        => deadlock_cycles(DeadlockCyclesParams),
+                "channel_deadlock"       => channel_deadlock(ChannelDeadlockParams),
+                "lock_order_graph"       => lock_order_graph(LockOrderGraphParams),
+                "sync_skeleton"          => sync_skeleton(SyncSkeletonParams),
+                "concurrency_bottlenecks" => concurrency_bottlenecks(ConcurrencyBottlenecksParams),
+                "concurrency_forecast"   => concurrency_forecast(ConcurrencyForecastParams),
                 "send_sync_violations"   => send_sync_violations(SendSyncViolationsParams),
                 "quadratic_loops"        => quadratic_loops(QuadraticLoopsParams),
                 "missing_preallocation"  => missing_preallocation(MissingPreallocationParams),

@@ -27,6 +27,7 @@ pub mod api;
 pub mod cli;
 #[allow(dead_code)]
 pub mod code_analysis;
+pub mod concurrency;
 pub mod config;
 pub mod context;
 pub mod cron;

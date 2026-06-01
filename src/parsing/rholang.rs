@@ -42,6 +42,9 @@ use crate::parsing::function_metrics::{
     CognitiveIncrement, CognitiveKind, FunctionMetrics, ScoringInput,
 };
 use crate::parsing::symbols::{Import, Symbol, SymbolKind, SymbolRefKind, SymbolReference};
+use crate::parsing::sync_ops::{
+    FunctionSyncOps, ResourceConfidence, ResourceKind, SyncOp, SyncOpKind, SyncParadigm,
+};
 
 pub static RHOLANG_BACKEND: RholangBackend = RholangBackend;
 pub struct RholangBackend;
@@ -474,6 +477,97 @@ fn walk_rholang_proc(
     let _ = entered_nest;
 }
 
+/// Push one message-passing sync op. Rholang has no shared-memory locks, so
+/// every op is `paradigm = Message` on a `Channel`; identity comes from
+/// `channel_target` / `bind_source_target` (confidence `ChannelName` when a
+/// name resolved, else `Unknown`).
+fn push_msg_op(
+    ops: &mut Vec<SyncOp>,
+    seq: &mut u32,
+    kind: SyncOpKind,
+    key: Option<String>,
+    depth: u32,
+    line: u32,
+) {
+    let conf = if key.is_some() {
+        ResourceConfidence::ChannelName.value()
+    } else {
+        ResourceConfidence::Unknown.value()
+    };
+    ops.push(SyncOp {
+        seq: *seq,
+        op_kind: kind,
+        resource_kind: ResourceKind::Channel,
+        paradigm: SyncParadigm::Message,
+        resource_key: key,
+        resource_confidence: conf,
+        nesting_depth: depth,
+        guard_id: None,
+        line,
+    });
+    *seq += 1;
+}
+
+/// Ordered DFS over a contract body, emitting channel send/recv sync ops in
+/// source order. Does not descend into nested `contract` / `name_decl` nodes —
+/// those are separate symbols with their own skeletons. `par` (`|`) composition
+/// and `eval` (`*x`) are intentionally NOT recorded as ops in v1: the
+/// channel-deadlock analysis is driven by send/recv matching, and treating
+/// ubiquitous par-composition as an explicit spawn op would flood the net.
+fn walk_sync(
+    node: Node<'_>,
+    src: &str,
+    depth: u32,
+    seq: &mut u32,
+    ops: &mut Vec<SyncOp>,
+    is_root: bool,
+) {
+    if !is_root && matches!(node.kind(), "contract" | "name_decl") {
+        return;
+    }
+    match node.kind() {
+        "send" => {
+            let key = channel_target(node, src).filter(|s| !s.is_empty());
+            let kind = match node.child_by_field_name("send_type").map(|n| n.kind()) {
+                Some("send_multiple") => SyncOpKind::SendPersistent,
+                _ => SyncOpKind::Send,
+            };
+            push_msg_op(ops, seq, kind, key, depth, line_of(node));
+        }
+        "send_sync" => {
+            let key = channel_target(node, src).filter(|s| !s.is_empty());
+            push_msg_op(ops, seq, SyncOpKind::Send, key, depth, line_of(node));
+        }
+        "linear_bind" | "repeated_bind" | "peek_bind" => {
+            let key = node
+                .child_by_field_name("input")
+                .map(|i| bind_source_target(i, src))
+                .filter(|s| !s.is_empty());
+            let kind = if node.kind() == "repeated_bind" {
+                SyncOpKind::RecvPersistent
+            } else {
+                // linear and peek both consume-or-read a single message; v1
+                // models peek as a (non-persistent) receive.
+                SyncOpKind::Recv
+            };
+            push_msg_op(ops, seq, kind, key, depth, line_of(node));
+        }
+        _ => {}
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        walk_sync(child, src, depth + 1, seq, ops, false);
+    }
+}
+
+/// Build the ordered synchronization skeleton for one Rholang contract body.
+fn sync_ops_for_body(body: Node<'_>, src: &str) -> Vec<SyncOp> {
+    let mut ops = Vec::new();
+    let mut seq = 0u32;
+    walk_sync(body, src, 0, &mut seq, &mut ops, true);
+    ops
+}
+
 impl LanguageBackend for RholangBackend {
     fn language_name(&self) -> &'static str {
         "rholang"
@@ -787,6 +881,45 @@ impl LanguageBackend for RholangBackend {
         }
         out
     }
+
+    fn extract_sync_ops(&self, content: &str) -> Vec<FunctionSyncOps> {
+        let Some(tree) = parse(content) else {
+            return Vec::new();
+        };
+        let mut out: Vec<FunctionSyncOps> = Vec::new();
+        let q = symbol_query();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(q, tree.root_node(), content.as_bytes());
+        while let Some(m) = matches.next() {
+            // Only contracts carry a function-like body; `let`/channel decls are
+            // keyed elsewhere. Mirrors `extract_function_metrics`.
+            let Some(cap) = m
+                .captures
+                .iter()
+                .find(|c| q.capture_names()[c.index as usize] == "contract.def")
+            else {
+                continue;
+            };
+            let node = cap.node;
+            let Some(name) = contract_name(node, content) else {
+                continue;
+            };
+            if name.is_empty() {
+                continue;
+            }
+            let body = node.child_by_field_name("proc").unwrap_or(node);
+            let ops = sync_ops_for_body(body, content);
+            if !ops.is_empty() {
+                out.push(FunctionSyncOps {
+                    function: name,
+                    start_line: line_of(node),
+                    end_line: end_line_of(node),
+                    ops,
+                });
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]
@@ -802,6 +935,33 @@ helloworld!(\"world\")\n  \
 |\n  \
 helloworld!(\"world2\")\n\
 }\n";
+
+    #[test]
+    fn extract_sync_ops_records_send_and_recv() {
+        let src = "new chan, ack in {\n  \
+                   contract worker(@job) = {\n    \
+                     for(@msg <- chan) {\n      \
+                       ack!(msg)\n    \
+                     }\n  \
+                   }\n\
+                   }\n";
+        let fns = RholangBackend.extract_sync_ops(src);
+        let ops: Vec<SyncOp> = fns.into_iter().flat_map(|f| f.ops).collect();
+        assert!(
+            ops.iter().any(|o| o.op_kind == SyncOpKind::Recv
+                && o.resource_key.as_deref() == Some("chan")),
+            "expected a linear recv on `chan`: {ops:?}"
+        );
+        assert!(
+            ops.iter()
+                .any(|o| o.op_kind == SyncOpKind::Send && o.resource_key.as_deref() == Some("ack")),
+            "expected a send on `ack`: {ops:?}"
+        );
+        assert!(
+            ops.iter().all(|o| o.paradigm == SyncParadigm::Message),
+            "Rholang ops are all message-passing"
+        );
+    }
 
     #[test]
     fn extract_symbols_finds_contract() {

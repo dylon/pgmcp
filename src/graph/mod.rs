@@ -6,8 +6,10 @@ pub mod connectivity;
 pub mod dsm;
 pub mod import_extractor;
 pub mod info_theory;
+pub mod lock_order;
 pub mod metrics;
 pub mod pathrank;
+pub mod petri;
 #[allow(dead_code)]
 pub mod ports;
 pub mod spectral;

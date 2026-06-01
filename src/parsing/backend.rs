@@ -50,4 +50,18 @@ pub trait LanguageBackend: Send + Sync {
     fn extract_dataflow(&self, _content: &str) -> Vec<FunctionDataflow> {
         Vec::new()
     }
+
+    /// Extract the ordered intra-function synchronization skeleton (lock
+    /// acquire/release, channel send/recv, spawn/await/select) for static
+    /// deadlock + bottleneck analysis (`sync_ops`, migration `v21_sync_ops`).
+    /// Returned `FunctionSyncOps` use the `(function, start_line)` identity the
+    /// symbol-extraction cron keys to `file_symbols`.
+    ///
+    /// Default returns `Vec::new()` so backends roll out incrementally (exactly
+    /// like `extract_dataflow`); a language with no sync-op pass keeps only its
+    /// coarse `symbol_effects` membership and the analyzers' regex fallback.
+    /// Rust + Rholang ship in v1.
+    fn extract_sync_ops(&self, _content: &str) -> Vec<super::sync_ops::FunctionSyncOps> {
+        Vec::new()
+    }
 }

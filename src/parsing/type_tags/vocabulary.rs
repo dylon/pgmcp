@@ -218,6 +218,18 @@ define_vocabulary! {
     EFFECT_HTTP_HANDLER = ("http_handler", "Handles an HTTP request (route handler).",                   TagOrigin::Universal);
     EFFECT_AUTH_REQUIRED = ("auth_required", "Requires authenticated/authorized caller.",                TagOrigin::Universal);
 
+    // ── Concurrency (coarse membership mirror of the ordered `sync_ops`
+    //    skeleton, v21). `sync_ops` carries the ordered detail + resource
+    //    identity; these effects give per-symbol "does it touch locks/spawn/
+    //    await at all" membership for `symbol_effects`, the effect-drift ledger,
+    //    and search facets. Folded into `Symbol.effects` by the symbol-extraction
+    //    cron from `extract_sync_ops`. ────────────────────────────────
+    EFFECT_LOCK_ACQUIRE  = ("lock_acquire",  "Acquires a mutex / rwlock / lock guard.",                    TagOrigin::Universal);
+    EFFECT_LOCK_RELEASE  = ("lock_release",  "Releases a lock guard (explicit or scope-end).",             TagOrigin::Universal);
+    EFFECT_THREAD_SPAWN  = ("thread_spawn",  "Spawns an OS thread / async task (thread::spawn, tokio::spawn).", TagOrigin::Universal);
+    EFFECT_AWAIT_POINT   = ("await_point",   "Contains an await suspension point.",                        TagOrigin::Universal);
+    EFFECT_CHANNEL_SELECT = ("channel_select", "Non-deterministic channel choice (select! / tokio::select!).", TagOrigin::Universal);
+
     // ── Rholang-specific effects ────────────────────────────────────
     EFFECT_CHANNEL_SEND               = ("channel_send",               "Sends on a channel (`!`).",                     TagOrigin::Language("rholang"));
     EFFECT_CHANNEL_SEND_PERSISTENT    = ("channel_send_persistent",    "Persistent send on a channel (`!!`).",          TagOrigin::Language("rholang"));

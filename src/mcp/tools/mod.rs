@@ -170,14 +170,20 @@ pub mod tool_test_smells;
 
 // SOTA Phase 5 — concurrency / safety / performance
 pub mod tool_blocking_in_async;
+pub mod tool_channel_deadlock;
 pub mod tool_clone_density;
+pub mod tool_concurrency_bottlenecks;
+pub mod tool_concurrency_forecast;
 pub mod tool_deadlock_candidates;
+pub mod tool_deadlock_cycles;
 pub mod tool_io_hotpath;
+pub mod tool_lock_order_graph;
 pub mod tool_lockset_races;
 pub mod tool_missing_preallocation;
 pub mod tool_panic_paths;
 pub mod tool_quadratic_loops;
 pub mod tool_send_sync_violations;
+pub mod tool_sync_skeleton;
 pub mod tool_unsafe_clusters;
 
 // SOTA Phase 6 — security

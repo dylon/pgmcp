@@ -37,6 +37,132 @@ impl McpServer {
         .await
     }
     #[tool(
+        description = "Interprocedural lock-order deadlock cycles with lock identity from the \
+            sync_ops skeleton: per-symbol held-set + callee-lock inlining across the resolved \
+            call graph (RacerD-style), SCC cycles with witnessing call sites + severity. \
+            Supersedes the shallow intra-function deadlock_candidates; TLA+/Rocq-backed (ADR-011)."
+    )]
+    async fn deadlock_cycles(
+        &self,
+        Parameters(params): Parameters<DeadlockCyclesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "deadlock_cycles",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_deadlock_cycles::tool_deadlock_cycles(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Inspect the interprocedural lock-order graph (nodes = lock resources, \
+            edges = \"B acquired while A held\", cyclic SCCs); optional resource_key neighborhood."
+    )]
+    async fn lock_order_graph(
+        &self,
+        Parameters(params): Parameters<LockOrderGraphParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "lock_order_graph",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_lock_order_graph::tool_lock_order_graph(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Inspect one symbol's ordered synchronization skeleton (sync_ops) with a \
+            per-op held-set annotation (drill-down for a reported lock cycle)."
+    )]
+    async fn sync_skeleton(
+        &self,
+        Parameters(params): Parameters<SyncSkeletonParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "sync_skeleton",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_sync_skeleton::tool_sync_skeleton(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Message-passing (channel) deadlock signals over the sync_ops skeleton: \
+            blocked_recv (linear receive with no producer), orphan_send (send never received), \
+            channel_cycle (processes mutually blocked on each other's sends). Petri-net \
+            structural analysis; TLA+/Rocq-backed (ADR-011)."
+    )]
+    async fn channel_deadlock(
+        &self,
+        Parameters(params): Parameters<ChannelDeadlockParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "channel_deadlock",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_channel_deadlock::tool_channel_deadlock(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Concurrency choke-point ranking over sync_ops, weighted by file pagerank: \
+            lock contention (one lock acquired by many symbols), channel imbalance (send/recv \
+            skew), spawn fan-out, and async stalls (await + blocking I/O). Complements io_hotpath."
+    )]
+    async fn concurrency_bottlenecks(
+        &self,
+        Parameters(params): Parameters<ConcurrencyBottlenecksParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "concurrency_bottlenecks",
+            60,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_concurrency_bottlenecks::tool_concurrency_bottlenecks(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+    #[tool(
+        description = "Forecast a concurrency-health metric (deadlock_cycle_count / \
+            max_lock_contention / …) over concurrency_health_history via OLS: current value, \
+            slope/day, % change, and weeks-to-threshold ETA. Mirrors quality_forecast (ADR-011)."
+    )]
+    async fn concurrency_forecast(
+        &self,
+        Parameters(params): Parameters<ConcurrencyForecastParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "concurrency_forecast",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_concurrency_forecast::tool_concurrency_forecast(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+    #[tool(
         description = "Rust Send/Sync violation candidates: Arc<RefCell>, static mut, unsafe Send/Sync impls."
     )]
     async fn send_sync_violations(

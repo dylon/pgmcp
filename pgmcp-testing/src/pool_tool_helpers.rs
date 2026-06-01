@@ -75,3 +75,107 @@ pub async fn seed_file(pool: &sqlx::PgPool, project_id: i32, path: &str, rel: &s
     .await
     .expect("file")
 }
+
+/// Seed a `file_symbols` row, returning its id. `visibility` is e.g.
+/// `Some("public")` to exercise the public-API-reachable severity bump in the
+/// lock-order analysis; `None` leaves it NULL. `end_line` is pinned to
+/// `start_line` (the analyzers key on identity + order, not span). Idempotent on
+/// the `(file_id, kind, name, start_line)` unique key.
+pub async fn seed_file_symbol(
+    pool: &sqlx::PgPool,
+    file_id: i64,
+    name: &str,
+    kind: &str,
+    start_line: i32,
+    visibility: Option<&str>,
+) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO file_symbols (file_id, name, kind, start_line, end_line, visibility) \
+         VALUES ($1, $2, $3, $4, $4, $5) \
+         ON CONFLICT (file_id, kind, name, start_line) \
+             DO UPDATE SET visibility = EXCLUDED.visibility \
+         RETURNING id",
+    )
+    .bind(file_id)
+    .bind(name)
+    .bind(kind)
+    .bind(start_line)
+    .bind(visibility)
+    .fetch_one(pool)
+    .await
+    .expect("file_symbol")
+}
+
+/// Seed one ordered `sync_ops` row for a symbol (the synchronization skeleton
+/// the deadlock analyzers read). `op_kind` / `resource_kind` / `paradigm` are
+/// the closed-vocab DB strings (e.g. `acquire`/`mutex`/`lock`,
+/// `recv`/`channel`/`message`). `resource_confidence` is pinned to 0.9 (above
+/// the 0.3 analysis floor) so seeded edges are never dropped. Idempotent on
+/// `(symbol_id, seq)`.
+#[allow(clippy::too_many_arguments)]
+pub async fn seed_sync_ops(
+    pool: &sqlx::PgPool,
+    symbol_id: i64,
+    seq: i32,
+    op_kind: &str,
+    resource_key: &str,
+    resource_kind: &str,
+    paradigm: &str,
+    line: i32,
+) {
+    sqlx::query(
+        "INSERT INTO sync_ops \
+             (symbol_id, seq, op_kind, resource_key, resource_kind, paradigm, \
+              nesting_depth, guard_id, resource_confidence, line) \
+         VALUES ($1, $2, $3, $4, $5, $6, 0, NULL, 0.9, $7) \
+         ON CONFLICT (symbol_id, seq) DO UPDATE \
+             SET op_kind = EXCLUDED.op_kind, resource_key = EXCLUDED.resource_key, \
+                 resource_kind = EXCLUDED.resource_kind, paradigm = EXCLUDED.paradigm, \
+                 line = EXCLUDED.line",
+    )
+    .bind(symbol_id)
+    .bind(seq)
+    .bind(op_kind)
+    .bind(resource_key)
+    .bind(resource_kind)
+    .bind(paradigm)
+    .bind(line)
+    .execute(pool)
+    .await
+    .expect("sync_op");
+}
+
+/// Seed a resolved call edge (`source_symbol → target_symbol`) into
+/// `symbol_references`, the relation the lock-order analyzer reads for
+/// interprocedural lock inlining. `resolution_confidence` must be ≥ 0.5 for the
+/// inliner to follow the edge (`resolved_call_edges_for_project`'s floor).
+/// Idempotent on `(source_file_id, source_line, target_raw, ref_kind)`.
+pub async fn seed_symbol_references(
+    pool: &sqlx::PgPool,
+    source_file_id: i64,
+    source_symbol_id: i64,
+    target_symbol_id: i64,
+    target_raw: &str,
+    source_line: i32,
+    resolution_confidence: f32,
+) {
+    sqlx::query(
+        "INSERT INTO symbol_references \
+             (source_file_id, source_symbol_id, target_symbol_id, target_raw, \
+              ref_kind, source_line, resolution_confidence) \
+         VALUES ($1, $2, $3, $4, 'call', $5, $6) \
+         ON CONFLICT (source_file_id, source_line, target_raw, ref_kind) DO UPDATE \
+             SET source_symbol_id = EXCLUDED.source_symbol_id, \
+                 target_symbol_id = EXCLUDED.target_symbol_id, \
+                 resolution_confidence = EXCLUDED.resolution_confidence",
+    )
+    .bind(source_file_id)
+    .bind(source_symbol_id)
+    .bind(target_symbol_id)
+    .bind(target_raw)
+    .bind(source_line)
+    .bind(resolution_confidence)
+    .execute(pool)
+    .await
+    .expect("symbol_reference");
+}

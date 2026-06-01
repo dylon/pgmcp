@@ -21,6 +21,7 @@ mod api;
 mod cli;
 #[allow(dead_code)]
 mod code_analysis;
+mod concurrency;
 mod config;
 mod context;
 mod cron;

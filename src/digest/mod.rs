@@ -118,6 +118,8 @@ pub enum DigestCategory {
     Health,
     /// Quality trajectory (GPA slope / forecast).
     Trend,
+    /// Concurrency defects (deadlock cycles, blocked receives, lock contention).
+    Concurrency,
 }
 
 impl DigestCategory {
@@ -125,13 +127,15 @@ impl DigestCategory {
     /// by the golden test); `#[allow(dead_code)]` documents it has no non-test
     /// caller — `as_str`/`heading` are reached per-item during rendering.
     #[allow(dead_code)]
-    pub const ALL: &'static [DigestCategory] = &[Self::Tracker, Self::Health, Self::Trend];
+    pub const ALL: &'static [DigestCategory] =
+        &[Self::Tracker, Self::Health, Self::Trend, Self::Concurrency];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Tracker => "tracker",
             Self::Health => "health",
             Self::Trend => "trend",
+            Self::Concurrency => "concurrency",
         }
     }
 
@@ -141,6 +145,7 @@ impl DigestCategory {
             Self::Tracker => "Tracker",
             Self::Health => "Health",
             Self::Trend => "Trend",
+            Self::Concurrency => "Concurrency",
         }
     }
 }
@@ -367,6 +372,9 @@ pub async fn compose_digest(
     collect_health(pool, project_id, stats, &mut items).await;
     if cfg.include_trends {
         collect_trend(pool, project_id, &mut items).await;
+    }
+    if cfg.include_concurrency {
+        collect_concurrency(pool, project_id, &mut items).await;
     }
 
     Digest { items }
@@ -602,6 +610,78 @@ async fn collect_trend(pool: &PgPool, project_id: Option<i32>, out: &mut Vec<Dig
                 p.abs()
             ),
         ));
+    }
+}
+
+/// CONCURRENCY (ADR-011): open deadlock cycles / blocked receives / channel
+/// cycles + trending lock contention, per project. SELECT-only — reads
+/// `concurrency_findings` + `concurrency_health_history` (filled by the opt-in
+/// concurrency-scan cron); the digest's read-only trust boundary
+/// (`pgmcp-testing/tests/digest_trust_boundary.rs`) auto-covers it.
+async fn collect_concurrency(pool: &PgPool, project_id: Option<i32>, out: &mut Vec<DigestItem>) {
+    let Some(pid) = project_id else {
+        return; // per-project, like trend
+    };
+
+    // Recently-observed findings per kind (n total, hi = critical/high).
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT finding_kind, COUNT(*) AS n,
+                COUNT(*) FILTER (WHERE severity IN ('critical', 'high')) AS hi
+         FROM concurrency_findings
+         WHERE project_id = $1
+           AND finding_kind IN ('deadlock_cycle', 'channel_cycle', 'blocked_recv', 'lock_contention')
+           AND observed_at > now() - interval '30 days'
+         GROUP BY finding_kind",
+    )
+    .bind(pid)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default();
+
+    for (kind, n, hi) in &rows {
+        if *n == 0 {
+            continue;
+        }
+        let (sev, label) = match kind.as_str() {
+            "deadlock_cycle" => (DigestSeverity::Critical, "lock-order deadlock cycle"),
+            "channel_cycle" => (DigestSeverity::Critical, "channel deadlock cycle"),
+            "blocked_recv" => (DigestSeverity::High, "blocked receive (no producer)"),
+            "lock_contention" if *hi > 0 => (DigestSeverity::Notice, "high-contention lock"),
+            _ => continue,
+        };
+        let plural = if *n == 1 { "" } else { "s" };
+        out.push(DigestItem::new(
+            sev,
+            DigestCategory::Concurrency,
+            format!("{n} {label}{plural} (observed in the last 30d)"),
+        ));
+    }
+
+    // Deadlock-cycle-count trajectory — a rising count is the headline trend.
+    let series = crate::db::queries::concurrency_metric_series(
+        pool,
+        pid,
+        "deadlock_cycle_count",
+        TREND_WINDOW_DAYS as i32,
+    )
+    .await
+    .unwrap_or_default();
+    if series.len() >= 2 {
+        let points: Vec<(f64, f64)> = series.iter().map(|(da, v)| (-da, *v)).collect();
+        let current = series.last().map(|(_, v)| *v).unwrap_or(0.0);
+        if let Some(slope) = crate::quality::forecast::ols_slope(&points)
+            && slope > 0.0
+            && current > 0.0
+        {
+            out.push(DigestItem::new(
+                DigestSeverity::Notice,
+                DigestCategory::Concurrency,
+                format!(
+                    "deadlock-cycle count rising (~{:.1}/week, now {current:.0})",
+                    slope * 7.0
+                ),
+            ));
+        }
     }
 }
 

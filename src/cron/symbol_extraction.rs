@@ -154,6 +154,19 @@ async fn extract_project_symbols(
         );
         watermark = None;
     }
+    // One-time `sync_ops` backfill (v21): on the first run after the migration
+    // for a Rust/Rholang project, force a full re-scan so the existing corpus
+    // populates the synchronization skeleton (the steady-state incremental path
+    // would otherwise leave `sync_ops` empty until each file next changes).
+    // Flag-gated, so it fires at most once even on concurrency-free projects.
+    if watermark.is_some() && queries::sync_ops_backfill_pending(pool, project_id).await? {
+        info!(
+            project = %project_name,
+            "Symbol extraction: one-time sync_ops backfill; forcing full re-scan"
+        );
+        watermark = None;
+        queries::mark_sync_ops_backfill_done(pool, project_id).await?;
+    }
     let phase_a_start = std::time::Instant::now();
     let metas =
         queries::list_files_for_symbol_extraction(pool, project_id, BACKEND_LANGUAGES, watermark)
@@ -322,6 +335,64 @@ mod import_ref_tests {
 /// concurrently) is the cron's FK-drift mitigation.
 ///
 /// Returns `(symbols_inserted, references_inserted)` on success.
+/// Fold the coarse concurrency effects derived from the ordered `sync_ops`
+/// skeleton into each symbol's `effects`, keyed by `(name, start_line)`. Called
+/// BEFORE `bulk_insert_symbol_effects` and the effect-drift diff so the
+/// membership lands in `symbol_effects` AND the v15 drift ledger ("function X
+/// gained `lock_acquire`") with no extra code.
+fn fold_sync_effects(
+    symbols: &mut [crate::parsing::symbols::Symbol],
+    fn_sync_ops: &[crate::parsing::sync_ops::FunctionSyncOps],
+) {
+    use crate::parsing::sync_ops::SyncOpKind;
+    use crate::parsing::type_tags::vocabulary as v;
+    use std::collections::HashMap;
+    if fn_sync_ops.is_empty() {
+        return;
+    }
+    let mut idx: HashMap<(&str, u32), usize> = HashMap::with_capacity(symbols.len());
+    for (i, s) in symbols.iter().enumerate() {
+        idx.insert((s.name.as_str(), s.start_line), i);
+    }
+    let mut to_add: Vec<(usize, &'static str)> = Vec::new();
+    for f in fn_sync_ops {
+        let Some(&i) = idx.get(&(f.function.as_str(), f.start_line)) else {
+            continue;
+        };
+        let (mut acq, mut rel, mut spn, mut awt, mut sel) = (false, false, false, false, false);
+        for op in &f.ops {
+            match op.op_kind {
+                k if k.is_acquire() => acq = true,
+                SyncOpKind::Release => rel = true,
+                SyncOpKind::Spawn => spn = true,
+                SyncOpKind::Await => awt = true,
+                SyncOpKind::Select => sel = true,
+                _ => {}
+            }
+        }
+        if acq {
+            to_add.push((i, v::EFFECT_LOCK_ACQUIRE));
+        }
+        if rel {
+            to_add.push((i, v::EFFECT_LOCK_RELEASE));
+        }
+        if spn {
+            to_add.push((i, v::EFFECT_THREAD_SPAWN));
+        }
+        if awt {
+            to_add.push((i, v::EFFECT_AWAIT_POINT));
+        }
+        if sel {
+            to_add.push((i, v::EFFECT_CHANNEL_SELECT));
+        }
+    }
+    for (i, eff) in to_add {
+        if !symbols[i].effects.iter().any(|e| e == eff) {
+            symbols[i].effects.push(eff.to_string());
+        }
+    }
+}
+
 async fn extract_and_persist_file(
     pool: &PgPool,
     file_id: i64,
@@ -337,6 +408,12 @@ async fn extract_and_persist_file(
     // Run the backends outside the transaction (CPU work).
     let mut symbols = backend.extract_symbols(content);
     let mut references = backend.extract_references(content);
+    // Ordered synchronization skeleton (sync_ops, v21). Fold its coarse effects
+    // into `symbols` now — before the effect-drift snapshot/diff and
+    // `bulk_insert_symbol_effects` below — so they reach both membership and the
+    // drift ledger. The ordered rows are persisted after symbol insert.
+    let fn_sync_ops = backend.extract_sync_ops(content);
+    fold_sync_effects(&mut symbols, &fn_sync_ops);
 
     // Imports are produced by a SEPARATE backend method. Folding them into
     // `references` as `ImportUse` rows is load-bearing: without it
@@ -439,6 +516,32 @@ async fn extract_and_persist_file(
     if !nonzero_ids.is_empty() {
         queries::bulk_insert_symbol_parameters(pool, &nonzero_ids, &nonzero_syms).await?;
         queries::bulk_insert_symbol_effects(pool, &nonzero_ids, &nonzero_syms).await?;
+    }
+
+    // Persist the ordered synchronization skeleton (sync_ops, v21), keyed to the
+    // just-inserted symbol_ids by (name, start_line) — the same identity the
+    // coarse effects used. The `DELETE FROM file_symbols` at the top of the tx
+    // already cascaded away any stale ops (ON DELETE CASCADE).
+    if !fn_sync_ops.is_empty() {
+        let mut id_by_key: std::collections::HashMap<(&str, u32), i64> =
+            std::collections::HashMap::with_capacity(symbols.len());
+        for (sym, sid) in symbols.iter().zip(symbol_ids.iter()) {
+            if *sid != 0 {
+                id_by_key.insert((sym.name.as_str(), sym.start_line), *sid);
+            }
+        }
+        let mut sids: Vec<i64> = Vec::with_capacity(fn_sync_ops.len());
+        let mut fops: Vec<crate::parsing::sync_ops::FunctionSyncOps> =
+            Vec::with_capacity(fn_sync_ops.len());
+        for f in &fn_sync_ops {
+            if let Some(&sid) = id_by_key.get(&(f.function.as_str(), f.start_line)) {
+                sids.push(sid);
+                fops.push(f.clone());
+            }
+        }
+        if !sids.is_empty() {
+            queries::bulk_insert_sync_ops(pool, &sids, &fops).await?;
+        }
     }
 
     // Temporal effect-drift (v15): diff the freshly-extracted effect sets

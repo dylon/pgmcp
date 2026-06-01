@@ -70,6 +70,14 @@ pub use queries_metrics::*;
 mod queries_symbols;
 pub use queries_symbols::*;
 
+#[path = "queries/sync_ops.rs"]
+mod queries_sync_ops;
+pub use queries_sync_ops::*;
+
+#[path = "queries/concurrency.rs"]
+mod queries_concurrency;
+pub use queries_concurrency::*;
+
 #[path = "queries/graph.rs"]
 mod queries_graph;
 pub use queries_graph::*;

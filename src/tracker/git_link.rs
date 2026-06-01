@@ -88,16 +88,29 @@ pub enum FindingSource {
     /// A high-severity developer-authored debt marker (FIXME / BUG / HACK)
     /// surfaced by `documented_tech_debt` → a `pending` `fixme` item.
     DocumentedTechDebt,
+    /// A lock-order deadlock cycle (`deadlock_cycles`, ADR-011) → a `pending`
+    /// `bug` item.
+    DeadlockCycle,
+    /// A channel deadlock — `blocked_recv` / `channel_cycle` (ADR-011) → a
+    /// `pending` `bug` item.
+    ChannelDeadlock,
 }
 
 impl FindingSource {
     /// Canonical ordering; also the source of the DB CHECK vocabulary.
-    pub const ALL: &'static [FindingSource] = &[Self::BugPrediction, Self::DocumentedTechDebt];
+    pub const ALL: &'static [FindingSource] = &[
+        Self::BugPrediction,
+        Self::DocumentedTechDebt,
+        Self::DeadlockCycle,
+        Self::ChannelDeadlock,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::BugPrediction => "bug_prediction",
             Self::DocumentedTechDebt => "documented_tech_debt",
+            Self::DeadlockCycle => "deadlock_cycle",
+            Self::ChannelDeadlock => "channel_deadlock",
         }
     }
 
@@ -121,6 +134,8 @@ impl FindingSource {
         match self {
             Self::BugPrediction => "bug",
             Self::DocumentedTechDebt => "fixme",
+            // Deadlock cycles are correctness defects → first-class `bug`.
+            Self::DeadlockCycle | Self::ChannelDeadlock => "bug",
         }
     }
 }
@@ -152,15 +167,20 @@ mod tests {
     #[test]
     fn finding_source_vocabulary_is_pinned() {
         let got: HashSet<&str> = FindingSource::ALL.iter().map(|f| f.as_str()).collect();
-        let expected: HashSet<&str> = ["bug_prediction", "documented_tech_debt"]
-            .into_iter()
-            .collect();
+        let expected: HashSet<&str> = [
+            "bug_prediction",
+            "documented_tech_debt",
+            "deadlock_cycle",
+            "channel_deadlock",
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
             got, expected,
             "FindingSource vocabulary drifted from pinned set"
         );
-        assert_eq!(FindingSource::ALL.len(), 2);
-        assert_eq!(got.len(), 2, "duplicate as_str() value in FindingSource");
+        assert_eq!(FindingSource::ALL.len(), 4);
+        assert_eq!(got.len(), 4, "duplicate as_str() value in FindingSource");
     }
 
     #[test]

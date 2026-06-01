@@ -90,6 +90,70 @@ async fn file_trajectories(pool: &PgPool, min_points: i64) -> Result<Vec<Traj>, 
         .collect())
 }
 
+/// deadlock-risk trajectories (ADR-011): per-project `deadlock_cycle_count`
+/// series from `concurrency_health_history`. Node id is the registered
+/// `project:{id}` unified node; cohort type `deadlock_risk`. So
+/// `recognize_trajectory("deadlock_risk", live_counts, …)` surfaces projects
+/// whose deadlock-cycle trajectory resembles this one.
+async fn deadlock_risk_trajectories(
+    pool: &PgPool,
+    min_points: i64,
+) -> Result<Vec<Traj>, sqlx::Error> {
+    let rows: Vec<(i32, Vec<i32>)> = sqlx::query_as(
+        "SELECT project_id,
+                array_agg(deadlock_cycle_count ORDER BY computed_at) AS series
+         FROM concurrency_health_history
+         GROUP BY project_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(pid, cs)| {
+            let series: Vec<f64> = cs.into_iter().map(|c| c as f64).collect();
+            (series.len() as i64 >= min_points).then(|| Traj {
+                node_id: format!("project:{pid}"),
+                node_type: "deadlock_risk".to_string(),
+                series,
+            })
+        })
+        .collect())
+}
+
+/// lock-contention trajectories (ADR-011): per-lock contention-score series from
+/// `concurrency_health_history.raw_summary->'lock_contention'` across snapshots.
+/// Node id is the registered `lock_resource:{key}` unified node; cohort type
+/// `lock_contention` — "this lock's contention trajectory resembles ones that
+/// historically led to deadlock".
+async fn lock_contention_trajectories(
+    pool: &PgPool,
+    min_points: i64,
+) -> Result<Vec<Traj>, sqlx::Error> {
+    let rows: Vec<(String, Vec<f64>)> = sqlx::query_as(
+        "WITH expanded AS (
+             SELECT h.computed_at, e.key AS lock_key, e.value::float8 AS score
+             FROM concurrency_health_history h,
+                  LATERAL jsonb_each_text(h.raw_summary -> 'lock_contention') AS e(key, value)
+             WHERE h.raw_summary ? 'lock_contention'
+         )
+         SELECT lock_key, array_agg(score ORDER BY computed_at) AS series
+         FROM expanded
+         GROUP BY lock_key",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(key, series)| {
+            (series.len() as i64 >= min_points).then(|| Traj {
+                node_id: format!("lock_resource:{key}"),
+                node_type: "lock_contention".to_string(),
+                series,
+            })
+        })
+        .collect())
+}
+
 /// MSM k-NN within one node type's trajectory cohort. Returns edge tuples
 /// `(from_id, from_type, to_id, to_type, weight, msm_distance)`.
 fn msm_knn(
@@ -228,6 +292,8 @@ pub async fn run_trajectory_similarity(
     for mut cohort in [
         work_item_trajectories(pool, config.min_points).await?,
         file_trajectories(pool, config.min_points).await?,
+        deadlock_risk_trajectories(pool, config.min_points).await?,
+        lock_contention_trajectories(pool, config.min_points).await?,
     ] {
         cohort.sort_by_key(|t| std::cmp::Reverse(t.series.len()));
         cohort.truncate(cap);
@@ -309,6 +375,8 @@ pub async fn recognize_partial_trajectory(
     let cohort = match node_type {
         "work_item" => work_item_trajectories(pool, 1).await?,
         "file" => file_trajectories(pool, 1).await?,
+        "deadlock_risk" => deadlock_risk_trajectories(pool, 1).await?,
+        "lock_contention" => lock_contention_trajectories(pool, 1).await?,
         _ => return Ok(Vec::new()),
     };
     let msm = MsmConfig::new(if msm_c > 0.0 { msm_c } else { 0.1 });

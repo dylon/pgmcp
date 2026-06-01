@@ -4,6 +4,7 @@ pub mod a2a_reflect;
 pub mod call_graph;
 #[allow(dead_code)]
 pub mod code_raptor;
+pub mod concurrency_scan;
 #[allow(dead_code)]
 pub mod cross_language_signatures;
 pub mod csm_validate;

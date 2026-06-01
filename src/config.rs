@@ -379,6 +379,12 @@ pub struct DigestConfig {
     /// digest carries only TRACKER + HEALTH.
     #[serde(default = "default_true_digest")]
     pub include_trends: bool,
+    /// Include the CONCURRENCY pillar (open deadlock cycles, trending lock
+    /// contention, newest high-severity concurrency findings). Off by default —
+    /// the `concurrency-scan` cron is itself opt-in, so the pillar is empty until
+    /// at least two health snapshots exist.
+    #[serde(default)]
+    pub include_concurrency: bool,
     /// Optional outbound webhook. Empty (the default) = no outbound POST. When
     /// set, the daemon fires the digest (fire-and-forget) on the observe path,
     /// gated on `max_severity() >= webhook_min_severity`.
@@ -405,6 +411,7 @@ impl Default for DigestConfig {
             max_per_session: default_digest_max_per_session(),
             max_bytes: default_digest_max_bytes(),
             include_trends: default_true_digest(),
+            include_concurrency: false,
             webhook_url: String::new(),
             webhook_min_severity: default_digest_webhook_min_severity(),
             pg_notify: false,
@@ -2367,6 +2374,20 @@ pub struct CronConfig {
     #[serde(default = "default_findings_promotion_interval")]
     pub findings_promotion_interval_secs: u64,
 
+    /// `concurrency-scan` cron interval (seconds). Runs the lock-order + channel
+    /// deadlock analyses, records findings to `concurrency_findings`, and
+    /// materializes `lock_order_edges` + health snapshots (Layer 4). Default 0 =
+    /// disabled (opt-in; heavier than findings-promotion).
+    #[serde(default = "default_concurrency_scan_interval")]
+    pub concurrency_scan_interval_secs: u64,
+
+    /// When true, the `concurrency-scan` cron promotes high-severity deadlock
+    /// findings to `pending` `bug` work items (never `confirmed` — confirmation
+    /// is user-only). Opt-in, default false; independent of
+    /// `[tracker] auto_promote_findings`.
+    #[serde(default)]
+    pub concurrency_auto_promote: bool,
+
     /// Batch size for the embedding-migration cron (default 64).
     #[serde(default = "default_embedding_migration_batch_size")]
     pub embedding_migration_batch_size: usize,
@@ -2571,6 +2592,8 @@ impl Default for CronConfig {
             embedding_migration_interval_secs: default_embedding_migration_interval(),
             quality_history_interval_secs: default_quality_history_interval(),
             findings_promotion_interval_secs: default_findings_promotion_interval(),
+            concurrency_scan_interval_secs: default_concurrency_scan_interval(),
+            concurrency_auto_promote: false,
             embedding_migration_batch_size: default_embedding_migration_batch_size(),
             embedding_migration_max_batches: default_embedding_migration_max_batches(),
             topic_max_mem_fraction: default_topic_max_mem_fraction(),
@@ -2765,6 +2788,10 @@ fn default_quality_history_interval() -> u64 {
 
 fn default_findings_promotion_interval() -> u64 {
     21_600 // 6h
+}
+
+fn default_concurrency_scan_interval() -> u64 {
+    0 // disabled by default; opt-in (heavier: betweenness + cycle detection)
 }
 
 fn default_embedding_migration_interval() -> u64 {
