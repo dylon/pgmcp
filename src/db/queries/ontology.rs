@@ -16,7 +16,7 @@
 use serde::Serialize;
 use sqlx::PgPool;
 
-use crate::ontology::edge::EvidenceKind;
+use crate::ontology::edge::{EvidenceKind, OntologyRelation};
 use crate::ontology::facet::{ConceptStatus, Facet};
 use crate::tracker::transition::Actor;
 
@@ -275,4 +275,84 @@ pub async fn count_concept_evidence(pool: &PgPool, entity_id: i64) -> Result<i64
         .bind(entity_id)
         .fetch_one(pool)
         .await
+}
+
+/// Insert a hierarchy edge (`is_a`/`part_of`/`broader`/`narrower`/`member_of`)
+/// between two concept entities via the freeform `memory_relations.relation_type`
+/// passthrough. Idempotent on the active (`valid_to IS NULL`) triple and
+/// self-edge-safe (the table's CHECK forbids `from = to`). Returns `true` if a
+/// new edge was inserted.
+pub async fn insert_ontology_edge(
+    pool: &PgPool,
+    from_entity_id: i64,
+    to_entity_id: i64,
+    relation: OntologyRelation,
+    weight: f64,
+) -> Result<bool, sqlx::Error> {
+    if from_entity_id == to_entity_id {
+        return Ok(false);
+    }
+    let id: Option<i64> = sqlx::query_scalar(
+        "INSERT INTO memory_relations
+            (from_entity_id, to_entity_id, relation_type, importance, source)
+         SELECT $1, $2, $3, $4, 'auto_index'::memory_source
+         WHERE NOT EXISTS (
+             SELECT 1 FROM memory_relations
+             WHERE from_entity_id = $1 AND to_entity_id = $2
+               AND relation_type = $3 AND valid_to IS NULL
+         )
+         RETURNING id",
+    )
+    .bind(from_entity_id)
+    .bind(to_entity_id)
+    .bind(relation.as_str())
+    .bind(weight as f32)
+    .fetch_optional(pool)
+    .await?;
+    Ok(id.is_some())
+}
+
+/// All active concept entity-ids of one facet (including those with no code
+/// attributes — they become the most-general nodes in the `is_a` poset).
+pub async fn list_concept_ids_by_facet(
+    pool: &PgPool,
+    facet: Facet,
+) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT m.entity_id FROM ontology_concept_meta m
+         JOIN memory_entities e ON e.id = m.entity_id AND e.valid_to IS NULL
+         WHERE m.facet = $1
+         ORDER BY m.entity_id",
+    )
+    .bind(facet.as_str())
+    .fetch_all(pool)
+    .await
+}
+
+/// `(entity_id, effect)` rows: the shadow-ASR effects exhibited (above
+/// `min_support` symbol occurrences) by the code units of each facet concept,
+/// via its `concept_topic` anchor → chunks → files → symbols → effects. The
+/// FCA attribute basis (Phase 4).
+pub async fn load_concept_effect_rows(
+    pool: &PgPool,
+    facet: Facet,
+    min_support: i64,
+) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT m.entity_id, se.effect
+         FROM ontology_concept_meta m
+         JOIN memory_code_anchor a        ON a.entity_id = m.entity_id AND a.topic_id IS NOT NULL
+         JOIN chunk_topic_assignments cta ON cta.topic_id = a.topic_id AND cta.membership_score >= 0.05
+         JOIN file_chunks fc              ON fc.id = cta.chunk_id
+         JOIN file_symbols fs             ON fs.file_id = fc.file_id
+         JOIN symbol_effects se           ON se.symbol_id = fs.id
+         WHERE m.facet = $1
+         GROUP BY m.entity_id, se.effect
+         HAVING COUNT(*) >= $2
+         ORDER BY m.entity_id, se.effect",
+    )
+    .bind(facet.as_str())
+    .bind(min_support)
+    .fetch_all(pool)
+    .await
 }

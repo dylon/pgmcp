@@ -611,6 +611,26 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         });
     }
 
+    // 11f-ter. Schedule the ontology-build cron (Phase 4 FCA is_a hierarchy).
+    // Off by default ([ontology] cron_enabled). Runs after invariant mining so
+    // the concepts it orders already carry facet metadata.
+    if config_snapshot.ontology.cron_enabled
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let ontology_cfg = config_snapshot.ontology.clone();
+        let interval_ms = ontology_cfg.cron_interval_secs.saturating_mul(1000);
+        let rt_for_ontology_build = tokio::runtime::Handle::current();
+        // 240s initial delay so it runs after invariant mining (180s).
+        cron_handle.schedule_recurring(240_000, interval_ms, "ontology-build", move || {
+            let pool = pool.clone();
+            let cfg = ontology_cfg.clone();
+            rt_for_ontology_build.spawn(async move {
+                cron::ontology_build::run_or_log(Arc::new(pool), cfg).await;
+            });
+            true
+        });
+    }
+
     // 11g. Schedule the trajectory-similarity cron (Stage 5c MSM evolves_like).
     // Off by default ([cron.trajectory_similarity] cron_enabled = false).
     if config_snapshot.cron.trajectory_similarity.cron_enabled

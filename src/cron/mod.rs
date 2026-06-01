@@ -41,6 +41,8 @@ pub mod memory_retention;
 #[allow(dead_code)]
 pub mod ngram_lm_train;
 
+pub mod ontology_build;
+
 pub mod ontology_invariants;
 #[allow(dead_code)]
 pub mod quality_history;
