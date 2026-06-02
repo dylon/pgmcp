@@ -69,45 +69,34 @@ pub struct Config {
     /// MCP agent path does not have it.
     #[serde(default)]
     pub tracker: TrackerConfig,
-    /// `[ontology]` — hierarchical-ontology crons (invariant mining, hierarchy
-    /// build, egglog reasoning, link-prediction). All off by default.
+    /// `[ontology]` — the hierarchical-ontology subsystem (invariant mining, FCA
+    /// hierarchy build, catalog migration, analyzer-finding integration,
+    /// constraint reasoning, Poincaré link-prediction). Runs by default.
     #[serde(default)]
     pub ontology: OntologyConfig,
 }
 
-/// `[ontology]` — the hierarchical-ontology subsystem's cron knobs. All off by
-/// default; a stock install does no ontology work until opted in.
+/// `[ontology]` — the hierarchical-ontology subsystem's tuning knobs. The crons
+/// run by default (there is no enable switch — they follow the
+/// `memory-graph-refresh` convention); set `cron_interval_secs = 0` to disable
+/// every ontology cron. Deterministic and idempotent, so they are safe to leave on.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OntologyConfig {
-    /// Whether the invariant-mining + hierarchy-build crons run.
-    #[serde(default)]
-    pub cron_enabled: bool,
+    /// Interval between ontology cron passes (invariant mining, hierarchy build,
+    /// catalog migration, analyzer-finding integration, constraint reasoning,
+    /// link-prediction). `0` disables every ontology cron.
     #[serde(default = "default_ontology_interval")]
     pub cron_interval_secs: u64,
-    /// Whether the opt-in LLM passes (invariant extraction, canonicalization,
-    /// internal-node naming) run — also requires a configured `[memory.extractor]`.
-    #[serde(default)]
-    pub llm_enabled: bool,
     /// Max items (concepts / invariants) processed per cron run.
     #[serde(default = "default_ontology_max_per_run")]
     pub max_items_per_run: i64,
-    /// Whether the egglog reasoning cron runs (Phase 9).
-    #[serde(default)]
-    pub reasoning_enabled: bool,
-    /// Whether the Poincaré link-prediction cron runs (Phase 8).
-    #[serde(default)]
-    pub link_predict_enabled: bool,
 }
 
 impl Default for OntologyConfig {
     fn default() -> Self {
         Self {
-            cron_enabled: false,
             cron_interval_secs: default_ontology_interval(),
-            llm_enabled: false,
             max_items_per_run: default_ontology_max_per_run(),
-            reasoning_enabled: false,
-            link_predict_enabled: false,
         }
     }
 }

@@ -58,7 +58,7 @@ impl OntologyRelation {
     }
 
     /// The relations whose transitive closure forms the concept hierarchy
-    /// (used by ancestor/descendant traversal + the egglog `is_a*` rules).
+    /// (used by ancestor/descendant traversal + the recursive-CTE `is_a*` closure).
     /// `narrower`/`member_of` are excluded: `narrower` is the inverse of
     /// `broader` (closure is computed in the `broader` direction), and
     /// `member_of` is instance→category, not subsumption.

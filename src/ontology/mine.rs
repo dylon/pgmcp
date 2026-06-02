@@ -9,8 +9,8 @@
 //! A candidate's [`name`](InvariantCandidate::name) is a *normalized merge key*
 //! derived from the constraint phrase, so the same invariant expressed in an
 //! ADR, a mandate, and a commit collapses onto **one** concept carrying three
-//! evidence rows (the deterministic precursor to the Phase-9 egglog
-//! canonicalization).
+//! evidence rows (the deterministic merge key that a future egglog-based
+//! canonicalization could build on — see [`crate::ontology::reason`]).
 
 /// Invariant-language cues (lowercase substring match). "must" subsumes
 /// "must not"; the set is intentionally small + high-precision.

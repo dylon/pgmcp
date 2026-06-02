@@ -160,6 +160,25 @@ where
             .collect()
     }
 
+    /// Prefix (autocomplete) search: every stored term beginning with `prefix`,
+    /// paired with its value, in the trie's enumeration order. Linear in the
+    /// prefix length via the trie's `iter_prefix_with_values` — the right
+    /// primitive for resource-template completion and prefix-narrowed lookup.
+    /// `limit == 0` means uncapped. A missing prefix path or a read error yields
+    /// an empty vec (fails closed, like [`contains`](Self::contains)). Collected
+    /// under the read guard and returned owned, so no lock is held across an await.
+    pub fn prefix(&self, prefix: &str, limit: usize) -> Vec<(String, V)> {
+        match self.storage.read().iter_prefix_with_values(prefix) {
+            Ok(Some(mut hits)) => {
+                if limit > 0 && hits.len() > limit {
+                    hits.truncate(limit);
+                }
+                hits
+            }
+            Ok(None) | Err(_) => Vec::new(),
+        }
+    }
+
     /// Collect every term in the trie as owned `String`s. Collected under
     /// the read guard and returned owned, so no lock is held across an await.
     pub fn iter_strings(&self) -> Vec<String> {
@@ -260,6 +279,31 @@ mod tests {
         // `recieve` is one transposition from `receive`.
         let hits = idx.query("recieve", 2);
         assert!(hits.iter().any(|(t, _, _)| t == "receive"));
+    }
+
+    #[test]
+    fn prefix_returns_terms_with_values() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("prefix.artrie");
+        let (idx, _) = FuzzyIndex::<i64>::open_or_create(&path).expect("create");
+        idx.upsert("concurrency", 1).unwrap();
+        idx.upsert("concurrent", 2).unwrap();
+        idx.upsert("consensus", 3).unwrap();
+        idx.upsert("deadlock", 4).unwrap();
+
+        // The "concur" prefix returns both concurrency terms (with values) and
+        // neither "consensus" nor "deadlock".
+        let hits = idx.prefix("concur", 0);
+        let names: Vec<&str> = hits.iter().map(|(t, _)| t.as_str()).collect();
+        assert!(names.contains(&"concurrency"));
+        assert!(names.contains(&"concurrent"));
+        assert!(!names.contains(&"consensus"));
+        assert!(!names.contains(&"deadlock"));
+        assert!(hits.iter().any(|(t, v)| t == "concurrency" && *v == 1));
+
+        // `limit` caps the result count; a non-matching prefix fails closed to empty.
+        assert_eq!(idx.prefix("concur", 1).len(), 1);
+        assert!(idx.prefix("zzz", 0).is_empty());
     }
 
     #[test]

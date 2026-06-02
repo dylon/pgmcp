@@ -1537,6 +1537,7 @@ pub fn schedule_maintenance_jobs(
                                 paths = report.paths_synced,
                                 commits = report.commits_synced,
                                 durable_mandates = report.durable_mandates_synced,
+                                concepts = report.concepts_synced,
                                 rss_mb_start = rss_start >> 20,
                                 rss_mb_end = rss_end >> 20,
                                 rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,

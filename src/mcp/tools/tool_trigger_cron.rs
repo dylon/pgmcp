@@ -188,7 +188,8 @@ pub async fn tool_trigger_cron(
                 "paths_synced": report.paths_synced,
                 "commits_synced": report.commits_synced,
                 "durable_mandates_synced": report.durable_mandates_synced,
-                "guidance": "Per-project symbol/path/commit + durable-mandate fuzzy tries rebuilt from PG.",
+                "concepts_synced": report.concepts_synced,
+                "guidance": "Per-project symbol/path/commit + global durable-mandate & ontology-concept fuzzy tries rebuilt from PG.",
             }))
         }
         "graph-analysis" => {

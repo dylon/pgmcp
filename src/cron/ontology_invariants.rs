@@ -12,8 +12,9 @@
 //!
 //! The same rule from several sources collapses onto **one** concept (merge key
 //! = [`crate::ontology::mine::normalize_invariant_name`]) carrying one evidence
-//! row per source. Fully **deterministic** — LLM *canonicalization* is Phase 9
-//! (egglog); LLM-emergent *concept* extraction already lives in the
+//! row per source. Fully **deterministic** — equational canonicalization is a
+//! documented future egglog enhancement (see [`crate::ontology::reason`]);
+//! LLM-emergent *concept* extraction already lives in the
 //! `memory-concept-extract` cron. Idempotent: concept upsert is curation-safe,
 //! evidence is `provenance_key`-deduped, and anchoring is existence-guarded — so
 //! re-runs add nothing new (and never churn `memory_code_anchor`).

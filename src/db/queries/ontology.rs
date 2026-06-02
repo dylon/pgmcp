@@ -469,6 +469,43 @@ pub async fn concept_ancestors(
     .await
 }
 
+/// Subtree under a concept: its hierarchy **descendants** (more-specific
+/// concepts reachable by following `is_a`/`part_of`/`broader` edges in the
+/// child→parent direction) within `max_depth` hops, as named edges. Correct over
+/// the DAG — this is a recursive transitive closure; a materialized-path trie
+/// would be ill-defined for multi-parent "diamond" concepts (see ADR-012), so
+/// the recursive CTE is the right tool here.
+pub async fn concept_descendants(
+    pool: &PgPool,
+    root_id: i64,
+    max_depth: i32,
+) -> Result<Vec<ConceptEdgeRow>, sqlx::Error> {
+    sqlx::query_as(
+        "WITH RECURSIVE sub(child_id, parent_id, relation, depth) AS (
+             SELECT r.from_entity_id, r.to_entity_id, r.relation_type, 1
+             FROM memory_relations r
+             WHERE r.to_entity_id = $1
+               AND r.relation_type IN ('is_a','part_of','broader') AND r.valid_to IS NULL
+             UNION
+             SELECT r.from_entity_id, r.to_entity_id, r.relation_type, s.depth + 1
+             FROM sub s
+             JOIN memory_relations r
+               ON r.to_entity_id = s.child_id
+               AND r.relation_type IN ('is_a','part_of','broader') AND r.valid_to IS NULL
+             WHERE s.depth < $2
+         )
+         SELECT s.child_id, cf.name AS child_name, s.parent_id, pf.name AS parent_name, s.relation
+         FROM sub s
+         JOIN memory_entities cf ON cf.id = s.child_id AND cf.valid_to IS NULL
+         JOIN memory_entities pf ON pf.id = s.parent_id AND pf.valid_to IS NULL
+         ORDER BY s.parent_id, s.child_id",
+    )
+    .bind(root_id)
+    .bind(max_depth)
+    .fetch_all(pool)
+    .await
+}
+
 /// All concepts for export: `(entity_id, name, facet, status)`.
 pub async fn export_concepts(
     pool: &PgPool,
@@ -604,7 +641,11 @@ pub async fn resolve_concept(pool: &PgPool, name_or_id: &str) -> Result<Option<i
     .await
 }
 
-/// Substring search over concept names, optionally facet-filtered.
+/// Substring search over concept names **and invariant bodies**, optionally
+/// facet-filtered. Matching `constraint_text` as well as `name` is what lets
+/// "find the invariant about ambiguity" work — a concept surfaces if the query
+/// appears in its name OR its constraint sentence (NULL bodies simply never
+/// match the body leg, so non-invariant concepts are unaffected).
 pub async fn search_concepts_by_name(
     pool: &PgPool,
     query: &str,
@@ -615,12 +656,42 @@ pub async fn search_concepts_by_name(
         "SELECT e.id AS entity_id, e.name, m.facet, m.status, m.confidence
          FROM ontology_concept_meta m
          JOIN memory_entities e ON e.id = m.entity_id AND e.valid_to IS NULL
-         WHERE e.name ILIKE '%' || $1 || '%'
+         WHERE (e.name ILIKE '%' || $1 || '%' OR m.constraint_text ILIKE '%' || $1 || '%')
            AND ($2::text IS NULL OR m.facet = $2)
          ORDER BY (m.status = 'canonical') DESC, m.confidence DESC, e.id
          LIMIT $3",
     )
     .bind(query)
+    .bind(facet.map(|f| f.as_str()))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Resolve a set of concept *names* to their brief rows by exact match — used to
+/// expand fuzzy/prefix concept-trie candidates back to authoritative, live rows.
+/// `valid_to IS NULL` drops stale trie entries; same-name concepts across
+/// projects all surface. Optionally facet-filtered; ordered like
+/// [`search_concepts_by_name`]. Empty `names` short-circuits to no rows.
+pub async fn resolve_concepts_by_names(
+    pool: &PgPool,
+    names: &[String],
+    facet: Option<Facet>,
+    limit: i64,
+) -> Result<Vec<ConceptBriefRow>, sqlx::Error> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as(
+        "SELECT e.id AS entity_id, e.name, m.facet, m.status, m.confidence
+         FROM ontology_concept_meta m
+         JOIN memory_entities e ON e.id = m.entity_id AND e.valid_to IS NULL
+         WHERE e.name = ANY($1)
+           AND ($2::text IS NULL OR m.facet = $2)
+         ORDER BY (m.status = 'canonical') DESC, m.confidence DESC, e.id
+         LIMIT $3",
+    )
+    .bind(names)
     .bind(facet.map(|f| f.as_str()))
     .bind(limit)
     .fetch_all(pool)

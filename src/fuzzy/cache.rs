@@ -14,12 +14,13 @@
 //! keeps the cache exactly as fresh as the file (which only the cron changes)
 //! with no coupling to the cron.
 //!
-//! **Bound.** At most `capacity` handles per kind (symbols, paths). On overflow
-//! the least-recently-accessed entry is dropped — its daemon threads are then
-//! joined by `PersistentARTrieChar::Drop`. In practice the working set is the
-//! handful of projects queried within a cron interval. Only symbols + paths are
-//! cached: they are the only kinds the query path opens (commits and durable
-//! mandates are built by the cron only).
+//! **Bound.** At most `capacity` handles per kind (symbols, paths, concepts). On
+//! overflow the least-recently-accessed entry is dropped — its daemon threads are
+//! then joined by `PersistentARTrieChar::Drop`. In practice the working set is the
+//! handful of projects queried within a cron interval. Only symbols, paths, and
+//! concepts are cached: they are the kinds the query path opens (`fuzzy_*_search`
+//! and `ontology_search`); commits and durable mandates are built by the cron
+//! only. The concept trie is workspace-global (one handle under a fixed slug).
 
 use std::path::Path;
 use std::sync::Arc;
@@ -30,7 +31,7 @@ use dashmap::DashMap;
 use libdictenstein::DictionaryValue;
 
 use super::persistent_artrie::FuzzyIndex;
-use super::values::{PathValue, SymbolValue};
+use super::values::{ConceptValue, PathValue, SymbolValue};
 
 /// Max cached handles per kind. Bounds steady-state trie daemon threads to
 /// ~3 × this per kind. Comfortably above a typical active working set; the
@@ -50,10 +51,12 @@ where
     last_access: AtomicU64,
 }
 
-/// Per-project open-`FuzzyIndex` cache for the symbol and path tries.
+/// Open-`FuzzyIndex` cache for the symbol, path, and (workspace-global) concept
+/// tries.
 pub struct FuzzyCache {
     symbols: DashMap<String, Entry<SymbolValue>>,
     paths: DashMap<String, Entry<PathValue>>,
+    concepts: DashMap<String, Entry<ConceptValue>>,
     capacity: usize,
     clock: AtomicU64,
 }
@@ -75,6 +78,7 @@ impl FuzzyCache {
         Self {
             symbols: DashMap::new(),
             paths: DashMap::new(),
+            concepts: DashMap::new(),
             capacity: capacity.max(1),
             clock: AtomicU64::new(0),
         }
@@ -112,14 +116,31 @@ impl FuzzyCache {
         insert(&self.paths, &self.clock, self.capacity, slug, path, idx)
     }
 
-    /// Number of currently-cached handles (symbols + paths). For tests/metrics.
+    /// Mirror of [`get_symbols`](Self::get_symbols) for the workspace-global
+    /// concept trie (cache key is a fixed slug — see `open_concept_trie`).
+    pub fn get_concepts(&self, slug: &str, path: &Path) -> Option<Arc<FuzzyIndex<ConceptValue>>> {
+        get(&self.concepts, &self.clock, slug, path)
+    }
+
+    /// Mirror of [`insert_symbols`](Self::insert_symbols) for the concept trie.
+    pub fn insert_concepts(
+        &self,
+        slug: &str,
+        path: &Path,
+        idx: FuzzyIndex<ConceptValue>,
+    ) -> Arc<FuzzyIndex<ConceptValue>> {
+        insert(&self.concepts, &self.clock, self.capacity, slug, path, idx)
+    }
+
+    /// Number of currently-cached handles (symbols + paths + concepts). For
+    /// tests/metrics.
     pub fn len(&self) -> usize {
-        self.symbols.len() + self.paths.len()
+        self.symbols.len() + self.paths.len() + self.concepts.len()
     }
 
     /// Whether the cache holds no handles.
     pub fn is_empty(&self) -> bool {
-        self.symbols.is_empty() && self.paths.is_empty()
+        self.symbols.is_empty() && self.paths.is_empty() && self.concepts.is_empty()
     }
 }
 

@@ -7,8 +7,8 @@
 //! candidate** edges (low importance = model confidence). They are deliberately
 //! NOT inserted as `is_a` — the deterministic FCA backbone stays authoritative;
 //! these are suggestions surfaced by `ontology_suggest_edges` for a curator. The
-//! strict norm ordering keeps the proposed set acyclic. Opt-in
-//! (`[ontology] link_predict_enabled`, default off); deterministic (seed 42).
+//! strict norm ordering keeps the proposed set acyclic. Runs by default
+//! (set `[ontology] cron_interval_secs = 0` to disable); deterministic (seed 42).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

@@ -11,6 +11,7 @@ use serde_json::json;
 
 use crate::context::SystemContext;
 use crate::db::queries;
+use crate::fuzzy::values::ConceptValue;
 use crate::mcp::server::{
     OntologyAssertInvariantParams, OntologyCheckParams, OntologyConceptParams,
     OntologyCreateConceptParams, OntologyExportParams, OntologyInvariantsForFileParams,
@@ -44,12 +45,34 @@ fn db_err(e: sqlx::Error) -> McpError {
     McpError::internal_error(format!("ontology query failed: {e}"), None)
 }
 
-/// `ontology_tree` — the per-facet `is_a`/`part_of`/`broader` hierarchy (nodes + edges).
+/// `ontology_tree` — the per-facet `is_a`/`part_of`/`broader` hierarchy (nodes +
+/// edges), or — when `root_concept` is given — the bounded **subtree** of
+/// descendants under that concept.
 pub async fn tool_ontology_tree(
     ctx: &SystemContext,
     params: OntologyTreeParams,
 ) -> Result<CallToolResult, McpError> {
     let pool = pool_or_err(ctx)?;
+
+    // Subtree mode: descendants of one concept (bounded depth). Correct over the
+    // DAG via a recursive closure (see `queries::concept_descendants`).
+    if let Some(root) = params.root_concept.as_deref() {
+        let root_id = queries::resolve_concept(pool, root)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| McpError::invalid_params(format!("no concept `{root}`"), None))?;
+        let depth = params.depth.unwrap_or(5).clamp(1, 50) as i32;
+        let edges = queries::concept_descendants(pool, root_id, depth)
+            .await
+            .map_err(db_err)?;
+        return json_result(&json!({
+            "root_concept": root,
+            "root_id": root_id,
+            "depth": depth,
+            "edges": edges,
+        }));
+    }
+
     let facets: Vec<Facet> = match params.facet.as_deref() {
         Some(s) => vec![parse_facet(s)?],
         None => Facet::ALL.to_vec(),
@@ -91,7 +114,16 @@ pub async fn tool_ontology_concept(
     json_result(&json!({ "entity_id": entity_id, "meta": meta, "evidence": evidence }))
 }
 
-/// `ontology_search` — substring search over concept names (optional facet filter).
+/// `ontology_search` — typo-tolerant + substring concept-name search.
+///
+/// Unions and dedups (by `entity_id`) the persistent **concept trie** — a
+/// Damerau-Levenshtein fuzzy leg + a prefix leg (the typo/autocomplete
+/// accelerator, linear in query length over the mmap'd trie) — with the SQL
+/// `ILIKE` substring scan (the always-correct fallback). Trie hits propose only
+/// concept *names*; PG resolves them to live rows (`valid_to IS NULL`), so stale
+/// or cross-project duplicate trie entries can never produce an incorrect
+/// result. Degrades cleanly to ILIKE-only when the trie is cold/unavailable
+/// (fresh install before the first `fuzzy-sync`).
 pub async fn tool_ontology_search(
     ctx: &SystemContext,
     params: OntologySearchParams,
@@ -102,10 +134,67 @@ pub async fn tool_ontology_search(
         None => None,
     };
     let limit = params.limit.unwrap_or(30).clamp(1, 200);
-    let hits = queries::search_concepts_by_name(pool, &params.query, facet, limit)
+
+    // Leg 1 — SQL ILIKE substring (always-correct; the cold-trie fallback).
+    let mut rows = queries::search_concepts_by_name(pool, &params.query, facet, limit)
         .await
         .map_err(db_err)?;
-    json_result(&json!({ "query": params.query, "results": hits }))
+    let mut seen: std::collections::HashSet<i64> = rows.iter().map(|r| r.entity_id).collect();
+
+    // Legs 2+3 — the persistent concept trie: fuzzy (typo-tolerant) + prefix.
+    // Best-effort: a cold/absent trie simply leaves the ILIKE results in place.
+    let mut fuzzy_used = false;
+    if let Ok(idx) = crate::fuzzy::sync::open_concept_trie(ctx).await {
+        fuzzy_used = true;
+        let facet_str = facet.map(|f| f.as_str());
+        let pred = |v: &ConceptValue| facet_str.is_none_or(|f| v.facet == f);
+        // Tighter edit budget for short queries so fuzzy doesn't over-match.
+        let max_distance = if params.query.chars().count() <= 4 {
+            1
+        } else {
+            2
+        };
+
+        let mut names: Vec<String> = Vec::new();
+        let mut name_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (name, _dist, v) in idx.query(&params.query, max_distance) {
+            if pred(&v) && name_seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+        for (name, v) in idx.prefix(&params.query, 50) {
+            if pred(&v) && name_seen.insert(name.clone()) {
+                names.push(name);
+            }
+        }
+        // Resolve the trie's candidate names → authoritative live rows; merge
+        // whatever the ILIKE leg didn't already surface.
+        if !names.is_empty() {
+            let resolved = queries::resolve_concepts_by_names(pool, &names, facet, limit)
+                .await
+                .map_err(db_err)?;
+            for r in resolved {
+                if seen.insert(r.entity_id) {
+                    rows.push(r);
+                }
+            }
+        }
+    }
+
+    // Re-rank the merged union (canonical first, then confidence, then id) and cap.
+    rows.sort_by(|a, b| {
+        (b.status == "canonical")
+            .cmp(&(a.status == "canonical"))
+            .then(
+                b.confidence
+                    .partial_cmp(&a.confidence)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+            .then(a.entity_id.cmp(&b.entity_id))
+    });
+    rows.truncate(limit as usize);
+
+    json_result(&json!({ "query": params.query, "fuzzy": fuzzy_used, "results": rows }))
 }
 
 /// `ontology_invariants_for_file` — the anti-mistake query: invariants governing a file.

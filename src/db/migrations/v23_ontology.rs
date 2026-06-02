@@ -20,7 +20,8 @@
 //! - `ontology_concept_attr` — small structured key/value facts on a concept.
 //! - `ontology_data_link` — links a concept to a v19 `data_tables` row (tabular
 //!   non-code data: hardware inventory, tool registry).
-//! - `ontology_rule` — the user-extensible egglog/Datalog ruleset (Phase 9).
+//! - `ontology_rule` — the user-extensible Datalog-style ruleset (Phase 9;
+//!   recursive-CTE-evaluated today, egglog-ready as a documented future engine).
 
 use sqlx::PgPool;
 
@@ -128,7 +129,7 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
     .execute(&mut *tx)
     .await?;
 
-    // 5. User-extensible egglog/Datalog rules (materialized by the Phase-9 engine).
+    // 5. User-extensible Datalog-style rules (evaluated by the Phase-9 reasoning engine).
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS ontology_rule (
             id         BIGSERIAL PRIMARY KEY,

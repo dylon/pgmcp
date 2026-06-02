@@ -10,9 +10,11 @@
 //! only new schema is the v23 sidecar set (facet/status/invariant/evidence/attr/
 //! data-link/rule), built from this module's closed vocabularies.
 //!
-//! This `mod.rs` owns those vocabularies; later phases add `classify`, `cluster`,
-//! `fca`, `hierarchy`, `mine`, `canonicalize`, `egglog_engine`, `export`, and the
-//! trie-accelerator submodules.
+//! This `mod.rs` owns those vocabularies; the sibling modules add `classify`,
+//! `cluster`, `fca`, `hierarchy`, `mine`, `reason` (recursive-CTE deduction —
+//! egglog is a documented future enhancement, see [`reason`]), `export`,
+//! `embed_hyperbolic` (Poincaré link-prediction), and the persistent-trie
+//! accelerators (`concept_index`, `path_index`, `substring_index`).
 
 pub mod classify;
 pub mod cluster;

@@ -17,7 +17,7 @@ use rmcp::ErrorData as McpError;
 use sqlx::PgPool;
 
 use super::persistent_artrie::{FuzzyError, FuzzyIndex};
-use super::values::{CommitRef, DurableMandateRef, PathValue, SymbolValue};
+use super::values::{CommitRef, ConceptValue, DurableMandateRef, PathValue, SymbolValue};
 use crate::context::SystemContext;
 use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
 
@@ -191,6 +191,76 @@ pub async fn open_path_trie(
         );
     }
     Ok(ctx.fuzzy_cache().insert_paths(&slug, &path, idx))
+}
+
+/// Rebuild the workspace-global concept index from
+/// `ontology_concept_meta ⨝ memory_entities` — one entry per concept *name*
+/// across all projects (workspace rollups carry `project_id = NULL`). The trie
+/// is a **fuzzy name-matcher**: `ontology_search` resolves matched names back
+/// through PG (`WHERE name = ANY(...) AND valid_to IS NULL`), so same-name
+/// concepts in different projects and stale/deleted names never yield an
+/// incorrect row — the trie only proposes candidates, PG remains authoritative.
+pub async fn rebuild_concepts(
+    pool: &PgPool,
+    idx: &FuzzyIndex<ConceptValue>,
+) -> Result<usize, FuzzyError> {
+    let rows: Vec<(String, i64, String, String, Option<i32>)> =
+        sqlx::query_as::<_, (String, i64, String, String, Option<i32>)>(
+            "SELECT e.name, e.id, m.facet, m.status, m.project_id
+             FROM ontology_concept_meta m
+             JOIN memory_entities e ON e.id = m.entity_id AND e.valid_to IS NULL",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| FuzzyError::Trie(format!("concept fetch: {e}")))?;
+
+    let mut count = 0usize;
+    for (name, entity_id, facet, status, project_id) in rows {
+        let value = ConceptValue {
+            entity_id,
+            facet,
+            status,
+            project_id,
+        };
+        idx.upsert(&name, value)?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+/// Open (or create + lazy-warm from PG) the **workspace-global** concept
+/// `FuzzyIndex`. Backs the typo-tolerant / prefix legs of `ontology_search`
+/// and the `{concept}` resource-template completion. Unlike the per-project
+/// symbol/path tries this is a single global trie (concepts span projects and
+/// include workspace-level rollups); `ConceptValue` carries `project_id` so a
+/// caller can still filter by project in-trie. Lazy warming runs only on first
+/// creation; thereafter the `fuzzy-sync` cron keeps it current.
+pub async fn open_concept_trie(
+    ctx: &SystemContext,
+) -> Result<Arc<FuzzyIndex<ConceptValue>>, McpError> {
+    let data_dir = ctx.config().load().fuzzy.data_dir.clone();
+    let slug = crate::cron::fuzzy_sync::CONCEPT_TRIE_SLUG;
+    let path = crate::cron::fuzzy_sync::concept_trie_path(&data_dir);
+
+    if let Some(idx) = ctx.fuzzy_cache().get_concepts(slug, &path) {
+        return Ok(idx);
+    }
+
+    let fresh = !path.exists();
+    let (idx, _recovery) = FuzzyIndex::<ConceptValue>::open_or_create(&path)
+        .map_err(|e| McpError::internal_error(format!("fuzzy concept trie open: {e}"), None))?;
+    if fresh {
+        let pool = pool_or_err(ctx)?;
+        rebuild_concepts(pool, &idx).await.map_err(|e| {
+            McpError::internal_error(format!("fuzzy concept trie initial warm: {e}"), None)
+        })?;
+        tracing::info!(
+            path = %path.display(),
+            entries = idx.len(),
+            "fuzzy concept trie lazy-warmed from PG"
+        );
+    }
+    Ok(ctx.fuzzy_cache().insert_concepts(slug, &path, idx))
 }
 
 /// Rebuild the durable-mandate index from `durable_mandates`.

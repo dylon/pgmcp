@@ -68,7 +68,8 @@ pub async fn build_facet_isa(
 /// EDC canonicalization (Phase 5): link same-facet near-duplicate concepts
 /// (observation-embedding cosine ≥ `tau`) with a `broader` edge from the variant
 /// (higher entity id) to the canonical (lower entity id), weighted by the cosine.
-/// Deterministic candidate generation; the Phase-9 egglog pass does true merging.
+/// Deterministic candidate generation; a future egglog pass (a documented
+/// enhancement — see [`crate::ontology::reason`]) could add equational merging.
 /// Idempotent (edge insert is existence-guarded). Returns new-edge count.
 pub async fn build_broader_edges(
     pool: &PgPool,

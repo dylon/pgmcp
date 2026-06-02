@@ -16,7 +16,7 @@ use sqlx::PgPool;
 
 use crate::fuzzy::persistent_artrie::{FuzzyError, FuzzyIndex};
 use crate::fuzzy::sync;
-use crate::fuzzy::values::{CommitRef, DurableMandateRef, PathValue, SymbolValue};
+use crate::fuzzy::values::{CommitRef, ConceptValue, DurableMandateRef, PathValue, SymbolValue};
 use crate::stats::tracker::StatsTracker;
 
 /// Build the canonical filesystem path for a per-project trie.
@@ -28,6 +28,16 @@ pub fn trie_path(data_dir: &Path, kind: &str, project_slug: &str) -> PathBuf {
     p.push(format!("{kind}.artrie"));
     p
 }
+
+/// Filesystem path for the workspace-global concept trie — one file across all
+/// projects + workspace rollups (concepts are global, like durable mandates).
+/// Cached under [`CONCEPT_TRIE_SLUG`].
+pub fn concept_trie_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("fuzzy").join("concepts_global.artrie")
+}
+
+/// Cache slug for the single global concept-trie handle in `FuzzyCache`.
+pub const CONCEPT_TRIE_SLUG: &str = "_global";
 
 /// Run the fuzzy-sync job once across every active project.
 ///
@@ -101,6 +111,21 @@ pub async fn run_fuzzy_sync(
         &stats,
     )?;
 
+    // Concepts (ontology) are workspace-global like durable mandates: one trie
+    // across all projects + workspace rollups, keyed by concept name. Backs the
+    // typo-tolerant / prefix legs of `ontology_search` + `{concept}` completion.
+    let concepts_path = concept_trie_path(data_dir);
+    let (concept_idx, _concept_recovery) =
+        FuzzyIndex::<ConceptValue>::open_or_create(&concepts_path)?;
+    report.concepts_synced += sync::rebuild_concepts(pool, &concept_idx).await?;
+    finalize_trie(
+        &concept_idx,
+        &concepts_path,
+        max_disk_bytes,
+        &eviction_cfg,
+        &stats,
+    )?;
+
     stats
         .fuzzy_sync_runs
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -108,7 +133,8 @@ pub async fn run_fuzzy_sync(
         (report.symbols_synced
             + report.paths_synced
             + report.commits_synced
-            + report.durable_mandates_synced) as u64,
+            + report.durable_mandates_synced
+            + report.concepts_synced) as u64,
         std::sync::atomic::Ordering::Relaxed,
     );
 
@@ -150,6 +176,7 @@ pub struct FuzzySyncReport {
     pub paths_synced: usize,
     pub commits_synced: usize,
     pub durable_mandates_synced: usize,
+    pub concepts_synced: usize,
 }
 
 /// Filesystem-safe project slug.

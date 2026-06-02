@@ -2,11 +2,27 @@
 //!
 //! Transitive `is_a` closure + structural **constraint checking**, evaluated via
 //! recursive CTEs (Datalog-equivalent for these queries). The equality-saturation
-//! *canonicalization* half of the chosen reasoning layer is delivered by the
-//! Phase-5 EDC pass (`hierarchy::build_broader_edges`); these two together cover
-//! the deduction + canonicalization intent, behind the `ontology_check` /
-//! `ontology_query` / `ontology_export` tool surface (a future egglog engine can
-//! be swapped in behind the same surface without changing callers).
+//! *canonicalization* half is delivered by the Phase-5 EDC pass
+//! (`hierarchy::build_broader_edges`); together they cover the deduction +
+//! canonicalization intent behind the `ontology_check` / `ontology_query` /
+//! `ontology_export` tool surface.
+//!
+//! ## Future enhancement: egglog (intentionally not a dependency)
+//!
+//! The design (`~/.claude/plans/what-are-the-state-of-the-art-wise-willow.md`)
+//! considered the **egglog** crate (Datalog + e-graph equality saturation) as the
+//! reasoning engine. It is deliberately **not** wired in: the recursive-CTE
+//! deduction here, plus the embedding-cosine EDC canonicalization, already satisfy
+//! every current need — `is_a` acyclicity + invariant-anchoring constraints,
+//! transitive `is_a*`/`part_of*` closure, and near-duplicate concept merging —
+//! with no heavyweight in-process engine and no extra build risk. egglog would
+//! earn its place only if the ontology later needs genuine *equational* rewriting
+//! (canonicalizing morphological / acronym variants by saturation rather than
+//! cosine) or large user-authored Datalog rule sets materialized at scale. The
+//! `ontology_rule` table and the `ontology_check` / `ontology_query` /
+//! `ontology_export` tools are shaped so an egglog engine can be slotted in behind
+//! them with no change to callers or schema — so it can be adopted then, if ever
+//! needed, without a migration.
 
 use serde::Serialize;
 use sqlx::PgPool;

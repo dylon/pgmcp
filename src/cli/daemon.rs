@@ -592,9 +592,9 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     }
 
     // 11f-bis. Schedule the ontology-invariants cron (Phase 3 invariant mining).
-    // Off by default ([ontology] cron_enabled = false). Mines facet='invariant'
-    // concepts + evidence from ADRs / mandate files / commit messages.
-    if config_snapshot.ontology.cron_enabled
+    // Runs by default; set [ontology] cron_interval_secs = 0 to disable. Mines
+    // facet='invariant' concepts + evidence from ADRs / mandate files / commits.
+    if config_snapshot.ontology.cron_interval_secs > 0
         && let Some(pool) = system_ctx.db().pool().cloned()
     {
         let ontology_cfg = config_snapshot.ontology.clone();
@@ -612,9 +612,9 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     }
 
     // 11f-ter. Schedule the ontology-build cron (Phase 4 FCA is_a hierarchy).
-    // Off by default ([ontology] cron_enabled). Runs after invariant mining so
+    // Runs by default (cron_interval_secs > 0). Runs after invariant mining so
     // the concepts it orders already carry facet metadata.
-    if config_snapshot.ontology.cron_enabled
+    if config_snapshot.ontology.cron_interval_secs > 0
         && let Some(pool) = system_ctx.db().pool().cloned()
     {
         let ontology_cfg = config_snapshot.ontology.clone();
@@ -631,10 +631,11 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         });
     }
 
-    // 11f-quater. Schedule the ontology-link-predict cron (Phase 8 optional ML).
-    // Off by default ([ontology] link_predict_enabled). Poincaré-embeds the is_a
-    // DAG and proposes soft `broader` candidate edges (curator-reviewed).
-    if config_snapshot.ontology.link_predict_enabled
+    // 11f-quater. Schedule the ontology-link-predict cron (Phase 8, Poincaré).
+    // Runs by default (cron_interval_secs > 0); CPU-only, deterministic (seed 42).
+    // Poincaré-embeds the is_a DAG and proposes soft `broader` candidate edges
+    // (curator-reviewed — never auto-canonical).
+    if config_snapshot.ontology.cron_interval_secs > 0
         && let Some(pool) = system_ctx.db().pool().cloned()
     {
         let ontology_cfg = config_snapshot.ontology.clone();
@@ -652,9 +653,9 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     }
 
     // 11f-quinquies. Schedule the ontology-reason cron (Phase 9 constraint check).
-    // Off by default ([ontology] reasoning_enabled). Logs is_a-acyclicity +
-    // invariant-anchoring violations; detail on demand via `ontology_check`.
-    if config_snapshot.ontology.reasoning_enabled
+    // Runs by default (cron_interval_secs > 0). Recursive-CTE deduction: logs
+    // is_a-acyclicity + invariant-anchoring violations; detail via `ontology_check`.
+    if config_snapshot.ontology.cron_interval_secs > 0
         && let Some(pool) = system_ctx.db().pool().cloned()
     {
         let ontology_cfg = config_snapshot.ontology.clone();
@@ -671,9 +672,9 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     }
 
     // 11f-sexies. Schedule the ontology-migrate cron (Phase 10): fold the
-    // software-pattern catalog into the ontology. Gated on [ontology] cron_enabled;
-    // idempotent, so the recurring run is a no-op after the first import.
-    if config_snapshot.ontology.cron_enabled
+    // software-pattern catalog into the ontology. Runs by default
+    // (cron_interval_secs > 0); idempotent, so reruns no-op after the first import.
+    if config_snapshot.ontology.cron_interval_secs > 0
         && let Some(pool) = system_ctx.db().pool().cloned()
     {
         let ontology_cfg = config_snapshot.ontology.clone();
@@ -692,8 +693,8 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
 
     // 11f-septies. Schedule the ontology-integrate cron (Phase 11): attach analyzer
     // findings (concurrency v22) as evidence to the concepts governing that code.
-    // Gated on [ontology] cron_enabled; idempotent.
-    if config_snapshot.ontology.cron_enabled
+    // Runs by default (cron_interval_secs > 0); idempotent.
+    if config_snapshot.ontology.cron_interval_secs > 0
         && let Some(pool) = system_ctx.db().pool().cloned()
     {
         let ontology_cfg = config_snapshot.ontology.clone();

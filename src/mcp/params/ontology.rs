@@ -8,6 +8,14 @@ pub struct OntologyTreeParams {
     /// Facet to show (e.g. "invariant", "concurrency"); omit for all facets.
     #[serde(default)]
     pub facet: Option<String>,
+    /// Subtree mode: a concept (name or id) whose hierarchy *descendants* to
+    /// return (more-specific concepts reachable via is_a/part_of/broader). When
+    /// set, `facet` is ignored and the response is the bounded subtree.
+    #[serde(default)]
+    pub root_concept: Option<String>,
+    /// Max hops for `root_concept` subtree traversal (default 5, clamped 1..=50).
+    #[serde(default)]
+    pub depth: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]

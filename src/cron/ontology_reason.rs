@@ -1,7 +1,7 @@
 //! `ontology-reason` cron (Phase 9): periodic deductive constraint check over
 //! the ontology (is_a acyclicity + invariants-must-anchor), logging a summary.
-//! The on-demand detail is served by the `ontology_check` tool. Opt-in
-//! (`[ontology] reasoning_enabled`, default off).
+//! The on-demand detail is served by the `ontology_check` tool. Runs by default;
+//! set `[ontology] cron_interval_secs = 0` to disable.
 
 use std::sync::Arc;
 
