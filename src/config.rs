@@ -434,6 +434,10 @@ pub struct DigestConfig {
     /// at least two health snapshots exist.
     #[serde(default)]
     pub include_concurrency: bool,
+    /// Include the ONTOLOGY pillar — design invariants governing files in scope
+    /// (the read-only constraint-surfacing / anti-mistake path). On by default.
+    #[serde(default = "default_true_digest")]
+    pub include_ontology: bool,
     /// Optional outbound webhook. Empty (the default) = no outbound POST. When
     /// set, the daemon fires the digest (fire-and-forget) on the observe path,
     /// gated on `max_severity() >= webhook_min_severity`.
@@ -461,6 +465,7 @@ impl Default for DigestConfig {
             max_bytes: default_digest_max_bytes(),
             include_trends: default_true_digest(),
             include_concurrency: false,
+            include_ontology: default_true_digest(),
             webhook_url: String::new(),
             webhook_min_severity: default_digest_webhook_min_severity(),
             pg_notify: false,

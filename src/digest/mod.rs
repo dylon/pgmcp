@@ -120,6 +120,8 @@ pub enum DigestCategory {
     Trend,
     /// Concurrency defects (deadlock cycles, blocked receives, lock contention).
     Concurrency,
+    /// Ontology design invariants governing files in scope (read-only surfacing).
+    Ontology,
 }
 
 impl DigestCategory {
@@ -127,8 +129,13 @@ impl DigestCategory {
     /// by the golden test); `#[allow(dead_code)]` documents it has no non-test
     /// caller — `as_str`/`heading` are reached per-item during rendering.
     #[allow(dead_code)]
-    pub const ALL: &'static [DigestCategory] =
-        &[Self::Tracker, Self::Health, Self::Trend, Self::Concurrency];
+    pub const ALL: &'static [DigestCategory] = &[
+        Self::Tracker,
+        Self::Health,
+        Self::Trend,
+        Self::Concurrency,
+        Self::Ontology,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -136,6 +143,7 @@ impl DigestCategory {
             Self::Health => "health",
             Self::Trend => "trend",
             Self::Concurrency => "concurrency",
+            Self::Ontology => "ontology",
         }
     }
 
@@ -146,6 +154,7 @@ impl DigestCategory {
             Self::Health => "Health",
             Self::Trend => "Trend",
             Self::Concurrency => "Concurrency",
+            Self::Ontology => "Ontology",
         }
     }
 }
@@ -376,8 +385,50 @@ pub async fn compose_digest(
     if cfg.include_concurrency {
         collect_concurrency(pool, project_id, &mut items).await;
     }
+    if cfg.include_ontology {
+        collect_ontology(pool, project_id, &mut items).await;
+    }
 
     Digest { items }
+}
+
+/// ONTOLOGY: design invariants governing files in scope — the "constraint
+/// surfacing" anti-mistake path. Read-only (a single SELECT). Canonical
+/// invariants surface at High severity; non-canonical (e.g. agent-asserted)
+/// ones are surfaced too but visibly labeled `(candidate)` and de-emphasized,
+/// so unverified assertions are not mistaken for established rules.
+async fn collect_ontology(pool: &PgPool, project_id: Option<i32>, out: &mut Vec<DigestItem>) {
+    let rows: Result<Vec<(String, Option<String>, String)>, _> = sqlx::query_as(
+        "SELECT DISTINCT e.name, m.constraint_text, m.status
+         FROM ontology_concept_meta m
+         JOIN memory_entities e     ON e.id = m.entity_id AND e.valid_to IS NULL
+         JOIN memory_code_anchor a  ON a.entity_id = m.entity_id
+         LEFT JOIN file_symbols s   ON s.id = a.symbol_id
+         JOIN indexed_files f       ON f.id = COALESCE(a.file_id, s.file_id)
+         WHERE m.facet = 'invariant' AND ($1::int IS NULL OR f.project_id = $1)
+         ORDER BY (m.status = 'canonical') DESC, m.confidence DESC
+         LIMIT 8",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await;
+    let Ok(rows) = rows else {
+        return;
+    };
+    for (name, constraint, status) in rows {
+        let Some(constraint) = constraint else {
+            continue;
+        };
+        let (sev, text) = if status == "canonical" {
+            (DigestSeverity::High, format!("invariant `{name}`: {constraint}"))
+        } else {
+            (
+                DigestSeverity::Notice,
+                format!("invariant `{name}` (candidate): {constraint}"),
+            )
+        };
+        out.push(DigestItem::new(sev, DigestCategory::Ontology, text));
+    }
 }
 
 /// TRACKER: overdue / blocked / needs-triage / next-actionable buckets.
