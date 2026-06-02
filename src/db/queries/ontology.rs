@@ -329,6 +329,205 @@ pub async fn list_concept_ids_by_facet(
     .await
 }
 
+/// A named hierarchy edge between two concepts (for the `ontology_tree` view).
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ConceptEdgeRow {
+    pub child_id: i64,
+    pub child_name: String,
+    pub parent_id: i64,
+    pub parent_name: String,
+    pub relation: String,
+}
+
+/// An evidence pointer row (for `ontology_concept`).
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ConceptEvidenceRow {
+    pub evidence_kind: String,
+    pub commit_id: Option<i64>,
+    pub file_id: Option<i64>,
+    pub mandate_ref: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Active hierarchy edges (`is_a`/`part_of`/`broader`) among one facet's
+/// concepts, with both endpoints' names — the `ontology_tree` payload.
+pub async fn concept_hierarchy_edges(
+    pool: &PgPool,
+    facet: Facet,
+) -> Result<Vec<ConceptEdgeRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT r.from_entity_id AS child_id, cf.name AS child_name,
+                r.to_entity_id AS parent_id, pf.name AS parent_name, r.relation_type AS relation
+         FROM memory_relations r
+         JOIN ontology_concept_meta cm ON cm.entity_id = r.from_entity_id AND cm.facet = $1
+         JOIN ontology_concept_meta pm ON pm.entity_id = r.to_entity_id   AND pm.facet = $1
+         JOIN memory_entities cf ON cf.id = r.from_entity_id AND cf.valid_to IS NULL
+         JOIN memory_entities pf ON pf.id = r.to_entity_id   AND pf.valid_to IS NULL
+         WHERE r.relation_type IN ('is_a','part_of','broader') AND r.valid_to IS NULL
+         ORDER BY r.from_entity_id, r.to_entity_id",
+    )
+    .bind(facet.as_str())
+    .fetch_all(pool)
+    .await
+}
+
+/// Resolve a concept reference (numeric id string or exact name) → entity id.
+pub async fn resolve_concept(
+    pool: &PgPool,
+    name_or_id: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    if let Ok(id) = name_or_id.parse::<i64>() {
+        let hit: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM memory_entities \
+             WHERE id = $1 AND entity_type = 'concept' AND valid_to IS NULL",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+        if hit.is_some() {
+            return Ok(hit);
+        }
+    }
+    sqlx::query_scalar(
+        "SELECT id FROM memory_entities \
+         WHERE name = $1 AND entity_type = 'concept' AND valid_to IS NULL ORDER BY id LIMIT 1",
+    )
+    .bind(name_or_id)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Substring search over concept names, optionally facet-filtered.
+pub async fn search_concepts_by_name(
+    pool: &PgPool,
+    query: &str,
+    facet: Option<Facet>,
+    limit: i64,
+) -> Result<Vec<ConceptBriefRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT e.id AS entity_id, e.name, m.facet, m.status, m.confidence
+         FROM ontology_concept_meta m
+         JOIN memory_entities e ON e.id = m.entity_id AND e.valid_to IS NULL
+         WHERE e.name ILIKE '%' || $1 || '%'
+           AND ($2::text IS NULL OR m.facet = $2)
+         ORDER BY (m.status = 'canonical') DESC, m.confidence DESC, e.id
+         LIMIT $3",
+    )
+    .bind(query)
+    .bind(facet.map(|f| f.as_str()))
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Evidence rows backing a concept (for `ontology_concept`).
+pub async fn list_concept_evidence(
+    pool: &PgPool,
+    entity_id: i64,
+) -> Result<Vec<ConceptEvidenceRow>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT evidence_kind, commit_id, file_id, mandate_ref, detail
+         FROM ontology_concept_evidence WHERE entity_id = $1 ORDER BY id",
+    )
+    .bind(entity_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Get-or-create a concept entity (by active name) + its facet metadata. The
+/// `actor` sets provenance: an agent's concepts are `agent_write`, a user's are
+/// `user_explicit`; the auto-miner's `auto_index` path is separate and never
+/// clobbers these. Returns `(entity_id, created)`.
+pub async fn create_concept(
+    pool: &PgPool,
+    name: &str,
+    facet: Facet,
+    actor: Actor,
+) -> Result<(i64, bool), sqlx::Error> {
+    let source = match actor {
+        Actor::Agent => "agent_write",
+        _ => "user_explicit",
+    };
+    let existing: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM memory_entities \
+         WHERE name = $1 AND entity_type = 'concept' AND valid_to IS NULL LIMIT 1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    let (entity_id, created) = match existing {
+        Some(id) => (id, false),
+        None => {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO memory_entities (name, entity_type, source) \
+                 VALUES ($1, 'concept', $2::memory_source) RETURNING id",
+            )
+            .bind(name)
+            .bind(source)
+            .fetch_one(pool)
+            .await?;
+            (id, true)
+        }
+    };
+    let build_method = match actor {
+        Actor::Agent => "agent",
+        _ => "user",
+    };
+    upsert_concept_meta(pool, entity_id, facet, build_method, None).await?;
+    Ok((entity_id, created))
+}
+
+/// Agent-authored invariant assertion: create the concept, set its invariant
+/// metadata (always `status='candidate'` — an agent CANNOT self-canonicalize),
+/// attach `kind='agent'` evidence, and (optionally) anchor it to a file. Returns
+/// the concept entity id.
+pub async fn agent_assert_invariant(
+    pool: &PgPool,
+    name: &str,
+    constraint_text: &str,
+    rationale: &str,
+    file_id: Option<i64>,
+) -> Result<i64, sqlx::Error> {
+    let (entity_id, _) = create_concept(pool, name, Facet::Invariant, Actor::Agent).await?;
+    upsert_invariant_meta(pool, entity_id, constraint_text, rationale, "agent", None).await?;
+    let provenance_key = format!("agent:{entity_id}:{name}");
+    insert_concept_evidence(
+        pool,
+        entity_id,
+        EvidenceKind::Agent,
+        None,
+        file_id,
+        None,
+        Some(constraint_text),
+        &provenance_key,
+    )
+    .await?;
+    if let Some(fid) = file_id {
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM memory_code_anchor \
+             WHERE entity_id = $1 AND file_id = $2 AND anchor_type = 'concept_code')",
+        )
+        .bind(entity_id)
+        .bind(fid)
+        .fetch_one(pool)
+        .await?;
+        if !exists {
+            crate::db::queries::memory_anchor_entity(
+                pool,
+                entity_id,
+                Some(fid),
+                None,
+                None,
+                None,
+                None,
+                "concept_code",
+            )
+            .await?;
+        }
+    }
+    Ok(entity_id)
+}
+
 /// Same-facet concept pairs whose observation embeddings are within cosine
 /// distance `1 - tau` (i.e. cosine similarity ≥ `tau`) — the EDC canonicalization
 /// candidate set (Phase 5). One embedding per concept (its lowest-id embedded

@@ -27,6 +27,7 @@ pub mod fix_helpers;
 pub mod sema_helpers;
 pub mod sota_helpers;
 pub mod sota_regex_scan;
+pub mod tool_ontology;
 
 pub mod tool_adoption_lag;
 pub mod tool_adoption_report;

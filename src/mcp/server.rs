@@ -63,6 +63,8 @@ mod handlers_memory_crud;
 mod handlers_memory_search;
 #[path = "server/handlers/ml_embedding.rs"]
 mod handlers_ml_embedding;
+#[path = "server/handlers/ontology.rs"]
+mod handlers_ontology;
 #[path = "server/handlers/patterns.rs"]
 mod handlers_patterns;
 #[path = "server/handlers/prediction.rs"]
@@ -384,6 +386,7 @@ impl McpServer {
             + Self::router_core_advanced()
             + Self::router_sema()
             + Self::router_fuzzy()
+            + Self::router_ontology()
     }
 }
 

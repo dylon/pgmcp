@@ -1,0 +1,67 @@
+//! Parameter structs for the `ontology_*` MCP tools (Phase 6).
+
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OntologyTreeParams {
+    /// Facet to show (e.g. "invariant", "concurrency"); omit for all facets.
+    #[serde(default)]
+    pub facet: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OntologyConceptParams {
+    /// Concept name or numeric entity id.
+    pub concept: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OntologySearchParams {
+    /// Substring to match against concept names.
+    pub query: String,
+    /// Optional facet filter.
+    #[serde(default)]
+    pub facet: Option<String>,
+    /// Max results (default 30).
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OntologyInvariantsForFileParams {
+    /// File path (relative or absolute) to surface governing invariants for.
+    pub file: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OntologyAssertInvariantParams {
+    /// Short name for the invariant concept.
+    pub name: String,
+    /// The constraint sentence (the rule).
+    pub constraint_text: String,
+    /// Why it holds (optional).
+    #[serde(default)]
+    pub rationale: Option<String>,
+    /// Optional file the invariant governs (anchors it for surfacing).
+    #[serde(default)]
+    pub file: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OntologyCreateConceptParams {
+    /// Concept name.
+    pub name: String,
+    /// Facet (e.g. "tool", "system", "collection", "algorithm", ...).
+    pub facet: String,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OntologyLinkParams {
+    /// Source concept (name or id).
+    pub from: String,
+    /// Target concept (name or id).
+    pub to: String,
+    /// Relation: is_a | part_of | broader | narrower | member_of.
+    pub relation: String,
+}
