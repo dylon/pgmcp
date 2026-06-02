@@ -670,6 +670,26 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         });
     }
 
+    // 11f-sexies. Schedule the ontology-migrate cron (Phase 10): fold the
+    // software-pattern catalog into the ontology. Gated on [ontology] cron_enabled;
+    // idempotent, so the recurring run is a no-op after the first import.
+    if config_snapshot.ontology.cron_enabled
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let ontology_cfg = config_snapshot.ontology.clone();
+        let interval_ms = ontology_cfg.cron_interval_secs.saturating_mul(1000);
+        let rt_for_ontology_mig = tokio::runtime::Handle::current();
+        // 150s: run before the hierarchy build (240s) so pattern concepts exist.
+        cron_handle.schedule_recurring(150_000, interval_ms, "ontology-migrate", move || {
+            let pool = pool.clone();
+            let cfg = ontology_cfg.clone();
+            rt_for_ontology_mig.spawn(async move {
+                cron::ontology_migrate::run_or_log(Arc::new(pool), cfg).await;
+            });
+            true
+        });
+    }
+
     // 11g. Schedule the trajectory-similarity cron (Stage 5c MSM evolves_like).
     // Off by default ([cron.trajectory_similarity] cron_enabled = false).
     if config_snapshot.cron.trajectory_similarity.cron_enabled

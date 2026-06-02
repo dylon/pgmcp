@@ -47,6 +47,8 @@ pub mod ontology_invariants;
 
 pub mod ontology_link_predict;
 
+pub mod ontology_migrate;
+
 pub mod ontology_reason;
 #[allow(dead_code)]
 pub mod quality_history;

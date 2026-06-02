@@ -329,6 +329,67 @@ pub async fn list_concept_ids_by_facet(
     .await
 }
 
+/// Software-pattern catalog rows for migration: `(slug, name, category, kind)`.
+pub async fn load_software_patterns(
+    pool: &PgPool,
+) -> Result<Vec<(String, String, String, String)>, sqlx::Error> {
+    sqlx::query_as("SELECT slug, name, category, kind FROM software_patterns ORDER BY id")
+        .fetch_all(pool)
+        .await
+}
+
+/// Get-or-create a `source='migration'` concept entity (by active name) + its
+/// facet metadata — the Phase-10 taxonomy-import path. Returns `(entity_id,
+/// created)`. Curation-safe (the meta upsert only refreshes a `candidate`).
+pub async fn migrate_concept(
+    pool: &PgPool,
+    name: &str,
+    facet: Facet,
+    build_method: &str,
+) -> Result<(i64, bool), sqlx::Error> {
+    let existing: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM memory_entities \
+         WHERE name = $1 AND entity_type = 'concept' AND valid_to IS NULL LIMIT 1",
+    )
+    .bind(name)
+    .fetch_optional(pool)
+    .await?;
+    let (entity_id, created) = match existing {
+        Some(id) => (id, false),
+        None => {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO memory_entities (name, entity_type, source) \
+                 VALUES ($1, 'concept', 'migration'::memory_source) RETURNING id",
+            )
+            .bind(name)
+            .fetch_one(pool)
+            .await?;
+            (id, true)
+        }
+    };
+    upsert_concept_meta(pool, entity_id, facet, build_method, None).await?;
+    Ok((entity_id, created))
+}
+
+/// Upsert a small structured attribute on a concept (`ontology_concept_attr`).
+pub async fn set_concept_attr(
+    pool: &PgPool,
+    entity_id: i64,
+    key: &str,
+    value: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO ontology_concept_attr (entity_id, key, value) VALUES ($1, $2, $3)
+         ON CONFLICT (entity_id, key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(entity_id)
+    .bind(key)
+    .bind(value)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Concept entity-ids that lie on an `is_a` cycle (reachable from themselves).
 /// The recursive CTE uses `UNION` (set semantics) so it terminates even when a
 /// cycle exists. An empty result means the `is_a` graph is a DAG.
