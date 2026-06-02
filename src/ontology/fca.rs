@@ -82,10 +82,10 @@ mod tests {
     fn cover_is_transitive_reduction() {
         // R{} ⊂ M{1} ⊂ {S1{1,2}, S2{1,3}}.
         let concepts = vec![
-            ConceptAttrs::new(10, []),        // R — most general
-            ConceptAttrs::new(20, [1]),       // M
-            ConceptAttrs::new(30, [1, 2]),    // S1
-            ConceptAttrs::new(40, [1, 3]),    // S2
+            ConceptAttrs::new(10, []),     // R — most general
+            ConceptAttrs::new(20, [1]),    // M
+            ConceptAttrs::new(30, [1, 2]), // S1
+            ConceptAttrs::new(40, [1, 3]), // S2
         ];
         let mut edges = is_a_cover(&concepts);
         edges.sort_unstable();
@@ -95,10 +95,7 @@ mod tests {
 
     #[test]
     fn equal_attribute_sets_are_not_is_a() {
-        let concepts = vec![
-            ConceptAttrs::new(1, [1, 2]),
-            ConceptAttrs::new(2, [1, 2]),
-        ];
+        let concepts = vec![ConceptAttrs::new(1, [1, 2]), ConceptAttrs::new(2, [1, 2])];
         assert!(is_a_cover(&concepts).is_empty());
     }
 
@@ -106,16 +103,19 @@ mod tests {
     fn diamond_keeps_both_paths_but_no_shortcut() {
         // bottom{1,2,3} ⊃ {A{1,2}, B{1,3}} ⊃ top{1}
         let concepts = vec![
-            ConceptAttrs::new(1, [1]),          // top
-            ConceptAttrs::new(2, [1, 2]),       // A
-            ConceptAttrs::new(3, [1, 3]),       // B
-            ConceptAttrs::new(4, [1, 2, 3]),    // bottom
+            ConceptAttrs::new(1, [1]),       // top
+            ConceptAttrs::new(2, [1, 2]),    // A
+            ConceptAttrs::new(3, [1, 3]),    // B
+            ConceptAttrs::new(4, [1, 2, 3]), // bottom
         ];
         let mut edges = is_a_cover(&concepts);
         edges.sort_unstable();
         // bottom is_a A, bottom is_a B, A is_a top, B is_a top. No bottom is_a top.
         assert_eq!(edges, vec![(2, 1), (3, 1), (4, 2), (4, 3)]);
-        assert!(!edges.contains(&(4, 1)), "transitive shortcut must be removed");
+        assert!(
+            !edges.contains(&(4, 1)),
+            "transitive shortcut must be removed"
+        );
     }
 
     #[test]

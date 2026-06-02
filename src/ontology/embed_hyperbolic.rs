@@ -51,7 +51,6 @@ fn arccosh(x: f64) -> f64 {
 
 /// A trained Poincaré embedding over `n` nodes.
 pub struct PoincareModel {
-    dim: usize,
     emb: Vec<Vec<f64>>,
 }
 
@@ -64,14 +63,6 @@ impl PoincareModel {
     /// L2 norm of node `i` (its tree depth proxy: larger ⇒ more specific).
     pub fn norm(&self, i: usize) -> f64 {
         dot(&self.emb[i], &self.emb[i]).sqrt()
-    }
-
-    pub fn len(&self) -> usize {
-        self.emb.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.emb.is_empty()
     }
 
     /// Propose `child is_a parent` edges for unlinked pairs that are within
@@ -160,7 +151,7 @@ pub fn train(
         .map(|_| (0..dim).map(|_| rng.uniform(1e-3)).collect())
         .collect();
     if n_nodes < 2 || edges.is_empty() {
-        return PoincareModel { dim, emb };
+        return PoincareModel { emb };
     }
 
     for _ in 0..epochs {
@@ -176,7 +167,10 @@ pub fn train(
                 cands.push(q);
             }
             // Softmax over -distance; the positive (index 0) target prob 1.
-            let dists: Vec<f64> = cands.iter().map(|&q| poincare_distance(&emb[c], &emb[q])).collect();
+            let dists: Vec<f64> = cands
+                .iter()
+                .map(|&q| poincare_distance(&emb[c], &emb[q]))
+                .collect();
             let max_neg = dists.iter().cloned().fold(f64::MIN, f64::max);
             let exps: Vec<f64> = dists.iter().map(|d| (-(d - max_neg)).exp()).collect();
             let z: f64 = exps.iter().sum::<f64>().max(EPS);
@@ -213,7 +207,7 @@ pub fn train(
             project(&mut emb[c]);
         }
     }
-    PoincareModel { dim, emb }
+    PoincareModel { emb }
 }
 
 #[cfg(test)]
@@ -224,7 +218,6 @@ mod tests {
     #[test]
     fn distance_is_symmetric_and_zero_on_self() {
         let m = PoincareModel {
-            dim: 2,
             emb: vec![vec![0.1, 0.2], vec![-0.3, 0.05]],
         };
         assert!((m.distance(0, 1) - m.distance(1, 0)).abs() < 1e-9);

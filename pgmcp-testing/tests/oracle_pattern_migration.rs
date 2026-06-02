@@ -38,7 +38,14 @@ async fn pattern_catalog_migrates_to_concept_hierarchy() {
     let pool = db.pool();
     seed_pattern(pool, "visitor", "Visitor", "pattern", "gof").await;
     seed_pattern(pool, "observer", "Observer", "pattern", "gof").await;
-    seed_pattern(pool, "god-object", "God Object", "anti_pattern", "code_smells").await;
+    seed_pattern(
+        pool,
+        "god-object",
+        "God Object",
+        "anti_pattern",
+        "code_smells",
+    )
+    .await;
 
     run_ontology_migrate(pool).await.expect("migrate");
 
@@ -57,7 +64,11 @@ async fn pattern_catalog_migrates_to_concept_hierarchy() {
         .unwrap()
         .expect("gof paradigm concept");
     assert_eq!(
-        queries::get_concept_meta(pool, gid).await.unwrap().unwrap().facet,
+        queries::get_concept_meta(pool, gid)
+            .await
+            .unwrap()
+            .unwrap()
+            .facet,
         "paradigm"
     );
     let isa: Vec<(i64, i64)> = sqlx::query_as(

@@ -40,7 +40,10 @@ pub async fn run_ontology_integrate(pool: &PgPool) -> Result<(), sqlx::Error> {
             attached += 1;
         }
     }
-    info!(finding_evidence_attached = attached, "ontology-integrate complete");
+    info!(
+        finding_evidence_attached = attached,
+        "ontology-integrate complete"
+    );
     Ok(())
 }
 

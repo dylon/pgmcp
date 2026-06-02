@@ -32,7 +32,9 @@ async fn agent_asserted_invariant_is_candidate_only() {
         meta.status, "candidate",
         "TRUST BOUNDARY: an agent-authored invariant must be candidate, never canonical"
     );
-    let ev = queries::list_concept_evidence(pool, eid).await.expect("evidence");
+    let ev = queries::list_concept_evidence(pool, eid)
+        .await
+        .expect("evidence");
     assert!(
         ev.iter().any(|e| e.evidence_kind == "agent"),
         "agent-kind evidence recorded"
@@ -44,10 +46,14 @@ async fn create_concept_and_facet_filtered_search() {
     let db = pgmcp_testing::require_test_db!();
     let pool = db.pool();
 
-    let (cid, created) =
-        queries::create_concept(pool, "Formal Verification Systems", Facet::Collection, Actor::Agent)
-            .await
-            .expect("create");
+    let (cid, created) = queries::create_concept(
+        pool,
+        "Formal Verification Systems",
+        Facet::Collection,
+        Actor::Agent,
+    )
+    .await
+    .expect("create");
     assert!(created);
 
     let hits = queries::search_concepts_by_name(pool, "Formal Verification", None, 10)
@@ -61,10 +67,9 @@ async fn create_concept_and_facet_filtered_search() {
             .await
             .expect("search facet");
     assert!(in_collection.iter().any(|h| h.entity_id == cid));
-    let in_algorithm =
-        queries::search_concepts_by_name(pool, "Formal", Some(Facet::Algorithm), 10)
-            .await
-            .expect("search wrong facet");
+    let in_algorithm = queries::search_concepts_by_name(pool, "Formal", Some(Facet::Algorithm), 10)
+        .await
+        .expect("search wrong facet");
     assert!(!in_algorithm.iter().any(|h| h.entity_id == cid));
 }
 
@@ -76,10 +81,14 @@ async fn hierarchy_edges_and_resolve() {
     let (parent, _) = queries::create_concept(pool, "Parser", Facet::Component, Actor::User)
         .await
         .expect("parent");
-    let (child, _) =
-        queries::create_concept(pool, "RecursiveDescentParser", Facet::Component, Actor::User)
-            .await
-            .expect("child");
+    let (child, _) = queries::create_concept(
+        pool,
+        "RecursiveDescentParser",
+        Facet::Component,
+        Actor::User,
+    )
+    .await
+    .expect("child");
     queries::insert_ontology_edge(pool, child, parent, OntologyRelation::IsA, 1.0)
         .await
         .expect("link");
@@ -94,10 +103,20 @@ async fn hierarchy_edges_and_resolve() {
         "is_a edge with names surfaces in the tree payload"
     );
 
-    assert_eq!(queries::resolve_concept(pool, "Parser").await.unwrap(), Some(parent));
     assert_eq!(
-        queries::resolve_concept(pool, &parent.to_string()).await.unwrap(),
+        queries::resolve_concept(pool, "Parser").await.unwrap(),
         Some(parent)
     );
-    assert_eq!(queries::resolve_concept(pool, "NoSuchConcept").await.unwrap(), None);
+    assert_eq!(
+        queries::resolve_concept(pool, &parent.to_string())
+            .await
+            .unwrap(),
+        Some(parent)
+    );
+    assert_eq!(
+        queries::resolve_concept(pool, "NoSuchConcept")
+            .await
+            .unwrap(),
+        None
+    );
 }

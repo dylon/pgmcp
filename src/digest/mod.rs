@@ -420,7 +420,10 @@ async fn collect_ontology(pool: &PgPool, project_id: Option<i32>, out: &mut Vec<
             continue;
         };
         let (sev, text) = if status == "canonical" {
-            (DigestSeverity::High, format!("invariant `{name}`: {constraint}"))
+            (
+                DigestSeverity::High,
+                format!("invariant `{name}`: {constraint}"),
+            )
         } else {
             (
                 DigestSeverity::Notice,

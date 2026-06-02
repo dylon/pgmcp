@@ -76,7 +76,8 @@ pub async fn run_memory_concepts(
         // the ontology sidecar. Idempotent + curation-safe (see
         // queries::upsert_concept_meta — a curator-set status is never clobbered).
         let facet = crate::ontology::classify::classify_topic_concept(pool, *topic_id, label).await;
-        if let Err(e) = queries::upsert_concept_meta(pool, entity_id, facet, "topic_seed", None).await
+        if let Err(e) =
+            queries::upsert_concept_meta(pool, entity_id, facet, "topic_seed", None).await
         {
             warn!(error = %e, entity_id, "ontology concept meta upsert failed");
         }

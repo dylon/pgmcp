@@ -33,65 +33,162 @@ const CUE_RULES: &[CueRule] = &[
     CueRule {
         facet: Facet::Concurrency,
         needles: &[
-            "lock", "mutex", "rwlock", "async", "await", "channel", "thread",
-            "atomic", "concurren", "parallel", "semaphore", "deadlock", "spawn",
-            "tokio", "rayon", "barrier", "condvar",
+            "lock",
+            "mutex",
+            "rwlock",
+            "async",
+            "await",
+            "channel",
+            "thread",
+            "atomic",
+            "concurren",
+            "parallel",
+            "semaphore",
+            "deadlock",
+            "spawn",
+            "tokio",
+            "rayon",
+            "barrier",
+            "condvar",
         ],
     },
     CueRule {
         facet: Facet::Security,
         needles: &[
-            "auth", "crypto", "secret", "passwd", "password", "sanitiz", "inject",
-            "vulnerab", "exploit", "encrypt", "decrypt", "tls", "ssl", "permission",
-            "sandbox", "taint", "credential", "oauth", "jwt", "cve",
+            "auth",
+            "crypto",
+            "secret",
+            "passwd",
+            "password",
+            "sanitiz",
+            "inject",
+            "vulnerab",
+            "exploit",
+            "encrypt",
+            "decrypt",
+            "tls",
+            "ssl",
+            "permission",
+            "sandbox",
+            "taint",
+            "credential",
+            "oauth",
+            "jwt",
+            "cve",
         ],
     },
     CueRule {
         facet: Facet::Protocol,
         needles: &[
-            "protocol", "handshake", "grpc", "rpc", "http", "mpst", "cfsm",
-            "session_type", "wire_format", "codec",
+            "protocol",
+            "handshake",
+            "grpc",
+            "rpc",
+            "http",
+            "mpst",
+            "cfsm",
+            "session_type",
+            "wire_format",
+            "codec",
         ],
     },
     CueRule {
         facet: Facet::DataStructure,
         needles: &[
-            "trie", "dawg", "automaton", "hashmap", "btree", "queue", "deque",
-            "stack", "heap", "ringbuffer", "buffer", "bitset", "bloom", "lattice",
-            "linkedlist", "hashset", "dictionary",
+            "trie",
+            "dawg",
+            "automaton",
+            "hashmap",
+            "btree",
+            "queue",
+            "deque",
+            "stack",
+            "heap",
+            "ringbuffer",
+            "buffer",
+            "bitset",
+            "bloom",
+            "lattice",
+            "linkedlist",
+            "hashset",
+            "dictionary",
         ],
     },
     CueRule {
         facet: Facet::Algorithm,
         needles: &[
-            "sort", "dijkstra", "levenshtein", "kmeans", "clustering", "traversal",
-            "greedy", "backtrack", "memoiz", "pagerank", "viterbi", "knapsack",
-            "fft", "gradient", "heuristic", "search_algo",
+            "sort",
+            "dijkstra",
+            "levenshtein",
+            "kmeans",
+            "clustering",
+            "traversal",
+            "greedy",
+            "backtrack",
+            "memoiz",
+            "pagerank",
+            "viterbi",
+            "knapsack",
+            "fft",
+            "gradient",
+            "heuristic",
+            "search_algo",
         ],
     },
     CueRule {
         facet: Facet::DesignPattern,
         needles: &[
-            "visitor", "singleton", "observer", "decorator", "factory_pattern",
-            "facade", "adapter_pattern", "memento", "flyweight", "proxy_pattern",
+            "visitor",
+            "singleton",
+            "observer",
+            "decorator",
+            "factory_pattern",
+            "facade",
+            "adapter_pattern",
+            "memento",
+            "flyweight",
+            "proxy_pattern",
         ],
     },
     CueRule {
         facet: Facet::EngineeringPractice,
         needles: &[
-            "unittest", "integration_test", "benchmark", "lint", "telemetry",
-            "logging", "tracing", "profiling", "fuzz", "ci_pipeline", "coverage",
+            "unittest",
+            "integration_test",
+            "benchmark",
+            "lint",
+            "telemetry",
+            "logging",
+            "tracing",
+            "profiling",
+            "fuzz",
+            "ci_pipeline",
+            "coverage",
         ],
     },
     CueRule {
         facet: Facet::Architecture,
-        needles: &["architecture", "subsystem", "boundary", "topology", "layering"],
+        needles: &[
+            "architecture",
+            "subsystem",
+            "boundary",
+            "topology",
+            "layering",
+        ],
     },
     CueRule {
         facet: Facet::Component,
         needles: &[
-            "daemon", "service", "controller", "repository", "gateway", "scheduler",
-            "dispatcher", "registry", "orchestrator", "supervisor",
+            "daemon",
+            "service",
+            "controller",
+            "repository",
+            "gateway",
+            "scheduler",
+            "dispatcher",
+            "registry",
+            "orchestrator",
+            "supervisor",
         ],
     },
 ];
@@ -174,14 +271,35 @@ mod tests {
 
     #[test]
     fn cues_classify_obvious_labels() {
-        assert_eq!(facet_from_text("mutex lock guard"), Some(Facet::Concurrency));
-        assert_eq!(facet_from_text("async runtime channel"), Some(Facet::Concurrency));
+        assert_eq!(
+            facet_from_text("mutex lock guard"),
+            Some(Facet::Concurrency)
+        );
+        assert_eq!(
+            facet_from_text("async runtime channel"),
+            Some(Facet::Concurrency)
+        );
         assert_eq!(facet_from_text("oauth token crypto"), Some(Facet::Security));
-        assert_eq!(facet_from_text("persistent trie dawg"), Some(Facet::DataStructure));
-        assert_eq!(facet_from_text("levenshtein automaton"), Some(Facet::DataStructure)); // 'automaton' (DS) before 'levenshtein' only if DS precedes algo
-        assert_eq!(facet_from_text("dijkstra shortest path"), Some(Facet::Algorithm));
-        assert_eq!(facet_from_text("grpc handshake codec"), Some(Facet::Protocol));
-        assert_eq!(facet_from_text("background daemon service"), Some(Facet::Component));
+        assert_eq!(
+            facet_from_text("persistent trie dawg"),
+            Some(Facet::DataStructure)
+        );
+        assert_eq!(
+            facet_from_text("levenshtein automaton"),
+            Some(Facet::DataStructure)
+        ); // 'automaton' (DS) before 'levenshtein' only if DS precedes algo
+        assert_eq!(
+            facet_from_text("dijkstra shortest path"),
+            Some(Facet::Algorithm)
+        );
+        assert_eq!(
+            facet_from_text("grpc handshake codec"),
+            Some(Facet::Protocol)
+        );
+        assert_eq!(
+            facet_from_text("background daemon service"),
+            Some(Facet::Component)
+        );
     }
 
     #[test]

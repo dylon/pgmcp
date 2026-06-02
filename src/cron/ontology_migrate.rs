@@ -36,7 +36,9 @@ pub async fn run_ontology_migrate(pool: &PgPool) -> Result<(), sqlx::Error> {
                 let (id, _) =
                     queries::migrate_concept(pool, &category, Facet::Paradigm, "pattern_catalog")
                         .await?;
-                let _ = queries::set_concept_status(pool, id, ConceptStatus::Canonical, Actor::System).await;
+                let _ =
+                    queries::set_concept_status(pool, id, ConceptStatus::Canonical, Actor::System)
+                        .await;
                 paradigms.insert(category.clone(), id);
                 id
             }
@@ -48,8 +50,11 @@ pub async fn run_ontology_migrate(pool: &PgPool) -> Result<(), sqlx::Error> {
         if created {
             migrated += 1;
         }
-        let _ = queries::set_concept_status(pool, concept_id, ConceptStatus::Canonical, Actor::System).await;
-        queries::insert_ontology_edge(pool, concept_id, paradigm_id, OntologyRelation::IsA, 1.0).await?;
+        let _ =
+            queries::set_concept_status(pool, concept_id, ConceptStatus::Canonical, Actor::System)
+                .await;
+        queries::insert_ontology_edge(pool, concept_id, paradigm_id, OntologyRelation::IsA, 1.0)
+            .await?;
         queries::set_concept_attr(pool, concept_id, "pattern_kind", &kind).await?;
         queries::set_concept_attr(pool, concept_id, "pattern_slug", &slug).await?;
     }

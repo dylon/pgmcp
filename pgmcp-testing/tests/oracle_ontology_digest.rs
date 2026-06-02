@@ -72,12 +72,14 @@ async fn ontology_invariants_surface_in_digest() {
 
     assert!(
         onto.iter().any(|i| i.severity == DigestSeverity::High
-            && i.text.contains("must always validate the input token stream")),
+            && i.text
+                .contains("must always validate the input token stream")),
         "canonical invariant surfaces at High severity"
     );
     assert!(
-        onto.iter().any(|i| i.text.contains("(candidate)")
-            && i.text.contains("never disambiguate prematurely")),
+        onto.iter()
+            .any(|i| i.text.contains("(candidate)")
+                && i.text.contains("never disambiguate prematurely")),
         "candidate invariant surfaces but is labeled provisional"
     );
 }

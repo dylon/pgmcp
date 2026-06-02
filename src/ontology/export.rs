@@ -67,8 +67,18 @@ mod tests {
 
     fn fixture() -> (Vec<ConceptTuple>, Vec<EdgeTuple>) {
         let concepts = vec![
-            (1, "Parser".to_string(), "component".to_string(), "canonical".to_string()),
-            (2, "Don't Panic".to_string(), "invariant".to_string(), "candidate".to_string()),
+            (
+                1,
+                "Parser".to_string(),
+                "component".to_string(),
+                "canonical".to_string(),
+            ),
+            (
+                2,
+                "Don't Panic".to_string(),
+                "invariant".to_string(),
+                "candidate".to_string(),
+            ),
         ];
         let edges = vec![(2, 1, "is_a".to_string())];
         (concepts, edges)
@@ -80,7 +90,10 @@ mod tests {
         let pl = to_prolog(&c, &e);
         assert!(pl.contains("concept(1, 'Parser', 'component', 'canonical')."));
         assert!(pl.contains("is_a(2, 1)."));
-        assert!(pl.contains("\\'"), "single quote in an atom must be escaped");
+        assert!(
+            pl.contains("\\'"),
+            "single quote in an atom must be escaped"
+        );
     }
 
     #[test]

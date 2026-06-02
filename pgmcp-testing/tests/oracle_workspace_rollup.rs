@@ -59,7 +59,10 @@ async fn edc_links_near_duplicates_only() {
     let n = build_broader_edges(pool, Facet::Algorithm, 0.92)
         .await
         .expect("build broader edges");
-    assert_eq!(n, 1, "exactly one broader link between the two near-identical concepts");
+    assert_eq!(
+        n, 1,
+        "exactly one broader link between the two near-identical concepts"
+    );
 
     let edges: Vec<(i64, i64)> = sqlx::query_as(
         "SELECT from_entity_id, to_entity_id FROM memory_relations \

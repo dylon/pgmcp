@@ -33,9 +33,9 @@ const CUES: &[&str] = &[
 /// Tokens dropped when building the normalized merge key — modal/auxiliary verbs
 /// and high-frequency function words that carry no invariant identity.
 const NAME_STOP: &[&str] = &[
-    "must", "should", "shall", "the", "a", "an", "to", "of", "is", "are", "be", "will",
-    "may", "it", "not", "do", "dont", "that", "this", "until", "its", "in", "on", "for",
-    "and", "or", "we", "you", "always", "never", "with", "as", "at", "by", "if",
+    "must", "should", "shall", "the", "a", "an", "to", "of", "is", "are", "be", "will", "may",
+    "it", "not", "do", "dont", "that", "this", "until", "its", "in", "on", "for", "and", "or",
+    "we", "you", "always", "never", "with", "as", "at", "by", "if",
 ];
 
 /// A mined invariant: a stable merge `name`, the constraint sentence, and a short
@@ -112,7 +112,9 @@ pub fn extract_adr_invariant(content: &str, fallback: &str) -> Option<InvariantC
         .lines()
         .find_map(|l| {
             let t = l.trim();
-            t.strip_prefix("# ").or_else(|| t.strip_prefix("## ")).map(str::trim)
+            t.strip_prefix("# ")
+                .or_else(|| t.strip_prefix("## "))
+                .map(str::trim)
         })
         .unwrap_or(fallback);
     let constraint = invariant_cue_lines(content).into_iter().next()?;
@@ -161,16 +163,29 @@ mod tests {
         assert!(has_invariant_cue("ambiguity must propagate end-to-end"));
         assert!(has_invariant_cue("Never disambiguate over the parse tree"));
         assert!(has_invariant_cue("This is an INVARIANT of the pipeline"));
-        assert!(!has_invariant_cue("just a normal descriptive sentence here"));
+        assert!(!has_invariant_cue(
+            "just a normal descriptive sentence here"
+        ));
     }
 
     #[test]
     fn cue_lines_strip_markers_and_bound_length() {
         let text = "# Heading\n- ambiguity must propagate end-to-end\nshort\n* always validate the input token stream\nplain line no cue word here";
         let lines = invariant_cue_lines(text);
-        assert!(lines.iter().any(|l| l == "ambiguity must propagate end-to-end"));
-        assert!(lines.iter().any(|l| l == "always validate the input token stream"));
-        assert!(!lines.iter().any(|l| l == "short"), "too-short line excluded");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "ambiguity must propagate end-to-end")
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l == "always validate the input token stream")
+        );
+        assert!(
+            !lines.iter().any(|l| l == "short"),
+            "too-short line excluded"
+        );
     }
 
     #[test]
@@ -201,8 +216,9 @@ mod tests {
 
     #[test]
     fn commit_extract_reads_subject_and_body() {
-        let inv = extract_commit_invariant("feat: parser", Some("ambiguity must propagate end-to-end"))
-            .expect("cued body");
+        let inv =
+            extract_commit_invariant("feat: parser", Some("ambiguity must propagate end-to-end"))
+                .expect("cued body");
         assert!(inv.constraint_text.contains("ambiguity"));
     }
 }

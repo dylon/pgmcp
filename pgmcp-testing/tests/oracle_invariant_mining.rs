@@ -93,7 +93,10 @@ async fn mining_merges_three_sources_onto_one_invariant() {
     .expect("meta row");
     assert_eq!(facet, "invariant");
     assert!(
-        constraint.as_deref().unwrap_or_default().contains("ambiguity"),
+        constraint
+            .as_deref()
+            .unwrap_or_default()
+            .contains("ambiguity"),
         "constraint text should be the mined rule"
     );
 
@@ -108,7 +111,11 @@ async fn mining_merges_three_sources_onto_one_invariant() {
     .expect("evidence kinds");
     assert_eq!(
         kinds,
-        vec!["adr".to_string(), "commit".to_string(), "mandate".to_string()],
+        vec![
+            "adr".to_string(),
+            "commit".to_string(),
+            "mandate".to_string()
+        ],
         "expected adr+commit+mandate evidence, got {kinds:?}"
     );
 
@@ -119,12 +126,17 @@ async fn mining_merges_three_sources_onto_one_invariant() {
             .fetch_one(pool)
             .await
             .unwrap();
-    run_ontology_invariants(pool, &cfg).await.expect("second run");
+    run_ontology_invariants(pool, &cfg)
+        .await
+        .expect("second run");
     let after: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM ontology_concept_evidence WHERE entity_id = $1")
             .bind(entity_id)
             .fetch_one(pool)
             .await
             .unwrap();
-    assert_eq!(before, after, "mining must be idempotent (provenance-keyed)");
+    assert_eq!(
+        before, after,
+        "mining must be idempotent (provenance-keyed)"
+    );
 }

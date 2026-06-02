@@ -50,8 +50,14 @@ async fn isa_cover_persists_excludes_shortcuts_and_is_idempotent() {
     assert!(edges.contains(&(m, r)), "M is_a R");
     assert!(edges.contains(&(s1, m)), "S1 is_a M");
     assert!(edges.contains(&(s2, m)), "S2 is_a M");
-    assert!(!edges.contains(&(s1, r)), "transitive shortcut S1→R must be excluded");
-    assert!(!edges.contains(&(s2, r)), "transitive shortcut S2→R must be excluded");
+    assert!(
+        !edges.contains(&(s1, r)),
+        "transitive shortcut S1→R must be excluded"
+    );
+    assert!(
+        !edges.contains(&(s2, r)),
+        "transitive shortcut S2→R must be excluded"
+    );
     assert!(!edges.iter().any(|(a, b)| a == b), "no self-edges");
     assert!(!edges.contains(&(r, m)), "no reverse edge");
 

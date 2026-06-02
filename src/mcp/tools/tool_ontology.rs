@@ -79,8 +79,12 @@ pub async fn tool_ontology_concept(
     let entity_id = queries::resolve_concept(pool, &params.concept)
         .await
         .map_err(db_err)?
-        .ok_or_else(|| McpError::invalid_params(format!("no concept `{}`", params.concept), None))?;
-    let meta = queries::get_concept_meta(pool, entity_id).await.map_err(db_err)?;
+        .ok_or_else(|| {
+            McpError::invalid_params(format!("no concept `{}`", params.concept), None)
+        })?;
+    let meta = queries::get_concept_meta(pool, entity_id)
+        .await
+        .map_err(db_err)?;
     let evidence = queries::list_concept_evidence(pool, entity_id)
         .await
         .map_err(db_err)?;
@@ -111,7 +115,9 @@ pub async fn tool_ontology_invariants_for_file(
 ) -> Result<CallToolResult, McpError> {
     let pool = pool_or_err(ctx)?;
     let Some(file_id) = resolve_file_id(pool, &params.file).await? else {
-        return json_result(&json!({ "file": params.file, "invariants": [], "note": "file not indexed" }));
+        return json_result(
+            &json!({ "file": params.file, "invariants": [], "note": "file not indexed" }),
+        );
     };
     let invariants = queries::invariants_for_file(pool, file_id)
         .await
@@ -175,7 +181,10 @@ pub async fn tool_ontology_link(
     let pool = pool_or_err(ctx)?;
     let relation = OntologyRelation::parse(&params.relation).ok_or_else(|| {
         McpError::invalid_params(
-            format!("unknown relation `{}` (is_a/part_of/broader/narrower/member_of)", params.relation),
+            format!(
+                "unknown relation `{}` (is_a/part_of/broader/narrower/member_of)",
+                params.relation
+            ),
             None,
         )
     })?;
@@ -205,7 +214,9 @@ pub async fn tool_ontology_suggest_edges(
     let id = queries::resolve_concept(pool, &params.concept)
         .await
         .map_err(db_err)?
-        .ok_or_else(|| McpError::invalid_params(format!("no concept `{}`", params.concept), None))?;
+        .ok_or_else(|| {
+            McpError::invalid_params(format!("no concept `{}`", params.concept), None)
+        })?;
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let rows = queries::concept_broader_links(pool, id, limit)
         .await
@@ -271,7 +282,9 @@ pub async fn tool_ontology_query(
     let id = queries::resolve_concept(pool, &params.concept)
         .await
         .map_err(db_err)?
-        .ok_or_else(|| McpError::invalid_params(format!("no concept `{}`", params.concept), None))?;
+        .ok_or_else(|| {
+            McpError::invalid_params(format!("no concept `{}`", params.concept), None)
+        })?;
     let ancestors = queries::concept_ancestors(pool, id).await.map_err(db_err)?;
     let anc: Vec<_> = ancestors
         .into_iter()

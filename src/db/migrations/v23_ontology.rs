@@ -8,11 +8,11 @@
 //! [`crate::db::ontology::FREEFORM_EDGE_SOURCES`]). These sidecars carry only the
 //! *new* facet / invariant / curation metadata.
 //!
-//! - `ontology_concept_meta` — 1:1 with a concept entity: facet + curation status
-//!   + confidence + invariant constraint/rationale + optional WFST `sequence_spec`
-//!   + build provenance + project scope. `facet`/`status` are closed vocabularies
-//!   (ADR-003): `TEXT` + `CHECK` from
-//!   [`crate::ontology::facet`]`::{facet,status}_sql_in_list()`.
+//! - `ontology_concept_meta` — 1:1 with a concept entity: facet, curation status,
+//!   confidence, invariant constraint/rationale, an optional WFST `sequence_spec`,
+//!   build provenance, and project scope. `facet`/`status` are closed vocabularies
+//!   (ADR-003) — `TEXT` + `CHECK` from
+//!   `crate::ontology::facet::{facet,status}_sql_in_list()`.
 //! - `ontology_concept_evidence` — Code-Digital-Twin `constrained-by`/`justified-by`
 //!   provenance pointers; `evidence_kind` closed vocab from
 //!   [`crate::ontology::edge::evidence_sql_in_list`]; `provenance_key` UNIQUE for

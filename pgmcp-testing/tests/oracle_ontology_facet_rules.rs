@@ -30,8 +30,8 @@ async fn status_chokepoint_blocks_agent_curation() {
         .await
         .expect("upsert meta");
 
-    let blocked = queries::set_concept_status(pool, entity_id, ConceptStatus::Canonical, Actor::Agent)
-        .await;
+    let blocked =
+        queries::set_concept_status(pool, entity_id, ConceptStatus::Canonical, Actor::Agent).await;
     assert!(
         matches!(blocked, Err(SetStatusError::AgentCannotCurate)),
         "agent must be refused a curator-only status, got {blocked:?}"
@@ -70,7 +70,10 @@ async fn upsert_meta_is_curation_safe() {
         .await
         .expect("get meta")
         .expect("meta exists");
-    assert_eq!(meta.facet, "algorithm", "curated facet must not be re-classified");
+    assert_eq!(
+        meta.facet, "algorithm",
+        "curated facet must not be re-classified"
+    );
     assert_eq!(meta.status, "canonical", "curated status must be preserved");
 }
 
@@ -113,9 +116,18 @@ async fn invariants_for_file_returns_anchored_invariant() {
     .await
     .expect("set constraint text");
 
-    queries::memory_anchor_entity(pool, entity_id, Some(file_id), None, None, None, None, "concept_code")
-        .await
-        .expect("anchor concept to file");
+    queries::memory_anchor_entity(
+        pool,
+        entity_id,
+        Some(file_id),
+        None,
+        None,
+        None,
+        None,
+        "concept_code",
+    )
+    .await
+    .expect("anchor concept to file");
 
     let invs = queries::invariants_for_file(pool, file_id)
         .await

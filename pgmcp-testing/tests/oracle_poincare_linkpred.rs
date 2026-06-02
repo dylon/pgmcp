@@ -31,7 +31,9 @@ async fn link_predict_runs_and_proposes_novel_acyclic_broader() {
             .expect("is_a");
     }
 
-    run_ontology_link_predict(pool).await.expect("link-predict cron runs");
+    run_ontology_link_predict(pool)
+        .await
+        .expect("link-predict cron runs");
 
     let broader: Vec<(i64, i64)> = sqlx::query_as(
         "SELECT from_entity_id, to_entity_id FROM memory_relations \
@@ -44,8 +46,14 @@ async fn link_predict_runs_and_proposes_novel_acyclic_broader() {
     let isa: HashSet<(i64, i64)> = isa_pairs.iter().map(|(c, p)| (ids[*c], ids[*p])).collect();
     let set: HashSet<(i64, i64)> = broader.iter().copied().collect();
     for (c, p) in &broader {
-        assert!(!isa.contains(&(*c, *p)), "a broader candidate must not duplicate an is_a edge");
+        assert!(
+            !isa.contains(&(*c, *p)),
+            "a broader candidate must not duplicate an is_a edge"
+        );
         assert_ne!(c, p, "no self-edge");
-        assert!(!set.contains(&(*p, *c)), "no symmetric broader pair ⇒ acyclic");
+        assert!(
+            !set.contains(&(*p, *c)),
+            "no symmetric broader pair ⇒ acyclic"
+        );
     }
 }

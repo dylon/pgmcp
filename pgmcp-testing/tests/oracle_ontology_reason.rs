@@ -24,8 +24,12 @@ async fn detects_is_a_cycle() {
     let pool = db.pool();
     let a = concept(pool, "CycA", Facet::Component).await;
     let b = concept(pool, "CycB", Facet::Component).await;
-    queries::insert_ontology_edge(pool, a, b, OntologyRelation::IsA, 1.0).await.unwrap();
-    queries::insert_ontology_edge(pool, b, a, OntologyRelation::IsA, 1.0).await.unwrap();
+    queries::insert_ontology_edge(pool, a, b, OntologyRelation::IsA, 1.0)
+        .await
+        .unwrap();
+    queries::insert_ontology_edge(pool, b, a, OntologyRelation::IsA, 1.0)
+        .await
+        .unwrap();
 
     let violations = reason::check_constraints(pool).await.expect("check");
     assert!(
@@ -59,13 +63,22 @@ async fn transitive_is_a_closure() {
     let a = concept(pool, "AncA", Facet::Algorithm).await;
     let b = concept(pool, "AncB", Facet::Algorithm).await;
     let c = concept(pool, "AncC", Facet::Algorithm).await;
-    queries::insert_ontology_edge(pool, a, b, OntologyRelation::IsA, 1.0).await.unwrap();
-    queries::insert_ontology_edge(pool, b, c, OntologyRelation::IsA, 1.0).await.unwrap();
+    queries::insert_ontology_edge(pool, a, b, OntologyRelation::IsA, 1.0)
+        .await
+        .unwrap();
+    queries::insert_ontology_edge(pool, b, c, OntologyRelation::IsA, 1.0)
+        .await
+        .unwrap();
 
-    let ancestors = queries::concept_ancestors(pool, a).await.expect("ancestors");
+    let ancestors = queries::concept_ancestors(pool, a)
+        .await
+        .expect("ancestors");
     let ids: HashSet<i64> = ancestors.iter().map(|(id, _)| *id).collect();
     assert!(ids.contains(&b), "direct parent");
-    assert!(ids.contains(&c), "transitive grandparent (deductive closure)");
+    assert!(
+        ids.contains(&c),
+        "transitive grandparent (deductive closure)"
+    );
 }
 
 #[tokio::test]
@@ -74,12 +87,22 @@ async fn export_round_trips_to_prolog() {
     let pool = db.pool();
     let parent = concept(pool, "ExpParser", Facet::Component).await;
     let child = concept(pool, "ExpRecursiveDescent", Facet::Component).await;
-    queries::insert_ontology_edge(pool, child, parent, OntologyRelation::IsA, 1.0).await.unwrap();
+    queries::insert_ontology_edge(pool, child, parent, OntologyRelation::IsA, 1.0)
+        .await
+        .unwrap();
 
     let concepts = queries::export_concepts(pool).await.expect("concepts");
     let edges = queries::export_edges(pool).await.expect("edges");
-    assert!(concepts.iter().any(|(_, n, f, _)| n == "ExpParser" && f == "component"));
-    assert!(edges.iter().any(|(from, to, r)| *from == child && *to == parent && r == "is_a"));
+    assert!(
+        concepts
+            .iter()
+            .any(|(_, n, f, _)| n == "ExpParser" && f == "component")
+    );
+    assert!(
+        edges
+            .iter()
+            .any(|(from, to, r)| *from == child && *to == parent && r == "is_a")
+    );
 
     let prolog = export::to_prolog(&concepts, &edges);
     assert!(prolog.contains(&format!("is_a({child}, {parent}).")));

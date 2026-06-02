@@ -55,8 +55,14 @@ pub async fn run_ontology_link_predict(pool: &PgPool) -> Result<(), sqlx::Error>
         for (c, p, dist) in model.predict_missing(&existing, MAX_DIST, TOP_K) {
             // Low, distance-decayed confidence (kept well below FCA's 1.0 is_a weight).
             let confidence = (1.0 / (1.0 + dist)).clamp(0.0, 0.5);
-            match queries::insert_ontology_edge(pool, ids[c], ids[p], OntologyRelation::Broader, confidence)
-                .await
+            match queries::insert_ontology_edge(
+                pool,
+                ids[c],
+                ids[p],
+                OntologyRelation::Broader,
+                confidence,
+            )
+            .await
             {
                 Ok(true) => total += 1,
                 Ok(false) => {}
@@ -65,7 +71,10 @@ pub async fn run_ontology_link_predict(pool: &PgPool) -> Result<(), sqlx::Error>
         }
     }
     queries::refresh_memory_unified_edges(pool).await?;
-    info!(predicted_broader_edges = total, "ontology-link-predict complete");
+    info!(
+        predicted_broader_edges = total,
+        "ontology-link-predict complete"
+    );
     Ok(())
 }
 

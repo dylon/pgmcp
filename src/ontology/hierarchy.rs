@@ -79,8 +79,14 @@ pub async fn build_broader_edges(
     let mut inserted = 0usize;
     for (canonical, variant, cosine) in pairs {
         // `variant broader canonical` ⇒ canonical (lower id) is the broader concept.
-        if queries::insert_ontology_edge(pool, variant, canonical, OntologyRelation::Broader, cosine)
-            .await?
+        if queries::insert_ontology_edge(
+            pool,
+            variant,
+            canonical,
+            OntologyRelation::Broader,
+            cosine,
+        )
+        .await?
         {
             inserted += 1;
         }

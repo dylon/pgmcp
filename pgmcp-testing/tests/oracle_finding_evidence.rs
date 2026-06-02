@@ -38,9 +38,18 @@ async fn concurrency_findings_attach_as_concept_evidence() {
     let (cid, _) = queries::create_concept(pool, "ParserLocking", Facet::Concurrency, Actor::User)
         .await
         .unwrap();
-    queries::memory_anchor_entity(pool, cid, Some(file_id), None, None, None, None, "concept_code")
-        .await
-        .unwrap();
+    queries::memory_anchor_entity(
+        pool,
+        cid,
+        Some(file_id),
+        None,
+        None,
+        None,
+        None,
+        "concept_code",
+    )
+    .await
+    .unwrap();
 
     // A concurrency finding on that file.
     sqlx::query(
@@ -58,10 +67,8 @@ async fn concurrency_findings_attach_as_concept_evidence() {
 
     let evidence = queries::list_concept_evidence(pool, cid).await.unwrap();
     assert!(
-        evidence
-            .iter()
-            .any(|e| e.evidence_kind == "finding"
-                && e.detail.as_deref() == Some("lock contention in parser")),
+        evidence.iter().any(|e| e.evidence_kind == "finding"
+            && e.detail.as_deref() == Some("lock contention in parser")),
         "the finding should attach as concept evidence, got {evidence:?}"
     );
 

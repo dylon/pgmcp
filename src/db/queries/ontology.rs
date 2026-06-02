@@ -582,10 +582,7 @@ pub async fn concept_hierarchy_edges(
 }
 
 /// Resolve a concept reference (numeric id string or exact name) → entity id.
-pub async fn resolve_concept(
-    pool: &PgPool,
-    name_or_id: &str,
-) -> Result<Option<i64>, sqlx::Error> {
+pub async fn resolve_concept(pool: &PgPool, name_or_id: &str) -> Result<Option<i64>, sqlx::Error> {
     if let Ok(id) = name_or_id.parse::<i64>() {
         let hit: Option<i64> = sqlx::query_scalar(
             "SELECT id FROM memory_entities \
