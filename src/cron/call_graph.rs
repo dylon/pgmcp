@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 
 use chrono::Utc;
 use sqlx::PgPool;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::db::DbClient;
 use crate::db::queries;
@@ -63,11 +63,62 @@ pub async fn run_call_graph(
         return;
     }
 
+    run_call_graph_over(pool, work_pool.as_ref(), &projects, start).await;
+}
+
+/// Run the call-graph analysis for a SINGLE project (by name or numeric id).
+/// Operator-facing per-project trigger (F2) — keeps a manual `trigger_cron`
+/// within the tool budget instead of scanning every project serially.
+pub async fn run_call_graph_for_project(
+    db: &dyn DbClient,
+    stats: &Arc<StatsTracker>,
+    work_pool: Option<Arc<crate::work_pool::pool::WorkPool>>,
+    project_ref: &str,
+) {
+    let pool = db
+        .pool()
+        .expect("call_graph requires a real &PgPool — DbClient backend must be PgPool-backed");
+    info!(project = %project_ref, "Starting single-project call-graph");
+    let start = std::time::Instant::now();
+    stats.call_graph_runs.fetch_add(1, Ordering::Relaxed);
+
+    let projects: Vec<(i32, String)> = match sqlx::query_as::<_, (i32, String)>(
+        "SELECT id, name FROM projects WHERE name = $1 OR id::text = $1 ORDER BY id",
+    )
+    .bind(project_ref)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            error!(project = %project_ref, error = %e, "Failed to resolve project for call-graph");
+            return;
+        }
+    };
+
+    if projects.is_empty() {
+        stats
+            .call_graph_noop_returns
+            .fetch_add(1, Ordering::Relaxed);
+        warn!(project = %project_ref, "Call-graph: no project matched name or id");
+        return;
+    }
+
+    run_call_graph_over(pool, work_pool.as_ref(), &projects, start).await;
+}
+
+/// Shared driver: analyze a resolved project set and emit the completion log.
+async fn run_call_graph_over(
+    pool: &PgPool,
+    work_pool: Option<&Arc<crate::work_pool::pool::WorkPool>>,
+    projects: &[(i32, String)],
+    start: std::time::Instant,
+) {
     let mut total_edges: u64 = 0;
     let mut total_functions: u64 = 0;
 
-    for (project_id, project_name) in &projects {
-        match analyze_project(pool, *project_id, project_name, work_pool.as_ref()).await {
+    for (project_id, project_name) in projects {
+        match analyze_project(pool, *project_id, project_name, work_pool).await {
             Ok(per_project) => {
                 total_edges += per_project.edges_inserted;
                 total_functions += per_project.functions_updated;

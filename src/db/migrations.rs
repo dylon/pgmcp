@@ -19,6 +19,8 @@
 
 use sqlx::PgPool;
 
+use crate::parsing::type_tags::vocabulary::{SEED_EFFECTS, SEED_TYPE_TAGS, TagDef};
+
 mod schema_introspect;
 mod v10_fk_index_hardening;
 mod v11_nudge_emissions;
@@ -34,6 +36,7 @@ mod v20_unresolved_ref_index;
 mod v21_sync_ops;
 mod v22_concurrency_findings;
 mod v23_ontology;
+mod v24_extracted_content_hash;
 mod v2_shadow_asr;
 mod v3_cross_language_signatures;
 mod v4_work_items;
@@ -2369,6 +2372,21 @@ pub async fn run_migrations(
     )
     .await?;
 
+    apply_step(
+        pool,
+        v24_extracted_content_hash::EXTRACTED_CONTENT_HASH_V1,
+        v24_extracted_content_hash::EXTRACTED_CONTENT_HASH_V1_NAME,
+        || v24_extracted_content_hash::apply(pool),
+    )
+    .await?;
+
+    // Every-boot vocabulary-catalog reconcile (RC1 durable fix). Unconditional
+    // and idempotent; closes the post-v2 catalog-drift gap that silently
+    // FK-skipped symbol extraction for files carrying a newly-added effect.
+    // MUST precede ensure_memory_unified_views (which sources effect_catalog /
+    // type_tag_catalog as graph-node arms).
+    reconcile_vocabulary_catalogs(pool).await?;
+
     // Build/refresh the work_items HNSW index (unconditional; the table exists
     // after the v4 step on fresh installs and already exists on upgrades).
     ensure_work_items_hnsw_index(pool, vector_config).await?;
@@ -2392,6 +2410,99 @@ pub async fn run_migrations(
     // ================================================================
     ensure_memory_unified_views(pool, vector_config).await?;
 
+    Ok(())
+}
+
+/// Reconcile the vocabulary catalogs (`effect_catalog`, `type_tag_catalog`)
+/// with the Rust source-of-truth (`SEED_EFFECTS` / `SEED_TYPE_TAGS`).
+/// Unconditional + idempotent — runs on every boot from `run_migrations`.
+///
+/// The v2 `shadow_asr` migration first-seeds the catalogs, but `apply_step`
+/// gates it behind `version_applied`, so any effect / type tag *added* to the
+/// vocabulary after v2 never reaches an already-migrated database. That gap
+/// silently broke symbol extraction on 2026-06-01: the v21 concurrency effects
+/// (`await_point`, `lock_acquire`, `lock_release`, `thread_spawn`,
+/// `channel_select`) were missing from `effect_catalog`, so the
+/// `symbol_effects_effect_fkey` FK rejected every symbol carrying one and the
+/// entire file was skipped. This reconcile closes the gap permanently — it is
+/// the catalog-superset half of the invariant ADR-003 anticipated.
+///
+/// Non-fatal by design: a residual gap is logged at `error!` (and caught by the
+/// `vocabulary_catalog_parity` regression test), never panicked — a stale
+/// catalog must not stop the daemon from starting.
+async fn reconcile_vocabulary_catalogs(pool: &PgPool) -> Result<(), sqlx::Error> {
+    seed_catalog(pool, "type_tag_catalog", SEED_TYPE_TAGS).await?;
+    seed_catalog(pool, "effect_catalog", SEED_EFFECTS).await?;
+
+    // Verify the catalog ⊇ vocabulary post-condition. The seeds above ran
+    // immediately before, so a non-empty result means a write failed or a name
+    // is otherwise non-insertable.
+    let missing_effects: Vec<String> = sqlx::query_scalar(
+        "SELECT v.name FROM UNNEST($1::text[]) AS v(name)
+         WHERE NOT EXISTS (SELECT 1 FROM effect_catalog c WHERE c.name = v.name)",
+    )
+    .bind(seed_names(SEED_EFFECTS))
+    .fetch_all(pool)
+    .await?;
+    let missing_type_tags: Vec<String> = sqlx::query_scalar(
+        "SELECT v.name FROM UNNEST($1::text[]) AS v(name)
+         WHERE NOT EXISTS (SELECT 1 FROM type_tag_catalog c WHERE c.name = v.name)",
+    )
+    .bind(seed_names(SEED_TYPE_TAGS))
+    .fetch_all(pool)
+    .await?;
+
+    match (missing_effects.is_empty(), missing_type_tags.is_empty()) {
+        (true, true) => info!(
+            effects = SEED_EFFECTS.len(),
+            type_tags = SEED_TYPE_TAGS.len(),
+            "vocabulary catalogs reconciled (catalog ⊇ vocabulary verified)"
+        ),
+        _ => tracing::error!(
+            ?missing_effects,
+            ?missing_type_tags,
+            "vocabulary catalog reconcile left a residual gap — symbol_effects / \
+             type-tag inserts for the missing names will be rejected; investigate"
+        ),
+    }
+    Ok(())
+}
+
+/// Owned `Vec` of a seed slice's `name` fields (preallocated) for binding as a
+/// `text[]` parameter.
+fn seed_names(seed: &'static [TagDef]) -> Vec<String> {
+    let mut names = Vec::with_capacity(seed.len());
+    names.extend(seed.iter().map(|t| t.name.to_string()));
+    names
+}
+
+/// Idempotent upsert of a vocabulary catalog (`effect_catalog` /
+/// `type_tag_catalog`) from its Rust seed slice. Shared by the v2 first-seed
+/// (`v2_shadow_asr::seed_catalog_tables`) and the every-boot
+/// [`reconcile_vocabulary_catalogs`] so both use one ON CONFLICT policy.
+async fn seed_catalog(
+    pool: &PgPool,
+    table: &'static str,
+    seed: &'static [TagDef],
+) -> Result<(), sqlx::Error> {
+    // Per-row upsert with ON CONFLICT DO UPDATE — keeps descriptions in sync as
+    // the vocabulary evolves, and yields clearer error messages than a single
+    // N-row VALUES list.
+    let sql = format!(
+        "INSERT INTO {table} (name, description, language_origin)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (name) DO UPDATE SET
+            description = EXCLUDED.description,
+            language_origin = EXCLUDED.language_origin"
+    );
+    for entry in seed {
+        sqlx::query(&sql)
+            .bind(entry.name)
+            .bind(entry.description)
+            .bind(entry.origin.as_db_str())
+            .execute(pool)
+            .await?;
+    }
     Ok(())
 }
 

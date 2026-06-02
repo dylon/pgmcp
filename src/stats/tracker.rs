@@ -505,6 +505,19 @@ pub struct StatsTracker {
     /// file missing, permission error, encoding error. Falls back to
     /// chunk stitching.
     pub read_file_disk_io_errors: AtomicU64,
+    /// Symbol-extraction cron recovered a content-NULL file's text from disk
+    /// (hash-verified) for parsing — the RC2 disk-fallback fast-path.
+    pub symbol_extraction_disk_reads: AtomicU64,
+    /// Symbol-extraction disk read found a `content_hash` mismatch (file edited
+    /// since indexing); the file is skipped until the indexer refreshes it.
+    pub symbol_extraction_disk_hash_mismatches: AtomicU64,
+    /// Symbol-extraction disk read found the file gone from disk; skipped.
+    pub symbol_extraction_disk_missing: AtomicU64,
+    /// Symbol-extraction disk read failed (not recoverable / IO error); skipped.
+    pub symbol_extraction_disk_io_errors: AtomicU64,
+    /// Symbol-extraction skipped a file whose `content_hash` matched the hash at
+    /// its last successful extraction (RC2 incremental-skip — no re-parse).
+    pub symbol_extraction_unchanged_skips: AtomicU64,
     /// `read_file` MCP tool stitched chunks because there was no
     /// inline content and either no recoverable-from-disk flag or
     /// the disk attempt failed/mismatched.
@@ -900,6 +913,11 @@ impl StatsTracker {
             read_file_disk_hits: AtomicU64::new(0),
             read_file_disk_hash_mismatches: AtomicU64::new(0),
             read_file_disk_io_errors: AtomicU64::new(0),
+            symbol_extraction_disk_reads: AtomicU64::new(0),
+            symbol_extraction_disk_hash_mismatches: AtomicU64::new(0),
+            symbol_extraction_disk_missing: AtomicU64::new(0),
+            symbol_extraction_disk_io_errors: AtomicU64::new(0),
+            symbol_extraction_unchanged_skips: AtomicU64::new(0),
             read_file_chunk_stitches: AtomicU64::new(0),
             graph_build_runs: AtomicU64::new(0),
             dependency_graph_scans: AtomicU64::new(0),
@@ -1261,6 +1279,11 @@ impl StatsTracker {
             "read_file_disk_hits": self.read_file_disk_hits.load(Ordering::Acquire),
             "read_file_disk_hash_mismatches": self.read_file_disk_hash_mismatches.load(Ordering::Acquire),
             "read_file_disk_io_errors": self.read_file_disk_io_errors.load(Ordering::Acquire),
+            "symbol_extraction_disk_reads": self.symbol_extraction_disk_reads.load(Ordering::Acquire),
+            "symbol_extraction_disk_hash_mismatches": self.symbol_extraction_disk_hash_mismatches.load(Ordering::Acquire),
+            "symbol_extraction_disk_missing": self.symbol_extraction_disk_missing.load(Ordering::Acquire),
+            "symbol_extraction_disk_io_errors": self.symbol_extraction_disk_io_errors.load(Ordering::Acquire),
+            "symbol_extraction_unchanged_skips": self.symbol_extraction_unchanged_skips.load(Ordering::Acquire),
             "read_file_chunk_stitches": self.read_file_chunk_stitches.load(Ordering::Acquire),
             "graph_build_runs": self.graph_build_runs.load(Ordering::Acquire),
             "dependency_graph_scans": self.dependency_graph_scans.load(Ordering::Acquire),

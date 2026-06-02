@@ -37,9 +37,22 @@ pub async fn tool_trigger_cron(
 
     match params.job.as_str() {
         "symbol-extraction" => {
-            crate::cron::symbol_extraction::run_symbol_extraction(db.as_ref(), stats).await;
+            match &params.project {
+                Some(p) => {
+                    crate::cron::symbol_extraction::run_symbol_extraction_for_project(
+                        db.as_ref(),
+                        stats,
+                        p,
+                    )
+                    .await
+                }
+                None => {
+                    crate::cron::symbol_extraction::run_symbol_extraction(db.as_ref(), stats).await
+                }
+            }
             json_result(&json!({
                 "job": params.job,
+                "project": params.project,
                 "status": "completed",
                 "guidance": "Symbols populated. dead_code_reachability and naming_consistency should now return populated results. For end-to-end call-graph closure, also run trigger_cron job=\"call-graph\".",
             }))
@@ -47,15 +60,34 @@ pub async fn tool_trigger_cron(
         "call-graph" => {
             // Manual trigger: no general WorkPool in scope, so betweenness runs
             // sequentially (gated by DENSE_CENTRALITY_MAX_NODES in the cron).
-            crate::cron::call_graph::run_call_graph(db.as_ref(), stats, None).await;
+            match &params.project {
+                Some(p) => {
+                    crate::cron::call_graph::run_call_graph_for_project(db.as_ref(), stats, None, p)
+                        .await
+                }
+                None => crate::cron::call_graph::run_call_graph(db.as_ref(), stats, None).await,
+            }
             json_result(&json!({
                 "job": params.job,
+                "project": params.project,
                 "status": "completed",
                 "guidance": "Call graph populated. dead_code_reachability now uses real symbol_references edges.",
             }))
         }
         "function-metrics" => {
-            crate::cron::function_metrics::run_function_metrics(db.as_ref(), stats).await;
+            match &params.project {
+                Some(p) => {
+                    crate::cron::function_metrics::run_function_metrics_for_project(
+                        db.as_ref(),
+                        stats,
+                        p,
+                    )
+                    .await
+                }
+                None => {
+                    crate::cron::function_metrics::run_function_metrics(db.as_ref(), stats).await
+                }
+            }
             // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
             let effect_breakdown: Vec<serde_json::Value> = (async {
                 let Some(pool) = ctx.db().pool() else {
@@ -79,6 +111,7 @@ pub async fn tool_trigger_cron(
             json_result(&json!({
             "effect_breakdown": effect_breakdown,
                     "job": params.job,
+                    "project": params.project,
                     "status": "completed",
                     "guidance": "Function metrics populated (cyclomatic, cognitive, Halstead, NPath, MI).",
                 }))

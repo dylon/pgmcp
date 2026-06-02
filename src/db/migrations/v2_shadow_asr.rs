@@ -32,7 +32,7 @@
 
 use sqlx::PgPool;
 
-use crate::parsing::type_tags::vocabulary::{SEED_EFFECTS, SEED_TYPE_TAGS, TagDef};
+use crate::parsing::type_tags::vocabulary::{SEED_EFFECTS, SEED_TYPE_TAGS};
 
 /// Step version number — must be unique across all migration steps.
 pub(super) const SHADOW_ASR_V1: i32 = 2;
@@ -87,38 +87,15 @@ async fn create_catalog_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
 }
 
 async fn seed_catalog_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
-    // Seed both catalogs from the Rust vocabulary. ON CONFLICT DO UPDATE
-    // keeps descriptions in sync if the vocabulary file evolves — re-running
-    // the migration on a fresh install picks up vocabulary edits without
-    // a separate fixup step.
-    seed_catalog(pool, "type_tag_catalog", SEED_TYPE_TAGS).await?;
-    seed_catalog(pool, "effect_catalog", SEED_EFFECTS).await?;
-    Ok(())
-}
-
-async fn seed_catalog(
-    pool: &PgPool,
-    table: &'static str,
-    seed: &'static [TagDef],
-) -> Result<(), sqlx::Error> {
-    // Per-row insert with ON CONFLICT DO UPDATE — fewer statements than
-    // a single VALUES list with N rows would yield in error messages, and
-    // sqlx's borrow rules favor it.
-    let sql = format!(
-        "INSERT INTO {table} (name, description, language_origin)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (name) DO UPDATE SET
-            description = EXCLUDED.description,
-            language_origin = EXCLUDED.language_origin"
-    );
-    for entry in seed {
-        sqlx::query(&sql)
-            .bind(entry.name)
-            .bind(entry.description)
-            .bind(entry.origin.as_db_str())
-            .execute(pool)
-            .await?;
-    }
+    // First-seed both catalogs from the Rust vocabulary. This runs only when
+    // the v2 step is first applied to a database (the runner gates it via
+    // `version_applied`), so vocabulary edits landed *after* v2 do NOT reach an
+    // already-migrated DB from here. Ongoing catalog ⊇ vocabulary parity is
+    // guaranteed instead by `super::reconcile_vocabulary_catalogs`, which runs
+    // unconditionally on every boot (see that fn for the drift incident that
+    // motivated it). `seed_catalog` is shared between the two paths.
+    super::seed_catalog(pool, "type_tag_catalog", SEED_TYPE_TAGS).await?;
+    super::seed_catalog(pool, "effect_catalog", SEED_EFFECTS).await?;
     Ok(())
 }
 

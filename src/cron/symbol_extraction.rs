@@ -18,11 +18,12 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 
 use crate::db::DbClient;
+use crate::db::disk_read::{DiskReadOutcome, read_disk_verified};
 use crate::db::queries;
 use crate::parsing::{LanguageRegistry, symbols::Symbol, symbols::SymbolKind};
 use crate::stats::tracker::StatsTracker;
@@ -87,11 +88,68 @@ pub async fn run_symbol_extraction(db: &dyn DbClient, stats: &Arc<StatsTracker>)
         return;
     }
 
+    extract_over_projects(pool, stats, &projects, start).await;
+}
+
+/// Run symbol extraction for a SINGLE project, resolved by name or numeric id.
+///
+/// Lets an operator (`trigger_cron job="symbol-extraction" project=...`) stay
+/// within the MCP tool budget instead of scanning every project serially —
+/// the all-projects loop can exceed the 300s trigger timeout on a large
+/// workspace, starving higher-id projects (F2).
+pub async fn run_symbol_extraction_for_project(
+    db: &dyn DbClient,
+    stats: &Arc<StatsTracker>,
+    project_ref: &str,
+) {
+    let pool = db.pool().expect(
+        "symbol_extraction requires a real &PgPool — DbClient backend must be PgPool-backed",
+    );
+
+    info!(project = %project_ref, "Starting single-project symbol-extraction");
+    let start = std::time::Instant::now();
+    stats.symbol_extraction_runs.fetch_add(1, Ordering::Relaxed);
+
+    // Resolve by name first, then numeric id (id::text avoids a parse step).
+    let projects: Vec<(i32, String)> = match sqlx::query_as::<_, (i32, String)>(
+        "SELECT id, name FROM projects WHERE name = $1 OR id::text = $1 ORDER BY id",
+    )
+    .bind(project_ref)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            error!(project = %project_ref, error = %e, "Failed to resolve project for symbol extraction");
+            return;
+        }
+    };
+
+    if projects.is_empty() {
+        stats
+            .symbol_extraction_noop_returns
+            .fetch_add(1, Ordering::Relaxed);
+        warn!(project = %project_ref, "Symbol extraction: no project matched name or id");
+        return;
+    }
+
+    extract_over_projects(pool, stats, &projects, start).await;
+}
+
+/// Shared driver: run `extract_project_symbols` over a resolved project set,
+/// accumulate totals, and emit the completion log. Used by both the
+/// all-projects and single-project entry points.
+async fn extract_over_projects(
+    pool: &PgPool,
+    stats: &Arc<StatsTracker>,
+    projects: &[(i32, String)],
+    start: std::time::Instant,
+) {
     let mut total_files: u64 = 0;
     let mut total_symbols: u64 = 0;
     let mut total_refs: u64 = 0;
 
-    for (project_id, project_name) in &projects {
+    for (project_id, project_name) in projects {
         match extract_project_symbols(pool, *project_id, project_name, stats).await {
             Ok(stats_per_project) => {
                 total_files += stats_per_project.files_processed;
@@ -108,7 +166,6 @@ pub async fn run_symbol_extraction(db: &dyn DbClient, stats: &Arc<StatsTracker>)
         }
     }
 
-    // `symbol_extraction_runs` was promoted to top-of-body above.
     info!(
         elapsed_ms = start.elapsed().as_millis() as u64,
         projects = projects.len(),
@@ -210,13 +267,78 @@ async fn extract_project_symbols(
     let file_ids: Vec<i64> = metas.iter().map(|m| m.file_id).collect();
     let mut counters = ProjectExtractionStats::default();
 
+    // F1 — watermark resilience. Track the smallest `modified_at` among SKIPPED
+    // files (disk hash-mismatch / IO error / parse failure) so the watermark is
+    // never advanced past a file we failed to extract (which would strand it
+    // until a forced full re-scan). Incremental-skips of unchanged files are
+    // NOT failures and do not hold the watermark back.
+    let mut min_skipped: Option<DateTime<Utc>> = None;
+
     for batch_ids in file_ids.chunks(CONTENT_BATCH_SIZE) {
         let batch = queries::fetch_file_content_batch(pool, project_id, batch_ids).await?;
 
         for file in &batch {
-            let content = match &file.content {
+            // RC2 incremental-skip: content unchanged since the last successful
+            // extraction — nothing to re-parse. Cheap (a hash compare; no disk
+            // read, no parse), which keeps full re-scans affordable.
+            if file.content_hash.is_some() && file.content_hash == file.extracted_content_hash {
+                stats
+                    .symbol_extraction_unchanged_skips
+                    .fetch_add(1, Ordering::Relaxed);
+                continue;
+            }
+
+            // Resolve content: inline if present, else a hash-verified disk read
+            // (asymmetric-storage policy — `content` is NULL for files cheap to
+            // re-read from disk). RC2: never silently skip a content-NULL file;
+            // recover it from disk or count the failure (and hold the watermark).
+            let disk_owned;
+            let content: &str = match &file.content {
                 Some(c) => c,
-                None => continue,
+                None => match read_disk_verified(
+                    &file.path,
+                    file.content_recoverable_from_disk,
+                    file.content_hash,
+                ) {
+                    DiskReadOutcome::Hit(bytes) => {
+                        stats
+                            .symbol_extraction_disk_reads
+                            .fetch_add(1, Ordering::Relaxed);
+                        disk_owned = bytes;
+                        &disk_owned
+                    }
+                    DiskReadOutcome::HashMismatch => {
+                        stats
+                            .symbol_extraction_disk_hash_mismatches
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            project = %project_name,
+                            file = %file.relative_path,
+                            "Symbol extraction: disk content changed since indexing (hash mismatch); skipping until re-indexed"
+                        );
+                        min_skipped = min_modified(min_skipped, file.modified_at);
+                        continue;
+                    }
+                    DiskReadOutcome::Missing => {
+                        stats
+                            .symbol_extraction_disk_missing
+                            .fetch_add(1, Ordering::Relaxed);
+                        min_skipped = min_modified(min_skipped, file.modified_at);
+                        continue;
+                    }
+                    DiskReadOutcome::IoError | DiskReadOutcome::NotRecoverable => {
+                        stats
+                            .symbol_extraction_disk_io_errors
+                            .fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            project = %project_name,
+                            file = %file.relative_path,
+                            "Symbol extraction: content NULL and not recoverable from disk; skipping"
+                        );
+                        min_skipped = min_modified(min_skipped, file.modified_at);
+                        continue;
+                    }
+                },
             };
 
             match extract_and_persist_file(pool, file.file_id, &file.language, content, stats).await
@@ -225,6 +347,10 @@ async fn extract_project_symbols(
                     counters.files_processed += 1;
                     counters.symbols_inserted += s;
                     counters.refs_inserted += r;
+                    // RC2 incremental-skip bookkeeping: remember the content we
+                    // just extracted so an unchanged file is skipped next pass.
+                    queries::set_extracted_content_hash(pool, file.file_id, file.content_hash)
+                        .await?;
                 }
                 Err(e) => {
                     // Per-file transaction failures are logged and skipped — the
@@ -236,6 +362,7 @@ async fn extract_project_symbols(
                         error = %e,
                         "Symbol extraction failed for file (skipping)"
                     );
+                    min_skipped = min_modified(min_skipped, file.modified_at);
                 }
             }
         }
@@ -252,16 +379,37 @@ async fn extract_project_symbols(
         "Symbol-reference target resolution complete"
     );
 
-    queries::set_symbol_extraction_watermark(pool, project_id, Utc::now()).await?;
+    // F1 — advance the watermark to just before the earliest SKIPPED file's
+    // `modified_at`, so every file we failed to extract is re-listed next run
+    // instead of being stranded past the watermark. With no skips, advance to
+    // now. The 1µs back-off keeps the skipped file (whose `modified_at` equals
+    // `min_skipped`) inside the strict `modified_at > watermark` predicate;
+    // successful newer files re-list too, but the incremental-skip turns them
+    // into a cheap no-op. This is monotonic on incremental runs (a listed
+    // file's `modified_at` always exceeds the prior watermark).
+    let new_watermark = match min_skipped {
+        None => Utc::now(),
+        Some(min_skip) => min_skip - chrono::Duration::microseconds(1),
+    };
+    queries::set_symbol_extraction_watermark(pool, project_id, new_watermark).await?;
     info!(
         project = %project_name,
         files = counters.files_processed,
         symbols = counters.symbols_inserted,
         references = counters.refs_inserted,
+        skipped_min_modified = ?min_skipped,
         "Symbol extraction complete for project"
     );
 
     Ok(counters)
+}
+
+/// `min` over an `Option<DateTime>` accumulator and a new value (F1 watermark).
+fn min_modified(acc: Option<DateTime<Utc>>, v: DateTime<Utc>) -> Option<DateTime<Utc>> {
+    match acc {
+        Some(cur) if cur <= v => Some(cur),
+        _ => Some(v),
+    }
 }
 
 /// Map a backend's extracted imports into `ImportUse` symbol-references so the

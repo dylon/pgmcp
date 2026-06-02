@@ -63,10 +63,59 @@ pub async fn run_function_metrics(db: &dyn DbClient, stats: &Arc<StatsTracker>) 
         return;
     }
 
+    run_function_metrics_over(pool, stats, &projects, start).await;
+}
+
+/// Run function-metrics scoring for a SINGLE project (by name or numeric id).
+/// Operator-facing per-project trigger (F2).
+pub async fn run_function_metrics_for_project(
+    db: &dyn DbClient,
+    stats: &Arc<StatsTracker>,
+    project_ref: &str,
+) {
+    let pool = db.pool().expect(
+        "function_metrics requires a real &PgPool — DbClient backend must be PgPool-backed",
+    );
+    info!(project = %project_ref, "Starting single-project function-metrics");
+    let start = std::time::Instant::now();
+    stats.function_metrics_runs.fetch_add(1, Ordering::Relaxed);
+
+    let projects: Vec<(i32, String)> = match sqlx::query_as::<_, (i32, String)>(
+        "SELECT id, name FROM projects WHERE name = $1 OR id::text = $1 ORDER BY id",
+    )
+    .bind(project_ref)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            error!(project = %project_ref, error = %e, "Failed to resolve project for function-metrics");
+            return;
+        }
+    };
+
+    if projects.is_empty() {
+        stats
+            .function_metrics_noop_returns
+            .fetch_add(1, Ordering::Relaxed);
+        warn!(project = %project_ref, "Function-metrics: no project matched name or id");
+        return;
+    }
+
+    run_function_metrics_over(pool, stats, &projects, start).await;
+}
+
+/// Shared driver: score a resolved project set and emit the completion log.
+async fn run_function_metrics_over(
+    pool: &PgPool,
+    stats: &Arc<StatsTracker>,
+    projects: &[(i32, String)],
+    start: std::time::Instant,
+) {
     let mut total_files: u64 = 0;
     let mut total_functions: u64 = 0;
 
-    for (project_id, project_name) in &projects {
+    for (project_id, project_name) in projects {
         match score_project_functions(pool, *project_id, project_name, stats).await {
             Ok(per_project) => {
                 total_files += per_project.files_processed;

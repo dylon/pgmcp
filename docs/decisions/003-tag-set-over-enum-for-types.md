@@ -86,3 +86,33 @@ The `feedback_feature_gated_build_verification.md` discipline applies: a structu
 - Vocabulary seed: `src/parsing/type_tags/vocabulary.rs` (the canonical name → description → language_origin table that seeds `type_tag_catalog`)
 - LFortran ASR for comparison: `https://github.com/lfortran/lfortran/blob/main/src/libasr/ASR.asdl` — ASR is a closed structural grammar because LFortran processes one well-defined language family; pgmcp processes an open polyglot set, so the same shape would be wrong here.
 - Discipline reference: `feedback_feature_gated_build_verification.md` (the after-action that established structural enforcement of architecture choices over commenting / convention).
+
+## Amendment — catalog reconciliation & drift enforcement (2026-06-02)
+
+The "Negative" mitigation (b) above promised a test asserting every emitted tag
+exists "in `vocabulary::SEED_TAGS` **and in the seeded catalog**". The
+catalog-superset half was never written — and its absence bit us: the v21
+concurrency effects (`await_point`, `lock_acquire`, `lock_release`,
+`thread_spawn`, `channel_select`) were added to `SEED_EFFECTS` but the catalogs
+are seeded only inside the **version-gated** v2 migration step, so they never
+reached already-migrated databases. The `symbol_effects.effect` → `effect_catalog`
+FK then rejected every symbol carrying one and the whole file was skipped,
+collapsing symbol coverage. (Full record:
+`docs/scientific-ledger/symbol-coverage-rc1-rc2-2026-06-02.md`.)
+
+This is now enforced structurally:
+
+- **Every-boot reconcile.** `reconcile_vocabulary_catalogs` in
+  `src/db/migrations.rs` runs **unconditionally** from `run_migrations`,
+  idempotently upserting both `effect_catalog` (from `SEED_EFFECTS`) and
+  `type_tag_catalog` (from `SEED_TYPE_TAGS`) and verifying catalog ⊇ vocabulary
+  (a residual gap is logged at `error!`, never fatal). Adding a
+  `define_vocabulary!` line now requires nothing else — the catalog follows on
+  the next boot, fresh install or upgrade alike.
+- **Regression tests** (the promised "and in the seeded catalog" half):
+  `pgmcp-testing/tests/vocabulary_catalog_parity.rs` (real-DB: catalog ⊇ vocab,
+  plus a delete-and-heal test proving the reconcile repairs drift) and the no-DB
+  tripwire `vocabulary.rs::tests::concurrency_effects_present_in_seed`.
+
+The original decision (TEXT + catalog over a Rust enum) is unchanged; this only
+closes the enforcement gap it always intended.

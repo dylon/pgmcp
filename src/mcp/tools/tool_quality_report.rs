@@ -64,7 +64,10 @@ pub async fn tool_quality_report(
         for job in crons {
             crate::mcp::tools::tool_trigger_cron::tool_trigger_cron(
                 ctx,
-                TriggerCronParams { job: job.clone() },
+                TriggerCronParams {
+                    job: job.clone(),
+                    project: None,
+                },
             )
             .await?;
         }

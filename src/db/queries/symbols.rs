@@ -30,10 +30,14 @@ pub async fn list_files_for_symbol_extraction(
 ) -> Result<Vec<SymbolExtractionFileMeta>, sqlx::Error> {
     let langs: Vec<String> = backend_languages.iter().map(|s| s.to_string()).collect();
     sqlx::query_as::<_, SymbolExtractionFileMeta>(
+        // No `content IS NOT NULL` filter: files stored under the
+        // asymmetric-storage policy (content NULL, recoverable from disk) MUST
+        // be listed — Phase B recovers their text from disk. Filtering them out
+        // here is what historically left ~90% of an actively-reindexed project
+        // unextracted (RC2).
         "SELECT id as file_id, relative_path, language
          FROM indexed_files
          WHERE project_id = $1
-           AND content IS NOT NULL
            AND language = ANY($2::text[])
            AND ($3::timestamptz IS NULL OR modified_at > $3)
          ORDER BY id",
@@ -46,29 +50,61 @@ pub async fn list_files_for_symbol_extraction(
 }
 
 /// Per-batch content fetch for the symbol-extraction cron's Phase B.
+///
+/// `content` is `NULL` for files stored under the asymmetric-storage policy
+/// (`content_recoverable_from_disk = true`); the cron recovers their text from
+/// disk via `db::disk_read::read_disk_verified`, keyed off `path` +
+/// `content_hash`. `extracted_content_hash` records the `content_hash` at the
+/// last successful extraction so an unchanged file can be skipped on a full
+/// re-scan (RC2 incremental-skip).
 #[derive(Debug, sqlx::FromRow)]
 pub struct SymbolExtractionFileContent {
     pub file_id: i64,
+    pub path: String,
     pub relative_path: String,
     pub language: String,
     pub content: Option<String>,
+    pub content_recoverable_from_disk: bool,
+    pub content_hash: Option<i64>,
+    pub extracted_content_hash: Option<i64>,
+    pub modified_at: DateTime<Utc>,
 }
 
-/// Fetch content for a batch of file IDs.
+/// Fetch content (+ disk-fallback / incremental-skip metadata) for a batch of
+/// file IDs. No `content IS NOT NULL` filter — content-NULL files are recovered
+/// from disk in Phase B.
 pub async fn fetch_file_content_batch(
     pool: &PgPool,
     project_id: i32,
     file_ids: &[i64],
 ) -> Result<Vec<SymbolExtractionFileContent>, sqlx::Error> {
     sqlx::query_as::<_, SymbolExtractionFileContent>(
-        "SELECT id as file_id, relative_path, language, content
+        "SELECT id as file_id, path, relative_path, language, content,
+                content_recoverable_from_disk, content_hash,
+                extracted_content_hash, modified_at
          FROM indexed_files
-         WHERE project_id = $1 AND id = ANY($2::bigint[]) AND content IS NOT NULL",
+         WHERE project_id = $1 AND id = ANY($2::bigint[])",
     )
     .bind(project_id)
     .bind(file_ids)
     .fetch_all(pool)
     .await
+}
+
+/// Record the `content_hash` that was just successfully extracted, so a later
+/// full re-scan can skip the file while its content is unchanged (RC2
+/// incremental-skip). Idempotent.
+pub async fn set_extracted_content_hash(
+    pool: &PgPool,
+    file_id: i64,
+    content_hash: Option<i64>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE indexed_files SET extracted_content_hash = $1 WHERE id = $2")
+        .bind(content_hash)
+        .bind(file_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Delete all `file_symbols` rows for a file (CASCADE wipes children + dependent

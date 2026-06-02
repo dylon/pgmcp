@@ -25,9 +25,9 @@ use rmcp::model::{CallToolResult, Content, LoggingLevel};
 use serde::Serialize;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
-use xxhash_rust::xxh3::xxh3_64;
 
 use crate::context::SystemContext;
+use crate::db::disk_read::{DiskReadOutcome, read_disk_verified};
 use crate::db::queries::{FileChunkRow, FileContent};
 use crate::mcp::server::*;
 
@@ -116,45 +116,41 @@ pub async fn tool_read_file(
             // from PR D). Try the disk fast-path first; on hash mismatch,
             // disk-IO error, or `content_recoverable_from_disk = false`,
             // fall back to stitching all chunks.
-            if file.content_recoverable_from_disk
-                && let Some(expected_hash) = file.content_hash
-            {
-                match std::fs::read_to_string(&params.path) {
-                    Ok(disk_bytes) => {
-                        let disk_hash = xxh3_64(disk_bytes.as_bytes()) as i64;
-                        if disk_hash == expected_hash {
-                            ctx.stats()
-                                .read_file_disk_hits
-                                .fetch_add(1, Ordering::Relaxed);
-                            file.content = Some(disk_bytes);
-                            file
-                        } else {
-                            info!(
-                                tool = "read_file",
-                                path = %params.path,
-                                "Disk file changed since indexing (hash mismatch); falling back to chunks"
-                            );
-                            ctx.stats()
-                                .read_file_disk_hash_mismatches
-                                .fetch_add(1, Ordering::Relaxed);
-                            stitch_chunks(ctx, &params.path, file).await?
-                        }
-                    }
-                    Err(e) => {
-                        info!(
-                            tool = "read_file",
-                            path = %params.path,
-                            error = %e,
-                            "Disk read failed; falling back to chunks"
-                        );
-                        ctx.stats()
-                            .read_file_disk_io_errors
-                            .fetch_add(1, Ordering::Relaxed);
-                        stitch_chunks(ctx, &params.path, file).await?
-                    }
+            match read_disk_verified(
+                &params.path,
+                file.content_recoverable_from_disk,
+                file.content_hash,
+            ) {
+                DiskReadOutcome::Hit(disk_bytes) => {
+                    ctx.stats()
+                        .read_file_disk_hits
+                        .fetch_add(1, Ordering::Relaxed);
+                    file.content = Some(disk_bytes);
+                    file
                 }
-            } else {
-                stitch_chunks(ctx, &params.path, file).await?
+                DiskReadOutcome::HashMismatch => {
+                    info!(
+                        tool = "read_file",
+                        path = %params.path,
+                        "Disk file changed since indexing (hash mismatch); falling back to chunks"
+                    );
+                    ctx.stats()
+                        .read_file_disk_hash_mismatches
+                        .fetch_add(1, Ordering::Relaxed);
+                    stitch_chunks(ctx, &params.path, file).await?
+                }
+                DiskReadOutcome::Missing | DiskReadOutcome::IoError => {
+                    info!(
+                        tool = "read_file",
+                        path = %params.path,
+                        "Disk read failed; falling back to chunks"
+                    );
+                    ctx.stats()
+                        .read_file_disk_io_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    stitch_chunks(ctx, &params.path, file).await?
+                }
+                DiskReadOutcome::NotRecoverable => stitch_chunks(ctx, &params.path, file).await?,
             }
         }
         Some(file) => file,

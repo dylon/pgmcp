@@ -465,4 +465,26 @@ mod tests {
             assert!(effect(name).is_some(), "missing MeTTa effect: {}", name);
         }
     }
+
+    #[test]
+    fn concurrency_effects_present_in_seed() {
+        // RC1 tripwire (no DB): the v21 concurrency effects must stay in
+        // SEED_EFFECTS. They drifted out of `effect_catalog` once — the
+        // every-boot `reconcile_vocabulary_catalogs` in `db::migrations` now
+        // heals that — and dropping one here would silently FK-skip every
+        // symbol that emits it during extraction. Pairs with the real-DB
+        // `vocabulary_catalog_parity` test (catalog ⊇ vocabulary).
+        for name in [
+            EFFECT_LOCK_ACQUIRE,
+            EFFECT_LOCK_RELEASE,
+            EFFECT_THREAD_SPAWN,
+            EFFECT_AWAIT_POINT,
+            EFFECT_CHANNEL_SELECT,
+        ] {
+            assert!(
+                effect(name).is_some(),
+                "concurrency effect {name} dropped from SEED_EFFECTS"
+            );
+        }
+    }
 }

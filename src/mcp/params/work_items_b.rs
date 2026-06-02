@@ -491,9 +491,15 @@ pub struct DocumentedTechDebtParams {
 pub struct TriggerCronParams {
     /// Cron job to run on demand.
     #[schemars(
-        description = "Cron job name: \"symbol-extraction\" | \"call-graph\" | \"function-metrics\" | \"fuzzy-sync\" | \"a2a-reflect\" | \"msm-calibrate\". Use symbol-extraction first to populate file_symbols (needed by dead_code_reachability and naming_consistency), then call-graph to populate symbol_references edges, then function-metrics for cyclomatic/cognitive/Halstead/NPath/MI. fuzzy-sync rebuilds the per-project symbol/path/commit/mandate fuzzy tries from PG. Workspace-wide; per-project scoping happens through the project filter on the underlying queries."
+        description = "Cron job name: \"symbol-extraction\" | \"call-graph\" | \"function-metrics\" | \"fuzzy-sync\" | \"a2a-reflect\" | \"msm-calibrate\" | \"graph-analysis\". Use symbol-extraction first to populate file_symbols (needed by dead_code_reachability and naming_consistency), then call-graph to populate symbol_references edges, then function-metrics for cyclomatic/cognitive/Halstead/NPath/MI. fuzzy-sync rebuilds the per-project symbol/path/commit/mandate fuzzy tries from PG. Optionally set `project` to scope symbol-extraction / call-graph / function-metrics to a single project."
     )]
     pub job: String,
+    /// Optional project (name or numeric id) to scope a per-project job to.
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project name or numeric id. When set, the symbol-extraction / call-graph / function-metrics jobs run for just that project — keeping a manual trigger within its time budget on a large workspace — instead of looping every project. Ignored by jobs that are not per-project (fuzzy-sync / a2a-reflect / msm-calibrate / graph-analysis)."
+    )]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
