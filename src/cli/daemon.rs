@@ -690,6 +690,26 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         });
     }
 
+    // 11f-septies. Schedule the ontology-integrate cron (Phase 11): attach analyzer
+    // findings (concurrency v22) as evidence to the concepts governing that code.
+    // Gated on [ontology] cron_enabled; idempotent.
+    if config_snapshot.ontology.cron_enabled
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let ontology_cfg = config_snapshot.ontology.clone();
+        let interval_ms = ontology_cfg.cron_interval_secs.saturating_mul(1000);
+        let rt_for_ontology_int = tokio::runtime::Handle::current();
+        // 270s: run after the hierarchy build (240s) so concepts + anchors exist.
+        cron_handle.schedule_recurring(270_000, interval_ms, "ontology-integrate", move || {
+            let pool = pool.clone();
+            let cfg = ontology_cfg.clone();
+            rt_for_ontology_int.spawn(async move {
+                cron::ontology_integrate::run_or_log(Arc::new(pool), cfg).await;
+            });
+            true
+        });
+    }
+
     // 11g. Schedule the trajectory-similarity cron (Stage 5c MSM evolves_like).
     // Off by default ([cron.trajectory_similarity] cron_enabled = false).
     if config_snapshot.cron.trajectory_similarity.cron_enabled

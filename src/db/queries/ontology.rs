@@ -329,6 +329,25 @@ pub async fn list_concept_ids_by_facet(
     .await
 }
 
+/// `(entity_id, finding_id, title, file_id)` pairs where a concurrency finding
+/// (v22) touches a file/symbol that an ontology concept is anchored to — the
+/// Phase-11 producer-integration join (analyzer findings → concept evidence).
+pub async fn concept_concurrency_findings(
+    pool: &PgPool,
+) -> Result<Vec<(i64, i64, String, Option<i64>)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT DISTINCT m.entity_id, cf.id, cf.title, cf.file_id
+         FROM concurrency_findings cf
+         JOIN memory_code_anchor a
+           ON (cf.file_id   IS NOT NULL AND a.file_id   = cf.file_id)
+           OR (cf.symbol_id IS NOT NULL AND a.symbol_id = cf.symbol_id)
+         JOIN ontology_concept_meta m ON m.entity_id = a.entity_id
+         ORDER BY m.entity_id, cf.id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// Software-pattern catalog rows for migration: `(slug, name, category, kind)`.
 pub async fn load_software_patterns(
     pool: &PgPool,

@@ -43,6 +43,8 @@ pub mod ngram_lm_train;
 
 pub mod ontology_build;
 
+pub mod ontology_integrate;
+
 pub mod ontology_invariants;
 
 pub mod ontology_link_predict;
