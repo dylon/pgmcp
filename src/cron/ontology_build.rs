@@ -20,17 +20,30 @@ use crate::ontology::hierarchy;
 /// effect to count as a concept attribute (the FCA support / iceberg threshold).
 const MIN_EFFECT_SUPPORT: i64 = 2;
 
-/// Build the `is_a` hierarchy across all facets, then refresh the edge matview.
+/// Cosine-similarity threshold for EDC `broader` canonicalization links (Phase 5).
+const BROADER_TAU: f64 = 0.92;
+
+/// Build the per-facet `is_a` hierarchy (FCA) + `broader` canonicalization edges
+/// (EDC), then refresh the edge matview.
 pub async fn run_ontology_build(pool: &PgPool) -> Result<(), sqlx::Error> {
-    let mut total = 0usize;
+    let mut isa_total = 0usize;
+    let mut broader_total = 0usize;
     for facet in Facet::ALL {
         match hierarchy::build_facet_isa(pool, *facet, MIN_EFFECT_SUPPORT).await {
-            Ok(n) => total += n,
+            Ok(n) => isa_total += n,
             Err(e) => warn!(error = %e, facet = facet.as_str(), "facet is_a build failed"),
+        }
+        match hierarchy::build_broader_edges(pool, *facet, BROADER_TAU).await {
+            Ok(n) => broader_total += n,
+            Err(e) => warn!(error = %e, facet = facet.as_str(), "facet broader build failed"),
         }
     }
     queries::refresh_memory_unified_edges(pool).await?;
-    info!(is_a_edges = total, "ontology-build is_a hierarchy complete");
+    info!(
+        is_a_edges = isa_total,
+        broader_edges = broader_total,
+        "ontology-build hierarchy complete"
+    );
     Ok(())
 }
 

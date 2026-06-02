@@ -329,6 +329,35 @@ pub async fn list_concept_ids_by_facet(
     .await
 }
 
+/// Same-facet concept pairs whose observation embeddings are within cosine
+/// distance `1 - tau` (i.e. cosine similarity ≥ `tau`) — the EDC canonicalization
+/// candidate set (Phase 5). One embedding per concept (its lowest-id embedded
+/// observation). Returns `(lower_id, higher_id, cosine)` with `lower_id < higher_id`.
+pub async fn find_similar_concept_pairs(
+    pool: &PgPool,
+    facet: Facet,
+    tau: f64,
+) -> Result<Vec<(i64, i64, f64)>, sqlx::Error> {
+    sqlx::query_as(
+        "WITH ce AS (
+             SELECT DISTINCT ON (m.entity_id) m.entity_id, o.embedding
+             FROM ontology_concept_meta m
+             JOIN memory_entities e     ON e.id = m.entity_id AND e.valid_to IS NULL
+             JOIN memory_observations o ON o.entity_id = m.entity_id AND o.embedding IS NOT NULL
+             WHERE m.facet = $1
+             ORDER BY m.entity_id, o.id
+         )
+         SELECT a.entity_id, b.entity_id, (1 - (a.embedding <=> b.embedding))::float8
+         FROM ce a JOIN ce b ON a.entity_id < b.entity_id
+         WHERE (1 - (a.embedding <=> b.embedding)) >= $2
+         ORDER BY a.entity_id, b.entity_id",
+    )
+    .bind(facet.as_str())
+    .bind(tau)
+    .fetch_all(pool)
+    .await
+}
+
 /// `(entity_id, effect)` rows: the shadow-ASR effects exhibited (above
 /// `min_support` symbol occurrences) by the code units of each facet concept,
 /// via its `concept_topic` anchor → chunks → files → symbols → effects. The

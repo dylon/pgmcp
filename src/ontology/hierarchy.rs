@@ -64,3 +64,26 @@ pub async fn build_facet_isa(
         .collect();
     build_isa_from_attrs(pool, &concepts).await
 }
+
+/// EDC canonicalization (Phase 5): link same-facet near-duplicate concepts
+/// (observation-embedding cosine ≥ `tau`) with a `broader` edge from the variant
+/// (higher entity id) to the canonical (lower entity id), weighted by the cosine.
+/// Deterministic candidate generation; the Phase-9 egglog pass does true merging.
+/// Idempotent (edge insert is existence-guarded). Returns new-edge count.
+pub async fn build_broader_edges(
+    pool: &PgPool,
+    facet: Facet,
+    tau: f64,
+) -> Result<usize, sqlx::Error> {
+    let pairs = queries::find_similar_concept_pairs(pool, facet, tau).await?;
+    let mut inserted = 0usize;
+    for (canonical, variant, cosine) in pairs {
+        // `variant broader canonical` ⇒ canonical (lower id) is the broader concept.
+        if queries::insert_ontology_edge(pool, variant, canonical, OntologyRelation::Broader, cosine)
+            .await?
+        {
+            inserted += 1;
+        }
+    }
+    Ok(inserted)
+}
