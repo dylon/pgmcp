@@ -17,6 +17,7 @@
 pub mod classify;
 pub mod cluster;
 pub mod edge;
+pub mod embed_hyperbolic;
 pub mod facet;
 pub mod fca;
 pub mod hierarchy;

@@ -13,7 +13,8 @@ use crate::context::SystemContext;
 use crate::db::queries;
 use crate::mcp::server::{
     OntologyAssertInvariantParams, OntologyConceptParams, OntologyCreateConceptParams,
-    OntologyInvariantsForFileParams, OntologyLinkParams, OntologySearchParams, OntologyTreeParams,
+    OntologyInvariantsForFileParams, OntologyLinkParams, OntologySearchParams,
+    OntologySuggestEdgesParams, OntologyTreeParams,
 };
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err};
 use crate::ontology::edge::OntologyRelation;
@@ -191,4 +192,31 @@ pub async fn tool_ontology_link(
     json_result(&json!({
         "from": from, "to": to, "relation": relation.as_str(), "inserted": inserted,
     }))
+}
+
+/// `ontology_suggest_edges` — Poincaré-predicted candidate hierarchy links
+/// (`broader`) touching a concept, for curator review.
+pub async fn tool_ontology_suggest_edges(
+    ctx: &SystemContext,
+    params: OntologySuggestEdgesParams,
+) -> Result<CallToolResult, McpError> {
+    let pool = pool_or_err(ctx)?;
+    let id = queries::resolve_concept(pool, &params.concept)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| McpError::invalid_params(format!("no concept `{}`", params.concept), None))?;
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
+    let rows = queries::concept_broader_links(pool, id, limit)
+        .await
+        .map_err(db_err)?;
+    let suggestions: Vec<_> = rows
+        .into_iter()
+        .map(|(from_id, from, to_id, to, confidence)| {
+            json!({
+                "from_id": from_id, "from": from, "to_id": to_id, "to": to,
+                "relation": "broader", "confidence": confidence,
+            })
+        })
+        .collect();
+    json_result(&json!({ "concept": params.concept, "suggestions": suggestions }))
 }

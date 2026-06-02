@@ -65,3 +65,12 @@ pub struct OntologyLinkParams {
     /// Relation: is_a | part_of | broader | narrower | member_of.
     pub relation: String,
 }
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OntologySuggestEdgesParams {
+    /// Concept (name or id) to list candidate (`broader`) hierarchy links for.
+    pub concept: String,
+    /// Max suggestions (default 20).
+    #[serde(default)]
+    pub limit: Option<i64>,
+}

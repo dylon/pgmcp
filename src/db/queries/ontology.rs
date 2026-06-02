@@ -329,6 +329,47 @@ pub async fn list_concept_ids_by_facet(
     .await
 }
 
+/// `(child_id, parent_id)` for active `is_a` edges among one facet's concepts —
+/// the Poincaré link-prediction input (Phase 8).
+pub async fn load_isa_edge_ids(
+    pool: &PgPool,
+    facet: Facet,
+) -> Result<Vec<(i64, i64)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT r.from_entity_id, r.to_entity_id
+         FROM memory_relations r
+         JOIN ontology_concept_meta cm ON cm.entity_id = r.from_entity_id AND cm.facet = $1
+         JOIN ontology_concept_meta pm ON pm.entity_id = r.to_entity_id   AND pm.facet = $1
+         WHERE r.relation_type = 'is_a' AND r.valid_to IS NULL",
+    )
+    .bind(facet.as_str())
+    .fetch_all(pool)
+    .await
+}
+
+/// `broader` candidate edges touching a concept (the `ontology_suggest_edges`
+/// payload): `(from_id, from_name, to_id, to_name, weight)`.
+pub async fn concept_broader_links(
+    pool: &PgPool,
+    entity_id: i64,
+    limit: i64,
+) -> Result<Vec<(i64, String, i64, String, f64)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT r.from_entity_id, ef.name, r.to_entity_id, et.name, r.importance::float8
+         FROM memory_relations r
+         JOIN memory_entities ef ON ef.id = r.from_entity_id AND ef.valid_to IS NULL
+         JOIN memory_entities et ON et.id = r.to_entity_id   AND et.valid_to IS NULL
+         WHERE r.relation_type = 'broader' AND r.valid_to IS NULL
+           AND (r.from_entity_id = $1 OR r.to_entity_id = $1)
+         ORDER BY r.importance DESC
+         LIMIT $2",
+    )
+    .bind(entity_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// A named hierarchy edge between two concepts (for the `ontology_tree` view).
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ConceptEdgeRow {

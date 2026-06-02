@@ -151,4 +151,24 @@ broader/narrower (SKOS), or member_of (instance → collection)."
         )
         .await
     }
+
+    #[tool(
+        description = "List Poincaré-predicted candidate hierarchy links (`broader`) touching a \
+concept — ML suggestions for a curator to review (not authoritative `is_a` edges)."
+    )]
+    async fn ontology_suggest_edges(
+        &self,
+        Parameters(params): Parameters<OntologySuggestEdgesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "ontology_suggest_edges",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_ontology::tool_ontology_suggest_edges(self.ctx(), params),
+        )
+        .await
+    }
 }

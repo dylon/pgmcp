@@ -631,6 +631,26 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         });
     }
 
+    // 11f-quater. Schedule the ontology-link-predict cron (Phase 8 optional ML).
+    // Off by default ([ontology] link_predict_enabled). Poincaré-embeds the is_a
+    // DAG and proposes soft `broader` candidate edges (curator-reviewed).
+    if config_snapshot.ontology.link_predict_enabled
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let ontology_cfg = config_snapshot.ontology.clone();
+        let interval_ms = ontology_cfg.cron_interval_secs.saturating_mul(1000);
+        let rt_for_ontology_lp = tokio::runtime::Handle::current();
+        // 300s initial delay so it runs after the hierarchy build (240s).
+        cron_handle.schedule_recurring(300_000, interval_ms, "ontology-link-predict", move || {
+            let pool = pool.clone();
+            let cfg = ontology_cfg.clone();
+            rt_for_ontology_lp.spawn(async move {
+                cron::ontology_link_predict::run_or_log(Arc::new(pool), cfg).await;
+            });
+            true
+        });
+    }
+
     // 11g. Schedule the trajectory-similarity cron (Stage 5c MSM evolves_like).
     // Off by default ([cron.trajectory_similarity] cron_enabled = false).
     if config_snapshot.cron.trajectory_similarity.cron_enabled
