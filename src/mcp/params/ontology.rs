@@ -74,3 +74,19 @@ pub struct OntologySuggestEdgesParams {
     #[serde(default)]
     pub limit: Option<i64>,
 }
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct OntologyCheckParams {}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OntologyExportParams {
+    /// Export format: "prolog" (Prolog/Datalog facts, default) or "edn" (Datomic-style datoms).
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct OntologyQueryParams {
+    /// Concept (name or id) to compute transitive is_a ancestors for.
+    pub concept: String,
+}

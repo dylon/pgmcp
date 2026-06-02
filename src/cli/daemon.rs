@@ -651,6 +651,25 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         });
     }
 
+    // 11f-quinquies. Schedule the ontology-reason cron (Phase 9 constraint check).
+    // Off by default ([ontology] reasoning_enabled). Logs is_a-acyclicity +
+    // invariant-anchoring violations; detail on demand via `ontology_check`.
+    if config_snapshot.ontology.reasoning_enabled
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let ontology_cfg = config_snapshot.ontology.clone();
+        let interval_ms = ontology_cfg.cron_interval_secs.saturating_mul(1000);
+        let rt_for_ontology_reason = tokio::runtime::Handle::current();
+        cron_handle.schedule_recurring(360_000, interval_ms, "ontology-reason", move || {
+            let pool = pool.clone();
+            let cfg = ontology_cfg.clone();
+            rt_for_ontology_reason.spawn(async move {
+                cron::ontology_reason::run_or_log(Arc::new(pool), cfg).await;
+            });
+            true
+        });
+    }
+
     // 11g. Schedule the trajectory-similarity cron (Stage 5c MSM evolves_like).
     // Off by default ([cron.trajectory_similarity] cron_enabled = false).
     if config_snapshot.cron.trajectory_similarity.cron_enabled

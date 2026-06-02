@@ -171,4 +171,64 @@ concept — ML suggestions for a curator to review (not authoritative `is_a` edg
         )
         .await
     }
+
+    #[tool(
+        description = "Check the ontology's structural constraints (is_a acyclicity + every \
+invariant must anchor code) and return any violations."
+    )]
+    async fn ontology_check(
+        &self,
+        Parameters(params): Parameters<OntologyCheckParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "ontology_check",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_ontology::tool_ontology_check(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Export the ontology as Prolog/Datalog facts (`format:\"prolog\"`, default) or \
+EDN datoms (`format:\"edn\"`) for an external reasoner or a local Datomic — read-only interop."
+    )]
+    async fn ontology_export(
+        &self,
+        Parameters(params): Parameters<OntologyExportParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "ontology_export",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_ontology::tool_ontology_export(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Deductive query: the transitive is_a ancestors (the full `is_a*` closure) of \
+a concept."
+    )]
+    async fn ontology_query(
+        &self,
+        Parameters(params): Parameters<OntologyQueryParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "ontology_query",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_ontology::tool_ontology_query(self.ctx(), params),
+        )
+        .await
+    }
 }

@@ -18,10 +18,12 @@ pub mod classify;
 pub mod cluster;
 pub mod edge;
 pub mod embed_hyperbolic;
+pub mod export;
 pub mod facet;
 pub mod fca;
 pub mod hierarchy;
 pub mod mine;
+pub mod reason;
 
 #[allow(unused_imports)] // re-exports consumed by queries/tools/crons in later phases
 pub use edge::{EvidenceKind, OntologyRelation};

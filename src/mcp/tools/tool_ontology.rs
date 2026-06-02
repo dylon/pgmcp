@@ -6,15 +6,16 @@
 //! the structural trust boundary (an agent cannot self-canonicalize).
 
 use rmcp::ErrorData as McpError;
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResult, Content};
 use serde_json::json;
 
 use crate::context::SystemContext;
 use crate::db::queries;
 use crate::mcp::server::{
-    OntologyAssertInvariantParams, OntologyConceptParams, OntologyCreateConceptParams,
-    OntologyInvariantsForFileParams, OntologyLinkParams, OntologySearchParams,
-    OntologySuggestEdgesParams, OntologyTreeParams,
+    OntologyAssertInvariantParams, OntologyCheckParams, OntologyConceptParams,
+    OntologyCreateConceptParams, OntologyExportParams, OntologyInvariantsForFileParams,
+    OntologyLinkParams, OntologyQueryParams, OntologySearchParams, OntologySuggestEdgesParams,
+    OntologyTreeParams,
 };
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err};
 use crate::ontology::edge::OntologyRelation;
@@ -219,4 +220,62 @@ pub async fn tool_ontology_suggest_edges(
         })
         .collect();
     json_result(&json!({ "concept": params.concept, "suggestions": suggestions }))
+}
+
+/// `ontology_check` — run the structural constraint checks (is_a acyclicity +
+/// invariants-must-anchor) and return the violation report.
+pub async fn tool_ontology_check(
+    ctx: &SystemContext,
+    _params: OntologyCheckParams,
+) -> Result<CallToolResult, McpError> {
+    let pool = pool_or_err(ctx)?;
+    let violations = crate::ontology::reason::check_constraints(pool)
+        .await
+        .map_err(db_err)?;
+    let count = violations.len();
+    json_result(&json!({
+        "violations": violations,
+        "count": count,
+        "well_formed": count == 0,
+    }))
+}
+
+/// `ontology_export` — emit the ontology as Prolog/Datalog facts or EDN datoms
+/// for an external reasoner / a local Datomic.
+pub async fn tool_ontology_export(
+    ctx: &SystemContext,
+    params: OntologyExportParams,
+) -> Result<CallToolResult, McpError> {
+    let pool = pool_or_err(ctx)?;
+    let concepts = queries::export_concepts(pool).await.map_err(db_err)?;
+    let edges = queries::export_edges(pool).await.map_err(db_err)?;
+    let text = match params.format.as_deref().unwrap_or("prolog") {
+        "edn" | "datoms" => crate::ontology::export::to_edn(&concepts, &edges),
+        "prolog" | "datalog" => crate::ontology::export::to_prolog(&concepts, &edges),
+        other => {
+            return Err(McpError::invalid_params(
+                format!("unknown export format `{other}` (prolog|edn)"),
+                None,
+            ));
+        }
+    };
+    Ok(CallToolResult::success(vec![Content::text(text)]))
+}
+
+/// `ontology_query` — deductive query: the transitive `is_a` ancestors of a concept.
+pub async fn tool_ontology_query(
+    ctx: &SystemContext,
+    params: OntologyQueryParams,
+) -> Result<CallToolResult, McpError> {
+    let pool = pool_or_err(ctx)?;
+    let id = queries::resolve_concept(pool, &params.concept)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| McpError::invalid_params(format!("no concept `{}`", params.concept), None))?;
+    let ancestors = queries::concept_ancestors(pool, id).await.map_err(db_err)?;
+    let anc: Vec<_> = ancestors
+        .into_iter()
+        .map(|(id, name)| json!({ "id": id, "name": name }))
+        .collect();
+    json_result(&json!({ "concept": params.concept, "entity_id": id, "is_a_ancestors": anc }))
 }

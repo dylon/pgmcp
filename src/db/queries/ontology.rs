@@ -329,6 +329,95 @@ pub async fn list_concept_ids_by_facet(
     .await
 }
 
+/// Concept entity-ids that lie on an `is_a` cycle (reachable from themselves).
+/// The recursive CTE uses `UNION` (set semantics) so it terminates even when a
+/// cycle exists. An empty result means the `is_a` graph is a DAG.
+pub async fn detect_is_a_cycles(pool: &PgPool) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar(
+        "WITH RECURSIVE reach(start, node) AS (
+             SELECT from_entity_id, to_entity_id FROM memory_relations
+             WHERE relation_type = 'is_a' AND valid_to IS NULL
+             UNION
+             SELECT r.start, m.to_entity_id
+             FROM reach r
+             JOIN memory_relations m
+               ON m.from_entity_id = r.node AND m.relation_type = 'is_a' AND m.valid_to IS NULL
+         )
+         SELECT DISTINCT start FROM reach WHERE start = node ORDER BY start",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Invariant concepts with no code anchor — a constraint violation (an invariant
+/// must govern ≥1 file/symbol to be actionable). Returns `(entity_id, name)`.
+pub async fn unanchored_invariants(pool: &PgPool) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT m.entity_id, e.name
+         FROM ontology_concept_meta m
+         JOIN memory_entities e ON e.id = m.entity_id AND e.valid_to IS NULL
+         WHERE m.facet = 'invariant'
+           AND NOT EXISTS (SELECT 1 FROM memory_code_anchor a WHERE a.entity_id = m.entity_id)
+         ORDER BY m.entity_id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// Transitive `is_a` ancestors of a concept (the deductive closure), nearest
+/// first by name. `(ancestor_id, name)`.
+pub async fn concept_ancestors(
+    pool: &PgPool,
+    entity_id: i64,
+) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "WITH RECURSIVE anc(node) AS (
+             SELECT to_entity_id FROM memory_relations
+             WHERE from_entity_id = $1 AND relation_type = 'is_a' AND valid_to IS NULL
+             UNION
+             SELECT r.to_entity_id
+             FROM anc a
+             JOIN memory_relations r
+               ON r.from_entity_id = a.node AND r.relation_type = 'is_a' AND r.valid_to IS NULL
+         )
+         SELECT a.node, e.name
+         FROM anc a JOIN memory_entities e ON e.id = a.node AND e.valid_to IS NULL
+         ORDER BY e.name",
+    )
+    .bind(entity_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// All concepts for export: `(entity_id, name, facet, status)`.
+pub async fn export_concepts(
+    pool: &PgPool,
+) -> Result<Vec<(i64, String, String, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT m.entity_id, e.name, m.facet, m.status
+         FROM ontology_concept_meta m
+         JOIN memory_entities e ON e.id = m.entity_id AND e.valid_to IS NULL
+         ORDER BY m.entity_id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
+/// All ontology hierarchy/membership edges for export: `(from_id, to_id, relation)`.
+pub async fn export_edges(pool: &PgPool) -> Result<Vec<(i64, i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT r.from_entity_id, r.to_entity_id, r.relation_type
+         FROM memory_relations r
+         JOIN ontology_concept_meta a ON a.entity_id = r.from_entity_id
+         JOIN ontology_concept_meta b ON b.entity_id = r.to_entity_id
+         WHERE r.relation_type IN ('is_a','part_of','broader','narrower','member_of')
+           AND r.valid_to IS NULL
+         ORDER BY r.from_entity_id, r.to_entity_id",
+    )
+    .fetch_all(pool)
+    .await
+}
+
 /// `(child_id, parent_id)` for active `is_a` edges among one facet's concepts —
 /// the Poincaré link-prediction input (Phase 8).
 pub async fn load_isa_edge_ids(
