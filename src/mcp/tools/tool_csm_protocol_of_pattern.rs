@@ -21,7 +21,7 @@ pub async fn tool_csm_protocol_of_pattern(
             McpError::invalid_params(
                 format!(
                     "unknown pattern '{}' (expected one of: sequential, mixture, distillation, \
-                     deliberation, recursive — or the a2a_pattern_* skill id)",
+                     deliberation, recursive, worktree_negotiation — or the a2a_pattern_* skill id)",
                     params.pattern
                 ),
                 None,

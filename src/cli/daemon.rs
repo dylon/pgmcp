@@ -28,7 +28,8 @@ use crate::context::SystemContext;
 use crate::shutdown::ShutdownCoordinator;
 use crate::stats::tracker::StatsTracker;
 use crate::{
-    api, cron, daemon, daemon_state, db, embed, indexer, logging, mcp, shutdown, stats, work_pool,
+    api, cron, daemon, daemon_state, db, embed, indexer, logging, mcp, proc_clients, shutdown,
+    stats, work_pool,
 };
 
 /// Wrap any [`SessionManager`] so that successful `create_session` /
@@ -401,6 +402,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         &config_snapshot.cron,
         &config_snapshot.fuzzy,
         &config_snapshot.embeddings,
+        &config_snapshot.clients,
         tokio::runtime::Handle::current(),
         embed_sender.clone(),
         lifecycle.clone(),
@@ -460,6 +462,53 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             ))
         } else {
             tracing::warn!("telemetry writer disabled: DbClient has no PgPool (CLI mode?)");
+            None
+        }
+    } else {
+        None
+    };
+
+    // 11b-bis. MCP-client OS-identity capture writer. Resolves each connected
+    // client's PID/cwd/project from `/proc` (via the TCP peer) and upserts
+    // `mcp_clients`, feeding the `active_clients` tool and the A2A
+    // active-agents-by-project view. Set the listen port FIRST so `note_client`
+    // can disambiguate the client's `/proc/net/tcp` row on the first tool call.
+    let _client_writer_handle = if config_snapshot.clients.enabled {
+        // Set the listen port FIRST so `note_client` can disambiguate the
+        // client's `/proc/net/tcp` row on the first tool call.
+        stats_tracker.set_mcp_server_port(config_snapshot.mcp.port);
+        if let Some(pool) = system_ctx.db().pool() {
+            Some(stats::client_writer::start_client_writer(
+                pool.clone(),
+                Arc::clone(&stats_tracker),
+                shutdown.cancellation_token(),
+            ))
+        } else {
+            tracing::warn!(
+                "mcp-client capture writer disabled: DbClient has no PgPool (CLI mode?)"
+            );
+            None
+        }
+    } else {
+        tracing::info!("mcp-client capture disabled ([clients] enabled = false)");
+        None
+    };
+
+    // 11b′. Phase-2B eBPF file-event capture (client-agnostic, opt-in). Long-lived
+    // task tracing the live client PIDs' openat/open syscalls via bpftrace and
+    // recording `ebpf`-source client_file_events. Off by default; needs
+    // CAP_BPF+CAP_PERFMON at runtime, so it never affects cap-less hosts.
+    let _ebpf_handle = if config_snapshot.clients.enabled && config_snapshot.clients.ebpf_enabled {
+        if let Some(pool) = system_ctx.db().pool() {
+            Some(proc_clients::ebpf::start_ebpf_consumer(
+                pool.clone(),
+                config_snapshot.workspace.paths.clone(),
+                config_snapshot.clients.ebpf_refresh_secs,
+                config_snapshot.clients.ebpf_dedup_secs,
+                shutdown.cancellation_token(),
+            ))
+        } else {
+            tracing::warn!("eBPF capture disabled: DbClient has no PgPool (CLI mode?)");
             None
         }
     } else {
@@ -860,6 +909,14 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
                 axum::routing::post(api::handlers::session_observe),
             )
             .route(
+                "/api/client/file_event",
+                axum::routing::post(api::handlers::client_file_event),
+            )
+            .route(
+                "/api/client/inbox_peek",
+                axum::routing::post(api::handlers::client_inbox_peek),
+            )
+            .route(
                 "/api/tracker/ingest_plan",
                 axum::routing::post(api::handlers::tracker_ingest_plan),
             )
@@ -874,6 +931,10 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             .route(
                 "/api/tracker/pr_event",
                 axum::routing::post(api::handlers::tracker_pr_event),
+            )
+            .route(
+                "/api/tracker/project_event",
+                axum::routing::post(api::handlers::tracker_project_event),
             )
             .merge(crate::a2a::a2a_router())
             .with_state(api_state);
@@ -930,7 +991,17 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let cancel_for_serve = cancel_token.clone();
         let cancel_for_timeout = cancel_token;
 
-        let serve_future = axum::serve(tcp_listener, router).with_graceful_shutdown(async move {
+        // Serve with per-connection `ConnectInfo<SocketAddr>` so tool handlers can
+        // recover the client's TCP peer (source ip:port) and map it back to the
+        // client PID via /proc (see `extract_peer_addr` + `proc_clients`). rmcp's
+        // streamable-HTTP tower layer forwards the whole `http::request::Parts`
+        // (including its `.extensions`, where axum stores ConnectInfo) into the
+        // RequestContext, so nesting `/mcp` does not strip it.
+        let serve_future = axum::serve(
+            tcp_listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
             cancel_for_serve.cancelled().await;
         });
 

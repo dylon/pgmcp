@@ -122,15 +122,41 @@ pub async fn tool_centrality_analysis(
     })
     .await;
 
+    // Cross-project neighborhood (ADR-009 §4.2): which projects depend on this
+    // one (its changes ripple to them) and which it depends on. Centrality is
+    // intra-project; this adds the project-level criticality context.
+    let (cross_project_dependencies, cross_project_dependents) = (async {
+        let Some(pool) = ctx.db().pool() else {
+            return (Vec::new(), Vec::new());
+        };
+        let project_id_opt: Option<i32> =
+            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
+                .bind(&params.project)
+                .fetch_optional(pool)
+                .await
+                .unwrap_or(None);
+        match project_id_opt {
+            Some(pid) => crate::deps::store::cross_project_blocks(pool, pid).await,
+            None => (Vec::new(), Vec::new()),
+        }
+    })
+    .await;
+
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
         "project": params.project,
         "metric": metric,
         "file_count": files.len(),
         "files": files,
+        "cross_project_dependency_count": cross_project_dependencies.len(),
+        "cross_project_dependencies": cross_project_dependencies,
+        "cross_project_dependent_count": cross_project_dependents.len(),
+        "cross_project_dependents": cross_project_dependents,
         "guidance": "High PageRank files are depended upon by many others (critical paths). \
                      High betweenness files sit on many shortest paths (bottlenecks). \
-                     High degree files have many direct dependencies.",
+                     High degree files have many direct dependencies. \
+                     `cross_project_dependents` are OTHER projects whose builds this one's \
+                     central files can break — coordinate via a2a_active_agents.",
     });
 
     let json = serde_json::to_string_pretty(&result)

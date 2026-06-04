@@ -170,6 +170,26 @@ pub(crate) fn extract_mcp_session_id(ctx: &RequestContext<RoleServer>) -> Option
         .map(|s| s.to_string())
 }
 
+/// Extract the connecting client's TCP peer address (source ip:port) from the
+/// streamable-HTTP transport. The daemon serves the router via
+/// `into_make_service_with_connect_info::<SocketAddr>()` (`src/cli/daemon.rs`),
+/// so axum inserts `ConnectInfo<SocketAddr>` into the request extensions, and
+/// rmcp's tower layer forwards the whole `http::request::Parts` (including its
+/// `.extensions`) into `ctx.extensions` — the same seam `extract_mcp_session_id`
+/// uses for headers. Returns `None` for the stdio debug path and CLI dispatch
+/// (no `RequestContext` / no ConnectInfo). The peer port is the key that
+/// `crate::proc_clients::resolve_pid_for_peer` maps back to the client PID via
+/// `/proc/net/tcp`. If a future rmcp build drops `Parts.extensions`, fall back
+/// to a tower `from_fn` layer that stamps the port into an `x-pgmcp-peer-port`
+/// header (headers are known to survive — see `extract_mcp_session_id`).
+pub(crate) fn extract_peer_addr(ctx: &RequestContext<RoleServer>) -> Option<std::net::SocketAddr> {
+    let parts = ctx.extensions.get::<axum::http::request::Parts>()?;
+    parts
+        .extensions
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0)
+}
+
 /// Time, identify, and record a tool invocation, then forward through
 /// `timeout_wrap` so the timeout behavior is preserved verbatim. Replaces
 /// the older `self.stats().record_tool_call(name)` + `timeout_wrap(...)`
@@ -199,6 +219,19 @@ where
     let caller = extract_caller(ctx);
     let request_id = Some(format!("{:?}", ctx.id));
     let mcp_session_id = extract_mcp_session_id(ctx);
+    // Capture the client's OS identity (PID/cwd/project) once per session. Only
+    // the HTTP transport carries both a session id and a TCP peer; stdio/CLI
+    // yield `None` and skip. The ~100 ms /proc resolution + DB upsert happen off
+    // this hot path in the client-writer task (`note_client` is O(1) here).
+    if let (Some(sid), Some(peer)) = (mcp_session_id.as_deref(), extract_peer_addr(ctx)) {
+        stats.note_client(
+            sid,
+            &caller.client_name,
+            &caller.client_version,
+            &caller.protocol_version,
+            peer,
+        );
+    }
     instrumented_tool_run(
         stats,
         name,
@@ -650,6 +683,11 @@ impl McpServer {
                 "a2a_cancel_task"        => a2a_cancel_task(A2aCancelTaskParams),
                 "a2a_register_agent"     => a2a_register_agent(A2aRegisterAgentParams),
                 "a2a_list_agents"        => a2a_list_agents(A2aListAgentsParams),
+                "a2a_active_agents"      => a2a_active_agents(A2aActiveAgentsParams),
+                "a2a_send_message"       => a2a_send_message(A2aSendMessageParams),
+                "a2a_inbox"              => a2a_inbox(A2aInboxParams),
+                "a2a_reply_message"      => a2a_reply_message(A2aReplyMessageParams),
+                "a2a_ack_message"        => a2a_ack_message(A2aAckMessageParams),
                 // A2A RecursiveMAS-inspired extensions
                 "a2a_find_agents_by_specialty"
                     => a2a_find_agents_by_specialty(A2aFindAgentsBySpecialtyParams),
@@ -860,6 +898,13 @@ impl McpServer {
                 "reviewer_recommender"           => reviewer_recommender(ReviewerRecommenderParams),
                 "fix_circular_dependency"        => fix_circular_dependency(FixCircularDependencyParams),
                 "reindex"                        => reindex(ReindexParams),
+                "active_clients"                 => active_clients(ActiveClientsParams),
+                "client_project_matrix"          => client_project_matrix(ClientProjectMatrixParams),
+                "project_dependents"             => project_dependents(ProjectDependentsParams),
+                "project_dependencies"           => project_dependencies(ProjectDependenciesParams),
+                "coordinate_dependency_block"    => coordinate_dependency_block(CoordinateDependencyBlockParams),
+                "coordination_respond"           => coordination_respond(CoordinationRespondParams),
+                "suggest_worktree"               => suggest_worktree(SuggestWorktreeParams),
             }, no_params: {
                 "list_projects" => list_projects,
                 "index_stats"   => index_stats,

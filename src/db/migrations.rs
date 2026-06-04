@@ -37,6 +37,11 @@ mod v21_sync_ops;
 mod v22_concurrency_findings;
 mod v23_ontology;
 mod v24_extracted_content_hash;
+mod v25_client_tracking;
+mod v26_client_file_events;
+mod v27_agent_social;
+mod v28_project_deps_gitstate;
+mod v29_coordination;
 mod v2_shadow_asr;
 mod v3_cross_language_signatures;
 mod v4_work_items;
@@ -2380,6 +2385,46 @@ pub async fn run_migrations(
     )
     .await?;
 
+    apply_step(
+        pool,
+        v25_client_tracking::CLIENT_TRACKING_V1,
+        v25_client_tracking::CLIENT_TRACKING_V1_NAME,
+        || v25_client_tracking::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v26_client_file_events::CLIENT_FILE_EVENTS_V1,
+        v26_client_file_events::CLIENT_FILE_EVENTS_V1_NAME,
+        || v26_client_file_events::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v27_agent_social::AGENT_SOCIAL_V1,
+        v27_agent_social::AGENT_SOCIAL_V1_NAME,
+        || v27_agent_social::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v28_project_deps_gitstate::PROJECT_DEPS_GITSTATE_V1,
+        v28_project_deps_gitstate::PROJECT_DEPS_GITSTATE_V1_NAME,
+        || v28_project_deps_gitstate::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v29_coordination::COORDINATION_V1,
+        v29_coordination::COORDINATION_V1_NAME,
+        || v29_coordination::apply(pool),
+    )
+    .await?;
+
     // Every-boot vocabulary-catalog reconcile (RC1 durable fix). Unconditional
     // and idempotent; closes the post-v2 catalog-drift gap that silently
     // FK-skipped symbol extraction for files carrying a newly-added effect.
@@ -2817,6 +2862,15 @@ pub(crate) const MEMORY_UNIFIED_EDGES_SQL: &str = "CREATE MATERIALIZED VIEW memo
            'lock_order', min_confidence::DOUBLE PRECISION,
            valid_from, valid_to
       FROM lock_order_edges
+    UNION ALL
+    -- project → project: the BITEMPORAL cross-project dependency edge (Phase 4).
+    -- `valid_from`/`valid_to` make the dependency graph `as_of`-queryable and let
+    -- MSM track cross-project coupling evolution over time.
+    SELECT 'project:' || dependent_project_id::TEXT, 'project',
+           'project:' || dependency_project_id::TEXT, 'project',
+           'project_depends_on', confidence::DOUBLE PRECISION,
+           valid_from, valid_to
+      FROM project_dependencies
     UNION ALL
     -- file ↔ file: import / co_change / call (passthrough edge_type)
     SELECT 'file:' || source_file_id::TEXT, 'file',

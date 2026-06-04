@@ -620,6 +620,7 @@ pub fn schedule_maintenance_jobs(
     config: &CronConfig,
     fuzzy_config: &crate::config::FuzzyConfig,
     embeddings_config: &crate::config::EmbeddingsConfig,
+    clients_config: &crate::config::ClientsConfig,
     rt: tokio::runtime::Handle,
     embed_tx: crossbeam_channel::Sender<EmbedIndexRequest>,
     lifecycle: DaemonLifecycle,
@@ -717,6 +718,86 @@ pub fn schedule_maintenance_jobs(
                         presence_offline,
                     )
                     .await;
+                });
+            }
+            true
+        },
+    );
+
+    // mcp-client-liveness: re-check each connected client's PID via /proc,
+    // refresh cwd/project for survivors, and flip dead clients to `exited`.
+    // Light job; backs the `active_clients` tool + the A2A
+    // active-agents-by-project view.
+    let db_lv = Arc::clone(&db);
+    let rt_lv = rt.clone();
+    let stats_lv = Arc::clone(&stats);
+    let lc_lv = lifecycle.clone();
+    let liveness_interval = config.mcp_client_liveness_interval_secs.max(1);
+    let liveness_proc_fd = clients_config.proc_fd_supplement;
+    handle.schedule_recurring(
+        staggered_initial_delay_ms("mcp-client-liveness", liveness_interval * 1000),
+        liveness_interval * 1000,
+        "mcp-client-liveness",
+        move || {
+            if lc_lv.is_stopping() {
+                return false;
+            }
+            let stats = Arc::clone(&stats_lv);
+            if let Some(pool) = db_lv.pool().cloned() {
+                rt_lv.spawn(async move {
+                    crate::cron::mcp_client_liveness::run_or_log(pool, stats, liveness_proc_fd)
+                        .await;
+                });
+            }
+            true
+        },
+    );
+
+    // project-deps-index: re-parse Cargo manifests into project_dependencies
+    // (source=cargo), feeding the project_depends_on unified-graph edges.
+    let db_pd = Arc::clone(&db);
+    let rt_pd = rt.clone();
+    let stats_pd = Arc::clone(&stats);
+    let lc_pd = lifecycle.clone();
+    let deps_interval = config.project_deps_index_interval_secs.max(60);
+    handle.schedule_recurring(
+        staggered_initial_delay_ms("project-deps-index", deps_interval * 1000),
+        deps_interval * 1000,
+        "project-deps-index",
+        move || {
+            if lc_pd.is_stopping() {
+                return false;
+            }
+            let stats = Arc::clone(&stats_pd);
+            if let Some(pool) = db_pd.pool().cloned() {
+                rt_pd.spawn(async move {
+                    crate::cron::project_deps_index::run_or_log(pool, stats).await;
+                });
+            }
+            true
+        },
+    );
+
+    // git-state-scan: detect when a dependency under active coordination is back
+    // on its stable branch & clean, then resolve the coordination (the gatekeeper
+    // close-the-loop). Scoped to active coordinations, so cheap + responsive.
+    let db_gs = Arc::clone(&db);
+    let rt_gs = rt.clone();
+    let stats_gs = Arc::clone(&stats);
+    let lc_gs = lifecycle.clone();
+    let gitscan_interval = config.git_state_scan_interval_secs.max(15);
+    handle.schedule_recurring(
+        staggered_initial_delay_ms("git-state-scan", gitscan_interval * 1000),
+        gitscan_interval * 1000,
+        "git-state-scan",
+        move || {
+            if lc_gs.is_stopping() {
+                return false;
+            }
+            let stats = Arc::clone(&stats_gs);
+            if let Some(pool) = db_gs.pool().cloned() {
+                rt_gs.spawn(async move {
+                    crate::cron::git_state_scan::run_or_log(pool, stats).await;
                 });
             }
             true

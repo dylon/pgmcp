@@ -147,6 +147,21 @@ include_trends = true        # include the TREND (GPA slope/forecast) section
 webhook_url = ""             # empty = no outbound POST (opt-in)
 webhook_min_severity = "high" # min max_severity to POST: info|notice|high|critical
 pg_notify = false            # emit pg_notify('pgmcp_digest', …); reserved seam, no consumer built
+
+# MCP-client tracking — which clients (by OS PID + cwd → project) are connected,
+# their liveness, and which files they touch. The PID is recovered from the TCP
+# peer via /proc; everything else (cwd, liveness, open files) follows from it.
+[clients]
+enabled = true               # capture connected clients into mcp_clients (PID/cwd/project/liveness)
+file_events = true           # accept POST /api/client/file_event (Claude Code PostToolUse hook)
+ebpf_enabled = false         # Phase-2B client-agnostic capture via a bpftrace openat/open probe
+                             #   filtered to the live client PIDs (source='ebpf'). Needs bpftrace on
+                             #   PATH + CAP_BPF+CAP_PERFMON (or root) at runtime; never affects the
+                             #   stable build. Off by default.
+ebpf_refresh_secs = 15       # how often the eBPF consumer re-reads the live PID set & respawns
+ebpf_dedup_secs = 5          # collapse identical (pid, op, path) eBPF events within this window
+proc_fd_supplement = false   # also sample /proc/<pid>/fd on each liveness tick (source='proc_fd');
+                             #   near-blind to open-close editors, so low-signal — off by default
 ```
 
 ### Configuration Reference
@@ -212,6 +227,12 @@ pg_notify = false            # emit pg_notify('pgmcp_digest', …); reserved sea
 | `digest`     | `webhook_url`                     | `""`                                | Optional outbound webhook (empty = off)        |
 | `digest`     | `webhook_min_severity`            | `high`                              | Min `max_severity` to POST (`info`/`notice`/`high`/`critical`) |
 | `digest`     | `pg_notify`                       | `false`                             | Emit `pg_notify('pgmcp_digest', …)` (reserved seam; no consumer) |
+| `clients`    | `enabled`                         | `true`                              | Capture connected MCP clients (PID/cwd→project/liveness) into `mcp_clients` |
+| `clients`    | `file_events`                     | `true`                              | Accept `POST /api/client/file_event` (Claude Code PostToolUse hook → `client_file_events`) |
+| `clients`    | `ebpf_enabled`                    | `false`                             | Phase-2B client-agnostic capture via a `bpftrace` openat/open probe (needs `CAP_BPF`+`CAP_PERFMON`; off by default) |
+| `clients`    | `ebpf_refresh_secs`               | `15`                                | eBPF consumer: live-PID-set re-read & probe-respawn interval |
+| `clients`    | `ebpf_dedup_secs`                 | `5`                                 | eBPF consumer: collapse identical `(pid, op, path)` within this window |
+| `clients`    | `proc_fd_supplement`              | `false`                             | Sample `/proc/<pid>/fd` on each liveness tick (`proc_fd` source; low-signal) |
 
 ### Per-Project Configuration (`.pgmcp.toml`)
 

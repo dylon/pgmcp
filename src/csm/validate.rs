@@ -126,3 +126,83 @@ pub async fn prepare_validation(pool: &PgPool, task_id: Uuid) -> Result<Prepared
         n_turns,
     }))
 }
+
+/// Conformance verdict for a `WorktreeNegotiation` coordination run (ADR-009 §4.4).
+pub struct CoordinationVerdict {
+    pub coordination_id: i64,
+    pub status: String,
+    pub n_turns: usize,
+    pub conformant: bool,
+    pub conformance_error: Option<String>,
+    pub trace: Vec<Event>,
+}
+
+/// Lift a recorded `WorktreeNegotiation` coordination (by `coordination_requests.id`)
+/// from its mailbox thread and conformance-check it against the protocol. The
+/// thread is the `request_worktree` message linked on the request plus every
+/// typed reply (`accept`/`decline`/`moved`) threaded under it (`reply_to`),
+/// time-ordered; each typed message maps to one protocol turn. This realizes the
+/// §4.4 intent — `csm_validate_run` *lifts the mailbox transcript*. No persistence:
+/// a coordination is not an `a2a_tasks` run, so there is no `csm_run_traces` row.
+pub async fn validate_coordination(
+    pool: &PgPool,
+    coordination_id: i64,
+) -> Result<CoordinationVerdict, String> {
+    let row: Option<(Option<i64>, String)> =
+        sqlx::query_as("SELECT message_id, status FROM coordination_requests WHERE id = $1")
+            .bind(coordination_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("read coordination failed: {e}"))?;
+    let Some((message_id, status)) = row else {
+        return Err(format!("coordination #{coordination_id} not found"));
+    };
+
+    // Gather the thread: the request message + its typed replies, time-ordered.
+    let kinds: Vec<String> = match message_id {
+        Some(mid) => sqlx::query_scalar(
+            "SELECT kind FROM agent_messages
+              WHERE id = $1 OR reply_to = $1
+              ORDER BY created_at, id",
+        )
+        .bind(mid)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("read thread failed: {e}"))?,
+        None => Vec::new(),
+    };
+
+    // Only the four typed protocol kinds become turns; any plain message/fyi the
+    // agents exchanged in the same thread is not part of the protocol alphabet.
+    let turns: Vec<TranscriptTurn> = kinds
+        .iter()
+        .filter(|k| {
+            matches!(
+                k.as_str(),
+                "request_worktree" | "accept" | "decline" | "moved"
+            )
+        })
+        .map(|k| TranscriptTurn {
+            round: 0,
+            role: k.clone(),
+            converged: false,
+        })
+        .collect();
+
+    let g = global_of(ProtocolId::WorktreeNegotiation, &ProtocolParams::default());
+    let net = Network::build(ProtocolId::WorktreeNegotiation.name(), &g)
+        .map_err(|e| format!("projection failed: {}", e.message()))?;
+    let trace = lift_transcript(ProtocolId::WorktreeNegotiation, &turns);
+    let (conformant, conformance_error) = match check_conformance(&net, &trace) {
+        Ok(()) => (true, None),
+        Err(e) => (false, Some(e.message())),
+    };
+    Ok(CoordinationVerdict {
+        coordination_id,
+        status,
+        n_turns: turns.len(),
+        conformant,
+        conformance_error,
+        trace,
+    })
+}

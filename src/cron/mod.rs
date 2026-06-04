@@ -17,6 +17,8 @@ pub mod function_metrics;
 #[allow(dead_code)]
 pub mod fuzzy_sync;
 #[allow(dead_code)]
+pub mod git_state_scan;
+#[allow(dead_code)]
 pub mod gpu_fcm;
 #[allow(dead_code)]
 pub mod graph_analysis;
@@ -26,6 +28,8 @@ pub mod job;
 pub mod k_selector;
 #[allow(dead_code)]
 pub mod latent_pipeline_quality;
+#[allow(dead_code)]
+pub mod mcp_client_liveness;
 #[allow(dead_code)]
 pub mod memory_concepts;
 #[allow(dead_code)]
@@ -40,6 +44,8 @@ pub mod memory_reflect;
 pub mod memory_retention;
 #[allow(dead_code)]
 pub mod ngram_lm_train;
+#[allow(dead_code)]
+pub mod project_deps_index;
 
 pub mod ontology_build;
 

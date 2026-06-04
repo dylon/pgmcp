@@ -399,14 +399,15 @@ pub async fn compose_digest(
 /// so unverified assertions are not mistaken for established rules.
 async fn collect_ontology(pool: &PgPool, project_id: Option<i32>, out: &mut Vec<DigestItem>) {
     let rows: Result<Vec<(String, Option<String>, String)>, _> = sqlx::query_as(
-        "SELECT DISTINCT e.name, m.constraint_text, m.status
+        "SELECT e.name, m.constraint_text, m.status
          FROM ontology_concept_meta m
          JOIN memory_entities e     ON e.id = m.entity_id AND e.valid_to IS NULL
          JOIN memory_code_anchor a  ON a.entity_id = m.entity_id
          LEFT JOIN file_symbols s   ON s.id = a.symbol_id
          JOIN indexed_files f       ON f.id = COALESCE(a.file_id, s.file_id)
          WHERE m.facet = 'invariant' AND ($1::int IS NULL OR f.project_id = $1)
-         ORDER BY (m.status = 'canonical') DESC, m.confidence DESC
+         GROUP BY e.name, m.constraint_text, m.status
+         ORDER BY (m.status = 'canonical') DESC, MAX(m.confidence) DESC, e.name
          LIMIT 8",
     )
     .bind(project_id)

@@ -25,9 +25,34 @@ pub async fn tool_csm_validate_run(
     params: CsmValidateRunParams,
 ) -> Result<CallToolResult, McpError> {
     let pool = pool_or_err(ctx)?;
-    let task_id = Uuid::parse_str(&params.task_id).map_err(|e| {
-        McpError::invalid_params(format!("bad task_id '{}': {e}", params.task_id), None)
+
+    // Coordination mode (§4.4): validate a WorktreeNegotiation run by lifting its
+    // typed mailbox thread. No `a2a_tasks`/`csm_run_traces` involvement.
+    if let Some(cid) = params.coordination_id {
+        let v = crate::csm::validate::validate_coordination(pool, cid)
+            .await
+            .map_err(|e| McpError::invalid_params(e, None))?;
+        return json_result(&json!({
+            "coordination_id": v.coordination_id,
+            "protocol": "worktree_negotiation",
+            "coordination_status": v.status,
+            "conformant": v.conformant,
+            "conformance_error": v.conformance_error,
+            "n_turns": v.n_turns,
+            "n_events": v.trace.len(),
+            "events": serde_json::to_value(&v.trace).unwrap_or(Value::Null),
+        }));
+    }
+
+    let task_id_str = params.task_id.ok_or_else(|| {
+        McpError::invalid_params(
+            "provide task_id (an a2a_pattern_* run) or coordination_id (a WorktreeNegotiation run)"
+                .to_string(),
+            None,
+        )
     })?;
+    let task_id = Uuid::parse_str(&task_id_str)
+        .map_err(|e| McpError::invalid_params(format!("bad task_id '{task_id_str}': {e}"), None))?;
 
     let ready = match prepare_validation(pool, task_id)
         .await
@@ -55,7 +80,7 @@ pub async fn tool_csm_validate_run(
             reason,
         } => {
             return json_result(&json!({
-                "task_id": params.task_id,
+                "task_id": task_id_str,
                 "protocol": id.name(),
                 "conformant": false,
                 "conformance_error": reason,
@@ -90,7 +115,7 @@ pub async fn tool_csm_validate_run(
     .map_err(|e| McpError::internal_error(format!("insert_run_trace failed: {e}"), None))?;
 
     json_result(&json!({
-        "task_id": params.task_id,
+        "task_id": task_id_str,
         "protocol": ready.protocol.name(),
         "conformant": ready.conformant,
         "conformance_error": ready.conformance_error,

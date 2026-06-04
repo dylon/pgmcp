@@ -264,6 +264,33 @@ pub fn lift_transcript(pattern: ProtocolId, turns: &[TranscriptTurn]) -> Trace {
                 tr.push(Event::new(sub, o.clone(), Label::text("subresult")));
             }
         }
+        ProtocolId::WorktreeNegotiation => {
+            // Each turn names one typed mailbox kind exchanged between the
+            // Requester (R, on the dependent) and the Editor (E, on the
+            // dependency): request_worktree (R→E), then E's choice accept|decline
+            // (E→R) and, on accept, moved (E→R). The mapping is 1:1 with the
+            // mailbox `MessageKind`s, so a recorded coordination thread lifts
+            // faithfully — a thread that skips `accept` straight to `moved`, or
+            // never answers, yields a non-conforming trace the observer surfaces.
+            let r = Role::new("R");
+            let e = Role::new("E");
+            for t in turns {
+                let role = t.role.to_lowercase();
+                if role.contains("request") {
+                    tr.push(Event::new(
+                        r.clone(),
+                        e.clone(),
+                        Label::text("request_worktree"),
+                    ));
+                } else if role.contains("accept") {
+                    tr.push(Event::new(e.clone(), r.clone(), Label::text("accept")));
+                } else if role.contains("moved") {
+                    tr.push(Event::new(e.clone(), r.clone(), Label::text("moved")));
+                } else if role.contains("decline") {
+                    tr.push(Event::new(e.clone(), r.clone(), Label::text("decline")));
+                }
+            }
+        }
     }
     tr
 }
@@ -364,5 +391,89 @@ mod tests {
         let turns = [turn("Sub"), turn("Sub")];
         let trace = lift_transcript(ProtocolId::Recursive, &turns);
         check_conformance(&n, &trace).expect("recursive depth-2 run conforms");
+    }
+
+    #[test]
+    fn worktree_negotiation_accept_then_moved_conforms() {
+        // R asks, E accepts, E reports moved — the happy path through the
+        // accept branch (`request_worktree . accept . moved . end`).
+        let p = ProtocolParams::default();
+        let n = net(ProtocolId::WorktreeNegotiation, &p);
+        let turns = [turn("request_worktree"), turn("accept"), turn("moved")];
+        let trace = lift_transcript(ProtocolId::WorktreeNegotiation, &turns);
+        check_conformance(&n, &trace)
+            .unwrap_or_else(|e| panic!("accept→moved should conform: {}", e.message()));
+    }
+
+    #[test]
+    fn worktree_negotiation_decline_conforms() {
+        // The decline branch (`request_worktree . decline . end`) is a complete,
+        // legal run: the dependent escalates or withdraws out of band.
+        let p = ProtocolParams::default();
+        let n = net(ProtocolId::WorktreeNegotiation, &p);
+        let turns = [turn("request_worktree"), turn("decline")];
+        let trace = lift_transcript(ProtocolId::WorktreeNegotiation, &turns);
+        check_conformance(&n, &trace).expect("decline branch conforms");
+    }
+
+    #[test]
+    fn worktree_negotiation_moved_without_accept_is_rejected() {
+        // `moved` before the editor's `accept` selection is not a legal path —
+        // the protocol requires the choice be announced first. The observer
+        // surfaces an editor that jumps straight to "moved".
+        let p = ProtocolParams::default();
+        let n = net(ProtocolId::WorktreeNegotiation, &p);
+        let turns = [turn("request_worktree"), turn("moved")];
+        let trace = lift_transcript(ProtocolId::WorktreeNegotiation, &turns);
+        let err = check_conformance(&n, &trace)
+            .expect_err("moved-without-accept diverges from the protocol");
+        assert!(matches!(
+            err,
+            ConformanceError::Step { .. } | ConformanceError::Incomplete { .. }
+        ));
+    }
+
+    #[test]
+    fn worktree_negotiation_request_only_is_incomplete() {
+        // R asked, E never answered: the network is still awaiting E's choice, so
+        // the run is Incomplete — exactly the "stalled negotiation" the observer
+        // must surface (the dependent should escalate or withdraw).
+        let p = ProtocolParams::default();
+        let n = net(ProtocolId::WorktreeNegotiation, &p);
+        let turns = [turn("request_worktree")];
+        let trace = lift_transcript(ProtocolId::WorktreeNegotiation, &turns);
+        let err = check_conformance(&n, &trace).expect_err("an unanswered request is incomplete");
+        assert!(matches!(err, ConformanceError::Incomplete { .. }));
+    }
+
+    #[test]
+    fn worktree_negotiation_accept_only_is_incomplete() {
+        // E accepted but never reported `moved`: the accept branch requires a
+        // trailing `moved` before terminal, so accept-without-moved is Incomplete.
+        let p = ProtocolParams::default();
+        let n = net(ProtocolId::WorktreeNegotiation, &p);
+        let turns = [turn("request_worktree"), turn("accept")];
+        let trace = lift_transcript(ProtocolId::WorktreeNegotiation, &turns);
+        let err = check_conformance(&n, &trace).expect_err("accept-without-moved is incomplete");
+        assert!(matches!(err, ConformanceError::Incomplete { .. }));
+    }
+
+    #[test]
+    fn worktree_negotiation_lift_ignores_non_protocol_turns() {
+        // A stray plain message in the thread (role outside the 4 kinds) is not
+        // part of the protocol alphabet and is dropped by the lift, so the
+        // request_worktree·accept·moved run still conforms despite the noise.
+        let p = ProtocolParams::default();
+        let n = net(ProtocolId::WorktreeNegotiation, &p);
+        let turns = [
+            turn("request_worktree"),
+            turn("fyi-some-chatter"),
+            turn("accept"),
+            turn("moved"),
+        ];
+        let trace = lift_transcript(ProtocolId::WorktreeNegotiation, &turns);
+        // Exactly three protocol events survive (the chatter is dropped).
+        assert_eq!(trace.len(), 3, "non-protocol turn dropped from the lift");
+        check_conformance(&n, &trace).expect("conforms despite stray chatter");
     }
 }

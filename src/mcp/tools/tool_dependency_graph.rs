@@ -284,11 +284,36 @@ pub async fn tool_dependency_graph(
     })
     .await;
 
+    // Cross-project neighborhood (ADR-009 §4.2): the `project_depends_on` edges
+    // touching this project — the projects it depends on (which may break it) and
+    // the projects that depend on it (which it may break). Surfaced alongside the
+    // intra-project import graph so the dependency view spans project boundaries.
+    let (cross_project_dependencies, cross_project_dependents) = match ctx.db().pool() {
+        Some(pool) => crate::deps::store::cross_project_blocks(pool, project_id).await,
+        None => (Vec::new(), Vec::new()),
+    };
+
     let result_with_effects = match result {
         serde_json::Value::Object(mut m) => {
             m.insert(
                 "effect_breakdown".to_string(),
                 serde_json::json!(effect_breakdown),
+            );
+            m.insert(
+                "cross_project_dependency_count".to_string(),
+                serde_json::json!(cross_project_dependencies.len()),
+            );
+            m.insert(
+                "cross_project_dependencies".to_string(),
+                serde_json::json!(cross_project_dependencies),
+            );
+            m.insert(
+                "cross_project_dependent_count".to_string(),
+                serde_json::json!(cross_project_dependents.len()),
+            );
+            m.insert(
+                "cross_project_dependents".to_string(),
+                serde_json::json!(cross_project_dependents),
             );
             serde_json::Value::Object(m)
         }

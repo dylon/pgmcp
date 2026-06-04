@@ -51,7 +51,10 @@ user = "you"
 password = "password"       # or omit and set PGMCP_DB_PASSWORD
 ```
 
-Option A wins if both are set.
+Option A wins if both are set. If neither option is configured, the harness
+falls back to `~/.config/pgmcp/config.toml` as the connection authority, but it
+still creates separate `pgmcp_test_*` databases and never runs tests against the
+configured pgmcp database's tables.
 
 ## How the harness works
 

@@ -277,6 +277,49 @@ fn workflow_knn(trajs: &[WfTraj], k: usize) -> Vec<(String, String, String, Stri
 
 /// Compute trajectory similarities for all sources and replace the
 /// `trajectory_similarities` table contents in one transaction.
+/// project dependency-accrual trajectories: per-project cumulative count of
+/// live+historical `project_depends_on` edges bucketed by the week of each
+/// edge's `valid_from` (cross-project coupling growth over time). `evolves_like`
+/// then links projects whose dependency-accumulation curves move alike — "which
+/// projects are accreting/shedding dependencies in the same shape?".
+async fn project_depends_on_trajectories(
+    pool: &PgPool,
+    min_points: i64,
+) -> Result<Vec<Traj>, sqlx::Error> {
+    let rows: Vec<(i32, Vec<f64>)> = sqlx::query_as(
+        "WITH weekly AS (
+            SELECT dependent_project_id AS pid,
+                   date_trunc('week', valid_from) AS wk,
+                   COUNT(*)::float8 AS added
+              FROM project_dependencies
+             GROUP BY dependent_project_id, date_trunc('week', valid_from)
+         )
+         SELECT pid, array_agg(added ORDER BY wk) AS series
+           FROM weekly
+          GROUP BY pid",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(pid, weekly_adds)| {
+            let mut cum = 0.0;
+            let series: Vec<f64> = weekly_adds
+                .into_iter()
+                .map(|a| {
+                    cum += a;
+                    cum
+                })
+                .collect();
+            (series.len() as i64 >= min_points).then(|| Traj {
+                node_id: format!("project:{pid}"),
+                node_type: "project_depends_on".to_string(),
+                series,
+            })
+        })
+        .collect())
+}
+
 pub async fn run_trajectory_similarity(
     pool: &PgPool,
     stats: &StatsTracker,
@@ -294,6 +337,7 @@ pub async fn run_trajectory_similarity(
         file_trajectories(pool, config.min_points).await?,
         deadlock_risk_trajectories(pool, config.min_points).await?,
         lock_contention_trajectories(pool, config.min_points).await?,
+        project_depends_on_trajectories(pool, config.min_points).await?,
     ] {
         cohort.sort_by_key(|t| std::cmp::Reverse(t.series.len()));
         cohort.truncate(cap);

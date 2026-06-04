@@ -471,6 +471,233 @@ pub async fn search(
 }
 
 // ============================================================================
+// POST /api/client/file_event — record a client file-touch (Phase 2A hook)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ClientFileEventRequest {
+    pub session_id: uuid::Uuid,
+    pub cwd: String,
+    pub file_path: String,
+    /// Closed `FileOp` vocab: open|read|write|edit|close. Unknown values are
+    /// rejected (400) so a typo can't land an unconstrained row.
+    pub op: String,
+    // NB: the hook also sends a constant `agent_id` ("claude-code"); it is
+    // intentionally not a field here — it is fully implied by `source='client_hook'`
+    // and adds no attribution beyond the per-session/pid columns. serde ignores
+    // the extra JSON key, so the hook needs no change.
+}
+
+#[derive(Debug, Serialize)]
+pub struct ClientFileEventResponse {
+    pub recorded: bool,
+    pub project_id: Option<i32>,
+    pub file_id: Option<i64>,
+}
+
+/// Records one client↔file event from the Claude Code `PostToolUse` hook
+/// (`~/.claude/hooks/pgmcp-file-event.sh`). Resolves the project (longest-prefix
+/// cwd) and the indexed file (by absolute path), validates `op` against the
+/// closed `FileOp` vocabulary, and inserts into `client_file_events` with
+/// `source='client_hook'`. Hook-side identity is the Claude `session_id`; the
+/// MCP `mcp_session_id` / PID are left NULL (PID-native sources fill those).
+pub async fn client_file_event(
+    State(state): State<ApiState>,
+    Json(req): Json<ClientFileEventRequest>,
+) -> Result<Json<ClientFileEventResponse>, (StatusCode, String)> {
+    // Honor the `[clients] file_events` switch — a no-op (not an error) when
+    // off, so the hook stays harmless even if left wired in settings.json.
+    if !state.config.load().clients.file_events {
+        return Ok(Json(ClientFileEventResponse {
+            recorded: false,
+            project_id: None,
+            file_id: None,
+        }));
+    }
+
+    // Validate `op` against the closed vocabulary before touching the DB.
+    let op = crate::proc_clients::file_events::FileOp::parse(&req.op).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!(
+            "invalid op '{}': expected one of open|read|write|edit|close",
+            req.op
+        ),
+    ))?;
+
+    let pool = state.db.pool().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "raw pool unavailable".to_string(),
+    ))?;
+
+    // Best-effort project (longest-prefix cwd) + indexed-file (absolute path)
+    // resolution — a NULL on either is fine (cwd outside any project, or an
+    // unindexed/just-written file); the row still attributes the touch.
+    let project_id = state
+        .db
+        .find_project_by_cwd(&req.cwd)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.id);
+    let file_id: Option<i64> = sqlx::query_scalar("SELECT id FROM indexed_files WHERE path = $1")
+        .bind(&req.file_path)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+
+    sqlx::query(
+        "INSERT INTO client_file_events
+            (session_id, file_id, project_id, abs_path, op, source, ts)
+         VALUES ($1, $2, $3, $4, $5, 'client_hook', now())",
+    )
+    .bind(req.session_id)
+    .bind(file_id)
+    .bind(project_id)
+    .bind(&req.file_path)
+    .bind(op.as_str())
+    .execute(pool)
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("client_file_event insert failed: {e}"),
+        )
+    })?;
+
+    Ok(Json(ClientFileEventResponse {
+        recorded: true,
+        project_id,
+        file_id,
+    }))
+}
+
+// ============================================================================
+// POST /api/client/inbox_peek — mid-loop A2A message delivery (PostToolUse hook)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct InboxPeekRequest {
+    pub session_id: uuid::Uuid,
+    pub cwd: String,
+    #[serde(default)]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct InboxPeekResponse {
+    /// Rendered "📨 Agent messages" block, or empty when nothing is pending.
+    pub additional_context: String,
+}
+
+/// Returns any undelivered A2A messages for this session/project as a markdown
+/// block (and marks them delivered on the `posttooluse` channel). Backs the
+/// `~/.claude/hooks/pgmcp-inbox.sh` PostToolUse hook, which emits the block as
+/// `additionalContext` so a mid-agentic-loop agent sees mail between tool calls.
+pub async fn client_inbox_peek(
+    State(state): State<ApiState>,
+    Json(req): Json<InboxPeekRequest>,
+) -> Result<Json<InboxPeekResponse>, (StatusCode, String)> {
+    let pool = state.db.pool().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "raw pool unavailable".to_string(),
+    ))?;
+    let project_id = state
+        .db
+        .find_project_by_cwd(&req.cwd)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.id);
+    let recipient_session = req.session_id.to_string();
+    let block = crate::a2a::delivery::render_and_deliver(
+        pool,
+        Some(&recipient_session),
+        project_id,
+        req.agent_id.as_deref(),
+        crate::a2a::mailbox::DeliveryChannel::Posttooluse.as_str(),
+        5,
+    )
+    .await
+    .unwrap_or_default();
+    Ok(Json(InboxPeekResponse {
+        additional_context: block,
+    }))
+}
+
+// ============================================================================
+// POST /api/tracker/project_event — git-state gatekeeper (resolves coordination)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ProjectEventRequest {
+    pub project: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ProjectEventResponse {
+    pub recorded: bool,
+    pub resolved_requests: Vec<i64>,
+}
+
+/// The coordination gatekeeper seam (parallels `ci_evidence`/`pr_event`): an
+/// external git scanner or CI posts a project git-state event. A
+/// `stable_restored` event for a dependency resolves the open coordination
+/// requests against it and notifies the unblocked requesters — the only
+/// non-cron path to `resolved`, preserving the trust boundary proven in
+/// `docs/formal/WorktreeNegotiation.{tla,v}`.
+pub async fn tracker_project_event(
+    State(state): State<ApiState>,
+    Json(req): Json<ProjectEventRequest>,
+) -> Result<Json<ProjectEventResponse>, (StatusCode, String)> {
+    let pool = state.db.pool().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "raw pool unavailable".to_string(),
+    ))?;
+    let kind = crate::deps::coordination::ProjectEventKind::parse(&req.kind).ok_or((
+        StatusCode::BAD_REQUEST,
+        format!(
+            "invalid kind '{}': expected stable_restored | went_unstable",
+            req.kind
+        ),
+    ))?;
+    let pid: Option<i32> = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
+        .bind(&req.project)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some(pid) = pid else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("unknown project '{}'", req.project),
+        ));
+    };
+    sqlx::query("INSERT INTO project_events (project_id, kind) VALUES ($1, $2)")
+        .bind(pid)
+        .bind(kind.as_str())
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("event insert: {e}"),
+            )
+        })?;
+    let resolved_requests = if kind == crate::deps::coordination::ProjectEventKind::StableRestored {
+        crate::deps::coord_store::resolve_and_notify(pool, pid)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("resolve: {e}")))?
+    } else {
+        Vec::new()
+    };
+    Ok(Json(ProjectEventResponse {
+        recorded: true,
+        resolved_requests,
+    }))
+}
+
+// ============================================================================
 // POST /api/session/observe — Session-mandate observation + re-injection
 // ============================================================================
 
@@ -530,6 +757,19 @@ pub async fn session_observe(
                 format!("upsert_session failed: {}", e),
             )
         })?;
+
+    // Make the work-item presence layer project-aware: record this agent's
+    // session + current project so the active-agents-by-project view can join
+    // agent → project. Fire-and-forget; never blocks the observe response.
+    if let Some(agent_id) = req.agent_id.as_deref() {
+        let _ = crate::db::queries::touch_agent_presence_project(
+            pool,
+            agent_id,
+            req.session_id,
+            project_id,
+        )
+        .await;
+    }
 
     let sha256 = crate::sessions::prompt_sha256(&req.prompt);
 
@@ -813,6 +1053,57 @@ pub async fn session_observe(
                     });
                 }
             }
+        }
+    }
+
+    // 📨 Agent mailbox: surface undelivered messages for this session/project on
+    // the model-visible next-turn channel (UserPromptSubmit). Receipt-deduped per
+    // session so each message appears once; budget-shared with the 2 KB block.
+    // (Session-addressed messages — keyed by mcp_session_id — arrive via the
+    // `a2a_inbox` pull instead; here we deliver project- and agent-broadcasts.)
+    if additional_context.len() < 1900
+        && let Some(block) = crate::a2a::delivery::render_and_deliver(
+            pool,
+            Some(&req.session_id.to_string()),
+            project_id,
+            req.agent_id.as_deref(),
+            crate::a2a::mailbox::DeliveryChannel::Prompt.as_str(),
+            5,
+        )
+        .await
+        && additional_context.len() + block.len() + 1 < 2048
+    {
+        if !additional_context.is_empty() {
+            additional_context.push('\n');
+        }
+        additional_context.push_str(&block);
+    }
+
+    // Phase 4 (ADR-009 §4.6): proactive dependency-edit warnings. Surface
+    // "a dependency you rely on is being edited (dirty) by <agent>" for the
+    // dependencies of this project that are dirty, have a live editor, and are not
+    // already under an open coordination request from here (that open-request
+    // check is the dedup — once you `coordinate_dependency_block`, it goes quiet).
+    // Off unless [a2a] proactive_dependency_warnings = true. Read-only;
+    // budget-shared with the 2 KB block.
+    if state.config.load().a2a.proactive_dependency_warnings
+        && additional_context.len() < 1900
+        && let Some(pid) = project_id
+        && let Ok(warns) = crate::deps::coord_store::pending_dependency_warnings(pool, pid, 3).await
+        && !warns.is_empty()
+    {
+        let mut block = String::from("\n## ⚠ Dependencies being edited (pgmcp)\n");
+        for w in &warns {
+            block.push_str(&format!(
+                "- **{}** is being edited (dirty) by {} — your build may break; \
+                 `coordinate_dependency_block{{dependency:\"{}\"}}` to request a worktree move.\n",
+                w.dependency_name,
+                w.editors.as_deref().unwrap_or("an agent"),
+                w.dependency_name,
+            ));
+        }
+        if additional_context.len() + block.len() < 2048 {
+            additional_context.push_str(&block);
         }
     }
 

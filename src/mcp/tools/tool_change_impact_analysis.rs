@@ -343,6 +343,29 @@ pub async fn tool_change_impact_analysis(
     })
     .await;
 
+    // Cross-project impact (Phase 4): OTHER projects that depend on this one may
+    // break when its exported API changes. Surfaced at project granularity via
+    // the `project_depends_on` edge — the "edits in U impact dependents D" signal
+    // that powers proactive coordination warnings.
+    let cross_project_dependents: Vec<serde_json::Value> = match ctx.db().pool() {
+        Some(pool) => crate::deps::store::dependents_of(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "project": r.dependent_name,
+                    "project_id": r.dependent_project_id,
+                    "dep_name": r.dep_name,
+                    "kind": r.kind,
+                    "source": format!("cross_project_{}", r.source),
+                    "confidence": r.confidence,
+                })
+            })
+            .collect(),
+        None => Vec::new(),
+    };
+
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
         "project": params.project,
@@ -351,10 +374,14 @@ pub async fn tool_change_impact_analysis(
         "include_semantic": include_semantic,
         "impacted_file_count": impact_list.len(),
         "impacted_files": impact_list,
+        "cross_project_dependent_count": cross_project_dependents.len(),
+        "cross_project_dependents": cross_project_dependents,
         "guidance": "Files with high impact scores are most likely to need changes when the \
                      target file changes. 'import' sources are direct dependents, \
                      'co_change' sources historically change together, \
-                     'semantic' sources are functionally related.",
+                     'semantic' sources are functionally related. \
+                     `cross_project_dependents` are OTHER projects that depend on this one and \
+                     may break — use a2a_active_agents on them to coordinate.",
     });
 
     let json = serde_json::to_string_pretty(&result)

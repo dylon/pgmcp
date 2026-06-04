@@ -300,6 +300,110 @@ pub struct FileInfoParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ActiveClientsParams {
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project-name filter (as shown by list_projects); omit to list clients across all projects."
+    )]
+    pub project: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Also include recently-exited clients (default false → only currently-alive clients)."
+    )]
+    pub include_exited: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClientProjectMatrixParams {
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project-name filter (as shown by list_projects); omit for all projects."
+    )]
+    pub project: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Lookback window in minutes (default 1440 = 24h; clamped to 1..=44640 = 31d)."
+    )]
+    pub since_minutes: Option<i32>,
+    #[serde(default)]
+    #[schemars(
+        description = "How many recently-edited files to list per project (default 5; clamped 0..=50)."
+    )]
+    pub top_files_per_project: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectDependentsParams {
+    #[schemars(
+        description = "Project name (as shown by list_projects) — returns the projects that depend ON it."
+    )]
+    pub project: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProjectDependenciesParams {
+    #[schemars(
+        description = "Project name (as shown by list_projects) — returns the projects IT depends on."
+    )]
+    pub project: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CoordinateDependencyBlockParams {
+    #[schemars(
+        description = "The dependency project name (from list_projects) your build broke on."
+    )]
+    pub dependency: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional compiler-error excerpt naming the breakage (ground truth)."
+    )]
+    pub error_excerpt: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Your own project name (the blocked dependent), if known.")]
+    pub dependent_project: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Your mcp_session_id; auto-filled with the caller's session over MCP."
+    )]
+    pub requester_session: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional: the public_id of YOUR work-item that this dependency blocks. It is \
+                       set `blocked` now and auto-unblocked (blocked → ready, by the git-scanner \
+                       gatekeeper — never by the editor) when the dependency is restored."
+    )]
+    pub blocked_work_item: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CoordinationRespondParams {
+    #[schemars(description = "The coordination request id (from coordinate_dependency_block).")]
+    pub request_id: i64,
+    #[schemars(description = "Your response: accept | decline | moved.")]
+    pub response: String,
+    #[serde(default)]
+    #[schemars(description = "On 'moved', the worktree branch you moved your in-flight edits to.")]
+    pub worktree_branch: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Your mcp_session_id; auto-filled with the caller's session over MCP."
+    )]
+    pub editor_session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SuggestWorktreeParams {
+    #[schemars(
+        description = "The project name to suggest a worktree-move for (the dependency being edited)."
+    )]
+    pub project: String,
+    #[serde(default)]
+    #[schemars(description = "Feature branch name for the moved work (default 'wip').")]
+    pub feature_branch: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct RecallPromptsParams {
     #[schemars(
         description = "Free-text query — embedded and matched by cosine similarity \

@@ -1,5 +1,6 @@
 pub mod acceptance;
 pub mod cli;
+pub mod client_writer;
 pub mod inference;
 pub mod metrics;
 pub mod recorder;

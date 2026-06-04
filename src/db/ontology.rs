@@ -198,6 +198,14 @@ pub const EDGE_TYPES_CORE: &[EdgeTypeMeta] = &[
         display: "Belongs To (chunk→topic)",
         directed: true,
     },
+    // Phase 4 — project → its dependency (cross-project, bitemporal). Source:
+    // `project_dependencies`; makes the dependency graph a first-class,
+    // `as_of`-queryable unified-graph citizen.
+    EdgeTypeMeta {
+        key: "project_depends_on",
+        display: "Depends On (project→project)",
+        directed: true,
+    },
     // ADR-009 — protocol → its per-role projection.
     EdgeTypeMeta {
         key: "projects_to",

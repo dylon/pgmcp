@@ -74,6 +74,67 @@ pub struct Config {
     /// constraint reasoning, Poincaré link-prediction). Runs by default.
     #[serde(default)]
     pub ontology: OntologyConfig,
+    /// `[clients]` — MCP-client tracking (PID/cwd/project/liveness) + file-event
+    /// attribution. Capture is on by default (local-first telemetry); the eBPF
+    /// and `/proc`-fd file-event sources are opt-in.
+    #[serde(default)]
+    pub clients: ClientsConfig,
+}
+
+/// `[clients]` — MCP-client tracking and file-event attribution knobs.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClientsConfig {
+    /// Master switch for client capture (`note_client` + the liveness cron's
+    /// effect). When false no `mcp_clients` rows are written and the listen port
+    /// is never registered, so `note_client` short-circuits.
+    #[serde(default = "default_true_clients")]
+    pub enabled: bool,
+    /// Accept `POST /api/client/file_event` (the Claude Code PostToolUse hook)
+    /// and record `client_file_events`. When false the endpoint is a no-op.
+    #[serde(default = "default_true_clients")]
+    pub file_events: bool,
+    /// Run the eBPF PID-filtered file-event probe (Phase 2B). Requires
+    /// `CAP_BPF`+`CAP_PERFMON` (or root) and `bpftrace` on PATH; off by default.
+    #[serde(default)]
+    pub ebpf_enabled: bool,
+    /// How often (seconds) the eBPF consumer re-reads the live client PID set and
+    /// respawns its probe when the set changed. Default 15.
+    #[serde(default = "default_ebpf_refresh_secs")]
+    pub ebpf_refresh_secs: u64,
+    /// Collapse window (seconds) for identical `(pid, op, path)` eBPF events, so
+    /// a tight open/reopen loop records one row, not hundreds. Default 5.
+    #[serde(default = "default_ebpf_dedup_secs")]
+    pub ebpf_dedup_secs: u64,
+    /// Sample `/proc/<pid>/fd` on each liveness tick as a best-effort file-event
+    /// supplement (the `proc_fd` source). Off by default — near-blind to
+    /// open-close editors, so cheap but low-signal.
+    #[serde(default)]
+    pub proc_fd_supplement: bool,
+}
+
+impl Default for ClientsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            file_events: true,
+            ebpf_enabled: false,
+            ebpf_refresh_secs: default_ebpf_refresh_secs(),
+            ebpf_dedup_secs: default_ebpf_dedup_secs(),
+            proc_fd_supplement: false,
+        }
+    }
+}
+
+fn default_ebpf_refresh_secs() -> u64 {
+    15
+}
+
+fn default_ebpf_dedup_secs() -> u64 {
+    5
+}
+
+fn default_true_clients() -> bool {
+    true
 }
 
 /// `[ontology]` — the hierarchical-ontology subsystem's tuning knobs. The crons
@@ -228,6 +289,13 @@ pub struct A2aConfig {
     /// re-enter the pattern tools. Default off (stock install stays inert).
     #[serde(default)]
     pub autostart_adapters: bool,
+    /// Phase-4 (ADR-009 §4.6): surface a proactive "⚠ a dependency you rely on is
+    /// being edited (dirty) by <agent>" warning into the dependent's
+    /// `session_observe` `additional_context`, for dependencies that are dirty,
+    /// have a live editor, and are not yet under an open coordination request from
+    /// this project. Off by default. Read-only; budget-shared with the 2 KB block.
+    #[serde(default)]
+    pub proactive_dependency_warnings: bool,
     #[serde(default)]
     pub reflection: A2aReflectionConfig,
     #[serde(default)]
@@ -2598,6 +2666,29 @@ pub struct CronConfig {
     /// driven by each claim's own `lease_expires_at`.
     #[serde(default = "default_work_item_presence_offline")]
     pub work_item_presence_offline_secs: u64,
+
+    /// Interval (seconds) of the `mcp-client-liveness` sweep: re-checks each
+    /// `alive` `mcp_clients` PID via `/proc` (existence + start-time
+    /// fingerprint, so a recycled PID counts as exited), refreshes cwd/project
+    /// for survivors, and flips dead clients to `exited`. Backs the
+    /// `active_clients` tool + the A2A active-agents-by-project view. Default 30.
+    #[serde(default = "default_mcp_client_liveness_interval")]
+    pub mcp_client_liveness_interval_secs: u64,
+
+    /// Interval (seconds) of the `project-deps-index` cron: re-parses each
+    /// project's Cargo manifests into `project_dependencies` (source=cargo),
+    /// upserting live cross-project edges and closing vanished ones. Default
+    /// 3600 (1h).
+    #[serde(default = "default_project_deps_index_interval")]
+    pub project_deps_index_interval_secs: u64,
+
+    /// Interval (seconds) of the `git-state-scan` cron: for projects under an
+    /// open worktree-coordination request, reads live git state and resolves the
+    /// coordination when the dependency is back on its stable branch & clean (the
+    /// gatekeeper close-the-loop). Scoped to active coordinations, so cheap.
+    /// Default 45.
+    #[serde(default = "default_git_state_scan_interval")]
+    pub git_state_scan_interval_secs: u64,
 }
 
 impl Default for CronConfig {
@@ -2666,12 +2757,24 @@ impl Default for CronConfig {
             work_item_presence_interval_secs: default_work_item_presence_interval(),
             work_item_presence_idle_secs: default_work_item_presence_idle(),
             work_item_presence_offline_secs: default_work_item_presence_offline(),
+            mcp_client_liveness_interval_secs: default_mcp_client_liveness_interval(),
+            project_deps_index_interval_secs: default_project_deps_index_interval(),
+            git_state_scan_interval_secs: default_git_state_scan_interval(),
         }
     }
 }
 
 fn default_work_item_presence_interval() -> u64 {
     60
+}
+fn default_mcp_client_liveness_interval() -> u64 {
+    30
+}
+fn default_project_deps_index_interval() -> u64 {
+    3600
+}
+fn default_git_state_scan_interval() -> u64 {
+    45
 }
 fn default_work_item_presence_idle() -> u64 {
     300

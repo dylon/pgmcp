@@ -81,6 +81,165 @@ use the built-in `Bash: stat` or `Read` instead."
     }
 
     #[tool(
+        description = "List currently-connected MCP clients (agents) and the project each is working on — PID, working directory, liveness, and idle time, grouped by project. \
+USE WHEN: you want to see who/what is connected to pgmcp right now and which project they are actively editing. \
+DO NOT USE WHEN: you want historical per-call telemetry (use `mcp_tool_telemetry`) or the live in-memory counters (use `index_stats`). \
+Optional `project` filters to one project by name; `include_exited` also lists recently-exited clients."
+    )]
+    async fn active_clients(
+        &self,
+        Parameters(params): Parameters<ActiveClientsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "active_clients",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_active_clients::tool_active_clients(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "The m:n matrix of which clients are EDITING which projects, from observed file events — edit/read counts, recently-edited files, and recency, grouped by project. \
+USE WHEN: you want a weighted 'who is working on what' view based on actual file touches, not just cwd. \
+DO NOT USE WHEN: you only need the live connection/PID view (use `active_clients`) or historical tool telemetry (use `mcp_tool_telemetry`). \
+`project` filters to one project; `since_minutes` sets the window (default 1440 = 24h); `top_files_per_project` caps the per-project recently-edited file list."
+    )]
+    async fn client_project_matrix(
+        &self,
+        Parameters(params): Parameters<ClientProjectMatrixParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "client_project_matrix",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_client_project_matrix::tool_client_project_matrix(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List the projects that depend ON a given project (the reverse cross-project dependency edge). \
+USE WHEN: you're editing a project and want to know who builds on it and might break if you destabilize it — then `a2a_active_agents` on them to coordinate."
+    )]
+    async fn project_dependents(
+        &self,
+        Parameters(params): Parameters<ProjectDependentsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "project_dependents",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_project_dependents::tool_project_dependents(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List the projects a given project depends ON (the forward cross-project dependency edge). \
+USE WHEN: your build broke and you want to find which dependency might be the cause — then `a2a_active_agents` to find who is editing it, or `coordinate_dependency_block` to open a worktree negotiation."
+    )]
+    async fn project_dependencies(
+        &self,
+        Parameters(params): Parameters<ProjectDependenciesParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "project_dependencies",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_project_dependencies::tool_project_dependencies(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Open a worktree-coordination request: your build broke on a dependency, so pgmcp records the asserted edge, finds the agents live on that dependency, and asks them (a `request_worktree` message) to move their in-flight edits to a worktree and restore the stable branch. The dependent auto-unblocks when pgmcp's git scanner observes the dependency stable — only the scanner can resolve it (the trust boundary)."
+    )]
+    async fn coordinate_dependency_block(
+        &self,
+        Parameters(mut params): Parameters<CoordinateDependencyBlockParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.requester_session.is_none() {
+            params.requester_session = crate::mcp::server::extract_mcp_session_id(&_ctx);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "coordinate_dependency_block",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_coordinate_dependency_block::tool_coordinate_dependency_block(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Respond to a worktree-coordination request (you are the editor on the dependency): accept | decline | moved. 'moved' is a CANDIDATE — the dependent unblocks only when pgmcp's git scanner observes the dependency back on its stable branch & clean."
+    )]
+    async fn coordination_respond(
+        &self,
+        Parameters(mut params): Parameters<CoordinationRespondParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.editor_session.is_none() {
+            params.editor_session = crate::mcp::server::extract_mcp_session_id(&_ctx);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "coordination_respond",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_coordination_respond::tool_coordination_respond(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Suggest the exact git commands to move a project's in-flight edits to a worktree on a feature branch and restore its stable branch (so dependents are unblocked). pgmcp SUGGESTS; it never runs git."
+    )]
+    async fn suggest_worktree(
+        &self,
+        Parameters(params): Parameters<SuggestWorktreeParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "suggest_worktree",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_suggest_worktree::tool_suggest_worktree(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Query per-call MCP tool telemetry from the durable `mcp_tool_calls` table. \
 USE WHEN: you want a historical view of which tools were used (over the last N minutes), how long they took (p50/p95/p99), which agents called them, and which projects they targeted. \
 DO NOT USE WHEN: you only need real-time counts — `index_stats` and the `pgmcp://stats` resource already carry the live in-memory snapshot. \

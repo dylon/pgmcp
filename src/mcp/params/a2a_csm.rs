@@ -166,6 +166,111 @@ pub struct A2aRegisterAgentParams {
 pub struct A2aListAgentsParams {}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aActiveAgentsParams {
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project-name filter (as shown by list_projects); omit to list active agents across all projects."
+    )]
+    pub project: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aSendMessageParams {
+    #[serde(default)]
+    #[schemars(
+        description = "Target a specific live instance by its mcp_session_id (from a2a_active_agents)."
+    )]
+    pub to_session: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Target any agent working on this project (by name) — robustly hook-deliverable."
+    )]
+    pub to_project: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Target all instances of a client type, e.g. \"claude-code\".")]
+    pub to_agent: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Message kind (default 'message'): message|request|fyi|request_worktree|accept|decline|moved."
+    )]
+    pub kind: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Optional short subject line.")]
+    pub subject: Option<String>,
+    #[schemars(description = "The message body.")]
+    pub body: String,
+    #[serde(default)]
+    #[schemars(description = "Optional id of the message this replies to.")]
+    pub reply_to: Option<i64>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional TTL in minutes; after this the message stops being delivered."
+    )]
+    pub expires_minutes: Option<i64>,
+    #[serde(default)]
+    #[schemars(
+        description = "Sender agent name; auto-filled with the caller's client_name over MCP."
+    )]
+    pub from_agent: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Sender mcp_session_id; auto-filled with the caller's session over MCP."
+    )]
+    pub from_session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aInboxParams {
+    #[serde(default)]
+    #[schemars(
+        description = "Recipient mcp_session_id; auto-filled with the caller's own session over MCP."
+    )]
+    pub session: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Also include messages addressed to this project (by name).")]
+    pub project: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Also include client-type broadcasts to this agent name, e.g. \"claude-code\"."
+    )]
+    pub agent: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Only return messages not yet read (default false → full thread).")]
+    pub unread_only: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aReplyMessageParams {
+    #[schemars(
+        description = "The id of the message being replied to (its sender becomes the recipient)."
+    )]
+    pub message_id: i64,
+    #[schemars(description = "The reply body.")]
+    pub body: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Replying agent name; auto-filled with the caller's client_name over MCP."
+    )]
+    pub from_agent: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Replying mcp_session_id; auto-filled with the caller's session over MCP."
+    )]
+    pub from_session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aAckMessageParams {
+    #[schemars(description = "The id of the message to acknowledge.")]
+    pub message_id: i64,
+    #[serde(default)]
+    #[schemars(
+        description = "Acknowledging mcp_session_id; auto-filled with the caller's session over MCP."
+    )]
+    pub session: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct A2aFindAgentsBySpecialtyParams {
     #[schemars(description = "Specialty tags to match (OR-logic: any match wins)")]
     pub specialty: Vec<String>,
@@ -253,8 +358,17 @@ pub struct CsmShowProjectionParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CsmValidateRunParams {
-    #[schemars(description = "The a2a_tasks UUID of a completed a2a_pattern_* run")]
-    pub task_id: String,
+    #[serde(default)]
+    #[schemars(
+        description = "The a2a_tasks UUID of a completed a2a_pattern_* run (omit when using coordination_id)"
+    )]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Alternatively, a coordination_requests id — validates a WorktreeNegotiation \
+                       run by lifting its typed mailbox thread (request_worktree/accept/decline/moved)"
+    )]
+    pub coordination_id: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

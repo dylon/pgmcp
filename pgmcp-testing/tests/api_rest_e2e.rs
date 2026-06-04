@@ -248,6 +248,91 @@ async fn rest_api_search_returns_200_for_valid_query() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn rest_api_client_file_event_records_touch_and_rejects_bad_op() {
+    let db = require_test_db!();
+    // Seed a project + one indexed file so project_id and file_id resolve.
+    let project_id: i32 = sqlx::query_scalar(
+        "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind("/ws")
+    .bind("/ws/cfe-proj/")
+    .bind("cfe-proj")
+    .fetch_one(db.pool())
+    .await
+    .expect("seed project");
+    sqlx::query(
+        "INSERT INTO indexed_files
+            (project_id, path, relative_path, language, size_bytes, line_count, modified_at)
+         VALUES ($1, $2, $3, 'rust', 10, 1, now())",
+    )
+    .bind(project_id)
+    .bind("/ws/cfe-proj/src/main.rs")
+    .bind("src/main.rs")
+    .execute(db.pool())
+    .await
+    .expect("seed indexed_file");
+
+    let daemon = require_binary_or_skip!(db);
+    wait_for_listen(daemon.port, Duration::from_secs(20)).await;
+    let client = reqwest::Client::new();
+
+    // Happy path: a recorded touch resolves both project and file.
+    let resp = client
+        .post(format!(
+            "http://127.0.0.1:{}/api/client/file_event",
+            daemon.port
+        ))
+        .json(&serde_json::json!({
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "cwd": "/ws/cfe-proj/src",
+            "file_path": "/ws/cfe-proj/src/main.rs",
+            "op": "edit"
+        }))
+        .send()
+        .await
+        .expect("send");
+    assert!(
+        resp.status().is_success(),
+        "file_event should return 2xx, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("json");
+    assert_eq!(body["recorded"], true);
+    assert!(body["file_id"].is_number(), "file_id resolved: {body}");
+    assert!(
+        body["project_id"].is_number(),
+        "project_id resolved: {body}"
+    );
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM client_file_events
+         WHERE abs_path = $1 AND source = 'client_hook' AND op = 'edit'",
+    )
+    .bind("/ws/cfe-proj/src/main.rs")
+    .fetch_one(db.pool())
+    .await
+    .expect("count");
+    assert_eq!(count, 1, "exactly one client_file_event recorded");
+
+    // An op outside the closed FileOp vocabulary is rejected with 400.
+    let bad = client
+        .post(format!(
+            "http://127.0.0.1:{}/api/client/file_event",
+            daemon.port
+        ))
+        .json(&serde_json::json!({
+            "session_id": "11111111-1111-1111-1111-111111111111",
+            "cwd": "/ws/cfe-proj/src",
+            "file_path": "/ws/cfe-proj/src/main.rs",
+            "op": "bogus"
+        }))
+        .send()
+        .await
+        .expect("send bad");
+    assert_eq!(bad.status().as_u16(), 400, "invalid op must be rejected");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn rest_api_search_with_project_filter_ok() {
     let db = require_test_db!();
     let daemon = require_binary_or_skip!(db);

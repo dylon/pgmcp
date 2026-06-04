@@ -5,8 +5,16 @@
 //! Deliberation Tool-Caller producing the final answer on convergence, per the
 //! paper, vs. the impl reusing the Reflector's text), the observer
 //! (`super::conformance`) surfaces it — that divergence is the point.
+//!
+//! Beyond the five collaboration patterns, the registry also holds the
+//! **`WorktreeNegotiation`** coordination protocol (ADR-009 Phase 4): the
+//! request/accept/decline/moved exchange between a blocked dependent's
+//! Requester (`R`) and a dependency's Editor (`E`), whose gatekeeper safety and
+//! liveness are machine-checked in `docs/formal/WorktreeNegotiation.{tla,v}`.
+//! It rides the A2A mailbox as typed message kinds rather than an
+//! `a2a_pattern_*` run, but shares the same projection/conformance machinery.
 
-use crate::csm::examples::deliberation;
+use crate::csm::examples::{deliberation, worktree_negotiation};
 use crate::csm::mpst::global::{GlobalType, end, interaction};
 use crate::csm::role::{Label, Role};
 
@@ -19,15 +27,21 @@ pub enum ProtocolId {
     Distillation,
     Deliberation,
     Recursive,
+    /// The cross-project worktree-coordination protocol (ADR-009 Phase 4). Not a
+    /// RecursiveMAS collaboration pattern — it coordinates a blocked dependent's
+    /// Requester (`R`) with a dependency's Editor (`E`) and is gatekept by
+    /// pgmcp's git scanner (modelled in `docs/formal/WorktreeNegotiation.tla`).
+    WorktreeNegotiation,
 }
 
 impl ProtocolId {
-    pub const ALL: [ProtocolId; 5] = [
+    pub const ALL: [ProtocolId; 6] = [
         ProtocolId::Sequential,
         ProtocolId::Mixture,
         ProtocolId::Distillation,
         ProtocolId::Deliberation,
         ProtocolId::Recursive,
+        ProtocolId::WorktreeNegotiation,
     ];
 
     /// Short stable name (`"sequential"`, …).
@@ -38,10 +52,13 @@ impl ProtocolId {
             ProtocolId::Distillation => "distillation",
             ProtocolId::Deliberation => "deliberation",
             ProtocolId::Recursive => "recursive",
+            ProtocolId::WorktreeNegotiation => "worktree_negotiation",
         }
     }
 
-    /// The `a2a_tasks.skill_id` of the tool that runs this pattern.
+    /// The `a2a_tasks.skill_id` (or, for `WorktreeNegotiation`, the initiating
+    /// MCP tool) associated with this protocol. Stable identifier used to match
+    /// a recorded run to its contract and to round-trip the name.
     pub fn pattern_skill_id(self) -> &'static str {
         match self {
             ProtocolId::Sequential => "a2a_pattern_sequential",
@@ -49,6 +66,7 @@ impl ProtocolId {
             ProtocolId::Distillation => "a2a_pattern_distillation",
             ProtocolId::Deliberation => "a2a_pattern_deliberation",
             ProtocolId::Recursive => "a2a_pattern_recursive",
+            ProtocolId::WorktreeNegotiation => "coordinate_dependency_block",
         }
     }
 
@@ -95,6 +113,8 @@ pub fn global_of(id: ProtocolId, p: &ProtocolParams) -> GlobalType {
         // Depth comes from the actual run when validating (0 ⇒ a leaf RLM with
         // no decomposition, which is the empty protocol `end`).
         ProtocolId::Recursive => recursive(p.rlm_depth),
+        // Fixed two-party negotiation — no parameters.
+        ProtocolId::WorktreeNegotiation => worktree_negotiation(),
     }
 }
 
@@ -249,5 +269,31 @@ mod tests {
         let g = mixture(3);
         // O, Sp1, Sp2, Sp3, Sum = 5 roles.
         assert_eq!(g.participants().len(), 5);
+    }
+
+    #[test]
+    fn worktree_negotiation_is_two_party_r_e_and_resolves_by_name() {
+        // The coordination protocol is exactly the two agents R (Requester, on the
+        // dependent) and E (Editor, on the dependency) — pgmcp is a gatekeeper, not
+        // a protocol role.
+        let g = global_of(ProtocolId::WorktreeNegotiation, &ProtocolParams::default());
+        let parts: std::collections::HashSet<String> =
+            g.participants().iter().map(|r| r.to_string()).collect();
+        assert_eq!(parts.len(), 2, "exactly two roles: {parts:?}");
+        assert!(
+            parts.contains("R") && parts.contains("E"),
+            "Requester R and Editor E: {parts:?}"
+        );
+        well_formed(&g).expect("worktree_negotiation well-formed");
+        Network::build("wn", &g).expect("worktree_negotiation projects to a network");
+        // Name/skill resolution round-trips through the registry like the patterns.
+        assert_eq!(
+            ProtocolId::from_name("worktree_negotiation"),
+            Some(ProtocolId::WorktreeNegotiation)
+        );
+        assert_eq!(
+            ProtocolId::from_skill_id("coordinate_dependency_block"),
+            Some(ProtocolId::WorktreeNegotiation)
+        );
     }
 }

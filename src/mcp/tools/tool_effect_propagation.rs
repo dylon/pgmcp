@@ -158,13 +158,22 @@ pub async fn tool_effect_propagation(
         })
         .collect();
 
+    // Cross-project neighborhood (ADR-009 §4.2): these in-project effects also
+    // propagate to the projects that depend on this one — surface them so an
+    // agent can warn/coordinate downstream.
+    let (_deps, cross_project_dependents) =
+        crate::deps::store::cross_project_blocks(pool, project_id).await;
+
     json_result(&json!({
         "mode": "reverse_to_targets",
         "target_effects": target_effects,
         "max_depth": max_depth,
         "results": payload,
+        "cross_project_dependent_count": cross_project_dependents.len(),
+        "cross_project_dependents": cross_project_dependents,
         "guidance": "Returns symbols that REACH (via resolved call edges) any symbol carrying \
                      one of the target_effects, with the minimum hop count. depth=0 = direct \
-                     carrier."
+                     carrier. `cross_project_dependents` are projects that depend on this one and \
+                     may be affected by these effects — coordinate via a2a_active_agents."
     }))
 }

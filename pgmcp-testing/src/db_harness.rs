@@ -28,10 +28,13 @@
 //!     (the `/dbname` path component is ignored — only the base URL matters).
 //!   * `~/.config/pgmcp/test-config.toml` containing a `[database]` section
 //!     in the pgmcp config format.
+//!   * `~/.config/pgmcp/config.toml`; used only when no test-specific config
+//!     exists, and still only as the connection authority for `pgmcp_test_*`
+//!     databases.
 //!
 //! See `tests/README.md` in the repo root for a walk-through.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use sqlx::{Connection, PgConnection, PgPool, Postgres, Transaction};
@@ -44,10 +47,9 @@ use pgmcp::config::{Config, DatabaseConfig, VectorConfig};
 /// can print a short human-readable "SKIPPED" line.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum TestDbUnavailable {
-    /// Neither `PGMCP_TEST_DATABASE_URL` nor `~/.config/pgmcp/test-config.toml`
-    /// was present.
+    /// No test-specific or default pgmcp database config was present.
     #[error(
-        "no test DB configured (set PGMCP_TEST_DATABASE_URL or ~/.config/pgmcp/test-config.toml)"
+        "no test DB configured (set PGMCP_TEST_DATABASE_URL, ~/.config/pgmcp/test-config.toml, or ~/.config/pgmcp/config.toml)"
     )]
     NotConfigured,
     /// Env var or config file was present but unparseable.
@@ -87,15 +89,19 @@ impl TestDbConfig {
         if let Some(path) = test_config_path()
             && path.exists()
         {
-            let raw = std::fs::read_to_string(&path).map_err(|e| {
-                TestDbUnavailable::BadConfig(format!("read {}: {}", path.display(), e))
-            })?;
-            let cfg: Config = toml::from_str(&raw).map_err(|e| {
-                TestDbUnavailable::BadConfig(format!("parse {}: {}", path.display(), e))
-            })?;
-            return Self::from_database_config(&cfg.database);
+            return Self::from_config_path(&path);
+        }
+        let default_path = Config::default_config_path();
+        if default_path.exists() {
+            return Self::from_config_path(&default_path);
         }
         Err(TestDbUnavailable::NotConfigured)
+    }
+
+    fn from_config_path(path: &Path) -> Result<Self, TestDbUnavailable> {
+        let cfg = Config::load(Some(path))
+            .map_err(|e| TestDbUnavailable::BadConfig(format!("load {}: {}", path.display(), e)))?;
+        Self::from_database_config(&cfg.database)
     }
 
     fn from_url(url: &str) -> Result<Self, TestDbUnavailable> {
@@ -428,6 +434,27 @@ mod tests {
     fn from_url_missing_scheme_is_error() {
         let err = TestDbConfig::from_url("localhost/db").expect_err("no scheme");
         assert!(matches!(err, TestDbUnavailable::BadConfig(_)));
+    }
+
+    #[test]
+    fn from_config_path_uses_database_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[database]
+host = "dbhost"
+port = 15432
+name = "prod"
+user = "tester"
+password = "pw"
+"#,
+        )
+        .expect("write config");
+
+        let cfg = TestDbConfig::from_config_path(&path).expect("parses");
+        assert_eq!(cfg.base_url, "postgres://tester:pw@dbhost:15432");
     }
 
     #[test]

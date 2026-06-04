@@ -11,12 +11,12 @@
 //! }
 //! ```
 //!
-//! When `PGMCP_TEST_DATABASE_URL` (or `~/.config/pgmcp/test-config.toml`)
-//! is unset, the macro prints `SKIPPED (…): set PGMCP_TEST_DATABASE_URL
-//! to enable` to stderr and `return`s from the enclosing function. This
-//! lets `./scripts/verify.sh` stay green for contributors who don't have a
-//! local Postgres+pgvector install, while turning real-DB gating on
-//! automatically when the env var is set.
+//! When no test database authority is available (`PGMCP_TEST_DATABASE_URL`,
+//! `~/.config/pgmcp/test-config.toml`, or `~/.config/pgmcp/config.toml`), the
+//! macro prints `SKIPPED: ...` to stderr and `return`s from the enclosing
+//! function. This lets `./scripts/verify.sh` stay green for contributors who
+//! don't have a local Postgres+pgvector install, while turning real-DB gating on
+//! automatically when local pgmcp database config is present.
 
 /// Begin a [`TestTransaction`](crate::db_harness::TestTransaction). On
 /// failure, prints a human-readable "SKIPPED" line and returns from the

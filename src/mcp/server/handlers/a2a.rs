@@ -50,6 +50,114 @@ impl McpServer {
         .await
     }
     #[tool(
+        description = "List currently-active agent instances and the project each is working on, grouped by project — with PID, liveness, and (if registered) A2A role/specialty. \
+USE WHEN: you want to discover which agents are live on a project of interest (e.g. before messaging one that is editing a dependency you build on). \
+The returned `mcp_session_id` is the precise instance handle to address with `a2a_send_message`. `project` filters to one project by name."
+    )]
+    async fn a2a_active_agents(
+        &self,
+        Parameters(params): Parameters<A2aActiveAgentsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_active_agents",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_a2a_active_agents::tool_a2a_active_agents(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Send a message into a peer agent's mailbox — addressable by `to_session` (a precise live instance: the `mcp_session_id` from a2a_active_agents), `to_project` (any agent working there), or `to_agent` (a client type). Complements `a2a_send_task` (which spawns a new agent) with a mailbox to LIVE instances. `kind` defaults to 'message'. The sender (from_agent/from_session) is auto-filled with your identity."
+    )]
+    async fn a2a_send_message(
+        &self,
+        Parameters(mut params): Parameters<A2aSendMessageParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.from_agent.is_none() {
+            params.from_agent = Some(extract_caller(&_ctx).client_name);
+        }
+        if params.from_session.is_none() {
+            params.from_session = extract_mcp_session_id(&_ctx);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_send_message",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_a2a_send_message::tool_a2a_send_message(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Read messages addressed to you — the reliable inbox pull. With no args it returns messages for your own session; pass `project` to also see project-addressed messages, or `agent` for client-type broadcasts. Reading marks them read."
+    )]
+    async fn a2a_inbox(
+        &self,
+        Parameters(mut params): Parameters<A2aInboxParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.session.is_none() && params.project.is_none() && params.agent.is_none() {
+            params.session = extract_mcp_session_id(&_ctx);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_inbox",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_a2a_inbox::tool_a2a_inbox(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
+        description = "Reply to a mailbox message; the reply is addressed back to the original sender and linked via reply_to."
+    )]
+    async fn a2a_reply_message(
+        &self,
+        Parameters(mut params): Parameters<A2aReplyMessageParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.from_agent.is_none() {
+            params.from_agent = Some(extract_caller(&_ctx).client_name);
+        }
+        if params.from_session.is_none() {
+            params.from_session = extract_mcp_session_id(&_ctx);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_reply_message",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_a2a_reply_message::tool_a2a_reply_message(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(description = "Acknowledge a mailbox message (stamps acked_at for your session).")]
+    async fn a2a_ack_message(
+        &self,
+        Parameters(mut params): Parameters<A2aAckMessageParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.session.is_none() {
+            params.session = extract_mcp_session_id(&_ctx);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_ack_message",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_a2a_ack_message::tool_a2a_ack_message(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
         description = "Return the SSE URL for streaming events from a peer's Task. Caller opens the URL with Accept: text/event-stream."
     )]
     async fn a2a_subscribe_task(

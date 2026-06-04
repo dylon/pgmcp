@@ -2,7 +2,7 @@
 mod outcomes;
 pub use outcomes::*;
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::time::Instant;
 
 use arc_swap::ArcSwapOption;
@@ -10,6 +10,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
+use crate::stats::client_writer::ClientObservation;
 use crate::stats::telemetry_writer::TelemetryRow;
 
 /// Per-tool telemetry: call count, error count, cumulative duration, and
@@ -752,6 +753,19 @@ pub struct StatsTracker {
     /// path is lock-free.
     telemetry_tx: ArcSwapOption<mpsc::Sender<TelemetryRow>>,
 
+    /// Channel sender to the MCP-client capture writer task; `None` in CLI mode
+    /// or before `start_client_writer` has registered it. Lock-free
+    /// (`ArcSwapOption`) for the hot `instrumented_tool_wrap` path.
+    client_tx: ArcSwapOption<mpsc::Sender<ClientObservation>>,
+    /// Sessions whose OS identity has already been captured, so `note_client`
+    /// enqueues each session exactly once (the ~100 ms `/proc` resolution is not
+    /// repeated per tool call). Pruned by the liveness cron when a session exits.
+    client_seen: DashMap<String, ()>,
+    /// The daemon's MCP listen port, set once at startup; `0` in CLI/stdio mode.
+    /// The `/proc/net/tcp` remote-port disambiguator when mapping a client's TCP
+    /// peer back to its PID.
+    mcp_server_port: AtomicU16,
+
     // Uptime
     pub uptime_start: Instant,
 }
@@ -1028,6 +1042,9 @@ impl StatsTracker {
             trajectory_similarity_runs: AtomicU64::new(0),
             trajectory_edges_emitted: AtomicU64::new(0),
             telemetry_tx: ArcSwapOption::empty(),
+            client_tx: ArcSwapOption::empty(),
+            client_seen: DashMap::new(),
+            mcp_server_port: AtomicU16::new(0),
             uptime_start: Instant::now(),
         }
     }
@@ -1043,6 +1060,64 @@ impl StatsTracker {
     /// (CLI mode or `[metrics] telemetry_db_write_enabled = false`).
     pub fn telemetry_sender(&self) -> Option<std::sync::Arc<mpsc::Sender<TelemetryRow>>> {
         self.telemetry_tx.load_full()
+    }
+
+    /// Register the MCP-client capture writer's sender (see `start_client_writer`).
+    pub fn set_client_sender(&self, tx: mpsc::Sender<ClientObservation>) {
+        self.client_tx.store(Some(std::sync::Arc::new(tx)));
+    }
+
+    /// Record the daemon's MCP listen port so `note_client` can disambiguate the
+    /// client's `/proc/net/tcp` row. Called once at startup.
+    pub fn set_mcp_server_port(&self, port: u16) {
+        self.mcp_server_port.store(port, Ordering::Relaxed);
+    }
+
+    /// Capture the connecting client's OS identity, once per session. O(1) on the
+    /// hot path: a `DashMap` dedup check plus, on first sighting, a non-blocking
+    /// channel send; the heavy `/proc` resolution + DB upsert run in the
+    /// client-writer task. No-op when no writer/port is registered (CLI/stdio) or
+    /// when this session has already been captured.
+    pub fn note_client(
+        &self,
+        mcp_session_id: &str,
+        client_name: &str,
+        client_version: &str,
+        protocol_version: &str,
+        peer: std::net::SocketAddr,
+    ) {
+        let server_port = self.mcp_server_port.load(Ordering::Relaxed);
+        if server_port == 0 {
+            return; // CLI/stdio: no listening socket to resolve against.
+        }
+        let Some(tx) = self.client_tx.load_full() else {
+            return; // capture disabled / no writer registered
+        };
+        // Capture each session exactly once (DashMap insert is atomic per key).
+        if self
+            .client_seen
+            .insert(mcp_session_id.to_string(), ())
+            .is_some()
+        {
+            return;
+        }
+        let obs = ClientObservation {
+            mcp_session_id: mcp_session_id.to_string(),
+            client_name: client_name.to_string(),
+            client_version: Some(client_version.to_string()),
+            protocol_version: Some(protocol_version.to_string()),
+            peer,
+            server_port,
+        };
+        // Non-blocking; a dropped capture on overflow is backfilled by the
+        // liveness cron's periodic reconcile.
+        let _ = tx.try_send(obs);
+    }
+
+    /// Drop a session from the capture-dedup set (called by the liveness cron
+    /// when a session exits) so the set does not grow without bound.
+    pub fn remove_seen_client(&self, mcp_session_id: &str) {
+        self.client_seen.remove(mcp_session_id);
     }
 
     /// Record a completed tool invocation. Called once per tool call

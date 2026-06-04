@@ -52,7 +52,7 @@ async fn ontology_invariants_surface_in_digest() {
     queries::set_concept_status(pool, canonical, ConceptStatus::Canonical, Actor::User)
         .await
         .expect("curate");
-    queries::agent_assert_invariant(
+    let candidate = queries::agent_assert_invariant(
         pool,
         "AmbiguityPropagation",
         "never disambiguate prematurely over the parse tree",
@@ -61,6 +61,20 @@ async fn ontology_invariants_surface_in_digest() {
     )
     .await
     .expect("assert candidate");
+    for entity_id in [canonical, candidate] {
+        queries::memory_anchor_entity(
+            pool,
+            entity_id,
+            Some(file_id),
+            None,
+            None,
+            None,
+            None,
+            "concept_code",
+        )
+        .await
+        .expect("duplicate ontology anchor");
+    }
 
     let cfg = DigestConfig::default(); // include_ontology defaults true
     let digest = compose_digest(pool, Some(project_id), None, &cfg).await;
@@ -76,10 +90,26 @@ async fn ontology_invariants_surface_in_digest() {
                 .contains("must always validate the input token stream")),
         "canonical invariant surfaces at High severity"
     );
+    assert_eq!(
+        onto.iter()
+            .filter(|i| i
+                .text
+                .contains("must always validate the input token stream"))
+            .count(),
+        1,
+        "duplicate anchors should not duplicate canonical digest items"
+    );
     assert!(
         onto.iter()
             .any(|i| i.text.contains("(candidate)")
                 && i.text.contains("never disambiguate prematurely")),
         "candidate invariant surfaces but is labeled provisional"
+    );
+    assert_eq!(
+        onto.iter()
+            .filter(|i| i.text.contains("never disambiguate prematurely"))
+            .count(),
+        1,
+        "duplicate anchors should not duplicate candidate digest items"
     );
 }

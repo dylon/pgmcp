@@ -250,17 +250,17 @@ mod tests {
         let path = dir.path().join("test.artrie");
 
         // First open: create a new trie.
-        let (idx, report) = FuzzyIndex::<()>::open_or_create(&path).expect("create");
+        let (idx, report) = FuzzyIndex::<i64>::open_or_create(&path).expect("create");
         assert!(report.is_none(), "fresh trie should not run recovery");
-        idx.upsert("hello", ()).unwrap();
-        idx.upsert("world", ()).unwrap();
+        idx.upsert("hello", 1).unwrap();
+        idx.upsert("world", 2).unwrap();
         assert!(idx.contains("hello"));
         assert!(idx.contains("world"));
         assert_eq!(idx.len(), 2);
         drop(idx);
 
         // Re-open: should recover prior entries.
-        let (idx2, report2) = FuzzyIndex::<()>::open_or_create(&path).expect("reopen");
+        let (idx2, report2) = FuzzyIndex::<i64>::open_or_create(&path).expect("reopen");
         assert!(report2.is_some(), "reopen should produce a recovery report");
         assert!(idx2.contains("hello"));
         assert!(idx2.contains("world"));

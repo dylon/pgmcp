@@ -30,6 +30,10 @@ pub(crate) use queries_dedup::*;
 mod queries_projects;
 pub use queries_projects::*;
 
+#[path = "queries/clients.rs"]
+mod queries_clients;
+pub use queries_clients::*;
+
 #[path = "queries/files.rs"]
 mod queries_files;
 pub use queries_files::*;

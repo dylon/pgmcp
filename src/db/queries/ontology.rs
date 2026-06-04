@@ -188,14 +188,15 @@ pub async fn invariants_for_file(
     file_id: i64,
 ) -> Result<Vec<InvariantRow>, sqlx::Error> {
     sqlx::query_as::<_, InvariantRow>(
-        "SELECT DISTINCT e.id AS entity_id, e.name, m.constraint_text, m.rationale,
+        "SELECT e.id AS entity_id, e.name, m.constraint_text, m.rationale,
                 m.status, m.confidence
          FROM ontology_concept_meta m
          JOIN memory_entities e     ON e.id = m.entity_id AND e.valid_to IS NULL
          JOIN memory_code_anchor a  ON a.entity_id = m.entity_id
          LEFT JOIN file_symbols s   ON s.id = a.symbol_id
          WHERE m.facet = 'invariant' AND (a.file_id = $1 OR s.file_id = $1)
-         ORDER BY (m.status = 'canonical') DESC, m.confidence DESC",
+         GROUP BY e.id, e.name, m.constraint_text, m.rationale, m.status, m.confidence
+         ORDER BY (m.status = 'canonical') DESC, m.confidence DESC, e.id",
     )
     .bind(file_id)
     .fetch_all(pool)

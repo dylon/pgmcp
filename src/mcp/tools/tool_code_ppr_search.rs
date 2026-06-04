@@ -152,6 +152,14 @@ pub async fn tool_code_ppr_search(
         );
     }
 
+    // Cross-project neighborhood (ADR-009 §4.2): PPR is scoped to this project's
+    // code graph, but the developer working here often needs the code of the
+    // projects it depends on (the APIs it calls) and to know who depends on it.
+    // Surface that `project_depends_on` neighborhood as related projects to also
+    // search (e.g. via code_raptor_search across all projects).
+    let (cross_project_dependencies, cross_project_dependents) =
+        crate::deps::store::cross_project_blocks(pool, project_id).await;
+
     json_result(&json!({
         "project": params.project,
         "seed_files": seed_files.len(),
@@ -162,11 +170,17 @@ pub async fn tool_code_ppr_search(
         "ppr_converged": ppr_converged,
         "result_count": results.len(),
         "results": results,
+        "cross_project_dependency_count": cross_project_dependencies.len(),
+        "cross_project_dependencies": cross_project_dependencies,
+        "cross_project_dependent_count": cross_project_dependents.len(),
+        "cross_project_dependents": cross_project_dependents,
         "guidance": "Personalized PageRank over the code graph (import/call/co_change/semantic), \
             restarted on the query's dense-similar files. Ranks files by relational proximity to the \
             lexical hits — surfacing callers, callees, and config a flat cosine search would miss. \
             `used_graph=false` means no seed file had graph edges (graph crons may not have run); the \
-            tool then falls back to dense order. Pair with `find_callers_by_signature` / `read_file` \
+            tool then falls back to dense order. `cross_project_dependencies` are projects this one \
+            depends on — their code is not in these results; search them separately (e.g. \
+            code_raptor_search with no project). Pair with `find_callers_by_signature` / `read_file` \
             to follow the strongest edges."
     }))
 }

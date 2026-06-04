@@ -102,23 +102,70 @@ async fn invariants_for_file_returns_anchored_invariant() {
     .await
     .expect("insert file");
 
-    let entity_id = insert_concept(pool, "AmbiguityPropagation").await;
-    queries::upsert_concept_meta(pool, entity_id, Facet::Invariant, "agent", Some(project_id))
-        .await
-        .expect("upsert invariant meta");
+    let candidate_id = insert_concept(pool, "AmbiguityPropagation").await;
+    queries::upsert_concept_meta(
+        pool,
+        candidate_id,
+        Facet::Invariant,
+        "agent",
+        Some(project_id),
+    )
+    .await
+    .expect("upsert invariant meta");
     sqlx::query(
         "UPDATE ontology_concept_meta \
-         SET constraint_text = 'ambiguity must propagate end-to-end until evidence rejects it' \
+         SET constraint_text = 'ambiguity must propagate end-to-end until evidence rejects it',
+             confidence = 0.95 \
          WHERE entity_id = $1",
     )
-    .bind(entity_id)
+    .bind(candidate_id)
     .execute(pool)
     .await
     .expect("set constraint text");
 
+    // Duplicate anchors are legal; the surfacing query must still return one row
+    // per invariant concept.
+    for _ in 0..2 {
+        queries::memory_anchor_entity(
+            pool,
+            candidate_id,
+            Some(file_id),
+            None,
+            None,
+            None,
+            None,
+            "concept_code",
+        )
+        .await
+        .expect("anchor candidate concept to file");
+    }
+
+    let canonical_id = insert_concept(pool, "ValidatedInputContract").await;
+    queries::upsert_concept_meta(
+        pool,
+        canonical_id,
+        Facet::Invariant,
+        "agent",
+        Some(project_id),
+    )
+    .await
+    .expect("upsert canonical invariant meta");
+    sqlx::query(
+        "UPDATE ontology_concept_meta \
+         SET constraint_text = 'input contracts must be validated before parsing',
+             confidence = 0.10 \
+         WHERE entity_id = $1",
+    )
+    .bind(canonical_id)
+    .execute(pool)
+    .await
+    .expect("set canonical constraint text");
+    queries::set_concept_status(pool, canonical_id, ConceptStatus::Canonical, Actor::User)
+        .await
+        .expect("curate canonical invariant");
     queries::memory_anchor_entity(
         pool,
-        entity_id,
+        canonical_id,
         Some(file_id),
         None,
         None,
@@ -127,14 +174,25 @@ async fn invariants_for_file_returns_anchored_invariant() {
         "concept_code",
     )
     .await
-    .expect("anchor concept to file");
+    .expect("anchor canonical concept to file");
 
     let invs = queries::invariants_for_file(pool, file_id)
         .await
         .expect("invariants_for_file");
-    assert_eq!(invs.len(), 1, "the anchored invariant should surface");
+    assert_eq!(
+        invs.len(),
+        2,
+        "duplicate anchors should not duplicate surfaced invariants"
+    );
+    assert_eq!(
+        invs[0].entity_id, canonical_id,
+        "canonical invariants should sort before higher-confidence candidates"
+    );
+    assert_eq!(invs[0].status, "canonical");
+    assert_eq!(invs[1].entity_id, candidate_id);
+    assert_eq!(invs[1].status, "candidate");
     assert!(
-        invs[0]
+        invs[1]
             .constraint_text
             .as_deref()
             .unwrap_or_default()

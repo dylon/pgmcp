@@ -28,6 +28,142 @@ pub fn a2a_router() -> Router<ApiState> {
         .route("/a2a/jsonrpc", post(handle_jsonrpc))
         .route("/a2a/sse/{task_id}", get(stream_task_events))
         .route("/a2a/agents", get(list_agents).post(register_agent))
+        .route("/a2a/agents/active", get(active_agents))
+        .route("/a2a/messages", post(post_message).get(get_messages))
+}
+
+#[derive(serde::Deserialize)]
+struct ActiveAgentsQuery {
+    project: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct SendMessageBody {
+    from_agent: Option<String>,
+    from_session: Option<String>,
+    to_session: Option<String>,
+    to_project_id: Option<i32>,
+    to_agent: Option<String>,
+    kind: Option<String>,
+    subject: Option<String>,
+    body: String,
+    reply_to: Option<i64>,
+    expires_minutes: Option<i64>,
+}
+
+/// `POST /a2a/messages` — enqueue a mailbox message (REST twin of `a2a_send_message`).
+async fn post_message(
+    State(state): State<ApiState>,
+    Json(b): Json<SendMessageBody>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pool = state
+        .db
+        .pool()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no pool".into()))?;
+    if b.to_session.is_none() && b.to_project_id.is_none() && b.to_agent.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "specify at least one of to_session / to_project_id / to_agent".into(),
+        ));
+    }
+    let kind = b.kind.as_deref().unwrap_or("message");
+    if crate::a2a::mailbox::MessageKind::parse(kind).is_none() {
+        return Err((StatusCode::BAD_REQUEST, format!("invalid kind '{kind}'")));
+    }
+    let expires_at = b
+        .expires_minutes
+        .map(|m| chrono::Utc::now() + chrono::Duration::minutes(m));
+    let msg = crate::a2a::mailbox_store::NewMessage {
+        from_agent: b.from_agent.as_deref().unwrap_or("unknown"),
+        from_session: b.from_session.as_deref(),
+        to_session: b.to_session.as_deref(),
+        to_project_id: b.to_project_id,
+        to_agent: b.to_agent.as_deref(),
+        kind,
+        subject: b.subject.as_deref(),
+        body: &b.body,
+        reply_to: b.reply_to,
+        expires_at,
+    };
+    let id = crate::a2a::mailbox_store::send(pool, &msg)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(serde_json::json!({ "message_id": id })))
+}
+
+#[derive(serde::Deserialize)]
+struct InboxQuery {
+    session: Option<String>,
+    project_id: Option<i32>,
+    agent: Option<String>,
+    #[serde(default)]
+    unread_only: bool,
+}
+
+/// `GET /a2a/messages?session=|project_id=|agent=` — inbox (REST twin of `a2a_inbox`).
+async fn get_messages(
+    State(state): State<ApiState>,
+    axum::extract::Query(q): axum::extract::Query<InboxQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pool = state
+        .db
+        .pool()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no pool".into()))?;
+    if q.session.is_none() && q.project_id.is_none() && q.agent.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "specify at least one of session / project_id / agent".into(),
+        ));
+    }
+    let rows = crate::a2a::mailbox_store::inbox(
+        pool,
+        q.session.as_deref(),
+        q.project_id,
+        q.agent.as_deref(),
+        q.unread_only,
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(
+        serde_json::json!({ "count": rows.len(), "messages": rows }),
+    ))
+}
+
+/// `GET /a2a/agents/active?project=<name>` — live agent instances and the
+/// project each is on (the A2A active-agents-by-project discovery view; the
+/// REST twin of the `a2a_active_agents` MCP tool).
+async fn active_agents(
+    State(state): State<ApiState>,
+    axum::extract::Query(q): axum::extract::Query<ActiveAgentsQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let pool = state
+        .db
+        .pool()
+        .ok_or((StatusCode::INTERNAL_SERVER_ERROR, "no pool".into()))?;
+    let rows = crate::db::queries::active_agents_by_project(pool, q.project.as_deref())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let agents: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "client_name": r.client_name,
+                "mcp_session_id": r.mcp_session_id,
+                "pid": r.pid,
+                "cwd": r.cwd,
+                "project": r.project,
+                "project_id": r.project_id,
+                "alive": r.alive,
+                "last_seen": r.last_seen,
+                "recommended_role": r.recommended_role,
+                "specialty": r.specialty,
+            })
+        })
+        .collect();
+    let count = agents.len();
+    Ok(Json(
+        serde_json::json!({ "active_agents": agents, "count": count }),
+    ))
 }
 
 async fn get_agent_card(State(state): State<ApiState>) -> Json<AgentCard> {
