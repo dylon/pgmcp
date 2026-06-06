@@ -1268,6 +1268,54 @@ pub async fn promote_mandate(
     .fetch_one(&mut *tx)
     .await?;
 
+    let existing: Option<(i64, String, Option<i32>, Option<String>)> = sqlx::query_as(
+        "SELECT id, scope, project_id, file_path
+           FROM durable_mandates
+          WHERE source_mandate_id = $1
+          ORDER BY id
+          LIMIT 1",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    if let Some((durable_id, existing_scope, existing_project_id, existing_file_path)) = existing {
+        if existing_scope != scope || existing_project_id != project_id {
+            return Err(sqlx::Error::Protocol(
+                "session mandate is already promoted with a different scope/project".to_string(),
+            ));
+        }
+        match (existing_file_path.as_deref(), file_path) {
+            (Some(existing), Some(requested)) if existing != requested => {
+                return Err(sqlx::Error::Protocol(
+                    "session mandate is already promoted with a different target_file".to_string(),
+                ));
+            }
+            (None, Some(requested)) => {
+                sqlx::query("UPDATE durable_mandates SET file_path = $2 WHERE id = $1")
+                    .bind(durable_id)
+                    .bind(requested)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            _ => {}
+        }
+
+        sqlx::query("UPDATE session_mandates SET status = 'promoted' WHERE id = $1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        return Ok(durable_id);
+    }
+
+    if mandate.status != "active" {
+        return Err(sqlx::Error::Protocol(
+            "session mandate is not active and cannot be promoted".to_string(),
+        ));
+    }
+
     let durable_id: i64 = sqlx::query_scalar(
         "INSERT INTO durable_mandates
             (scope, project_id, polarity, imperative, target, source_mandate_id, file_path)

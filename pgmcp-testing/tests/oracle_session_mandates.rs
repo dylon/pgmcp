@@ -149,3 +149,227 @@ async fn promote_session_mandate_flips_status() {
         .expect("status select");
     assert_eq!(status, "promoted");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_mandates_all_status_respects_cwd() {
+    let db = require_test_db!();
+    let session_a = Uuid::new_v4();
+    let session_b = Uuid::new_v4();
+    let cwd_a = format!("/ws/cwd-a-{session_a}");
+    let cwd_b = format!("/ws/cwd-b-{session_b}");
+
+    seed_session_mandate(
+        db.pool(),
+        session_a,
+        &cwd_a,
+        "Never leak mandates across cwd boundaries again.",
+    )
+    .await;
+    seed_session_mandate(
+        db.pool(),
+        session_b,
+        &cwd_b,
+        "Never let another cwd appear in this query again.",
+    )
+    .await;
+
+    let server = server_with_pool(db.pool().clone());
+    let result = server
+        .call_tool_cli(
+            "session_mandates",
+            serde_json::json!({
+                "cwd": format!("  {cwd_a}  "),
+                "status": " all ",
+                "limit": 0,
+            }),
+        )
+        .await
+        .expect("session_mandates all-status cwd query");
+    let body = extract_json(&result);
+    assert_eq!(
+        body.get("cwd").and_then(Value::as_str),
+        Some(cwd_a.as_str())
+    );
+    assert_eq!(body.get("status").and_then(Value::as_str), Some("all"));
+    assert_eq!(body.get("limit").and_then(Value::as_i64), Some(1));
+
+    let mandates = body
+        .get("mandates")
+        .and_then(Value::as_array)
+        .expect("mandates array");
+    assert_eq!(mandates.len(), 1, "cwd query leaked rows: {body}");
+    assert_eq!(
+        mandates[0].get("session_id").and_then(Value::as_str),
+        Some(session_a.to_string().as_str())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn session_mandates_rejects_unknown_status() {
+    let db = require_test_db!();
+    let server = server_with_pool(db.pool().clone());
+    let err = server
+        .call_tool_cli(
+            "session_mandates",
+            serde_json::json!({"cwd": "/ws/no-status-leak", "status": "deleted"}),
+        )
+        .await;
+    assert!(err.is_err(), "unknown status must fail closed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_session_mandate_concurrent_calls_are_idempotent() {
+    let db = require_test_db!();
+    let session_id = Uuid::new_v4();
+    let cwd = "/ws/promote-idempotent";
+    let mandate_id = seed_session_mandate(
+        db.pool(),
+        session_id,
+        cwd,
+        "Never duplicate promotions again.",
+    )
+    .await;
+
+    let server_a = server_with_pool(db.pool().clone());
+    let server_b = server_with_pool(db.pool().clone());
+    let args = serde_json::json!({
+        "mandate_id": mandate_id,
+        "scope": " workspace ",
+        "write_to_file": false,
+    });
+
+    let (first, second) = tokio::join!(
+        server_a.call_tool_cli("promote_session_mandate", args.clone()),
+        server_b.call_tool_cli("promote_session_mandate", args),
+    );
+    let first = extract_json(&first.expect("first promote"));
+    let second = extract_json(&second.expect("second promote"));
+    assert_eq!(
+        first.get("durable_mandate_id"),
+        second.get("durable_mandate_id")
+    );
+    assert_eq!(
+        first.get("scope").and_then(Value::as_str),
+        Some("workspace")
+    );
+    assert_eq!(
+        second.get("scope").and_then(Value::as_str),
+        Some("workspace")
+    );
+
+    let durable_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM durable_mandates WHERE source_mandate_id = $1")
+            .bind(mandate_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("durable count");
+    assert_eq!(durable_count, 1, "promotion must be DB-idempotent");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_session_mandate_rejects_missing_target_file_before_db_write() {
+    let db = require_test_db!();
+    let session_id = Uuid::new_v4();
+    let cwd = "/ws/promote-no-target";
+    let mandate_id = seed_session_mandate(
+        db.pool(),
+        session_id,
+        cwd,
+        "Never partially promote missing files.",
+    )
+    .await;
+
+    let server = server_with_pool(db.pool().clone());
+    let err = server
+        .call_tool_cli(
+            "promote_session_mandate",
+            serde_json::json!({
+                "mandate_id": mandate_id,
+                "scope": "workspace",
+                "write_to_file": true,
+            }),
+        )
+        .await;
+    assert!(
+        err.is_err(),
+        "write_to_file=true without target_file must fail before DB writes"
+    );
+
+    let durable_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM durable_mandates WHERE source_mandate_id = $1")
+            .bind(mandate_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("durable count");
+    assert_eq!(durable_count, 0);
+
+    let status: String = sqlx::query_scalar("SELECT status FROM session_mandates WHERE id = $1")
+        .bind(mandate_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("status select");
+    assert_eq!(status, "active");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_session_mandate_appends_target_file_once() {
+    let db = require_test_db!();
+    let session_id = Uuid::new_v4();
+    let cwd = "/ws/promote-file";
+    let mandate_id = seed_session_mandate(
+        db.pool(),
+        session_id,
+        cwd,
+        "Never append duplicate bullets again.",
+    )
+    .await;
+
+    let mandate_text: String =
+        sqlx::query_scalar("SELECT imperative FROM session_mandates WHERE id = $1")
+            .bind(mandate_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("mandate imperative");
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let target = temp.path().join("AGENTS.md");
+    std::fs::write(&target, "# Rules\n").expect("seed target file");
+    let target = target.to_string_lossy().to_string();
+
+    let server = server_with_pool(db.pool().clone());
+    for _ in 0..2 {
+        server
+            .call_tool_cli(
+                "promote_session_mandate",
+                serde_json::json!({
+                    "mandate_id": mandate_id,
+                    "scope": "workspace",
+                    "write_to_file": true,
+                    "target_file": format!("  {target}  "),
+                }),
+            )
+            .await
+            .expect("promote with file");
+    }
+
+    let durable_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM durable_mandates WHERE source_mandate_id = $1")
+            .bind(mandate_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("durable count");
+    assert_eq!(durable_count, 1);
+
+    let content = std::fs::read_to_string(&target).expect("target content");
+    assert_eq!(
+        content
+            .matches("## Promoted session mandates (pgmcp)")
+            .count(),
+        1
+    );
+    assert_eq!(
+        content.matches(&mandate_text).count(),
+        1,
+        "file append must be idempotent:\n{content}"
+    );
+}
