@@ -16,6 +16,43 @@ fn text_of(result: &rmcp::model::CallToolResult) -> String {
         .expect("text content present")
 }
 
+async fn seed_panic_function(
+    pool: &sqlx::PgPool,
+    project_id: i32,
+    file_id: i64,
+    name: &str,
+    visibility: &str,
+    panic_paths: i32,
+    cyclomatic: i32,
+) -> i64 {
+    let symbol_id: i64 = sqlx::query_scalar(
+        "INSERT INTO file_symbols (file_id, name, kind, start_line, end_line, visibility)
+         VALUES ($1, $2, 'function', 1, 3, $3)
+         RETURNING id",
+    )
+    .bind(file_id)
+    .bind(name)
+    .bind(visibility)
+    .fetch_one(pool)
+    .await
+    .expect("file symbol");
+
+    sqlx::query(
+        "INSERT INTO function_metrics
+            (function_id, file_id, project_id, cyclomatic, panic_paths)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(symbol_id)
+    .bind(file_id)
+    .bind(project_id)
+    .bind(cyclomatic)
+    .bind(panic_paths)
+    .execute(pool)
+    .await
+    .expect("function metrics");
+    symbol_id
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn lockset_races_runs() {
     let db = require_test_db!();
@@ -98,14 +135,101 @@ async fn unsafe_clusters_rejects_ambiguous_project_name() {
 #[tokio::test(flavor = "multi_thread")]
 async fn panic_paths_runs() {
     let db = require_test_db!();
-    let p = seed_project(db.pool(), "p5-pp", "/ws/p5-pp").await;
-    seed_file(db.pool(), p, "/ws/p5-pp/a.rs", "a.rs").await;
+    let name = format!("p5-pp-{}", Uuid::now_v7().simple());
+    let root = format!("/ws/{name}");
+    let p = seed_project(db.pool(), &name, &root).await;
+    let file_id = seed_file(db.pool(), p, &format!("{root}/a.rs"), "a.rs").await;
+    seed_panic_function(db.pool(), p, file_id, "may_panic", "public", 3, 5).await;
     let server = server_with_pool(db.pool().clone());
     let r = server
-        .call_tool_cli("panic_paths", serde_json::json!({"project": "p5-pp"}))
+        .call_tool_cli(
+            "panic_paths",
+            serde_json::json!({"project": format!(" {name} "), "entry_filter": " pub ", "limit": 0}),
+        )
         .await
         .expect("tool");
     assert!(r.is_error != Some(true));
+    let v: serde_json::Value = serde_json::from_str(&text_of(&r)).expect("panic JSON");
+    assert_eq!(v["project"].as_str(), Some(name.as_str()));
+    assert_eq!(v["entry_filter"].as_str(), Some("pub"));
+    assert_eq!(v["limit"].as_u64(), Some(1));
+    let functions = v["functions"].as_array().expect("functions");
+    assert_eq!(functions.len(), 1);
+    assert_eq!(functions[0]["file"].as_str(), Some("a.rs"));
+    assert_eq!(functions[0]["function"].as_str(), Some("may_panic"));
+    assert_eq!(functions[0]["panic_paths"].as_u64(), Some(3));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn panic_paths_rejects_invalid_entry_filter() {
+    let db = require_test_db!();
+    let name = format!("p5-pp-filter-{}", Uuid::now_v7().simple());
+    let root = format!("/ws/{name}");
+    seed_project(db.pool(), &name, &root).await;
+    let server = server_with_pool(db.pool().clone());
+    let err = server
+        .call_tool_cli(
+            "panic_paths",
+            serde_json::json!({"project": name, "entry_filter": "public"}),
+        )
+        .await
+        .expect_err("invalid entry_filter must fail closed");
+    assert!(
+        err.to_string().contains("entry_filter must be one of"),
+        "unexpected panic_paths entry_filter error: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn panic_paths_rejects_stale_cross_project_metrics() {
+    let db = require_test_db!();
+    let suffix = Uuid::now_v7().simple().to_string();
+    let target_name = format!("p5-pp-target-{suffix}");
+    let other_name = format!("p5-pp-other-{suffix}");
+    let target_root = format!("/ws/{target_name}");
+    let other_root = format!("/ws/{other_name}");
+    let target_project = seed_project(db.pool(), &target_name, &target_root).await;
+    let other_project = seed_project(db.pool(), &other_name, &other_root).await;
+    seed_file(
+        db.pool(),
+        target_project,
+        &format!("{target_root}/target.rs"),
+        "target.rs",
+    )
+    .await;
+    let other_file = seed_file(
+        db.pool(),
+        other_project,
+        &format!("{other_root}/other.rs"),
+        "other.rs",
+    )
+    .await;
+    seed_panic_function(
+        db.pool(),
+        target_project,
+        other_file,
+        "foreign_panic",
+        "public",
+        9,
+        11,
+    )
+    .await;
+
+    let server = server_with_pool(db.pool().clone());
+    let r = server
+        .call_tool_cli(
+            "panic_paths",
+            serde_json::json!({"project": target_name, "entry_filter": "pub"}),
+        )
+        .await
+        .expect("tool");
+    assert!(r.is_error != Some(true));
+    let v: serde_json::Value = serde_json::from_str(&text_of(&r)).expect("panic JSON");
+    assert_eq!(
+        v["functions"].as_array().expect("functions").len(),
+        0,
+        "stale function_metrics row must not leak another project's file: {v}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

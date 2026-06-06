@@ -20,17 +20,35 @@ use crate::mcp::tools::sema_helpers::effects::symbols_with_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::parsing::type_tags::vocabulary::EFFECT_MAY_PANIC;
 
+const DEFAULT_PANIC_PATHS_LIMIT: i32 = 50;
+const MAX_PANIC_PATHS_LIMIT: i32 = 1000;
+
 pub async fn tool_panic_paths(
     ctx: &SystemContext,
     params: PanicPathsParams,
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "panic_paths", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
 
-    let entry_filter = params.entry_filter.as_deref().unwrap_or("any");
-    let limit = params.limit.unwrap_or(50);
+    let entry_filter = params
+        .entry_filter
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("any");
+    if !matches!(entry_filter, "any" | "pub" | "module" | "private") {
+        return Err(McpError::invalid_params(
+            "entry_filter must be one of: any, pub, module, private",
+            None,
+        ));
+    }
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_PANIC_PATHS_LIMIT)
+        .clamp(1, MAX_PANIC_PATHS_LIMIT);
 
     let vis_clause = match entry_filter {
         "pub" => "AND COALESCE(fs.visibility, 'private') = 'public'",
@@ -41,9 +59,9 @@ pub async fn tool_panic_paths(
     let sql = format!(
         "SELECT f.relative_path, fs.name, fs.start_line, fs.end_line, fm.panic_paths, fm.cyclomatic
          FROM function_metrics fm
-         JOIN file_symbols fs ON fs.id = fm.function_id
-         JOIN indexed_files f ON f.id = fs.file_id
-         WHERE fm.project_id = $1 AND fm.panic_paths > 0 {vis_clause}
+         JOIN file_symbols fs ON fs.id = fm.function_id AND fs.file_id = fm.file_id
+         JOIN indexed_files f ON f.id = fm.file_id AND f.project_id = fm.project_id
+         WHERE fm.project_id = $1 AND f.project_id = $1 AND fm.panic_paths > 0 {vis_clause}
          ORDER BY fm.panic_paths DESC, fm.cyclomatic DESC
          LIMIT $2"
     );
@@ -52,7 +70,7 @@ pub async fn tool_panic_paths(
         (String, String, i32, i32, i32, i32),
     >(&sql)
     .bind(project_id)
-    .bind(limit as i64)
+    .bind(i64::from(limit))
     .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("Panic-paths query failed: {}", e), None))?;
@@ -87,8 +105,9 @@ pub async fn tool_panic_paths(
         .collect::<Vec<_>>();
 
     json_result(&json!({
-        "project": params.project,
+        "project": project,
         "entry_filter": entry_filter,
+        "limit": limit,
         "functions": funcs,
         "effect_marked": effect_marked,
         "guidance": "Functions with high panic-leaf counts crash on unexpected input. Public functions are worst because they have no caller-controllable input validation upstream. The `effect_marked` channel surfaces every symbol the extractor tagged with `may_panic` — useful when you want a binary `panics?` answer rather than the count-based metric."
