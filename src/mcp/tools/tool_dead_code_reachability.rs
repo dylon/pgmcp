@@ -1,8 +1,6 @@
 //! `tool_dead_code_reachability` — Forward closure from roots over
 //! `symbol_references` to find unreached private symbols (SOTA Phase 10.1).
 
-#![allow(unused_imports)]
-
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
 use serde_json::json;
@@ -13,16 +11,25 @@ use crate::context::SystemContext;
 use crate::mcp::server::DeadCodeReachabilityParams;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 
+const DEFAULT_LIMIT: i32 = 50;
+const MAX_DEAD_CANDIDATES: i32 = 1_000;
+
+fn normalize_limit(limit: Option<i32>) -> usize {
+    limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_DEAD_CANDIDATES) as usize
+}
+
 pub async fn tool_dead_code_reachability(
     ctx: &SystemContext,
     params: DeadCodeReachabilityParams,
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "dead_code_reachability", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim().to_string();
+    let project_id = project_id_or_err(ctx, &project).await?;
     let pool = pool_or_err(ctx)?;
     let include_tests = params.include_tests.unwrap_or(false);
-    let limit = params.limit.unwrap_or(50);
+    let include_bare_name = params.include_bare_name.unwrap_or(false);
+    let limit = normalize_limit(params.limit);
 
     // Pre-flight: if no symbols have been extracted yet, return a
     // structured soft-fail mirroring `naming_consistency`'s pattern.
@@ -43,7 +50,10 @@ pub async fn tool_dead_code_reachability(
 
     if symbol_count == 0 {
         return json_result(&json!({
-            "project": params.project,
+            "project": project,
+            "limit": limit,
+            "include_tests": include_tests,
+            "include_bare_name": include_bare_name,
             "roots": 0,
             "reached": 0,
             "dead_candidates": [],
@@ -66,11 +76,19 @@ pub async fn tool_dead_code_reachability(
          JOIN indexed_files f ON fs.file_id = f.id
          WHERE f.project_id = $1
            AND (
+                $2::bool
+                OR (
+                    f.relative_path !~ '(^|/)(test|tests|spec|specs)(/|_)'
+                    AND f.relative_path !~ '(_test|_spec)\\.[a-z]+$'
+                )
+           )
+           AND (
                 COALESCE(fs.visibility, 'private') = 'public'
                 OR fs.name IN ('main','start','run','init')
            )",
     )
     .bind(project_id)
+    .bind(include_tests)
     .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("Roots query failed: {}", e), None))?;
@@ -82,35 +100,36 @@ pub async fn tool_dead_code_reachability(
     // modeled correctly. Bare-name-resolved edges are admitted only
     // when explicitly opted in via params.include_bare_name (default
     // false) — keeps the dead-code report's false-positive rate low.
-    let include_bare_name = params.include_bare_name.unwrap_or(false);
-    let edges: Vec<(Option<i64>, Option<i64>)> = if include_bare_name {
-        sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
-            "SELECT sr.source_symbol_id, sr.target_symbol_id
-             FROM symbol_references sr
-             JOIN indexed_files f ON sr.source_file_id = f.id
-             WHERE f.project_id = $1 AND sr.ref_kind = 'call'
-               AND sr.target_symbol_id IS NOT NULL",
-        )
-    } else {
-        sqlx::query_as::<_, (Option<i64>, Option<i64>)>(
-            "SELECT sr.source_symbol_id, sr.target_symbol_id
-             FROM symbol_references sr
-             JOIN indexed_files f ON sr.source_file_id = f.id
-             WHERE f.project_id = $1 AND sr.ref_kind = 'call'
-               AND sr.target_symbol_id IS NOT NULL
-               AND sr.resolution_kind IN ('exact_in_file', 'exact_via_import')",
-        )
-    }
+    let edges: Vec<(i64, i64)> = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT sr.source_symbol_id, sr.target_symbol_id
+         FROM symbol_references sr
+         JOIN indexed_files sf
+           ON sf.id = sr.source_file_id
+          AND sf.project_id = $1
+         JOIN file_symbols ss
+           ON ss.id = sr.source_symbol_id
+          AND ss.file_id = sf.id
+         JOIN file_symbols ts
+           ON ts.id = sr.target_symbol_id
+         JOIN indexed_files tf
+           ON tf.id = ts.file_id
+          AND tf.project_id = $1
+         WHERE sr.ref_kind = 'call'
+           AND (sr.target_file_id IS NULL OR sr.target_file_id = ts.file_id)
+           AND (
+                sr.resolution_kind IN ('exact_in_file', 'exact_via_import')
+                OR ($2::bool AND sr.resolution_kind = 'bare_name_in_project')
+           )",
+    )
     .bind(project_id)
+    .bind(include_bare_name)
     .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("Edge query failed: {}", e), None))?;
 
     let mut out_edges: HashMap<i64, Vec<i64>> = HashMap::new();
     for (s, t) in edges {
-        if let (Some(s), Some(t)) = (s, t) {
-            out_edges.entry(s).or_default().push(t);
-        }
+        out_edges.entry(s).or_default().push(t);
     }
 
     // BFS from roots.
@@ -132,26 +151,29 @@ pub async fn tool_dead_code_reachability(
     }
 
     // Unreached private symbols = dead candidates.
-    let test_clause = if include_tests {
-        ""
-    } else {
-        " AND f.relative_path !~ '(^|/)(test|tests|spec|specs)(/|_)' AND f.relative_path !~ '(_test|_spec)\\.[a-z]+$'"
-    };
-    let sql = format!(
+    let all_syms: Vec<(i64, String, String, i32, String)> = sqlx::query_as::<
+        _,
+        (i64, String, String, i32, String),
+    >(
         "SELECT fs.id, fs.name, f.relative_path, fs.start_line, COALESCE(fs.visibility, 'private')
          FROM file_symbols fs
          JOIN indexed_files f ON fs.file_id = f.id
          WHERE f.project_id = $1
            AND fs.kind IN ('function','class','struct')
-           {test_clause}
-         ORDER BY f.relative_path, fs.start_line"
-    );
-    let all_syms: Vec<(i64, String, String, i32, String)> =
-        sqlx::query_as::<_, (i64, String, String, i32, String)>(&sql)
-            .bind(project_id)
-            .fetch_all(pool)
-            .await
-            .map_err(|e| McpError::internal_error(format!("Symbol enum failed: {}", e), None))?;
+           AND (
+                $2::bool
+                OR (
+                    f.relative_path !~ '(^|/)(test|tests|spec|specs)(/|_)'
+                    AND f.relative_path !~ '(_test|_spec)\\.[a-z]+$'
+                )
+           )
+         ORDER BY f.relative_path, fs.start_line",
+    )
+    .bind(project_id)
+    .bind(include_tests)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| McpError::internal_error(format!("Symbol enum failed: {}", e), None))?;
 
     let mut dead: Vec<serde_json::Value> = Vec::new();
     for (id, name, path, line, vis) in all_syms {
@@ -164,40 +186,33 @@ pub async fn tool_dead_code_reachability(
             "start_line": line,
             "visibility": vis,
         }));
-        if dead.len() >= limit.max(0) as usize {
+        if dead.len() >= limit {
             break;
         }
     }
     // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown
     // for the project. Universal enrichment — every tool benefits from
     // surfacing the effect distribution alongside its primary output.
-    // Gracefully degrades to empty when the project lookup or
-    // shadow-ASR data isn't populated.
+    // Gracefully degrades to empty when shadow-ASR data isn't populated.
     let effect_breakdown: Vec<serde_json::Value> = (async {
         let Some(pool) = ctx.db().pool() else {
             return Vec::new();
         };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
-        }
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
     })
     .await;
 
     json_result(&json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
+        "project": project,
+        "limit": limit,
+        "include_tests": include_tests,
+        "include_bare_name": include_bare_name,
         "roots": roots.len(),
         "reached": reached.len(),
         "dead_candidates": dead,

@@ -65,6 +65,7 @@ correctness invariants. Modeled after libgrammstein's
 | `io-hotpath-traceability.md` | Concurrency/performance slice for `io_hotpath`: unique project resolution, finite scan/output bounds, stale metric rejection, scoped effect-symbol hints, and read-only execution. | Evidence ledger for `tla/IoHotpathScope.tla` and filtered `tool_sota_phase5` tests. |
 | `api-stability-traceability.md` | API-contract slice for `api_stability`: finite commit-window/output bounds, migrated commit-chunk column usage, resolved-project scoping, same-project effect enrichment, and read-only execution. | Evidence ledger for `tla/ApiStabilityScope.tla` and filtered `tool_sota_phase7_to_11` tests. |
 | `community-detection-traceability.md` | Graph-analysis slice for `community_detection`: duplicate-name fail-closed behavior, closed graph-type validation, bounded finite resolution, stale cross-project edge exclusion, numeric community envelope, and same-project effect enrichment. | Evidence ledger for `tla/CommunityDetectionScope.tla` and `oracle_community_detection`. |
+| `dead-code-reachability-traceability.md` | Call-graph reachability slice for `dead_code_reachability`: normalized bounds, test-root opt-in, exact/bare-name edge policy, same-project source/target symbol traversal, bounded BFS, and read-only execution. | Evidence ledger for `tla/DeadCodeReachabilityScope.tla` and `oracle_dead_code_reachability`. |
 
 ## TLA+ specs
 
@@ -133,6 +134,7 @@ correctness invariants. Modeled after libgrammstein's
 | `tla/IoHotpathScope.tla`                          | I/O hotpath boundary: invalid projects do not scan, limits and scan/effect outputs are bounded, stale metrics are rejected, and reported rows stay in the resolved project. | `src/mcp/tools/tool_io_hotpath.rs` |
 | `tla/ApiStabilityScope.tla`                       | API-stability boundary: invalid projects fail closed, commit windows and output limits are clamped, git commit chunk reads use `content`, reported symbols stay in-project, and effect enrichment reuses the resolved project id. | `src/mcp/tools/tool_api_stability.rs` |
 | `tla/CommunityDetectionScope.tla`                 | Community-detection boundary: invalid projects and graph types fail closed, finite resolution is bounded, stale cross-project edges are excluded, output exposes numeric graph fields, and effect enrichment reuses the resolved project id. | `src/mcp/tools/tool_community_detection.rs` |
+| `tla/DeadCodeReachabilityScope.tla`               | Dead-code reachability boundary: invalid projects fail closed, no-symbol state soft-fails, limits are bounded, tests and bare-name edges are opt-in, traversed call edges are same-project, and BFS/read-only execution is bounded. | `src/mcp/tools/tool_dead_code_reachability.rs` |
 
 ## Rocq proofs
 
@@ -249,6 +251,7 @@ the separate well-founded T1/T2 argument, not coinduction.
 | MemoryUnifiedSearchBoundary — pre-embed validation, node-type filter normalization, bounded vector search settings, and read-only execution | 2026-06-05 | 2026-06-05 | `scripts/tlc-capped.sh MemoryUnifiedSearchBoundary.tla` exit 0; 9 distinct states, 18 generated |
 | ApiStabilityScope — bounded commit windows, migrated commit-chunk reads, resolved-project scoping, and same-project enrichment | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh ApiStabilityScope.tla` exit 0; 5 distinct states, 10 generated |
 | CommunityDetectionScope — project/graph-type validation, bounded resolution, stale-edge exclusion, numeric output envelope, and same-project enrichment | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh CommunityDetectionScope.tla` exit 0; 7 distinct states, 14 generated |
+| DeadCodeReachabilityScope — bounded output, test-root/bare-name opt-in, same-project edge traversal, bounded BFS, and read-only execution | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh DeadCodeReachabilityScope.tla` exit 0; 6 distinct states, 12 generated |
 
 **P13.5 (2026-05-23) — Status integrity:** the previous version of
 this README claimed "Verified 2026-05-23" without any mechanical
