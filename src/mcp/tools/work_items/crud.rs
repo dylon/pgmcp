@@ -513,6 +513,9 @@ pub async fn tool_work_item_tree(
         .await
         .map_err(map_db_err)?;
 
+    ctx.stats()
+        .work_item_queries
+        .fetch_add(1, Ordering::Relaxed);
     json_result(&rows)
 }
 

@@ -850,7 +850,8 @@ pub async fn work_item_timeline(
 
 /// Return an item's subtree (the item plus all descendants via `parent_id`),
 /// ordered by depth then priority — the materialized hierarchy for
-/// `work_item_tree`. Bounded by `max_rows` for safety on pathological trees.
+/// `work_item_tree`. Bounded by `max_rows` and cycle-suppressed for safety on
+/// pathological/corrupted trees.
 pub async fn get_work_item_subtree(
     pool: &PgPool,
     root_id: i64,
@@ -864,10 +865,12 @@ pub async fn get_work_item_subtree(
         .join(", ");
     sqlx::query_as::<_, WorkItemRow>(&format!(
         "WITH RECURSIVE subtree AS (
-            SELECT {cols}, 0 AS depth FROM work_items WHERE id = $1
+            SELECT {cols}, 0 AS depth, ARRAY[id] AS path FROM work_items WHERE id = $1
             UNION ALL
-            SELECT {child_cols}, s.depth + 1
+            SELECT {child_cols}, s.depth + 1, s.path || c.id
             FROM work_items c JOIN subtree s ON c.parent_id = s.id
+            WHERE NOT c.id = ANY(s.path)
+              AND cardinality(s.path) < $2
          )
          SELECT {cols} FROM subtree
          ORDER BY depth, priority DESC, id
