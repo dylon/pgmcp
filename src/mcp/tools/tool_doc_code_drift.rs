@@ -10,12 +10,27 @@
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
 use serde_json::json;
-use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::DocCodeDriftParams;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
+
+const DEFAULT_MIN_DRIFT: f64 = 0.3;
+const MAX_COSINE_DISTANCE: f64 = 2.0;
+const DEFAULT_LIMIT: i32 = 30;
+const MAX_LIMIT: i32 = 100;
+
+fn normalize_min_drift(value: Option<f64>) -> Result<f64, McpError> {
+    let value = value.unwrap_or(DEFAULT_MIN_DRIFT);
+    if !value.is_finite() {
+        return Err(McpError::invalid_params(
+            "min_drift must be a finite number",
+            None,
+        ));
+    }
+    Ok(value.clamp(0.0, MAX_COSINE_DISTANCE))
+}
 
 pub async fn tool_doc_code_drift(
     ctx: &SystemContext,
@@ -23,8 +38,11 @@ pub async fn tool_doc_code_drift(
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "doc_code_drift", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
+    let min_drift = normalize_min_drift(params.min_drift)?;
+    let limit = params.limit.unwrap_or(DEFAULT_LIMIT).clamp(0, MAX_LIMIT);
 
     // Phase 5 C7: signature-aware column resolution.
     let active = crate::embed::signature::read_active_signature(pool)
@@ -62,22 +80,28 @@ pub async fn tool_doc_code_drift(
             FROM dir_emb d JOIN dir_emb c
                 ON d.dir = c.dir AND d.kind = 'doc' AND c.kind = 'code'
         )
-        SELECT dir, (doc_centroid <=> code_centroid)::float8 AS dist, doc_chunks, code_chunks
-        FROM paired
-        ORDER BY dist DESC"
+        SELECT dir, dist, doc_chunks, code_chunks
+        FROM (
+            SELECT dir,
+                   (doc_centroid <=> code_centroid)::float8 AS dist,
+                   doc_chunks,
+                   code_chunks
+            FROM paired
+        ) scored
+        WHERE dist >= $2
+        ORDER BY dist DESC
+        LIMIT $3"
     );
     let rows: Vec<(String, f64, i32, i32)> = sqlx::query_as::<_, (String, f64, i32, i32)>(&sql)
         .bind(project_id)
+        .bind(min_drift)
+        .bind(limit)
         .fetch_all(pool)
         .await
         .map_err(|e| McpError::internal_error(format!("Drift query failed: {}", e), None))?;
 
-    let min_drift = params.min_drift.unwrap_or(0.3);
-    let limit = params.limit.unwrap_or(30);
-
-    let mut out: Vec<_> = rows
+    let out: Vec<_> = rows
         .into_iter()
-        .filter(|(_d, dist, _, _)| *dist >= min_drift)
         .map(|(dir, dist, dc, cc)| {
             json!({
                 "directory": dir,
@@ -87,39 +111,23 @@ pub async fn tool_doc_code_drift(
             })
         })
         .collect();
-    out.truncate(limit.max(0) as usize);
 
     // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown
     // for the project. Universal enrichment — every tool benefits from
     // surfacing the effect distribution alongside its primary output.
-    // Gracefully degrades to empty when the project lookup or
-    // shadow-ASR data isn't populated.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
-        }
-    })
-    .await;
+    let effect_breakdown: Vec<serde_json::Value> =
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect();
 
     json_result(&json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
+        "project": project,
         "min_drift": min_drift,
+        "limit": limit,
         "directories": out,
         "guidance": "Higher cosine distance = doc and code drift apart in vocabulary, suggesting stale documentation."
     }))
