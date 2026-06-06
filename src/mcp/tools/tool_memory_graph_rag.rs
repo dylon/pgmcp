@@ -29,6 +29,12 @@ use crate::mcp::server::{
     MemoryUnifiedSearchParams,
 };
 
+const MAX_MEMORY_UNIFIED_QUERY_BYTES: usize = 16 * 1024;
+const MAX_MEMORY_UNIFIED_NODE_TYPES: usize = 32;
+const DEFAULT_MEMORY_UNIFIED_K: i32 = 20;
+const MAX_MEMORY_UNIFIED_K: i32 = 200;
+const MAX_VECTOR_EF_SEARCH: i32 = 10_000;
+
 fn raw_pool(ctx: &SystemContext) -> Result<&sqlx::PgPool, McpError> {
     ctx.db()
         .pool()
@@ -58,6 +64,59 @@ fn enforce_latency_cap(ctx: &SystemContext, tool: &'static str, elapsed_ms: u64)
     }
 }
 
+fn valid_node_type_list() -> String {
+    crate::db::ontology::NODE_TYPES
+        .iter()
+        .map(|n| n.key)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn normalize_memory_unified_node_types(
+    raw: Option<Vec<String>>,
+) -> Result<Option<Vec<String>>, McpError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Err(McpError::invalid_params(
+            "node_types must not be empty when supplied",
+            None,
+        ));
+    }
+    if raw.len() > MAX_MEMORY_UNIFIED_NODE_TYPES {
+        return Err(McpError::invalid_params(
+            format!("node_types must contain at most {MAX_MEMORY_UNIFIED_NODE_TYPES} entries"),
+            None,
+        ));
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut normalized = Vec::new();
+    for node_type in raw {
+        let node_type = node_type.trim();
+        if node_type.is_empty() {
+            return Err(McpError::invalid_params(
+                "node_types entries must be non-empty",
+                None,
+            ));
+        }
+        if !crate::db::ontology::is_registered_node_type(node_type) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "unknown node_type '{node_type}'; valid types: {}",
+                    valid_node_type_list()
+                ),
+                None,
+            ));
+        }
+        if seen.insert(node_type.to_string()) {
+            normalized.push(node_type.to_string());
+        }
+    }
+    Ok(Some(normalized))
+}
+
 pub async fn tool_memory_unified_search(
     ctx: &SystemContext,
     params: MemoryUnifiedSearchParams,
@@ -65,17 +124,47 @@ pub async fn tool_memory_unified_search(
     tracing::debug!(tool = "memory_unified_search", "MCP tool invoked");
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let pool = raw_pool(ctx)?;
-    let embedding = ctx.embed().embed_query(&params.query).await.map_err(|e| {
+    let query = params.query.trim();
+    if query.is_empty() {
+        return Err(McpError::invalid_params("query must be non-empty", None));
+    }
+    if query.len() > MAX_MEMORY_UNIFIED_QUERY_BYTES {
+        return Err(McpError::invalid_params(
+            format!("query must be at most {MAX_MEMORY_UNIFIED_QUERY_BYTES} bytes"),
+            None,
+        ));
+    }
+    let node_types = normalize_memory_unified_node_types(params.node_types)?;
+    let k = params
+        .k
+        .unwrap_or(DEFAULT_MEMORY_UNIFIED_K)
+        .clamp(1, MAX_MEMORY_UNIFIED_K);
+    let ef = ctx
+        .config()
+        .load()
+        .vector
+        .ef_search
+        .clamp(1, MAX_VECTOR_EF_SEARCH);
+    let embedding = ctx.embed().embed_query(query).await.map_err(|e| {
         error!(tool = "memory_unified_search", error = %e, "embed failed");
         McpError::internal_error(format!("embed failed: {}", e), None)
     })?;
-    let ef = ctx.config().load().vector.ef_search;
-    let limit = params.k.unwrap_or(20);
-    let node_types = params.node_types;
-    let rows = queries::memory_unified_search(pool, &embedding, node_types.as_deref(), limit, ef)
+    if embedding.len() != 1024 {
+        return Err(McpError::internal_error(
+            format!(
+                "query embedding dimension mismatch: got {}, expected 1024",
+                embedding.len()
+            ),
+            None,
+        ));
+    }
+    let pool = raw_pool(ctx)?;
+    let rows = queries::memory_unified_search(pool, &embedding, node_types.as_deref(), k, ef)
         .await
-        .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
+        .map_err(|e| match &e {
+            sqlx::Error::Protocol(msg) => McpError::invalid_params(msg.clone(), None),
+            _ => McpError::internal_error(format!("query failed: {}", e), None),
+        })?;
     enforce_latency_cap(
         ctx,
         "memory_unified_search",
@@ -83,6 +172,10 @@ pub async fn tool_memory_unified_search(
     );
     json_result(json!({
         "count": rows.len(),
+        "query": query,
+        "node_types": node_types,
+        "k": k,
+        "ef_search": ef,
         "results": rows,
     }))
 }
@@ -285,7 +378,12 @@ pub async fn tool_memory_raptor_search(
             None,
         ));
     }
-    let ef = ctx.config().load().vector.ef_search.clamp(1, 10_000);
+    let ef = ctx
+        .config()
+        .load()
+        .vector
+        .ef_search
+        .clamp(1, MAX_VECTOR_EF_SEARCH);
     let k = params.k.unwrap_or(10).clamp(1, 200);
     let rows =
         queries::memory_raptor_search(pool, &embedding, params.scope_id, levels.as_deref(), k, ef)

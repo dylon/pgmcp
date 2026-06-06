@@ -1,6 +1,6 @@
 //! Phase 6 (graph-enhanced retrieval) + Phase 7 (reranker) integration
-//! tests. Exercises the SQL paths directly with hand-rolled 1024d
-//! vectors since the test DeterministicEmbedder is 384d.
+//! tests. Exercises direct SQL paths with hand-rolled 1024d vectors and tool
+//! paths with the deterministic 1024d test embedder.
 //!
 //! Phase 7 model-download tests are `#[ignore]`-gated.
 
@@ -15,6 +15,7 @@ use pgmcp::reranker::{RerankerChoice, parse_reranker_choice};
 use pgmcp_testing::fixtures::test_embedding;
 use pgmcp_testing::pool_tool_helpers::server_with_pool;
 use pgmcp_testing::require_test_db;
+use uuid::Uuid;
 
 fn unit_vec_1024(axis: usize) -> Vec<f32> {
     (0..1024)
@@ -31,6 +32,17 @@ async fn unified_search_rejects_non_1024d_query() {
         .await
         .unwrap_err();
     assert!(format!("{err}").contains("expected 1024d"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unified_search_clamps_limit_and_ef_search() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let v = unit_vec_1024(17);
+    let hits = memory_unified_search(pool, &v, None, 0, -500)
+        .await
+        .expect("negative ef_search and zero limit clamp before SET LOCAL");
+    assert!(hits.len() <= 1, "zero limit clamps to one row: {hits:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -76,6 +88,98 @@ async fn unified_search_returns_observation_matching_query_axis() {
         "near observation should rank in top-k: {:?}",
         hits.iter().map(|h| &h.label).collect::<Vec<_>>()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unified_search_tool_normalizes_filters_and_bounds() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let server = server_with_pool(pool.clone());
+    let suffix = Uuid::new_v4().simple().to_string();
+    let query = format!("unified-query-{suffix}");
+    let entity_name = format!("unified-entity-{suffix}");
+    let content = format!("normalized observation {suffix}");
+    let content_sha = format!("{suffix}{suffix}");
+
+    let entity_id: i64 = sqlx::query_scalar(
+        "INSERT INTO memory_entities (name, entity_type, source)
+         VALUES ($1, 'concept', 'agent_write'::memory_source) RETURNING id",
+    )
+    .bind(&entity_name)
+    .fetch_one(pool)
+    .await
+    .expect("entity");
+
+    let v = test_embedding(1024, &query);
+    let pgv = pgvector::Vector::from(v);
+    sqlx::query(
+        "INSERT INTO memory_observations (entity_id, content, content_sha256, embedding, source)
+         VALUES ($1, $2, $3, $4, 'agent_write'::memory_source)",
+    )
+    .bind(entity_id)
+    .bind(&content)
+    .bind(&content_sha)
+    .bind(&pgv)
+    .execute(pool)
+    .await
+    .expect("obs");
+    refresh_memory_unified_nodes(pool)
+        .await
+        .expect("refresh matview");
+
+    let result = server
+        .call_tool_cli(
+            "memory_unified_search",
+            serde_json::json!({
+                "query": format!("  {query}  "),
+                "node_types": [" observation ", "observation"],
+                "k": 999
+            }),
+        )
+        .await
+        .expect("valid memory_unified_search");
+    let body: serde_json::Value =
+        serde_json::from_str(&text_of(&result)).expect("unified search tool JSON");
+    assert_eq!(body["query"].as_str(), Some(query.as_str()));
+    assert_eq!(body["k"].as_i64(), Some(200));
+    assert_eq!(body["node_types"], serde_json::json!(["observation"]));
+    assert!(
+        body["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .all(|row| row["node_type"].as_str() == Some("observation")),
+        "node_type filter must be sound: {body}"
+    );
+    assert!(
+        body["results"]
+            .as_array()
+            .expect("results")
+            .iter()
+            .any(|row| row["label"].as_str() == Some(content.as_str())),
+        "seeded observation should be returned: {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unified_search_tool_rejects_blank_query_and_unknown_node_type() {
+    let db = require_test_db!();
+    let server = server_with_pool(db.pool().clone());
+
+    let err = server
+        .call_tool_cli("memory_unified_search", serde_json::json!({"query": "   "}))
+        .await
+        .expect_err("blank query must fail before embedding");
+    assert!(format!("{err}").contains("query must be non-empty"));
+
+    let err = server
+        .call_tool_cli(
+            "memory_unified_search",
+            serde_json::json!({"query": "x", "node_types": ["observation", "not_a_node"]}),
+        )
+        .await
+        .expect_err("unknown node type must fail before querying");
+    assert!(format!("{err}").contains("unknown node_type"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

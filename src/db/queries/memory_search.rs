@@ -786,6 +786,8 @@ pub async fn memory_unified_search(
         )));
     }
     let v = pgvector::Vector::from(embedding.to_vec());
+    let limit = limit.clamp(1, 200);
+    let ef_search = ef_search.clamp(1, 10_000);
     let mut tx = pool.begin().await?;
     sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
         .execute(&mut *tx)
@@ -801,7 +803,7 @@ pub async fn memory_unified_search(
     )
     .bind(&v)
     .bind(node_types)
-    .bind(limit.clamp(1, 200))
+    .bind(limit)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
