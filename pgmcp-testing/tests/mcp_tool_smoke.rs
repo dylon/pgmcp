@@ -726,10 +726,41 @@ async fn refactoring_report_produces_structured_output() {
     });
     let server = server_with_mock(mock);
     let result = server
-        .call_tool_cli("refactoring_report", serde_json::json!({}))
+        .call_tool_cli(
+            "refactoring_report",
+            serde_json::json!({
+                "min_similarity": 2.5,
+                "min_projects": 0,
+                "language": " Rust ",
+                "limit": 0
+            }),
+        )
         .await
         .expect("tool call");
     assert!(result.is_error != Some(true));
+    let v: serde_json::Value = serde_json::from_str(&text_of(&result)).expect("json");
+    assert_eq!(v["parameters"]["min_similarity"].as_f64(), Some(1.0));
+    assert_eq!(v["parameters"]["min_projects"].as_u64(), Some(1));
+    assert_eq!(v["parameters"]["language"].as_str(), Some("rust"));
+    assert_eq!(v["parameters"]["limit"].as_u64(), Some(1));
+    assert_eq!(v["parameters"]["fetch_limit"].as_u64(), Some(5));
+    assert_eq!(v["parameters"]["include_same_repo"].as_bool(), Some(false));
+}
+
+#[tokio::test]
+async fn refactoring_report_rejects_oversized_language_filter() {
+    let server = server_with_mock(MockDbClient::new());
+    let err = server
+        .call_tool_cli(
+            "refactoring_report",
+            serde_json::json!({"language": "x".repeat(65)}),
+        )
+        .await
+        .expect_err("oversized language filter must fail closed");
+    assert!(
+        err.to_string().contains("language must be at most"),
+        "unexpected refactoring_report language error: {err}"
+    );
 }
 
 #[tokio::test]

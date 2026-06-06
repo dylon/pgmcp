@@ -60,6 +60,7 @@ correctness invariants. Modeled after libgrammstein's
 | `experiment-decide-traceability.md` | High-use experiment decision slice for `experiment_decide`: normalized/bounded decision input, invalid no-write behavior, same-arm rejection, and atomic result/verdict/status publication. | Evidence ledger for `tla/ExperimentDecideAtomicity.tla` and `tool_experiments_integration`. |
 | `fuzzy-grep-adapter-traceability.md` | Fuzzy-search adapter slice for `fuzzy_grep`: bounded caller-supplied haystacks, non-wrapping distance clamps, explicit token-budget validation, finite reported matches, and read-only execution. | Evidence ledger for `tla/FuzzyGrepAdapterBounds.tla` and `g10_fuzzy_grep_tools`. |
 | `find-duplicates-traceability.md` | Similarity slice for `find_duplicates`: finite request bounds, overflow-safe fetch windows, bounded cluster output, filtered cross-language clone rows, and read-only execution. | Evidence ledger for `tla/FindDuplicatesBounds.tla` and `oracle_similarity_tools`. |
+| `refactoring-report-traceability.md` | Similarity/reporting slice for `refactoring_report`: finite similarity validation, bounded project/language/output filters, overflow-safe fetch windows, bounded candidate output, and read-only execution. | Evidence ledger for `tla/RefactoringReportBounds.tla` and filtered `mcp_tool_smoke` tests. |
 | `io-hotpath-traceability.md` | Concurrency/performance slice for `io_hotpath`: unique project resolution, finite scan/output bounds, stale metric rejection, scoped effect-symbol hints, and read-only execution. | Evidence ledger for `tla/IoHotpathScope.tla` and filtered `tool_sota_phase5` tests. |
 
 ## TLA+ specs
@@ -124,6 +125,7 @@ correctness invariants. Modeled after libgrammstein's
 | `tla/ExperimentDecideAtomicity.tla`                 | Experiment decide boundary: invalid requests do not write, DB failures roll back, and result/verdict/status publication is atomic. | `src/mcp/tools/tool_experiments.rs::tool_experiment_decide`, `src/db/queries/experiments.rs::insert_experiment_decision` |
 | `tla/FuzzyGrepAdapterBounds.tla`                    | Fuzzy-grep adapter boundary: invalid requests do not scan, distances clamp without wrapping, reported matches are bounded, and the tool remains read-only. | `src/mcp/tools/tool_fuzzy_grep.rs` |
 | `tla/FindDuplicatesBounds.tla`                    | Find-duplicates boundary: non-finite thresholds reject, numeric filters clamp, fetch/output windows stay bounded, and cross-language rows satisfy threshold/language/same-repo/project-consistency filters. | `src/mcp/tools/tool_find_duplicates.rs` |
+| `tla/RefactoringReportBounds.tla`                 | Refactoring-report boundary: non-finite thresholds reject, numeric/language filters clamp, duplicate-pair fetch windows stay bounded, and candidate output respects the effective limit. | `src/mcp/tools/tool_refactoring_report.rs` |
 | `tla/IoHotpathScope.tla`                          | I/O hotpath boundary: invalid projects do not scan, limits and scan/effect outputs are bounded, stale metrics are rejected, and reported rows stay in the resolved project. | `src/mcp/tools/tool_io_hotpath.rs` |
 
 ## Rocq proofs
@@ -236,6 +238,7 @@ the separate well-founded T1/T2 argument, not coinduction.
 | ExperimentDecideAtomicity — invalid no-write behavior, rollback on DB failure, and atomic result/verdict/status publication | 2026-06-05 | 2026-06-05 | `scripts/tlc-capped.sh ExperimentDecideAtomicity.tla` exit 0; 227 distinct states, 308 generated |
 | FuzzyGrepAdapterBounds — invalid no-scan behavior, non-wrapping distance clamps, bounded reported matches, and read-only execution | 2026-06-05 | 2026-06-05 | `scripts/tlc-capped.sh FuzzyGrepAdapterBounds.tla` exit 0; 1,957 distinct states, 1,957 generated |
 | FindDuplicatesBounds — finite request bounds, bounded fetch/output windows, filtered cross-language rows, and read-only execution | 2026-06-05 | 2026-06-05 | `scripts/tlc-capped.sh FindDuplicatesBounds.tla` exit 0; 65 distinct states, 65 generated |
+| RefactoringReportBounds — finite request bounds, bounded fetch/output windows, and read-only candidate reporting | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh RefactoringReportBounds.tla` exit 0; 4 distinct states, 8 generated |
 | IoHotpathScope — unique project resolution, bounded scan/output/effects, stale metric rejection, and read-only execution | 2026-06-05 | 2026-06-05 | `scripts/tlc-capped.sh IoHotpathScope.tla` exit 0; 326 distinct states, 326 generated |
 | MemoryUnifiedSearchBoundary — pre-embed validation, node-type filter normalization, bounded vector search settings, and read-only execution | 2026-06-05 | 2026-06-05 | `scripts/tlc-capped.sh MemoryUnifiedSearchBoundary.tla` exit 0; 9 distinct states, 18 generated |
 
