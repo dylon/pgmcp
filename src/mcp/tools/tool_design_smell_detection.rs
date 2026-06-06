@@ -13,7 +13,48 @@ use serde_json::json;
 use tracing::{debug, error, info, warn};
 
 use crate::context::SystemContext;
+use crate::db::queries;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
+
+const MAX_DESIGN_SMELL_LIMIT: i32 = 1_000;
+const ALLOWED_DESIGN_SMELLS: &[&str] = &[
+    "god_class",
+    "srp_violation",
+    "shotgun_surgery",
+    "stale_module",
+    "unstable_dependency",
+];
+
+fn normalize_design_smells(smells: Option<Vec<String>>) -> Result<(bool, Vec<String>), McpError> {
+    let Some(smells) = smells else {
+        return Ok((true, Vec::new()));
+    };
+    if smells.is_empty() {
+        return Err(McpError::invalid_params(
+            "smells must not be empty when provided",
+            None,
+        ));
+    }
+
+    let mut out = Vec::with_capacity(smells.len());
+    for smell in smells {
+        let smell = smell.trim();
+        if !ALLOWED_DESIGN_SMELLS.contains(&smell) {
+            return Err(McpError::invalid_params(
+                format!(
+                    "smell '{}' is invalid; expected one of: god_class, srp_violation, shotgun_surgery, stale_module, unstable_dependency",
+                    smell
+                ),
+                None,
+            ));
+        }
+        out.push(smell.to_string());
+    }
+    out.sort();
+    out.dedup();
+    Ok((false, out))
+}
 
 pub async fn tool_design_smell_detection(
     ctx: &SystemContext,
@@ -25,14 +66,19 @@ pub async fn tool_design_smell_detection(
         .design_smell_scans
         .fetch_add(1, Ordering::Relaxed);
 
-    let limit = params.limit.unwrap_or(30);
-    let detect_all = params.smells.is_none();
-    let smells = params.smells.unwrap_or_default();
+    let project = params.project.trim().to_string();
+    if project.is_empty() {
+        return Err(McpError::invalid_params("project must be non-empty", None));
+    }
+    let limit = params.limit.unwrap_or(30).clamp(1, MAX_DESIGN_SMELL_LIMIT);
+    let (detect_all, smells) = normalize_design_smells(params.smells)?;
     let include_fixes = params.include_fixes.unwrap_or(true);
+    let pool = pool_or_err(ctx)?;
+    let project_id = project_id_or_err(ctx, &project).await?;
 
     debug!(
         tool = "design_smell_detection",
-        project = %params.project,
+        project = %project,
         limit,
         include_fixes,
         "MCP tool invoked",
@@ -59,15 +105,11 @@ pub async fn tool_design_smell_detection(
                 fm.commit_count, fm.churn_rate, fm.days_since_last_change
          FROM indexed_files f
          LEFT JOIN file_metrics fm ON fm.file_id = f.id
-         JOIN projects p ON f.project_id = p.id
-         WHERE p.name = $1",
+                                  AND fm.project_id = f.project_id
+         WHERE f.project_id = $1",
     )
-    .bind(&params.project)
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .bind(project_id)
+    .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
 
@@ -83,16 +125,11 @@ pub async fn tool_design_smell_detection(
          FROM indexed_files f
          JOIN file_chunks fc ON fc.file_id = f.id
          JOIN chunk_topic_assignments cta ON cta.chunk_id = fc.id
-         JOIN projects p ON f.project_id = p.id
-         WHERE p.name = $1
+         WHERE f.project_id = $1
          GROUP BY f.relative_path",
     )
-    .bind(&params.project)
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .bind(project_id)
+    .fetch_all(pool)
     .await
     .unwrap_or_default();
 
@@ -102,9 +139,7 @@ pub async fn tool_design_smell_detection(
         .collect();
 
     // Get co-change partner counts
-    let coupling_pairs = ctx
-        .db()
-        .find_coupled_files(&params.project, 0.2, 2)
+    let coupling_pairs = queries::find_coupled_files_by_project_id(pool, project_id, 0.2, 2)
         .await
         .unwrap_or_default();
 
@@ -226,13 +261,9 @@ pub async fn tool_design_smell_detection(
             // builder clamps to 1 to keep PathRange.end_line valid).
             let line_count = s["line_count"].as_i64().unwrap_or(0).min(i32::MAX as i64) as i32;
             let metric_summary = s["reason"].as_str().unwrap_or("").to_string();
-            if let Some(fix) = default_fix_for_smell(
-                &smell_type,
-                &params.project,
-                &path,
-                line_count,
-                &metric_summary,
-            ) && let Ok(fix_json) = serde_json::to_value(&fix)
+            if let Some(fix) =
+                default_fix_for_smell(&smell_type, &project, &path, line_count, &metric_summary)
+                && let Ok(fix_json) = serde_json::to_value(&fix)
                 && let Some(obj) = s.as_object_mut()
             {
                 obj.insert("recommended_fix".to_string(), fix_json);
@@ -245,31 +276,20 @@ pub async fn tool_design_smell_detection(
     // surfacing the effect distribution alongside its primary output.
     // Gracefully degrades to empty when the project lookup or
     // shadow-ASR data isn't populated.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
-        }
-    })
-    .await;
+    let effect_breakdown: Vec<serde_json::Value> =
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect();
 
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
+        "project": project,
+        "limit": limit,
+        "detect_all": detect_all,
+        "smells_requested": smells,
         "smell_count": detected_smells.len(),
         "smells": detected_smells,
         "guidance": "God classes and SRP violations should be split. Shotgun surgery files \

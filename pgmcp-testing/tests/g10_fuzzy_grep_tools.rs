@@ -99,3 +99,74 @@ async fn fuzzy_grep_reports_positional_matches() {
     assert!(matches[0].get("byte_start").is_some());
     assert!(matches[0].get("distance").is_some());
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fuzzy_grep_clamps_distance_without_wrapping() {
+    let testdb = require_test_db!();
+    let ctx = build_ctx(Arc::new(testdb.pool().clone()));
+
+    let result = tool_fuzzy_grep::run(
+        &ctx,
+        FuzzyGrepParams {
+            query: "colour".to_string(),
+            haystack: vec!["let color = 1;".to_string()],
+            max_distance: Some(1_000),
+        },
+    )
+    .await
+    .expect("fuzzy_grep clamps large distance");
+    let val = result_json(&result);
+
+    assert_eq!(
+        val["max_distance"].as_u64(),
+        Some(8),
+        "u32 max_distance must clamp before converting to u8"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fuzzy_grep_rejects_explicit_token_distance_above_cap() {
+    let testdb = require_test_db!();
+    let ctx = build_ctx(Arc::new(testdb.pool().clone()));
+
+    let err = tool_fuzzy_grep::run(
+        &ctx,
+        FuzzyGrepParams {
+            query: "colour:9".to_string(),
+            haystack: vec!["let color = 1;".to_string()],
+            max_distance: Some(2),
+        },
+    )
+    .await
+    .expect_err("explicit token distance above the adapter cap must reject");
+
+    assert!(
+        err.message.contains("explicit token distance"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fuzzy_grep_caps_reported_matches() {
+    let testdb = require_test_db!();
+    let ctx = build_ctx(Arc::new(testdb.pool().clone()));
+    let repeated = vec!["color"; 1_100].join(" ");
+
+    let result = tool_fuzzy_grep::run(
+        &ctx,
+        FuzzyGrepParams {
+            query: "color".to_string(),
+            haystack: vec![repeated],
+            max_distance: Some(0),
+        },
+    )
+    .await
+    .expect("fuzzy_grep caps output");
+    let val = result_json(&result);
+    let matches = val["matches"].as_array().expect("matches array");
+
+    assert_eq!(matches.len(), 1_000);
+    assert_eq!(val["match_count"].as_u64(), Some(1_000));
+    assert_eq!(val["reported_match_count"].as_u64(), Some(1_000));
+    assert_eq!(val["matches_truncated"].as_bool(), Some(true));
+}

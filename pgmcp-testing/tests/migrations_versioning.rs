@@ -70,3 +70,27 @@ async fn run_migrations_records_initial_schema_version_once() {
         "at least the initial_schema baseline version must be recorded"
     );
 }
+
+#[tokio::test]
+async fn work_item_code_anchor_chunk_fk_index_exists() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM pg_indexes
+             WHERE schemaname = 'public'
+               AND tablename = 'work_item_code_anchor'
+               AND indexname = 'idx_wi_anchor_chunk'
+         )",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("index existence query");
+
+    assert!(
+        exists,
+        "work_item_code_anchor.chunk_id must be indexed for file_chunks delete cascades"
+    );
+}

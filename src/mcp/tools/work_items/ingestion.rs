@@ -20,10 +20,14 @@ use crate::context::SystemContext;
 use crate::db::queries::{self, NewWorkItem};
 use crate::mcp::server::{WorkItemIngestPlanParams, WorkItemPromoteMarkerParams};
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err};
-use crate::mcp::tools::work_items::crud::map_db_err;
+use crate::mcp::tools::work_items::crud::{map_db_err, resolve_existing_project_id_param};
 use crate::mcp::tools::work_items::slugify;
 use crate::tracker::ingest::parse_plan;
 use crate::tracker::kind::WorkItemKind;
+
+/// Bounded before any DB write so one oversized ExitPlanMode transcript cannot
+/// consume unbounded memory or create an unreviewable tracker subtree.
+const MAX_INGEST_NODES: usize = 500;
 
 /// First 8 hex chars of sha256 — a stable short suffix for idempotent ids.
 fn short_hash(s: &str) -> String {
@@ -73,22 +77,41 @@ pub async fn ingest_plan_core(
             None,
         ));
     }
+    if nodes.len() > MAX_INGEST_NODES {
+        return Err(McpError::invalid_params(
+            format!(
+                "plan contains {} trackable nodes; cap is {MAX_INGEST_NODES}",
+                nodes.len()
+            ),
+            None,
+        ));
+    }
 
-    let project_id = queries::resolve_project_id(pool, project)
-        .await
-        .map_err(map_db_err)?;
+    let project_id = resolve_existing_project_id_param(pool, project).await?;
     let definition_id = match definition_slug {
         None => None,
-        Some(slug) => queries::get_plan_definition(pool, &slugify(slug), None)
-            .await
-            .map_err(map_db_err)?
-            .map(|d| d.id),
+        Some(slug) => {
+            let slug = slug.trim();
+            if slug.is_empty() {
+                None
+            } else {
+                queries::get_plan_definition(pool, &slugify(slug), None)
+                    .await
+                    .map_err(map_db_err)?
+                    .map(|d| d.id)
+            }
+        }
     };
+    let normalized_definition_slug = definition_slug
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())
+        .map(slugify);
 
     let root_ns = slugify(&nodes[0].title);
     let mut ids: Vec<i64> = Vec::with_capacity(nodes.len());
     let mut pubs: Vec<String> = Vec::with_capacity(nodes.len());
     let mut created = 0_usize;
+    let mut tx = pool.begin().await.map_err(map_db_err)?;
 
     for node in &nodes {
         let parent_id = node.parent_index.map(|pi| ids[pi]);
@@ -106,8 +129,8 @@ pub async fn ingest_plan_core(
         } else {
             "pending"
         };
-        let (id, inserted) = queries::upsert_ingested_item(
-            pool,
+        let (id, inserted) = queries::upsert_ingested_item_in_tx(
+            &mut tx,
             &public_id,
             parent_id,
             project_id,
@@ -129,8 +152,8 @@ pub async fn ingest_plan_core(
                 "single"
             };
             for acc in &node.acceptance {
-                queries::insert_acceptance_criterion(
-                    pool,
+                queries::insert_acceptance_criterion_in_tx(
+                    &mut tx,
                     id,
                     &acc.criterion_kind,
                     &acc.description,
@@ -147,6 +170,7 @@ pub async fn ingest_plan_core(
         ids.push(id);
         pubs.push(public_id);
     }
+    tx.commit().await.map_err(map_db_err)?;
 
     let mut out = json!({
         "root_public_id": pubs[0],
@@ -161,7 +185,7 @@ pub async fn ingest_plan_core(
             .map_err(map_db_err)?;
         let errors = v.iter().filter(|x| x.severity == "error").count();
         out["validation"] = json!({
-            "definition": definition_slug,
+            "definition": normalized_definition_slug,
             "valid": errors == 0,
             "violations": v,
         });

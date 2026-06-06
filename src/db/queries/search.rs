@@ -358,6 +358,7 @@ async fn run_text_search_query<'e, E>(
     query: &str,
     limit: i32,
     language: Option<&str>,
+    project: Option<&str>,
     dedupe_worktrees: bool,
 ) -> Result<Vec<TextSearchResult>, sqlx::Error>
 where
@@ -369,59 +370,34 @@ where
     // SELECT re-sorts by rank globally and applies the limit. Chunks
     // hang off `COALESCE(duplicate_of_file_id, id)` so duplicates point
     // at canonical chunks.
-    let results = if let Some(lang) = language {
-        // $1=query, $2=limit, $3=lang, $4=dedupe
-        sqlx::query_as::<_, TextSearchResult>(&format!(
-            "SELECT path, relative_path, language, content, rank FROM (
-                SELECT DISTINCT ON (f.id)
-                    f.path,
-                    f.relative_path,
-                    f.language,
-                    c.content,
-                    ts_rank(c.content_tsv, plainto_tsquery('english', $1)) AS rank
-                FROM file_chunks c
-                JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
-                WHERE c.content_tsv @@ plainto_tsquery('english', $1)
-                  AND f.language = $3
-                  AND {}
-                ORDER BY f.id, rank DESC
-             ) per_file
-             ORDER BY rank DESC
-             LIMIT $2",
-            worktree_dedup_clause(4)
-        ))
-        .bind(query)
-        .bind(limit)
-        .bind(lang)
-        .bind(dedupe_worktrees)
-        .fetch_all(executor)
-        .await?
-    } else {
-        // $1=query, $2=limit, $3=dedupe
-        sqlx::query_as::<_, TextSearchResult>(&format!(
-            "SELECT path, relative_path, language, content, rank FROM (
-                SELECT DISTINCT ON (f.id)
-                    f.path,
-                    f.relative_path,
-                    f.language,
-                    c.content,
-                    ts_rank(c.content_tsv, plainto_tsquery('english', $1)) AS rank
-                FROM file_chunks c
-                JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
-                WHERE c.content_tsv @@ plainto_tsquery('english', $1)
-                  AND {}
-                ORDER BY f.id, rank DESC
-             ) per_file
-             ORDER BY rank DESC
-             LIMIT $2",
-            worktree_dedup_clause(3)
-        ))
-        .bind(query)
-        .bind(limit)
-        .bind(dedupe_worktrees)
-        .fetch_all(executor)
-        .await?
-    };
+    let results = sqlx::query_as::<_, TextSearchResult>(&format!(
+        "SELECT path, relative_path, language, content, rank FROM (
+            SELECT DISTINCT ON (f.id)
+                f.path,
+                f.relative_path,
+                f.language,
+                c.content,
+                ts_rank(c.content_tsv, plainto_tsquery('english', $1)) AS rank
+            FROM file_chunks c
+            JOIN indexed_files f ON c.file_id = COALESCE(f.duplicate_of_file_id, f.id)
+            LEFT JOIN projects p ON p.id = f.project_id
+            WHERE c.content_tsv @@ plainto_tsquery('english', $1)
+              AND ($3::text IS NULL OR f.language = $3)
+              AND ($4::text IS NULL OR p.name = $4)
+              AND {}
+            ORDER BY f.id, rank DESC
+         ) per_file
+         ORDER BY rank DESC
+         LIMIT $2",
+        worktree_dedup_clause(5)
+    ))
+    .bind(query)
+    .bind(limit)
+    .bind(language)
+    .bind(project)
+    .bind(dedupe_worktrees)
+    .fetch_all(executor)
+    .await?;
 
     Ok(results)
 }
@@ -431,9 +407,10 @@ pub async fn text_search(
     query: &str,
     limit: i32,
     language: Option<&str>,
+    project: Option<&str>,
     dedupe_worktrees: bool,
 ) -> Result<Vec<TextSearchResult>, sqlx::Error> {
-    run_text_search_query(pool, query, limit, language, dedupe_worktrees).await
+    run_text_search_query(pool, query, limit, language, project, dedupe_worktrees).await
 }
 
 /// Same as [`text_search`], but caps the query with a per-call
@@ -447,6 +424,7 @@ pub async fn text_search_bounded(
     query: &str,
     limit: i32,
     language: Option<&str>,
+    project: Option<&str>,
     dedupe_worktrees: bool,
     statement_timeout_ms: u32,
 ) -> Result<Vec<TextSearchResult>, sqlx::Error> {
@@ -457,7 +435,8 @@ pub async fn text_search_bounded(
     ))
     .execute(&mut *tx)
     .await?;
-    let results = run_text_search_query(&mut *tx, query, limit, language, dedupe_worktrees).await?;
+    let results =
+        run_text_search_query(&mut *tx, query, limit, language, project, dedupe_worktrees).await?;
     tx.commit().await?;
     Ok(results)
 }

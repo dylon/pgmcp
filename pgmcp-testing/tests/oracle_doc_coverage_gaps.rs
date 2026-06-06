@@ -22,6 +22,8 @@ use pgmcp::mcp::tasks::TaskStore;
 use pgmcp::stats::tracker::StatsTracker;
 use pgmcp_testing::fixtures::test_config;
 use pgmcp_testing::mocks::{DeterministicEmbeddingBackend, MockDbClient};
+use pgmcp_testing::pool_tool_helpers::server_with_pool;
+use pgmcp_testing::require_test_db;
 
 fn server_with_mock(mock: MockDbClient) -> McpServer {
     let db: Arc<dyn DbClient> = Arc::new(mock);
@@ -92,11 +94,12 @@ async fn doc_coverage_gaps_classifies_each_topic_per_threshold_table() {
     ];
     let server = server_with_mock(mock);
     let result = server
-        .call_tool_cli("doc_coverage_gaps", serde_json::json!({"project": "p"}))
+        .call_tool_cli("doc_coverage_gaps", serde_json::json!({"project": " p "}))
         .await
         .expect("call");
     let payload = text_of(&result);
     let v: serde_json::Value = serde_json::from_str(&payload).expect("json");
+    assert_eq!(v["project"].as_str(), Some("p"));
     let topics = v["topics"].as_array().expect("topics");
     assert_eq!(topics.len(), 3);
 
@@ -153,6 +156,49 @@ async fn doc_coverage_gaps_sorts_topics_worst_ratio_first() {
         .map(|t| t["label"].as_str().unwrap())
         .collect();
     assert_eq!(order, vec!["worst", "middle", "best"]);
+}
+
+#[tokio::test]
+async fn doc_coverage_gaps_rejects_empty_project() {
+    let server = server_with_mock(MockDbClient::new());
+    let result = server
+        .call_tool_cli("doc_coverage_gaps", serde_json::json!({"project": "   "}))
+        .await;
+    assert!(result.is_err(), "blank project names must be rejected");
+}
+
+#[tokio::test]
+async fn doc_coverage_gaps_rejects_duplicate_project_display_names() {
+    let db = require_test_db!();
+    let server = server_with_pool(db.pool().clone());
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+    let name = format!("doc-coverage-dup-{suffix}");
+
+    for idx in 0..2 {
+        sqlx::query(
+            "INSERT INTO projects (workspace_path, path, name)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(format!("/tmp/doc-coverage-dup-{suffix}-{idx}"))
+        .bind(format!("/tmp/doc-coverage-dup-{suffix}-{idx}/project"))
+        .bind(&name)
+        .execute(db.pool())
+        .await
+        .expect("insert duplicate project");
+    }
+
+    let result = server
+        .call_tool_cli("doc_coverage_gaps", serde_json::json!({"project": name}))
+        .await
+        .expect_err("duplicate project display names must fail closed");
+    let msg = format!("{result:?}");
+    assert!(
+        msg.contains("not unique"),
+        "error should identify duplicate project name; got {msg}"
+    );
 }
 
 #[tokio::test]

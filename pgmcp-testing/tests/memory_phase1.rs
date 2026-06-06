@@ -177,10 +177,12 @@ async fn recall_prompts_rejects_non_1024d_query_dim() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "downloads BGE-M3 weights (~1.2 GB) and runs candle inference; opt-in"]
 async fn bge_m3_embedder_produces_1024d_l2_normalized_vectors() {
-    let mut cfg = pgmcp::config::EmbeddingsConfig::default();
-    cfg.model = "bge-m3".into();
-    cfg.dimensions = 1024;
-    cfg.use_gpu = std::env::var("PGMCP_TEST_USE_GPU").ok().as_deref() == Some("1");
+    let cfg = pgmcp::config::EmbeddingsConfig {
+        model: "bge-m3".into(),
+        dimensions: 1024,
+        use_gpu: std::env::var("PGMCP_TEST_USE_GPU").ok().as_deref() == Some("1"),
+        ..Default::default()
+    };
 
     let embedder = pgmcp::embed::model::Embedder::new(&cfg).expect("Embedder::new for bge-m3");
     let texts = ["hello world", "search-engine optimization"];

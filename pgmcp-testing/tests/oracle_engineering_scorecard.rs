@@ -221,7 +221,7 @@ async fn scorecard_orr_checklist_reflects_failing_dimensions() {
     //   has_documentation     ← doc_count > 0
     //   low_churn             ← avg_churn < 3.0
     //   low_fix_ratio         ← avg_fix < 0.3
-    //   no_god_files          ← high_complexity_count < 5
+    //   no_god_files          ← no file exceeds the 2000-line god-file bar
     //   bus_factor_ok         ← avg_authors >= 1.5
     //   recently_maintained   ← avg_stale < 180.0
     let cases: &[(&str, &str, ScorecardScenario)] = &[
@@ -358,6 +358,51 @@ async fn scorecard_orr_checklist_reflects_failing_dimensions() {
             "scenario `{proj}`: any failing item must flip orr_pass to false"
         );
     }
+}
+
+#[tokio::test]
+async fn scorecard_normalizes_project_and_validates_format() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let _pid = seed_scorecard_corpus(&pool, "format-proj", ScorecardScenario::Perfect).await;
+    let server = server_with_pool(pool);
+
+    let result = server
+        .call_tool_cli(
+            "engineering_scorecard",
+            serde_json::json!({"project": " format-proj ", "format": "summary"}),
+        )
+        .await
+        .expect("summary call");
+    let v: serde_json::Value = serde_json::from_str(&text_of(&result)).expect("json");
+    assert_eq!(v["project"].as_str(), Some("format-proj"));
+    assert!(
+        v["dimensions"]
+            .as_array()
+            .is_some_and(|dims| dims.is_empty()),
+        "summary format omits the per-dimension table"
+    );
+
+    assert!(
+        server
+            .call_tool_cli(
+                "engineering_scorecard",
+                serde_json::json!({"project": "format-proj", "format": "bogus"}),
+            )
+            .await
+            .is_err(),
+        "unknown format must fail closed"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "engineering_scorecard",
+                serde_json::json!({"project": "   "}),
+            )
+            .await
+            .is_err(),
+        "blank project must fail closed"
+    );
 }
 
 async fn run_scorecard(server: &pgmcp::mcp::server::McpServer, project: &str) -> serde_json::Value {

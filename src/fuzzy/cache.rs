@@ -12,7 +12,9 @@
 //! file's mtime at open time and treats an mtime change as a miss, so a cached
 //! handle is transparently reopened after the cron refreshes the file. This
 //! keeps the cache exactly as fresh as the file (which only the cron changes)
-//! with no coupling to the cron.
+//! with no coupling to the cron. Per-project entries are keyed by the
+//! collision-free artifact key (`slugified-name-p<project_id>`), not by display
+//! name alone.
 //!
 //! **Bound.** At most `capacity` handles per kind (symbols, paths, concepts). On
 //! overflow the least-recently-accessed entry is dropped — its daemon threads are

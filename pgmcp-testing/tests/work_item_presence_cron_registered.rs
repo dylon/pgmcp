@@ -32,7 +32,7 @@ async fn direct_run_or_log_increments_counter() {
     pgmcp::cron::work_item_presence::run_or_log(pool, Arc::clone(&stats), 300, 900).await;
     let after = stats.presence_sweeps.load(Ordering::Relaxed);
     assert!(
-        after >= before + 1,
+        after > before,
         "presence_sweeps must increment on each run_or_log call: {before} -> {after}"
     );
 }

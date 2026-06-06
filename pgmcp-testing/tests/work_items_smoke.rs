@@ -28,14 +28,14 @@ use pgmcp::mcp::logging::LogBroadcaster;
 use pgmcp::mcp::server::McpServer;
 use pgmcp::mcp::tasks::TaskStore;
 use pgmcp::stats::tracker::StatsTracker;
+use pgmcp::tracker::status::WorkItemStatus;
+use pgmcp::tracker::transition::Actor;
 use pgmcp_testing::mocks::DeterministicEmbeddingBackend;
 use pgmcp_testing::require_test_db;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
-/// Server with a real pool and a 1024-d deterministic embedder (matches the
-/// `work_items.embedding vector(1024)` column).
-fn server_1024(pool: PgPool) -> McpServer {
+fn server_with_embed_dim(pool: PgPool, dim: usize) -> McpServer {
     let db: Arc<dyn DbClient> = Arc::new(pool);
     let stats = Arc::new(StatsTracker::new());
     let mut cfg = Config::default();
@@ -45,7 +45,7 @@ fn server_1024(pool: PgPool) -> McpServer {
     let log_broadcaster = Arc::new(LogBroadcaster::new());
     let task_store = Arc::new(TaskStore::new());
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
-        Arc::new(DeterministicEmbeddingBackend::new(1024));
+        Arc::new(DeterministicEmbeddingBackend::new(dim));
     let embed_source = EmbedSource::backend(embed_backend);
     let lifecycle = pgmcp::daemon_state::DaemonLifecycle::new();
     lifecycle.transition(pgmcp::daemon_state::DaemonPhase::Ready);
@@ -59,6 +59,12 @@ fn server_1024(pool: PgPool) -> McpServer {
         lifecycle,
     );
     McpServer::new(ctx)
+}
+
+/// Server with a real pool and a 1024-d deterministic embedder (matches the
+/// `work_items.embedding vector(1024)` column).
+fn server_1024(pool: PgPool) -> McpServer {
+    server_with_embed_dim(pool, 1024)
 }
 
 /// Pull the `public_id` out of a `work_item_create` / `_update` body (the row
@@ -94,6 +100,82 @@ async fn work_item_tracker_full_round_trip() {
     assert_eq!(pv["origin"].as_str(), Some("agent_write"), "agent origin");
     assert!(pv["parent_id"].is_null(), "a root has no parent");
     let plan_id = public_id_of(&pv);
+
+    // Input normalization and caller-facing validation happen before writes.
+    let explicit_id = format!("normalized-{plan_id}");
+    let normalized = server
+        .call_tool_cli(
+            "work_item_create",
+            json!({
+                "kind": " task ",
+                "title": "  Normalize create input  ",
+                "body": "   ",
+                "public_id": format!(" {explicit_id} "),
+                "priority": 100,
+                "weight": 0.25,
+                "parametric_corpus": " corpus/** ",
+            }),
+        )
+        .await
+        .expect("normalized create must succeed");
+    let nv: Value = serde_json::from_str(&text_of(&normalized)).expect("normalized body JSON");
+    assert_eq!(nv["public_id"].as_str(), Some(explicit_id.as_str()));
+    assert_eq!(nv["kind"].as_str(), Some("task"));
+    assert_eq!(nv["title"].as_str(), Some("Normalize create input"));
+    assert!(nv["body"].is_null(), "blank body normalizes to NULL");
+    assert_eq!(nv["priority"].as_i64(), Some(100));
+    assert_eq!(nv["parametric_corpus"].as_str(), Some("corpus/**"));
+
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_create",
+                json!({ "kind": "task", "title": "bad priority", "priority": 101 }),
+            )
+            .await
+            .is_err(),
+        "priority above 100 is rejected before the DB CHECK"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_create",
+                json!({ "kind": "task", "title": "bad weight", "weight": 0.0 }),
+            )
+            .await
+            .is_err(),
+        "non-positive weight is rejected before the DB CHECK"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_create",
+                json!({ "kind": "task", "title": "bad project", "project": "missing-project" }),
+            )
+            .await
+            .is_err(),
+        "an unknown project name must not silently create a global item"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_create",
+                json!({ "kind": "task", "title": "not a bug", "severity": "low" }),
+            )
+            .await
+            .is_err(),
+        "severity is reserved for first-class bugs"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_create",
+                json!({ "kind": "task", "title": "not a bug", "reproduction_steps": "do X" }),
+            )
+            .await
+            .is_err(),
+        "bug-detail sidecar fields are reserved for first-class bugs"
+    );
 
     // ── create a child task under the plan ──
     let task = server
@@ -139,9 +221,12 @@ async fn work_item_tracker_full_round_trip() {
 
     // ── get (plain) ──
     let got = server
-        .call_tool_cli("work_item_get", json!({ "public_id": plan_id }))
+        .call_tool_cli(
+            "work_item_get",
+            json!({ "public_id": format!(" {plan_id} ") }),
+        )
         .await
-        .expect("work_item_get must succeed");
+        .expect("work_item_get trims public_id and succeeds");
     let gv: Value = serde_json::from_str(&text_of(&got)).expect("get body JSON");
     assert_eq!(gv["item"]["public_id"].as_str(), Some(plan_id.as_str()));
     assert!(
@@ -182,8 +267,8 @@ async fn work_item_tracker_full_round_trip() {
         .call_tool_cli(
             "work_item_update",
             json!({
-                "public_id": task_id,
-                "title": "Wire the dispatch arms + tests",
+                "public_id": format!(" {task_id} "),
+                "title": "  Wire the dispatch arms + tests  ",
                 "priority": 7,
             }),
         )
@@ -192,12 +277,52 @@ async fn work_item_tracker_full_round_trip() {
     let uv: Value = serde_json::from_str(&text_of(&updated)).expect("update body JSON");
     assert_eq!(uv["title"].as_str(), Some("Wire the dispatch arms + tests"));
     assert_eq!(uv["priority"].as_i64(), Some(7));
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_update",
+                json!({ "public_id": task_id, "title": "   " }),
+            )
+            .await
+            .is_err(),
+        "blank update title is rejected"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_update",
+                json!({ "public_id": task_id, "priority": 101 }),
+            )
+            .await
+            .is_err(),
+        "update priority above 100 is rejected before the DB CHECK"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_update",
+                json!({ "public_id": task_id, "weight": 0.0 }),
+            )
+            .await
+            .is_err(),
+        "update non-positive weight is rejected before the DB CHECK"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_update",
+                json!({ "public_id": task_id, "severity": "low" }),
+            )
+            .await
+            .is_err(),
+        "bug-only update fields are rejected on non-bugs"
+    );
 
     // ── list (filter by kind) ──
     let listed = server
-        .call_tool_cli("work_item_list", json!({ "kind": "task" }))
+        .call_tool_cli("work_item_list", json!({ "kind": " task " }))
         .await
-        .expect("work_item_list must succeed");
+        .expect("work_item_list trims kind filters");
     let lv: Value = serde_json::from_str(&text_of(&listed)).expect("list body JSON");
     let rows = lv.as_array().expect("list returns an array");
     assert!(
@@ -205,15 +330,36 @@ async fn work_item_tracker_full_round_trip() {
             .any(|r| r["public_id"].as_str() == Some(task_id.as_str())),
         "the listed tasks include our task"
     );
+    assert!(
+        server
+            .call_tool_cli("work_item_list", json!({ "kind": "not_a_kind" }))
+            .await
+            .is_err(),
+        "unknown list kind is rejected"
+    );
+    assert!(
+        server
+            .call_tool_cli("work_item_list", json!({ "status": "not_a_status" }))
+            .await
+            .is_err(),
+        "unknown list status is rejected"
+    );
+    assert!(
+        server
+            .call_tool_cli("work_item_list", json!({ "project": "missing-project" }))
+            .await
+            .is_err(),
+        "unknown list project does not fall back to global rows"
+    );
 
     // ── list (children of the plan) ──
     let children = server
         .call_tool_cli(
             "work_item_list",
-            json!({ "parent_public_id": plan_id, "limit": 100 }),
+            json!({ "parent_public_id": format!(" {plan_id} "), "limit": 100 }),
         )
         .await
-        .expect("work_item_list (children) must succeed");
+        .expect("work_item_list trims parent_public_id");
     let cv: Value = serde_json::from_str(&text_of(&children)).expect("children body JSON");
     assert_eq!(
         cv.as_array().map(|a| a.len()),
@@ -276,9 +422,9 @@ async fn work_item_tracker_full_round_trip() {
         .call_tool_cli(
             "work_item_set_status",
             json!({
-                "public_id": task_id,
-                "status": "in_progress",
-                "reason": "starting the wiring",
+                "public_id": format!(" {task_id} "),
+                "status": " in_progress ",
+                "reason": " starting the wiring ",
             }),
         )
         .await
@@ -289,6 +435,16 @@ async fn work_item_tracker_full_round_trip() {
         !sv["started_at"].is_null(),
         "started_at stamped on first start"
     );
+    let stored_reason: String = sqlx::query_scalar(
+        "SELECT reason FROM work_item_status_history
+         WHERE item_id = $1 AND to_status = 'in_progress'
+         ORDER BY id DESC LIMIT 1",
+    )
+    .bind(sv["id"].as_i64().expect("work item id"))
+    .fetch_one(db.pool())
+    .await
+    .expect("status history reason");
+    assert_eq!(stored_reason, "starting the wiring");
 
     // ── HARD TRUST RULE: an agent may NOT self-verify. ──
     let verify_attempt = server
@@ -354,6 +510,11 @@ async fn work_item_tracker_full_round_trip() {
         .expect("work_item_search must succeed");
     let fv: Value = serde_json::from_str(&text_of(&found)).expect("search body JSON");
     assert!(fv["hits"].is_array(), "search returns a hits array");
+    assert_eq!(
+        fv["limit"].as_i64(),
+        Some(10),
+        "search echoes the normalized limit"
+    );
     assert!(
         fv["hits"]
             .as_array()
@@ -473,6 +634,99 @@ async fn work_item_tracker_full_round_trip() {
 }
 
 #[tokio::test]
+async fn work_item_set_status_serializes_concurrent_transitions() {
+    let db = require_test_db!();
+    let server = server_1024(db.pool().clone());
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_nanos();
+
+    let created = server
+        .call_tool_cli(
+            "work_item_create",
+            json!({
+                "title": format!("Concurrent status transition {suffix}"),
+                "kind": "task",
+                "body": "race regression",
+            }),
+        )
+        .await
+        .expect("create work item");
+    let cv: Value = serde_json::from_str(&text_of(&created)).expect("create JSON");
+    let item_id = cv["id"].as_i64().expect("work item id");
+
+    let to_triage = pgmcp::db::queries::set_work_item_status(
+        db.pool(),
+        item_id,
+        WorkItemStatus::Triage,
+        Actor::Agent,
+        Some("race-a"),
+        Some("race to triage"),
+        None,
+        None,
+    );
+    let to_in_progress = pgmcp::db::queries::set_work_item_status(
+        db.pool(),
+        item_id,
+        WorkItemStatus::InProgress,
+        Actor::Agent,
+        Some("race-b"),
+        Some("race to progress"),
+        None,
+        None,
+    );
+    let (a, b) = tokio::join!(to_triage, to_in_progress);
+    let successes = [a.as_ref().ok(), b.as_ref().ok()]
+        .into_iter()
+        .flatten()
+        .count();
+    assert_eq!(
+        successes, 1,
+        "racing pending -> triage and pending -> in_progress must not both commit"
+    );
+
+    let pending_history_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_item_status_history
+         WHERE item_id = $1 AND from_status = 'pending'",
+    )
+    .bind(item_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("history count");
+    assert_eq!(
+        pending_history_count, 1,
+        "exactly one transition may observe pending under the row lock"
+    );
+}
+
+#[tokio::test]
+async fn work_item_search_rejects_bad_scope_or_embedding_dimension() {
+    let db = require_test_db!();
+    let server = server_1024(db.pool().clone());
+
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_search",
+                json!({ "query": "tracker", "project": "missing-project" }),
+            )
+            .await
+            .is_err(),
+        "an explicit unknown project must fail closed"
+    );
+
+    let bad_dim_server = server_with_embed_dim(db.pool().clone(), 8);
+    assert!(
+        bad_dim_server
+            .call_tool_cli("work_item_search", json!({ "query": "tracker" }))
+            .await
+            .is_err(),
+        "work_item_search rejects non-1024d query embeddings before pgvector"
+    );
+}
+
+#[tokio::test]
 async fn work_item_ingest_and_promote() {
     let db = require_test_db!();
     let server = server_1024(db.pool().clone());
@@ -541,6 +795,101 @@ async fn work_item_ingest_and_promote() {
         mv2["already_promoted"].as_bool(),
         Some(true),
         "re-promoting the same marker is idempotent"
+    );
+}
+
+#[tokio::test]
+async fn work_item_ingest_plan_rejects_oversized_plan_before_writing() {
+    let db = require_test_db!();
+    let server = server_1024(db.pool().clone());
+
+    let mut md = String::from("# Oversized ingest\n");
+    for i in 0..501 {
+        md.push_str(&format!("- [ ] oversized item {i}\n"));
+    }
+
+    assert!(
+        server
+            .call_tool_cli("work_item_ingest_plan", json!({ "plan_markdown": md }))
+            .await
+            .is_err(),
+        "plans above the ingestion cap are rejected"
+    );
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_items
+         WHERE origin = 'ingest_plan' AND title = 'Oversized ingest'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("count oversized root");
+    assert_eq!(count, 0, "oversized plans fail before any DB write");
+}
+
+#[tokio::test]
+async fn work_item_ingest_plan_rolls_back_item_and_criteria_writes() {
+    let db = require_test_db!();
+    let server = server_1024(db.pool().clone());
+
+    sqlx::query(
+        "CREATE OR REPLACE FUNCTION pgmcp_testing_reject_boom_acceptance()
+         RETURNS trigger
+         LANGUAGE plpgsql
+         AS $$
+         BEGIN
+             IF NEW.description = 'boom' THEN
+                 RAISE EXCEPTION 'boom acceptance rejected for atomicity test';
+             END IF;
+             RETURN NEW;
+         END
+         $$",
+    )
+    .execute(db.pool())
+    .await
+    .expect("install trigger function");
+    sqlx::query(
+        "CREATE TRIGGER pgmcp_testing_reject_boom_acceptance
+         BEFORE INSERT ON acceptance_criteria
+         FOR EACH ROW
+         EXECUTE FUNCTION pgmcp_testing_reject_boom_acceptance()",
+    )
+    .execute(db.pool())
+    .await
+    .expect("install trigger");
+
+    let md =
+        "# Atomic ingest\n- [ ] safe node\nacceptance: safe\n- [ ] doomed node\nacceptance: boom\n";
+    assert!(
+        server
+            .call_tool_cli("work_item_ingest_plan", json!({ "plan_markdown": md }))
+            .await
+            .is_err(),
+        "triggered criterion failure surfaces as a tool error"
+    );
+
+    let item_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_items
+         WHERE origin = 'ingest_plan'
+           AND title IN ('Atomic ingest', 'safe node', 'doomed node')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("count rolled-back items");
+    assert_eq!(
+        item_count, 0,
+        "item upserts roll back with criterion failure"
+    );
+
+    let criterion_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM acceptance_criteria
+         WHERE description IN ('safe', 'boom')",
+    )
+    .fetch_one(db.pool())
+    .await
+    .expect("count rolled-back criteria");
+    assert_eq!(
+        criterion_count, 0,
+        "earlier criteria in the failed ingest are rolled back too"
     );
 }
 

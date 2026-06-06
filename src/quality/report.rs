@@ -206,6 +206,11 @@ pub struct TopIssue {
 #[derive(Debug, Clone)]
 pub struct ReportOptions {
     pub include_findings: bool,
+    /// Internal execution knob: when false, the aggregate skips the finding
+    /// collectors entirely and marks finding-backed dimensions as N/A. Public
+    /// reports keep this true; the quality-history cron sets it false to
+    /// snapshot GPAs without retaining whole finding payloads.
+    pub compute_findings: bool,
     pub include_recommended_fixes: bool,
     /// Display floor — findings below this severity are hidden (default Low, so
     /// Info-severity placeholders stay in the appendix but out of the list).
@@ -218,6 +223,7 @@ impl Default for ReportOptions {
     fn default() -> Self {
         ReportOptions {
             include_findings: true,
+            compute_findings: true,
             include_recommended_fixes: true,
             min_severity: Severity::Low,
             trend_points: 12,

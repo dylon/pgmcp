@@ -5,7 +5,7 @@
 //! Post-P14.3 the tools no longer touch PG at the query path (only
 //! during the first-call lazy warm), and project isolation is a
 //! property of the per-project trie file living under
-//! `<data_dir>/fuzzy/symbols/<slug>/symbols.artrie`. The new
+//! `<data_dir>/fuzzy/symbols/<slug>-p<project_id>/symbols.artrie`. The new
 //! assertion shape: seed two projects in PG, point each test at a
 //! fresh tempdir-rooted `data_dir` so lazy warm pulls them
 //! correctly, call the tool with project A, assert project B's

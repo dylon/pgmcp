@@ -440,7 +440,6 @@ async fn process_file_writes_all_files_in_directory() {
     wait_for(
         || {
             let pool = pool.clone();
-            let project_id = project_id;
             async move {
                 let (count,): (i64,) = sqlx::query_as(
                     "SELECT COUNT(*) FROM indexed_files \
@@ -655,7 +654,6 @@ async fn process_file_concurrent_on_distinct_paths_no_deadlock() {
     wait_for(
         || {
             let pool = pool.clone();
-            let project_id = project_id;
             async move {
                 let (count,): (i64,) = sqlx::query_as(
                     "SELECT COUNT(*) FROM indexed_files \
@@ -752,7 +750,7 @@ async fn process_file_deletes_chunks_before_re_embedding_on_change() {
     .await
     .expect("count");
     assert!(
-        chunk_count >= 1 && chunk_count <= 2,
+        (1..=2).contains(&chunk_count),
         "expected 1 fresh chunk after replace, got {}",
         chunk_count
     );

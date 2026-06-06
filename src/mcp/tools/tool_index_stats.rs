@@ -1,19 +1,13 @@
 //! `tool_index_stats` — MCP tool body, extracted from `super::super::server`.
 
-#![allow(unused_imports)]
-
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
-use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, LoggingLevel};
-use serde_json::json;
-use tracing::{debug, error, info, warn};
+use rmcp::model::{CallToolResult, Content};
+use tracing::debug;
 
 use crate::context::SystemContext;
-use crate::mcp::server::*;
 
 pub async fn tool_index_stats(ctx: &SystemContext) -> Result<CallToolResult, McpError> {
     let start = Instant::now();
@@ -21,6 +15,32 @@ pub async fn tool_index_stats(ctx: &SystemContext) -> Result<CallToolResult, Mcp
     debug!(tool = "index_stats", "MCP tool invoked");
 
     let snapshot = ctx.stats().snapshot();
+    let index_counts = match async {
+        let projects = ctx.db().count_projects().await?;
+        let indexed_files = ctx.db().count_indexed_files().await?;
+        let chunks = ctx.db().count_chunks().await?;
+        let total_bytes = ctx.db().total_bytes_indexed().await?;
+        Ok::<serde_json::Value, sqlx::Error>(serde_json::json!({
+            "available": true,
+            "projects": projects,
+            "indexed_files": indexed_files,
+            "chunks": chunks,
+            "total_bytes": total_bytes,
+        }))
+    }
+    .await
+    {
+        Ok(counts) => counts,
+        Err(e) => serde_json::json!({
+            "available": false,
+            "error": e.to_string(),
+            "projects": 0,
+            "indexed_files": 0,
+            "chunks": 0,
+            "total_bytes": 0,
+        }),
+    };
+
     // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
     let effect_breakdown: Vec<serde_json::Value> = (async {
         let Some(pool) = ctx.db().pool() else {
@@ -43,6 +63,7 @@ pub async fn tool_index_stats(ctx: &SystemContext) -> Result<CallToolResult, Mcp
 
     let envelope = serde_json::json!({
         "snapshot": snapshot,
+        "index": index_counts,
         "effect_breakdown": effect_breakdown,
     });
 

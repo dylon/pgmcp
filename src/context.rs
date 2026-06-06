@@ -77,6 +77,10 @@ pub struct SystemContext {
     /// via `try_lock`; a held lock surfaces as a `Conflict`-style error
     /// to the caller rather than queueing.
     reindex_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes heavy cron bodies across scheduled jobs and manual
+    /// `trigger_cron` calls. Acquired non-blocking so manual requests return a
+    /// structured `busy` response instead of queueing behind long GPU/DB jobs.
+    heavy_cron_lock: Arc<tokio::sync::Mutex<()>>,
     /// P14.4 — per-project `Arc<PgmcpPhonetics>` registry. Populated
     /// by `event_processor.rs`'s `.pgmcp.toml` change handler when
     /// the project's `ProjectOverride.phonetics.rules_path` is set.
@@ -125,6 +129,7 @@ impl SystemContext {
             lifecycle,
             llm_extractor: Arc::new(parking_lot::RwLock::new(None)),
             reindex_lock: Arc::new(tokio::sync::Mutex::new(())),
+            heavy_cron_lock: Arc::new(tokio::sync::Mutex::new(())),
             phonetics: Arc::new(DashMap::new()),
             default_phonetics: Arc::new(OnceLock::new()),
             client_profiles: Arc::new(OnceLock::new()),
@@ -156,6 +161,7 @@ impl SystemContext {
             lifecycle,
             llm_extractor,
             reindex_lock: Arc::new(tokio::sync::Mutex::new(())),
+            heavy_cron_lock: Arc::new(tokio::sync::Mutex::new(())),
             phonetics: Arc::new(DashMap::new()),
             default_phonetics: Arc::new(OnceLock::new()),
             client_profiles: Arc::new(OnceLock::new()),
@@ -248,6 +254,12 @@ impl SystemContext {
     /// The reindex serialization lock — see field-level docstring.
     pub fn reindex_lock(&self) -> &Arc<tokio::sync::Mutex<()>> {
         &self.reindex_lock
+    }
+
+    /// The global heavy-cron serialization lock shared by scheduled cron
+    /// dispatch and manual `trigger_cron` calls.
+    pub fn heavy_cron_lock(&self) -> &Arc<tokio::sync::Mutex<()>> {
+        &self.heavy_cron_lock
     }
 
     pub fn log_broadcaster(&self) -> &Arc<LogBroadcaster> {

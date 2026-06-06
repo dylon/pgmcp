@@ -25,6 +25,7 @@ use libgrammstein::ngram::TrainerBuilder;
 use sqlx::PgPool;
 use tracing::{debug, info, warn};
 
+use crate::cron::fuzzy_sync::{project_artifact_key, slugify};
 use crate::stats::tracker::StatsTracker;
 use crate::wfst::hybrid_lm::{
     HybridLmConfig, PgmcpLmDictionary, lm_trie_paths, try_build_lm_dictionary,
@@ -111,7 +112,7 @@ async fn train_project(
     // from readers' `live/` dir so the cron and a reader never share a trie
     // path). Wipe it first so the tries start empty (`create` reuses, not
     // truncates, existing files).
-    let model_path = model_path_for(data_dir, project_name);
+    let model_path = model_path_for_project(data_dir, project_id, project_name);
     let train_dir = model_path
         .parent()
         .map(Path::to_path_buf)
@@ -163,14 +164,23 @@ async fn train_project(
     Ok(true)
 }
 
-/// Canonical on-disk location for a project's HybridLM model.
-/// Shape: `<data_dir>/hybrid_lm/<slug>/model.bin`. The slug is the
-/// project's name (already constrained to a safe identifier by the
-/// scanner).
+/// Low-level on-disk location for an ad-hoc HybridLM model keyed only by a
+/// sanitized name. Production project models should use
+/// [`model_path_for_project`] so display-name and slug collisions cannot share
+/// a model namespace.
 pub fn model_path_for(data_dir: &Path, project_name: &str) -> PathBuf {
     data_dir
         .join("hybrid_lm")
-        .join(project_name)
+        .join(slugify(project_name))
+        .join("model.bin")
+}
+
+/// Canonical on-disk location for an indexed project's HybridLM model.
+/// Shape: `<data_dir>/hybrid_lm/<slug>-p<project_id>/model.bin`.
+pub fn model_path_for_project(data_dir: &Path, project_id: i32, project_name: &str) -> PathBuf {
+    data_dir
+        .join("hybrid_lm")
+        .join(project_artifact_key(project_id, project_name))
         .join("model.bin")
 }
 
@@ -292,6 +302,22 @@ mod tests {
         assert!(
             (s1 - s2).abs() < 1e-9,
             "score stable across reload: {s1} vs {s2}"
+        );
+    }
+
+    #[test]
+    fn model_paths_sanitize_names_and_project_paths_include_id() {
+        let base = Path::new("/tmp/pgmcp-model-path-test");
+
+        assert_eq!(
+            model_path_for(base, "../bad/name"),
+            base.join("hybrid_lm").join("___bad_name").join("model.bin")
+        );
+        assert_eq!(
+            model_path_for_project(base, 42, "bad/name"),
+            base.join("hybrid_lm")
+                .join("bad_name-p42")
+                .join("model.bin")
         );
     }
 }

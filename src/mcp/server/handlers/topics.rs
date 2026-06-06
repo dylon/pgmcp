@@ -155,12 +155,14 @@ Requires discover_topics first."
         Parameters(params): Parameters<TestCoverageGapsParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        let project_hint = Some(params.project.clone());
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "test_coverage_gaps",
             30,
             &_ctx,
             &summarize_debug(&params),
+            project_hint,
             crate::mcp::tools::tool_test_coverage_gaps::tool_test_coverage_gaps(self.ctx(), params),
         )
         .await
@@ -180,12 +182,14 @@ Sortable by: composite (default), size, chunks, topics, coupling."
         Parameters(params): Parameters<ComplexityHotspotsParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        let project = params.project.clone();
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "complexity_hotspots",
             30,
             &_ctx,
             &summarize_debug(&params),
+            Some(project),
             crate::mcp::tools::tool_complexity_hotspots::tool_complexity_hotspots(
                 self.ctx(),
                 params,

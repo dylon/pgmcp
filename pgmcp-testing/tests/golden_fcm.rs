@@ -57,11 +57,11 @@ fn max_fcm_error(expected: &FcmResult, actual: &FcmResult) -> f64 {
     let k = expected.centroids.nrows();
     let mut perm: Vec<usize> = vec![usize::MAX; k];
     let mut used: Vec<bool> = vec![false; k];
-    for ei in 0..k {
+    for (ei, slot) in perm.iter_mut().enumerate().take(k) {
         let mut best_aj = usize::MAX;
         let mut best_d = f32::INFINITY;
-        for aj in 0..k {
-            if used[aj] {
+        for (aj, already_used) in used.iter().enumerate().take(k) {
+            if *already_used {
                 continue;
             }
             let mut d2: f32 = 0.0;
@@ -77,13 +77,12 @@ fn max_fcm_error(expected: &FcmResult, actual: &FcmResult) -> f64 {
         if best_aj == usize::MAX {
             return f64::INFINITY;
         }
-        perm[ei] = best_aj;
+        *slot = best_aj;
         used[best_aj] = true;
     }
 
     let mut worst: f64 = 0.0;
-    for ei in 0..k {
-        let aj = perm[ei];
+    for (ei, aj) in perm.iter().copied().enumerate().take(k) {
         for col in 0..expected.centroids.ncols() {
             let d = (expected.centroids[[ei, col]] - actual.centroids[[aj, col]]).abs() as f64;
             if d > worst {

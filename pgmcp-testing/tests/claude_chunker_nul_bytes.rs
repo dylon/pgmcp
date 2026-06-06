@@ -60,7 +60,7 @@ fn multiple_messages_with_nul_all_get_stripped() {
         "{\"type\":\"assistant\",\"message\":\"second\\u0000here\"}\n",
     );
     let mut chunks = chunk_claude_jsonl(jsonl);
-    assert!(chunks.len() >= 1, "claude chunker produced chunks");
+    assert!(!chunks.is_empty(), "claude chunker produced chunks");
     let any_nul_before = chunks.iter().any(|c| c.content.contains('\0'));
     assert!(any_nul_before, "at least one chunk has a NUL pre-strip");
     let changed = strip_nul_bytes_from_chunks(&mut chunks);

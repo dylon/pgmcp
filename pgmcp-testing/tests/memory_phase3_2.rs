@@ -99,6 +99,110 @@ async fn memory_semantic_search_rejects_non_1024d_query_embedding() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn memory_semantic_search_dedupes_multi_scope_and_tier_entities() {
+    let db = require_test_db!();
+    let pool = db.pool();
+
+    let entity_id: i64 = sqlx::query_scalar(
+        "INSERT INTO memory_entities (name, entity_type, source)
+         VALUES ('dedupe-memory-semantic', 'concept', 'agent_write'::memory_source)
+         RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("entity");
+
+    let embedding: Vec<f32> = (0..1024).map(|i| if i == 7 { 1.0 } else { 0.0 }).collect();
+    let pg_embedding = pgvector::Vector::from(embedding.clone());
+    sqlx::query(
+        "INSERT INTO memory_observations
+            (entity_id, content, content_sha256, embedding, source)
+         VALUES ($1, $2, $3, $4, 'agent_write'::memory_source)",
+    )
+    .bind(entity_id)
+    .bind("dedupe semantic observation")
+    .bind("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")
+    .bind(&pg_embedding)
+    .execute(pool)
+    .await
+    .expect("observation");
+
+    let scope_a = pgmcp::db::queries::find_or_create_scope(
+        pool,
+        &pgmcp::db::queries::ScopeSpec {
+            user_id: Some("semantic-user-a".into()),
+            agent_id: None,
+            session_id: None,
+            project_id: None,
+        },
+    )
+    .await
+    .expect("scope a");
+    let scope_b = pgmcp::db::queries::find_or_create_scope(
+        pool,
+        &pgmcp::db::queries::ScopeSpec {
+            user_id: Some("semantic-user-b".into()),
+            agent_id: None,
+            session_id: None,
+            project_id: None,
+        },
+    )
+    .await
+    .expect("scope b");
+
+    for scope_id in [scope_a, scope_b] {
+        sqlx::query(
+            "INSERT INTO memory_entity_scope (entity_id, scope_id)
+             VALUES ($1, $2)",
+        )
+        .bind(entity_id)
+        .bind(scope_id)
+        .execute(pool)
+        .await
+        .expect("entity scope");
+    }
+    for tier in ["semantic", "procedural"] {
+        sqlx::query(
+            "INSERT INTO memory_entity_tier (entity_id, tier)
+             VALUES ($1, $2::memory_tier)",
+        )
+        .bind(entity_id)
+        .bind(tier)
+        .execute(pool)
+        .await
+        .expect("entity tier");
+    }
+
+    let rows = pgmcp::db::queries::memory_semantic_search(pool, &embedding, None, None, 20, 64)
+        .await
+        .expect("unfiltered semantic search");
+    let occurrences = rows.iter().filter(|row| row.entity_id == entity_id).count();
+    assert_eq!(
+        occurrences, 1,
+        "one observation must not be duplicated by multiple scope/tier memberships"
+    );
+
+    let tier_rows = pgmcp::db::queries::memory_semantic_search(
+        pool,
+        &embedding,
+        None,
+        Some("semantic"),
+        20,
+        64,
+    )
+    .await
+    .expect("tier-filtered semantic search");
+    assert_eq!(
+        tier_rows
+            .iter()
+            .filter(|row| row.entity_id == entity_id)
+            .count(),
+        1,
+        "tier filters should still return the observation once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn memory_facts_at_returns_pre_delete_snapshot() {
     let db = require_test_db!();
     let pool = db.pool();
@@ -425,6 +529,23 @@ async fn memory_semantic_search_validates_tier_filter() {
         .call_tool_cli(
             "memory_semantic_search",
             serde_json::json!({"query": "anything", "tier": "not-a-tier"}),
+        )
+        .await;
+    match result {
+        Err(_) => {}
+        Ok(r) => assert_eq!(r.is_error, Some(true), "expected error, got {r:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_semantic_search_rejects_blank_query_before_embedding() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let server = server_with_pool(pool.clone());
+    let result = server
+        .call_tool_cli(
+            "memory_semantic_search",
+            serde_json::json!({"query": "   "}),
         )
         .await;
     match result {

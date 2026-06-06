@@ -14,6 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 
 pub async fn tool_code_summarize(
     ctx: &SystemContext,
@@ -23,30 +24,62 @@ pub async fn tool_code_summarize(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().summarize_scans.fetch_add(1, Ordering::Relaxed);
 
-    let scope = params.scope.as_deref().unwrap_or("project");
-    let detail = params.detail.as_deref().unwrap_or("standard");
+    let project = params.project.trim();
+    let scope = params
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|scope| !scope.is_empty())
+        .unwrap_or("project");
+    if !matches!(scope, "project" | "directory" | "file") {
+        return Err(McpError::invalid_params(
+            format!("unknown scope '{scope}'; expected project | directory | file"),
+            None,
+        ));
+    }
+    let detail = params
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+        .unwrap_or("standard");
+    if !matches!(detail, "brief" | "standard" | "detailed") {
+        return Err(McpError::invalid_params(
+            format!("unknown detail '{detail}'; expected brief | standard | detailed"),
+            None,
+        ));
+    }
+    let path = params
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    if scope != "project" && path.is_none() {
+        return Err(McpError::invalid_params(
+            "path is required when scope is directory or file",
+            None,
+        ));
+    }
 
     debug!(
         tool = "code_summarize",
-        project = %params.project,
+        project,
         scope,
-        path = params.path.as_deref().unwrap_or("*"),
+        path = path.unwrap_or("*"),
         detail,
         "MCP tool invoked",
     );
 
-    let project_id: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-            .bind(&params.project)
-            .fetch_optional(ctx.db().pool().expect(
-                "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-            ))
-            .await
-            .map_err(|e| McpError::internal_error(format!("Project lookup failed: {}", e), None))?;
-
-    let project_id = project_id.ok_or_else(|| {
-        McpError::internal_error(format!("Project not found: {}", params.project), None)
-    })?;
+    let pool = pool_or_err(ctx)?;
+    let project_id = project_id_or_err(ctx, project).await?;
+    let directory_like = match (scope, path) {
+        ("directory", Some(path)) => Some(format!("{}%", escape_like(path))),
+        _ => None,
+    };
+    let file_exact = match (scope, path) {
+        ("file", Some(path)) => Some(path),
+        _ => None,
+    };
 
     // Get directory-level summary
     #[derive(sqlx::FromRow)]
@@ -57,17 +90,7 @@ pub async fn tool_code_summarize(
         languages: String,
     }
 
-    let path_filter = params.path.as_deref().unwrap_or("");
-    let dir_where = if !path_filter.is_empty() && scope != "project" {
-        format!(
-            "AND f.relative_path LIKE '{}%'",
-            path_filter.replace('\'', "''")
-        )
-    } else {
-        String::new()
-    };
-
-    let query = format!(
+    let dirs: Vec<DirSummary> = sqlx::query_as::<_, DirSummary>(
         "SELECT
             COALESCE(
                 CASE WHEN position('/' IN relative_path) > 0
@@ -79,21 +102,19 @@ pub async fn tool_code_summarize(
             SUM(line_count)::BIGINT as total_lines,
             STRING_AGG(DISTINCT language, ', ') as languages
          FROM indexed_files f
-         WHERE f.project_id = $1 {}
+         WHERE f.project_id = $1
+           AND ($2::text IS NULL OR f.relative_path LIKE $2 ESCAPE '\\')
+           AND ($3::text IS NULL OR f.relative_path = $3)
          GROUP BY directory
          ORDER BY file_count DESC
          LIMIT 30",
-        dir_where
-    );
-
-    let dirs: Vec<DirSummary> =
-        sqlx::query_as::<_, DirSummary>(&query)
-            .bind(project_id)
-            .fetch_all(ctx.db().pool().expect(
-                "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-            ))
-            .await
-            .map_err(|e| McpError::internal_error(format!("Dir query failed: {}", e), None))?;
+    )
+    .bind(project_id)
+    .bind(directory_like.as_deref())
+    .bind(file_exact)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| McpError::internal_error(format!("Dir query failed: {}", e), None))?;
 
     // Get top files by PageRank
     #[derive(sqlx::FromRow)]
@@ -107,17 +128,17 @@ pub async fn tool_code_summarize(
     let top_files: Vec<TopFile> = sqlx::query_as::<_, TopFile>(
         "SELECT f.relative_path, f.language, f.line_count, fm.pagerank
          FROM indexed_files f
-         LEFT JOIN file_metrics fm ON fm.file_id = f.id
+         LEFT JOIN file_metrics fm ON fm.file_id = f.id AND fm.project_id = f.project_id
          WHERE f.project_id = $1
+           AND ($2::text IS NULL OR f.relative_path LIKE $2 ESCAPE '\\')
+           AND ($3::text IS NULL OR f.relative_path = $3)
          ORDER BY fm.pagerank DESC NULLS LAST
          LIMIT 10",
     )
     .bind(project_id)
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .bind(directory_like.as_deref())
+    .bind(file_exact)
+    .fetch_all(pool)
     .await
     .unwrap_or_default();
 
@@ -131,16 +152,12 @@ pub async fn tool_code_summarize(
     let topics: Vec<TopicSummary> = sqlx::query_as::<_, TopicSummary>(
         "SELECT label, chunk_count
          FROM code_topics
-         WHERE scope LIKE $1
+         WHERE $1 = ANY(project_names)
          ORDER BY chunk_count DESC
          LIMIT 15",
     )
-    .bind(format!("%{}", params.project))
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .bind(project)
+    .fetch_all(pool)
     .await
     .unwrap_or_default();
 
@@ -156,15 +173,15 @@ pub async fn tool_code_summarize(
         "SELECT language, COUNT(*) as count, SUM(line_count)::BIGINT as total_lines
          FROM indexed_files
          WHERE project_id = $1
+           AND ($2::text IS NULL OR relative_path LIKE $2 ESCAPE '\\')
+           AND ($3::text IS NULL OR relative_path = $3)
          GROUP BY language
          ORDER BY count DESC",
     )
     .bind(project_id)
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .bind(directory_like.as_deref())
+    .bind(file_exact)
+    .fetch_all(pool)
     .await
     .unwrap_or_default();
 
@@ -218,31 +235,19 @@ pub async fn tool_code_summarize(
         .collect();
 
     // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
-        }
-    })
-    .await;
+    let effect_breakdown: Vec<serde_json::Value> =
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect();
 
     let mut result = serde_json::json!({
-        "project": params.project,
+        "project": project,
         "scope": scope,
+        "path": path,
+        "detail": detail,
         "total_files": total_files,
         "total_lines": total_lines,
         "language_breakdown": lang_json,
@@ -257,9 +262,6 @@ pub async fn tool_code_summarize(
         o.insert("topics".to_string(), serde_json::json!(topic_json));
     }
 
-    let json = serde_json::to_string_pretty(&result)
-        .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
-
     debug!(
         tool = "code_summarize",
         total_files,
@@ -268,5 +270,29 @@ pub async fn tool_code_summarize(
         "MCP tool completed",
     );
 
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    json_result(&result)
+}
+
+fn escape_like(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_like;
+
+    #[test]
+    fn like_escape_treats_wildcards_literally() {
+        assert_eq!(escape_like(r"src_%\generated"), r"src\_\%\\generated");
+    }
 }

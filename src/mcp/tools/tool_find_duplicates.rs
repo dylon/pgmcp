@@ -16,37 +16,52 @@ use crate::context::SystemContext;
 use crate::mcp::server::*;
 use crate::mcp::tools::sema_helpers::equivalence::materialized_available;
 
+const DEFAULT_FIND_DUPLICATES_MIN_SIMILARITY: f64 = 0.90;
+const DEFAULT_FIND_DUPLICATES_MIN_PROJECTS: usize = 2;
+const DEFAULT_FIND_DUPLICATES_LIMIT: i32 = 20;
+const MAX_FIND_DUPLICATES_LIMIT: i32 = 100;
+const MAX_FIND_DUPLICATES_MIN_PROJECTS: usize = 128;
+const MAX_FIND_DUPLICATES_LANGUAGE_BYTES: usize = 64;
+const FIND_DUPLICATES_FETCH_MULTIPLIER: i32 = 5;
+
 pub async fn tool_find_duplicates(
     ctx: &SystemContext,
     params: FindDuplicatesParams,
 ) -> Result<CallToolResult, McpError> {
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let min_sim = params.min_similarity.unwrap_or(0.90);
-    let min_projects = params.min_projects.unwrap_or(2);
-    let limit = params.limit.unwrap_or(20);
+    let min_sim = normalize_min_similarity(params.min_similarity)?;
+    let min_projects = params
+        .min_projects
+        .unwrap_or(DEFAULT_FIND_DUPLICATES_MIN_PROJECTS)
+        .clamp(1, MAX_FIND_DUPLICATES_MIN_PROJECTS);
+    let language = normalize_language_filter(params.language)?;
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_FIND_DUPLICATES_LIMIT)
+        .clamp(1, MAX_FIND_DUPLICATES_LIMIT) as usize;
+    let fetch_limit = (limit as i32).saturating_mul(FIND_DUPLICATES_FETCH_MULTIPLIER);
+    let include_same_repo = params.include_same_repo.unwrap_or(false);
     debug!(
         tool = "find_duplicates",
         min_similarity = min_sim,
         min_projects,
-        language = params.language.as_deref().unwrap_or("*"),
+        language = language.as_deref().unwrap_or("*"),
         limit,
+        fetch_limit,
+        include_same_repo,
         "MCP tool invoked",
     );
 
     let pairs = ctx
         .db()
-        .find_duplicate_file_pairs(
-            min_sim,
-            params.language.as_deref(),
-            limit * 5,
-            params.include_same_repo.unwrap_or(false),
-        )
+        .find_duplicate_file_pairs(min_sim, language.as_deref(), fetch_limit, include_same_repo)
         .await
         .map_err(|e| McpError::internal_error(format!("Duplicate query failed: {}", e), None))?;
 
     let clusters = cluster_file_pairs(&pairs, min_projects);
-    let limited: Vec<_> = clusters.into_iter().take(limit as usize).collect();
+    let embedding_clusters_truncated = clusters.len() > limit;
+    let limited: Vec<_> = clusters.into_iter().take(limit).collect();
 
     // Shadow-ASR cross-language channel: pull pairs from the
     // `cross_language_signature_clones` materialized table when the
@@ -67,10 +82,28 @@ pub async fn tool_find_duplicates(
              FROM cross_language_signature_clones c
              JOIN file_symbols fs_a ON fs_a.id = c.symbol_id_a
              JOIN file_symbols fs_b ON fs_b.id = c.symbol_id_b
+             JOIN indexed_files f_a
+               ON f_a.id = fs_a.file_id
+              AND f_a.project_id = c.project_id_a
+             JOIN indexed_files f_b
+               ON f_b.id = fs_b.file_id
+              AND f_b.project_id = c.project_id_b
+             JOIN projects p_a ON p_a.id = c.project_id_a
+             JOIN projects p_b ON p_b.id = c.project_id_b
+             WHERE c.similarity >= $1::real
+               AND ($2::text IS NULL OR c.language_a = $2 OR c.language_b = $2)
+               AND ($3::boolean OR NOT (
+                    (p_a.git_common_dir IS NOT NULL AND p_a.git_common_dir = p_b.git_common_dir)
+                    OR
+                    (p_a.git_root_commits IS NOT NULL AND p_a.git_root_commits = p_b.git_root_commits)
+               ))
              ORDER BY c.similarity DESC
-             LIMIT $1",
+             LIMIT $4",
         )
-        .bind(limit as i64 * 5)
+        .bind(min_sim as f32)
+        .bind(language.as_deref())
+        .bind(include_same_repo)
+        .bind(fetch_limit as i64)
         .fetch_all(pool)
         .await
         .unwrap_or_default();
@@ -105,9 +138,19 @@ pub async fn tool_find_duplicates(
 
     // Combined payload: legacy embedding-derived clusters + new
     // shadow-ASR cross-language symbol-pair channel.
+    let cross_language_symbol_pairs_truncated = cross_language_pairs.len() >= fetch_limit as usize;
     let payload = json!({
+        "filters": {
+            "min_similarity": min_sim,
+            "min_projects": min_projects,
+            "language": language,
+            "limit": limit,
+            "include_same_repo": include_same_repo,
+        },
         "embedding_clusters": limited,
+        "embedding_clusters_truncated": embedding_clusters_truncated,
         "cross_language_symbol_pairs": cross_language_pairs,
+        "cross_language_symbol_pairs_truncated": cross_language_symbol_pairs_truncated,
     });
     let json = serde_json::to_string_pretty(&payload)
         .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
@@ -120,4 +163,32 @@ pub async fn tool_find_duplicates(
     );
 
     Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+fn normalize_min_similarity(raw: Option<f64>) -> Result<f64, McpError> {
+    let value = raw.unwrap_or(DEFAULT_FIND_DUPLICATES_MIN_SIMILARITY);
+    if !value.is_finite() {
+        return Err(McpError::invalid_params(
+            "min_similarity must be finite",
+            None,
+        ));
+    }
+    Ok(value.clamp(0.0, 1.0))
+}
+
+fn normalize_language_filter(raw: Option<String>) -> Result<Option<String>, McpError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let language = raw.trim();
+    if language.is_empty() {
+        return Ok(None);
+    }
+    if language.len() > MAX_FIND_DUPLICATES_LANGUAGE_BYTES {
+        return Err(McpError::invalid_params(
+            format!("language must be at most {MAX_FIND_DUPLICATES_LANGUAGE_BYTES} bytes"),
+            None,
+        ));
+    }
+    Ok(Some(language.to_ascii_lowercase()))
 }

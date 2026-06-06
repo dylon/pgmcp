@@ -25,7 +25,7 @@ pub async fn tool_technical_debt_analysis(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().debt_analyses.fetch_add(1, Ordering::Relaxed);
 
-    let limit = params.limit.unwrap_or(30);
+    let limit = params.limit.unwrap_or(30).clamp(1, 100);
     let include_todos = params.include_todos.unwrap_or(true);
 
     debug!(
@@ -48,20 +48,47 @@ pub async fn tool_technical_debt_analysis(
         instability: Option<f64>,
     }
 
+    let pool = ctx
+        .db()
+        .pool()
+        .ok_or_else(|| McpError::internal_error("raw pool unavailable", None))?;
+
+    let matching_project_ids: Vec<i32> =
+        sqlx::query_scalar("SELECT id FROM projects WHERE name = $1 ORDER BY id")
+            .bind(&params.project)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Project lookup failed: {}", e), None))?;
+
+    let project_id = match matching_project_ids.as_slice() {
+        [] => {
+            return Err(McpError::internal_error(
+                format!("Project not found: {}", params.project),
+                None,
+            ));
+        }
+        [project_id] => *project_id,
+        ids => {
+            return Err(McpError::invalid_params(
+                format!(
+                    "ambiguous project name '{}' matched {} indexed projects; use a unique project name from list_projects",
+                    params.project,
+                    ids.len()
+                ),
+                None,
+            ));
+        }
+    };
+
     let rows: Vec<DebtRow> = sqlx::query_as::<_, DebtRow>(
         "SELECT f.relative_path, f.language, f.line_count, f.content,
                 fm.churn_rate, fm.fix_commit_ratio, fm.instability
          FROM indexed_files f
          LEFT JOIN file_metrics fm ON fm.file_id = f.id
-         JOIN projects p ON f.project_id = p.id
-         WHERE p.name = $1 AND f.content IS NOT NULL",
+         WHERE f.project_id = $1 AND f.content IS NOT NULL",
     )
-    .bind(&params.project)
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .bind(project_id)
+    .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
 
@@ -154,33 +181,19 @@ pub async fn tool_technical_debt_analysis(
     // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown
     // for the project. Universal enrichment — every tool benefits from
     // surfacing the effect distribution alongside its primary output.
-    // Gracefully degrades to empty when the project lookup or
-    // shadow-ASR data isn't populated.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
-        }
-    })
-    .await;
+    // Gracefully degrades to empty when shadow-ASR data isn't populated.
+    let effect_breakdown: Vec<serde_json::Value> =
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect();
 
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
         "project": params.project,
+        "limit": limit,
         "total_debt_markers": total_todos,
         "file_count": scored.len(),
         "files": scored,

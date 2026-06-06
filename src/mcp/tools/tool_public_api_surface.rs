@@ -27,10 +27,53 @@ pub async fn tool_public_api_surface(
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "public_api_surface", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
-    let format = params.format.as_deref().unwrap_or("summary");
-    let limit = params.limit.unwrap_or(500);
+    let format = params.format.as_deref().unwrap_or("summary").trim();
+    if !matches!(format, "summary" | "full") {
+        return Err(McpError::invalid_params(
+            format!("Unknown format '{format}'. Valid: summary|full"),
+            None,
+        ));
+    }
+    let language = params
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let limit = params.limit.unwrap_or(500).clamp(1, 2_000);
+
+    type KindCountRow = (String, i64);
+    let kind_counts: Vec<KindCountRow> = sqlx::query_as(
+        "SELECT fs.kind, COUNT(*)::BIGINT
+         FROM file_symbols fs
+         JOIN indexed_files f ON fs.file_id = f.id
+         WHERE f.project_id = $1
+           AND fs.visibility = 'public'
+           AND ($2::text IS NULL OR f.language = $2)
+         GROUP BY fs.kind
+         ORDER BY fs.kind",
+    )
+    .bind(project_id)
+    .bind(language)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| McpError::internal_error(format!("API surface count failed: {}", e), None))?;
+
+    let by_kind: std::collections::HashMap<String, i64> = kind_counts.iter().cloned().collect();
+    let total_public: i64 = kind_counts.iter().map(|(_, count)| *count).sum();
+
+    if format == "summary" {
+        return json_result(&json!({
+            "project": project,
+            "format": format,
+            "language": language,
+            "total_public": total_public,
+            "by_kind": by_kind,
+            "guidance": "Aggregate counts of public symbols by kind. Use format=\"full\" for the per-symbol list including shadow-ASR signature descriptors when available."
+        }));
+    }
 
     type ApiRow = (
         i64,
@@ -52,27 +95,11 @@ pub async fn tool_public_api_surface(
              LIMIT $3",
     )
     .bind(project_id)
-    .bind(params.language.as_deref())
+    .bind(language)
     .bind(limit as i64)
     .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("API surface query failed: {}", e), None))?;
-
-    let by_kind: std::collections::HashMap<String, i32> = {
-        let mut m = std::collections::HashMap::new();
-        for (_, _, _, kind, _, _, _) in &rows {
-            *m.entry(kind.clone()).or_insert(0) += 1;
-        }
-        m
-    };
-    if format == "summary" {
-        return json_result(&json!({
-            "project": params.project,
-            "total_public": rows.len(),
-            "by_kind": by_kind,
-            "guidance": "Aggregate counts of public symbols by kind. Use format=\"full\" for the per-symbol list including shadow-ASR signature descriptors when available."
-        }));
-    }
 
     // Full format: enrich each row with the shadow-ASR signature
     // descriptor. The fetch is one round-trip per symbol; for the common
@@ -118,8 +145,12 @@ pub async fn tool_public_api_surface(
         symbols.push(row);
     }
     json_result(&json!({
-        "project": params.project,
-        "total_public": symbols.len(),
+        "project": project,
+        "format": format,
+        "language": language,
+        "limit": limit,
+        "total_public": total_public,
+        "returned": symbols.len(),
         "by_kind": by_kind,
         "symbols": symbols,
     }))

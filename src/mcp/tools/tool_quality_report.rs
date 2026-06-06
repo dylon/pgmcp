@@ -76,6 +76,7 @@ pub async fn tool_quality_report(
     let include_json = params.include_underlying_json.unwrap_or(false);
     let options = ReportOptions {
         include_findings: params.include_findings.unwrap_or(true),
+        compute_findings: true,
         include_recommended_fixes: params.include_recommended_fixes.unwrap_or(true),
         min_severity,
         trend_points: params.trend_points.unwrap_or(12),

@@ -54,10 +54,10 @@ async fn seed(pool: &sqlx::PgPool) -> i32 {
              VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(file_id)
-        .bind(i as i32)
+        .bind(i)
         .bind(content)
-        .bind((i as i32) + 1)
-        .bind((i as i32) + 1)
+        .bind(i + 1)
+        .bind(i + 1)
         .execute(pool)
         .await
         .expect("chunk");
@@ -68,7 +68,7 @@ async fn seed(pool: &sqlx::PgPool) -> i32 {
 #[tokio::test(flavor = "multi_thread")]
 async fn rerun_rebuilds_model_after_corruption() {
     let testdb = require_test_db!();
-    let _ = seed(testdb.pool()).await;
+    let project_id = seed(testdb.pool()).await;
     let tmp = tempfile::tempdir().expect("tempdir");
     let pool = Arc::new(testdb.pool().clone());
     let stats = Arc::new(StatsTracker::new());
@@ -80,7 +80,11 @@ async fn rerun_rebuilds_model_after_corruption() {
     )
     .await;
 
-    let model_path = pgmcp::cron::ngram_lm_train::model_path_for(tmp.path(), "lm_resume_test");
+    let model_path = pgmcp::cron::ngram_lm_train::model_path_for_project(
+        tmp.path(),
+        project_id,
+        "lm_resume_test",
+    );
     assert!(model_path.exists(), "first run must persist model");
     let first_open = PgmcpHybridLm::open(&model_path);
     assert!(first_open.is_ok(), "first model loads cleanly");

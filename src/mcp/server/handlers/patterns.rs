@@ -26,12 +26,13 @@ Requires per-project opt-in via [git] index_history = true in .pgmcp.toml.")]
         Parameters(params): Parameters<SearchCommitsParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "search_commits",
             30,
             &_ctx,
             &summarize_debug(&params),
+            params.project.clone(),
             crate::mcp::tools::tool_search_commits::tool_search_commits(self.ctx(), params),
         )
         .await

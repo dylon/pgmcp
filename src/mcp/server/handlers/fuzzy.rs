@@ -21,12 +21,13 @@ impl McpServer {
         Parameters(params): Parameters<PhoneticNormalizeParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "phonetic_normalize",
             5,
             &_ctx,
             &summarize_debug(&params),
+            params.project.clone(),
             crate::mcp::tools::tool_phonetic_normalize::run(self.ctx(), params),
         )
         .await
@@ -40,12 +41,13 @@ impl McpServer {
         Parameters(params): Parameters<ExpandQueryToPhoneticPatternParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "expand_query_to_phonetic_pattern",
             5,
             &_ctx,
             &summarize_debug(&params),
+            params.project.clone(),
             crate::mcp::tools::tool_expand_query_to_phonetic_pattern::run(self.ctx(), params),
         )
         .await
@@ -74,12 +76,13 @@ impl McpServer {
         Parameters(params): Parameters<DendrogramTopicHierarchyParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "dendrogram_topic_hierarchy",
             10,
             &_ctx,
             &summarize_debug(&params),
+            Some(params.project.clone()),
             crate::mcp::tools::tool_dendrogram_topic_hierarchy::run(self.ctx(), params),
         )
         .await
@@ -91,12 +94,13 @@ impl McpServer {
         Parameters(params): Parameters<FuzzySymbolSearchParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "fuzzy_symbol_search",
             5,
             &_ctx,
             &summarize_debug(&params),
+            Some(params.project.clone()),
             crate::mcp::tools::tool_fuzzy_symbol_search::run(self.ctx(), params),
         )
         .await
@@ -108,12 +112,13 @@ impl McpServer {
         Parameters(params): Parameters<FuzzyPathSearchParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "fuzzy_path_search",
             5,
             &_ctx,
             &summarize_debug(&params),
+            Some(params.project.clone()),
             crate::mcp::tools::tool_fuzzy_path_search::run(self.ctx(), params),
         )
         .await
@@ -178,12 +183,13 @@ impl McpServer {
         Parameters(params): Parameters<CorrectQueryParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "correct_query",
             30,
             &_ctx,
             &summarize_debug(&params),
+            Some(params.project.clone()),
             crate::mcp::tools::tool_correct_query::run(self.ctx(), params),
         )
         .await
@@ -231,12 +237,13 @@ impl McpServer {
         Parameters(params): Parameters<PhoneticGrepCommentsParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "phonetic_grep_comments",
             5,
             &_ctx,
             &summarize_debug(&params),
+            params.project.clone(),
             crate::mcp::tools::tool_phonetic_grep_comments::run(self.ctx(), params),
         )
         .await
@@ -250,12 +257,13 @@ impl McpServer {
         Parameters(params): Parameters<PhoneticSymbolSearchParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "phonetic_symbol_search",
             5,
             &_ctx,
             &summarize_debug(&params),
+            Some(params.project.clone()),
             crate::mcp::tools::tool_phonetic_symbol_search::run(self.ctx(), params),
         )
         .await
@@ -352,12 +360,13 @@ on each category independently."
         Parameters(params): Parameters<SignatureLintParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "signature_lint",
             30,
             &_ctx,
             &summarize_debug(&params),
+            Some(params.project.clone()),
             crate::mcp::tools::tool_signature_lint::tool_signature_lint(self.ctx(), params),
         )
         .await

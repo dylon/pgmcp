@@ -19,6 +19,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 
 /// One result row returned by the SQL query below.
 #[derive(Debug, sqlx::FromRow)]
@@ -46,26 +47,37 @@ pub async fn tool_code_on_fire(
         .code_on_fire_scans
         .fetch_add(1, Ordering::Relaxed);
 
-    let limit = params.limit.unwrap_or(30);
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
+    let limit = params.limit.unwrap_or(30).clamp(1, 200);
     let churn_q = params.churn_quartile.unwrap_or(0.75);
     let complexity_q = params.complexity_quartile.unwrap_or(0.75);
+    if !(0.0..=1.0).contains(&churn_q) || !churn_q.is_finite() {
+        return Err(McpError::invalid_params(
+            "churn_quartile must be a finite number in [0, 1]",
+            None,
+        ));
+    }
+    if !(0.0..=1.0).contains(&complexity_q) || !complexity_q.is_finite() {
+        return Err(McpError::invalid_params(
+            "complexity_quartile must be a finite number in [0, 1]",
+            None,
+        ));
+    }
     let mi_q = 1.0 - complexity_q; // mirror quartile for MI (bottom)
-    let mode = params.mode.as_deref().unwrap_or("intersect");
+    let mode = params
+        .mode
+        .as_deref()
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+        .unwrap_or("intersect");
 
     debug!(
         tool = "code_on_fire",
-        project = %params.project,
-        limit,
-        churn_q,
-        complexity_q,
-        mode,
-        "MCP tool invoked",
+        project, limit, churn_q, complexity_q, mode, "MCP tool invoked",
     );
 
-    let pool = ctx
-        .db()
-        .pool()
-        .expect("code_on_fire needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>");
+    let pool = pool_or_err(ctx)?;
 
     // Build the WHERE clause based on mode. The CTE pipeline computes
     // quartile thresholds inline so the result is per-project even when
@@ -75,8 +87,14 @@ pub async fn tool_code_on_fire(
             "(pf.churn_rate >= churn_q.p OR fn.cyclomatic >= cyclo_q.p OR fn.maintainability_index <= mi_q.p)"
         }
         "max" => "TRUE", // rank by composite, no filter
-        _ => {
+        "intersect" => {
             "pf.churn_rate >= churn_q.p AND (fn.cyclomatic >= cyclo_q.p OR fn.maintainability_index <= mi_q.p)"
+        }
+        other => {
+            return Err(McpError::invalid_params(
+                format!("unknown mode '{other}'; expected intersect | union | max"),
+                None,
+            ));
         }
     };
 
@@ -86,9 +104,8 @@ pub async fn tool_code_on_fire(
                    COALESCE(fm.churn_rate, 0.0) AS churn_rate,
                    COALESCE(fm.commit_count, 0) AS commit_count
             FROM indexed_files f
-            LEFT JOIN file_metrics fm ON fm.file_id = f.id
-            JOIN projects p ON f.project_id = p.id
-            WHERE p.name = $1
+            LEFT JOIN file_metrics fm ON fm.file_id = f.id AND fm.project_id = f.project_id
+            WHERE f.project_id = $1
         ),
         churn_q AS (
             SELECT COALESCE(
@@ -104,7 +121,7 @@ pub async fn tool_code_on_fire(
                    fs.name, fs.start_line, fs.end_line
             FROM function_metrics fm
             JOIN file_symbols fs ON fm.function_id = fs.id
-            JOIN project_files pf ON fm.file_id = pf.file_id
+            JOIN project_files pf ON fm.file_id = pf.file_id AND fm.project_id = $1
         ),
         cyclo_q AS (
             SELECT COALESCE(PERCENTILE_CONT($4) WITHIN GROUP (ORDER BY cyclomatic), 0) AS p
@@ -138,7 +155,7 @@ pub async fn tool_code_on_fire(
     );
 
     let rows: Vec<CodeOnFireRow> = sqlx::query_as::<_, CodeOnFireRow>(&sql)
-        .bind(&params.project)
+        .bind(project_id)
         .bind(limit)
         .bind(churn_q)
         .bind(complexity_q)
@@ -148,12 +165,17 @@ pub async fn tool_code_on_fire(
         .map_err(|e| McpError::internal_error(format!("code_on_fire query failed: {}", e), None))?;
 
     if rows.is_empty() {
-        return Ok(CallToolResult::success(vec![Content::text(
-            "No 'on fire' functions found. Either the project has no churn × complexity \
-intersection, or the `function-metrics` cron has not run yet (no function_metrics rows). \
-Try `index_stats` to verify both file_metrics (graph-analysis) and function_metrics \
-(function-metrics) have been populated.",
-        )]));
+        return json_result(&json!({
+            "effect_breakdown": [],
+            "project": project,
+            "mode": mode,
+            "churn_quartile": churn_q,
+            "complexity_quartile": complexity_q,
+            "returned": 0,
+            "elapsed_ms": start.elapsed().as_millis() as u64,
+            "results": [],
+            "guidance": "No 'on fire' functions found. Either the project has no churn x complexity intersection, or the function-metrics cron has not run yet.",
+        }));
     }
 
     let results: Vec<serde_json::Value> = rows
@@ -179,31 +201,17 @@ Try `index_stats` to verify both file_metrics (graph-analysis) and function_metr
         .collect();
 
     // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
-        }
-    })
-    .await;
+    let effect_breakdown: Vec<serde_json::Value> =
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect();
 
     let summary = json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
+        "project": project,
         "mode": mode,
         "churn_quartile": churn_q,
         "complexity_quartile": complexity_q,

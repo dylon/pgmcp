@@ -79,6 +79,120 @@ async fn tool_orient_against_populated_corpus_resolves_topics() {
     }
 }
 
+#[tokio::test]
+async fn tool_orient_project_snapshot_does_not_leak_other_projects() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let h = SyntheticCorpus::seed_with_assignments(&pool).await;
+
+    let auth_file_id: i64 = sqlx::query_scalar(
+        "SELECT f.id
+         FROM indexed_files f
+         JOIN projects p ON p.id = f.project_id
+         WHERE p.name = 'proj-auth' AND f.relative_path = 'auth/file_0.rs'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("auth fixture file");
+    let database_file_id: i64 = sqlx::query_scalar(
+        "SELECT f.id
+         FROM indexed_files f
+         JOIN projects p ON p.id = f.project_id
+         WHERE p.name = 'proj-database' AND f.relative_path = 'database/file_0.rs'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("database fixture file");
+    sqlx::query(
+        "INSERT INTO file_metrics
+            (file_id, project_id, pagerank, in_degree, out_degree)
+         VALUES
+            ($1, $2, 0.90, 1, 0),
+            ($3, $4, 0.99, 2, 1)",
+    )
+    .bind(auth_file_id)
+    .bind(h.auth_project_id)
+    .bind(database_file_id)
+    .bind(h.database_project_id)
+    .execute(&pool)
+    .await
+    .expect("seed file metrics");
+
+    let server = server_with_pool(pool);
+    let result = server
+        .call_tool_cli("orient", json!({"project": "proj-auth"}))
+        .await
+        .expect("orient must not error");
+    let v: serde_json::Value =
+        serde_json::from_str(&text_of(&result)).expect("orient body must be JSON");
+
+    assert_eq!(v["project_name"].as_str(), Some("proj-auth"));
+    assert_eq!(v["project_root"].as_str(), Some("/ws/auth/proj-auth"));
+
+    for key in ["tree_depth_2", "recently_changed", "key_entry_points"] {
+        let rows = v[key].as_array().expect("orient path array");
+        assert!(!rows.is_empty(), "{key} must have fixture rows");
+        for row in rows {
+            let path = row
+                .as_str()
+                .or_else(|| row["path"].as_str())
+                .expect("orient row path");
+            assert!(
+                !path.starts_with("database/") && !path.starts_with("logging/"),
+                "{key} leaked a non-auth project path: {path}"
+            );
+        }
+    }
+
+    let entry_paths: Vec<&str> = v["key_entry_points"]
+        .as_array()
+        .expect("key_entry_points array")
+        .iter()
+        .filter_map(|row| row["path"].as_str())
+        .collect();
+    assert_eq!(entry_paths, vec!["auth/file_0.rs"]);
+}
+
+#[tokio::test]
+async fn tool_grep_project_filter_does_not_leak_other_projects() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let _h = SyntheticCorpus::seed_with_assignments(&pool).await;
+    let server = server_with_pool(pool);
+
+    let unscoped = server
+        .call_tool_cli("grep", json!({"pattern": "password", "limit": 50}))
+        .await
+        .expect("unscoped grep must not error");
+    let unscoped: serde_json::Value =
+        serde_json::from_str(&text_of(&unscoped)).expect("grep body must be JSON");
+    let unscoped_hits = unscoped["hits"].as_array().expect("hits array");
+    assert!(
+        unscoped_hits
+            .iter()
+            .any(|h| h["project_name"].as_str() == Some("proj-database")),
+        "fixture must include a cross-project password hit for this regression"
+    );
+
+    let scoped = server
+        .call_tool_cli(
+            "grep",
+            json!({"pattern": "password", "project": "proj-auth", "limit": 50}),
+        )
+        .await
+        .expect("scoped grep must not error");
+    let scoped: serde_json::Value =
+        serde_json::from_str(&text_of(&scoped)).expect("grep body must be JSON");
+    let scoped_hits = scoped["hits"].as_array().expect("hits array");
+    assert!(!scoped_hits.is_empty(), "proj-auth should have grep hits");
+    assert!(
+        scoped_hits
+            .iter()
+            .all(|h| h["project_name"].as_str() == Some("proj-auth")),
+        "project-scoped grep leaked another project: {scoped_hits:?}"
+    );
+}
+
 // =============================================================================
 // Layer A — generic smoke tests for previously-uncovered tools.
 //
@@ -363,6 +477,157 @@ async fn tool_mcp_tool_telemetry_against_empty_table() {
 }
 
 #[tokio::test]
+async fn tool_mcp_tool_telemetry_filters_project_across_aggregations() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let _h = SyntheticCorpus::seed_with_assignments(&pool).await;
+    let server = server_with_pool(pool.clone());
+
+    sqlx::query(
+        "INSERT INTO mcp_tool_calls
+            (tool, client_name, project, duration_ms, outcome)
+         VALUES
+            ('semantic_search', 'cli', 'pgmcp', 10, 'ok'),
+            ('grep', 'cli', 'pgmcp', 20, 'error'),
+            ('semantic_search', 'cli', 'other', 30, 'ok'),
+            ('grep', 'claude-code', 'other', 40, 'ok'),
+            ('orient', 'cli', '', 50, 'ok')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed telemetry rows");
+
+    let top_tools = server
+        .call_tool_cli(
+            "mcp_tool_telemetry",
+            json!({"aggregation": " top_tools ", "project": " pgmcp "}),
+        )
+        .await
+        .expect("top_tools telemetry must not error");
+    let top_tools: serde_json::Value =
+        serde_json::from_str(&text_of(&top_tools)).expect("top_tools body must be JSON");
+    assert_eq!(top_tools["aggregation"].as_str(), Some("top_tools"));
+    assert_eq!(top_tools["filters"]["project"].as_str(), Some("pgmcp"));
+    let rows = top_tools["data"]["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 2, "top_tools must only include pgmcp rows");
+    assert!(
+        rows.iter()
+            .any(|r| r["tool"].as_str() == Some("semantic_search"))
+    );
+    assert!(rows.iter().any(|r| r["tool"].as_str() == Some("grep")));
+    assert!(!rows.iter().any(|r| r["tool"].as_str() == Some("orient")));
+
+    let top_callers = server
+        .call_tool_cli(
+            "mcp_tool_telemetry",
+            json!({"aggregation": "top_callers", "tool": " grep ", "project": " pgmcp "}),
+        )
+        .await
+        .expect("top_callers telemetry must not error");
+    let top_callers: serde_json::Value =
+        serde_json::from_str(&text_of(&top_callers)).expect("top_callers body must be JSON");
+    assert_eq!(top_callers["filters"]["tool"].as_str(), Some("grep"));
+    assert_eq!(top_callers["filters"]["project"].as_str(), Some("pgmcp"));
+    let rows = top_callers["data"]["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["client_name"].as_str(), Some("cli"));
+    assert_eq!(rows[0]["calls"].as_i64(), Some(1));
+
+    let top_projects = server
+        .call_tool_cli(
+            "mcp_tool_telemetry",
+            json!({
+                "aggregation": "top_projects",
+                "tool": "semantic_search",
+                "client_name": "cli",
+                "project": "pgmcp"
+            }),
+        )
+        .await
+        .expect("top_projects telemetry must not error");
+    let top_projects: serde_json::Value =
+        serde_json::from_str(&text_of(&top_projects)).expect("top_projects body must be JSON");
+    let rows = top_projects["data"]["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["project"].as_str(), Some("pgmcp"));
+    assert_eq!(rows[0]["calls"].as_i64(), Some(1));
+
+    let error_rate = server
+        .call_tool_cli(
+            "mcp_tool_telemetry",
+            json!({"aggregation": "error_rate", "tool": "grep", "project": "pgmcp"}),
+        )
+        .await
+        .expect("error_rate telemetry must not error");
+    let error_rate: serde_json::Value =
+        serde_json::from_str(&text_of(&error_rate)).expect("error_rate body must be JSON");
+    let rows = error_rate["data"]["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["tool"].as_str(), Some("grep"));
+    assert_eq!(rows[0]["calls"].as_i64(), Some(1));
+    assert_eq!(rows[0]["errors"].as_i64(), Some(1));
+
+    let summary = server
+        .call_tool_cli(
+            "mcp_tool_telemetry",
+            json!({"aggregation": "summary", "project": "pgmcp"}),
+        )
+        .await
+        .expect("summary telemetry must not error");
+    let summary: serde_json::Value =
+        serde_json::from_str(&text_of(&summary)).expect("summary body must be JSON");
+    let rows = summary["data"]["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 2, "summary must only include pgmcp rows");
+    assert!(rows.iter().all(|r| r["project"].as_str() == Some("pgmcp")));
+    assert!(!rows.iter().any(|r| r["tool"].as_str() == Some("orient")));
+
+    let histogram = server
+        .call_tool_cli(
+            "mcp_tool_telemetry",
+            json!({"aggregation": "histogram", "tool": "semantic_search", "project": "pgmcp"}),
+        )
+        .await
+        .expect("histogram telemetry must not error");
+    let histogram: serde_json::Value =
+        serde_json::from_str(&text_of(&histogram)).expect("histogram body must be JSON");
+    let rows = histogram["data"]["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["tool"].as_str(), Some("semantic_search"));
+    assert_eq!(rows[0]["bucket"].as_i64(), Some(2));
+    assert_eq!(rows[0]["count"].as_i64(), Some(1));
+
+    let raw = server
+        .call_tool_cli(
+            "mcp_tool_telemetry",
+            json!({"aggregation": "raw", "project": "pgmcp", "limit": 10}),
+        )
+        .await
+        .expect("raw telemetry must not error");
+    let raw: serde_json::Value =
+        serde_json::from_str(&text_of(&raw)).expect("raw body must be JSON");
+    let rows = raw["data"]["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 2, "raw must only include pgmcp rows");
+    assert!(rows.iter().all(|r| r["project"].as_str() == Some("pgmcp")));
+    assert!(
+        rows.iter()
+            .any(|r| r["tool"].as_str() == Some("semantic_search"))
+    );
+    assert!(rows.iter().any(|r| r["tool"].as_str() == Some("grep")));
+
+    let raw_clamped = server
+        .call_tool_cli(
+            "mcp_tool_telemetry",
+            json!({"aggregation": "raw", "project": " pgmcp ", "limit": -10}),
+        )
+        .await
+        .expect("raw telemetry with low limit must not error");
+    let raw_clamped: serde_json::Value =
+        serde_json::from_str(&text_of(&raw_clamped)).expect("raw clamped body must be JSON");
+    let rows = raw_clamped["data"]["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "negative raw limit must clamp to one row");
+}
+
+#[tokio::test]
 async fn tool_pattern_abstraction_candidates_against_populated_corpus() {
     let db = require_test_db!();
     let pool = db.pool().clone();
@@ -485,10 +750,28 @@ async fn tool_upsert_pattern_source_against_seeded_catalog() {
 async fn tool_adoption_report_executes_against_real_schema() {
     let db = require_test_db!();
     let pool = db.pool().clone();
+    sqlx::query(
+        "INSERT INTO mcp_tool_calls
+            (ts, tool, client_name, mcp_session_id, duration_ms, outcome)
+         VALUES
+            (now(), 'a2a_send_task', 'claude-code', 's1', 10, 'ok'),
+            (now(), 'a2a_pattern_recursive', 'claude-code', 's1', 11, 'ok'),
+            (now(), 'memory_unified_search', 'claude-code', 's2', 12, 'ok'),
+            (now(), 'work_item_create', 'claude-code', 's3', 13, 'ok'),
+            (now(), 'semantic_search', 'claude-code', 's4', 14, 'ok'),
+            (now(), 'a2a_send_task', 'cli', 'cli1', 15, 'ok'),
+            (now() - interval '2 hours', 'memory_unified_search', 'claude-code', 'old', 16, 'ok')",
+    )
+    .execute(&pool)
+    .await
+    .expect("seed adoption telemetry");
     let server = server_with_pool(pool);
 
     let result = server
-        .call_tool_cli("adoption_report", json!({ "format": "json" }))
+        .call_tool_cli(
+            "adoption_report",
+            json!({ "format": " json ", "since_minutes": 60 }),
+        )
         .await
         .expect("adoption_report must not error against the real schema");
 
@@ -506,4 +789,26 @@ async fn tool_adoption_report_executes_against_real_schema() {
         v["csm_conformance"].is_object(),
         "csm_conformance must be an object"
     );
+    assert_eq!(v["window_minutes"].as_i64(), Some(60));
+    assert_eq!(v["overall_total_calls"].as_i64(), Some(5));
+    let clients = v["clients"].as_array().expect("clients");
+    assert_eq!(clients.len(), 1, "only real clients should be counted");
+    assert_eq!(clients[0]["client_name"].as_str(), Some("claude-code"));
+    assert_eq!(clients[0]["total_calls"].as_i64(), Some(5));
+    assert_eq!(clients[0]["total_sessions"].as_i64(), Some(4));
+
+    let family_calls = |family: &str| -> i64 {
+        v["overall"]
+            .as_array()
+            .expect("overall")
+            .iter()
+            .find(|row| row["family"].as_str() == Some(family))
+            .and_then(|row| row["calls"].as_i64())
+            .unwrap_or(-1)
+    };
+    assert_eq!(family_calls("A2A collaboration"), 2);
+    assert_eq!(family_calls("RLM (recursive)"), 1);
+    assert_eq!(family_calls("Memory server"), 1);
+    assert_eq!(family_calls("Work-item tracker"), 1);
+    assert_eq!(family_calls("CSM coordination-conformance"), 0);
 }

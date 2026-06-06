@@ -23,8 +23,12 @@ use pgmcp::mcp::logging::LogBroadcaster;
 use pgmcp::mcp::server::McpServer;
 use pgmcp::mcp::tasks::TaskStore;
 use pgmcp::stats::tracker::StatsTracker;
+use pgmcp_testing::fixtures::synthetic_corpus::SyntheticCorpus;
 use pgmcp_testing::fixtures::test_config;
 use pgmcp_testing::mocks::{DeterministicEmbeddingBackend, MockDbClient};
+use pgmcp_testing::require_test_db;
+
+mod common;
 
 fn server_with_mock(mock: MockDbClient) -> McpServer {
     let db: Arc<dyn DbClient> = Arc::new(mock);
@@ -175,5 +179,99 @@ async fn find_orphans_emits_guidance_when_topics_not_yet_computed() {
     assert!(
         !payload.contains("should not appear"),
         "tool must not surface orphan rows when has_topic_assignments=false"
+    );
+}
+
+#[tokio::test]
+async fn find_orphans_rejects_invalid_detail_and_blank_project() {
+    let mock = MockDbClient::new();
+    let server = server_with_mock(mock);
+
+    let invalid_detail = server
+        .call_tool_cli("find_orphans", serde_json::json!({"detail": "summary"}))
+        .await
+        .expect_err("invalid detail must fail closed");
+    assert!(
+        invalid_detail.to_string().contains("Unknown detail"),
+        "unexpected invalid-detail error: {invalid_detail}"
+    );
+
+    let blank_project = server
+        .call_tool_cli("find_orphans", serde_json::json!({"project": "   "}))
+        .await
+        .expect_err("blank project filter must fail closed");
+    assert!(
+        blank_project
+            .to_string()
+            .contains("project must be non-empty"),
+        "unexpected blank-project error: {blank_project}"
+    );
+}
+
+#[tokio::test]
+async fn find_orphans_real_db_scopes_project_language_and_limit() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    SyntheticCorpus::seed_with_assignments(&pool).await;
+    let server = common::server_with_pool(pool);
+
+    let result = server
+        .call_tool_cli(
+            "find_orphans",
+            serde_json::json!({
+                "project": " proj-auth ",
+                "language": " rust ",
+                "detail": "chunks",
+                "limit": -10
+            }),
+        )
+        .await
+        .expect("find_orphans chunks call");
+    let v: serde_json::Value = serde_json::from_str(&text_of(&result)).expect("json");
+    assert_eq!(v["project"], "proj-auth");
+    assert_eq!(v["language"], "rust");
+    assert_eq!(v["detail"], "chunks");
+    assert_eq!(v["limit"], 1);
+    assert_eq!(
+        v["orphan_count"], 1,
+        "negative limit should clamp to 1: {v}"
+    );
+    let orphans = v["orphans"].as_array().expect("orphans");
+    assert!(
+        orphans
+            .iter()
+            .all(|row| row["project_name"] == "proj-auth" && row["language"] == "rust"),
+        "orphan chunks must satisfy scoped filters: {v}"
+    );
+}
+
+#[tokio::test]
+async fn find_orphans_rejects_duplicate_project_display_names() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    SyntheticCorpus::seed_with_assignments(&pool).await;
+    sqlx::query("INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3)")
+        .bind("/ws/orphan-dup-a")
+        .bind("/ws/orphan-dup-a/orphan-dup")
+        .bind("orphan-dup")
+        .execute(&pool)
+        .await
+        .expect("insert first duplicate project");
+    sqlx::query("INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3)")
+        .bind("/ws/orphan-dup-b")
+        .bind("/ws/orphan-dup-b/orphan-dup")
+        .bind("orphan-dup")
+        .execute(&pool)
+        .await
+        .expect("insert second duplicate project");
+    let server = common::server_with_pool(pool);
+
+    let err = server
+        .call_tool_cli("find_orphans", serde_json::json!({"project": "orphan-dup"}))
+        .await
+        .expect_err("duplicate project display names must fail closed");
+    assert!(
+        err.to_string().contains("ambiguous project name"),
+        "unexpected duplicate-project error: {err}"
     );
 }

@@ -24,7 +24,7 @@ use crate::mocks::DeterministicEmbeddingBackend;
 
 /// Build an `McpServer` whose `db` is the given real `PgPool` and whose
 /// embedder is the deterministic test backend (no model download, no GPU).
-pub fn server_with_pool(pool: sqlx::PgPool) -> McpServer {
+pub fn context_with_pool(pool: sqlx::PgPool) -> SystemContext {
     let db: Arc<dyn DbClient> = Arc::new(pool);
     let stats = Arc::new(StatsTracker::new());
     let config = Arc::new(ArcSwap::from_pointee(test_config()));
@@ -34,7 +34,7 @@ pub fn server_with_pool(pool: sqlx::PgPool) -> McpServer {
         Arc::new(DeterministicEmbeddingBackend::new(1024));
     let lifecycle = pgmcp::daemon_state::DaemonLifecycle::new();
     lifecycle.transition(pgmcp::daemon_state::DaemonPhase::Ready);
-    let ctx = SystemContext::production(
+    SystemContext::production(
         db,
         EmbedSource::backend(embed_backend),
         stats,
@@ -42,8 +42,13 @@ pub fn server_with_pool(pool: sqlx::PgPool) -> McpServer {
         log_broadcaster,
         task_store,
         lifecycle,
-    );
-    McpServer::new(ctx)
+    )
+}
+
+/// Build an `McpServer` whose `db` is the given real `PgPool` and whose
+/// embedder is the deterministic test backend (no model download, no GPU).
+pub fn server_with_pool(pool: sqlx::PgPool) -> McpServer {
+    McpServer::new(context_with_pool(pool))
 }
 
 /// Upsert a project row, returning its id.

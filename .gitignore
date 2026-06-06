@@ -14,5 +14,6 @@ docs/formal/rocq/*.vos
 docs/formal/rocq/*.vok
 docs/formal/rocq/*.glob
 docs/formal/rocq/.*.aux
+docs/formal/tla/states/
 
 .pgmcp.toml

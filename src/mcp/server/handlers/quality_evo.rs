@@ -111,12 +111,14 @@ Concentration of unsafe in non-FFI files = review priority."
         Parameters(params): Parameters<UnsafeClustersParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        let project_hint = Some(params.project.trim().to_string());
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "unsafe_clusters",
             30,
             &_ctx,
             &summarize_debug(&params),
+            project_hint,
             crate::mcp::tools::tool_unsafe_clusters::tool_unsafe_clusters(self.ctx(), params),
         )
         .await

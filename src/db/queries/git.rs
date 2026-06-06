@@ -271,3 +271,22 @@ pub async fn has_commit_files_for_project(
     .await?;
     Ok(count > 0)
 }
+
+/// Check if git_commit_files has data for a resolved project id.
+pub async fn has_commit_files_for_project_id(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (
+             SELECT 1
+             FROM git_commit_files gcf
+             JOIN git_commits gc ON gc.id = gcf.commit_id
+             WHERE gc.project_id = $1
+             LIMIT 1
+         )",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+}

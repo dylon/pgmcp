@@ -12,7 +12,7 @@ use pgmcp::fuzzy::phonetic::PgmcpPhonetics;
 #[test]
 fn dictionary_built_via_pgmcp_phonetics_returns_phonetic_match() {
     let phon = PgmcpPhonetics::default_english();
-    let vocab = vec![
+    let vocab = [
         "receive_request",
         "process_response",
         "validate_input",

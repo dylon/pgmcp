@@ -103,27 +103,30 @@ pub async fn tool_memory_semantic_search(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     let scope_id = resolve_optional_scope_id(ctx, pool, params.scope.as_ref()).await?;
-    validate_tier(params.tier.as_deref())?;
-    let limit = params.limit.unwrap_or(20);
+    let query = params.query.trim();
+    if query.is_empty() {
+        return Err(McpError::invalid_params("query must be non-empty", None));
+    }
+    let tier = params
+        .tier
+        .as_deref()
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty());
+    validate_tier(tier)?;
+    let limit = params.limit.unwrap_or(20).clamp(1, 200);
 
-    let embedding = ctx.embed().embed_query(&params.query).await.map_err(|e| {
+    let embedding = ctx.embed().embed_query(query).await.map_err(|e| {
         error!(tool = "memory_semantic_search", error = %e, "embedding failed");
         McpError::internal_error(format!("embedding failed: {}", e), None)
     })?;
 
     let ef = ctx.config().load().vector.ef_search;
-    let rows = queries::memory_semantic_search(
-        pool,
-        &embedding,
-        scope_id,
-        params.tier.as_deref(),
-        limit,
-        ef,
-    )
-    .await
-    .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
+    let rows = queries::memory_semantic_search(pool, &embedding, scope_id, tier, limit, ef)
+        .await
+        .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
     json_result(json!({
         "count": rows.len(),
+        "limit": limit,
         "mode": "semantic",
         "results": rows,
     }))

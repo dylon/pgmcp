@@ -8,18 +8,47 @@
 //! lookback — the last hour, the last day — read straight from
 //! `mcp_tool_calls` with SQL aggregations.
 
-#![allow(unused_imports)]
-
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, Content};
 use serde_json::{Value, json};
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::context::SystemContext;
-use crate::mcp::server::*;
+use crate::mcp::server::McpToolTelemetryParams;
+
+#[derive(Debug)]
+struct TelemetryQuery {
+    tool: Option<String>,
+    client_name: Option<String>,
+    project: Option<String>,
+    since_minutes: i32,
+    raw_limit: i32,
+    aggregation: String,
+}
+
+fn normalized_optional(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn normalize_params(params: McpToolTelemetryParams) -> TelemetryQuery {
+    TelemetryQuery {
+        tool: normalized_optional(params.tool),
+        client_name: normalized_optional(params.client_name),
+        project: normalized_optional(params.project),
+        since_minutes: params.since_minutes.unwrap_or(60).clamp(1, 60 * 24 * 31),
+        raw_limit: params.limit.unwrap_or(100).clamp(1, 1000),
+        aggregation: params
+            .aggregation
+            .map(|aggregation| aggregation.trim().to_string())
+            .filter(|aggregation| !aggregation.is_empty())
+            .unwrap_or_else(|| "summary".to_string()),
+    }
+}
 
 pub async fn tool_mcp_tool_telemetry(
     ctx: &SystemContext,
@@ -27,10 +56,11 @@ pub async fn tool_mcp_tool_telemetry(
 ) -> Result<CallToolResult, McpError> {
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    let query = normalize_params(params);
     debug!(
         tool = "mcp_tool_telemetry",
-        aggregation = ?params.aggregation,
-        since_minutes = params.since_minutes,
+        aggregation = %query.aggregation,
+        since_minutes = query.since_minutes,
         "MCP tool invoked"
     );
 
@@ -38,20 +68,14 @@ pub async fn tool_mcp_tool_telemetry(
         McpError::internal_error("mcp_tool_telemetry requires a real PgPool", None)
     })?;
 
-    let since_minutes = params.since_minutes.unwrap_or(60).clamp(1, 60 * 24 * 31);
-    let aggregation = params
-        .aggregation
-        .clone()
-        .unwrap_or_else(|| "summary".to_string());
-
-    let body = match aggregation.as_str() {
-        "summary" => agg_summary(pool, &params, since_minutes).await?,
-        "top_tools" => agg_top_tools(pool, &params, since_minutes).await?,
-        "top_callers" => agg_top_callers(pool, &params, since_minutes).await?,
-        "top_projects" => agg_top_projects(pool, &params, since_minutes).await?,
-        "error_rate" => agg_error_rate(pool, &params, since_minutes).await?,
-        "histogram" => agg_histogram(pool, &params, since_minutes).await?,
-        "raw" => agg_raw(pool, &params, since_minutes).await?,
+    let body = match query.aggregation.as_str() {
+        "summary" => agg_summary(pool, &query).await?,
+        "top_tools" => agg_top_tools(pool, &query).await?,
+        "top_callers" => agg_top_callers(pool, &query).await?,
+        "top_projects" => agg_top_projects(pool, &query).await?,
+        "error_rate" => agg_error_rate(pool, &query).await?,
+        "histogram" => agg_histogram(pool, &query).await?,
+        "raw" => agg_raw(pool, &query).await?,
         other => {
             return Err(McpError::invalid_params(
                 format!(
@@ -86,12 +110,12 @@ pub async fn tool_mcp_tool_telemetry(
 
     let envelope = json!({
         "effect_breakdown": effect_breakdown,
-        "aggregation": aggregation,
-        "since_minutes": since_minutes,
+        "aggregation": query.aggregation,
+        "since_minutes": query.since_minutes,
         "filters": {
-            "tool": params.tool,
-            "client_name": params.client_name,
-            "project": params.project,
+            "tool": query.tool,
+            "client_name": query.client_name,
+            "project": query.project,
         },
         "data": body,
     });
@@ -107,18 +131,14 @@ pub async fn tool_mcp_tool_telemetry(
     )]))
 }
 
-async fn agg_summary(
-    pool: &sqlx::PgPool,
-    params: &McpToolTelemetryParams,
-    since_minutes: i32,
-) -> Result<Value, McpError> {
+async fn agg_summary(pool: &sqlx::PgPool, query: &TelemetryQuery) -> Result<Value, McpError> {
     #[allow(clippy::type_complexity)]
     let rows: Vec<(String, String, Option<String>, i64, i64, f64, f64, f64, f64, i64)> =
         sqlx::query_as(
             "SELECT
                 tool,
                 client_name,
-                project,
+                NULLIF(project, '')                                      AS project,
                 COUNT(*)                                                    AS calls,
                 COUNT(*) FILTER (WHERE outcome <> 'ok')                     AS errors,
                 AVG(duration_ms)::float8                                    AS mean_ms,
@@ -130,15 +150,15 @@ async fn agg_summary(
              WHERE ts > now() - ($1::int * interval '1 minute')
                AND ($2::text IS NULL OR tool = $2)
                AND ($3::text IS NULL OR client_name = $3)
-               AND ($4::text IS NULL OR project = $4)
-             GROUP BY tool, client_name, project
+               AND ($4::text IS NULL OR NULLIF(project, '') = $4)
+             GROUP BY tool, client_name, NULLIF(project, '')
              ORDER BY calls DESC
              LIMIT 1000",
         )
-        .bind(since_minutes)
-        .bind(params.tool.as_deref())
-        .bind(params.client_name.as_deref())
-        .bind(params.project.as_deref())
+        .bind(query.since_minutes)
+        .bind(query.tool.as_deref())
+        .bind(query.client_name.as_deref())
+        .bind(query.project.as_deref())
         .fetch_all(pool)
         .await
         .map_err(map_db_err)?;
@@ -165,23 +185,23 @@ async fn agg_summary(
     Ok(json!({ "rows": arr }))
 }
 
-async fn agg_top_tools(
-    pool: &sqlx::PgPool,
-    params: &McpToolTelemetryParams,
-    since_minutes: i32,
-) -> Result<Value, McpError> {
+async fn agg_top_tools(pool: &sqlx::PgPool, query: &TelemetryQuery) -> Result<Value, McpError> {
     let rows: Vec<(String, i64, i64, f64)> = sqlx::query_as(
         "SELECT tool, COUNT(*), COUNT(*) FILTER (WHERE outcome <> 'ok'),
                 COALESCE(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY duration_ms), 0.0)::float8 AS p95_ms
          FROM mcp_tool_calls
          WHERE ts > now() - ($1::int * interval '1 minute')
-           AND ($2::text IS NULL OR client_name = $2)
+           AND ($2::text IS NULL OR tool = $2)
+           AND ($3::text IS NULL OR client_name = $3)
+           AND ($4::text IS NULL OR NULLIF(project, '') = $4)
          GROUP BY tool
          ORDER BY COUNT(*) DESC
          LIMIT 50",
     )
-    .bind(since_minutes)
-    .bind(params.client_name.as_deref())
+    .bind(query.since_minutes)
+    .bind(query.tool.as_deref())
+    .bind(query.client_name.as_deref())
+    .bind(query.project.as_deref())
     .fetch_all(pool)
     .await
     .map_err(map_db_err)?;
@@ -193,23 +213,23 @@ async fn agg_top_tools(
     }))
 }
 
-async fn agg_top_callers(
-    pool: &sqlx::PgPool,
-    params: &McpToolTelemetryParams,
-    since_minutes: i32,
-) -> Result<Value, McpError> {
+async fn agg_top_callers(pool: &sqlx::PgPool, query: &TelemetryQuery) -> Result<Value, McpError> {
     let rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
         "SELECT client_name, COUNT(*), COUNT(*) FILTER (WHERE outcome <> 'ok'),
                 COUNT(DISTINCT tool)
          FROM mcp_tool_calls
          WHERE ts > now() - ($1::int * interval '1 minute')
            AND ($2::text IS NULL OR tool = $2)
+           AND ($3::text IS NULL OR client_name = $3)
+           AND ($4::text IS NULL OR NULLIF(project, '') = $4)
          GROUP BY client_name
          ORDER BY COUNT(*) DESC
          LIMIT 50",
     )
-    .bind(since_minutes)
-    .bind(params.tool.as_deref())
+    .bind(query.since_minutes)
+    .bind(query.tool.as_deref())
+    .bind(query.client_name.as_deref())
+    .bind(query.project.as_deref())
     .fetch_all(pool)
     .await
     .map_err(map_db_err)?;
@@ -221,25 +241,23 @@ async fn agg_top_callers(
     }))
 }
 
-async fn agg_top_projects(
-    pool: &sqlx::PgPool,
-    params: &McpToolTelemetryParams,
-    since_minutes: i32,
-) -> Result<Value, McpError> {
+async fn agg_top_projects(pool: &sqlx::PgPool, query: &TelemetryQuery) -> Result<Value, McpError> {
     let rows: Vec<(Option<String>, i64, i64)> = sqlx::query_as(
-        "SELECT project, COUNT(*), COUNT(*) FILTER (WHERE outcome <> 'ok')
+        "SELECT NULLIF(project, '') AS project, COUNT(*), COUNT(*) FILTER (WHERE outcome <> 'ok')
          FROM mcp_tool_calls
          WHERE ts > now() - ($1::int * interval '1 minute')
-           AND project IS NOT NULL
+           AND NULLIF(project, '') IS NOT NULL
            AND ($2::text IS NULL OR tool = $2)
            AND ($3::text IS NULL OR client_name = $3)
-         GROUP BY project
+           AND ($4::text IS NULL OR NULLIF(project, '') = $4)
+         GROUP BY NULLIF(project, '')
          ORDER BY COUNT(*) DESC
          LIMIT 50",
     )
-    .bind(since_minutes)
-    .bind(params.tool.as_deref())
-    .bind(params.client_name.as_deref())
+    .bind(query.since_minutes)
+    .bind(query.tool.as_deref())
+    .bind(query.client_name.as_deref())
+    .bind(query.project.as_deref())
     .fetch_all(pool)
     .await
     .map_err(map_db_err)?;
@@ -251,23 +269,23 @@ async fn agg_top_projects(
     }))
 }
 
-async fn agg_error_rate(
-    pool: &sqlx::PgPool,
-    params: &McpToolTelemetryParams,
-    since_minutes: i32,
-) -> Result<Value, McpError> {
+async fn agg_error_rate(pool: &sqlx::PgPool, query: &TelemetryQuery) -> Result<Value, McpError> {
     let rows: Vec<(String, i64, i64, f64)> = sqlx::query_as(
         "SELECT tool, COUNT(*), COUNT(*) FILTER (WHERE outcome <> 'ok'),
                 (COUNT(*) FILTER (WHERE outcome <> 'ok'))::float8 / NULLIF(COUNT(*), 0)::float8 AS error_rate
          FROM mcp_tool_calls
          WHERE ts > now() - ($1::int * interval '1 minute')
-           AND ($2::text IS NULL OR client_name = $2)
+           AND ($2::text IS NULL OR tool = $2)
+           AND ($3::text IS NULL OR client_name = $3)
+           AND ($4::text IS NULL OR NULLIF(project, '') = $4)
          GROUP BY tool
          ORDER BY error_rate DESC NULLS LAST, COUNT(*) DESC
          LIMIT 50",
     )
-    .bind(since_minutes)
-    .bind(params.client_name.as_deref())
+    .bind(query.since_minutes)
+    .bind(query.tool.as_deref())
+    .bind(query.client_name.as_deref())
+    .bind(query.project.as_deref())
     .fetch_all(pool)
     .await
     .map_err(map_db_err)?;
@@ -279,11 +297,7 @@ async fn agg_error_rate(
     }))
 }
 
-async fn agg_histogram(
-    pool: &sqlx::PgPool,
-    params: &McpToolTelemetryParams,
-    since_minutes: i32,
-) -> Result<Value, McpError> {
+async fn agg_histogram(pool: &sqlx::PgPool, query: &TelemetryQuery) -> Result<Value, McpError> {
     // Bucket duration_ms into log-spaced bands. Bands match the PerToolStats
     // in-memory bucketing (3× spacing from 1 ms upward) so the histogram
     // shape lines up with /metrics.
@@ -308,17 +322,17 @@ async fn agg_histogram(
             WHERE ts > now() - ($1::int * interval '1 minute')
               AND ($2::text IS NULL OR tool = $2)
               AND ($3::text IS NULL OR client_name = $3)
-              AND ($4::text IS NULL OR project = $4)
+              AND ($4::text IS NULL OR NULLIF(project, '') = $4)
         )
         SELECT tool, bucket, COUNT(*)::bigint
         FROM bucketed
         GROUP BY tool, bucket
         ORDER BY tool, bucket",
     )
-    .bind(since_minutes)
-    .bind(params.tool.as_deref())
-    .bind(params.client_name.as_deref())
-    .bind(params.project.as_deref())
+    .bind(query.since_minutes)
+    .bind(query.tool.as_deref())
+    .bind(query.client_name.as_deref())
+    .bind(query.project.as_deref())
     .fetch_all(pool)
     .await
     .map_err(map_db_err)?;
@@ -334,12 +348,7 @@ async fn agg_histogram(
     }))
 }
 
-async fn agg_raw(
-    pool: &sqlx::PgPool,
-    params: &McpToolTelemetryParams,
-    since_minutes: i32,
-) -> Result<Value, McpError> {
-    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
+async fn agg_raw(pool: &sqlx::PgPool, query: &TelemetryQuery) -> Result<Value, McpError> {
     #[allow(clippy::type_complexity)]
     let rows: Vec<(
         i64,
@@ -356,20 +365,20 @@ async fn agg_raw(
         Option<String>,
     )> = sqlx::query_as(
         "SELECT id, ts, tool, client_name, client_version, protocol_version,
-                mcp_session_id, project, duration_ms, outcome, error_class, request_id
+                mcp_session_id, NULLIF(project, '') AS project, duration_ms, outcome, error_class, request_id
          FROM mcp_tool_calls
          WHERE ts > now() - ($1::int * interval '1 minute')
            AND ($2::text IS NULL OR tool = $2)
            AND ($3::text IS NULL OR client_name = $3)
-           AND ($4::text IS NULL OR project = $4)
+           AND ($4::text IS NULL OR NULLIF(project, '') = $4)
          ORDER BY ts DESC
          LIMIT $5",
     )
-    .bind(since_minutes)
-    .bind(params.tool.as_deref())
-    .bind(params.client_name.as_deref())
-    .bind(params.project.as_deref())
-    .bind(limit)
+    .bind(query.since_minutes)
+    .bind(query.tool.as_deref())
+    .bind(query.client_name.as_deref())
+    .bind(query.project.as_deref())
+    .bind(query.raw_limit)
     .fetch_all(pool)
     .await
     .map_err(map_db_err)?;

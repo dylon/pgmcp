@@ -251,12 +251,19 @@ Default lookback is 60 minutes; pass `since_minutes` up to 44640 (31 days) to wi
         Parameters(params): Parameters<McpToolTelemetryParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        let project_hint = params
+            .project
+            .as_deref()
+            .map(str::trim)
+            .filter(|project| !project.is_empty())
+            .map(str::to_string);
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "mcp_tool_telemetry",
             30,
             &_ctx,
             &summarize_debug(&params),
+            project_hint,
             crate::mcp::tools::tool_mcp_tool_telemetry::tool_mcp_tool_telemetry(self.ctx(), params),
         )
         .await
@@ -289,6 +296,7 @@ file's incremental skip."
             "",
             request_id,
             mcp_session_id,
+            None,
             crate::mcp::tools::tool_reindex::tool_reindex(self.ctx(), params),
         )
         .await

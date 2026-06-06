@@ -124,7 +124,17 @@ pub async fn resolve_project_for_mandates(
 ) -> Result<Option<ProjectInfo>, sqlx::Error> {
     if let Some(project_name) = project {
         let projects = db.list_projects().await?;
-        return Ok(projects.into_iter().find(|p| p.name == project_name));
+        let matches: Vec<ProjectInfo> = projects
+            .into_iter()
+            .filter(|p| p.name == project_name)
+            .collect();
+        return match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            n => Err(sqlx::Error::Protocol(format!(
+                "ambiguous project name '{project_name}' matched {n} indexed projects"
+            ))),
+        };
     }
 
     if let Some(cwd) = cwd {

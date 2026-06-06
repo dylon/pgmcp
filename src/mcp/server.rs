@@ -216,6 +216,23 @@ pub(crate) async fn instrumented_tool_wrap<F>(
 where
     F: std::future::Future<Output = Result<CallToolResult, McpError>>,
 {
+    instrumented_tool_wrap_with_project(stats, name, secs, ctx, params_summary, None, fut).await
+}
+
+/// Same as `instrumented_tool_wrap`, but allows handlers whose parameter type
+/// has a `project` field to persist that project in durable telemetry.
+pub(crate) async fn instrumented_tool_wrap_with_project<F>(
+    stats: &StatsTracker,
+    name: &str,
+    secs: u64,
+    ctx: &RequestContext<RoleServer>,
+    params_summary: &str,
+    project_hint: Option<String>,
+    fut: F,
+) -> Result<CallToolResult, McpError>
+where
+    F: std::future::Future<Output = Result<CallToolResult, McpError>>,
+{
     let caller = extract_caller(ctx);
     let request_id = Some(format!("{:?}", ctx.id));
     let mcp_session_id = extract_mcp_session_id(ctx);
@@ -240,6 +257,7 @@ where
         params_summary,
         request_id,
         mcp_session_id,
+        normalize_telemetry_string(project_hint.as_deref()),
         fut,
     )
     .await
@@ -258,6 +276,7 @@ pub(crate) async fn instrumented_tool_run<F>(
     params_summary: &str,
     request_id: Option<String>,
     mcp_session_id: Option<String>,
+    project_hint: Option<String>,
     fut: F,
 ) -> Result<CallToolResult, McpError>
 where
@@ -327,7 +346,7 @@ where
         client_version: Some(caller.client_version.clone()),
         protocol_version: Some(caller.protocol_version.clone()),
         mcp_session_id,
-        project: None,
+        project: project_hint,
         cwd: None,
         duration_ms: (duration_ns / 1_000_000).min(i32::MAX as u64) as i32,
         outcome,
@@ -337,6 +356,17 @@ where
     };
     crate::stats::telemetry_writer::try_enqueue(stats, row);
     result
+}
+
+fn normalize_telemetry_string(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn telemetry_project_from_json(args: &serde_json::Value) -> Option<String> {
+    normalize_telemetry_string(args.get("project").and_then(serde_json::Value::as_str))
 }
 
 /// MCP Server state.
@@ -564,6 +594,7 @@ impl McpServer {
             protocol_version: "n/a".to_string(),
         };
         let params_summary = summarize_json(&args);
+        let project_hint = telemetry_project_from_json(&args);
         let fut = async move {
             dispatch_tool!(self, name, args, {
                 // Search
@@ -919,6 +950,7 @@ impl McpServer {
             &params_summary,
             None,
             None,
+            project_hint,
             fut,
         )
         .await
@@ -1537,6 +1569,60 @@ mod social_banner_tests {
         assert!(claude.contains("COLLABORATION (A2A)"));
         assert!(claude.len() > codex.len());
         assert_eq!(generic, base);
+    }
+}
+
+#[cfg(test)]
+mod telemetry_tests {
+    use rmcp::model::{CallToolResult, Content};
+    use serde_json::json;
+    use tokio::sync::mpsc;
+
+    use super::{
+        CallerInfo, instrumented_tool_run, normalize_telemetry_string, telemetry_project_from_json,
+    };
+    use crate::stats::tracker::StatsTracker;
+
+    #[test]
+    fn telemetry_project_from_json_normalizes_missing_or_empty_projects() {
+        assert_eq!(
+            telemetry_project_from_json(&json!({"project": " pgmcp "})),
+            Some("pgmcp".to_string())
+        );
+        assert_eq!(telemetry_project_from_json(&json!({"project": ""})), None);
+        assert_eq!(telemetry_project_from_json(&json!({"project": 42})), None);
+        assert_eq!(normalize_telemetry_string(Some(" \t ")), None);
+    }
+
+    #[tokio::test]
+    async fn instrumented_tool_run_enqueues_project_hint() {
+        let stats = StatsTracker::new();
+        let (tx, mut rx) = mpsc::channel(1);
+        stats.set_telemetry_sender(tx);
+        let caller = CallerInfo {
+            client_name: "cli".to_string(),
+            client_version: "test".to_string(),
+            protocol_version: "n/a".to_string(),
+        };
+
+        let result = instrumented_tool_run(
+            &stats,
+            "semantic_search",
+            None,
+            caller,
+            r#"{"project":"pgmcp"}"#,
+            None,
+            None,
+            Some("pgmcp".to_string()),
+            async { Ok(CallToolResult::success(vec![Content::text("ok")])) },
+        )
+        .await;
+
+        assert!(result.is_ok());
+        let row = rx.try_recv().expect("telemetry row must be enqueued");
+        assert_eq!(row.tool, "semantic_search");
+        assert_eq!(row.project.as_deref(), Some("pgmcp"));
+        assert!(row.params_sha256.is_some());
     }
 }
 

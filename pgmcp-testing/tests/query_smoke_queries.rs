@@ -26,6 +26,7 @@ use pgmcp::db::queries;
 use pgmcp_testing::fixtures::synthetic_corpus::SyntheticCorpus;
 use pgmcp_testing::require_test_db;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 /// Pull any file_id out of indexed_files. The synthetic corpus seeds
 /// at least 6 files so this never returns None.
@@ -87,12 +88,96 @@ async fn queries_list_projects_smoke() {
 }
 
 #[tokio::test]
+async fn queries_list_projects_preserves_duplicate_display_names() {
+    let db = require_test_db!();
+    let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;
+
+    let project_a = queries::upsert_project(
+        db.pool(),
+        "/ws/list-ambiguous-a",
+        "/ws/list-ambiguous-a/shared",
+        "duplicate-list-name",
+        None,
+        None,
+    )
+    .await
+    .expect("insert first duplicate-name project");
+    let project_b = queries::upsert_project(
+        db.pool(),
+        "/ws/list-ambiguous-b",
+        "/ws/list-ambiguous-b/shared",
+        "duplicate-list-name",
+        None,
+        None,
+    )
+    .await
+    .expect("insert second duplicate-name project");
+
+    let projects = queries::list_projects(db.pool())
+        .await
+        .expect("list_projects");
+    let duplicate_rows: Vec<_> = projects
+        .iter()
+        .filter(|p| p.name == "duplicate-list-name")
+        .collect();
+    let ids: std::collections::HashSet<_> = duplicate_rows.iter().map(|p| p.id).collect();
+    let paths: std::collections::HashSet<_> =
+        duplicate_rows.iter().map(|p| p.path.as_str()).collect();
+
+    assert_eq!(
+        duplicate_rows.len(),
+        2,
+        "list_projects must enumerate duplicate display names as distinct project rows"
+    );
+    assert_eq!(
+        ids.len(),
+        2,
+        "duplicate display-name rows must keep distinct ids"
+    );
+    assert!(ids.contains(&project_a));
+    assert!(ids.contains(&project_b));
+    assert!(paths.contains("/ws/list-ambiguous-a/shared"));
+    assert!(paths.contains("/ws/list-ambiguous-b/shared"));
+}
+
+#[tokio::test]
 async fn queries_find_project_by_cwd_smoke() {
     let db = require_test_db!();
     let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;
     let _ = queries::find_project_by_cwd(db.pool(), "/ws/auth/proj-auth")
         .await
         .expect("find_project_by_cwd");
+}
+
+#[tokio::test]
+async fn queries_find_project_by_cwd_respects_path_boundary() {
+    let db = require_test_db!();
+    let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;
+
+    queries::upsert_project(
+        db.pool(),
+        "/ws/boundary",
+        "/ws/boundary/app",
+        "boundary-app",
+        None,
+        None,
+    )
+    .await
+    .expect("insert boundary project");
+
+    let exact_child = queries::find_project_by_cwd(db.pool(), "/ws/boundary/app/src/lib.rs")
+        .await
+        .expect("find exact-child project")
+        .expect("exact child should resolve");
+    assert_eq!(exact_child.name, "boundary-app");
+
+    let sibling_prefix = queries::find_project_by_cwd(db.pool(), "/ws/boundary/application/src")
+        .await
+        .expect("find sibling-prefix project");
+    assert!(
+        sibling_prefix.is_none(),
+        "project paths must match only exact paths or directory boundaries"
+    );
 }
 
 #[tokio::test]
@@ -273,6 +358,53 @@ async fn queries_read_file_smoke() {
 }
 
 #[tokio::test]
+async fn queries_read_file_is_exact_absolute_path_only() {
+    let db = require_test_db!();
+    let h = SyntheticCorpus::seed_with_assignments(db.pool()).await;
+
+    sqlx::query(
+        "INSERT INTO indexed_files
+            (project_id, path, relative_path, language, size_bytes, content,
+             content_hash, line_count, truncated, content_recoverable_from_disk,
+             modified_at)
+         VALUES
+            ($1, '/ws/database/auth/file_0.rs', 'auth/file_0.rs', 'rust', 64,
+             'database project duplicate relative path', 777, 1, false, false, $2)",
+    )
+    .bind(h.database_project_id)
+    .bind(Utc::now())
+    .execute(db.pool())
+    .await
+    .expect("insert duplicate relative path in another project");
+
+    let auth_file = queries::read_file(db.pool(), "/ws/auth/auth/file_0.rs")
+        .await
+        .expect("read auth file")
+        .expect("auth file exists");
+    assert_eq!(auth_file.path, "/ws/auth/auth/file_0.rs");
+    assert_eq!(auth_file.relative_path, "auth/file_0.rs");
+    assert_eq!(auth_file.content.as_deref(), Some("synthetic"));
+
+    let database_file = queries::read_file(db.pool(), "/ws/database/auth/file_0.rs")
+        .await
+        .expect("read database duplicate")
+        .expect("database duplicate exists");
+    assert_eq!(database_file.path, "/ws/database/auth/file_0.rs");
+    assert_eq!(
+        database_file.content.as_deref(),
+        Some("database project duplicate relative path")
+    );
+
+    let relative_lookup = queries::read_file(db.pool(), "auth/file_0.rs")
+        .await
+        .expect("relative-looking path query must execute");
+    assert!(
+        relative_lookup.is_none(),
+        "read_file must not reinterpret a relative path as an absolute file"
+    );
+}
+
+#[tokio::test]
 async fn queries_read_file_by_relative_path_smoke() {
     let db = require_test_db!();
     let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;
@@ -293,12 +425,94 @@ async fn queries_file_info_smoke() {
 }
 
 #[tokio::test]
+async fn queries_file_info_reports_project_name() {
+    let db = require_test_db!();
+    let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;
+
+    let info = queries::file_info(db.pool(), "/ws/auth/auth/file_0.rs")
+        .await
+        .expect("file_info")
+        .expect("auth fixture file");
+
+    assert_eq!(info.project_name.as_deref(), Some("proj-auth"));
+}
+
+#[tokio::test]
 async fn queries_project_tree_smoke() {
     let db = require_test_db!();
     let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;
     let _ = queries::project_tree(db.pool(), "proj-auth", 3)
         .await
         .expect("project_tree");
+}
+
+#[tokio::test]
+async fn queries_project_tree_rejects_ambiguous_project_name() {
+    let db = require_test_db!();
+    let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;
+
+    let project_a = queries::upsert_project(
+        db.pool(),
+        "/ws/ambiguous-a",
+        "/ws/ambiguous-a/shared",
+        "duplicate-display-name",
+        None,
+        None,
+    )
+    .await
+    .expect("insert first duplicate-name project");
+    let project_b = queries::upsert_project(
+        db.pool(),
+        "/ws/ambiguous-b",
+        "/ws/ambiguous-b/shared",
+        "duplicate-display-name",
+        None,
+        None,
+    )
+    .await
+    .expect("insert second duplicate-name project");
+
+    queries::upsert_file(
+        db.pool(),
+        project_a,
+        "/ws/ambiguous-a/shared/a.rs",
+        "a.rs",
+        "rust",
+        1,
+        Some("fn a() {}"),
+        Some(1),
+        1,
+        false,
+        false,
+        Utc::now(),
+    )
+    .await
+    .expect("insert first duplicate-name file");
+    queries::upsert_file(
+        db.pool(),
+        project_b,
+        "/ws/ambiguous-b/shared/b.rs",
+        "b.rs",
+        "rust",
+        1,
+        Some("fn b() {}"),
+        Some(2),
+        1,
+        false,
+        false,
+        Utc::now(),
+    )
+    .await
+    .expect("insert second duplicate-name file");
+
+    let err = queries::project_tree(db.pool(), "duplicate-display-name", 3)
+        .await
+        .expect_err("duplicate project display names must fail closed");
+
+    assert!(
+        err.to_string().contains("ambiguous project name"),
+        "unexpected project_tree ambiguity error: {err}"
+    );
 }
 
 #[tokio::test]
@@ -365,9 +579,80 @@ async fn queries_hybrid_search_chunks_smoke() {
 async fn queries_text_search_smoke() {
     let db = require_test_db!();
     let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;
-    let _ = queries::text_search(db.pool(), "auth", 5, None, true)
+    let _ = queries::text_search(db.pool(), "auth", 5, None, None, true)
         .await
         .expect("text_search");
+}
+
+#[tokio::test]
+async fn queries_text_search_filters_project() {
+    let db = require_test_db!();
+    let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;
+    let results = queries::text_search(db.pool(), "auth", 10, None, Some("proj-auth"), true)
+        .await
+        .expect("text_search project filter");
+
+    assert!(!results.is_empty(), "expected auth hits in proj-auth");
+    assert!(
+        results.iter().all(|r| r.path.starts_with("/ws/auth/")),
+        "project filter must exclude cross-project FTS hits: {results:?}"
+    );
+}
+
+#[tokio::test]
+async fn queries_text_search_without_project_keeps_unscoped_files() {
+    let db = require_test_db!();
+    let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;
+
+    let file_id: i64 = sqlx::query_scalar(
+        "INSERT INTO indexed_files
+            (path, relative_path, language, size_bytes, content, content_hash,
+             line_count, truncated, content_recoverable_from_disk, modified_at)
+         VALUES
+            ('/unscoped/no-project.rs', 'no-project.rs', 'rust', 32,
+             'fn unscoped_auth_marker() {}', 12345, 1, false, false, $1)
+         RETURNING id",
+    )
+    .bind(Utc::now())
+    .fetch_one(db.pool())
+    .await
+    .expect("insert NULL-project indexed file");
+
+    let emb = test_embedding();
+    queries::insert_chunk(
+        db.pool(),
+        file_id,
+        0,
+        "fn unscoped_auth_marker() {}",
+        1,
+        1,
+        &emb,
+    )
+    .await
+    .expect("insert NULL-project chunk");
+
+    let unscoped = queries::text_search(db.pool(), "unscoped_auth_marker", 10, None, None, false)
+        .await
+        .expect("text_search without project filter");
+    assert!(
+        unscoped.iter().any(|r| r.path == "/unscoped/no-project.rs"),
+        "unscoped text_search must retain indexed files with NULL project_id: {unscoped:?}"
+    );
+
+    let scoped = queries::text_search(
+        db.pool(),
+        "unscoped_auth_marker",
+        10,
+        None,
+        Some("proj-auth"),
+        false,
+    )
+    .await
+    .expect("text_search with project filter");
+    assert!(
+        scoped.iter().all(|r| r.path != "/unscoped/no-project.rs"),
+        "project-scoped text_search must exclude NULL-project files: {scoped:?}"
+    );
 }
 
 #[tokio::test]
@@ -666,6 +951,62 @@ async fn queries_resolve_file_reference_smoke() {
     let _ = queries::resolve_file_reference(db.pool(), "proj-auth:auth/file_0.rs")
         .await
         .expect("resolve_file_reference");
+}
+
+#[tokio::test]
+async fn queries_resolve_file_reference_rejects_ambiguous_project_name() {
+    let db = require_test_db!();
+    let name = format!("dup-resolve-{}", Uuid::new_v4().simple());
+    let project_a = queries::upsert_project(
+        db.pool(),
+        "/ws/dup-resolve-a",
+        &format!("/ws/dup-resolve-a/{name}"),
+        &name,
+        None,
+        None,
+    )
+    .await
+    .expect("project a");
+    let project_b = queries::upsert_project(
+        db.pool(),
+        "/ws/dup-resolve-b",
+        &format!("/ws/dup-resolve-b/{name}"),
+        &name,
+        None,
+        None,
+    )
+    .await
+    .expect("project b");
+
+    for (project_id, root, content_hash) in [
+        (project_a, "/ws/dup-resolve-a", 31_i64),
+        (project_b, "/ws/dup-resolve-b", 32_i64),
+    ] {
+        queries::upsert_file(
+            db.pool(),
+            project_id,
+            &format!("{root}/{name}/src/lib.rs"),
+            "src/lib.rs",
+            "rust",
+            1,
+            Some("fn duplicate_name() {}"),
+            Some(content_hash),
+            1,
+            false,
+            false,
+            Utc::now(),
+        )
+        .await
+        .expect("file");
+    }
+
+    let resolved = queries::resolve_file_reference(db.pool(), &format!("{name}:src/lib.rs"))
+        .await
+        .expect("resolve ambiguous ref");
+    assert!(
+        resolved.is_none(),
+        "duplicate project display names must fail closed"
+    );
 }
 
 // =============================================================================

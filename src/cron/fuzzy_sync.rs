@@ -60,11 +60,11 @@ pub async fn run_fuzzy_sync(
             .map_err(|e| FuzzyError::Trie(format!("project list: {e}")))?;
 
     for (project_id, project_name) in &projects {
-        let project_slug = slugify(project_name);
+        let project_key = project_artifact_key(*project_id, project_name);
 
-        let symbols_path = trie_path(data_dir, "symbols", &project_slug);
-        let paths_path = trie_path(data_dir, "paths", &project_slug);
-        let commits_path = trie_path(data_dir, "commits", &project_slug);
+        let symbols_path = trie_path(data_dir, "symbols", &project_key);
+        let paths_path = trie_path(data_dir, "paths", &project_key);
+        let commits_path = trie_path(data_dir, "commits", &project_key);
 
         let (sym_idx, _sym_recovery) = FuzzyIndex::<SymbolValue>::open_or_create(&symbols_path)?;
         let (path_idx, _path_recovery) = FuzzyIndex::<PathValue>::open_or_create(&paths_path)?;
@@ -192,6 +192,16 @@ pub fn slugify(name: &str) -> String {
     s
 }
 
+/// Stable per-project artifact key for fuzzy tries and HybridLM files.
+///
+/// Project display names are not unique and `slugify` is many-to-one
+/// (`"foo/bar"` and `"foo_bar"` collide). Include the database id so every
+/// indexed project gets a distinct on-disk namespace while keeping paths
+/// inspectable.
+pub fn project_artifact_key(project_id: i32, name: &str) -> String {
+    format!("{}-p{}", slugify(name), project_id)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,5 +221,15 @@ mod tests {
         assert_eq!(slugify("rholang-rs"), "rholang-rs");
         assert_eq!(slugify("MeTTa Compiler"), "MeTTa_Compiler");
         assert_eq!(slugify("foo/bar"), "foo_bar");
+    }
+
+    #[test]
+    fn project_artifact_key_disambiguates_slug_collisions() {
+        assert_eq!(project_artifact_key(7, "foo/bar"), "foo_bar-p7");
+        assert_eq!(project_artifact_key(8, "foo_bar"), "foo_bar-p8");
+        assert_ne!(
+            project_artifact_key(7, "foo/bar"),
+            project_artifact_key(8, "foo_bar")
+        );
     }
 }

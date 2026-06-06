@@ -29,12 +29,14 @@ Heuristic, not ML. Requires graph-analysis cron + git history."
         Parameters(params): Parameters<BugPredictionParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        let project_hint = Some(params.project.clone());
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "bug_prediction",
             30,
             &_ctx,
             &summarize_debug(&params),
+            project_hint,
             crate::mcp::tools::tool_bug_prediction::tool_bug_prediction(self.ctx(), params),
         )
         .await
@@ -54,12 +56,14 @@ Optionally scans content for TODO/FIXME/HACK markers."
         Parameters(params): Parameters<TechnicalDebtAnalysisParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        let project_hint = Some(params.project.clone());
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "technical_debt_analysis",
             30,
             &_ctx,
             &summarize_debug(&params),
+            project_hint,
             crate::mcp::tools::tool_technical_debt_analysis::tool_technical_debt_analysis(
                 self.ctx(),
                 params,

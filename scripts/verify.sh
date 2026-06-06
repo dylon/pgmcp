@@ -91,6 +91,7 @@ run_gate "Gate 8/8: cargo test --release --tests" \
 # rule.
 formal_rocq_dir="docs/formal/rocq"
 formal_tla_dir="docs/formal/tla"
+tlc_runner="./scripts/tlc-capped.sh"
 
 if command -v coqc >/dev/null 2>&1; then
     if [ -d "${formal_rocq_dir}" ]; then
@@ -112,8 +113,8 @@ if command -v tlc >/dev/null 2>&1; then
             # `tlc` resolves the sibling .cfg by basename; cd into the
             # tla dir so relative paths Just Work.
             spec_base=$(basename "${spec}" .tla)
-            run_gate "Formal gate: tlc ${spec_base}" \
-                bash -c "cd ${formal_tla_dir} && tlc -workers auto ${spec_base}.tla"
+            run_gate "Formal gate: capped tlc ${spec_base}" \
+                bash -c "cd ${formal_tla_dir} && ../../../${tlc_runner} ${spec_base}.tla"
         done
     fi
 else

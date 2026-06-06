@@ -13,6 +13,7 @@ use serde_json::json;
 use tracing::{debug, error, info, warn};
 
 use crate::context::SystemContext;
+use crate::db::queries;
 use crate::mcp::server::*;
 
 pub async fn tool_doc_coverage_gaps(
@@ -25,17 +26,31 @@ pub async fn tool_doc_coverage_gaps(
         .doc_coverage_scans
         .fetch_add(1, Ordering::Relaxed);
 
+    let project = params.project.trim();
+    if project.is_empty() {
+        return Err(McpError::invalid_params("project must be non-empty", None));
+    }
+
     debug!(
         tool = "doc_coverage_gaps",
-        project = %params.project,
+        project = %project,
         "MCP tool invoked",
     );
 
-    let rows = ctx
-        .db()
-        .get_doc_topic_coverage(&params.project)
-        .await
-        .map_err(|e| McpError::internal_error(format!("Coverage query failed: {}", e), None))?;
+    let pool = ctx.db().pool();
+    let resolved_project_id = match pool {
+        Some(pool) => resolve_unique_project_id(pool, project).await?,
+        None => None,
+    };
+
+    let rows = match (pool, resolved_project_id) {
+        (Some(pool), Some(project_id)) => {
+            queries::get_doc_topic_coverage_by_project_id(pool, project_id).await
+        }
+        (Some(_), None) => Ok(Vec::new()),
+        (None, _) => ctx.db().get_doc_topic_coverage(project).await,
+    }
+    .map_err(|e| McpError::internal_error(format!("Coverage query failed: {}", e), None))?;
 
     if rows.is_empty() {
         return Ok(CallToolResult::success(vec![Content::text(
@@ -97,31 +112,21 @@ pub async fn tool_doc_coverage_gaps(
     // surfacing the effect distribution alongside its primary output.
     // Gracefully degrades to empty when the project lookup or
     // shadow-ASR data isn't populated.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
+    let effect_breakdown: Vec<serde_json::Value> = match (pool, resolved_project_id) {
+        (Some(pool), Some(project_id)) => {
+            crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
                 .await
                 .unwrap_or_default()
                 .into_iter()
                 .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
+                .collect()
         }
-    })
-    .await;
+        _ => Vec::new(),
+    };
 
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
+        "project": project,
         "total_doc_chunks": total_doc_chunks,
         "total_code_chunks": total_code_chunks,
         "topic_count": topics.len(),
@@ -142,4 +147,24 @@ pub async fn tool_doc_coverage_gaps(
     );
 
     Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+async fn resolve_unique_project_id(
+    pool: &sqlx::PgPool,
+    project: &str,
+) -> Result<Option<i32>, McpError> {
+    let ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1 LIMIT 2")
+        .bind(project)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| McpError::internal_error(format!("project lookup failed: {e}"), None))?;
+
+    match ids.as_slice() {
+        [] => Ok(None),
+        [id] => Ok(Some(*id)),
+        _ => Err(McpError::invalid_params(
+            format!("project name '{project}' is not unique"),
+            None,
+        )),
+    }
 }

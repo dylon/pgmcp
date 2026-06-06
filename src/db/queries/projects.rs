@@ -103,7 +103,11 @@ pub async fn find_project_by_cwd(
                 p.discovered_at, p.last_scanned_at,
                 (SELECT COUNT(*) FROM indexed_files f WHERE f.project_id = p.id) AS file_count
          FROM projects p
-         WHERE $1 LIKE p.path || '%'
+         WHERE $1 = p.path
+            OR $1 LIKE CASE
+                 WHEN right(p.path, 1) = '/' THEN p.path || '%'
+                 ELSE p.path || '/%'
+               END
          ORDER BY LENGTH(p.path) DESC
          LIMIT 1",
     )

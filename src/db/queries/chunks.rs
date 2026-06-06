@@ -64,6 +64,135 @@ pub struct ChunkInsert<'a> {
     pub embedding: &'a [f32],
 }
 
+/// Complete replacement payload for one indexed file.
+///
+/// `content_hash` is the final hash for the replacement. The transaction writes
+/// `indexed_files.content_hash = NULL` first, replaces chunks, then finalizes the
+/// hash before commit, so a lock timeout or insert error rolls the file back to
+/// its previous complete state.
+#[derive(Clone)]
+pub struct IndexedFileReplacement<'a> {
+    pub project_id: i32,
+    pub path: &'a str,
+    pub relative_path: &'a str,
+    pub language: &'a str,
+    pub size_bytes: i64,
+    pub content: Option<&'a str>,
+    pub content_hash: i64,
+    pub line_count: i32,
+    pub truncated: bool,
+    pub content_recoverable_from_disk: bool,
+    pub modified_at: DateTime<Utc>,
+    pub chunks: &'a [ChunkInsert<'a>],
+}
+
+/// Atomically replace an indexed file's metadata and chunks.
+///
+/// This is the active indexer's all-or-nothing write path. It deliberately does
+/// not reuse [`insert_chunks_batch`] because that helper assumes the caller has
+/// already mutated `indexed_files`; here the metadata update, chunk delete,
+/// chunk inserts, and content-hash finalization must live in one transaction.
+pub async fn replace_indexed_file(
+    pool: &PgPool,
+    replacement: IndexedFileReplacement<'_>,
+) -> Result<i64, sqlx::Error> {
+    for chunk in replacement.chunks {
+        if chunk.embedding.len() != 1024 {
+            return Err(sqlx::Error::Protocol(format!(
+                "replace_indexed_file: expected a 1024-dimension BGE-M3 \
+                 embedding, got {}",
+                chunk.embedding.len()
+            )));
+        }
+    }
+
+    let mut tx = pool.begin().await?;
+    let res = async {
+        let file_id = sqlx::query_scalar::<_, i64>(
+            "INSERT INTO indexed_files
+                (project_id, path, relative_path, language, size_bytes, content,
+                 content_hash, line_count, truncated, content_recoverable_from_disk,
+                 modified_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+             ON CONFLICT (path) DO UPDATE SET
+                project_id = EXCLUDED.project_id,
+                relative_path = EXCLUDED.relative_path,
+                language = EXCLUDED.language,
+                size_bytes = EXCLUDED.size_bytes,
+                content = EXCLUDED.content,
+                content_hash = EXCLUDED.content_hash,
+                line_count = EXCLUDED.line_count,
+                truncated = EXCLUDED.truncated,
+                content_recoverable_from_disk = EXCLUDED.content_recoverable_from_disk,
+                modified_at = EXCLUDED.modified_at,
+                indexed_at = NOW()
+             RETURNING id",
+        )
+        .bind(replacement.project_id)
+        .bind(replacement.path)
+        .bind(replacement.relative_path)
+        .bind(replacement.language)
+        .bind(replacement.size_bytes)
+        .bind(replacement.content)
+        .bind(Option::<i64>::None)
+        .bind(replacement.line_count)
+        .bind(replacement.truncated)
+        .bind(replacement.content_recoverable_from_disk)
+        .bind(replacement.modified_at)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        sqlx::query("DELETE FROM file_chunks WHERE file_id = $1")
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+
+        for chunk in replacement.chunks {
+            let embedding_vec = pgvector::Vector::from(chunk.embedding.to_vec());
+            sqlx::query(
+                "INSERT INTO file_chunks
+                    (file_id, chunk_index, content, start_line, end_line,
+                     embedding_v2, embedding_signature)
+                 VALUES ($1, $2, $3, $4, $5, $6, 'bge-m3-v1')
+                 ON CONFLICT (file_id, chunk_index) DO UPDATE SET
+                    content = EXCLUDED.content,
+                    start_line = EXCLUDED.start_line,
+                    end_line = EXCLUDED.end_line,
+                    embedding_v2 = EXCLUDED.embedding_v2,
+                    embedding_signature = EXCLUDED.embedding_signature",
+            )
+            .bind(file_id)
+            .bind(chunk.chunk_index)
+            .bind(chunk.content)
+            .bind(chunk.start_line)
+            .bind(chunk.end_line)
+            .bind(embedding_vec)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        sqlx::query("UPDATE indexed_files SET content_hash = $1 WHERE id = $2")
+            .bind(replacement.content_hash)
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+
+        Ok::<i64, sqlx::Error>(file_id)
+    }
+    .await;
+
+    match res {
+        Ok(file_id) => {
+            tx.commit().await?;
+            Ok(file_id)
+        }
+        Err(e) => {
+            let _ = tx.rollback().await;
+            Err(e)
+        }
+    }
+}
+
 /// Outcome of a batched chunk insert.
 ///
 /// The batch runs inside a single transaction so the embed pool holds

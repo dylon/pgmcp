@@ -1,19 +1,15 @@
 //! `tool_coupling_cohesion_report` — MCP tool body, extracted from `super::super::server`.
 
-#![allow(unused_imports)]
-
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
-use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, LoggingLevel};
-use serde_json::json;
-use tracing::{debug, error, info, warn};
+use rmcp::model::{CallToolResult, Content};
+use tracing::debug;
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
 
 pub async fn tool_coupling_cohesion_report(
     ctx: &SystemContext,
@@ -23,29 +19,37 @@ pub async fn tool_coupling_cohesion_report(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().coupling_reports.fetch_add(1, Ordering::Relaxed);
 
-    let module_depth = params.module_depth.unwrap_or(2) as usize;
-    let sort_by = params.sort_by.as_deref().unwrap_or("distance");
+    let project = params.project.trim().to_string();
+    let module_depth = params.module_depth.unwrap_or(2).clamp(1, 8) as usize;
+    let sort_by = params
+        .sort_by
+        .as_deref()
+        .map(str::trim)
+        .filter(|sort_by| !sort_by.is_empty())
+        .unwrap_or("distance");
+    if !matches!(
+        sort_by,
+        "instability" | "distance" | "coupling" | "cohesion"
+    ) {
+        return Err(McpError::invalid_params(
+            format!(
+                "Unknown sort_by '{}': expected one of instability | distance | coupling | cohesion",
+                sort_by
+            ),
+            None,
+        ));
+    }
 
     debug!(
         tool = "coupling_cohesion_report",
-        project = %params.project,
+        project = %project,
         module_depth,
         sort_by,
         "MCP tool invoked",
     );
 
-    let project_id: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-            .bind(&params.project)
-            .fetch_optional(ctx.db().pool().expect(
-                "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-            ))
-            .await
-            .map_err(|e| McpError::internal_error(format!("Project lookup failed: {}", e), None))?;
-
-    let project_id = project_id.ok_or_else(|| {
-        McpError::internal_error(format!("Project not found: {}", params.project), None)
-    })?;
+    let pool = pool_or_err(ctx)?;
+    let project_id = project_id_or_err(ctx, &project).await?;
 
     // Load edges and files, build graph
     #[derive(sqlx::FromRow)]
@@ -71,16 +75,14 @@ pub async fn tool_coupling_cohesion_report(
             e.edge_type,
             e.weight
          FROM code_graph_edges e
-         JOIN indexed_files sf ON e.source_file_id = sf.id
-         LEFT JOIN indexed_files tf ON e.target_file_id = tf.id
-         WHERE e.project_id = $1 AND e.edge_type = 'import'",
+         JOIN indexed_files sf ON e.source_file_id = sf.id AND sf.project_id = e.project_id
+         LEFT JOIN indexed_files tf ON e.target_file_id = tf.id AND tf.project_id = e.project_id
+         WHERE e.project_id = $1
+           AND e.edge_type = 'import'
+           AND (e.target_file_id IS NULL OR tf.id IS NOT NULL)",
     )
     .bind(project_id)
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("Edge query failed: {}", e), None))?;
 
@@ -97,11 +99,7 @@ pub async fn tool_coupling_cohesion_report(
          FROM indexed_files WHERE project_id = $1",
     )
     .bind(project_id)
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("File query failed: {}", e), None))?;
 
@@ -171,8 +169,13 @@ pub async fn tool_coupling_cohesion_report(
         }),
     }
 
+    const MAX_REPORTED_MODULES: usize = 2000;
+    let total_module_count = module_metrics.len();
+    let truncated = total_module_count > MAX_REPORTED_MODULES;
+
     let modules: Vec<serde_json::Value> = module_metrics
         .iter()
+        .take(MAX_REPORTED_MODULES)
         .map(|m| {
             let zone = if m.instability < 0.3 && m.abstractness < 0.3 {
                 "zone_of_pain"
@@ -201,34 +204,22 @@ pub async fn tool_coupling_cohesion_report(
     // surfacing the effect distribution alongside its primary output.
     // Gracefully degrades to empty when the project lookup or
     // shadow-ASR data isn't populated.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
-        }
-    })
-    .await;
+    let effect_breakdown: Vec<serde_json::Value> =
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect();
 
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
+        "project": project,
         "module_depth": module_depth,
         "sort_by": sort_by,
         "module_count": modules.len(),
+        "total_module_count": total_module_count,
+        "truncated": truncated,
         "modules": modules,
         "guidance": "D* close to 0 = on the Main Sequence (ideal balance of A+I). \
                      Zone of Pain (low A, low I): concrete and stable — hard to change. \

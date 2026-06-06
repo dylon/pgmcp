@@ -17,9 +17,12 @@
 //!
 //! Skips with `SKIPPED:` if no test DB is configured.
 
+mod common;
+
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use common::text_of;
 use pgmcp::config::Config;
 use pgmcp::context::SystemContext;
 use pgmcp::db::DbClient;
@@ -30,6 +33,7 @@ use pgmcp::mcp::tasks::TaskStore;
 use pgmcp::stats::tracker::StatsTracker;
 use pgmcp_testing::fixtures::synthetic_corpus::SyntheticCorpus;
 use pgmcp_testing::mocks::DeterministicEmbeddingBackend;
+use pgmcp_testing::pool_tool_helpers::{seed_file, seed_project, server_with_pool};
 use pgmcp_testing::require_test_db;
 
 #[tokio::test]
@@ -174,4 +178,91 @@ async fn code_summarize_brief_detail_omits_topics_field() {
     );
     assert!(v.get("directories").is_some());
     assert!(v.get("key_files").is_some());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn code_summarize_normalizes_and_applies_directory_scope_to_all_counts() {
+    let db = require_test_db!();
+    let p = seed_project(db.pool(), "sum-scope", "/ws/sum-scope").await;
+    seed_file(db.pool(), p, "/ws/sum-scope/src/a.rs", "src/a.rs").await;
+    seed_file(db.pool(), p, "/ws/sum-scope/tests/b.rs", "tests/b.rs").await;
+    let server = server_with_pool(db.pool().clone());
+
+    let result = server
+        .call_tool_cli(
+            "code_summarize",
+            serde_json::json!({
+                "project": " sum-scope ",
+                "scope": " directory ",
+                "path": " src/ ",
+                "detail": " brief "
+            }),
+        )
+        .await
+        .expect("directory scoped summary");
+    assert!(result.is_error != Some(true));
+    let v: serde_json::Value = serde_json::from_str(&text_of(&result)).expect("summary JSON");
+
+    assert_eq!(v["project"].as_str(), Some("sum-scope"));
+    assert_eq!(v["scope"].as_str(), Some("directory"));
+    assert_eq!(v["path"].as_str(), Some("src/"));
+    assert_eq!(v["detail"].as_str(), Some("brief"));
+    assert_eq!(v["total_files"].as_i64(), Some(1));
+    assert!(v.get("topics").is_none(), "brief detail omits topics");
+    assert_eq!(
+        v["language_breakdown"][0]["files"].as_i64(),
+        Some(1),
+        "language counts must obey the same path scope"
+    );
+    let key_files = v["key_files"].as_array().expect("key files");
+    assert_eq!(key_files.len(), 1);
+    assert_eq!(key_files[0]["path"].as_str(), Some("src/a.rs"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn code_summarize_rejects_ambiguous_project_and_invalid_filters() {
+    let db = require_test_db!();
+    seed_project(db.pool(), "sum-dupe", "/ws/sum-dupe-a").await;
+    seed_project(db.pool(), "sum-dupe", "/ws/sum-dupe-b").await;
+    let p = seed_project(db.pool(), "sum-valid", "/ws/sum-valid").await;
+    seed_file(db.pool(), p, "/ws/sum-valid/a.rs", "a.rs").await;
+    let server = server_with_pool(db.pool().clone());
+
+    assert!(
+        server
+            .call_tool_cli("code_summarize", serde_json::json!({"project": "sum-dupe"}))
+            .await
+            .is_err(),
+        "duplicate project display names must fail closed"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "code_summarize",
+                serde_json::json!({"project": "sum-valid", "scope": "workspace"}),
+            )
+            .await
+            .is_err(),
+        "unknown scope is rejected"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "code_summarize",
+                serde_json::json!({"project": "sum-valid", "detail": "verbose"}),
+            )
+            .await
+            .is_err(),
+        "unknown detail is rejected"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "code_summarize",
+                serde_json::json!({"project": "sum-valid", "scope": "file"}),
+            )
+            .await
+            .is_err(),
+        "file scope requires a path"
+    );
 }

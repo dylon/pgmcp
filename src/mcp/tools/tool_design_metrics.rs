@@ -25,8 +25,21 @@ pub async fn tool_design_metrics(
         .design_metric_scans
         .fetch_add(1, Ordering::Relaxed);
 
-    let scope = params.scope.as_deref().unwrap_or("project");
-    let limit = params.limit.unwrap_or(30);
+    let scope = match params.scope.as_deref().unwrap_or("project") {
+        "project" => "project",
+        "module" | "directory" => "module",
+        "file" => "file",
+        other => {
+            return Err(McpError::invalid_params(
+                format!(
+                    "invalid scope '{}'; expected 'project', 'module', 'directory', or 'file'",
+                    other
+                ),
+                None,
+            ));
+        }
+    };
+    let limit = params.limit.unwrap_or(30).clamp(1, 100);
     let sort_by = params.sort_by.as_deref().unwrap_or("system_complexity");
 
     debug!(
@@ -50,47 +63,78 @@ pub async fn tool_design_metrics(
         out_degree: Option<i32>,
     }
 
-    let path_filter = params.path.as_deref().unwrap_or("");
-    let query = if path_filter.is_empty() || scope == "project" {
-        "SELECT f.id as file_id, f.relative_path, f.language, f.line_count, f.content,
-                fm.in_degree, fm.out_degree
-         FROM indexed_files f
-         LEFT JOIN file_metrics fm ON fm.file_id = f.id
-         JOIN projects p ON f.project_id = p.id
-         WHERE p.name = $1 AND f.content IS NOT NULL"
-            .to_string()
-    } else if scope == "directory" {
-        format!(
-            "SELECT f.id as file_id, f.relative_path, f.language, f.line_count, f.content,
-                    fm.in_degree, fm.out_degree
-             FROM indexed_files f
-             LEFT JOIN file_metrics fm ON fm.file_id = f.id
-             JOIN projects p ON f.project_id = p.id
-             WHERE p.name = $1 AND f.content IS NOT NULL
-               AND f.relative_path LIKE '{}%'",
-            path_filter.replace('\'', "''")
-        )
-    } else {
-        format!(
-            "SELECT f.id as file_id, f.relative_path, f.language, f.line_count, f.content,
-                    fm.in_degree, fm.out_degree
-             FROM indexed_files f
-             LEFT JOIN file_metrics fm ON fm.file_id = f.id
-             JOIN projects p ON f.project_id = p.id
-             WHERE p.name = $1 AND f.content IS NOT NULL
-               AND f.relative_path = '{}'",
-            path_filter.replace('\'', "''")
-        )
+    let pool = ctx
+        .db()
+        .pool()
+        .ok_or_else(|| McpError::internal_error("raw pool unavailable", None))?;
+
+    let matching_project_ids: Vec<i32> =
+        sqlx::query_scalar("SELECT id FROM projects WHERE name = $1 ORDER BY id")
+            .bind(&params.project)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Project lookup failed: {}", e), None))?;
+
+    let project_id = match matching_project_ids.as_slice() {
+        [] => {
+            return Err(McpError::internal_error(
+                format!("Project not found: {}", params.project),
+                None,
+            ));
+        }
+        [project_id] => *project_id,
+        ids => {
+            return Err(McpError::invalid_params(
+                format!(
+                    "ambiguous project name '{}' matched {} indexed projects; use a unique project name from list_projects",
+                    params.project,
+                    ids.len()
+                ),
+                None,
+            ));
+        }
     };
 
-    let rows: Vec<FileRow> =
-        sqlx::query_as::<_, FileRow>(&query)
-            .bind(&params.project)
-            .fetch_all(ctx.db().pool().expect(
-                "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-            ))
-            .await
-            .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
+    let path_filter = params.path.as_deref().unwrap_or("");
+    let rows: Vec<FileRow> = if path_filter.is_empty() || scope == "project" {
+        sqlx::query_as::<_, FileRow>(
+            "SELECT f.id as file_id, f.relative_path, f.language, f.line_count, f.content,
+                    fm.in_degree, fm.out_degree
+             FROM indexed_files f
+             LEFT JOIN file_metrics fm ON fm.file_id = f.id
+             WHERE f.project_id = $1 AND f.content IS NOT NULL",
+        )
+        .bind(project_id)
+        .fetch_all(pool)
+        .await
+    } else if scope == "module" {
+        sqlx::query_as::<_, FileRow>(
+            "SELECT f.id as file_id, f.relative_path, f.language, f.line_count, f.content,
+                    fm.in_degree, fm.out_degree
+             FROM indexed_files f
+             LEFT JOIN file_metrics fm ON fm.file_id = f.id
+             WHERE f.project_id = $1 AND f.content IS NOT NULL
+               AND left(f.relative_path, char_length($2)) = $2",
+        )
+        .bind(project_id)
+        .bind(path_filter)
+        .fetch_all(pool)
+        .await
+    } else {
+        sqlx::query_as::<_, FileRow>(
+            "SELECT f.id as file_id, f.relative_path, f.language, f.line_count, f.content,
+                    fm.in_degree, fm.out_degree
+             FROM indexed_files f
+             LEFT JOIN file_metrics fm ON fm.file_id = f.id
+             WHERE f.project_id = $1 AND f.content IS NOT NULL
+               AND f.relative_path = $2",
+        )
+        .bind(project_id)
+        .bind(path_filter)
+        .fetch_all(pool)
+        .await
+    }
+    .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
 
     if rows.is_empty() {
         return Ok(CallToolResult::success(vec![Content::text(
@@ -103,26 +147,12 @@ pub async fn tool_design_metrics(
     // Maintainability-Index; files with none fall back to the regex/line-count
     // heuristic below. Provenance is reported per file via the `source` field.
     let agg_map: std::collections::HashMap<i64, crate::db::queries::FileFunctionAggregate> =
-        (async {
-            let Some(pool) = ctx.db().pool() else {
-                return std::collections::HashMap::new();
-            };
-            let pid: Option<i32> = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-            match pid {
-                Some(pid) => crate::db::queries::get_file_function_metric_aggregates(pool, pid)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|a| (a.file_id, a))
-                    .collect(),
-                None => std::collections::HashMap::new(),
-            }
-        })
-        .await;
+        crate::db::queries::get_file_function_metric_aggregates(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|a| (a.file_id, a))
+            .collect();
 
     // Compute metrics per file
     let branch_re = regex::Regex::new(
@@ -266,35 +296,21 @@ pub async fn tool_design_metrics(
     // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown
     // for the project. Universal enrichment — every tool benefits from
     // surfacing the effect distribution alongside its primary output.
-    // Gracefully degrades to empty when the project lookup or
-    // shadow-ASR data isn't populated.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
-        }
-    })
-    .await;
+    // Gracefully degrades to empty when shadow-ASR data isn't populated.
+    let effect_breakdown: Vec<serde_json::Value> =
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect();
 
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
         "project": params.project,
         "scope": scope,
         "path": params.path,
+        "limit": limit,
         "sort_by": sort_by,
         "file_count": metrics.len(),
         "files": metrics,

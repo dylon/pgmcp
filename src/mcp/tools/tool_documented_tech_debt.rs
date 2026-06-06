@@ -194,16 +194,74 @@ pub async fn tool_documented_tech_debt(
     ctx.stats()
         .documented_debt_scans
         .fetch_add(1, Ordering::Relaxed);
-    let _ = project_id_or_err(ctx, &params.project).await?;
     let pool = pool_or_err(ctx)?;
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
 
-    let limit = params.limit.unwrap_or(100) as usize;
-    let format = params.format.as_deref().unwrap_or("summary");
-    let category_filter = params.category.as_deref().unwrap_or("all");
-    let kind_filter = params.kind.as_ref().map(|s| s.to_uppercase());
-    let severity_filter = params.severity.as_deref().map(|s| s.to_lowercase());
-    let min_age_days = params.min_age_days;
-    let language_filter = params.language.as_deref();
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000) as usize;
+    let format = params
+        .format
+        .as_deref()
+        .map(str::trim)
+        .filter(|format| !format.is_empty())
+        .unwrap_or("summary");
+    if !matches!(format, "summary" | "full") {
+        return Err(McpError::invalid_params(
+            format!("unknown format '{format}'; expected summary | full"),
+            None,
+        ));
+    }
+    let category_filter = params
+        .category
+        .as_deref()
+        .map(str::trim)
+        .filter(|category| !category.is_empty())
+        .unwrap_or("all");
+    if !matches!(
+        category_filter,
+        "all" | "comments" | "stub_macros" | "deprecated"
+    ) {
+        return Err(McpError::invalid_params(
+            format!(
+                "unknown category '{category_filter}'; expected all | comments | stub_macros | deprecated"
+            ),
+            None,
+        ));
+    }
+    let kind_filter = params
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())
+        .map(str::to_uppercase);
+    let severity_filter = params
+        .severity
+        .as_deref()
+        .map(str::trim)
+        .filter(|severity| !severity.is_empty())
+        .map(str::to_lowercase);
+    if let Some(severity) = severity_filter.as_deref()
+        && !matches!(severity, "high" | "medium" | "low")
+    {
+        return Err(McpError::invalid_params(
+            format!("unknown severity '{severity}'; expected high | medium | low"),
+            None,
+        ));
+    }
+    let min_age_days = match params.min_age_days {
+        Some(days) if days < 0 => {
+            return Err(McpError::invalid_params(
+                "min_age_days must be non-negative",
+                None,
+            ));
+        }
+        other => other,
+    };
+    let language_filter = params
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|language| !language.is_empty());
 
     // Canonical defaults when the caller omits `exclude_paths`: skip the
     // curated pattern catalog and the marker-detector's own regex test
@@ -214,12 +272,19 @@ pub async fn tool_documented_tech_debt(
         "src/mcp/tools/tool_technical_debt_analysis.rs",
         "src/mcp/tools/tool_documented_tech_debt.rs",
     ];
-    let exclude_glob_patterns: Vec<String> = params.exclude_paths.clone().unwrap_or_else(|| {
-        DEFAULT_EXCLUDE_PATHS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect()
-    });
+    let exclude_glob_patterns: Vec<String> = params
+        .exclude_paths
+        .clone()
+        .unwrap_or_else(|| {
+            DEFAULT_EXCLUDE_PATHS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect()
+        })
+        .into_iter()
+        .map(|pat| pat.trim().to_string())
+        .filter(|pat| !pat.is_empty())
+        .collect();
     let exclude_matcher: Option<globset::GlobSet> =
         if exclude_glob_patterns.is_empty() {
             None
@@ -245,9 +310,7 @@ pub async fn tool_documented_tech_debt(
 
     debug!(
         tool = "documented_tech_debt",
-        project = %params.project,
-        limit, format, category_filter,
-        "MCP tool invoked"
+        project, limit, format, category_filter, "MCP tool invoked"
     );
 
     // Fetch project files.
@@ -255,12 +318,11 @@ pub async fn tool_documented_tech_debt(
         sqlx::query_as::<_, (i64, String, String, Option<String>)>(
             "SELECT f.id, f.relative_path, f.language, f.content
              FROM indexed_files f
-             JOIN projects p ON f.project_id = p.id
-             WHERE p.name = $1
+             WHERE f.project_id = $1
                AND f.content IS NOT NULL
                AND ($2::text IS NULL OR f.language = $2)",
         )
-        .bind(&params.project)
+        .bind(project_id)
         .bind(language_filter)
         .fetch_all(pool)
         .await
@@ -278,31 +340,17 @@ pub async fn tool_documented_tech_debt(
         // surfacing the effect distribution alongside its primary output.
         // Gracefully degrades to empty when the project lookup or
         // shadow-ASR data isn't populated.
-        let effect_breakdown: Vec<serde_json::Value> = (async {
-            let Some(pool) = ctx.db().pool() else {
-                return Vec::new();
-            };
-            let project_id_opt: Option<i32> =
-                sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                    .bind(&params.project)
-                    .fetch_optional(pool)
-                    .await
-                    .unwrap_or(None);
-            match project_id_opt {
-                Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                    .collect(),
-                None => Vec::new(),
-            }
-        })
-        .await;
+        let effect_breakdown: Vec<serde_json::Value> =
+            crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+                .collect();
 
         return json_result(&json!({
         "effect_breakdown": effect_breakdown,
-            "project": params.project,
+            "project": project,
             "total_markers": 0,
             "findings": [],
             "guidance": "No files matched the filter (project not indexed, no content, or language filter excludes all).",
@@ -554,7 +602,16 @@ pub async fn tool_documented_tech_debt(
     }
 
     let summary = json!({
-        "project": params.project,
+        "project": project,
+        "filters": {
+            "format": format,
+            "category": category_filter,
+            "kind": kind_filter,
+            "severity": severity_filter,
+            "min_age_days": min_age_days,
+            "language": language_filter,
+            "limit": limit,
+        },
         "total_markers": total_markers,
         "by_kind": by_kind,
         "by_severity": by_severity,

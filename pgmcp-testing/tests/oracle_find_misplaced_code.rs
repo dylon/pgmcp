@@ -31,6 +31,8 @@ use pgmcp::mcp::tasks::TaskStore;
 use pgmcp::stats::tracker::StatsTracker;
 use pgmcp_testing::fixtures::test_config;
 use pgmcp_testing::mocks::{DeterministicEmbeddingBackend, MockDbClient};
+use pgmcp_testing::pool_tool_helpers::{seed_project, server_with_pool};
+use pgmcp_testing::require_test_db;
 
 fn server_with_mock(mock: MockDbClient) -> McpServer {
     let db: Arc<dyn DbClient> = Arc::new(mock);
@@ -176,5 +178,67 @@ async fn find_misplaced_code_orders_results_by_mismatch_descending() {
     assert_eq!(
         misplaced[1]["path"].as_str(),
         Some("/ws/p/dir_b/small_misfit.rs"),
+    );
+}
+
+#[tokio::test]
+async fn find_misplaced_code_normalizes_project_and_clamps_threshold() {
+    let mut mock = MockDbClient::new();
+    mock.chunk_topic_assignments_for_files = vec![
+        row("/ws/p/auth/a.rs", 1, "auth"),
+        row("/ws/p/auth/b.rs", 1, "auth"),
+        row("/ws/p/auth/log_misplaced.rs", 2, "logging"),
+    ];
+    let server = server_with_mock(mock);
+
+    let low = server
+        .call_tool_cli(
+            "find_misplaced_code",
+            serde_json::json!({"project": " p ", "min_mismatch": -10.0}),
+        )
+        .await
+        .expect("low clamp call");
+    let low_v: serde_json::Value = serde_json::from_str(&text_of(&low)).expect("json");
+    assert_eq!(low_v["project"].as_str(), Some("p"));
+    assert_eq!(low_v["min_mismatch"].as_f64(), Some(0.0));
+
+    let high = server
+        .call_tool_cli(
+            "find_misplaced_code",
+            serde_json::json!({"project": "p", "min_mismatch": 10.0}),
+        )
+        .await
+        .expect("high clamp call");
+    let high_v: serde_json::Value = serde_json::from_str(&text_of(&high)).expect("json");
+    assert_eq!(high_v["min_mismatch"].as_f64(), Some(1.0));
+}
+
+#[tokio::test]
+async fn find_misplaced_code_rejects_blank_and_duplicate_projects() {
+    let mut mock = MockDbClient::new();
+    mock.chunk_topic_assignments_for_files = vec![row("/ws/p/auth/a.rs", 1, "auth")];
+    let mock_server = server_with_mock(mock);
+    assert!(
+        mock_server
+            .call_tool_cli("find_misplaced_code", serde_json::json!({"project": "   "}))
+            .await
+            .is_err(),
+        "blank project must fail closed"
+    );
+
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    seed_project(&pool, "dup-misplaced", "/ws/misplaced-a").await;
+    seed_project(&pool, "dup-misplaced", "/ws/misplaced-b").await;
+    let server = server_with_pool(pool);
+    assert!(
+        server
+            .call_tool_cli(
+                "find_misplaced_code",
+                serde_json::json!({"project": "dup-misplaced"}),
+            )
+            .await
+            .is_err(),
+        "duplicate project display names must fail closed"
     );
 }

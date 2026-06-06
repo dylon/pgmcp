@@ -19,7 +19,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
-use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
+use crate::mcp::tools::sota_helpers::{import_cycle_file_count, pool_or_err, project_id_or_err};
 use crate::quality::report::{DimensionScore, OrrGate, grade_gpa, letter_grade};
 
 /// The Engineering pillar's full analysis: 10 graded dimensions, the 8-gate ORR
@@ -46,7 +46,6 @@ struct ProjectStats {
 pub(crate) async fn collect_engineering_analysis(
     ctx: &SystemContext,
     project_id: i32,
-    project_name: &str,
 ) -> Result<EngineeringAnalysis, McpError> {
     let pool = pool_or_err(ctx)?;
 
@@ -68,22 +67,9 @@ pub(crate) async fn collect_engineering_analysis(
     let size_score = (1.0 - (stats.avg_file_lines - 200.0).abs().max(0.0) / 800.0).max(0.0) * 100.0;
 
     // === Dimension 2: Dependency Health ===
-    let cycle_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM (
-            SELECT DISTINCT e1.source_file_id
-            FROM code_graph_edges e1
-            JOIN code_graph_edges e2 ON e1.target_file_id = e2.source_file_id
-                AND e2.target_file_id = e1.source_file_id
-            WHERE e1.project_id = $1 AND e1.edge_type = 'import'
-                AND e2.edge_type = 'import'
-        ) t",
-    )
-    .bind(project_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
+    let cycle_file_count: i64 = import_cycle_file_count(pool, project_id).await.unwrap_or(0);
     let dep_score = if stats.file_count > 0 {
-        (1.0 - cycle_count as f64 / stats.file_count as f64).max(0.0) * 100.0
+        (1.0 - cycle_file_count as f64 / stats.file_count as f64).max(0.0) * 100.0
     } else {
         100.0
     };
@@ -194,11 +180,10 @@ pub(crate) async fn collect_engineering_analysis(
     // (>2000 lines) is the signal; the gate passes only when none exceed it.
     const GOD_FILE_LINES: i64 = 2000;
     let god_file_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM indexed_files f
-         JOIN projects p ON f.project_id = p.id
-         WHERE p.name = $1 AND f.line_count > $2",
+        "SELECT COUNT(*) FROM indexed_files
+         WHERE project_id = $1 AND line_count > $2",
     )
-    .bind(project_name)
+    .bind(project_id)
     .bind(GOD_FILE_LINES)
     .fetch_one(pool)
     .await
@@ -251,7 +236,7 @@ pub(crate) async fn collect_engineering_analysis(
     let orr = vec![
         OrrGate {
             name: "no_circular_deps".into(),
-            pass: cycle_count == 0,
+            pass: cycle_file_count == 0,
         },
         OrrGate {
             name: "test_coverage".into(),
@@ -305,16 +290,23 @@ pub async fn tool_engineering_scorecard(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().scorecard_scans.fetch_add(1, Ordering::Relaxed);
 
-    let format = params.format.as_deref().unwrap_or("full");
+    let project = params.project.trim();
+    let format = params.format.as_deref().unwrap_or("full").trim();
+    if !matches!(format, "full" | "summary" | "failures_only") {
+        return Err(McpError::invalid_params(
+            format!("Unknown format '{format}'. Valid: full|summary|failures_only"),
+            None,
+        ));
+    }
     debug!(
         tool = "engineering_scorecard",
-        project = %params.project,
+        project = %project,
         format,
         "MCP tool invoked",
     );
 
-    let project_id = project_id_or_err(ctx, &params.project).await?;
-    let analysis = collect_engineering_analysis(ctx, project_id, &params.project).await?;
+    let project_id = project_id_or_err(ctx, project).await?;
+    let analysis = collect_engineering_analysis(ctx, project_id).await?;
 
     // Average only the scorable dimensions' continuous GPAs; data-absent dims
     // (e.g. complexity before per-function metrics exist) are N/A and excluded
@@ -351,17 +343,14 @@ pub async fn tool_engineering_scorecard(
     }
     let orr_pass = analysis.orr.iter().all(|g| g.pass);
 
-    let filtered_dims = if format == "failures_only" {
-        dim_json
+    let filtered_dims = match format {
+        "failures_only" => dim_json
             .iter()
-            .filter(|d| {
-                let grade = d["grade"].as_str().unwrap_or("A");
-                grade == "C" || grade == "D" || grade == "F"
-            })
+            .filter(|d| matches!(d["grade"].as_str(), Some("C" | "D" | "F")))
             .cloned()
-            .collect::<Vec<_>>()
-    } else {
-        dim_json
+            .collect::<Vec<_>>(),
+        "summary" => Vec::new(),
+        _ => dim_json,
     };
 
     let effect_breakdown = if let Some(pool) = ctx.db().pool() {
@@ -376,7 +365,7 @@ pub async fn tool_engineering_scorecard(
     };
 
     let result = json!({
-        "project": params.project,
+        "project": project,
         "gpa": format!("{:.2}", gpa),
         "overall_grade": letter_grade(gpa * 25.0),
         "dimensions": filtered_dims,

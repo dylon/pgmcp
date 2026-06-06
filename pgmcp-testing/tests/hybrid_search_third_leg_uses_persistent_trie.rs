@@ -7,7 +7,8 @@
 //! per-project `FuzzyIndex<SymbolValue>` (lazy-warming it from PG
 //! on first call if needed). This test proves the new behavior:
 //!
-//! - Pre-populate the symbol trie at `<data_dir>/fuzzy/symbols/<slug>/symbols.artrie`
+//! - Pre-populate the symbol trie at
+//!   `<data_dir>/fuzzy/symbols/<slug>-p<project_id>/symbols.artrie`
 //!   with `receive_handler`. Do NOT seed `file_symbols` in PG.
 //! - Train the HybridLM in the same tempdir.
 //! - Call `tool_hybrid_search` with the misspelled query `recieve`.
@@ -21,7 +22,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use pgmcp::config::Config;
 use pgmcp::context::SystemContext;
-use pgmcp::cron::fuzzy_sync::{slugify, trie_path};
+use pgmcp::cron::fuzzy_sync::{project_artifact_key, trie_path};
 use pgmcp::daemon_state::DaemonLifecycle;
 use pgmcp::db::DbClient;
 use pgmcp::embed::{EmbedSource, EmbeddingBackend};
@@ -105,7 +106,7 @@ async fn seed_project_and_chunks(pool: &sqlx::PgPool, project_name: &str) -> i32
 async fn third_leg_pulls_candidates_from_persistent_trie() {
     let testdb = require_test_db!();
     let project_name = "third_leg_trie_test";
-    let _ = seed_project_and_chunks(testdb.pool(), project_name).await;
+    let project_id = seed_project_and_chunks(testdb.pool(), project_name).await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let pool_arc = Arc::new(testdb.pool().clone());
@@ -113,7 +114,11 @@ async fn third_leg_pulls_candidates_from_persistent_trie() {
 
     // 1. Pre-populate the symbol trie with the authoritative symbol.
     //    PG's `file_symbols` is intentionally empty for this project.
-    let symbols_path = trie_path(tmp.path(), "symbols", &slugify(project_name));
+    let symbols_path = trie_path(
+        tmp.path(),
+        "symbols",
+        &project_artifact_key(project_id, project_name),
+    );
     let (sym_idx, _recovery) =
         FuzzyIndex::<SymbolValue>::open_or_create(&symbols_path).expect("symbol trie create");
     sym_idx
@@ -136,7 +141,8 @@ async fn third_leg_pulls_candidates_from_persistent_trie() {
         tmp.path().to_path_buf(),
     )
     .await;
-    let model_path = pgmcp::cron::ngram_lm_train::model_path_for(tmp.path(), project_name);
+    let model_path =
+        pgmcp::cron::ngram_lm_train::model_path_for_project(tmp.path(), project_id, project_name);
     assert!(
         model_path.exists(),
         "training prerequisite failed: model at {} missing",

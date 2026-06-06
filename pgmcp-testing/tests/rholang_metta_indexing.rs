@@ -141,7 +141,7 @@ async fn rholang_and_metta_indexing_e2e() {
     // Assert Rholang file_symbols rows.
     let rholang_symbol_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM file_symbols WHERE file_id = ANY($1::bigint[])")
-            .bind(&[rho_id_1, rho_id_2])
+            .bind([rho_id_1, rho_id_2])
             .fetch_one(pool)
             .await
             .expect("rholang symbol count");
@@ -217,7 +217,7 @@ async fn rholang_and_metta_indexing_e2e() {
     let rholang_ref_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM symbol_references WHERE source_file_id = ANY($1::bigint[])",
     )
-    .bind(&[rho_id_1, rho_id_2])
+    .bind([rho_id_1, rho_id_2])
     .fetch_one(pool)
     .await
     .expect("rholang reference count");

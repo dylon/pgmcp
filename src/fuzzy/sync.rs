@@ -129,14 +129,16 @@ pub async fn open_symbol_trie(
     ctx: &SystemContext,
     project_name: &str,
 ) -> Result<Arc<FuzzyIndex<SymbolValue>>, McpError> {
+    let project_name = project_name.trim();
+    let project_id = project_id_or_err(ctx, project_name).await?;
     let data_dir = ctx.config().load().fuzzy.data_dir.clone();
-    let slug = crate::cron::fuzzy_sync::slugify(project_name);
-    let path = crate::cron::fuzzy_sync::trie_path(&data_dir, "symbols", &slug);
+    let key = crate::cron::fuzzy_sync::project_artifact_key(project_id, project_name);
+    let path = crate::cron::fuzzy_sync::trie_path(&data_dir, "symbols", &key);
 
     // Reuse a cached handle if the on-disk trie is unchanged since it was opened
     // (the cron bumps the file's mtime when it rebuilds). Opening a handle spawns
     // three daemon threads, so reuse avoids per-call thread churn.
-    if let Some(idx) = ctx.fuzzy_cache().get_symbols(&slug, &path) {
+    if let Some(idx) = ctx.fuzzy_cache().get_symbols(&key, &path) {
         return Ok(idx);
     }
 
@@ -144,7 +146,6 @@ pub async fn open_symbol_trie(
     let (idx, _recovery) = FuzzyIndex::<SymbolValue>::open_or_create(&path)
         .map_err(|e| McpError::internal_error(format!("fuzzy symbol trie open: {e}"), None))?;
     if fresh {
-        let project_id = project_id_or_err(ctx, project_name).await?;
         let pool = pool_or_err(ctx)?;
         rebuild_symbols(pool, project_id, &idx).await.map_err(|e| {
             McpError::internal_error(format!("fuzzy symbol trie initial warm: {e}"), None)
@@ -156,7 +157,7 @@ pub async fn open_symbol_trie(
             "fuzzy symbol trie lazy-warmed from PG"
         );
     }
-    Ok(ctx.fuzzy_cache().insert_symbols(&slug, &path, idx))
+    Ok(ctx.fuzzy_cache().insert_symbols(&key, &path, idx))
 }
 
 /// Open (or create + lazy-warm from PG) the per-project path
@@ -166,11 +167,13 @@ pub async fn open_path_trie(
     ctx: &SystemContext,
     project_name: &str,
 ) -> Result<Arc<FuzzyIndex<PathValue>>, McpError> {
+    let project_name = project_name.trim();
+    let project_id = project_id_or_err(ctx, project_name).await?;
     let data_dir = ctx.config().load().fuzzy.data_dir.clone();
-    let slug = crate::cron::fuzzy_sync::slugify(project_name);
-    let path = crate::cron::fuzzy_sync::trie_path(&data_dir, "paths", &slug);
+    let key = crate::cron::fuzzy_sync::project_artifact_key(project_id, project_name);
+    let path = crate::cron::fuzzy_sync::trie_path(&data_dir, "paths", &key);
 
-    if let Some(idx) = ctx.fuzzy_cache().get_paths(&slug, &path) {
+    if let Some(idx) = ctx.fuzzy_cache().get_paths(&key, &path) {
         return Ok(idx);
     }
 
@@ -178,7 +181,6 @@ pub async fn open_path_trie(
     let (idx, _recovery) = FuzzyIndex::<PathValue>::open_or_create(&path)
         .map_err(|e| McpError::internal_error(format!("fuzzy path trie open: {e}"), None))?;
     if fresh {
-        let project_id = project_id_or_err(ctx, project_name).await?;
         let pool = pool_or_err(ctx)?;
         rebuild_paths(pool, project_id, &idx).await.map_err(|e| {
             McpError::internal_error(format!("fuzzy path trie initial warm: {e}"), None)
@@ -190,7 +192,7 @@ pub async fn open_path_trie(
             "fuzzy path trie lazy-warmed from PG"
         );
     }
-    Ok(ctx.fuzzy_cache().insert_paths(&slug, &path, idx))
+    Ok(ctx.fuzzy_cache().insert_paths(&key, &path, idx))
 }
 
 /// Rebuild the workspace-global concept index from

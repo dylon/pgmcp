@@ -24,7 +24,7 @@ use serde_json::json;
 use tracing::{debug, error, info, warn};
 
 use crate::context::SystemContext;
-use crate::db::queries::language_summary;
+use crate::db::queries::LanguageCount;
 use crate::mcp::server::*;
 
 pub async fn tool_orient(
@@ -48,22 +48,38 @@ pub async fn tool_orient(
     // are best-effort — a missing table or query error yields 0, never fails.
     let social = social_envelope(pool).await;
 
-    // Project metadata
-    let project_meta: Option<crate::db::queries::ProjectInfo> = sqlx::query_as(
+    #[derive(sqlx::FromRow)]
+    struct ProjectMeta {
+        id: i32,
+        workspace_path: String,
+        path: String,
+        name: String,
+        git_common_dir: Option<String>,
+        git_root_commits: Option<String>,
+        discovered_at: Option<chrono::DateTime<chrono::Utc>>,
+        last_scanned_at: Option<chrono::DateTime<chrono::Utc>>,
+        file_count: Option<i64>,
+        match_count: i64,
+    }
+
+    // Project metadata. The window count makes duplicate display names fail
+    // from the same statement snapshot instead of arbitrarily picking one row.
+    let project_matches: Vec<ProjectMeta> = sqlx::query_as(
         "SELECT p.id, p.workspace_path, p.path, p.name,
                 p.git_common_dir, p.git_root_commits,
                 p.discovered_at, p.last_scanned_at,
-                (SELECT COUNT(*) FROM indexed_files f WHERE f.project_id = p.id) AS file_count
+                (SELECT COUNT(*) FROM indexed_files f WHERE f.project_id = p.id) AS file_count,
+                COUNT(*) OVER ()::int8 AS match_count
          FROM projects p
          WHERE p.name = $1
-         LIMIT 1",
+         ORDER BY p.path",
     )
     .bind(project_name)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("Project lookup failed: {}", e), None))?;
 
-    let Some(project) = project_meta else {
+    let Some(project_meta) = project_matches.into_iter().next() else {
         let body = json!({
             "found": false,
             "project_name": project_name,
@@ -74,11 +90,39 @@ pub async fn tool_orient(
             body.to_string(),
         )]));
     };
+    if project_meta.match_count > 1 {
+        return Err(McpError::invalid_params(
+            format!(
+                "Ambiguous project name '{}' matched {} indexed projects; use a unique project name from list_projects",
+                project_name, project_meta.match_count
+            ),
+            None,
+        ));
+    }
+    let project = crate::db::queries::ProjectInfo {
+        id: project_meta.id,
+        workspace_path: project_meta.workspace_path,
+        path: project_meta.path,
+        name: project_meta.name,
+        git_common_dir: project_meta.git_common_dir,
+        git_root_commits: project_meta.git_root_commits,
+        discovered_at: project_meta.discovered_at,
+        last_scanned_at: project_meta.last_scanned_at,
+        file_count: project_meta.file_count,
+    };
 
     // Languages
-    let languages = language_summary(pool, project_name)
-        .await
-        .map_err(|e| McpError::internal_error(format!("language_summary failed: {}", e), None))?;
+    let languages: Vec<LanguageCount> = sqlx::query_as(
+        "SELECT language, COUNT(*) AS count
+         FROM indexed_files
+         WHERE project_id = $1
+         GROUP BY language
+         ORDER BY count DESC",
+    )
+    .bind(project.id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| McpError::internal_error(format!("language_summary failed: {}", e), None))?;
 
     // Depth-2 tree (capped to 200 entries to bound output)
     let tree: Vec<String> = ctx
@@ -105,12 +149,11 @@ pub async fn tool_orient(
         "SELECT f.relative_path, f.language, fm.pagerank, fm.in_degree, fm.out_degree
          FROM file_metrics fm
          JOIN indexed_files f ON fm.file_id = f.id
-         JOIN projects p ON fm.project_id = p.id
-         WHERE p.name = $1 AND fm.pagerank IS NOT NULL
+         WHERE fm.project_id = $1 AND fm.pagerank IS NOT NULL
          ORDER BY fm.pagerank DESC NULLS LAST
          LIMIT 10",
     )
-    .bind(project_name)
+    .bind(project.id)
     .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("entry_points failed: {}", e), None))?;
@@ -127,12 +170,11 @@ pub async fn tool_orient(
     let recent: Vec<RecentFile> = sqlx::query_as(
         "SELECT f.relative_path, f.language, f.indexed_at
          FROM indexed_files f
-         JOIN projects p ON f.project_id = p.id
-         WHERE p.name = $1
+         WHERE f.project_id = $1
          ORDER BY f.indexed_at DESC NULLS LAST
          LIMIT 10",
     )
-    .bind(project_name)
+    .bind(project.id)
     .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("recent_files failed: {}", e), None))?;

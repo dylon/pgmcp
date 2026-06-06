@@ -6,21 +6,19 @@
 //! (add integration test, freeze API, refactor) based on which dimension
 //! dominates.
 
-#![allow(unused_imports)]
-
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, Content};
 use serde_json::json;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::context::SystemContext;
 use crate::db::queries;
 use crate::mcp::server::*;
-use crate::mcp::tools::fix_helpers::{lookup_project_id, pool_or_err};
 use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect;
+use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
 use crate::parsing::type_tags::vocabulary::{
     EFFECT_BLOCKING_IO, EFFECT_DATABASE, EFFECT_FILESYSTEM, EFFECT_IO, EFFECT_NETWORK,
 };
@@ -33,19 +31,31 @@ pub async fn tool_hot_path_audit(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().hot_path_audits.fetch_add(1, Ordering::Relaxed);
 
-    let percentile_threshold = params.percentile_threshold.unwrap_or(0.9).clamp(0.0, 1.0);
-    let limit = params.limit.unwrap_or(20).max(1);
+    let project = params.project.trim().to_string();
+    if project.is_empty() {
+        return Err(McpError::invalid_params("project must be non-empty", None));
+    }
+    let percentile_threshold = params.percentile_threshold.unwrap_or(0.9);
+    if !percentile_threshold.is_finite() {
+        return Err(McpError::invalid_params(
+            "percentile_threshold must be finite",
+            None,
+        ));
+    }
+    let percentile_threshold = percentile_threshold.clamp(0.0, 1.0);
+    let limit = params.limit.unwrap_or(20).clamp(1, 1000);
 
     debug!(
         tool = "hot_path_audit",
-        project = %params.project,
+        project = %project,
         percentile_threshold,
         limit,
         "MCP tool invoked",
     );
 
     let pool = pool_or_err(ctx)?;
-    let rows = queries::find_hot_paths(pool, &params.project, percentile_threshold, limit)
+    let project_id = project_id_or_err(ctx, &project).await?;
+    let rows = queries::find_hot_paths_by_project_id(pool, project_id, percentile_threshold, limit)
         .await
         .map_err(|e| McpError::internal_error(format!("Hot-path query failed: {}", e), None))?;
 
@@ -55,7 +65,7 @@ pub async fn tool_hot_path_audit(
                 "hot_paths": [],
                 "summary": { "p0_count": 0, "p1_count": 0, "p2_count": 0 },
                 "parameters": {
-                    "project": params.project,
+                    "project": project,
                     "percentile_threshold": percentile_threshold,
                     "limit": limit,
                 },
@@ -133,29 +143,26 @@ pub async fn tool_hot_path_audit(
 
     // Shadow-ASR channel: symbols on (or near) the hot path that carry
     // effects worth flagging — I/O, network, database, blocking_io.
-    let hot_path_effect_symbols = match lookup_project_id(ctx, &params.project).await {
-        Ok(Some(project_id)) => symbols_with_any_effect(
-            pool,
-            project_id,
-            &[
-                EFFECT_IO.to_string(),
-                EFFECT_NETWORK.to_string(),
-                EFFECT_FILESYSTEM.to_string(),
-                EFFECT_DATABASE.to_string(),
-                EFFECT_BLOCKING_IO.to_string(),
-            ],
-        )
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(symbol_id, file_id, name, scope_path)| {
-            serde_json::json!({
-                "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
-            })
+    let hot_path_effect_symbols = symbols_with_any_effect(
+        pool,
+        project_id,
+        &[
+            EFFECT_IO.to_string(),
+            EFFECT_NETWORK.to_string(),
+            EFFECT_FILESYSTEM.to_string(),
+            EFFECT_DATABASE.to_string(),
+            EFFECT_BLOCKING_IO.to_string(),
+        ],
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(symbol_id, file_id, name, scope_path)| {
+        serde_json::json!({
+            "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
         })
-        .collect::<Vec<_>>(),
-        _ => Vec::new(),
-    };
+    })
+    .collect::<Vec<_>>();
     let result = json!({
         "hot_paths": hot_paths,
         "summary": {
@@ -164,7 +171,7 @@ pub async fn tool_hot_path_audit(
             "p2_count": p2,
         },
         "parameters": {
-            "project": params.project,
+            "project": project,
             "percentile_threshold": percentile_threshold,
             "limit": limit,
         },

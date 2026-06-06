@@ -43,6 +43,7 @@ mod v27_agent_social;
 mod v28_project_deps_gitstate;
 mod v29_coordination;
 mod v2_shadow_asr;
+mod v30_chunk_delete_index_hardening;
 mod v3_cross_language_signatures;
 mod v4_work_items;
 mod v5_work_items_collab;
@@ -2422,6 +2423,14 @@ pub async fn run_migrations(
         v29_coordination::COORDINATION_V1,
         v29_coordination::COORDINATION_V1_NAME,
         || v29_coordination::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v30_chunk_delete_index_hardening::CHUNK_DELETE_INDEX_HARDENING_V1,
+        v30_chunk_delete_index_hardening::CHUNK_DELETE_INDEX_HARDENING_V1_NAME,
+        || v30_chunk_delete_index_hardening::apply(pool),
     )
     .await?;
 

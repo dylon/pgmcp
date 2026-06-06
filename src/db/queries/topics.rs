@@ -491,6 +491,92 @@ pub async fn find_orphan_chunks(
     }
 }
 
+/// Find chunks not assigned to any topic, scoped by resolved project id.
+pub async fn find_orphan_chunks_by_project_id(
+    pool: &PgPool,
+    project_id: Option<i32>,
+    language: Option<&str>,
+    limit: i32,
+) -> Result<Vec<OrphanChunkRow>, sqlx::Error> {
+    match (project_id, language) {
+        (Some(pid), Some(lang)) => {
+            sqlx::query_as::<_, OrphanChunkRow>(
+                "SELECT c.id as chunk_id, c.content, f.path, f.language,
+                        p.name as project_name, c.chunk_index
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM chunk_topic_assignments cta WHERE cta.chunk_id = c.id
+                 )
+                 AND f.project_id = $1 AND f.language = $2
+                 ORDER BY f.path, c.chunk_index
+                 LIMIT $3",
+            )
+            .bind(pid)
+            .bind(lang)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+        (Some(pid), None) => {
+            sqlx::query_as::<_, OrphanChunkRow>(
+                "SELECT c.id as chunk_id, c.content, f.path, f.language,
+                        p.name as project_name, c.chunk_index
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM chunk_topic_assignments cta WHERE cta.chunk_id = c.id
+                 )
+                 AND f.project_id = $1
+                 ORDER BY f.path, c.chunk_index
+                 LIMIT $2",
+            )
+            .bind(pid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+        (None, Some(lang)) => {
+            sqlx::query_as::<_, OrphanChunkRow>(
+                "SELECT c.id as chunk_id, c.content, f.path, f.language,
+                        p.name as project_name, c.chunk_index
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM chunk_topic_assignments cta WHERE cta.chunk_id = c.id
+                 )
+                 AND f.language = $1
+                 ORDER BY f.path, c.chunk_index
+                 LIMIT $2",
+            )
+            .bind(lang)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+        (None, None) => {
+            sqlx::query_as::<_, OrphanChunkRow>(
+                "SELECT c.id as chunk_id, c.content, f.path, f.language,
+                        p.name as project_name, c.chunk_index
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM chunk_topic_assignments cta WHERE cta.chunk_id = c.id
+                 )
+                 ORDER BY f.path, c.chunk_index
+                 LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+    }
+}
+
 /// File-level orphan summary.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct OrphanFileSummary {
@@ -541,6 +627,101 @@ pub async fn find_orphan_file_summary(
         )
         .fetch_all(pool)
         .await
+    }
+}
+
+/// Get file-level summary of orphan chunks, scoped by resolved project id and
+/// bounded for MCP response safety.
+pub async fn find_orphan_file_summary_by_project_id(
+    pool: &PgPool,
+    project_id: Option<i32>,
+    language: Option<&str>,
+    limit: i32,
+) -> Result<Vec<OrphanFileSummary>, sqlx::Error> {
+    match (project_id, language) {
+        (Some(pid), Some(lang)) => {
+            sqlx::query_as::<_, OrphanFileSummary>(
+                "SELECT f.path, p.name as project_name, f.language,
+                        COUNT(*) FILTER (WHERE cta.chunk_id IS NULL) as orphan_chunks,
+                        COUNT(*) as total_chunks,
+                        ROUND(100.0 * COUNT(*) FILTER (WHERE cta.chunk_id IS NULL) / COUNT(*), 1)::float8 as orphan_pct
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 LEFT JOIN chunk_topic_assignments cta ON cta.chunk_id = c.id
+                 WHERE f.project_id = $1 AND f.language = $2
+                 GROUP BY f.id, f.path, p.name, f.language
+                 HAVING COUNT(*) FILTER (WHERE cta.chunk_id IS NULL) > 0
+                 ORDER BY orphan_pct DESC, orphan_chunks DESC
+                 LIMIT $3",
+            )
+            .bind(pid)
+            .bind(lang)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+        (Some(pid), None) => {
+            sqlx::query_as::<_, OrphanFileSummary>(
+                "SELECT f.path, p.name as project_name, f.language,
+                        COUNT(*) FILTER (WHERE cta.chunk_id IS NULL) as orphan_chunks,
+                        COUNT(*) as total_chunks,
+                        ROUND(100.0 * COUNT(*) FILTER (WHERE cta.chunk_id IS NULL) / COUNT(*), 1)::float8 as orphan_pct
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 LEFT JOIN chunk_topic_assignments cta ON cta.chunk_id = c.id
+                 WHERE f.project_id = $1
+                 GROUP BY f.id, f.path, p.name, f.language
+                 HAVING COUNT(*) FILTER (WHERE cta.chunk_id IS NULL) > 0
+                 ORDER BY orphan_pct DESC, orphan_chunks DESC
+                 LIMIT $2",
+            )
+            .bind(pid)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+        (None, Some(lang)) => {
+            sqlx::query_as::<_, OrphanFileSummary>(
+                "SELECT f.path, p.name as project_name, f.language,
+                        COUNT(*) FILTER (WHERE cta.chunk_id IS NULL) as orphan_chunks,
+                        COUNT(*) as total_chunks,
+                        ROUND(100.0 * COUNT(*) FILTER (WHERE cta.chunk_id IS NULL) / COUNT(*), 1)::float8 as orphan_pct
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 LEFT JOIN chunk_topic_assignments cta ON cta.chunk_id = c.id
+                 WHERE f.language = $1
+                 GROUP BY f.id, f.path, p.name, f.language
+                 HAVING COUNT(*) FILTER (WHERE cta.chunk_id IS NULL) > 0
+                 ORDER BY orphan_pct DESC, orphan_chunks DESC
+                 LIMIT $2",
+            )
+            .bind(lang)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
+        (None, None) => {
+            sqlx::query_as::<_, OrphanFileSummary>(
+                "SELECT f.path, p.name as project_name, f.language,
+                        COUNT(*) FILTER (WHERE cta.chunk_id IS NULL) as orphan_chunks,
+                        COUNT(*) as total_chunks,
+                        ROUND(100.0 * COUNT(*) FILTER (WHERE cta.chunk_id IS NULL) / COUNT(*), 1)::float8 as orphan_pct
+                 FROM file_chunks c
+                 JOIN indexed_files f ON f.id = c.file_id
+                 JOIN projects p ON p.id = f.project_id
+                 LEFT JOIN chunk_topic_assignments cta ON cta.chunk_id = c.id
+                 GROUP BY f.id, f.path, p.name, f.language
+                 HAVING COUNT(*) FILTER (WHERE cta.chunk_id IS NULL) > 0
+                 ORDER BY orphan_pct DESC, orphan_chunks DESC
+                 LIMIT $1",
+            )
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+        }
     }
 }
 
@@ -602,6 +783,39 @@ pub async fn load_chunk_topic_assignments_for_files(
         .fetch_all(&mut *tx)
         .await?
     };
+    tx.commit().await?;
+    Ok(results)
+}
+
+/// Load chunk-to-topic assignments aggregated to file level for one resolved
+/// project id. This is the production path for name-scoped MCP tools because
+/// project display names are not globally unique.
+pub async fn load_chunk_topic_assignments_for_files_by_project_id(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Vec<FileTopicRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '2min'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("SET LOCAL application_name = 'pgmcp:heavy:topic-clustering'")
+        .execute(&mut *tx)
+        .await?;
+    let results = sqlx::query_as::<_, FileTopicRow>(
+        "SELECT f.path, p.name as project_name, ct.label as topic_label,
+                ct.id as topic_id, COUNT(*) as chunks_in_topic
+         FROM chunk_topic_assignments cta
+         JOIN file_chunks c ON c.id = cta.chunk_id
+         JOIN indexed_files f ON f.id = c.file_id
+         JOIN projects p ON p.id = f.project_id
+         JOIN code_topics ct ON ct.id = cta.topic_id
+         WHERE f.project_id = $1
+         GROUP BY f.path, p.name, ct.label, ct.id
+         ORDER BY f.path, chunks_in_topic DESC",
+    )
+    .bind(project_id)
+    .fetch_all(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(results)
 }
@@ -687,6 +901,61 @@ pub async fn find_coupled_files(
     .await
 }
 
+/// Project-id-scoped variant used by MCP tools after duplicate project-name
+/// resolution. This is the production-safe path: duplicate display names cannot
+/// merge unrelated git histories.
+pub async fn find_coupled_files_by_project_id(
+    pool: &PgPool,
+    project_id: i32,
+    min_coupling: f64,
+    min_commits: i32,
+) -> Result<Vec<CoupledFilePair>, sqlx::Error> {
+    sqlx::query_as::<_, CoupledFilePair>(
+        "WITH commit_sizes AS (
+            SELECT gcf.commit_id, COUNT(*) AS files_in_commit
+            FROM git_commit_files gcf
+            JOIN git_commits gc ON gc.id = gcf.commit_id
+            WHERE gc.project_id = $1
+            GROUP BY gcf.commit_id
+        ),
+        file_commits AS (
+            SELECT gcf.file_path, gcf.commit_id
+            FROM git_commit_files gcf
+            JOIN git_commits gc ON gc.id = gcf.commit_id
+            JOIN commit_sizes cs ON cs.commit_id = gcf.commit_id
+            WHERE gc.project_id = $1
+              AND cs.files_in_commit <= $4
+        ),
+        pair_counts AS (
+            SELECT a.file_path AS file_a, b.file_path AS file_b,
+                   COUNT(*) AS co_commits
+            FROM file_commits a
+            JOIN file_commits b ON a.commit_id = b.commit_id AND a.file_path < b.file_path
+            GROUP BY a.file_path, b.file_path
+        ),
+        file_totals AS (
+            SELECT file_path, COUNT(DISTINCT commit_id) AS total_commits
+            FROM file_commits
+            GROUP BY file_path
+        )
+        SELECT pc.file_a, pc.file_b, pc.co_commits,
+               ta.total_commits AS commits_a, tb.total_commits AS commits_b,
+               pc.co_commits::float8 / (ta.total_commits + tb.total_commits - pc.co_commits) AS jaccard
+        FROM pair_counts pc
+        JOIN file_totals ta ON ta.file_path = pc.file_a
+        JOIN file_totals tb ON tb.file_path = pc.file_b
+        WHERE pc.co_commits::float8 / (ta.total_commits + tb.total_commits - pc.co_commits) >= $2
+          AND pc.co_commits >= $3
+        ORDER BY jaccard DESC"
+    )
+    .bind(project_id)
+    .bind(min_coupling)
+    .bind(min_commits)
+    .bind(COCHANGE_MAX_FILES_PER_COMMIT)
+    .fetch_all(pool)
+    .await
+}
+
 /// Topic coverage row for test gap analysis.
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct TopicCoverageRow {
@@ -715,6 +984,28 @@ pub async fn get_test_topic_coverage(
          ORDER BY impl_chunks DESC"
     )
     .bind(project)
+    .fetch_all(pool)
+    .await
+}
+
+/// Get per-topic test vs implementation chunk counts for a resolved project id.
+pub async fn get_test_topic_coverage_by_project_id(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Vec<TopicCoverageRow>, sqlx::Error> {
+    sqlx::query_as::<_, TopicCoverageRow>(
+        "SELECT ct.id as topic_id, ct.label,
+                COUNT(*) FILTER (WHERE f.path ~ '(^|/)(tests?|specs?)(/|$)|_test\\.|\\btest_|\\.test\\.|_spec\\.|\\bspec_|\\.spec\\.') as test_chunks,
+                COUNT(*) FILTER (WHERE f.path !~ '(^|/)(tests?|specs?)(/|$)|_test\\.|\\btest_|\\.test\\.|_spec\\.|\\bspec_|\\.spec\\.') as impl_chunks
+         FROM chunk_topic_assignments cta
+         JOIN file_chunks c ON c.id = cta.chunk_id
+         JOIN indexed_files f ON f.id = c.file_id
+         JOIN code_topics ct ON ct.id = cta.topic_id
+         WHERE f.project_id = $1
+         GROUP BY ct.id, ct.label
+         ORDER BY impl_chunks DESC"
+    )
+    .bind(project_id)
     .fetch_all(pool)
     .await
 }
@@ -946,6 +1237,28 @@ pub async fn get_doc_topic_coverage(
          ORDER BY code_chunks DESC",
     )
     .bind(project)
+    .fetch_all(pool)
+    .await
+}
+
+/// Get per-topic documentation vs code chunk counts for one resolved project.
+pub async fn get_doc_topic_coverage_by_project_id(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Vec<DocCoverageRow>, sqlx::Error> {
+    sqlx::query_as::<_, DocCoverageRow>(
+        "SELECT ct.id as topic_id, ct.label, ct.keywords,
+                COUNT(*) FILTER (WHERE f.language = 'markdown') as doc_chunks,
+                COUNT(*) FILTER (WHERE f.language != 'markdown') as code_chunks
+         FROM chunk_topic_assignments cta
+         JOIN file_chunks c ON c.id = cta.chunk_id
+         JOIN indexed_files f ON f.id = c.file_id
+         JOIN code_topics ct ON ct.id = cta.topic_id
+         WHERE f.project_id = $1
+         GROUP BY ct.id, ct.label, ct.keywords
+         ORDER BY code_chunks DESC",
+    )
+    .bind(project_id)
     .fetch_all(pool)
     .await
 }

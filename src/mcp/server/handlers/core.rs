@@ -27,12 +27,13 @@ Code session transcripts, memory files, and plans from ~/.claude/.")]
         Parameters(params): Parameters<SemanticSearchParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "semantic_search",
             30,
             &_ctx,
             &summarize_debug(&params),
+            params.project.clone(),
             crate::mcp::tools::tool_semantic_search::tool_semantic_search(self.ctx(), params),
         )
         .await
@@ -49,12 +50,13 @@ Filter by project; use project: \"claude\" to search Claude Code session transcr
         Parameters(params): Parameters<TextSearchParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "text_search",
             30,
             &_ctx,
             &summarize_debug(&params),
+            params.project.clone(),
             crate::mcp::tools::tool_text_search::tool_text_search(self.ctx(), params),
         )
         .await
@@ -75,12 +77,13 @@ chunks) — finds typo'd / near-miss identifiers exact regex would miss; bound t
         Parameters(params): Parameters<GrepParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "grep",
             30,
             &_ctx,
             &summarize_debug(&params),
+            params.project.clone(),
             crate::mcp::tools::tool_grep::tool_grep(self.ctx(), params),
         )
         .await
@@ -135,12 +138,13 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
         Parameters(params): Parameters<OrientParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "orient",
             30,
             &_ctx,
             &summarize_debug(&params),
+            Some(params.project.clone()),
             crate::mcp::tools::tool_orient::tool_orient(self.ctx(), params),
         )
         .await
@@ -154,12 +158,13 @@ DO NOT USE WHEN: reading a file you just wrote this turn (not yet indexed), read
         Parameters(params): Parameters<MandateContextParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "mandate_context",
             30,
             &_ctx,
             &summarize_debug(&params),
+            params.project.clone(),
             crate::mcp::tools::tool_mandate_context::tool_mandate_context(self.ctx(), params),
         )
         .await
@@ -178,12 +183,13 @@ score."
         Parameters(params): Parameters<RecallPromptsParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "recall_prompts",
             30,
             &_ctx,
             &summarize_debug(&params),
+            params.project.clone(),
             crate::mcp::tools::tool_recall_prompts::tool_recall_prompts(self.ctx(), params),
         )
         .await

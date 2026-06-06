@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, Utc};
 use pgvector::Vector;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 // ============================================================================
@@ -20,6 +20,42 @@ use uuid::Uuid;
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_experiment(
     pool: &PgPool,
+    slug: &str,
+    title: &str,
+    question: &str,
+    context: Option<&str>,
+    kind: &str,
+    project_id: Option<i32>,
+    hardware_json: &str,
+    git_ref: Option<&str>,
+    plan_ref: Option<&str>,
+    correction: &str,
+    embedding: Option<Vector>,
+) -> Result<i64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let id = insert_experiment_in_tx(
+        &mut tx,
+        slug,
+        title,
+        question,
+        context,
+        kind,
+        project_id,
+        hardware_json,
+        git_ref,
+        plan_ref,
+        correction,
+        embedding,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Transactional variant of [`insert_experiment`].
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_experiment_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
     slug: &str,
     title: &str,
     question: &str,
@@ -51,7 +87,7 @@ pub async fn insert_experiment(
     .bind(plan_ref)
     .bind(correction)
     .bind(embedding)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await
 }
 
@@ -59,6 +95,36 @@ pub async fn insert_experiment(
 #[allow(clippy::too_many_arguments)]
 pub async fn insert_experiment_hypothesis(
     pool: &PgPool,
+    experiment_id: i64,
+    statement: &str,
+    primary_metric: &str,
+    unit: Option<&str>,
+    predicted_direction: &str,
+    acceptance_criterion_json: &str,
+    planned_n: Option<i32>,
+    embedding: Option<Vector>,
+) -> Result<i64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let id = insert_experiment_hypothesis_in_tx(
+        &mut tx,
+        experiment_id,
+        statement,
+        primary_metric,
+        unit,
+        predicted_direction,
+        acceptance_criterion_json,
+        planned_n,
+        embedding,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Transactional variant of [`insert_experiment_hypothesis`].
+#[allow(clippy::too_many_arguments)]
+pub async fn insert_experiment_hypothesis_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
     experiment_id: i64,
     statement: &str,
     primary_metric: &str,
@@ -83,7 +149,7 @@ pub async fn insert_experiment_hypothesis(
     .bind(acceptance_criterion_json)
     .bind(planned_n)
     .bind(embedding)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await
 }
 
@@ -259,6 +325,175 @@ pub async fn insert_experiment_samples(
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
+}
+
+/// Complete write payload for `experiment_record_measurement`.
+#[allow(clippy::too_many_arguments)]
+pub struct RecordExperimentMeasurement<'a> {
+    pub experiment_id: i64,
+    pub hypothesis_id: Option<i64>,
+    pub arm_label: &'a str,
+    pub arm_kind: &'a str,
+    pub command_spec_json: &'a str,
+    pub run_plan_json: &'a str,
+    pub host_meta_json: &'a str,
+    pub git_ref: Option<&'a str>,
+    pub runner: Option<&'a str>,
+    pub seed: i64,
+    pub metric_name: &'a str,
+    pub samples: &'a [f64],
+    pub unit_keys: Option<&'a [String]>,
+    pub is_warmup: bool,
+}
+
+/// Result of the atomic measurement write.
+pub struct RecordedExperimentMeasurement {
+    pub run_id: Uuid,
+    pub inserted_samples: u64,
+}
+
+/// Atomically find/create the run, append samples, and mark the experiment as
+/// measuring. The transaction takes exactly one advisory lock keyed by the run
+/// identity, which serializes concurrent NULL-hypothesis upserts without
+/// introducing a lock-order cycle.
+pub async fn record_experiment_measurement(
+    pool: &PgPool,
+    r: RecordExperimentMeasurement<'_>,
+) -> Result<RecordedExperimentMeasurement, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let res = async {
+        let (lock_a, lock_b) =
+            experiment_run_advisory_lock_key(r.experiment_id, r.hypothesis_id, r.arm_label);
+        sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+            .bind(lock_a)
+            .bind(lock_b)
+            .execute(&mut *tx)
+            .await?;
+
+        let existing: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM experiment_runs
+             WHERE experiment_id = $1 AND hypothesis_id IS NOT DISTINCT FROM $2 AND arm_label = $3
+             LIMIT 1",
+        )
+        .bind(r.experiment_id)
+        .bind(r.hypothesis_id)
+        .bind(r.arm_label)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let run_id = if let Some(id) = existing {
+            sqlx::query(
+                "UPDATE experiment_runs
+                 SET arm_kind = $2::experiment_arm_kind, command_spec = $3::jsonb,
+                     run_plan = $4::jsonb, host_meta = $5::jsonb, git_ref = $6,
+                     runner = $7, seed = $8, status = 'complete', finished_at = NOW()
+                 WHERE id = $1",
+            )
+            .bind(id)
+            .bind(r.arm_kind)
+            .bind(r.command_spec_json)
+            .bind(r.run_plan_json)
+            .bind(r.host_meta_json)
+            .bind(r.git_ref)
+            .bind(r.runner)
+            .bind(r.seed)
+            .execute(&mut *tx)
+            .await?;
+            id
+        } else {
+            let id = Uuid::new_v4();
+            sqlx::query(
+                "INSERT INTO experiment_runs
+                    (id, experiment_id, hypothesis_id, arm_label, arm_kind, command_spec,
+                     run_plan, host_meta, git_ref, runner, seed, status, started_at, finished_at)
+                 VALUES ($1, $2, $3, $4, $5::experiment_arm_kind, $6::jsonb, $7::jsonb,
+                         $8::jsonb, $9, $10, $11, 'complete', NOW(), NOW())",
+            )
+            .bind(id)
+            .bind(r.experiment_id)
+            .bind(r.hypothesis_id)
+            .bind(r.arm_label)
+            .bind(r.arm_kind)
+            .bind(r.command_spec_json)
+            .bind(r.run_plan_json)
+            .bind(r.host_meta_json)
+            .bind(r.git_ref)
+            .bind(r.runner)
+            .bind(r.seed)
+            .execute(&mut *tx)
+            .await?;
+            id
+        };
+
+        let indices: Vec<i32> = (0..r.samples.len() as i32).collect();
+        let values: Vec<f64> = r.samples.to_vec();
+        let keys: Vec<Option<String>> = match r.unit_keys {
+            Some(k) => k.iter().map(|s| Some(s.clone())).collect(),
+            None => vec![None; r.samples.len()],
+        };
+        let inserted_samples = if r.samples.is_empty() {
+            0
+        } else {
+            sqlx::query(
+                "INSERT INTO experiment_samples
+                    (run_id, arm, metric_name, replicate_index, value, unit_key, is_warmup)
+                 SELECT $1, $2, $3, t.idx, t.val, t.uk, $7
+                 FROM UNNEST($4::int[], $5::double precision[], $6::text[]) AS t(idx, val, uk)",
+            )
+            .bind(run_id)
+            .bind(r.arm_label)
+            .bind(r.metric_name)
+            .bind(&indices)
+            .bind(&values)
+            .bind(&keys)
+            .bind(r.is_warmup)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        };
+
+        sqlx::query(
+            "UPDATE experiments SET status = 'measuring'::experiment_status, updated_at = NOW()
+             WHERE id = $1",
+        )
+        .bind(r.experiment_id)
+        .execute(&mut *tx)
+        .await?;
+
+        Ok::<RecordedExperimentMeasurement, sqlx::Error>(RecordedExperimentMeasurement {
+            run_id,
+            inserted_samples,
+        })
+    }
+    .await;
+
+    match res {
+        Ok(recorded) => {
+            tx.commit().await?;
+            Ok(recorded)
+        }
+        Err(e) => {
+            let _ = tx.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+fn experiment_run_advisory_lock_key(
+    experiment_id: i64,
+    hypothesis_id: Option<i64>,
+    arm_label: &str,
+) -> (i32, i32) {
+    let mut high = experiment_id as u64;
+    high ^= (hypothesis_id.unwrap_or(-1) as u64).rotate_left(17);
+
+    let mut low = 0x811c9dc5u32;
+    for byte in arm_label.as_bytes() {
+        low ^= u32::from(*byte);
+        low = low.wrapping_mul(0x01000193);
+    }
+
+    (high as u32 as i32, low as i32)
 }
 
 /// Set an experiment's lifecycle status.
@@ -481,6 +716,84 @@ pub async fn insert_experiment_result(
     .bind(r.observation_id)
     .fetch_one(pool)
     .await
+}
+
+/// Atomically persist the decision row and publish the experiment/hypothesis
+/// status updates that make the decision visible.
+pub async fn insert_experiment_decision(
+    pool: &PgPool,
+    r: InsertExperimentResult<'_>,
+) -> Result<i64, sqlx::Error> {
+    let experiment_id = r.experiment_id;
+    let hypothesis_id = r.hypothesis_id;
+    let verdict = r.verdict.to_string();
+    let observation_id = r.observation_id;
+
+    let mut tx = pool.begin().await?;
+    let result_id: i64 = sqlx::query_scalar(
+        "INSERT INTO experiment_results
+            (experiment_id, hypothesis_id, test_type, metric_name, control_run_id,
+             treatment_run_id, statistic, df, p_value, effect_size, effect_size_kind,
+             ci_low, ci_high, ci_level, verdict, accepted, correction,
+             criterion_snapshot, test_result, rationale, decided_by, embedding,
+             observation_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                 $15::hypothesis_verdict, $16, $17, $18::jsonb, $19::jsonb, $20, $21, $22, $23)
+         RETURNING id",
+    )
+    .bind(r.experiment_id)
+    .bind(r.hypothesis_id)
+    .bind(r.test_type)
+    .bind(r.metric_name)
+    .bind(r.control_run_id)
+    .bind(r.treatment_run_id)
+    .bind(r.statistic)
+    .bind(r.df)
+    .bind(r.p_value)
+    .bind(r.effect_size)
+    .bind(r.effect_size_kind)
+    .bind(r.ci_low)
+    .bind(r.ci_high)
+    .bind(r.ci_level)
+    .bind(r.verdict)
+    .bind(r.accepted)
+    .bind(r.correction)
+    .bind(r.criterion_snapshot_json)
+    .bind(r.test_result_json)
+    .bind(r.rationale)
+    .bind(r.decided_by)
+    .bind(r.embedding)
+    .bind(r.observation_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query("UPDATE experiment_hypotheses SET verdict = $2::hypothesis_verdict WHERE id = $1")
+        .bind(hypothesis_id)
+        .bind(&verdict)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE experiments SET status = $2::experiment_status, updated_at = NOW() WHERE id = $1",
+    )
+    .bind(experiment_id)
+    .bind("decided")
+    .execute(&mut *tx)
+    .await?;
+    if let Some(oid) = observation_id {
+        sqlx::query("UPDATE experiment_results SET observation_id = $2 WHERE id = $1")
+            .bind(result_id)
+            .bind(oid)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE experiments SET observation_id = $2, updated_at = NOW() WHERE id = $1")
+            .bind(experiment_id)
+            .bind(oid)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    tx.commit().await?;
+    Ok(result_id)
 }
 
 /// Set a hypothesis's verdict.

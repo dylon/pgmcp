@@ -23,6 +23,7 @@ use rmcp::model::CallToolResult;
 use serde_json::json;
 
 use crate::context::SystemContext;
+use crate::fuzzy::limits::{bounded_limit, bounded_max_distance};
 use crate::fuzzy::phonetic::articulatory_distance_score;
 use crate::fuzzy::sync::open_symbol_trie;
 use crate::mcp::server::FuzzySymbolSearchParams;
@@ -35,8 +36,8 @@ pub async fn run(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
 
     let idx = open_symbol_trie(ctx, &params.project).await?;
-    let max_d = params.max_distance.unwrap_or(2) as usize;
-    let limit = params.limit.unwrap_or(20) as usize;
+    let max_d = bounded_max_distance(params.max_distance);
+    let limit = bounded_limit(params.limit);
     let phonetic = params.phonetic.unwrap_or(false);
 
     // Edit mode (default): the persistent trie returns (term, distance, value)

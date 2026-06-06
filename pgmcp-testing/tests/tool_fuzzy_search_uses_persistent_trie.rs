@@ -23,7 +23,7 @@ use std::sync::Arc;
 use arc_swap::ArcSwap;
 use pgmcp::config::Config;
 use pgmcp::context::SystemContext;
-use pgmcp::cron::fuzzy_sync::{slugify, trie_path};
+use pgmcp::cron::fuzzy_sync::{project_artifact_key, trie_path};
 use pgmcp::daemon_state::DaemonLifecycle;
 use pgmcp::db::DbClient;
 use pgmcp::embed::EmbedSource;
@@ -37,7 +37,11 @@ use pgmcp::stats::tracker::StatsTracker;
 use pgmcp_testing::mocks::DeterministicEmbeddingBackend;
 use pgmcp_testing::require_test_db;
 
-async fn seed_project_with_symbols(pool: &sqlx::PgPool, project_name: &str, symbol_names: &[&str]) {
+async fn seed_project_with_symbols(
+    pool: &sqlx::PgPool,
+    project_name: &str,
+    symbol_names: &[&str],
+) -> i32 {
     let project_id: i32 = sqlx::query_scalar(
         "INSERT INTO projects (workspace_path, path, name) VALUES ($1, $2, $3)
          ON CONFLICT (path) DO UPDATE SET workspace_path = $1 RETURNING id",
@@ -80,6 +84,7 @@ async fn seed_project_with_symbols(pool: &sqlx::PgPool, project_name: &str, symb
         .await
         .expect("symbol");
     }
+    project_id
 }
 
 fn build_ctx_with_data_dir(db: Arc<dyn DbClient>, data_dir: std::path::PathBuf) -> SystemContext {
@@ -105,11 +110,17 @@ fn build_ctx_with_data_dir(db: Arc<dyn DbClient>, data_dir: std::path::PathBuf) 
 #[tokio::test(flavor = "multi_thread")]
 async fn lazy_warm_from_empty() {
     let testdb = require_test_db!();
-    seed_project_with_symbols(testdb.pool(), "lazy_warm_test", &["alpha_unique_function"]).await;
+    let project_id =
+        seed_project_with_symbols(testdb.pool(), "lazy_warm_test", &["alpha_unique_function"])
+            .await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let data_dir = tmp.path().to_path_buf();
-    let expected_path = trie_path(&data_dir, "symbols", &slugify("lazy_warm_test"));
+    let expected_path = trie_path(
+        &data_dir,
+        "symbols",
+        &project_artifact_key(project_id, "lazy_warm_test"),
+    );
     assert!(
         !expected_path.exists(),
         "trie file must not exist before the call: {}",
@@ -156,11 +167,16 @@ async fn lazy_warm_from_empty() {
 async fn persistent_trie_beats_stale_pg() {
     let testdb = require_test_db!();
     // PG carries the stale symbol; the trie carries the authoritative one.
-    seed_project_with_symbols(testdb.pool(), "trie_beats_pg", &["pg_old_func"]).await;
+    let project_id =
+        seed_project_with_symbols(testdb.pool(), "trie_beats_pg", &["pg_old_func"]).await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
     let data_dir = tmp.path().to_path_buf();
-    let trie_file = trie_path(&data_dir, "symbols", &slugify("trie_beats_pg"));
+    let trie_file = trie_path(
+        &data_dir,
+        "symbols",
+        &project_artifact_key(project_id, "trie_beats_pg"),
+    );
 
     // Pre-populate the trie so lazy-warm DOES NOT run on the first
     // tool call.
@@ -212,4 +228,69 @@ async fn persistent_trie_beats_stale_pg() {
         !terms.iter().any(|t| t == &"pg_old_func"),
         "tool must NOT consult PG once the trie exists; got {terms:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn request_bounds_are_clamped_before_querying_persistent_trie() {
+    let testdb = require_test_db!();
+    let project_id = seed_project_with_symbols(testdb.pool(), "bounded_fuzzy", &[]).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let data_dir = tmp.path().to_path_buf();
+    let trie_file = trie_path(
+        &data_dir,
+        "symbols",
+        &project_artifact_key(project_id, "bounded_fuzzy"),
+    );
+
+    let (idx, _recovery) =
+        FuzzyIndex::<SymbolValue>::open_or_create(&trie_file).expect("open_or_create");
+    idx.upsert(
+        "bounded_alpha",
+        SymbolValue {
+            file_id: 1,
+            kind: "function".to_string(),
+            visibility: "public".to_string(),
+            line: 1,
+        },
+    )
+    .expect("upsert alpha");
+    idx.upsert(
+        "bounded_beta",
+        SymbolValue {
+            file_id: 2,
+            kind: "function".to_string(),
+            visibility: "public".to_string(),
+            line: 2,
+        },
+    )
+    .expect("upsert beta");
+    drop(idx);
+
+    let ctx = build_ctx_with_data_dir(Arc::new(testdb.pool().clone()), data_dir);
+    let result = tool_fuzzy_symbol_search::run(
+        &ctx,
+        FuzzySymbolSearchParams {
+            query: "bounded_alpha".to_string(),
+            project: "bounded_fuzzy".to_string(),
+            max_distance: Some(u32::MAX),
+            limit: Some(0),
+            phonetic: None,
+        },
+    )
+    .await
+    .expect("tool call");
+    let text = result
+        .content
+        .iter()
+        .find_map(|c| c.as_text().map(|t| t.text.clone()))
+        .expect("text");
+    let val: serde_json::Value = serde_json::from_str(&text).expect("json");
+    assert_eq!(val["max_distance"].as_u64(), Some(64));
+    let hits = val["hits"].as_array().expect("hits");
+    assert_eq!(
+        hits.len(),
+        1,
+        "limit=0 must clamp to a finite non-empty result window"
+    );
+    assert_eq!(hits[0]["term"], "bounded_alpha");
 }

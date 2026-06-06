@@ -24,6 +24,10 @@ use crate::ontology::facet::Facet;
 use crate::tracker::transition::Actor;
 
 fn parse_facet(s: &str) -> Result<Facet, McpError> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(McpError::invalid_params("facet must not be blank", None));
+    }
     Facet::parse(s).ok_or_else(|| {
         McpError::invalid_params(format!("unknown facet `{s}` (see Facet::ALL)"), None)
     })
@@ -249,16 +253,27 @@ pub async fn tool_ontology_create_concept(
     params: OntologyCreateConceptParams,
 ) -> Result<CallToolResult, McpError> {
     let pool = pool_or_err(ctx)?;
+    let name = queries::normalize_concept_name(&params.name)
+        .map_err(|msg| McpError::invalid_params(format!("invalid concept name: {msg}"), None))?;
     let facet = parse_facet(&params.facet)?;
-    let (entity_id, created) = queries::create_concept(pool, &params.name, facet, Actor::Agent)
+    let (entity_id, created) = queries::create_concept(pool, &name, facet, Actor::Agent)
         .await
         .map_err(db_err)?;
+    let meta = queries::get_concept_meta(pool, entity_id)
+        .await
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            McpError::internal_error(
+                format!("ontology concept {entity_id} has no metadata after create"),
+                None,
+            )
+        })?;
     json_result(&json!({
         "entity_id": entity_id,
         "created": created,
-        "name": params.name,
-        "facet": facet.as_str(),
-        "status": "candidate",
+        "name": name,
+        "facet": meta.facet,
+        "status": meta.status,
     }))
 }
 

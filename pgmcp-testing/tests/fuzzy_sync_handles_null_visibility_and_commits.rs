@@ -16,7 +16,7 @@
 //! always inserts `visibility = 'public'` and never seeds commits, which is
 //! exactly why both bugs escaped CI.
 
-use pgmcp::cron::fuzzy_sync::{slugify, trie_path};
+use pgmcp::cron::fuzzy_sync::{project_artifact_key, trie_path};
 use pgmcp::fuzzy::persistent_artrie::FuzzyIndex;
 use pgmcp::fuzzy::sync::{rebuild_commits, rebuild_symbols};
 use pgmcp::fuzzy::values::{CommitRef, SymbolValue};
@@ -101,7 +101,11 @@ async fn rebuild_symbols_tolerates_null_visibility() {
         seed_project_with_null_visibility_symbol(testdb.pool(), project, "null_vis_symbol").await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let path = trie_path(tmp.path(), "symbols", &slugify(project));
+    let path = trie_path(
+        tmp.path(),
+        "symbols",
+        &project_artifact_key(project_id, project),
+    );
     let (idx, _recovery) =
         FuzzyIndex::<SymbolValue>::open_or_create(&path).expect("open_or_create");
 
@@ -131,7 +135,11 @@ async fn rebuild_commits_uses_commit_hash_column() {
     seed_commit(testdb.pool(), project_id, "Fix the thing", "abc123def456").await;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let path = trie_path(tmp.path(), "commits", &slugify(project));
+    let path = trie_path(
+        tmp.path(),
+        "commits",
+        &project_artifact_key(project_id, project),
+    );
     let (idx, _recovery) = FuzzyIndex::<CommitRef>::open_or_create(&path).expect("open_or_create");
 
     // Pre-fix this returned: "commit fetch: ... column \"sha\" does not exist".

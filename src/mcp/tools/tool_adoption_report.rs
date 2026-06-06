@@ -31,7 +31,14 @@ pub async fn tool_adoption_report(
         .await
         .map_err(|e| McpError::internal_error(format!("adoption query failed: {e}"), None))?;
 
-    let body = match params.format.as_deref().unwrap_or("json") {
+    let format = params
+        .format
+        .as_deref()
+        .map(str::trim)
+        .filter(|format| !format.is_empty())
+        .unwrap_or("json");
+
+    let body = match format {
         "markdown" | "md" => report.to_markdown(),
         "json" => serde_json::to_string_pretty(&report.to_json())
             .unwrap_or_else(|_| report.to_json().to_string()),

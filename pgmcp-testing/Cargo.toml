@@ -31,6 +31,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # Test harness deps. Promoted from dev-dependencies because they're used by
 # `lib` modules (db_harness, cli_harness) that external test files import.
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "signal", "sync", "time", "process", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 thiserror = "2"
 uuid = { version = "1", features = ["v7"] }
 dirs = "6"

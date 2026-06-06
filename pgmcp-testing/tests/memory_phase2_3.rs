@@ -11,9 +11,11 @@
 //!
 //! Skips cleanly with `SKIPPED:` if no test DB is configured.
 
+use pgmcp::db::queries::{self, NewEntityInput, ScopeSpec};
 use pgmcp_testing::pool_tool_helpers::server_with_pool;
 use pgmcp_testing::require_test_db;
 use serde_json::Value;
+use uuid::Uuid;
 
 fn extract_json(call_result: &rmcp::model::CallToolResult) -> Value {
     for content in &call_result.content {
@@ -349,6 +351,248 @@ async fn create_entities_rejects_empty_input() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn create_entities_rejects_invalid_payload_before_scope_write() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let server = server_with_pool(pool.clone());
+    let user_id = format!("invalid-create-scope-{}", Uuid::new_v4().simple());
+
+    let err = server
+        .call_tool_cli(
+            "memory_create_entities",
+            serde_json::json!({
+                "scope": {"user_id": user_id.clone()},
+                "entities": [{"name": "   ", "entity_type": "concept"}]
+            }),
+        )
+        .await
+        .expect_err("blank entity name must fail");
+
+    assert!(
+        err.to_string().contains("entity name must not be blank"),
+        "unexpected validation error: {err}"
+    );
+
+    let scope_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM memory_scope WHERE user_id = $1")
+            .bind(&user_id)
+            .fetch_one(pool)
+            .await
+            .expect("count memory_scope rows");
+    assert_eq!(
+        scope_count, 0,
+        "invalid create request must not create a scope row"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_entities_normalizes_identity_and_reports_actual_inserts() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let server = server_with_pool(pool.clone());
+    let name = format!("normalized-create-{}", Uuid::new_v4().simple());
+
+    let first = server
+        .call_tool_cli(
+            "memory_create_entities",
+            serde_json::json!({
+                "entities": [
+                    {
+                        "name": format!("  {name}  "),
+                        "entity_type": "  concept  ",
+                        "observations": ["deduped observation", "deduped observation"]
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("first create");
+    let first_body = extract_json(&first);
+    assert_eq!(
+        first_body.get("entities_created").and_then(Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        first_body.get("entities_processed").and_then(Value::as_i64),
+        Some(1)
+    );
+    assert_eq!(
+        first_body
+            .get("observations_attached")
+            .and_then(Value::as_i64),
+        Some(1),
+        "duplicate observations in one create request should attach once"
+    );
+
+    let second = server
+        .call_tool_cli(
+            "memory_create_entities",
+            serde_json::json!({
+                "entities": [
+                    {
+                        "name": name.clone(),
+                        "entity_type": "concept",
+                        "observations": ["deduped observation"]
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("second create");
+    let second_body = extract_json(&second);
+    assert_eq!(
+        second_body.get("entities_created").and_then(Value::as_i64),
+        Some(0),
+        "second create should reuse the active normalized identity"
+    );
+    assert_eq!(
+        second_body
+            .get("observations_attached")
+            .and_then(Value::as_i64),
+        Some(0),
+        "duplicate active observations should not be reinserted"
+    );
+
+    let active_entities: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM memory_entities
+         WHERE name = $1 AND entity_type = 'concept' AND valid_to IS NULL",
+    )
+    .bind(&name)
+    .fetch_one(pool)
+    .await
+    .expect("count active normalized entities");
+    assert_eq!(active_entities, 1);
+
+    let active_observations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM memory_observations o
+         JOIN memory_entities e ON e.id = o.entity_id
+         WHERE e.name = $1
+           AND e.entity_type = 'concept'
+           AND e.valid_to IS NULL
+           AND o.valid_to IS NULL",
+    )
+    .bind(&name)
+    .fetch_one(pool)
+    .await
+    .expect("count active normalized observations");
+    assert_eq!(active_observations, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_entities_rejects_preexisting_duplicate_active_identity() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let server = server_with_pool(pool.clone());
+    let name = format!("duplicate-active-create-{}", Uuid::new_v4().simple());
+
+    sqlx::query(
+        "INSERT INTO memory_entities (name, entity_type, source, valid_from)
+         VALUES
+            ($1, 'concept', 'agent_write'::memory_source, NOW() - INTERVAL '1 second'),
+            ($1, 'concept', 'agent_write'::memory_source, NOW())",
+    )
+    .bind(&name)
+    .execute(pool)
+    .await
+    .expect("seed duplicate active identities");
+
+    let err = server
+        .call_tool_cli(
+            "memory_create_entities",
+            serde_json::json!({
+                "entities": [
+                    {"name": name, "entity_type": "concept", "observations": ["must not attach"]}
+                ]
+            }),
+        )
+        .await
+        .expect_err("duplicate active identity must fail closed");
+
+    assert!(
+        err.to_string()
+            .contains("ambiguous active memory entity identity"),
+        "unexpected duplicate identity error: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_entities_concurrent_same_identity_is_single_active_row() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let scope_id = queries::find_or_create_scope(&pool, &ScopeSpec::default())
+        .await
+        .expect("scope");
+    let name = format!("concurrent-create-{}", Uuid::new_v4().simple());
+
+    let mut handles = Vec::new();
+    for i in 0..16 {
+        let pool = pool.clone();
+        let name = name.clone();
+        handles.push(tokio::spawn(async move {
+            let inputs = vec![NewEntityInput {
+                name,
+                entity_type: "concept".to_string(),
+                observations: vec![format!("observation-{i}")],
+            }];
+            queries::memory_create_entities_detailed(&pool, &inputs, scope_id, "agent_write").await
+        }));
+    }
+
+    let mut entity_ids = Vec::new();
+    let mut inserted_entities = 0usize;
+    let mut inserted_observations = 0usize;
+    for handle in handles {
+        let result = handle
+            .await
+            .expect("join concurrent create")
+            .expect("create entity");
+        entity_ids.extend(result.entity_ids);
+        inserted_entities += result.entities_inserted;
+        inserted_observations += result.observations_inserted;
+    }
+
+    assert_eq!(
+        inserted_entities, 1,
+        "concurrent creates should insert exactly one active entity"
+    );
+    assert_eq!(
+        inserted_observations, 16,
+        "distinct observations should all attach once"
+    );
+    let first_id = *entity_ids.first().expect("at least one returned entity id");
+    assert!(
+        entity_ids.iter().all(|id| *id == first_id),
+        "all concurrent callers should observe the same entity id: {entity_ids:?}"
+    );
+
+    let active_entities: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM memory_entities
+         WHERE name = $1 AND entity_type = 'concept' AND valid_to IS NULL",
+    )
+    .bind(&name)
+    .fetch_one(&pool)
+    .await
+    .expect("count active race entities");
+    assert_eq!(active_entities, 1);
+
+    let active_observations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM memory_observations o
+         JOIN memory_entities e ON e.id = o.entity_id
+         WHERE e.name = $1
+           AND e.entity_type = 'concept'
+           AND e.valid_to IS NULL
+           AND o.valid_to IS NULL",
+    )
+    .bind(&name)
+    .fetch_one(&pool)
+    .await
+    .expect("count active race observations");
+    assert_eq!(active_observations, 16);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn delete_observations_soft_deletes_targeted_content() {
     let db = require_test_db!();
     let pool = db.pool();
@@ -461,5 +705,43 @@ async fn add_observations_dedupes_repeat_inserts() {
         body.get("observations_added").and_then(Value::as_i64),
         Some(0),
         "duplicate observations must dedupe"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn add_observations_rejects_ambiguous_active_entity_name() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let server = server_with_pool(pool.clone());
+    let name = format!("ambiguous-add-{}", Uuid::new_v4().simple());
+
+    server
+        .call_tool_cli(
+            "memory_create_entities",
+            serde_json::json!({
+                "entities": [
+                    {"name": name, "entity_type": "concept"},
+                    {"name": name, "entity_type": "person"}
+                ]
+            }),
+        )
+        .await
+        .expect("create ambiguous entities");
+
+    let err = server
+        .call_tool_cli(
+            "memory_add_observations",
+            serde_json::json!({
+                "observations": [
+                    {"entity_name": name, "contents": ["must not attach arbitrarily"]}
+                ]
+            }),
+        )
+        .await
+        .expect_err("ambiguous entity name must fail closed");
+
+    assert!(
+        err.to_string().contains("ambiguous memory entity name"),
+        "unexpected ambiguity error: {err}"
     );
 }

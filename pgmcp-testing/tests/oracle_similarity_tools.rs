@@ -443,7 +443,9 @@ async fn find_duplicates_union_find_clusters_match_hand_traced_groups() {
         .await
         .expect("call");
     let v: serde_json::Value = serde_json::from_str(&text_of(&result)).expect("json");
-    let clusters = v.as_array().expect("array");
+    let clusters = v["embedding_clusters"]
+        .as_array()
+        .expect("embedding_clusters array");
     assert_eq!(
         clusters.len(),
         2,
@@ -458,6 +460,122 @@ async fn find_duplicates_union_find_clusters_match_hand_traced_groups() {
         sizes,
         std::collections::BTreeSet::from([2, 3]),
         "clusters must be of sizes {{2, 3}}"
+    );
+}
+
+#[tokio::test]
+async fn find_duplicates_normalizes_filter_bounds() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let _ = seed_two_clusters(&pool).await;
+    let server = server_with_pool_and_deterministic_embed(pool);
+
+    let result = server
+        .call_tool_cli(
+            "find_duplicates",
+            serde_json::json!({
+                "min_similarity": -1.0,
+                "min_projects": 0,
+                "language": " RUST ",
+                "limit": -10
+            }),
+        )
+        .await
+        .expect("call");
+    let v: serde_json::Value = serde_json::from_str(&text_of(&result)).expect("json");
+
+    assert_eq!(v["filters"]["min_similarity"].as_f64(), Some(0.0));
+    assert_eq!(v["filters"]["min_projects"].as_u64(), Some(1));
+    assert_eq!(v["filters"]["language"].as_str(), Some("rust"));
+    assert_eq!(v["filters"]["limit"].as_u64(), Some(1));
+    assert_eq!(
+        v["embedding_clusters"].as_array().expect("clusters").len(),
+        1,
+        "negative limit must clamp to one cluster"
+    );
+}
+
+async fn insert_symbol(pool: &PgPool, file_id: i64, name: &str) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO file_symbols (file_id, name, kind, start_line, end_line, signature)
+         VALUES ($1, $2, 'function', 1, 5, $3)
+         RETURNING id",
+    )
+    .bind(file_id)
+    .bind(name)
+    .bind(format!("fn {name}()"))
+    .fetch_one(pool)
+    .await
+    .expect("symbol")
+}
+
+#[tokio::test]
+async fn find_duplicates_cross_language_rejects_stale_project_rows() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let rust_project = insert_project(&pool, "dup-xlang-rust").await;
+    let py_project = insert_project(&pool, "dup-xlang-python").await;
+    let stale_project = insert_project(&pool, "dup-xlang-stale").await;
+    let rust_file = insert_file(&pool, rust_project, "xlang/rust.rs", 20).await;
+    let py_file = insert_file(&pool, py_project, "xlang/python.py", 20).await;
+    let stale_file = insert_file(&pool, rust_project, "xlang/stale.rs", 20).await;
+    sqlx::query("UPDATE indexed_files SET language = 'python' WHERE id = $1")
+        .bind(py_file)
+        .execute(&pool)
+        .await
+        .expect("python language");
+
+    let rust_symbol = insert_symbol(&pool, rust_file, "authenticate").await;
+    let py_symbol = insert_symbol(&pool, py_file, "authenticate").await;
+    let stale_a = insert_symbol(&pool, stale_file, "stale_authenticate").await;
+    let stale_b = insert_symbol(&pool, py_file, "stale_authenticate").await;
+
+    sqlx::query(
+        "INSERT INTO cross_language_signature_clones
+         (symbol_id_a, symbol_id_b, signature_shape_hash, similarity,
+          language_a, language_b, project_id_a, project_id_b)
+         VALUES ($1, $2, 41, 0.95, 'rust', 'python', $3, $4)",
+    )
+    .bind(rust_symbol.min(py_symbol))
+    .bind(rust_symbol.max(py_symbol))
+    .bind(rust_project)
+    .bind(py_project)
+    .execute(&pool)
+    .await
+    .expect("valid cross-language clone");
+
+    sqlx::query(
+        "INSERT INTO cross_language_signature_clones
+         (symbol_id_a, symbol_id_b, signature_shape_hash, similarity,
+          language_a, language_b, project_id_a, project_id_b)
+         VALUES ($1, $2, 42, 0.99, 'rust', 'python', $3, $4)",
+    )
+    .bind(stale_a.min(stale_b))
+    .bind(stale_a.max(stale_b))
+    .bind(stale_project)
+    .bind(py_project)
+    .execute(&pool)
+    .await
+    .expect("stale cross-language clone");
+
+    let server = server_with_pool_and_deterministic_embed(pool);
+    let result = server
+        .call_tool_cli(
+            "find_duplicates",
+            serde_json::json!({"min_similarity": 0.9, "language": "python", "limit": 10}),
+        )
+        .await
+        .expect("call");
+    let v: serde_json::Value = serde_json::from_str(&text_of(&result)).expect("json");
+    let pairs = v["cross_language_symbol_pairs"]
+        .as_array()
+        .expect("cross-language pairs");
+
+    assert_eq!(pairs.len(), 1, "stale project-id clone leaked: {v}");
+    assert_eq!(
+        pairs[0]["symbol_name_a"].as_str(),
+        Some("authenticate"),
+        "expected the live symbol pair, not the stale higher-similarity row"
     );
 }
 

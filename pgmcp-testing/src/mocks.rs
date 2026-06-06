@@ -356,6 +356,38 @@ impl DbClient for MockDbClient {
         })
     }
 
+    async fn replace_indexed_file(
+        &self,
+        replacement: pgmcp::db::queries::IndexedFileReplacement<'_>,
+    ) -> Result<i64, sqlx::Error> {
+        let file_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
+        self.upsert_file_calls.lock().push(UpsertFileCall {
+            project_id: replacement.project_id,
+            path: replacement.path.to_string(),
+            relative_path: replacement.relative_path.to_string(),
+            language: replacement.language.to_string(),
+            size_bytes: replacement.size_bytes,
+            content: replacement.content.map(|s| s.to_string()),
+            content_hash: Some(replacement.content_hash),
+            line_count: replacement.line_count,
+            truncated: replacement.truncated,
+            content_recoverable_from_disk: replacement.content_recoverable_from_disk,
+            modified_at: replacement.modified_at,
+        });
+        let mut log = self.insert_chunk_calls.lock();
+        for c in replacement.chunks {
+            log.push(InsertChunkCall {
+                file_id,
+                chunk_index: c.chunk_index,
+                content: c.content.to_string(),
+                start_line: c.start_line,
+                end_line: c.end_line,
+                embedding: c.embedding.to_vec(),
+            });
+        }
+        Ok(file_id)
+    }
+
     async fn delete_file(&self, path: &str) -> Result<(), sqlx::Error> {
         self.deleted_file_paths.lock().push(path.to_string());
         Ok(())
@@ -413,6 +445,7 @@ impl DbClient for MockDbClient {
         _query: &str,
         _limit: i32,
         _language: Option<&str>,
+        _project: Option<&str>,
         _dedupe_worktrees: bool,
     ) -> Result<Vec<TextSearchResult>, sqlx::Error> {
         Ok(self.text_search_results.clone())
@@ -423,6 +456,7 @@ impl DbClient for MockDbClient {
         _query: &str,
         _limit: i32,
         _language: Option<&str>,
+        _project: Option<&str>,
         _dedupe_worktrees: bool,
         _statement_timeout_ms: u32,
     ) -> Result<Vec<TextSearchResult>, sqlx::Error> {

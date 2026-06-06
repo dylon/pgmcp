@@ -257,23 +257,40 @@ pub async fn tool_memory_raptor_search(
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
+    let query = params.query.trim();
+    if query.is_empty() {
+        return Err(McpError::invalid_params("query must be non-empty", None));
+    }
+    if let Some(scope_id) = params.scope_id
+        && scope_id <= 0
+    {
+        return Err(McpError::invalid_params(
+            "scope_id must be a positive integer",
+            None,
+        ));
+    }
+    let levels = queries::normalize_memory_raptor_levels(params.levels.as_deref())
+        .map_err(|e| McpError::invalid_params(e, None))?;
     let embedding = ctx
         .embed()
-        .embed_query(&params.query)
+        .embed_query(query)
         .await
         .map_err(|e| McpError::internal_error(format!("embed failed: {}", e), None))?;
-    let ef = ctx.config().load().vector.ef_search;
-    let k = params.k.unwrap_or(10);
-    let rows = queries::memory_raptor_search(
-        pool,
-        &embedding,
-        params.scope_id,
-        params.levels.as_deref(),
-        k,
-        ef,
-    )
-    .await
-    .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
+    if embedding.len() != 1024 {
+        return Err(McpError::internal_error(
+            format!(
+                "query embedding dimension mismatch: got {}, expected 1024",
+                embedding.len()
+            ),
+            None,
+        ));
+    }
+    let ef = ctx.config().load().vector.ef_search.clamp(1, 10_000);
+    let k = params.k.unwrap_or(10).clamp(1, 200);
+    let rows =
+        queries::memory_raptor_search(pool, &embedding, params.scope_id, levels.as_deref(), k, ef)
+            .await
+            .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
     enforce_latency_cap(
         ctx,
         "memory_raptor_search",
@@ -302,6 +319,10 @@ pub async fn tool_memory_raptor_search(
     json_result(json!({
         "effect_breakdown": effect_breakdown,
         "count": rows.len(),
+        "query": query,
+        "scope_id": params.scope_id,
+        "levels": levels,
+        "k": k,
         "results": rows,
     }))
 }

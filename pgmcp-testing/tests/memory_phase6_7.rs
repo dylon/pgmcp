@@ -4,11 +4,16 @@
 //!
 //! Phase 7 model-download tests are `#[ignore]`-gated.
 
+mod common;
+
+use common::text_of;
 use pgmcp::db::queries::{
     memory_neighbors, memory_path_search, memory_ppr_search, memory_raptor_search,
     memory_unified_search, refresh_memory_unified_edges, refresh_memory_unified_nodes,
 };
 use pgmcp::reranker::{RerankerChoice, parse_reranker_choice};
+use pgmcp_testing::fixtures::test_embedding;
+use pgmcp_testing::pool_tool_helpers::server_with_pool;
 use pgmcp_testing::require_test_db;
 
 fn unit_vec_1024(axis: usize) -> Vec<f32> {
@@ -301,8 +306,32 @@ async fn memory_raptor_search_returns_inserted_summaries() {
     .execute(pool)
     .await
     .expect("summary row");
+    let far_level_one = pgvector::Vector::from(unit_vec_1024(8));
+    sqlx::query(
+        "INSERT INTO memory_summary_tree
+            (scope_id, level, parent_id, observation_id, summary_text,
+             summary_embedding, child_count)
+         VALUES ($1, 1, NULL, NULL, 'far level-one summary', $2, 5)",
+    )
+    .bind(scope_id)
+    .bind(&far_level_one)
+    .execute(pool)
+    .await
+    .expect("second level-one summary row");
+    let level_two = pgvector::Vector::from(unit_vec_1024(9));
+    sqlx::query(
+        "INSERT INTO memory_summary_tree
+            (scope_id, level, parent_id, observation_id, summary_text,
+             summary_embedding, child_count)
+         VALUES ($1, 2, NULL, NULL, 'level-two summary', $2, 5)",
+    )
+    .bind(scope_id)
+    .bind(&level_two)
+    .execute(pool)
+    .await
+    .expect("level-two summary row");
 
-    let hits = memory_raptor_search(pool, &v, Some(scope_id), None, 5, 64)
+    let hits = memory_raptor_search(pool, &v, Some(scope_id), None, 1, 64)
         .await
         .expect("raptor_search");
     assert!(
@@ -310,19 +339,134 @@ async fn memory_raptor_search_returns_inserted_summaries() {
         "expected the seeded summary in top-k: {:?}",
         hits.iter().map(|h| &h.label).collect::<Vec<_>>()
     );
+    assert!(
+        hits.iter().any(|h| h.label.contains("level-two")),
+        "top-k is per level, so level 2 must not be starved by level 1: {:?}",
+        hits.iter().map(|h| &h.label).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        hits.iter().filter(|h| h.level == 1).count(),
+        1,
+        "k=1 keeps only one hit from level 1"
+    );
+
+    let filtered = memory_raptor_search(pool, &v, Some(scope_id), Some(&[2, 2]), 1, 64)
+        .await
+        .expect("raptor_search with duplicate level filter");
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].level, 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_raptor_search_rejects_bad_embedding_and_levels() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let short = vec![0.0; 384];
+    let err = memory_raptor_search(pool, &short, None, None, 5, 64)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("expected 1024d"));
+
+    let v = unit_vec_1024(1);
+    let err = memory_raptor_search(pool, &v, None, Some(&[]), 5, 64)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("at least one level"));
+    let err = memory_raptor_search(pool, &v, None, Some(&[-1]), 5, 64)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("levels must be between"));
+    let too_many = vec![1; pgmcp::db::queries::MEMORY_RAPTOR_MAX_LEVELS + 1];
+    let err = memory_raptor_search(pool, &v, None, Some(&too_many), 5, 64)
+        .await
+        .unwrap_err();
+    assert!(format!("{err}").contains("cap is"));
 }
 
 // ============================================================================
 // Inventory-coverage smoke tests (every dispatched tool needs one)
 // ============================================================================
 //
-// The server_with_pool helper uses a 384d DeterministicEmbedder so the
-// memory_*_search tools that require 1024d query embeddings reject with
-// a clear protocol error. We assert the call goes through end-to-end
-// — either with Ok+is_error=true or Err — so the inventory check is
-// satisfied without needing a 1024d test embedder.
+// The server_with_pool helper uses a 1024d DeterministicEmbedder, matching the
+// memory graph vector columns and avoiding model downloads.
 
-use pgmcp_testing::pool_tool_helpers::server_with_pool;
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_raptor_tool_validates_and_normalizes_inputs() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let server = server_with_pool(pool.clone());
+
+    assert!(
+        server
+            .call_tool_cli(
+                "memory_raptor_search",
+                serde_json::json!({ "query": "   " }),
+            )
+            .await
+            .is_err(),
+        "blank query rejects before embedding"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "memory_raptor_search",
+                serde_json::json!({ "query": "topic", "scope_id": -1 }),
+            )
+            .await
+            .is_err(),
+        "negative scope ids are rejected"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "memory_raptor_search",
+                serde_json::json!({ "query": "topic", "levels": [] }),
+            )
+            .await
+            .is_err(),
+        "empty level filters are rejected"
+    );
+
+    let scope_id: i64 = sqlx::query_scalar(
+        "INSERT INTO memory_scope (user_id, agent_id, session_id, project_id)
+         VALUES ('raptor-tool-user', NULL, NULL, NULL) RETURNING id",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("scope");
+    let pgv = pgvector::Vector::from(test_embedding(1024, "topic"));
+    sqlx::query(
+        "INSERT INTO memory_summary_tree
+            (scope_id, level, parent_id, observation_id, summary_text,
+             summary_embedding, child_count)
+         VALUES ($1, 1, NULL, NULL, 'tool summary topic', $2, 3)",
+    )
+    .bind(scope_id)
+    .bind(&pgv)
+    .execute(pool)
+    .await
+    .expect("summary row");
+
+    let result = server
+        .call_tool_cli(
+            "memory_raptor_search",
+            serde_json::json!({
+                "query": " topic ",
+                "scope_id": scope_id,
+                "levels": [1, 1],
+                "k": 999
+            }),
+        )
+        .await
+        .expect("valid memory_raptor_search");
+    let body: serde_json::Value =
+        serde_json::from_str(&text_of(&result)).expect("raptor tool JSON");
+    assert_eq!(body["query"].as_str(), Some("topic"));
+    assert_eq!(body["scope_id"].as_i64(), Some(scope_id));
+    assert_eq!(body["k"].as_i64(), Some(200), "k is clamped");
+    assert_eq!(body["levels"], serde_json::json!([1]));
+    assert_eq!(body["count"].as_i64(), Some(1));
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn graph_rag_tools_are_dispatch_callable() {
@@ -374,7 +518,7 @@ async fn bge_reranker_returns_ordered_hits() {
         .expect("construct")
         .expect("not disabled");
     let candidates = ["A purple cow.", "Rust is a systems programming language."];
-    let cand_refs: Vec<&str> = candidates.iter().copied().collect();
+    let cand_refs: Vec<&str> = candidates.to_vec();
     let hits = reranker
         .rerank("What is Rust?", &cand_refs)
         .expect("rerank");

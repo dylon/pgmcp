@@ -27,7 +27,7 @@ use std::sync::atomic::Ordering;
 
 use arc_swap::ArcSwap;
 use ndarray::{Array2, ArrayView2};
-use pgmcp::config::Config;
+use pgmcp::config::{Config, MetricsConfig};
 use pgmcp::context::SystemContext;
 use pgmcp::cron::graph_analysis;
 use pgmcp::cron::scheduler;
@@ -42,11 +42,24 @@ use pgmcp::indexer::extract::ocr_cache::{InMemoryOcrCache, OcrCache, PgOcrCache}
 use pgmcp::mcp::logging::LogBroadcaster;
 use pgmcp::mcp::tasks::TaskStore;
 use pgmcp::mcp::tools::fix_helpers;
+use pgmcp::stats::telemetry_writer::{self, TelemetryRow};
 use pgmcp::stats::tracker::StatsTracker;
 use pgmcp_testing::fixtures::synthetic_corpus::SyntheticCorpus;
 use pgmcp_testing::mocks::DeterministicEmbeddingBackend;
 use pgmcp_testing::require_test_db;
 use sqlx::PgPool;
+use tokio_util::sync::CancellationToken;
+
+type TelemetryTextRow = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 // =============================================================================
 // SystemContext construction (modeled after pgmcp-testing/tests/common/mod.rs)
@@ -272,7 +285,7 @@ fn topic_clustering_fuzzy_c_means_smoke() {
 #[test]
 fn topic_clustering_compute_ctf_idf_smoke() {
     let contents = ["auth password token", "query database transaction"];
-    let content_refs: Vec<&str> = contents.iter().copied().collect();
+    let content_refs: Vec<&str> = contents.to_vec();
     // 2 chunks × 2 topics — chunk 0 strongly belongs to topic 0; chunk 1 to topic 1.
     let mem = Array2::from_shape_vec((2, 2), vec![0.9_f32, 0.1, 0.1, 0.9]).expect("mem");
     let topics = topic_clustering::compute_ctf_idf(&content_refs, &mem, 3);
@@ -392,6 +405,108 @@ fn telemetry_writer_try_enqueue_when_channel_absent_returns_false() {
     };
     let ok = pgmcp::stats::telemetry_writer::try_enqueue(&stats, row);
     assert!(!ok, "try_enqueue must be false when writer is not started");
+}
+
+#[tokio::test]
+async fn telemetry_writer_flushes_null_optional_text_and_project() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let stats = Arc::new(StatsTracker::new());
+    let cancel = CancellationToken::new();
+    let config = MetricsConfig {
+        telemetry_batch_size: 2,
+        telemetry_batch_interval_ms: 1_000,
+        ..MetricsConfig::default()
+    };
+    let handle = telemetry_writer::start_telemetry_writer(
+        pool.clone(),
+        stats.clone(),
+        config,
+        cancel.clone(),
+    );
+
+    assert!(telemetry_writer::try_enqueue(
+        &stats,
+        TelemetryRow {
+            tool: "semantic_search".into(),
+            client_name: "cli".into(),
+            client_version: Some("  ".into()),
+            protocol_version: Some(" 2025-06-18 ".into()),
+            mcp_session_id: Some(" session-1 ".into()),
+            project: Some(" pgmcp ".into()),
+            cwd: None,
+            duration_ms: 12,
+            outcome: "ok",
+            error_class: None,
+            request_id: Some("  ".into()),
+            params_sha256: Some(" hash ".into()),
+        }
+    ));
+    assert!(telemetry_writer::try_enqueue(
+        &stats,
+        TelemetryRow {
+            tool: "grep".into(),
+            client_name: "cli".into(),
+            client_version: Some("1.0".into()),
+            protocol_version: None,
+            mcp_session_id: None,
+            project: Some("  ".into()),
+            cwd: Some(" ".into()),
+            duration_ms: 7,
+            outcome: "error",
+            error_class: Some(" Regex ".into()),
+            request_id: Some("req-1".into()),
+            params_sha256: None,
+        }
+    ));
+
+    let rows = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let rows: Vec<TelemetryTextRow> = sqlx::query_as(
+                "SELECT tool, client_version, protocol_version, mcp_session_id,
+                        project, cwd, error_class, request_id
+                 FROM mcp_tool_calls
+                 ORDER BY tool",
+            )
+            .fetch_all(&pool)
+            .await
+            .expect("select telemetry rows");
+            if rows.len() == 2 {
+                break rows;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("telemetry writer flushes batch");
+
+    cancel.cancel();
+    handle.await.expect("telemetry writer exits cleanly");
+
+    let grep = rows
+        .iter()
+        .find(|(tool, ..)| tool == "grep")
+        .expect("grep row");
+    assert_eq!(grep.1.as_deref(), Some("1.0"));
+    assert_eq!(grep.4, None, "blank project must be stored as SQL NULL");
+    assert_eq!(grep.5, None, "blank cwd must be stored as SQL NULL");
+    assert_eq!(grep.6.as_deref(), Some("Regex"));
+    assert_eq!(grep.7.as_deref(), Some("req-1"));
+
+    let semantic = rows
+        .iter()
+        .find(|(tool, ..)| tool == "semantic_search")
+        .expect("semantic_search row");
+    assert_eq!(semantic.1, None, "blank client_version becomes SQL NULL");
+    assert_eq!(semantic.2.as_deref(), Some("2025-06-18"));
+    assert_eq!(semantic.3.as_deref(), Some("session-1"));
+    assert_eq!(semantic.4.as_deref(), Some("pgmcp"));
+    assert_eq!(semantic.7, None, "blank request_id becomes SQL NULL");
+    assert_eq!(
+        stats.telemetry_rows_written.load(Ordering::Relaxed),
+        2,
+        "writer must report the inserted batch"
+    );
 }
 
 // Bridge to the rest of the suite — keeps `common` import not "dead".

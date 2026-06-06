@@ -43,7 +43,28 @@ pub async fn aggregate(
     options: ReportOptions,
     per_tool_timeout_secs: u64,
 ) -> Result<QualityReport, McpError> {
+    let project_name = project_name.trim();
     let project_id = project_id_or_err(ctx, project_name).await?;
+    aggregate_for_project(
+        ctx,
+        project_id,
+        project_name,
+        options,
+        per_tool_timeout_secs,
+    )
+    .await
+}
+
+/// Build the full graded report for an already-resolved project id. Internal
+/// cron callers use this path after listing concrete projects so duplicate
+/// display names cannot make snapshots disappear.
+pub async fn aggregate_for_project(
+    ctx: &SystemContext,
+    project_id: i32,
+    project_name: &str,
+    options: ReportOptions,
+    per_tool_timeout_secs: u64,
+) -> Result<QualityReport, McpError> {
     let pool = pool_or_err(ctx)?;
 
     let file_count: i64 =
@@ -54,35 +75,48 @@ pub async fn aggregate(
             .unwrap_or(0);
 
     // ── Pillar dimensions (Engineering + Architecture base) ──────────────
-    let eng = collect_engineering_analysis(ctx, project_id, project_name).await?;
+    let eng = collect_engineering_analysis(ctx, project_id).await?;
     let mut arch_dims = collect_architecture_dimensions(ctx, project_id).await?;
     arch_dims.push(oo_coupling_dim(pool, project_id).await);
     arch_dims.push(propagation_cost_dim(pool, project_id).await);
 
     // ── Fan out the finding collectors ───────────────────────────────────
-    let (tool_runs, findings) =
-        run_collectors(ctx, project_id, project_name, per_tool_timeout_secs).await;
+    let (tool_runs, findings) = if options.compute_findings {
+        run_collectors(ctx, project_id, project_name, per_tool_timeout_secs).await
+    } else {
+        (Vec::new(), Vec::new())
+    };
 
     // ── Security pillar dims (derived from collected findings + advisories) ─
-    let sec_dims = security_dims(pool, &findings, file_count).await;
+    let sec_dims = if options.compute_findings {
+        security_dims(pool, &findings, file_count).await
+    } else {
+        security_dims_skipped()
+    };
 
     // ── finding_density per pillar (over ALL findings, pre display-filter) ─
     let mut eng_dims = eng.dimensions;
-    eng_dims.push(DimensionScore::present(
-        "finding_density",
+    eng_dims.push(finding_density_dimension(
+        options.compute_findings,
+        &findings,
+        Pillar::Engineering,
+        file_count,
         "Severity-weighted finding load (Engineering categories)",
-        finding_density(&findings, Pillar::Engineering, file_count),
     ));
-    arch_dims.push(DimensionScore::present(
-        "finding_density",
+    arch_dims.push(finding_density_dimension(
+        options.compute_findings,
+        &findings,
+        Pillar::Architecture,
+        file_count,
         "Severity-weighted finding load (Architecture categories)",
-        finding_density(&findings, Pillar::Architecture, file_count),
     ));
     let mut sec_dims = sec_dims;
-    sec_dims.push(DimensionScore::present(
-        "finding_density",
+    sec_dims.push(finding_density_dimension(
+        options.compute_findings,
+        &findings,
+        Pillar::Security,
+        file_count,
         "Severity-weighted finding load (Security findings)",
-        finding_density(&findings, Pillar::Security, file_count),
     ));
 
     let pillars = vec![
@@ -121,6 +155,27 @@ pub async fn aggregate(
         trend,
         options,
     })
+}
+
+fn finding_density_dimension(
+    compute_findings: bool,
+    findings: &[Finding],
+    pillar: Pillar,
+    file_count: i64,
+    description: &'static str,
+) -> DimensionScore {
+    if compute_findings {
+        DimensionScore::present(
+            "finding_density",
+            description,
+            finding_density(findings, pillar, file_count),
+        )
+    } else {
+        DimensionScore::absent(
+            "finding_density",
+            format!("{description} - N/A (finding collectors skipped)"),
+        )
+    }
 }
 
 /// Append this run's per-pillar GPA as the newest trend point (so the strip and
@@ -305,6 +360,27 @@ async fn security_dims(
             crypto_hygiene,
         ),
         supply_chain,
+    ]
+}
+
+fn security_dims_skipped() -> Vec<DimensionScore> {
+    vec![
+        DimensionScore::absent(
+            "secret_hygiene",
+            "Absence of hardcoded secrets - N/A (finding collectors skipped)",
+        ),
+        DimensionScore::absent(
+            "injection_risk",
+            "Absence of injection/taint sites - N/A (finding collectors skipped)",
+        ),
+        DimensionScore::absent(
+            "crypto_hygiene",
+            "Sound cryptography & deserialization - N/A (finding collectors skipped)",
+        ),
+        DimensionScore::absent(
+            "supply_chain",
+            "Dependency advisories - N/A (finding collectors skipped)",
+        ),
     ]
 }
 

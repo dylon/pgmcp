@@ -5,21 +5,17 @@
 //! implementation. The thin tool wrapper keeps the stats counter, the
 //! effect-breakdown channel, and the JSON envelope.
 
-#![allow(unused_imports)]
-
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
-use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, LoggingLevel};
+use rmcp::model::{CallToolResult, Content};
 use serde_json::json;
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
-use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
+use crate::mcp::tools::sota_helpers::{import_cycle_file_count, pool_or_err, project_id_or_err};
 use crate::quality::report::{DimensionScore, letter_grade};
 
 /// Compute the 10 architecture-quality dimensions for a project. Shared by the
@@ -77,7 +73,9 @@ pub(crate) async fn collect_architecture_dimensions(
     // 2. Loose coupling: avg afferent+efferent coupling.
     let avg_coupling: Option<f64> = sqlx::query_scalar(
         "SELECT AVG(COALESCE(afferent_coupling, 0) + COALESCE(efferent_coupling, 0))::DOUBLE PRECISION
-         FROM file_metrics WHERE project_id = $1",
+         FROM file_metrics fm
+         JOIN indexed_files f ON f.id = fm.file_id AND f.project_id = fm.project_id
+         WHERE fm.project_id = $1",
     )
     .bind(project_id)
     .fetch_optional(pool)
@@ -93,20 +91,7 @@ pub(crate) async fn collect_architecture_dimensions(
             .fetch_one(pool)
             .await
             .unwrap_or(0);
-    let files_in_cycles: i64 = sqlx::query_scalar(
-        "SELECT COUNT(DISTINCT source_file_id) FROM (
-            SELECT e1.source_file_id
-            FROM code_graph_edges e1
-            JOIN code_graph_edges e2 ON e1.target_file_id = e2.source_file_id
-                AND e2.target_file_id = e1.source_file_id
-            WHERE e1.project_id = $1 AND e1.edge_type = 'import'
-                AND e2.edge_type = 'import'
-        ) t",
-    )
-    .bind(project_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
+    let files_in_cycles: i64 = import_cycle_file_count(pool, project_id).await.unwrap_or(0);
     let acyclicity_score = if total_files > 0 {
         (1.0 - files_in_cycles as f64 / total_files as f64) * 100.0
     } else {
@@ -144,7 +129,10 @@ pub(crate) async fn collect_architecture_dimensions(
 
     // 6. Module balance: PageRank evenness.
     let avg_pagerank: Option<f64> = sqlx::query_scalar(
-        "SELECT AVG(pagerank)::DOUBLE PRECISION FROM file_metrics WHERE project_id = $1",
+        "SELECT AVG(fm.pagerank)::DOUBLE PRECISION
+         FROM file_metrics fm
+         JOIN indexed_files f ON f.id = fm.file_id AND f.project_id = fm.project_id
+         WHERE fm.project_id = $1",
     )
     .bind(project_id)
     .fetch_optional(pool)
@@ -160,7 +148,10 @@ pub(crate) async fn collect_architecture_dimensions(
 
     // 7. API stability: inverse of churn.
     let avg_churn: Option<f64> = sqlx::query_scalar(
-        "SELECT AVG(churn_rate)::DOUBLE PRECISION FROM file_metrics WHERE project_id = $1",
+        "SELECT AVG(fm.churn_rate)::DOUBLE PRECISION
+         FROM file_metrics fm
+         JOIN indexed_files f ON f.id = fm.file_id AND f.project_id = fm.project_id
+         WHERE fm.project_id = $1",
     )
     .bind(project_id)
     .fetch_optional(pool)
@@ -171,7 +162,10 @@ pub(crate) async fn collect_architecture_dimensions(
 
     // 8. Dependency health: inverse of fix-commit ratio.
     let avg_fix_ratio: Option<f64> = sqlx::query_scalar(
-        "SELECT AVG(fix_commit_ratio)::DOUBLE PRECISION FROM file_metrics WHERE project_id = $1",
+        "SELECT AVG(fm.fix_commit_ratio)::DOUBLE PRECISION
+         FROM file_metrics fm
+         JOIN indexed_files f ON f.id = fm.file_id AND f.project_id = fm.project_id
+         WHERE fm.project_id = $1",
     )
     .bind(project_id)
     .fetch_optional(pool)
@@ -183,8 +177,10 @@ pub(crate) async fn collect_architecture_dimensions(
     // 9. SDP compliance: edges where stable doesn't depend on unstable.
     let sdp_violations: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM code_graph_edges e
-         JOIN file_metrics fm_s ON fm_s.file_id = e.source_file_id
-         JOIN file_metrics fm_t ON fm_t.file_id = e.target_file_id
+         JOIN indexed_files f_s ON f_s.id = e.source_file_id AND f_s.project_id = e.project_id
+         JOIN indexed_files f_t ON f_t.id = e.target_file_id AND f_t.project_id = e.project_id
+         JOIN file_metrics fm_s ON fm_s.file_id = e.source_file_id AND fm_s.project_id = e.project_id
+         JOIN file_metrics fm_t ON fm_t.file_id = e.target_file_id AND fm_t.project_id = e.project_id
          WHERE e.project_id = $1 AND e.edge_type = 'import'
            AND fm_s.instability < 0.3 AND fm_t.instability > 0.7",
     )
@@ -193,7 +189,10 @@ pub(crate) async fn collect_architecture_dimensions(
     .await
     .unwrap_or(0);
     let total_edges: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM code_graph_edges WHERE project_id = $1 AND edge_type = 'import'",
+        "SELECT COUNT(*) FROM code_graph_edges e
+         JOIN indexed_files f_s ON f_s.id = e.source_file_id AND f_s.project_id = e.project_id
+         JOIN indexed_files f_t ON f_t.id = e.target_file_id AND f_t.project_id = e.project_id
+         WHERE e.project_id = $1 AND e.edge_type = 'import'",
     )
     .bind(project_id)
     .fetch_one(pool)
@@ -263,15 +262,30 @@ pub async fn tool_architecture_quality(
         .architecture_quality_scans
         .fetch_add(1, Ordering::Relaxed);
 
-    let detail = params.detail.as_deref().unwrap_or("summary");
+    let project = params.project.trim().to_string();
+    let detail = params
+        .detail
+        .as_deref()
+        .map(str::trim)
+        .filter(|detail| !detail.is_empty())
+        .unwrap_or("summary");
+    if !matches!(detail, "summary" | "full") {
+        return Err(McpError::invalid_params(
+            format!(
+                "Unknown detail '{}': expected one of summary | full",
+                detail
+            ),
+            None,
+        ));
+    }
     debug!(
         tool = "architecture_quality",
-        project = %params.project,
+        project = %project,
         detail,
         "MCP tool invoked",
     );
 
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project_id = project_id_or_err(ctx, &project).await?;
     let dimensions = collect_architecture_dimensions(ctx, project_id).await?;
 
     // Average only the *scorable* dimensions; data-absent dims (e.g. a stale
@@ -285,17 +299,23 @@ pub async fn tool_architecture_quality(
 
     let dim_json: Vec<serde_json::Value> = dimensions
         .iter()
-        .map(|d| match d.score {
-            Some(score) => json!({
-                "dimension": d.name,
-                "score": format!("{:.1}", score),
-                "grade": letter_grade(score),
-            }),
-            None => json!({
-                "dimension": d.name,
-                "score": "N/A",
-                "grade": "N/A",
-            }),
+        .map(|d| {
+            let mut value = match d.score {
+                Some(score) => json!({
+                    "dimension": d.name,
+                    "score": format!("{:.1}", score),
+                    "grade": letter_grade(score),
+                }),
+                None => json!({
+                    "dimension": d.name,
+                    "score": "N/A",
+                    "grade": "N/A",
+                }),
+            };
+            if detail == "full" {
+                value["description"] = json!(d.description);
+            }
+            value
         })
         .collect();
 
@@ -315,7 +335,8 @@ pub async fn tool_architecture_quality(
 
     let result = json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
+        "project": project,
+        "detail": detail,
         "overall_score": format!("{:.1}", overall),
         "overall_grade": letter_grade(overall),
         "dimensions": dim_json,

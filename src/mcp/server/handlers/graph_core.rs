@@ -55,12 +55,14 @@ PageRank as part of its envelope."
         Parameters(params): Parameters<CentralityAnalysisParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        let project_hint = Some(params.project.trim().to_string());
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "centrality_analysis",
             30,
             &_ctx,
             &summarize_debug(&params),
+            project_hint,
             crate::mcp::tools::tool_centrality_analysis::tool_centrality_analysis(
                 self.ctx(),
                 params,
@@ -103,12 +105,14 @@ Requires graph-analysis cron."
         Parameters(params): Parameters<CircularDependenciesParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        let project_hint = Some(params.project.clone());
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "circular_dependencies",
             30,
             &_ctx,
             &summarize_debug(&params),
+            project_hint,
             crate::mcp::tools::tool_circular_dependencies::tool_circular_dependencies(
                 self.ctx(),
                 params,

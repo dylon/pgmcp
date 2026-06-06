@@ -14,6 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::project_id_or_err;
 
 pub async fn tool_find_misplaced_code(
     ctx: &SystemContext,
@@ -23,20 +24,42 @@ pub async fn tool_find_misplaced_code(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().misplaced_scans.fetch_add(1, Ordering::Relaxed);
 
-    let min_mismatch = params.min_mismatch.unwrap_or(0.5);
+    let project = params.project.trim();
+    let raw_min_mismatch = params.min_mismatch.unwrap_or(0.5);
+    if !raw_min_mismatch.is_finite() {
+        return Err(McpError::invalid_params(
+            "min_mismatch must be finite",
+            None,
+        ));
+    }
+    let min_mismatch = raw_min_mismatch.clamp(0.0, 1.0);
 
     debug!(
         tool = "find_misplaced_code",
-        project = %params.project,
+        project = %project,
         min_mismatch,
         "MCP tool invoked",
     );
 
-    let rows = ctx
-        .db()
-        .load_chunk_topic_assignments_for_files(Some(&params.project))
-        .await
-        .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
+    let project_id = if ctx.db().pool().is_some() {
+        Some(project_id_or_err(ctx, project).await?)
+    } else {
+        if project.is_empty() {
+            return Err(McpError::invalid_params("project must be non-empty", None));
+        }
+        None
+    };
+
+    let rows = if let (Some(pool), Some(project_id)) = (ctx.db().pool(), project_id) {
+        crate::db::queries::load_chunk_topic_assignments_for_files_by_project_id(pool, project_id)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?
+    } else {
+        ctx.db()
+            .load_chunk_topic_assignments_for_files(Some(project))
+            .await
+            .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?
+    };
 
     if rows.is_empty() {
         return Ok(CallToolResult::success(vec![Content::text(
@@ -133,13 +156,7 @@ pub async fn tool_find_misplaced_code(
         let Some(pool) = ctx.db().pool() else {
             return Vec::new();
         };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
+        match project_id {
             Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
                 .await
                 .unwrap_or_default()
@@ -153,7 +170,7 @@ pub async fn tool_find_misplaced_code(
 
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
+        "project": project,
         "min_mismatch": min_mismatch,
         "misplaced_count": misplaced.len(),
         "misplaced_files": misplaced,

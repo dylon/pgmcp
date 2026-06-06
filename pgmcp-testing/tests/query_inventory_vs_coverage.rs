@@ -102,10 +102,11 @@ fn extract_dispatched_tools(server_src: &str) -> BTreeSet<String> {
         }
         if let Some((lit, _)) = trimmed.split_once("=>") {
             let lit = lit.trim();
-            if let Some(name) = lit.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                if !name.is_empty() && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_') {
-                    tools.insert(name.to_string());
-                }
+            if let Some(name) = lit.strip_prefix('"').and_then(|s| s.strip_suffix('"'))
+                && !name.is_empty()
+                && name.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')
+            {
+                tools.insert(name.to_string());
             }
         }
     }
@@ -121,12 +122,12 @@ fn extract_tested_tools(tests_dir: &Path) -> BTreeSet<String> {
         for chunk in src.split("call_tool_cli(").skip(1) {
             // Next token should be `"<name>"`.
             let chunk = chunk.trim_start();
-            if let Some(rest) = chunk.strip_prefix('"') {
-                if let Some(end) = rest.find('"') {
-                    let name = &rest[..end];
-                    if !name.is_empty() {
-                        covered.insert(name.to_string());
-                    }
+            if let Some(rest) = chunk.strip_prefix('"')
+                && let Some(end) = rest.find('"')
+            {
+                let name = &rest[..end];
+                if !name.is_empty() {
+                    covered.insert(name.to_string());
                 }
             }
         }

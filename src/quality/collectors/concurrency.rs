@@ -237,7 +237,10 @@ pub async fn collect_unsafe_clusters(
          FROM function_metrics fm
          JOIN file_symbols fs ON fs.id = fm.function_id
          JOIN indexed_files f ON f.id = fm.file_id
-         WHERE fm.project_id = $1 AND fm.unsafe_blocks > 0
+         WHERE fm.project_id = $1
+           AND f.project_id = fm.project_id
+           AND fs.file_id = f.id
+           AND fm.unsafe_blocks > 0
          ORDER BY fm.unsafe_blocks DESC",
     )
     .bind(project_id)

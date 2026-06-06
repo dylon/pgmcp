@@ -15,6 +15,7 @@
 
 #![allow(unused_imports)]
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use rmcp::ErrorData as McpError;
@@ -29,15 +30,58 @@ pub async fn tool_trigger_cron(
     ctx: &SystemContext,
     params: TriggerCronParams,
 ) -> Result<CallToolResult, McpError> {
-    tracing::debug!(tool = "trigger_cron", job = %params.job, "MCP tool invoked");
+    let job = params.job.trim();
+    let project = params
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|project| !project.is_empty())
+        .map(str::to_string);
+
+    tracing::debug!(tool = "trigger_cron", job = %job, "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+
+    if job.is_empty() {
+        return Err(McpError::invalid_params("job must be non-empty", None));
+    }
+
+    const VALID_JOBS: &[&str] = &[
+        "symbol-extraction",
+        "call-graph",
+        "function-metrics",
+        "graph-analysis",
+        "a2a-reflect",
+        "msm-calibrate",
+        "fuzzy-sync",
+    ];
+    if !VALID_JOBS.contains(&job) {
+        return Err(McpError::invalid_params(
+            format!(
+                "Unknown job {job:?}. Valid: symbol-extraction | call-graph | function-metrics | graph-analysis | a2a-reflect | msm-calibrate | fuzzy-sync"
+            ),
+            None,
+        ));
+    }
 
     let db = ctx.db();
     let stats = ctx.stats();
+    let _heavy_guard = match ctx.heavy_cron_lock().try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return json_result(&json!({
+                "job": job,
+                "project": project,
+                "status": "busy",
+                "retry_after_secs": 60,
+                "guidance": "Another heavy cron is already running. Retry after it completes; trigger_cron never queues heavy work.",
+            }));
+        }
+    };
+    let _cron_flag = crate::cron::scheduler::HeavyCronFlag::new(Arc::clone(stats));
 
-    match params.job.as_str() {
+    match job {
         "symbol-extraction" => {
-            match &params.project {
+            match project.as_deref() {
                 Some(p) => {
                     crate::cron::symbol_extraction::run_symbol_extraction_for_project(
                         db.as_ref(),
@@ -51,8 +95,8 @@ pub async fn tool_trigger_cron(
                 }
             }
             json_result(&json!({
-                "job": params.job,
-                "project": params.project,
+                "job": job,
+                "project": project,
                 "status": "completed",
                 "guidance": "Symbols populated. dead_code_reachability and naming_consistency should now return populated results. For end-to-end call-graph closure, also run trigger_cron job=\"call-graph\".",
             }))
@@ -60,7 +104,7 @@ pub async fn tool_trigger_cron(
         "call-graph" => {
             // Manual trigger: no general WorkPool in scope, so betweenness runs
             // sequentially (gated by DENSE_CENTRALITY_MAX_NODES in the cron).
-            match &params.project {
+            match project.as_deref() {
                 Some(p) => {
                     crate::cron::call_graph::run_call_graph_for_project(db.as_ref(), stats, None, p)
                         .await
@@ -68,14 +112,14 @@ pub async fn tool_trigger_cron(
                 None => crate::cron::call_graph::run_call_graph(db.as_ref(), stats, None).await,
             }
             json_result(&json!({
-                "job": params.job,
-                "project": params.project,
+                "job": job,
+                "project": project,
                 "status": "completed",
                 "guidance": "Call graph populated. dead_code_reachability now uses real symbol_references edges.",
             }))
         }
         "function-metrics" => {
-            match &params.project {
+            match project.as_deref() {
                 Some(p) => {
                     crate::cron::function_metrics::run_function_metrics_for_project(
                         db.as_ref(),
@@ -110,8 +154,8 @@ pub async fn tool_trigger_cron(
 
             json_result(&json!({
             "effect_breakdown": effect_breakdown,
-                    "job": params.job,
-                    "project": params.project,
+                    "job": job,
+                    "project": project,
                     "status": "completed",
                     "guidance": "Function metrics populated (cyclomatic, cognitive, Halstead, NPath, MI).",
                 }))
@@ -135,7 +179,7 @@ pub async fn tool_trigger_cron(
             .await
             .map_err(|e| McpError::internal_error(format!("a2a-reflect failed: {e}"), None))?;
             json_result(&json!({
-                "job": params.job,
+                "job": job,
                 "status": "completed",
                 "consensus_groups": report.consensus_groups,
                 "scopes_reflected": report.scopes_reflected,
@@ -177,7 +221,7 @@ pub async fn tool_trigger_cron(
             let new_c = calibrate_adaptive_c(&success, &fail, prev_c, 64);
             let _ = store_msm_c(pool, new_c).await;
             json_result(&json!({
-                "job": params.job,
+                "job": job,
                 "status": "completed",
                 "newly_labeled": labeled,
                 "success_cohort": success.len(),
@@ -215,7 +259,7 @@ pub async fn tool_trigger_cron(
             .await
             .map_err(|e| McpError::internal_error(format!("fuzzy-sync failed: {e}"), None))?;
             json_result(&json!({
-                "job": params.job,
+                "job": job,
                 "status": "completed",
                 "symbols_synced": report.symbols_synced,
                 "paths_synced": report.paths_synced,
@@ -232,16 +276,11 @@ pub async fn tool_trigger_cron(
             // import-graph backfill is forced without a daemon restart.
             crate::cron::graph_analysis::run_graph_analysis(db.as_ref(), stats, None).await;
             json_result(&json!({
-                "job": params.job,
+                "job": job,
                 "status": "completed",
                 "guidance": "Import/co-change/semantic edges rebuilt from symbol_references. Repairs dependency_graph / coupling_cohesion_report / architecture_* once import_use refs exist (run symbol-extraction first).",
             }))
         }
-        other => Err(McpError::invalid_params(
-            format!(
-                "Unknown job {other:?}. Valid: symbol-extraction | call-graph | function-metrics | graph-analysis | a2a-reflect | msm-calibrate | fuzzy-sync"
-            ),
-            None,
-        )),
+        _ => unreachable!("validated trigger_cron job must match a branch"),
     }
 }

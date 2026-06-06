@@ -3,10 +3,15 @@
 //! filtered search, and hierarchy-edge/ resolve helpers. The MCP handler/body
 //! layer is a thin compile-checked wrapper over these. Self-skips with no DB.
 
+mod common;
+
 use pgmcp::db::queries;
 use pgmcp::ontology::edge::OntologyRelation;
-use pgmcp::ontology::facet::Facet;
+use pgmcp::ontology::facet::{ConceptStatus, Facet};
 use pgmcp::tracker::transition::Actor;
+use serde_json::json;
+
+use common::{server_with_pool, text_of};
 
 #[tokio::test]
 async fn agent_asserted_invariant_is_candidate_only() {
@@ -71,6 +76,125 @@ async fn create_concept_and_facet_filtered_search() {
         .await
         .expect("search wrong facet");
     assert!(!in_algorithm.iter().any(|h| h.entity_id == cid));
+}
+
+#[tokio::test]
+async fn create_concept_rejects_blank_and_oversized_names() {
+    let db = pgmcp_testing::require_test_db!();
+    let server = server_with_pool(db.pool().clone());
+
+    assert!(
+        server
+            .call_tool_cli(
+                "ontology_create_concept",
+                json!({"name": "   ", "facet": "tool"})
+            )
+            .await
+            .is_err(),
+        "blank concept names must fail before any DB write"
+    );
+
+    let oversized = "x".repeat(queries::ONTOLOGY_CONCEPT_MAX_NAME_CHARS + 1);
+    assert!(
+        server
+            .call_tool_cli(
+                "ontology_create_concept",
+                json!({"name": oversized, "facet": "tool"})
+            )
+            .await
+            .is_err(),
+        "oversized concept names must fail before any DB write"
+    );
+
+    assert!(
+        server
+            .call_tool_cli(
+                "ontology_create_concept",
+                json!({"name": "Z3 Solver", "facet": "   "})
+            )
+            .await
+            .is_err(),
+        "blank facets must fail before any DB write"
+    );
+
+    let result = server
+        .call_tool_cli(
+            "ontology_create_concept",
+            json!({"name": "  Z3 Solver  ", "facet": " tool "}),
+        )
+        .await
+        .expect("trimmed facet accepted");
+    let v: serde_json::Value = serde_json::from_str(&text_of(&result)).expect("json");
+    assert_eq!(v["name"].as_str(), Some("Z3 Solver"));
+    assert_eq!(v["facet"].as_str(), Some("tool"));
+    assert_eq!(v["status"].as_str(), Some("candidate"));
+}
+
+#[tokio::test]
+async fn create_concept_tool_returns_actual_curated_metadata() {
+    let db = pgmcp_testing::require_test_db!();
+    let pool = db.pool();
+
+    let (cid, _) = queries::create_concept(pool, "Curated Parser", Facet::Component, Actor::User)
+        .await
+        .expect("seed concept");
+    queries::set_concept_status(pool, cid, ConceptStatus::Canonical, Actor::User)
+        .await
+        .expect("curate");
+
+    let server = server_with_pool(pool.clone());
+    let result = server
+        .call_tool_cli(
+            "ontology_create_concept",
+            json!({"name": "  Curated Parser  ", "facet": "collection"}),
+        )
+        .await
+        .expect("tool call");
+    let v: serde_json::Value = serde_json::from_str(&text_of(&result)).expect("json");
+    assert_eq!(v["entity_id"].as_i64(), Some(cid));
+    assert_eq!(v["created"].as_bool(), Some(false));
+    assert_eq!(v["name"].as_str(), Some("Curated Parser"));
+    assert_eq!(v["facet"].as_str(), Some("component"));
+    assert_eq!(v["status"].as_str(), Some("canonical"));
+}
+
+#[tokio::test]
+async fn concurrent_create_concept_is_single_active_entity() {
+    let db = pgmcp_testing::require_test_db!();
+    let pool = db.pool().clone();
+    let name = "Concurrent Formal Verification Tool";
+
+    let mut joins = Vec::new();
+    for _ in 0..16 {
+        let pool = pool.clone();
+        joins.push(tokio::spawn(async move {
+            queries::create_concept(&pool, name, Facet::Tool, Actor::Agent).await
+        }));
+    }
+
+    let mut ids = Vec::new();
+    let mut created = 0;
+    for join in joins {
+        let (id, was_created) = join.await.expect("task join").expect("create concept");
+        ids.push(id);
+        created += i32::from(was_created);
+    }
+
+    assert_eq!(created, 1, "exactly one concurrent writer inserts");
+    assert!(
+        ids.iter().all(|id| *id == ids[0]),
+        "all concurrent writers resolve the same active entity id: {ids:?}"
+    );
+
+    let active_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM memory_entities
+         WHERE name = $1 AND entity_type = 'concept' AND valid_to IS NULL",
+    )
+    .bind(name)
+    .fetch_one(&pool)
+    .await
+    .expect("count active concepts");
+    assert_eq!(active_count, 1);
 }
 
 #[tokio::test]

@@ -31,7 +31,7 @@ async fn direct_run_or_log_increments_counter() {
     pgmcp::cron::topic_dendrogram::run_or_log(pool, Arc::clone(&stats)).await;
     let after = stats.topic_dendrogram_runs.load(Ordering::Relaxed);
     assert!(
-        after >= before + 1,
+        after > before,
         "topic_dendrogram_runs must increment on each run_or_log call: {before} -> {after}"
     );
 }

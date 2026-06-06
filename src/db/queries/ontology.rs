@@ -14,11 +14,32 @@
 #![allow(dead_code)]
 
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 use crate::ontology::edge::{EvidenceKind, OntologyRelation};
 use crate::ontology::facet::{ConceptStatus, Facet};
 use crate::tracker::transition::Actor;
+
+/// Upper bound for agent/user-authored ontology concept names.
+///
+/// This keeps MCP writes and trie refreshes bounded while leaving enough room
+/// for descriptive hand-curated concepts.
+pub const ONTOLOGY_CONCEPT_MAX_NAME_CHARS: usize = 256;
+
+/// Normalize a concept name before it reaches the database.
+pub fn normalize_concept_name(name: &str) -> Result<String, String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err("concept name must not be blank".to_string());
+    }
+    let chars = trimmed.chars().count();
+    if chars > ONTOLOGY_CONCEPT_MAX_NAME_CHARS {
+        return Err(format!(
+            "concept name must be at most {ONTOLOGY_CONCEPT_MAX_NAME_CHARS} characters"
+        ));
+    }
+    Ok(trimmed.to_string())
+}
 
 /// Full `ontology_concept_meta` row.
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -81,6 +102,19 @@ pub async fn upsert_concept_meta(
     build_method: &str,
     project_id: Option<i32>,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    upsert_concept_meta_in_tx(&mut tx, entity_id, facet, build_method, project_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn upsert_concept_meta_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    entity_id: i64,
+    facet: Facet,
+    build_method: &str,
+    project_id: Option<i32>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO ontology_concept_meta (entity_id, facet, build_method, project_id)
          VALUES ($1, $2, $3, $4)
@@ -95,7 +129,7 @@ pub async fn upsert_concept_meta(
     .bind(facet.as_str())
     .bind(build_method)
     .bind(project_id)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -215,6 +249,28 @@ pub async fn upsert_invariant_meta(
     build_method: &str,
     project_id: Option<i32>,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    upsert_invariant_meta_in_tx(
+        &mut tx,
+        entity_id,
+        constraint_text,
+        rationale,
+        build_method,
+        project_id,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+async fn upsert_invariant_meta_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    entity_id: i64,
+    constraint_text: &str,
+    rationale: &str,
+    build_method: &str,
+    project_id: Option<i32>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO ontology_concept_meta
             (entity_id, facet, constraint_text, rationale, build_method, project_id)
@@ -233,7 +289,7 @@ pub async fn upsert_invariant_meta(
     .bind(rationale)
     .bind(build_method)
     .bind(project_id)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -367,28 +423,7 @@ pub async fn migrate_concept(
     facet: Facet,
     build_method: &str,
 ) -> Result<(i64, bool), sqlx::Error> {
-    let existing: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM memory_entities \
-         WHERE name = $1 AND entity_type = 'concept' AND valid_to IS NULL LIMIT 1",
-    )
-    .bind(name)
-    .fetch_optional(pool)
-    .await?;
-    let (entity_id, created) = match existing {
-        Some(id) => (id, false),
-        None => {
-            let id: i64 = sqlx::query_scalar(
-                "INSERT INTO memory_entities (name, entity_type, source) \
-                 VALUES ($1, 'concept', 'migration'::memory_source) RETURNING id",
-            )
-            .bind(name)
-            .fetch_one(pool)
-            .await?;
-            (id, true)
-        }
-    };
-    upsert_concept_meta(pool, entity_id, facet, build_method, None).await?;
-    Ok((entity_id, created))
+    create_concept_with_source(pool, name, facet, "migration", build_method).await
 }
 
 /// Upsert a small structured attribute on a concept (`ontology_concept_attr`).
@@ -727,33 +762,91 @@ pub async fn create_concept(
         Actor::Agent => "agent_write",
         _ => "user_explicit",
     };
-    let existing: Option<i64> = sqlx::query_scalar(
-        "SELECT id FROM memory_entities \
-         WHERE name = $1 AND entity_type = 'concept' AND valid_to IS NULL LIMIT 1",
-    )
-    .bind(name)
-    .fetch_optional(pool)
-    .await?;
-    let (entity_id, created) = match existing {
-        Some(id) => (id, false),
-        None => {
-            let id: i64 = sqlx::query_scalar(
-                "INSERT INTO memory_entities (name, entity_type, source) \
-                 VALUES ($1, 'concept', $2::memory_source) RETURNING id",
-            )
-            .bind(name)
-            .bind(source)
-            .fetch_one(pool)
-            .await?;
-            (id, true)
-        }
-    };
     let build_method = match actor {
         Actor::Agent => "agent",
         _ => "user",
     };
-    upsert_concept_meta(pool, entity_id, facet, build_method, None).await?;
-    Ok((entity_id, created))
+    create_concept_with_source(pool, name, facet, source, build_method).await
+}
+
+async fn create_concept_with_source(
+    pool: &PgPool,
+    name: &str,
+    facet: Facet,
+    source: &str,
+    build_method: &str,
+) -> Result<(i64, bool), sqlx::Error> {
+    let name = normalize_concept_name(name).map_err(sqlx::Error::Protocol)?;
+    let mut tx = pool.begin().await?;
+    let res = async {
+        lock_concept_name(&mut tx, &name).await?;
+
+        let existing: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM memory_entities \
+             WHERE name = $1 AND entity_type = 'concept' AND valid_to IS NULL \
+             ORDER BY id LIMIT 1",
+        )
+        .bind(&name)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let (entity_id, created) = match existing {
+            Some(id) => (id, false),
+            None => {
+                let id: i64 = sqlx::query_scalar(
+                    "INSERT INTO memory_entities (name, entity_type, source) \
+                     VALUES ($1, 'concept', $2::memory_source) RETURNING id",
+                )
+                .bind(&name)
+                .bind(source)
+                .fetch_one(&mut *tx)
+                .await?;
+                (id, true)
+            }
+        };
+        upsert_concept_meta_in_tx(&mut tx, entity_id, facet, build_method, None).await?;
+        Ok::<(i64, bool), sqlx::Error>((entity_id, created))
+    }
+    .await;
+
+    match res {
+        Ok(out) => {
+            tx.commit().await?;
+            Ok(out)
+        }
+        Err(e) => {
+            let _ = tx.rollback().await;
+            Err(e)
+        }
+    }
+}
+
+async fn lock_concept_name(
+    tx: &mut Transaction<'_, Postgres>,
+    name: &str,
+) -> Result<(), sqlx::Error> {
+    let (lock_a, lock_b) = concept_name_advisory_lock_key(name);
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(lock_a)
+        .bind(lock_b)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+fn concept_name_advisory_lock_key(name: &str) -> (i32, i32) {
+    fn fnv1a32(seed: u32, bytes: &[u8]) -> u32 {
+        let mut hash = seed;
+        for byte in bytes {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        hash
+    }
+
+    let prefix = b"ontology:concept:";
+    let high = fnv1a32(fnv1a32(0x811c_9dc5, prefix), name.as_bytes());
+    let low = fnv1a32(fnv1a32(0x811c_9dc5 ^ 0x9e37_79b9, name.as_bytes()), prefix);
+    (high as i32, low as i32)
 }
 
 /// Agent-authored invariant assertion: create the concept, set its invariant

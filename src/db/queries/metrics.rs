@@ -298,6 +298,53 @@ pub async fn find_hot_paths(
     .await
 }
 
+/// Files in the intersection of top-P% PageRank, top-P% churn, and top-P%
+/// fix_commit_ratio for one already-resolved project id.
+pub async fn find_hot_paths_by_project_id(
+    pool: &PgPool,
+    project_id: i32,
+    percentile_threshold: f64,
+    limit: i32,
+) -> Result<Vec<HotPathRow>, sqlx::Error> {
+    sqlx::query_as::<_, HotPathRow>(
+        "WITH stats AS (
+            SELECT f.id AS file_id,
+                   f.relative_path,
+                   fm.pagerank,
+                   fm.churn_rate,
+                   fm.fix_commit_ratio,
+                   fm.bug_proneness,
+                   fm.instability,
+                   fm.in_degree,
+                   fm.author_count,
+                   fm.commit_count,
+                   PERCENT_RANK() OVER (ORDER BY COALESCE(fm.pagerank, 0)) AS pagerank_pct,
+                   PERCENT_RANK() OVER (ORDER BY COALESCE(fm.churn_rate, 0)) AS churn_pct,
+                   PERCENT_RANK() OVER (ORDER BY COALESCE(fm.fix_commit_ratio, 0)) AS fix_ratio_pct
+            FROM indexed_files f
+            LEFT JOIN file_metrics fm ON fm.file_id = f.id AND fm.project_id = f.project_id
+            WHERE f.project_id = $1
+         )
+         SELECT file_id, relative_path,
+                pagerank, churn_rate, fix_commit_ratio,
+                bug_proneness, instability,
+                in_degree, author_count, commit_count,
+                pagerank_pct, churn_pct, fix_ratio_pct
+         FROM stats
+         WHERE pagerank_pct >= $2
+           AND churn_pct >= $2
+           AND fix_ratio_pct >= $2
+         ORDER BY (pagerank_pct + churn_pct + fix_ratio_pct) DESC,
+                  file_id ASC
+         LIMIT $3",
+    )
+    .bind(project_id)
+    .bind(percentile_threshold)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// One row per file with its top author (by lines blamed) and risk score.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct BusFactorRow {
@@ -596,6 +643,27 @@ pub async fn get_file_complexity_data(
          ORDER BY chunk_count DESC",
     )
     .bind(project)
+    .fetch_all(pool)
+    .await
+}
+
+/// Get per-file complexity data for a resolved project id.
+pub async fn get_file_complexity_data_by_project_id(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Vec<FileComplexityRow>, sqlx::Error> {
+    sqlx::query_as::<_, FileComplexityRow>(
+        "SELECT f.path, f.language, f.size_bytes,
+                COUNT(DISTINCT c.id) as chunk_count,
+                COUNT(DISTINCT cta.topic_id) as topic_count
+         FROM indexed_files f
+         JOIN file_chunks c ON c.file_id = f.id
+         LEFT JOIN chunk_topic_assignments cta ON cta.chunk_id = c.id
+         WHERE f.project_id = $1
+         GROUP BY f.id, f.path, f.language, f.size_bytes
+         ORDER BY chunk_count DESC",
+    )
+    .bind(project_id)
     .fetch_all(pool)
     .await
 }

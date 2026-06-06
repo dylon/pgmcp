@@ -5,7 +5,7 @@
 //!
 //!   1. exact_in_file        → same file, name matches → 1.0
 //!   2. exact_via_import     → matches a symbol whose scope_path is
-//!                            prefixed by a known import → 0.95
+//!      prefixed by a known import → 0.95
 //!   3. bare_name_in_project → matches some symbol elsewhere → 0.5
 //!   4. unresolved           → no name match → 0.0
 //!

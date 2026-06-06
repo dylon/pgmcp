@@ -29,6 +29,7 @@ pub async fn tool_text_search(
         query = %truncate(&params.query, 200),
         limit,
         language = params.language.as_deref().unwrap_or("*"),
+        project = params.project.as_deref().unwrap_or("*"),
         "MCP tool invoked",
     );
 
@@ -38,6 +39,7 @@ pub async fn tool_text_search(
             &params.query,
             limit,
             params.language.as_deref(),
+            params.project.as_deref(),
             params.dedupe_worktrees.unwrap_or(false),
         )
         .await

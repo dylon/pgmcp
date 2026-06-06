@@ -132,6 +132,120 @@ async fn eval_recall_fts_matches_search_nodes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn eval_recall_search_nodes_treats_like_wildcards_as_literals() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let scope = queries::find_or_create_scope(
+        pool,
+        &ScopeSpec {
+            user_id: Some(format!("wildcard-{}", Uuid::new_v4())),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("scope");
+    queries::memory_create_entities(
+        pool,
+        &[
+            queries::NewEntityInput {
+                name: "literal-percent".into(),
+                entity_type: "concept".into(),
+                observations: vec!["literal token 100%_done".into()],
+            },
+            queries::NewEntityInput {
+                name: "wildcard-control".into(),
+                entity_type: "concept".into(),
+                observations: vec!["plain control text".into()],
+            },
+        ],
+        scope,
+        "agent_write",
+    )
+    .await
+    .expect("entities");
+
+    let hits = queries::memory_search_nodes(pool, "%", Some(scope), 10)
+        .await
+        .expect("search literal percent");
+    let names: Vec<&str> = hits.iter().map(|hit| hit.name.as_str()).collect();
+    assert!(
+        names.contains(&"literal-percent"),
+        "literal percent entity must match; got {names:?}"
+    );
+    assert!(
+        !names.contains(&"wildcard-control"),
+        "percent query must not act as an unbounded wildcard; got {names:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn eval_recall_search_nodes_observation_count_not_multiplied_by_scopes() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let suffix = Uuid::new_v4().simple().to_string();
+    let needle = format!("scope-count-needle-{suffix}");
+    let entity_id: i64 = sqlx::query_scalar(
+        "INSERT INTO memory_entities (name, entity_type, source)
+         VALUES ($1, 'concept', 'agent_write'::memory_source) RETURNING id",
+    )
+    .bind(format!("scope-count-entity-{suffix}"))
+    .fetch_one(pool)
+    .await
+    .expect("entity");
+    sqlx::query(
+        "INSERT INTO memory_observations (entity_id, content, content_sha256, source)
+         VALUES ($1, $2, $3, 'agent_write'::memory_source)",
+    )
+    .bind(entity_id)
+    .bind(format!("single matching observation {needle}"))
+    .bind(format!("{:0<64}", suffix))
+    .execute(pool)
+    .await
+    .expect("observation");
+    let scope_a = queries::find_or_create_scope(
+        pool,
+        &ScopeSpec {
+            user_id: Some(format!("scope-count-a-{suffix}")),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("scope a");
+    let scope_b = queries::find_or_create_scope(
+        pool,
+        &ScopeSpec {
+            user_id: Some(format!("scope-count-b-{suffix}")),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("scope b");
+    for scope in [scope_a, scope_b] {
+        sqlx::query(
+            "INSERT INTO memory_entity_scope (entity_id, scope_id)
+             VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(entity_id)
+        .bind(scope)
+        .execute(pool)
+        .await
+        .expect("scope link");
+    }
+
+    let hits = queries::memory_search_nodes(pool, &needle, None, 10)
+        .await
+        .expect("search");
+    let hit = hits
+        .iter()
+        .find(|hit| hit.id == entity_id)
+        .expect("inserted entity must match");
+    assert_eq!(
+        hit.matched_observations, 1,
+        "one observation must not be counted once per scope"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn eval_recall_exact_name_via_open_nodes() {
     let db = require_test_db!();
     let pool = db.pool();

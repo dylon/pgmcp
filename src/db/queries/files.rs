@@ -232,8 +232,11 @@ pub async fn read_file_by_relative_path(
 /// Get file info/metadata.
 pub async fn file_info(pool: &PgPool, path: &str) -> Result<Option<FileInfo>, sqlx::Error> {
     let row = sqlx::query_as::<_, FileInfo>(
-        "SELECT path, relative_path, language, size_bytes, line_count, truncated, indexed_at, modified_at
-         FROM indexed_files WHERE path = $1"
+        "SELECT f.path, f.relative_path, f.language, f.size_bytes, f.line_count,
+                f.truncated, f.indexed_at, f.modified_at, p.name AS project_name
+         FROM indexed_files f
+         LEFT JOIN projects p ON p.id = f.project_id
+         WHERE f.path = $1",
     )
     .bind(path)
     .fetch_optional(pool)
@@ -246,6 +249,7 @@ pub async fn file_info(pool: &PgPool, path: &str) -> Result<Option<FileInfo>, sq
 pub struct FileInfo {
     pub path: String,
     pub relative_path: String,
+    pub project_name: Option<String>,
     pub language: String,
     pub size_bytes: i64,
     pub line_count: i32,
@@ -260,17 +264,39 @@ pub async fn project_tree(
     project_name: &str,
     depth: i32,
 ) -> Result<Vec<String>, sqlx::Error> {
-    // Get all relative paths for the project and filter by depth
-    let paths = sqlx::query_scalar::<_, String>(
-        "SELECT f.relative_path
-         FROM indexed_files f
-         JOIN projects p ON p.id = f.project_id
-         WHERE p.name = $1
-         ORDER BY f.relative_path",
+    let rows: Vec<(i64, Option<String>)> = sqlx::query_as(
+        "WITH matching_projects AS (
+             SELECT id
+             FROM projects
+             WHERE name = $1
+         ),
+         project_match AS (
+             SELECT COUNT(*)::int8 AS match_count, MIN(id) AS project_id
+             FROM matching_projects
+         )
+         SELECT pm.match_count, f.relative_path
+         FROM project_match pm
+         LEFT JOIN indexed_files f
+           ON pm.match_count = 1 AND f.project_id = pm.project_id
+         ORDER BY f.relative_path NULLS LAST",
     )
     .bind(project_name)
     .fetch_all(pool)
     .await?;
+
+    let Some((match_count, _)) = rows.first() else {
+        return Ok(Vec::new());
+    };
+    if *match_count > 1 {
+        return Err(sqlx::Error::Protocol(format!(
+            "ambiguous project name '{project_name}' matched {match_count} indexed projects"
+        )));
+    }
+    if *match_count == 0 {
+        return Ok(Vec::new());
+    }
+
+    let paths: Vec<String> = rows.into_iter().filter_map(|(_, path)| path).collect();
 
     // Filter by depth
     let filtered: Vec<String> = paths
@@ -331,11 +357,21 @@ pub async fn resolve_file_reference(
 ) -> Result<Option<FileReference>, sqlx::Error> {
     if let Some((project, rel_path)) = file_ref.split_once(':') {
         sqlx::query_as::<_, FileReference>(
-            "SELECT f.id as file_id, f.path, f.relative_path, f.language, f.line_count,
+            "WITH matching_projects AS (
+                 SELECT id, name
+                 FROM projects
+                 WHERE name = $1
+             ),
+             unique_project AS (
+                 SELECT id, name
+                 FROM matching_projects
+                 WHERE (SELECT COUNT(*) FROM matching_projects) = 1
+             )
+             SELECT f.id as file_id, f.path, f.relative_path, f.language, f.line_count,
                     p.id as project_id, p.name as project_name
              FROM indexed_files f
-             JOIN projects p ON p.id = f.project_id
-             WHERE p.name = $1 AND f.relative_path = $2",
+             JOIN unique_project p ON p.id = f.project_id
+             WHERE f.relative_path = $2",
         )
         .bind(project)
         .bind(rel_path)

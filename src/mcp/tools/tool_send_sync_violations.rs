@@ -15,28 +15,31 @@ use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_er
 use crate::mcp::tools::sota_regex_scan::scan_files_for_pattern;
 use crate::parsing::type_tags::vocabulary::EFFECT_UNSAFE;
 
+const SEND_SYNC_VIOLATIONS_MAX_LIMIT: i32 = 200;
+
 pub async fn tool_send_sync_violations(
     ctx: &SystemContext,
     params: SendSyncViolationsParams,
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "send_sync_violations", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    if project.is_empty() {
+        return Err(McpError::invalid_params("project must be non-empty", None));
+    }
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
-    let limit = params.limit.unwrap_or(50);
+    let limit = params
+        .limit
+        .unwrap_or(50)
+        .clamp(1, SEND_SYNC_VIOLATIONS_MAX_LIMIT);
 
     let pat = Regex::new(
         r"(?m)Arc<RefCell\b|Arc<Cell\b|Rc<[^>]+>\s*(?:cloned|into).*spawn|static\s+mut\b|unsafe\s+impl\s+(Send|Sync)\b"
     ).expect("send/sync regex");
-    let hits = scan_files_for_pattern(
-        pool,
-        project_id,
-        &pat,
-        Some(&["rust"]),
-        limit.max(0) as usize,
-    )
-    .await
-    .map_err(|e| McpError::internal_error(format!("Scan failed: {}", e), None))?;
+    let hits = scan_files_for_pattern(pool, project_id, &pat, Some(&["rust"]), limit as usize)
+        .await
+        .map_err(|e| McpError::internal_error(format!("Scan failed: {}", e), None))?;
     let rows: Vec<_> = hits
         .into_iter()
         .map(|h| json!({"file": h.relative_path, "line": h.line, "snippet": h.snippet}))
@@ -54,7 +57,8 @@ pub async fn tool_send_sync_violations(
         })
         .collect::<Vec<_>>();
     json_result(&json!({
-        "project": params.project,
+        "project": project,
+        "limit": limit,
         "matches": rows,
         "unsafe_symbols": unsafe_symbols,
         "guidance": "Arc<RefCell<T>>/Arc<Cell<T>> across threads = data race; `static mut` = inherently unsynchronized global; `unsafe impl Send/Sync` requires manual audit of the invariants."

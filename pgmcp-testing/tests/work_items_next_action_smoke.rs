@@ -530,6 +530,55 @@ async fn work_item_bulk_partial_success() {
         Some(1)
     );
 
+    // Explicit public_ids are trimmed and deduped before mutation.
+    let bassign_dedup = server
+        .call_tool_cli(
+            "work_item_bulk",
+            json!({ "op": "assign", "public_ids": [" bulk-legal ", "bulk-legal"], "assignee": "bulk-owner-2" }),
+        )
+        .await
+        .expect("bulk assign with duplicate explicit ids must succeed");
+    let dedup_v: Value = serde_json::from_str(&text_of(&bassign_dedup)).expect("dedup bulk JSON");
+    assert_eq!(
+        dedup_v["attempted"].as_i64(),
+        Some(1),
+        "duplicate explicit public_ids are only attempted once"
+    );
+    assert_eq!(dedup_v["succeeded"].as_i64(), Some(1));
+
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_bulk",
+                json!({ "op": "assign", "public_ids": ["  "], "assignee": "nobody" }),
+            )
+            .await
+            .is_err(),
+        "blank explicit public_ids are rejected before mutation"
+    );
+
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_bulk",
+                json!({ "op": "reprioritize", "public_ids": ["bulk-legal"], "priority": 101 }),
+            )
+            .await
+            .is_err(),
+        "bulk reprioritize validates priority before applying updates"
+    );
+    let legal_after_bad_priority = server
+        .call_tool_cli("work_item_get", json!({ "public_id": "bulk-legal" }))
+        .await
+        .expect("get bulk-legal after rejected reprioritize");
+    assert_eq!(
+        serde_json::from_str::<Value>(&text_of(&legal_after_bad_priority)).unwrap()["item"]
+            ["priority"]
+            .as_i64(),
+        Some(0),
+        "rejected reprioritize leaves the row unchanged"
+    );
+
     // An unknown op is rejected.
     assert!(
         server

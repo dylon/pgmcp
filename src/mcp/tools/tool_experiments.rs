@@ -9,8 +9,7 @@
 //! cross-project. The agent executes the work; the daemon never spawns
 //! arbitrary commands.
 
-#![allow(unused_imports)]
-
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 use pgvector::Vector;
@@ -41,6 +40,60 @@ const VALID_KINDS: &[&str] = &[
     "other",
 ];
 const VALID_ARM_KINDS: &[&str] = &["control", "treatment", "baseline"];
+const VALID_DIRECTIONS: &[&str] = &["increase", "decrease", "either", "none"];
+const VALID_MEASUREMENT_SOURCES: &[&str] = &[
+    "external_benchmark",
+    "pgmcp_metric",
+    "agent_scalar",
+    "manual",
+];
+const MAX_MEASUREMENT_SAMPLES: usize = 10_000;
+const MAX_EXPERIMENT_DECIDE_LABEL_BYTES: usize = 128;
+const MAX_EXPERIMENT_DECIDE_TEXT_BYTES: usize = 4096;
+
+fn normalize_decide_label(
+    value: Option<String>,
+    default: &str,
+    field: &str,
+) -> Result<String, McpError> {
+    let value = value.unwrap_or_else(|| default.to_string());
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(McpError::invalid_params(
+            format!("{field} must not be blank"),
+            None,
+        ));
+    }
+    if value.len() > MAX_EXPERIMENT_DECIDE_LABEL_BYTES {
+        return Err(McpError::invalid_params(
+            format!("{field} must be at most {MAX_EXPERIMENT_DECIDE_LABEL_BYTES} bytes"),
+            None,
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_optional_decide_text(
+    value: Option<String>,
+    field: &str,
+) -> Result<Option<String>, McpError> {
+    match value {
+        Some(value) => {
+            let value = value.trim();
+            if value.is_empty() {
+                return Ok(None);
+            }
+            if value.len() > MAX_EXPERIMENT_DECIDE_TEXT_BYTES {
+                return Err(McpError::invalid_params(
+                    format!("{field} must be at most {MAX_EXPERIMENT_DECIDE_TEXT_BYTES} bytes"),
+                    None,
+                ));
+            }
+            Ok(Some(value.to_string()))
+        }
+        None => Ok(None),
+    }
+}
 
 /// Embed `text` when `on`, mapping failures to `None` (the migration cron
 /// backfills NULL embeddings, so a transient embed failure is not fatal).
@@ -106,6 +159,53 @@ fn finite_or_none(x: f64) -> Option<f64> {
     if x.is_finite() { Some(x) } else { None }
 }
 
+fn nonblank_str(s: Option<&str>) -> Option<&str> {
+    s.map(str::trim).filter(|s| !s.is_empty())
+}
+
+async fn validate_project_id(
+    pool: &sqlx::PgPool,
+    project_id: Option<i32>,
+) -> Result<Option<i32>, McpError> {
+    let Some(project_id) = project_id else {
+        return Ok(None);
+    };
+    if project_id <= 0 {
+        return Err(McpError::invalid_params(
+            "project_id must be positive",
+            None,
+        ));
+    }
+    let exists =
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM projects WHERE id = $1)")
+            .bind(project_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| McpError::internal_error(format!("validate project_id: {e}"), None))?;
+    if exists {
+        Ok(Some(project_id))
+    } else {
+        Err(McpError::invalid_params(
+            format!("unknown project_id {project_id}"),
+            None,
+        ))
+    }
+}
+
+fn map_experiment_open_err(e: sqlx::Error) -> McpError {
+    if let Some(db) = e.as_database_error() {
+        let code = db.code().map(|code| code.into_owned());
+        return match code.as_deref() {
+            Some("23503") => McpError::invalid_params("referenced project disappeared", None),
+            Some("23514") | Some("22P02") => {
+                McpError::invalid_params("experiment rejected by DB constraint", None)
+            }
+            _ => McpError::internal_error(format!("experiment_open: {e}"), None),
+        };
+    }
+    McpError::internal_error(format!("experiment_open: {e}"), None)
+}
+
 // ============================================================================
 // experiment_open
 // ============================================================================
@@ -117,24 +217,39 @@ pub async fn tool_experiment_open(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
 
-    if params.title.trim().is_empty()
-        || params.question.trim().is_empty()
-        || params.hypothesis.trim().is_empty()
-        || params.primary_metric.trim().is_empty()
+    let title = params.title.trim();
+    let question = params.question.trim();
+    let hypothesis = params.hypothesis.trim();
+    let primary_metric = params.primary_metric.trim();
+    if title.is_empty() || question.is_empty() || hypothesis.is_empty() || primary_metric.is_empty()
     {
         return Err(McpError::invalid_params(
             "title, question, hypothesis, and primary_metric must be non-empty",
             None,
         ));
     }
-    let kind = params.kind.as_deref().unwrap_or("other");
+    let kind = nonblank_str(params.kind.as_deref()).unwrap_or("other");
     if !VALID_KINDS.contains(&kind) {
         return Err(McpError::invalid_params(
             format!("unknown kind '{kind}'; expected one of {VALID_KINDS:?}"),
             None,
         ));
     }
-    let predicted_direction = params.predicted_direction.as_deref().unwrap_or("either");
+    let predicted_direction =
+        nonblank_str(params.predicted_direction.as_deref()).unwrap_or("either");
+    if !VALID_DIRECTIONS.contains(&predicted_direction) {
+        return Err(McpError::invalid_params(
+            format!(
+                "unknown predicted_direction '{predicted_direction}'; expected one of {VALID_DIRECTIONS:?}"
+            ),
+            None,
+        ));
+    }
+    let project_id = validate_project_id(pool, params.project_id).await?;
+    let context = nonblank_str(params.context.as_deref());
+    let unit = nonblank_str(params.unit.as_deref());
+    let git_ref = nonblank_str(params.git_ref.as_deref());
+    let plan_ref = nonblank_str(params.plan_ref.as_deref());
 
     // Resolve the acceptance criterion: supplied JSON, or a kind-appropriate
     // default (Welch p<0.05 ∧ |d|≥0.5 ∧ correct direction).
@@ -153,8 +268,8 @@ pub async fn tool_experiment_open(
     // Prescribe the protocol (kind-aware; sizes the sample via power analysis).
     let proto = protocol::prescribe(
         kind,
-        &params.primary_metric,
-        params.unit.as_deref(),
+        primary_metric,
+        unit,
         predicted_direction,
         &criterion,
         exp_cfg,
@@ -167,9 +282,11 @@ pub async fn tool_experiment_open(
 
     let slug = params
         .slug
-        .clone()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| slugify(&params.title));
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| slugify(title));
     let hardware_json = params
         .hardware
         .as_ref()
@@ -177,52 +294,52 @@ pub async fn tool_experiment_open(
         .unwrap_or_else(|| "{}".to_string());
 
     // Embeddings (synchronous on write; cron backfills on failure).
-    let exp_text = format!(
-        "{} {} {}",
-        params.title,
-        params.question,
-        params.context.as_deref().unwrap_or("")
-    );
+    let exp_text = format!("{} {} {}", title, question, context.unwrap_or(""));
     let exp_embedding = embed_opt(ctx, embed_on_write, &exp_text).await;
-    let hyp_embedding = embed_opt(ctx, embed_on_write, &params.hypothesis).await;
+    let hyp_embedding = embed_opt(ctx, embed_on_write, hypothesis).await;
 
-    let experiment_id = queries::insert_experiment(
-        pool,
+    let mut tx = pool.begin().await.map_err(map_experiment_open_err)?;
+    let experiment_id = queries::insert_experiment_in_tx(
+        &mut tx,
         &slug,
-        &params.title,
-        &params.question,
-        params.context.as_deref(),
+        title,
+        question,
+        context,
         kind,
-        params.project_id,
+        project_id,
         &hardware_json,
-        params.git_ref.as_deref(),
-        params.plan_ref.as_deref(),
+        git_ref,
+        plan_ref,
         &correction,
         exp_embedding,
     )
     .await
-    .map_err(|e| McpError::internal_error(format!("insert_experiment: {e}"), None))?;
+    .map_err(map_experiment_open_err)?;
 
-    let hypothesis_id = queries::insert_experiment_hypothesis(
-        pool,
+    let hypothesis_id = queries::insert_experiment_hypothesis_in_tx(
+        &mut tx,
         experiment_id,
-        &params.hypothesis,
-        &params.primary_metric,
-        params.unit.as_deref(),
+        hypothesis,
+        primary_metric,
+        unit,
         predicted_direction,
         &criterion_json,
         planned_n,
         hyp_embedding,
     )
     .await
-    .map_err(|e| McpError::internal_error(format!("insert_experiment_hypothesis: {e}"), None))?;
+    .map_err(map_experiment_open_err)?;
+    tx.commit().await.map_err(map_experiment_open_err)?;
 
     // Code anchors (best-effort path resolution).
     let mut anchored = 0usize;
     if let Some(paths) = &params.anchor_paths {
         for path in paths {
+            let Some(path) = nonblank_str(Some(path.as_str())) else {
+                continue;
+            };
             if let Ok(Some(file_id)) =
-                queries::resolve_experiment_file_id(pool, params.project_id, path).await
+                queries::resolve_experiment_file_id(pool, project_id, path).await
                 && queries::insert_experiment_code_anchor(
                     pool,
                     experiment_id,
@@ -243,13 +360,13 @@ pub async fn tool_experiment_open(
     if let Err(e) = mirror::mirror_open(
         pool,
         &slug,
-        &params.title,
-        &params.question,
+        title,
+        question,
         kind,
-        params.project_id,
+        project_id,
         hypothesis_id,
-        &params.hypothesis,
-        &params.primary_metric,
+        hypothesis,
+        primary_metric,
     )
     .await
     {
@@ -282,7 +399,24 @@ pub async fn tool_experiment_protocol(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
 
-    let core = queries::get_experiment_core(pool, params.experiment_id, params.slug.as_deref())
+    let experiment_id = params.experiment_id;
+    if let Some(id) = experiment_id
+        && id <= 0
+    {
+        return Err(McpError::invalid_params(
+            "experiment_id must be positive",
+            None,
+        ));
+    }
+    let slug = nonblank_str(params.slug.as_deref());
+    if experiment_id.is_none() && slug.is_none() {
+        return Err(McpError::invalid_params(
+            "experiment_id or slug is required",
+            None,
+        ));
+    }
+
+    let core = queries::get_experiment_core(pool, experiment_id, slug)
         .await
         .map_err(|e| McpError::internal_error(format!("get_experiment_core: {e}"), None))?
         .ok_or_else(|| McpError::invalid_params("experiment not found", None))?;
@@ -338,26 +472,106 @@ pub async fn tool_experiment_record_measurement(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
 
-    if params.samples.is_empty() {
-        return Err(McpError::invalid_params("samples must be non-empty", None));
+    let arm_label = params.arm_label.trim();
+    if arm_label.is_empty() {
+        return Err(McpError::invalid_params(
+            "arm_label must be non-empty",
+            None,
+        ));
     }
-    if params.samples.iter().any(|v| !v.is_finite()) {
-        return Err(McpError::invalid_params("samples must all be finite", None));
-    }
-    if !VALID_ARM_KINDS.contains(&params.arm_kind.as_str()) {
+    let arm_kind = params.arm_kind.trim();
+    if !VALID_ARM_KINDS.contains(&arm_kind) {
         return Err(McpError::invalid_params(
             format!("arm_kind must be one of {VALID_ARM_KINDS:?}"),
             None,
         ));
     }
-    if let Some(keys) = &params.unit_keys
-        && keys.len() != params.samples.len()
-    {
+    let metric = params.metric.trim();
+    if metric.is_empty() {
+        return Err(McpError::invalid_params("metric must be non-empty", None));
+    }
+    if params.samples.is_empty() {
+        return Err(McpError::invalid_params("samples must be non-empty", None));
+    }
+    if params.samples.len() > MAX_MEASUREMENT_SAMPLES {
         return Err(McpError::invalid_params(
-            "unit_keys length must equal samples length",
+            format!("samples length must be <= {MAX_MEASUREMENT_SAMPLES}"),
             None,
         ));
     }
+    if params.samples.iter().any(|v| !v.is_finite()) {
+        return Err(McpError::invalid_params("samples must all be finite", None));
+    }
+    let source = params
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("manual");
+    if !VALID_MEASUREMENT_SOURCES.contains(&source) {
+        return Err(McpError::invalid_params(
+            format!("source must be one of {VALID_MEASUREMENT_SOURCES:?}"),
+            None,
+        ));
+    }
+    let normalized_unit_keys = match &params.unit_keys {
+        Some(keys) => {
+            if keys.len() != params.samples.len() {
+                return Err(McpError::invalid_params(
+                    "unit_keys length must equal samples length",
+                    None,
+                ));
+            }
+            let mut seen = HashSet::with_capacity(keys.len());
+            let mut normalized = Vec::with_capacity(keys.len());
+            for key in keys {
+                let key = key.trim();
+                if key.is_empty() {
+                    return Err(McpError::invalid_params(
+                        "unit_keys entries must be non-empty",
+                        None,
+                    ));
+                }
+                if !seen.insert(key.to_string()) {
+                    return Err(McpError::invalid_params(
+                        "unit_keys entries must be unique within a submission",
+                        None,
+                    ));
+                }
+                normalized.push(key.to_string());
+            }
+            Some(normalized)
+        }
+        None => None,
+    };
+    let unit = params
+        .unit
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let core = queries::get_experiment_core(pool, Some(params.experiment_id), None)
+        .await
+        .map_err(|e| McpError::internal_error(format!("get_experiment_core: {e}"), None))?
+        .ok_or_else(|| McpError::invalid_params("experiment not found", None))?;
+    let hypothesis = match params.hypothesis_id {
+        Some(hyp_id) => {
+            let hyp = queries::get_experiment_hypothesis(pool, hyp_id)
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(format!("get_experiment_hypothesis: {e}"), None)
+                })?
+                .ok_or_else(|| McpError::invalid_params("hypothesis not found", None))?;
+            if hyp.experiment_id != params.experiment_id {
+                return Err(McpError::invalid_params(
+                    "hypothesis_id does not belong to experiment_id",
+                    None,
+                ));
+            }
+            Some(hyp)
+        }
+        None => None,
+    };
 
     let command_spec = params
         .command_spec
@@ -375,52 +589,40 @@ pub async fn tool_experiment_record_measurement(
         .map(|v| v.to_string())
         .unwrap_or_else(|| "{}".to_string());
 
-    let run_id = queries::upsert_experiment_run(
+    let recorded = queries::record_experiment_measurement(
         pool,
-        params.experiment_id,
-        params.hypothesis_id,
-        &params.arm_label,
-        &params.arm_kind,
-        &command_spec,
-        &run_plan,
-        &host_meta,
-        params.git_ref.as_deref(),
-        params.source.as_deref(),
-        params.seed.unwrap_or(0),
+        queries::RecordExperimentMeasurement {
+            experiment_id: params.experiment_id,
+            hypothesis_id: params.hypothesis_id,
+            arm_label,
+            arm_kind,
+            command_spec_json: &command_spec,
+            run_plan_json: &run_plan,
+            host_meta_json: &host_meta,
+            git_ref: params.git_ref.as_deref(),
+            runner: Some(source),
+            seed: params.seed.unwrap_or(0),
+            metric_name: metric,
+            samples: &params.samples,
+            unit_keys: normalized_unit_keys.as_deref(),
+            is_warmup: params.is_warmup.unwrap_or(false),
+        },
     )
     .await
-    .map_err(|e| McpError::internal_error(format!("upsert_experiment_run: {e}"), None))?;
+    .map_err(|e| McpError::internal_error(format!("record_experiment_measurement: {e}"), None))?;
 
     let is_warmup = params.is_warmup.unwrap_or(false);
-    let inserted = queries::insert_experiment_samples(
-        pool,
-        run_id,
-        &params.arm_label,
-        &params.metric,
-        &params.samples,
-        params.unit_keys.as_deref(),
-        is_warmup,
-    )
-    .await
-    .map_err(|e| McpError::internal_error(format!("insert_experiment_samples: {e}"), None))?;
-
-    queries::set_experiment_status(pool, params.experiment_id, "measuring")
-        .await
-        .map_err(|e| McpError::internal_error(format!("set_experiment_status: {e}"), None))?;
-
-    // Summary over the just-submitted (non-warm-up) samples.
+    // Summary over the just-submitted samples. Conformance below excludes
+    // warm-up rows from protocol sample counts and statistical decisions.
     let summary = inference::summarize(&params.samples);
 
     // Conformance check: compare the total non-warm-up samples recorded so far
     // for this arm/metric against the protocol's required_samples_per_arm.
     let mut conformance = json!({ "checked": false });
     if !is_warmup
-        && let Some(hyp_id) = params.hypothesis_id
-        && let Ok(Some(hyp)) = queries::get_experiment_hypothesis(pool, hyp_id).await
+        && let Some(hyp) = hypothesis.as_ref()
         && let Ok(criterion) =
             serde_json::from_str::<AcceptanceCriterion>(&hyp.acceptance_criterion_json)
-        && let Ok(Some(core)) =
-            queries::get_experiment_core(pool, Some(params.experiment_id), None).await
     {
         let cfg = ctx.config().load();
         let proto = protocol::prescribe(
@@ -437,8 +639,8 @@ pub async fn tool_experiment_record_measurement(
             pool,
             params.experiment_id,
             params.hypothesis_id,
-            &params.arm_label,
-            &params.metric,
+            arm_label,
+            metric,
         )
         .await
         .map(|v| v.len())
@@ -448,14 +650,14 @@ pub async fn tool_experiment_record_measurement(
         // metric/unit-match conformance: a submitted unit that conflicts with
         // the hypothesis's declared unit is flagged — samples in the wrong unit
         // would silently corrupt the test.
-        let unit_match = match (params.unit.as_deref(), hyp.unit.as_deref()) {
+        let unit_match = match (unit, hyp.unit.as_deref()) {
             (Some(submitted), Some(expected)) => submitted == expected,
             _ => true,
         };
         let unit_warning = (!unit_match).then(|| {
             format!(
                 "submitted unit {:?} does not match the hypothesis's declared unit {:?}",
-                params.unit, hyp.unit
+                unit, hyp.unit
             )
         });
         conformance = json!({
@@ -466,7 +668,7 @@ pub async fn tool_experiment_record_measurement(
             "met": met,
             "unit_match": unit_match,
             "warning": if met { serde_json::Value::Null } else {
-                json!(format!("only {total} non-warm-up samples for arm '{}'; protocol prescribes >= {:?}", params.arm_label, required))
+                json!(format!("only {total} non-warm-up samples for arm '{arm_label}'; protocol prescribes >= {required:?}"))
             },
             "unit_warning": unit_warning,
         });
@@ -477,8 +679,8 @@ pub async fn tool_experiment_record_measurement(
         .fetch_add(1, Ordering::Relaxed);
 
     json_result(&json!({
-        "run_id": run_id,
-        "inserted_samples": inserted,
+        "run_id": recorded.run_id,
+        "inserted_samples": recorded.inserted_samples,
         "is_warmup": is_warmup,
         "summary": {
             "n": summary.n,
@@ -502,8 +704,23 @@ pub async fn tool_experiment_decide(
 ) -> Result<CallToolResult, McpError> {
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
+    let ExperimentDecideParams {
+        hypothesis_id,
+        metric,
+        control_arm,
+        treatment_arm,
+        decided_by,
+        rationale_note,
+        link_outcome,
+    } = params;
+    if hypothesis_id <= 0 {
+        return Err(McpError::invalid_params(
+            "hypothesis_id must be positive",
+            None,
+        ));
+    }
 
-    let hyp = queries::get_experiment_hypothesis(pool, params.hypothesis_id)
+    let hyp = queries::get_experiment_hypothesis(pool, hypothesis_id)
         .await
         .map_err(|e| McpError::internal_error(format!("get_experiment_hypothesis: {e}"), None))?
         .ok_or_else(|| McpError::invalid_params("hypothesis not found", None))?;
@@ -514,15 +731,20 @@ pub async fn tool_experiment_decide(
 
     let criterion: AcceptanceCriterion = serde_json::from_str(&hyp.acceptance_criterion_json)
         .map_err(|e| McpError::internal_error(format!("stored criterion parse: {e}"), None))?;
-    let metric = params
-        .metric
-        .clone()
-        .unwrap_or_else(|| hyp.primary_metric.clone());
-    let control_arm = params.control_arm.as_deref().unwrap_or("control");
-    let treatment_arm = params.treatment_arm.as_deref().unwrap_or("treatment");
+    let metric = normalize_decide_label(metric, &hyp.primary_metric, "metric")?;
+    let control_arm = normalize_decide_label(control_arm, "control", "control_arm")?;
+    let treatment_arm = normalize_decide_label(treatment_arm, "treatment", "treatment_arm")?;
+    if control_arm == treatment_arm {
+        return Err(McpError::invalid_params(
+            "control_arm and treatment_arm must differ",
+            None,
+        ));
+    }
+    let decided_by = normalize_optional_decide_text(decided_by, "decided_by")?;
+    let rationale_note = normalize_optional_decide_text(rationale_note, "rationale_note")?;
 
     // Anti-p-hacking guard: the criterion must predate the first measurement.
-    if let Ok(Some(first)) = queries::earliest_measurement_time(pool, params.hypothesis_id).await
+    if let Ok(Some(first)) = queries::earliest_measurement_time(pool, hypothesis_id).await
         && hyp.criterion_locked_at > first
     {
         return Err(McpError::invalid_params(
@@ -535,8 +757,8 @@ pub async fn tool_experiment_decide(
     let control: Vec<f64> = queries::load_experiment_samples(
         pool,
         hyp.experiment_id,
-        Some(params.hypothesis_id),
-        control_arm,
+        Some(hypothesis_id),
+        &control_arm,
         &metric,
     )
     .await
@@ -547,8 +769,8 @@ pub async fn tool_experiment_decide(
     let treatment: Vec<f64> = queries::load_experiment_samples(
         pool,
         hyp.experiment_id,
-        Some(params.hypothesis_id),
-        treatment_arm,
+        Some(hypothesis_id),
+        &treatment_arm,
         &metric,
     )
     .await
@@ -613,8 +835,8 @@ pub async fn tool_experiment_decide(
                 "Inconclusive: the statistical test could not be run on the recorded samples."
                     .to_string()
             });
-        match &params.rationale_note {
-            Some(note) if !note.trim().is_empty() => format!("{base}\n\nOperator note: {note}"),
+        match &rationale_note {
+            Some(note) => format!("{base}\n\nOperator note: {note}"),
             _ => base,
         }
     };
@@ -633,20 +855,16 @@ pub async fn tool_experiment_decide(
     )
     .await;
 
-    let control_run_id = queries::find_experiment_run_id(
-        pool,
-        hyp.experiment_id,
-        Some(params.hypothesis_id),
-        control_arm,
-    )
-    .await
-    .ok()
-    .flatten();
+    let control_run_id =
+        queries::find_experiment_run_id(pool, hyp.experiment_id, Some(hypothesis_id), &control_arm)
+            .await
+            .ok()
+            .flatten();
     let treatment_run_id = queries::find_experiment_run_id(
         pool,
         hyp.experiment_id,
-        Some(params.hypothesis_id),
-        treatment_arm,
+        Some(hypothesis_id),
+        &treatment_arm,
     )
     .await
     .ok()
@@ -661,7 +879,7 @@ pub async fn tool_experiment_decide(
         pool,
         &core.slug,
         None,
-        params.hypothesis_id,
+        hypothesis_id,
         &metric,
         &verdict,
         &summary,
@@ -670,11 +888,11 @@ pub async fn tool_experiment_decide(
     .unwrap_or(None);
 
     let criterion_snapshot = serde_json::to_string(&criterion).unwrap_or_else(|_| "{}".to_string());
-    let result_id = queries::insert_experiment_result(
+    let result_id = queries::insert_experiment_decision(
         pool,
         InsertExperimentResult {
             experiment_id: hyp.experiment_id,
-            hypothesis_id: params.hypothesis_id,
+            hypothesis_id,
             test_type: &test_type,
             metric_name: &metric,
             control_run_id,
@@ -693,24 +911,13 @@ pub async fn tool_experiment_decide(
             criterion_snapshot_json: &criterion_snapshot,
             test_result_json: &test_result_json,
             rationale: Some(&rationale),
-            decided_by: params.decided_by.as_deref(),
+            decided_by: decided_by.as_deref(),
             embedding: decision_embedding,
             observation_id,
         },
     )
     .await
     .map_err(|e| McpError::internal_error(format!("insert_experiment_result: {e}"), None))?;
-
-    if let Some(oid) = observation_id {
-        let _ = queries::set_result_observation_id(pool, result_id, oid).await;
-        let _ = queries::set_experiment_observation_id(pool, hyp.experiment_id, oid).await;
-    }
-    queries::set_hypothesis_verdict(pool, params.hypothesis_id, &verdict)
-        .await
-        .map_err(|e| McpError::internal_error(format!("set_hypothesis_verdict: {e}"), None))?;
-    queries::set_experiment_status(pool, hyp.experiment_id, "decided")
-        .await
-        .map_err(|e| McpError::internal_error(format!("set_experiment_status: {e}"), None))?;
 
     // Phase 10 — tracker bridge: post the verdict to any linked work_items as
     // trusted (source='experiment') verification evidence and auto-verify an
@@ -746,7 +953,7 @@ pub async fn tool_experiment_decide(
 
     // Optional: graduate a confirmed/rejected verdict into the cross-agent
     // best-practice ledger (consensus → durable-mandate pipeline).
-    let link = params.link_outcome.unwrap_or(true);
+    let link = link_outcome.unwrap_or(true);
     let mut linked_outcome_id: Option<i64> = None;
     if link && matches!(verdict.as_str(), "accepted" | "rejected") {
         use crate::a2a::best_practices::{Outcome, OutcomeReport, record_outcome};
@@ -756,8 +963,7 @@ pub async fn tool_experiment_decide(
             Outcome::Failed
         };
         let report = OutcomeReport {
-            agent_id: params
-                .decided_by
+            agent_id: decided_by
                 .clone()
                 .unwrap_or_else(|| "experiment".to_string()),
             project_id: None,
@@ -782,7 +988,7 @@ pub async fn tool_experiment_decide(
     json_result(&json!({
         "result_id": result_id,
         "experiment_id": hyp.experiment_id,
-        "hypothesis_id": params.hypothesis_id,
+        "hypothesis_id": hypothesis_id,
         "verdict": verdict,
         "accepted": accepted,
         "test_type": test_type,
@@ -1025,7 +1231,8 @@ pub async fn tool_experiment_log_artifact(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
 
-    if params.kind.trim().is_empty() {
+    let kind = params.kind.trim();
+    if kind.is_empty() {
         return Err(McpError::invalid_params("kind must be non-empty", None));
     }
     let content = params.content.as_deref();
@@ -1037,7 +1244,7 @@ pub async fn tool_experiment_log_artifact(
     if params.parse.unwrap_or(false)
         && let Some(c) = content
     {
-        let parsed = match params.kind.as_str() {
+        let parsed = match kind {
             "hyperfine" => extract::parse_hyperfine_times(c).ok(),
             "criterion" => extract::parse_criterion_samples(c).ok(),
             _ => None,
@@ -1064,14 +1271,14 @@ pub async fn tool_experiment_log_artifact(
     let snippet: String = content
         .map(|c| c.chars().take(280).collect())
         .unwrap_or_default();
-    let summary = format!("{} artifact{label_part}: {snippet}", params.kind);
+    let summary = format!("{kind} artifact{label_part}: {snippet}");
     let embedding = embed_opt(ctx, embed_on_write, &summary).await;
 
     let artifact_id = queries::insert_experiment_artifact(
         pool,
         params.experiment_id,
         params.project_id,
-        &params.kind,
+        kind,
         params.tool.as_deref(),
         params.label.as_deref(),
         content,
@@ -1090,7 +1297,7 @@ pub async fn tool_experiment_log_artifact(
 
     json_result(&json!({
         "artifact_id": artifact_id,
-        "kind": params.kind,
+        "kind": kind,
         "parsed_metrics": metrics,
         "parsed_sample_count": parsed_sample_count,
     }))

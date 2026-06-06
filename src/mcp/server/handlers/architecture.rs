@@ -142,12 +142,14 @@ Pure metrics, no interpretation. Useful in scorecards and CI gates."
         Parameters(params): Parameters<DesignMetricsParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        let project_hint = Some(params.project.clone());
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "design_metrics",
             30,
             &_ctx,
             &summarize_debug(&params),
+            project_hint,
             crate::mcp::tools::tool_design_metrics::tool_design_metrics(self.ctx(), params),
         )
         .await

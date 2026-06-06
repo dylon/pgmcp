@@ -16,7 +16,9 @@ use crate::mcp::server::{
     WorkItemCompletionParams, WorkItemReprioritizeParams, WorkItemSearchParams,
 };
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err};
-use crate::mcp::tools::work_items::crud::{id_of_public, map_db_err};
+use crate::mcp::tools::work_items::crud::{
+    id_of_public, map_db_err, resolve_existing_project_id_param,
+};
 
 /// Round a fraction (0.0–1.0) to a 0.0–100.0 percentage with one decimal.
 fn pct(frac: f64) -> f64 {
@@ -77,9 +79,7 @@ pub async fn tool_work_item_reprioritize(
         .work_item_reprioritizations
         .fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
-    let project_id = queries::resolve_project_id(pool, params.project.as_deref())
-        .await
-        .map_err(map_db_err)?;
+    let project_id = resolve_existing_project_id_param(pool, params.project.as_deref()).await?;
     let half_life = params.half_life_days.unwrap_or(14.0);
     let limit = params.limit.unwrap_or(30);
     let ranked = queries::reprioritize_work_items(pool, project_id, half_life, limit)
@@ -122,17 +122,29 @@ pub async fn tool_work_item_search(
     if q.is_empty() {
         return Err(McpError::invalid_params("query must be non-empty", None));
     }
+    let project = params
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let qvec = ctx
         .embed()
         .embed_query(q)
         .await
         .map_err(|e| McpError::internal_error(format!("embed failed: {e}"), None))?;
-    let project_id = queries::resolve_project_id(pool, params.project.as_deref())
-        .await
-        .map_err(map_db_err)?;
-    let limit = params.limit.unwrap_or(10);
+    if qvec.len() != 1024 {
+        return Err(McpError::internal_error(
+            format!(
+                "query embedding dimension mismatch: got {}, expected 1024",
+                qvec.len()
+            ),
+            None,
+        ));
+    }
+    let project_id = resolve_existing_project_id_param(pool, params.project.as_deref()).await?;
+    let limit = params.limit.unwrap_or(10).clamp(1, 100);
     let hits = queries::search_work_items(pool, pgvector::Vector::from(qvec), project_id, limit)
         .await
         .map_err(map_db_err)?;
-    json_result(&json!({ "query": q, "hits": hits }))
+    json_result(&json!({ "query": q, "project": project, "limit": limit, "hits": hits }))
 }

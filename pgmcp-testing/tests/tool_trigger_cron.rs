@@ -9,8 +9,15 @@
 //! path (which short-circuits before touching the DB) so the test runs
 //! quickly and deterministically.
 
-use pgmcp_testing::pool_tool_helpers::server_with_pool;
+mod common;
+
+use std::sync::Arc;
+
+use common::text_of;
+use pgmcp::mcp::server::McpServer;
+use pgmcp_testing::pool_tool_helpers::{context_with_pool, server_with_pool};
 use pgmcp_testing::require_test_db;
+use serde_json::Value;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn trigger_cron_unknown_job_returns_invalid_params() {
@@ -40,4 +47,28 @@ async fn trigger_cron_unknown_job_returns_invalid_params() {
             // McpError::invalid_params propagated up; acceptable.
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn trigger_cron_busy_when_heavy_cron_lock_is_held() {
+    let db = require_test_db!();
+    let ctx = context_with_pool(db.pool().clone());
+    let lock = Arc::clone(ctx.heavy_cron_lock());
+    let _guard = lock.try_lock().expect("test holds heavy-cron lock");
+    let server = McpServer::new(ctx);
+
+    let result = server
+        .call_tool_cli(
+            "trigger_cron",
+            serde_json::json!({"job": " graph-analysis ", "project": "   "}),
+        )
+        .await
+        .expect("busy response");
+
+    assert!(result.is_error != Some(true));
+    let v: Value = serde_json::from_str(&text_of(&result)).expect("trigger_cron busy JSON");
+    assert_eq!(v["job"].as_str(), Some("graph-analysis"));
+    assert_eq!(v["project"], Value::Null);
+    assert_eq!(v["status"].as_str(), Some("busy"));
+    assert_eq!(v["retry_after_secs"].as_u64(), Some(60));
 }

@@ -6,6 +6,7 @@
 use crate::db::queries::*;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
+use std::collections::BTreeSet;
 
 /// Substring/ILIKE search across entity names, types, and observation
 /// content (Phase 3 baseline; semantic search is `memory_semantic_search`
@@ -23,27 +24,46 @@ pub struct EntitySearchHit {
     pub matched_observations: i64,
 }
 
+fn ilike_substring_pattern(query: &str) -> String {
+    let mut pattern = String::with_capacity(query.len() + 2);
+    pattern.push('%');
+    for ch in query.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
+
 pub async fn memory_search_nodes(
     pool: &PgPool,
     query: &str,
     scope_id: Option<i64>,
     limit: i32,
 ) -> Result<Vec<EntitySearchHit>, sqlx::Error> {
-    let like = format!("%{}%", query);
+    let like = ilike_substring_pattern(query);
     sqlx::query_as::<_, EntitySearchHit>(
         "SELECT e.id, e.name, e.entity_type, e.canonical_name, e.importance,
-                COUNT(o.id) FILTER (WHERE o.content ILIKE $1) AS matched_observations
+                COUNT(o.id) FILTER (WHERE o.content ILIKE $1 ESCAPE '\\') AS matched_observations
          FROM memory_entities e
          LEFT JOIN memory_observations o
             ON o.entity_id = e.id AND o.valid_to IS NULL
-         LEFT JOIN memory_entity_scope es ON es.entity_id = e.id
          WHERE e.valid_to IS NULL
-           AND ($2::bigint IS NULL OR es.scope_id = $2)
            AND (
-             e.name ILIKE $1
-             OR e.entity_type ILIKE $1
-             OR e.canonical_name ILIKE $1
-             OR o.content ILIKE $1
+             $2::bigint IS NULL
+             OR EXISTS (
+               SELECT 1
+               FROM memory_entity_scope es
+               WHERE es.entity_id = e.id AND es.scope_id = $2
+             )
+           )
+           AND (
+             e.name ILIKE $1 ESCAPE '\\'
+             OR e.entity_type ILIKE $1 ESCAPE '\\'
+             OR e.canonical_name ILIKE $1 ESCAPE '\\'
+             OR o.content ILIKE $1 ESCAPE '\\'
            )
          GROUP BY e.id
          ORDER BY matched_observations DESC, e.importance DESC, e.id
@@ -54,6 +74,20 @@ pub async fn memory_search_nodes(
     .bind(limit.clamp(1, 500))
     .fetch_all(pool)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ilike_substring_pattern;
+
+    #[test]
+    fn ilike_substring_pattern_escapes_sql_wildcards() {
+        assert_eq!(ilike_substring_pattern("alpha"), "%alpha%");
+        assert_eq!(
+            ilike_substring_pattern("100%_ok\\done"),
+            "%100\\%\\_ok\\\\done%"
+        );
+    }
 }
 
 /// Read entities + their observations + their relations by name (active
@@ -286,12 +320,16 @@ pub async fn memory_semantic_search(
                 o.created_at
          FROM memory_observations o
          JOIN memory_entities e ON e.id = o.entity_id AND e.valid_to IS NULL
-         LEFT JOIN memory_entity_scope es ON es.entity_id = e.id
-         LEFT JOIN memory_entity_tier  et ON et.entity_id = e.id
          WHERE o.embedding IS NOT NULL
            AND o.valid_to IS NULL
-           AND ($2::bigint IS NULL OR es.scope_id = $2)
-           AND ($3::text   IS NULL OR et.tier::text = $3)
+           AND ($2::bigint IS NULL OR EXISTS (
+               SELECT 1 FROM memory_entity_scope es
+               WHERE es.entity_id = e.id AND es.scope_id = $2
+           ))
+           AND ($3::text IS NULL OR EXISTS (
+               SELECT 1 FROM memory_entity_tier et
+               WHERE et.entity_id = e.id AND et.tier::text = $3
+           ))
          ORDER BY o.embedding <=> $1
          LIMIT $4",
     )
@@ -1388,6 +1426,35 @@ pub struct RaptorHit {
     pub similarity: Option<f64>,
 }
 
+pub const MEMORY_RAPTOR_MAX_LEVELS: usize = 16;
+pub const MEMORY_RAPTOR_MAX_LEVEL: i32 = 32;
+
+pub fn normalize_memory_raptor_levels(levels: Option<&[i32]>) -> Result<Option<Vec<i32>>, String> {
+    let Some(levels) = levels else {
+        return Ok(None);
+    };
+    if levels.is_empty() {
+        return Err("levels must be omitted or contain at least one level".to_string());
+    }
+    if levels.len() > MEMORY_RAPTOR_MAX_LEVELS {
+        return Err(format!(
+            "levels contains {} entries; cap is {MEMORY_RAPTOR_MAX_LEVELS}",
+            levels.len()
+        ));
+    }
+
+    let mut normalized = BTreeSet::new();
+    for &level in levels {
+        if !(0..=MEMORY_RAPTOR_MAX_LEVEL).contains(&level) {
+            return Err(format!(
+                "levels must be between 0 and {MEMORY_RAPTOR_MAX_LEVEL}; got {level}"
+            ));
+        }
+        normalized.insert(level);
+    }
+    Ok(Some(normalized.into_iter().collect()))
+}
+
 /// Phase 6.1: query against `memory_summary_tree`. Returns top-k
 /// summary nodes at each requested level (or all levels), ranked
 /// by cosine over `summary_embedding`. Useful for "thematic"
@@ -1406,26 +1473,39 @@ pub async fn memory_raptor_search(
             embedding.len()
         )));
     }
+    let normalized_levels =
+        normalize_memory_raptor_levels(levels).map_err(sqlx::Error::Protocol)?;
+    let k = k.clamp(1, 200);
+    let ef_search = ef_search.clamp(1, 10_000);
     let v = pgvector::Vector::from(embedding.to_vec());
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+    sqlx::query("SELECT set_config('hnsw.ef_search', $1, true)")
+        .bind(ef_search.to_string())
         .execute(&mut *tx)
         .await?;
     let rows = sqlx::query_as::<_, RaptorHit>(
-        "SELECT id AS node_id, level,
-                COALESCE(summary_text, '<leaf>') AS label,
-                1 - (summary_embedding <=> $1) AS similarity
-         FROM memory_summary_tree
-         WHERE summary_embedding IS NOT NULL
-           AND ($2::bigint IS NULL OR scope_id = $2)
-           AND ($3::int[] IS NULL OR level = ANY($3))
-         ORDER BY summary_embedding <=> $1
-         LIMIT $4",
+        "WITH ranked AS (
+            SELECT id AS node_id, level,
+                   COALESCE(summary_text, '<leaf>') AS label,
+                   summary_embedding <=> $1 AS distance,
+                   row_number() OVER (
+                       PARTITION BY level
+                       ORDER BY summary_embedding <=> $1, id
+                   ) AS level_rank
+            FROM memory_summary_tree
+            WHERE summary_embedding IS NOT NULL
+              AND ($2::bigint IS NULL OR scope_id = $2)
+              AND ($3::int[] IS NULL OR level = ANY($3))
+         )
+         SELECT node_id, level, label, 1 - distance AS similarity
+         FROM ranked
+         WHERE level_rank <= $4
+         ORDER BY distance, level, node_id",
     )
     .bind(&v)
     .bind(scope_id)
-    .bind(levels)
-    .bind(k.clamp(1, 200))
+    .bind(normalized_levels.as_deref())
+    .bind(k)
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;

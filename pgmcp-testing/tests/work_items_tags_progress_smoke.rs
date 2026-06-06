@@ -268,6 +268,34 @@ async fn tags_and_progress_full_round_trip() {
         "MCP-authored progress is always agent_write"
     );
 
+    let high = server
+        .call_tool_cli(
+            "work_item_record_progress",
+            json!({ "public_id": item_id, "note": "clamped high", "percent": 250 }),
+        )
+        .await
+        .expect("work_item_record_progress clamps high percent");
+    let highv: Value = serde_json::from_str(&text_of(&high)).expect("high progress body JSON");
+    assert_eq!(
+        highv["percent"].as_i64(),
+        Some(100),
+        "percent above 100 is clamped before insert"
+    );
+
+    let low = server
+        .call_tool_cli(
+            "work_item_record_progress",
+            json!({ "public_id": item_id, "note": "clamped low", "percent": -5 }),
+        )
+        .await
+        .expect("work_item_record_progress clamps low percent");
+    let lowv: Value = serde_json::from_str(&text_of(&low)).expect("low progress body JSON");
+    assert_eq!(
+        lowv["percent"].as_i64(),
+        Some(0),
+        "percent below 0 is clamped before insert"
+    );
+
     // A second note without a percent.
     server
         .call_tool_cli(
@@ -297,11 +325,11 @@ async fn tags_and_progress_full_round_trip() {
     let av: Value = serde_json::from_str(&text_of(&after)).expect("get body JSON");
     assert_eq!(
         av["item"]["claimed_percent"].as_i64(),
-        Some(40),
-        "claimed_percent updated from the percent-bearing note"
+        Some(0),
+        "claimed_percent updated from the latest percent-bearing note"
     );
 
-    // ── work_item_progress_log: newest first, both notes present ──
+    // ── work_item_progress_log: newest first, all notes present ──
     let log = server
         .call_tool_cli(
             "work_item_progress_log",
@@ -311,7 +339,7 @@ async fn tags_and_progress_full_round_trip() {
         .expect("work_item_progress_log must succeed");
     let logv: Value = serde_json::from_str(&text_of(&log)).expect("log body JSON");
     let entries = logv.as_array().expect("progress log is an array");
-    assert_eq!(entries.len(), 2, "two progress notes were recorded");
+    assert_eq!(entries.len(), 4, "four progress notes were recorded");
     assert_eq!(
         entries[0]["note"].as_str(),
         Some("added smoke coverage"),

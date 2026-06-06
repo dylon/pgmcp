@@ -26,7 +26,7 @@ fn run(input: &CtfIdfInput) -> Vec<Vec<TopicKeyword>> {
 /// Per-element max error. Returns `f64::INFINITY` if word identity or
 /// per-topic length disagrees — those failures are non-numeric and
 /// should never be smoothed by a tolerance.
-fn max_keyword_error(expected: &Vec<Vec<TopicKeyword>>, actual: &Vec<Vec<TopicKeyword>>) -> f64 {
+fn max_keyword_error(expected: &[Vec<TopicKeyword>], actual: &[Vec<TopicKeyword>]) -> f64 {
     if expected.len() != actual.len() {
         return f64::INFINITY;
     }
@@ -53,6 +53,6 @@ fn three_topics_ten_chunks_matches_golden() {
     assert_match_epsilon::<CtfIdfInput, Vec<Vec<TopicKeyword>>>(
         "ctf_idf/three_topics_ten_chunks",
         run,
-        max_keyword_error,
+        |expected, actual| max_keyword_error(expected, actual),
     );
 }

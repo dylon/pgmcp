@@ -579,14 +579,8 @@ fn tarjan_scc_composite_graph_finds_three_components() {
         sccs.iter().map(|s| s.iter().copied().collect()).collect();
     let three_cycle: HashSet<NodeIndex> = [n0, n1, n2].into_iter().collect();
     let two_cycle: HashSet<NodeIndex> = [n3, n4].into_iter().collect();
-    assert!(
-        scc_sets.iter().any(|s| *s == three_cycle),
-        "3-cycle SCC missing"
-    );
-    assert!(
-        scc_sets.iter().any(|s| *s == two_cycle),
-        "2-cycle SCC missing"
-    );
+    assert!(scc_sets.contains(&three_cycle), "3-cycle SCC missing");
+    assert!(scc_sets.contains(&two_cycle), "2-cycle SCC missing");
 }
 
 // ============================================================================

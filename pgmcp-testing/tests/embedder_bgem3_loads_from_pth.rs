@@ -17,6 +17,7 @@
 //!   - `BGE_M3_TEST_SKIP_DOWNLOAD=1` is set in the environment, OR
 //!   - `~/.cache/huggingface/hub/models--BAAI--bge-m3/` does not exist
 //!     (cold cache; do not pay the download cost in CI).
+//!
 //! In both cases the test prints a `SKIPPED:` line and returns Ok.
 
 use std::sync::Arc;

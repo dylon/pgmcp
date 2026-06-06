@@ -24,7 +24,7 @@ use libdictenstein::dynamic_dawg_char::DynamicDawgChar;
 use liblevenshtein::transducer::Transducer;
 
 /// Build the same dictionary + transducer pair the tool builds at runtime.
-fn make_transducer<'a>(now_names: &[&'a str]) -> Transducer<DynamicDawgChar<()>> {
+fn make_transducer(now_names: &[&str]) -> Transducer<DynamicDawgChar<()>> {
     let dict = DynamicDawgChar::from_terms(now_names.to_vec());
     Transducer::with_transposition(dict)
 }

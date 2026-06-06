@@ -40,7 +40,7 @@ pub struct HybridSearchParams {
         description = "Weight for the third RRF leg (WFST lattice + HybridLM-rescored query). \
                        Default 1.0. Set 0.0 to force the legacy 2-leg behavior. The third leg \
                        activates only when the per-project HybridLM model file exists at \
-                       <data_dir>/hybrid_lm/<project>/model.bin (populated by the \
+                       <data_dir>/hybrid_lm/<slug>-p<project_id>/model.bin (populated by the \
                        `ngram-lm-train` cron)."
     )]
     pub wfst_lm_weight: Option<f64>,

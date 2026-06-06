@@ -1,19 +1,16 @@
 //! `tool_test_coverage_gaps` — MCP tool body, extracted from `super::super::server`.
 
-#![allow(unused_imports)]
-
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
-use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, LoggingLevel};
+use rmcp::model::{CallToolResult, Content};
 use serde_json::json;
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
 use crate::context::SystemContext;
-use crate::mcp::server::*;
+use crate::db::queries;
+use crate::mcp::server::TestCoverageGapsParams;
 
 pub async fn tool_test_coverage_gaps(
     ctx: &SystemContext,
@@ -23,24 +20,29 @@ pub async fn tool_test_coverage_gaps(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().coverage_scans.fetch_add(1, Ordering::Relaxed);
 
+    let project = params.project.trim();
+    if project.is_empty() {
+        return Err(McpError::invalid_params("project must be non-empty", None));
+    }
+
     debug!(
         tool = "test_coverage_gaps",
-        project = %params.project,
+        project = %project,
         "MCP tool invoked",
     );
+
+    let pool = ctx.db().pool();
+    let resolved_project_id = match pool {
+        Some(pool) => resolve_unique_project_id(pool, project).await?,
+        None => None,
+    };
 
     // Phase 4.4: REAL line coverage from any indexed lcov / Cobertura / JaCoCo
     // report, crossed with AST cyclomatic to surface high-complexity,
     // low-coverage files. Falls through to the topic proxy when no report
     // exists (opportunistic — gated on the repo actually shipping a report).
     let mut real_coverage = serde_json::Value::Null;
-    if let Some(pool) = ctx.db().pool()
-        && let Ok(Some(project_id)) =
-            sqlx::query_scalar::<_, i32>("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-    {
+    if let (Some(pool), Some(project_id)) = (pool, resolved_project_id) {
         let artifacts: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT relative_path, content FROM indexed_files
              WHERE project_id = $1 AND content IS NOT NULL
@@ -118,11 +120,14 @@ pub async fn tool_test_coverage_gaps(
         }
     }
 
-    let rows = ctx
-        .db()
-        .get_test_topic_coverage(&params.project)
-        .await
-        .map_err(|e| McpError::internal_error(format!("Coverage query failed: {}", e), None))?;
+    let rows = match (pool, resolved_project_id) {
+        (Some(pool), Some(project_id)) => {
+            queries::get_test_topic_coverage_by_project_id(pool, project_id).await
+        }
+        (Some(_), None) => Ok(Vec::new()),
+        (None, _) => ctx.db().get_test_topic_coverage(project).await,
+    }
+    .map_err(|e| McpError::internal_error(format!("Coverage query failed: {}", e), None))?;
 
     if rows.is_empty() && real_coverage.is_null() {
         return Ok(CallToolResult::success(vec![Content::text(
@@ -184,31 +189,21 @@ pub async fn tool_test_coverage_gaps(
     // surfacing the effect distribution alongside its primary output.
     // Gracefully degrades to empty when the project lookup or
     // shadow-ASR data isn't populated.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
+    let effect_breakdown: Vec<serde_json::Value> = match (pool, resolved_project_id) {
+        (Some(pool), Some(project_id)) => {
+            crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
                 .await
                 .unwrap_or_default()
                 .into_iter()
                 .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
+                .collect()
         }
-    })
-    .await;
+        _ => Vec::new(),
+    };
 
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
+        "project": project,
         "coverage_source": if real_coverage.is_null() { "topic_proxy" } else { "report+topic_proxy" },
         "real_coverage": real_coverage,
         "total_impl_chunks": total_impl_chunks,
@@ -233,4 +228,24 @@ pub async fn tool_test_coverage_gaps(
     );
 
     Ok(CallToolResult::success(vec![Content::text(json)]))
+}
+
+async fn resolve_unique_project_id(
+    pool: &sqlx::PgPool,
+    project: &str,
+) -> Result<Option<i32>, McpError> {
+    let ids: Vec<i32> = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1 LIMIT 2")
+        .bind(project)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| McpError::internal_error(format!("project lookup failed: {e}"), None))?;
+
+    match ids.as_slice() {
+        [] => Ok(None),
+        [id] => Ok(Some(*id)),
+        _ => Err(McpError::invalid_params(
+            format!("project name '{project}' is not unique"),
+            None,
+        )),
+    }
 }

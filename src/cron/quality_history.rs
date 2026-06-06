@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 use tracing::{info, warn};
 
 use crate::context::SystemContext;
-use crate::quality::aggregate::aggregate;
+use crate::quality::aggregate::aggregate_for_project;
 use crate::quality::report::ReportOptions;
 use crate::stats::tracker::StatsTracker;
 
@@ -47,11 +47,20 @@ pub async fn run_or_log(ctx: SystemContext, stats: Arc<StatsTracker>) {
         // computing them; trend_points=0 skips the read-back strip.
         let opts = ReportOptions {
             include_findings: false,
+            compute_findings: false,
             include_recommended_fixes: false,
             trend_points: 0,
             ..Default::default()
         };
-        match aggregate(&ctx, &project.name, opts, QUALITY_HISTORY_TOOL_TIMEOUT_SECS).await {
+        match aggregate_for_project(
+            &ctx,
+            project.id,
+            &project.name,
+            opts,
+            QUALITY_HISTORY_TOOL_TIMEOUT_SECS,
+        )
+        .await
+        {
             Ok(report) => {
                 crate::quality::history::insert_history(&pool, project.id, &report).await;
                 snapshots += 1;

@@ -9,6 +9,7 @@
 pub mod cache;
 pub mod disk_guard;
 pub mod dynamic_dawg;
+pub mod limits;
 pub mod persistent_artrie;
 pub mod phonetic;
 pub mod suffix_automaton;

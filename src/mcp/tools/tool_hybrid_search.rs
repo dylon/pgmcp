@@ -131,6 +131,7 @@ pub async fn tool_hybrid_search(
                 &params.query,
                 limit * 2, // fetch more for fusion
                 params.language.as_deref(),
+                params.project.as_deref(),
                 dedupe_worktrees,
                 text_leg_timeout_ms,
             ),
@@ -423,8 +424,21 @@ async fn try_third_leg(
     let cfg_guard = ctx.config().load();
     let data_dir = cfg_guard.fuzzy.data_dir.clone();
     let project_name = params.project.as_ref()?;
+    let project_id =
+        match crate::mcp::tools::sota_helpers::project_id_or_err(ctx, project_name).await {
+            Ok(project_id) => project_id,
+            Err(e) => {
+                warn!(
+                    project = %project_name,
+                    error = ?e,
+                    "third leg skipped: project id resolution failed"
+                );
+                return None;
+            }
+        };
 
-    let model_path = crate::cron::ngram_lm_train::model_path_for(&data_dir, project_name);
+    let model_path =
+        crate::cron::ngram_lm_train::model_path_for_project(&data_dir, project_id, project_name);
     if !model_path.exists() {
         debug!(
             tool = "hybrid_search",

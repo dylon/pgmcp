@@ -177,6 +177,47 @@ async fn mandate_context_returns_sources_and_project_override_from_mock_db() {
     );
 }
 
+#[tokio::test]
+async fn mandate_context_rejects_ambiguous_project_name() {
+    let mut mock = MockDbClient::new();
+    mock.projects.push(ProjectInfo {
+        id: 1,
+        workspace_path: "/ws/a".into(),
+        path: "/ws/a/shared".into(),
+        name: "duplicate-mandate-name".into(),
+        discovered_at: None,
+        last_scanned_at: None,
+        file_count: Some(0),
+        git_common_dir: None,
+        git_root_commits: None,
+    });
+    mock.projects.push(ProjectInfo {
+        id: 2,
+        workspace_path: "/ws/b".into(),
+        path: "/ws/b/shared".into(),
+        name: "duplicate-mandate-name".into(),
+        discovered_at: None,
+        last_scanned_at: None,
+        file_count: Some(0),
+        git_common_dir: None,
+        git_root_commits: None,
+    });
+
+    let server = server_with_mock_and_config(mock, test_config());
+    let err = server
+        .call_tool_cli(
+            "mandate_context",
+            serde_json::json!({"project": "duplicate-mandate-name"}),
+        )
+        .await
+        .expect_err("duplicate project display names must fail closed");
+
+    assert!(
+        err.to_string().contains("ambiguous project name"),
+        "unexpected mandate_context ambiguity error: {err}"
+    );
+}
+
 /// Direct test of the extracted `tool_list_projects` free function — no
 /// McpServer instantiation, no rmcp router, no transport. Demonstrates
 /// the testability win from Phase 6's per-file extraction pattern.
@@ -412,6 +453,7 @@ async fn file_info_returns_metadata_from_mock_db() {
     mock.file_info_result = Some(FileInfo {
         path: "/ws/p/d.rs".into(),
         relative_path: "d.rs".into(),
+        project_name: Some("p".into()),
         language: "rust".into(),
         size_bytes: 42,
         line_count: 3,
@@ -468,14 +510,13 @@ async fn index_stats_returns_counts_from_mock_db() {
         .await
         .expect("tool call");
     let payload = text_of(&result);
-    // At least one of the counters should surface in the output.
-    assert!(
-        payload.contains("100")
-            || payload.contains("400")
-            || payload.contains("5")
-            || payload.contains("files"),
-        "index_stats payload missing expected counters:\n{payload}"
-    );
+    let v: serde_json::Value = serde_json::from_str(&payload).expect("index_stats JSON");
+    assert_eq!(v["index"]["available"].as_bool(), Some(true));
+    assert_eq!(v["index"]["projects"].as_u64(), Some(5));
+    assert_eq!(v["index"]["indexed_files"].as_u64(), Some(100));
+    assert_eq!(v["index"]["chunks"].as_u64(), Some(400));
+    assert_eq!(v["index"]["total_bytes"].as_u64(), Some(1024 * 1024));
+    assert!(v["snapshot"].is_object(), "snapshot missing:\n{payload}");
 }
 
 #[tokio::test]
@@ -1080,6 +1121,7 @@ async fn file_info_serializes_timestamp_fields() {
     mock.file_info_result = Some(FileInfo {
         path: "/a".into(),
         relative_path: "a".into(),
+        project_name: Some("p".into()),
         language: "rust".into(),
         size_bytes: 1,
         line_count: 1,
@@ -1145,7 +1187,12 @@ async fn index_stats_zeroed_mock_returns_zero_counters() {
         .await
         .expect("tool call");
     let payload = text_of(&result);
-    assert!(payload.contains("files") || payload.contains("projects"));
+    let v: serde_json::Value = serde_json::from_str(&payload).expect("index_stats JSON");
+    assert_eq!(v["index"]["available"].as_bool(), Some(true));
+    assert_eq!(v["index"]["projects"].as_u64(), Some(0));
+    assert_eq!(v["index"]["indexed_files"].as_u64(), Some(0));
+    assert_eq!(v["index"]["chunks"].as_u64(), Some(0));
+    assert_eq!(v["index"]["total_bytes"].as_u64(), Some(0));
 }
 
 #[tokio::test]
@@ -1158,7 +1205,11 @@ async fn index_stats_with_nonzero_bytes_prints_total() {
         .call_tool_cli("index_stats", serde_json::json!({}))
         .await
         .expect("tool call");
-    let _ = result;
+    let payload = text_of(&result);
+    let v: serde_json::Value = serde_json::from_str(&payload).expect("index_stats JSON");
+    assert_eq!(v["index"]["available"].as_bool(), Some(true));
+    assert_eq!(v["index"]["indexed_files"].as_u64(), Some(50));
+    assert_eq!(v["index"]["total_bytes"].as_u64(), Some(1_000_000));
 }
 
 #[tokio::test]

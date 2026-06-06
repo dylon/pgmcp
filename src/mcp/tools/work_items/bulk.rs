@@ -14,6 +14,7 @@
 //! bulk still auto-readies its dependents). `assign` is NOT a transition. The
 //! envelope is partial-success: `{op, attempted, succeeded, failed:[…]}`.
 
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 
 use rmcp::ErrorData as McpError;
@@ -71,9 +72,20 @@ pub async fn tool_work_item_bulk(
                 ));
             }
             let mut out = Vec::with_capacity(ids.len());
-            for pid in ids {
+            let mut seen = HashSet::with_capacity(ids.len());
+            for raw_pid in ids {
+                let pid = raw_pid.trim();
+                if pid.is_empty() {
+                    return Err(McpError::invalid_params(
+                        "public_ids must not contain blank entries",
+                        None,
+                    ));
+                }
+                if !seen.insert(pid.to_string()) {
+                    continue;
+                }
                 let id = id_of_public(pool, pid).await?;
-                out.push((pid.clone(), id));
+                out.push((pid.to_string(), id));
             }
             out
         }
@@ -160,9 +172,18 @@ pub async fn tool_work_item_bulk(
     };
 
     let priority = match op {
-        BulkOp::Reprioritize => Some(params.priority.ok_or_else(|| {
-            McpError::invalid_params("op=reprioritize requires a priority", None)
-        })?),
+        BulkOp::Reprioritize => {
+            let priority = params.priority.ok_or_else(|| {
+                McpError::invalid_params("op=reprioritize requires a priority", None)
+            })?;
+            if !(0..=100).contains(&priority) {
+                return Err(McpError::invalid_params(
+                    "priority must be between 0 and 100",
+                    None,
+                ));
+            }
+            Some(priority)
+        }
         _ => None,
     };
 

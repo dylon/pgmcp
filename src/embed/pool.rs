@@ -1051,22 +1051,27 @@ fn process_index_file_task(
                 .to_string_lossy()
                 .into_owned();
 
-            let file_id = db
-                .upsert_file(
+            let empty_chunks: &[crate::db::queries::ChunkInsert<'_>] = &[];
+            replace_indexed_file_with_retry(
+                db.as_ref(),
+                &path_str,
+                worker_id,
+                crate::db::queries::IndexedFileReplacement {
                     project_id,
-                    &path_str,
-                    &relative,
-                    &language,
+                    path: &path_str,
+                    relative_path: &relative,
+                    language: &language,
                     size_bytes,
-                    None,
-                    Some(content_hash),
-                    0,
-                    true,
-                    false, // content_recoverable_from_disk — irrelevant (oversize placeholder)
+                    content: None,
+                    content_hash,
+                    line_count: 0,
+                    truncated: true,
+                    content_recoverable_from_disk: false,
                     modified_at,
-                )
-                .await?;
-            db.delete_file_chunks(file_id).await?;
+                    chunks: empty_chunks,
+                },
+            )
+            .await?;
             Ok(false)
         });
         match res {
@@ -1375,41 +1380,26 @@ fn process_index_file_task(
         (None, true)
     };
 
-    // Level-2 content-hash skip + upsert if changed.
-    let upsert_res = rt.block_on(async {
+    // Level-2 content-hash skip. The DB mutation happens only after chunks
+    // and embeddings are ready, inside one replacement transaction.
+    let skip_res = rt.block_on(async {
         if let Ok(Some(existing)) = db.get_content_hash(&path_str).await
             && existing == content_hash
         {
-            return Ok::<Option<i64>, sqlx::Error>(None); // skipped
+            return Ok::<bool, sqlx::Error>(true);
         }
-        let line_count = content.lines().count() as i32;
-        let file_id = db
-            .upsert_file(
-                project_id,
-                &path_str,
-                &relative_path,
-                &language,
-                size_bytes,
-                stored_content,
-                None, // hash finalized after chunks land
-                line_count,
-                false,
-                content_recoverable_from_disk,
-                modified_at,
-            )
-            .await?;
-        db.delete_file_chunks(file_id).await?;
-        Ok(Some(file_id))
+        Ok(false)
     });
-    let file_id = match upsert_res {
-        Ok(Some(id)) => id,
-        Ok(None) => return, // unchanged content; skip
+    match skip_res {
+        Ok(true) => return,
+        Ok(false) => {}
         Err(e) => {
-            error!(path = %path_str, worker_id, error = %e, "upsert_file failed");
+            error!(path = %path_str, worker_id, error = %e, "content-hash check failed");
             stats.files_failed.fetch_add(1, Ordering::Relaxed);
             return;
         }
-    };
+    }
+    let line_count = content.lines().count() as i32;
 
     // Chunk content with the language-appropriate chunker. JSONL gets
     // record-aware variants for Claude/Codex session transcripts; latex,
@@ -1462,9 +1452,29 @@ fn process_index_file_task(
     chunks = chunker::split_oversized_chunks(chunks);
 
     if chunks.is_empty() {
-        if let Err(e) = rt.block_on(db.finalize_file_hash(file_id, content_hash)) {
-            error!(file_id, worker_id, error = %e,
-                   "finalize_file_hash failed (empty chunks)");
+        let empty_chunks: &[crate::db::queries::ChunkInsert<'_>] = &[];
+        if let Err(e) = rt.block_on(replace_indexed_file_with_retry(
+            db.as_ref(),
+            &path_str,
+            worker_id,
+            crate::db::queries::IndexedFileReplacement {
+                project_id,
+                path: &path_str,
+                relative_path: &relative_path,
+                language: &language,
+                size_bytes,
+                content: stored_content,
+                content_hash,
+                line_count,
+                truncated: false,
+                content_recoverable_from_disk,
+                modified_at,
+                chunks: empty_chunks,
+            },
+        )) {
+            error!(path = %path_str, worker_id, error = %e,
+                   "replace_indexed_file failed (empty chunks)");
+            stats.files_failed.fetch_add(1, Ordering::Relaxed);
         }
         return;
     }
@@ -1480,22 +1490,17 @@ fn process_index_file_task(
         }
     };
 
-    // Insert chunks + finalize hash. Three outcomes per file:
-    //   - all_ok: every chunk inserted; finalize the hash; count as indexed.
+    // Replace metadata + chunks + finalized hash in one transaction. Three
+    // outcomes per file:
+    //   - all_ok: every chunk inserted and the final hash committed.
     //   - aborted_fk: parent row deleted underfoot (PG SQLSTATE 23503);
-    //     log once at warn!, increment files_aborted_fk, skip finalize.
-    //   - other_err: any non-FK error during the batch; the whole
-    //     transaction rolls back so we don't leave a partial chunk
-    //     set under a NULL content_hash. Counted as failed; the next
-    //     rescan retries.
+    //     log once at warn!, increment files_aborted_fk.
+    //   - other_err: any non-FK error during replacement. The transaction
+    //     rolls back, preserving the previous complete indexed state.
     //
-    // The batch runs inside one transaction (`insert_chunks_batch`) so
-    // the embed worker holds one pooled connection for the whole file
-    // instead of N — direct mitigation for the "pool starvation under
-    // indexing storm" fragility in the audit. Wall-clock duration of
-    // the transaction is accumulated in `pool_pressure_ms_total` so
-    // operators can spot the case where coalescing trades too much
-    // pool contention for the reduced acquisition count.
+    // Wall-clock duration of the replacement transaction is accumulated in
+    // `pool_pressure_ms_total` so operators can spot DB contention in the
+    // active indexing path.
     enum InsertOutcome {
         AllOk,
         AbortedFk,
@@ -1515,64 +1520,51 @@ fn process_index_file_task(
         .collect();
     let batch_started = std::time::Instant::now();
     let outcome = rt.block_on(async {
-        match db.insert_chunks_batch(file_id, &chunk_inserts).await {
-            Ok(crate::db::queries::ChunkBatchOutcome {
-                fk_violation: true, ..
-            }) => {
-                tracing::warn!(
-                    path = %path_str,
-                    file_id,
-                    chunks_total = total_chunks,
-                    worker_id,
-                    reason = "parent row deleted underfoot — likely \
-                              pgmcp reindex --force or external admin SQL",
-                    "insert_chunks_batch aborted (FK violation)"
-                );
-                return InsertOutcome::AbortedFk;
-            }
-            Ok(crate::db::queries::ChunkBatchOutcome { error: Some(e), .. }) => {
-                error!(
-                    file_id,
-                    chunks_total = total_chunks,
-                    worker_id,
-                    error = %e,
-                    "insert_chunks_batch failed; transaction rolled back"
-                );
-                return InsertOutcome::OtherErr;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                error!(
-                    file_id,
-                    chunks_total = total_chunks,
-                    worker_id,
-                    error = %e,
-                    "insert_chunks_batch returned transport-level error"
-                );
-                return InsertOutcome::OtherErr;
-            }
-        }
-        let mut outcome = InsertOutcome::AllOk;
-        if matches!(outcome, InsertOutcome::AllOk)
-            && let Err(e) = db.finalize_file_hash(file_id, content_hash).await
+        match replace_indexed_file_with_retry(
+            db.as_ref(),
+            &path_str,
+            worker_id,
+            crate::db::queries::IndexedFileReplacement {
+                project_id,
+                path: &path_str,
+                relative_path: &relative_path,
+                language: &language,
+                size_bytes,
+                content: stored_content,
+                content_hash,
+                line_count,
+                truncated: false,
+                content_recoverable_from_disk,
+                modified_at,
+                chunks: &chunk_inserts,
+            },
+        )
+        .await
         {
-            // Finalize after a clean run failed — could be FK (race) or
-            // anything else. Use the same FK-vs-other discrimination.
-            if is_fk_violation(&e) {
-                tracing::warn!(
-                    path = %path_str,
-                    file_id,
-                    worker_id,
-                    reason = "parent row deleted underfoot during finalize",
-                    "finalize_file_hash aborted (FK violation)"
-                );
-                outcome = InsertOutcome::AbortedFk;
-            } else {
-                error!(file_id, worker_id, error = %e, "finalize_file_hash failed");
-                outcome = InsertOutcome::OtherErr;
+            Ok(_file_id) => InsertOutcome::AllOk,
+            Err(e) => {
+                if is_fk_violation(&e) {
+                    tracing::warn!(
+                        path = %path_str,
+                        chunks_total = total_chunks,
+                        worker_id,
+                        reason = "parent row deleted underfoot — likely \
+                                  pgmcp reindex --force or external admin SQL",
+                        "replace_indexed_file aborted (FK violation)"
+                    );
+                    InsertOutcome::AbortedFk
+                } else {
+                    error!(
+                        path = %path_str,
+                        chunks_total = total_chunks,
+                        worker_id,
+                        error = %e,
+                        "replace_indexed_file failed; transaction rolled back"
+                    );
+                    InsertOutcome::OtherErr
+                }
             }
         }
-        outcome
     });
     let batch_elapsed_ms = batch_started.elapsed().as_millis() as u64;
     stats
@@ -1612,6 +1604,57 @@ fn is_fk_violation(e: &sqlx::Error) -> bool {
         return db_err.code().as_deref() == Some("23503");
     }
     false
+}
+
+/// `true` iff the sqlx error is PostgreSQL `lock_not_available`
+/// (SQLSTATE `55P03`), which is how server-side `lock_timeout` reports
+/// transient lock contention.
+fn is_lock_timeout(e: &sqlx::Error) -> bool {
+    if let sqlx::Error::Database(db_err) = e {
+        return db_err.code().as_deref() == Some("55P03");
+    }
+    false
+}
+
+/// Retry the active indexer's all-or-nothing file replacement on transient
+/// lock contention. The caller rebuilds embeddings before this point, so a
+/// retry only replays the short DB transaction, not model inference.
+async fn replace_indexed_file_with_retry(
+    db: &dyn DbClient,
+    path: &str,
+    worker_id: usize,
+    replacement: crate::db::queries::IndexedFileReplacement<'_>,
+) -> std::result::Result<i64, sqlx::Error> {
+    const BACKOFFS_MS: &[u64] = &[500, 1_500, 3_000];
+
+    let mut last_err: Option<sqlx::Error> = None;
+    let schedule = std::iter::once(None).chain(BACKOFFS_MS.iter().copied().map(Some));
+    for (attempt, backoff_ms) in schedule.enumerate() {
+        if let Some(ms) = backoff_ms {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+            if let Some(ref e) = last_err {
+                warn!(
+                    path,
+                    worker_id,
+                    attempt,
+                    backoff_ms = ms,
+                    error = %e,
+                    "replace_indexed_file: retrying after lock_timeout"
+                );
+            }
+        }
+
+        match db.replace_indexed_file(replacement.clone()).await {
+            Ok(file_id) => return Ok(file_id),
+            Err(e) if is_lock_timeout(&e) => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_err.unwrap_or(sqlx::Error::PoolTimedOut))
 }
 
 /// Retry `db.upsert_project` on `sqlx::Error::PoolTimedOut`. Bounded

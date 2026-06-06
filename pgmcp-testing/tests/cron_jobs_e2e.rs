@@ -100,9 +100,11 @@ async fn similarity_scan_populates_cross_project_similarities() {
 
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let stats = Arc::new(StatsTracker::new());
-    let mut cron_cfg = CronConfig::default();
-    cron_cfg.similarity_threshold = 0.5; // lax to ensure matches
-    cron_cfg.similarity_top_k = 5;
+    let cron_cfg = CronConfig {
+        similarity_threshold: 0.5, // lax to ensure matches
+        similarity_top_k: 5,
+        ..Default::default()
+    };
     let vector_cfg = VectorConfig::default();
 
     run_similarity_scan(
@@ -150,10 +152,12 @@ async fn topic_clustering_populates_code_topics() {
 
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let stats = Arc::new(StatsTracker::new());
-    let mut cron_cfg = CronConfig::default();
-    cron_cfg.topic_min_cluster_size = 3;
-    cron_cfg.topic_num_clusters = Some(3);
-    cron_cfg.topic_fcm_max_iters = 20;
+    let cron_cfg = CronConfig {
+        topic_min_cluster_size: 3,
+        topic_num_clusters: Some(3),
+        topic_fcm_max_iters: 20,
+        ..Default::default()
+    };
 
     run_global_topic_scan(db.as_ref(), &cron_cfg, &stats, &DaemonLifecycle::new()).await;
 
@@ -242,9 +246,11 @@ async fn similarity_scan_below_threshold_emits_nothing() {
     .await;
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let stats = Arc::new(StatsTracker::new());
-    let mut cron_cfg = CronConfig::default();
-    cron_cfg.similarity_threshold = 0.99; // unreachable for distinct content
-    cron_cfg.similarity_top_k = 5;
+    let cron_cfg = CronConfig {
+        similarity_threshold: 0.99, // unreachable for distinct content
+        similarity_top_k: 5,
+        ..Default::default()
+    };
     let vector_cfg = VectorConfig::default();
     run_similarity_scan(
         db.as_ref(),
@@ -286,11 +292,13 @@ async fn topic_clustering_assigns_chunks_above_threshold() {
     .await;
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let stats = Arc::new(StatsTracker::new());
-    let mut cron_cfg = CronConfig::default();
-    cron_cfg.topic_min_cluster_size = 3;
-    cron_cfg.topic_num_clusters = Some(3);
-    cron_cfg.topic_fcm_max_iters = 20;
-    cron_cfg.topic_membership_threshold = 0.1;
+    let cron_cfg = CronConfig {
+        topic_min_cluster_size: 3,
+        topic_num_clusters: Some(3),
+        topic_fcm_max_iters: 20,
+        topic_membership_threshold: 0.1,
+        ..Default::default()
+    };
     run_global_topic_scan(db.as_ref(), &cron_cfg, &stats, &DaemonLifecycle::new()).await;
     let (assignment_count,): (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM chunk_topic_assignments")
@@ -381,9 +389,11 @@ async fn similarity_scan_is_idempotent_across_runs() {
     seed_chunks(testdb.pool(), "idb", "/ws/idb", "a.rs", shared, &backend).await;
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let stats = Arc::new(StatsTracker::new());
-    let mut cron_cfg = CronConfig::default();
-    cron_cfg.similarity_threshold = 0.5;
-    cron_cfg.similarity_top_k = 5;
+    let cron_cfg = CronConfig {
+        similarity_threshold: 0.5,
+        similarity_top_k: 5,
+        ..Default::default()
+    };
     let vector_cfg = VectorConfig::default();
     run_similarity_scan(
         db.as_ref(),
@@ -542,10 +552,12 @@ async fn topic_clustering_num_clusters_override_is_honored() {
     .await;
     let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
     let stats = Arc::new(StatsTracker::new());
-    let mut cron_cfg = CronConfig::default();
-    cron_cfg.topic_min_cluster_size = 2;
-    cron_cfg.topic_num_clusters = Some(2);
-    cron_cfg.topic_fcm_max_iters = 20;
+    let cron_cfg = CronConfig {
+        topic_min_cluster_size: 2,
+        topic_num_clusters: Some(2),
+        topic_fcm_max_iters: 20,
+        ..Default::default()
+    };
     run_global_topic_scan(db.as_ref(), &cron_cfg, &stats, &DaemonLifecycle::new()).await;
     let (topic_count,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM code_topics")
         .fetch_one(testdb.pool())

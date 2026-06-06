@@ -130,6 +130,12 @@ pub trait DbClient: Send + Sync {
         file_id: i64,
         chunks: &[queries::ChunkInsert<'_>],
     ) -> Result<queries::ChunkBatchOutcome, sqlx::Error>;
+    /// Atomically replace one file's metadata + chunks and finalize its
+    /// `content_hash` in the same transaction.
+    async fn replace_indexed_file(
+        &self,
+        replacement: queries::IndexedFileReplacement<'_>,
+    ) -> Result<i64, sqlx::Error>;
     async fn delete_file(&self, path: &str) -> Result<(), sqlx::Error>;
     async fn delete_files_batch(&self, paths: &[String]) -> Result<u64, sqlx::Error>;
     /// Delete all indexed files of `language` (and their chunks) for targeted
@@ -154,6 +160,7 @@ pub trait DbClient: Send + Sync {
         query: &str,
         limit: i32,
         language: Option<&str>,
+        project: Option<&str>,
         dedupe_worktrees: bool,
     ) -> Result<Vec<TextSearchResult>, sqlx::Error>;
     /// Like [`DbClient::text_search`] but with a tight per-call
@@ -165,6 +172,7 @@ pub trait DbClient: Send + Sync {
         query: &str,
         limit: i32,
         language: Option<&str>,
+        project: Option<&str>,
         dedupe_worktrees: bool,
         statement_timeout_ms: u32,
     ) -> Result<Vec<TextSearchResult>, sqlx::Error>;

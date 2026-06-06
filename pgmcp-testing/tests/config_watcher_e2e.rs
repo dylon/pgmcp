@@ -17,6 +17,14 @@ use pgmcp::indexer::config_watcher::{ConfigWatcherHandle, WatcherCommand, start_
 use pgmcp::stats::tracker::StatsTracker;
 use tempfile::TempDir;
 
+type WatcherFixture = (
+    Arc<ArcSwap<Config>>,
+    Sender<WatcherCommand>,
+    Receiver<WatcherCommand>,
+    Arc<AtomicBool>,
+    ConfigWatcherHandle,
+);
+
 fn seed_config(dir: &std::path::Path, workspace_paths: &[&str]) -> PathBuf {
     let path = dir.join("config.toml");
     let mut toml = String::new();
@@ -37,15 +45,7 @@ fn seed_config(dir: &std::path::Path, workspace_paths: &[&str]) -> PathBuf {
     path
 }
 
-fn start_watcher(
-    path: &std::path::Path,
-) -> (
-    Arc<ArcSwap<Config>>,
-    Sender<WatcherCommand>,
-    Receiver<WatcherCommand>,
-    Arc<AtomicBool>,
-    ConfigWatcherHandle,
-) {
+fn start_watcher(path: &std::path::Path) -> WatcherFixture {
     let initial = Config::load(Some(path)).expect("load");
     let config = Arc::new(ArcSwap::from_pointee(initial));
     let (tx, rx) = bounded::<WatcherCommand>(64);
@@ -115,13 +115,12 @@ fn config_watcher_sends_watch_command_on_workspace_path_addition() {
     let mut saw_watch = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(4);
     while std::time::Instant::now() < deadline {
-        if let Ok(cmd) = rx.recv_timeout(Duration::from_millis(200)) {
-            if let WatcherCommand::Watch(p) | WatcherCommand::Rescan(p) = cmd {
-                if p.to_string_lossy().contains("added_path") {
-                    saw_watch = true;
-                    break;
-                }
-            }
+        if let Ok(WatcherCommand::Watch(p) | WatcherCommand::Rescan(p)) =
+            rx.recv_timeout(Duration::from_millis(200))
+            && p.to_string_lossy().contains("added_path")
+        {
+            saw_watch = true;
+            break;
         }
     }
     assert!(saw_watch, "never saw Watch/Rescan for /added_path");
@@ -144,11 +143,11 @@ fn config_watcher_sends_unwatch_command_on_workspace_path_removal() {
     let mut saw_unwatch = false;
     let deadline = std::time::Instant::now() + Duration::from_secs(4);
     while std::time::Instant::now() < deadline {
-        if let Ok(WatcherCommand::Unwatch(p)) = rx.recv_timeout(Duration::from_millis(200)) {
-            if p.to_string_lossy().contains("removable") {
-                saw_unwatch = true;
-                break;
-            }
+        if let Ok(WatcherCommand::Unwatch(p)) = rx.recv_timeout(Duration::from_millis(200))
+            && p.to_string_lossy().contains("removable")
+        {
+            saw_unwatch = true;
+            break;
         }
     }
     assert!(saw_unwatch, "Unwatch command not received for removed path");

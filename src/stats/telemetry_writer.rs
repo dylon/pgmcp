@@ -151,29 +151,29 @@ async fn flush_batch(pool: &PgPool, stats: &StatsTracker, rows: &[TelemetryRow])
     let n = rows.len();
     let mut tools = Vec::with_capacity(n);
     let mut client_names = Vec::with_capacity(n);
-    let mut client_versions = Vec::with_capacity(n);
-    let mut protocol_versions = Vec::with_capacity(n);
-    let mut mcp_session_ids = Vec::with_capacity(n);
-    let mut projects = Vec::with_capacity(n);
-    let mut cwds = Vec::with_capacity(n);
+    let mut client_versions: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut protocol_versions: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut mcp_session_ids: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut projects: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut cwds: Vec<Option<String>> = Vec::with_capacity(n);
     let mut durations = Vec::with_capacity(n);
     let mut outcomes = Vec::with_capacity(n);
-    let mut error_classes = Vec::with_capacity(n);
-    let mut request_ids = Vec::with_capacity(n);
-    let mut params_hashes = Vec::with_capacity(n);
+    let mut error_classes: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut request_ids: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut params_hashes: Vec<Option<String>> = Vec::with_capacity(n);
     for r in rows {
         tools.push(r.tool.clone());
         client_names.push(r.client_name.clone());
-        client_versions.push(r.client_version.clone().unwrap_or_default());
-        protocol_versions.push(r.protocol_version.clone().unwrap_or_default());
-        mcp_session_ids.push(r.mcp_session_id.clone().unwrap_or_default());
-        projects.push(r.project.clone().unwrap_or_default());
-        cwds.push(r.cwd.clone().unwrap_or_default());
+        client_versions.push(clean_optional_text(&r.client_version));
+        protocol_versions.push(clean_optional_text(&r.protocol_version));
+        mcp_session_ids.push(clean_optional_text(&r.mcp_session_id));
+        projects.push(clean_optional_text(&r.project));
+        cwds.push(clean_optional_text(&r.cwd));
         durations.push(r.duration_ms);
         outcomes.push(r.outcome.to_string());
-        error_classes.push(r.error_class.clone().unwrap_or_default());
-        request_ids.push(r.request_id.clone().unwrap_or_default());
-        params_hashes.push(r.params_sha256.clone().unwrap_or_default());
+        error_classes.push(clean_optional_text(&r.error_class));
+        request_ids.push(clean_optional_text(&r.request_id));
+        params_hashes.push(clean_optional_text(&r.params_sha256));
     }
 
     let sql = "INSERT INTO mcp_tool_calls
@@ -184,16 +184,16 @@ async fn flush_batch(pool: &PgPool, stats: &StatsTracker, rows: &[TelemetryRow])
         FROM UNNEST(
             $1::text[],
             $2::text[],
-            NULLIF($3::text[], ARRAY[]::text[]),
-            NULLIF($4::text[], ARRAY[]::text[]),
-            NULLIF($5::text[], ARRAY[]::text[]),
-            NULLIF($6::text[], ARRAY[]::text[]),
-            NULLIF($7::text[], ARRAY[]::text[]),
+            $3::text[],
+            $4::text[],
+            $5::text[],
+            $6::text[],
+            $7::text[],
             $8::int[],
             $9::text[],
-            NULLIF($10::text[], ARRAY[]::text[]),
-            NULLIF($11::text[], ARRAY[]::text[]),
-            NULLIF($12::text[], ARRAY[]::text[])
+            $10::text[],
+            $11::text[],
+            $12::text[]
         )";
 
     let result = sqlx::query(sql)
@@ -225,6 +225,14 @@ async fn flush_batch(pool: &PgPool, stats: &StatsTracker, rows: &[TelemetryRow])
                 .fetch_add(n as u64, Ordering::Relaxed);
         }
     }
+}
+
+fn clean_optional_text(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// Try to enqueue a telemetry row from `instrumented_tool_wrap`. Returns

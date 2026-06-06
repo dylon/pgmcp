@@ -23,7 +23,7 @@ pub async fn tool_circular_dependencies(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().cycle_scans.fetch_add(1, Ordering::Relaxed);
 
-    let max_cycle_length = params.max_cycle_length.unwrap_or(10) as usize;
+    let max_cycle_length = params.max_cycle_length.unwrap_or(10).clamp(2, 64) as usize;
 
     debug!(
         tool = "circular_dependencies",
@@ -32,19 +32,40 @@ pub async fn tool_circular_dependencies(
         "MCP tool invoked",
     );
 
-    // Resolve project_id
-    let project_id: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
+    let pool = ctx
+        .db()
+        .pool()
+        .ok_or_else(|| McpError::internal_error("raw pool unavailable", None))?;
+
+    // Resolve a project display name only when it is unambiguous. Several
+    // workspaces can contain projects with the same basename; mixing their
+    // import edges would produce unsound cycle reports.
+    let matching_project_ids: Vec<i32> =
+        sqlx::query_scalar("SELECT id FROM projects WHERE name = $1 ORDER BY id")
             .bind(&params.project)
-            .fetch_optional(ctx.db().pool().expect(
-                "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-            ))
+            .fetch_all(pool)
             .await
             .map_err(|e| McpError::internal_error(format!("Project lookup failed: {}", e), None))?;
 
-    let project_id = project_id.ok_or_else(|| {
-        McpError::internal_error(format!("Project not found: {}", params.project), None)
-    })?;
+    let project_id = match matching_project_ids.as_slice() {
+        [] => {
+            return Err(McpError::internal_error(
+                format!("Project not found: {}", params.project),
+                None,
+            ));
+        }
+        [project_id] => *project_id,
+        ids => {
+            return Err(McpError::invalid_params(
+                format!(
+                    "ambiguous project name '{}' matched {} indexed projects; use a unique project name from list_projects",
+                    params.project,
+                    ids.len()
+                ),
+                None,
+            ));
+        }
+    };
 
     // Load import edges only
     #[derive(sqlx::FromRow)]
@@ -75,11 +96,7 @@ pub async fn tool_circular_dependencies(
          WHERE e.project_id = $1 AND e.edge_type = 'import'",
     )
     .bind(project_id)
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("Edge query failed: {}", e), None))?;
 
@@ -95,11 +112,7 @@ pub async fn tool_circular_dependencies(
          FROM indexed_files WHERE project_id = $1",
     )
     .bind(project_id)
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("File query failed: {}", e), None))?;
 
@@ -157,29 +170,14 @@ pub async fn tool_circular_dependencies(
     // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown
     // for the project. Universal enrichment — every tool benefits from
     // surfacing the effect distribution alongside its primary output.
-    // Gracefully degrades to empty when the project lookup or
-    // shadow-ASR data isn't populated.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
-        }
-    })
-    .await;
+    // Gracefully degrades to empty when shadow-ASR data isn't populated.
+    let effect_breakdown: Vec<serde_json::Value> =
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect();
 
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,

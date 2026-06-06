@@ -10,6 +10,7 @@
 use pgmcp::config::DatabaseConfig;
 use pgmcp::db::DbClient;
 use pgmcp::db::pool;
+use pgmcp::db::queries;
 use pgmcp_testing::require_test_db;
 
 #[tokio::test]
@@ -111,13 +112,141 @@ async fn text_search_bounded_finds_content_via_stored_tsv() {
     .expect("chunk");
 
     let hits = pool
-        .text_search_bounded("brown fox", 10, None, false, 5_000)
+        .text_search_bounded("brown fox", 10, None, None, false, 5_000)
         .await
         .expect("text_search_bounded must succeed under a 5s budget");
     assert!(
         hits.iter().any(|h| h.relative_path == "src/lib.rs"),
         "stored-tsv full-text search must find the seeded chunk; got {hits:?}"
     );
+}
+
+#[tokio::test]
+async fn replace_indexed_file_rolls_back_when_chunk_delete_hits_lock_timeout() {
+    let db = require_test_db!();
+    let mut cfg = database_config_from_url(&db.connection_url());
+    cfg.lock_timeout_ms = 250;
+    cfg.statement_timeout_ms = 5_000;
+    cfg.test_before_acquire = false;
+    cfg.max_connections = 4;
+
+    let pool = pool::create_pool(&cfg)
+        .await
+        .expect("create_pool should succeed with short lock_timeout");
+
+    let project_id: i32 = sqlx::query_scalar(
+        "INSERT INTO projects (workspace_path, path, name)
+         VALUES ('/ws/replace-lock', '/ws/replace-lock/project', 'replace-lock')
+         ON CONFLICT (path) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("project");
+    let file_id: i64 = sqlx::query_scalar(
+        "INSERT INTO indexed_files
+            (project_id, path, relative_path, language, size_bytes, content,
+             content_hash, line_count, truncated, content_recoverable_from_disk,
+             modified_at)
+         VALUES
+            ($1, '/ws/replace-lock/project/src/lib.rs', 'src/lib.rs', 'rust',
+             64, 'old content', 111, 1, false, false, NOW())
+         ON CONFLICT (path) DO UPDATE SET
+             project_id = EXCLUDED.project_id,
+             content = EXCLUDED.content,
+             content_hash = EXCLUDED.content_hash,
+             modified_at = NOW()
+         RETURNING id",
+    )
+    .bind(project_id)
+    .fetch_one(&pool)
+    .await
+    .expect("file");
+    let old_embedding = pgvector::Vector::from(vec![0.0_f32; 1024]);
+    let chunk_id: i64 = sqlx::query_scalar(
+        "INSERT INTO file_chunks
+            (file_id, chunk_index, content, start_line, end_line,
+             embedding_v2, embedding_signature)
+         VALUES ($1, 0, 'old chunk', 1, 1, $2, 'bge-m3-v1')
+         ON CONFLICT (file_id, chunk_index) DO UPDATE SET
+             content = EXCLUDED.content,
+             embedding_v2 = EXCLUDED.embedding_v2,
+             embedding_signature = EXCLUDED.embedding_signature
+         RETURNING id",
+    )
+    .bind(file_id)
+    .bind(old_embedding)
+    .fetch_one(&pool)
+    .await
+    .expect("chunk");
+
+    let mut holder = pool.begin().await.expect("BEGIN holder");
+    sqlx::query("SELECT id FROM file_chunks WHERE id = $1 FOR KEY SHARE")
+        .bind(chunk_id)
+        .fetch_one(&mut *holder)
+        .await
+        .expect("hold key-share lock on old chunk");
+
+    let replacement_embedding = vec![1.0_f32; 1024];
+    let replacement_chunks = [queries::ChunkInsert {
+        chunk_index: 0,
+        content: "new chunk",
+        start_line: 1,
+        end_line: 1,
+        embedding: replacement_embedding.as_slice(),
+    }];
+    let err = queries::replace_indexed_file(
+        &pool,
+        queries::IndexedFileReplacement {
+            project_id,
+            path: "/ws/replace-lock/project/src/lib.rs",
+            relative_path: "src/lib.rs",
+            language: "rust",
+            size_bytes: 64,
+            content: Some("new content"),
+            content_hash: 222,
+            line_count: 1,
+            truncated: false,
+            content_recoverable_from_disk: false,
+            modified_at: chrono::Utc::now(),
+            chunks: &replacement_chunks,
+        },
+    )
+    .await
+    .expect_err("chunk delete should hit lock_timeout while key-share holder is active");
+    let sqlstate = match &err {
+        sqlx::Error::Database(db_err) => db_err.code().map(|s| s.into_owned()),
+        _ => None,
+    };
+    assert_eq!(
+        sqlstate.as_deref(),
+        Some("55P03"),
+        "expected SQLSTATE 55P03 (lock_not_available), got error: {err}"
+    );
+
+    holder.rollback().await.expect("release holder");
+
+    let (content_hash, content): (Option<i64>, Option<String>) =
+        sqlx::query_as("SELECT content_hash, content FROM indexed_files WHERE id = $1")
+            .bind(file_id)
+            .fetch_one(&pool)
+            .await
+            .expect("file state");
+    assert_eq!(
+        content_hash,
+        Some(111),
+        "failed replace must roll back hash"
+    );
+    assert_eq!(content.as_deref(), Some("old content"));
+
+    let chunks: Vec<String> = sqlx::query_scalar(
+        "SELECT content FROM file_chunks WHERE file_id = $1 ORDER BY chunk_index",
+    )
+    .bind(file_id)
+    .fetch_all(&pool)
+    .await
+    .expect("chunks state");
+    assert_eq!(chunks, vec!["old chunk".to_string()]);
 }
 
 fn database_config_from_url(url: &str) -> DatabaseConfig {

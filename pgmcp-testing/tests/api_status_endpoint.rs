@@ -247,12 +247,12 @@ async fn status_endpoint_database_url_is_redacted_no_password_leak() {
     );
 
     // The raw password (if any) must NEVER appear in the response.
-    if let Some(pw) = daemon.password.as_deref() {
-        if !pw.is_empty() {
-            assert!(
-                !body.contains(pw),
-                "LEAK: raw password substring `{pw}` appears in /api/status payload"
-            );
-        }
+    if let Some(pw) = daemon.password.as_deref()
+        && !pw.is_empty()
+    {
+        assert!(
+            !body.contains(pw),
+            "LEAK: raw password substring `{pw}` appears in /api/status payload"
+        );
     }
 }

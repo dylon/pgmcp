@@ -156,6 +156,13 @@ impl DbClient for PgPool {
         queries::insert_chunks_batch(self, file_id, chunks).await
     }
 
+    async fn replace_indexed_file(
+        &self,
+        replacement: queries::IndexedFileReplacement<'_>,
+    ) -> Result<i64, sqlx::Error> {
+        queries::replace_indexed_file(self, replacement).await
+    }
+
     async fn delete_file(&self, path: &str) -> Result<(), sqlx::Error> {
         queries::delete_file(self, path).await
     }
@@ -206,9 +213,10 @@ impl DbClient for PgPool {
         query: &str,
         limit: i32,
         language: Option<&str>,
+        project: Option<&str>,
         dedupe_worktrees: bool,
     ) -> Result<Vec<TextSearchResult>, sqlx::Error> {
-        queries::text_search(self, query, limit, language, dedupe_worktrees).await
+        queries::text_search(self, query, limit, language, project, dedupe_worktrees).await
     }
 
     async fn text_search_bounded(
@@ -216,6 +224,7 @@ impl DbClient for PgPool {
         query: &str,
         limit: i32,
         language: Option<&str>,
+        project: Option<&str>,
         dedupe_worktrees: bool,
         statement_timeout_ms: u32,
     ) -> Result<Vec<TextSearchResult>, sqlx::Error> {
@@ -224,6 +233,7 @@ impl DbClient for PgPool {
             query,
             limit,
             language,
+            project,
             dedupe_worktrees,
             statement_timeout_ms,
         )

@@ -6,8 +6,6 @@
 //! - `effect_symbols`: shadow-ASR symbols carrying the `unsafe` effect
 //!   (Phase D2b). Populated by `sema_helpers::effects::symbols_with_effect`.
 
-#![allow(unused_imports)]
-
 use regex::Regex;
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
@@ -22,31 +20,34 @@ use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_er
 use crate::mcp::tools::sota_regex_scan::scan_files_for_pattern;
 use crate::parsing::type_tags::vocabulary::EFFECT_UNSAFE;
 
+const MAX_UNSAFE_CLUSTER_FILES: i32 = 200;
+
 pub async fn tool_unsafe_clusters(
     ctx: &SystemContext,
     params: UnsafeClustersParams,
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "unsafe_clusters", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
+    let limit = params
+        .limit
+        .unwrap_or(25)
+        .clamp(1, MAX_UNSAFE_CLUSTER_FILES);
 
     let pat = Regex::new(r"(?m)\bunsafe\s*(\{|fn|impl|trait)\b").expect("unsafe pattern");
     let hits = scan_files_for_pattern(pool, project_id, &pat, Some(&["rust"]), 100_000)
         .await
         .map_err(|e| McpError::internal_error(format!("Scan failed: {}", e), None))?;
 
-    let mut counts: HashMap<String, (u32, String)> = HashMap::new();
+    let mut counts: HashMap<String, u32> = HashMap::new();
     for h in &hits {
-        let entry = counts
-            .entry(h.relative_path.clone())
-            .or_insert((0, h.language.clone()));
-        entry.0 += 1;
+        *counts.entry(h.relative_path.clone()).or_insert(0) += 1;
     }
-    let limit = params.limit.unwrap_or(25);
-    let mut rows: Vec<(String, u32)> = counts.into_iter().map(|(p, (c, _))| (p, c)).collect();
-    rows.sort_by_key(|a| std::cmp::Reverse(a.1));
-    rows.truncate(limit.max(0) as usize);
+    let mut rows: Vec<(String, u32)> = counts.into_iter().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.truncate(limit as usize);
     let files: Vec<_> = rows
         .iter()
         .map(|(p, c)| json!({"file": p, "unsafe_blocks": c}))
@@ -70,7 +71,8 @@ pub async fn tool_unsafe_clusters(
         .collect::<Vec<_>>();
 
     json_result(&json!({
-        "project": params.project,
+        "project": project,
+        "limit": limit,
         "files": files,
         "total_unsafe_blocks": hits.len(),
         "effect_symbols": effect_symbols,

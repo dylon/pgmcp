@@ -56,10 +56,10 @@ async fn cron_writes_and_reload_round_trips() {
              VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(file_id)
-        .bind(i as i32)
+        .bind(i)
         .bind(content)
-        .bind((i as i32) + 1)
-        .bind((i as i32) + 1)
+        .bind(i + 1)
+        .bind(i + 1)
         .execute(testdb.pool())
         .await
         .expect("chunk");
@@ -84,7 +84,11 @@ async fn cron_writes_and_reload_round_trips() {
         "training cron must increment runs counter"
     );
 
-    let model_path = pgmcp::cron::ngram_lm_train::model_path_for(tmp.path(), "lm_train_test");
+    let model_path = pgmcp::cron::ngram_lm_train::model_path_for_project(
+        tmp.path(),
+        project_id,
+        "lm_train_test",
+    );
     assert!(
         model_path.exists(),
         "training cron must persist model to {}",

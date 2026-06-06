@@ -7,7 +7,7 @@ Reference for the four query interfaces pgmcp exposes. See the
 pgmcp provides four complementary search strategies:
 
 **Semantic Search** -- finds conceptually related code even when terminology differs.
-The query is embedded into the same 384-dimensional vector space, then ranked by
+The query is embedded into the same 1024-dimensional BGE-M3 vector space, then ranked by
 cosine similarity via pgvector's HNSW index:
 
 ```
@@ -38,4 +38,3 @@ results in only one list still contribute. Configurable `bm25_weight` and
 `semantic_weight` (default 0.5 each).
 
 ---
-

@@ -13,7 +13,40 @@ use serde_json::json;
 use tracing::{debug, error, info, warn};
 
 use crate::context::SystemContext;
+use crate::db::queries;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::project_id_or_err;
+
+const FIND_COUPLED_FILES_MAX_LIMIT: i32 = 200;
+const FIND_COUPLED_FILES_MAX_MIN_COMMITS: i32 = 10_000;
+
+fn normalize_find_coupled_params(
+    params: &FindCoupledFilesParams,
+) -> Result<(String, f64, i32, i32), McpError> {
+    let project = params.project.trim();
+    if project.is_empty() {
+        return Err(McpError::invalid_params("project must be non-empty", None));
+    }
+
+    let raw_min_coupling = params.min_coupling.unwrap_or(0.3);
+    if !raw_min_coupling.is_finite() {
+        return Err(McpError::invalid_params(
+            "min_coupling must be a finite number",
+            None,
+        ));
+    }
+    let min_coupling = raw_min_coupling.clamp(0.0, 1.0);
+    let min_commits = params
+        .min_commits
+        .unwrap_or(3)
+        .clamp(1, FIND_COUPLED_FILES_MAX_MIN_COMMITS);
+    let limit = params
+        .limit
+        .unwrap_or(50)
+        .clamp(1, FIND_COUPLED_FILES_MAX_LIMIT);
+
+    Ok((project.to_string(), min_coupling, min_commits, limit))
+}
 
 pub async fn tool_find_coupled_files(
     ctx: &SystemContext,
@@ -23,39 +56,55 @@ pub async fn tool_find_coupled_files(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().coupling_scans.fetch_add(1, Ordering::Relaxed);
 
-    let min_coupling = params.min_coupling.unwrap_or(0.3);
-    let min_commits = params.min_commits.unwrap_or(3);
-    let limit = params.limit.unwrap_or(50);
+    let (project, min_coupling, min_commits, limit) = normalize_find_coupled_params(&params)?;
 
     debug!(
         tool = "find_coupled_files",
-        project = %params.project,
+        project = %project,
         min_coupling,
         min_commits,
         limit,
         "MCP tool invoked",
     );
 
-    // Check if git_commit_files has data
-    let has_data = ctx
-        .db()
-        .has_commit_files_for_project(&params.project)
-        .await
-        .unwrap_or(false);
+    let pool = ctx.db().pool();
+    let mut pairs = if let Some(pool) = pool {
+        let project_id = project_id_or_err(ctx, &project).await?;
+        let has_data = queries::has_commit_files_for_project_id(pool, project_id)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Git data check failed: {}", e), None))?;
 
-    if !has_data {
-        return Ok(CallToolResult::success(vec![Content::text(
-            "No git commit file data found for this project. Enable git history indexing \
-             by adding [git] index_history = true to the project's .pgmcp.toml, then wait \
-             for the git-history-index cron job to run.",
-        )]));
-    }
+        if !has_data {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No git commit file data found for this project. Enable git history indexing \
+                 by adding [git] index_history = true to the project's .pgmcp.toml, then wait \
+                 for the git-history-index cron job to run.",
+            )]));
+        }
 
-    let mut pairs = ctx
-        .db()
-        .find_coupled_files(&params.project, min_coupling, min_commits)
-        .await
-        .map_err(|e| McpError::internal_error(format!("Coupling query failed: {}", e), None))?;
+        queries::find_coupled_files_by_project_id(pool, project_id, min_coupling, min_commits)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Coupling query failed: {}", e), None))?
+    } else {
+        let has_data = ctx
+            .db()
+            .has_commit_files_for_project(&project)
+            .await
+            .unwrap_or(false);
+
+        if !has_data {
+            return Ok(CallToolResult::success(vec![Content::text(
+                "No git commit file data found for this project. Enable git history indexing \
+                 by adding [git] index_history = true to the project's .pgmcp.toml, then wait \
+                 for the git-history-index cron job to run.",
+            )]));
+        }
+
+        ctx.db()
+            .find_coupled_files(&project, min_coupling, min_commits)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Coupling query failed: {}", e), None))?
+    };
 
     pairs.truncate(limit as usize);
 
@@ -65,32 +114,29 @@ pub async fn tool_find_coupled_files(
     // Gracefully degrades to empty when the project lookup or
     // shadow-ASR data isn't populated.
     let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
+        let Some(pool) = pool else {
             return Vec::new();
         };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
+        match project_id_or_err(ctx, &project).await {
+            Ok(project_id) => {
+                crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+                    .collect()
+            }
+            Err(_) => Vec::new(),
         }
     })
     .await;
 
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
+        "project": project,
         "min_coupling": min_coupling,
         "min_commits": min_commits,
+        "limit": limit,
         "pair_count": pairs.len(),
         "coupled_pairs": pairs.iter().map(|p| serde_json::json!({
             "file_a": p.file_a,

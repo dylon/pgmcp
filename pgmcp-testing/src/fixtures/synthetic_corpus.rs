@@ -887,16 +887,18 @@ async fn insert_perfect_metric(pool: &PgPool, project_id: i32, file_id: i64) {
         .execute(pool)
         .await
         .expect("days");
+    insert_function_metric(pool, project_id, file_id, 1).await;
 }
 
 /// Worst-case inputs across every dimension.
 async fn seed_failing(pool: &PgPool, project_id: i32) {
-    // 10 god-class files (line_count = 1500 → avg 1500 → size_score 0).
+    // 10 oversized files (line_count = 2500 -> avg 2500 -> size_score 0,
+    // and each exceeds the production god-file ORR threshold).
     let mut file_ids = Vec::with_capacity(10);
     for i in 0..10 {
         let path = format!("src/giant{i}.rs");
         let abs = format!("/ws/failing/{path}");
-        let fid = insert_file(pool, project_id, &abs, &path, "rust", 1500).await;
+        let fid = insert_file(pool, project_id, &abs, &path, "rust", 2500).await;
         file_ids.push(fid);
         insert_file_metric(
             pool,
@@ -924,17 +926,20 @@ async fn seed_failing(pool: &PgPool, project_id: i32) {
             .execute(pool)
             .await
             .expect("fix+stale");
+        insert_function_metric(pool, project_id, fid, 20).await;
     }
-    // Add a 3-cycle so dep_score drops.
+    // Add a 10-file ring so every source file participates in an SCC and the
+    // dependency-health dimension lands in the F band.
     if file_ids.len() >= 3 {
-        for win in &[(0_usize, 1_usize), (1, 2), (2, 0)] {
+        for i in 0..file_ids.len() {
+            let j = (i + 1) % file_ids.len();
             sqlx::query(
                 "INSERT INTO code_graph_edges (project_id, source_file_id, target_file_id, edge_type, weight) \
                  VALUES ($1, $2, $3, 'import', 1.0)",
             )
             .bind(project_id)
-            .bind(file_ids[win.0])
-            .bind(file_ids[win.1])
+            .bind(file_ids[i])
+            .bind(file_ids[j])
             .execute(pool)
             .await
             .expect("edge");
@@ -964,7 +969,7 @@ async fn seed_orr_tunable(
     for i in 0..10 {
         let path = format!("src/m{i}.rs");
         let abs = format!("/ws/orr/{path}");
-        let lc = if god_files && i < 6 { 1500 } else { 200 };
+        let lc = if god_files && i < 6 { 2500 } else { 200 };
         let fid = insert_file(pool, project_id, &abs, &path, "rust", lc).await;
         file_ids.push(fid);
         insert_file_metric(
@@ -1030,4 +1035,37 @@ async fn seed_orr_tunable(
             .expect("edge");
         }
     }
+}
+
+async fn insert_function_metric(pool: &PgPool, project_id: i32, file_id: i64, cyclomatic: i32) {
+    let symbol_id: i64 = sqlx::query_scalar(
+        "INSERT INTO file_symbols (file_id, name, kind, start_line, end_line)
+         VALUES ($1, $2, 'function', 1, 1)
+         ON CONFLICT (file_id, kind, name, start_line)
+         DO UPDATE SET end_line = EXCLUDED.end_line
+         RETURNING id",
+    )
+    .bind(file_id)
+    .bind(format!("score_fn_{file_id}"))
+    .fetch_one(pool)
+    .await
+    .expect("scorecard function symbol");
+
+    sqlx::query(
+        "INSERT INTO function_metrics
+            (function_id, file_id, project_id, cyclomatic, cognitive, maintainability_index, loc)
+         VALUES ($1, $2, $3, $4, $4, 100.0, 10)
+         ON CONFLICT (function_id) DO UPDATE
+             SET cyclomatic = EXCLUDED.cyclomatic,
+                 cognitive = EXCLUDED.cognitive,
+                 maintainability_index = EXCLUDED.maintainability_index,
+                 loc = EXCLUDED.loc",
+    )
+    .bind(symbol_id)
+    .bind(file_id)
+    .bind(project_id)
+    .bind(cyclomatic)
+    .execute(pool)
+    .await
+    .expect("scorecard function metric");
 }

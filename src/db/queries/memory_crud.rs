@@ -4,7 +4,7 @@
 
 use crate::db::queries::*;
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 // ============================================================================
 // Memory-server Phase 2 + 3: knowledge-graph CRUD queries
@@ -73,6 +73,101 @@ fn observation_sha256(content: &str) -> String {
     format!("{:x}", h.finalize())
 }
 
+async fn lock_memory_entity_identity(
+    tx: &mut Transaction<'_, Postgres>,
+    name: &str,
+    entity_type: &str,
+) -> Result<(), sqlx::Error> {
+    let (lock_a, lock_b) = memory_entity_identity_lock_key(name, entity_type);
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(lock_a)
+        .bind(lock_b)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn lock_memory_entity_observations(
+    tx: &mut Transaction<'_, Postgres>,
+    entity_id: i64,
+) -> Result<(), sqlx::Error> {
+    let (lock_a, lock_b) = memory_entity_observation_lock_key(entity_id);
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(lock_a)
+        .bind(lock_b)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+fn memory_entity_identity_lock_key(name: &str, entity_type: &str) -> (i32, i32) {
+    memory_advisory_lock_key(b"memory:entity:", &[name, entity_type])
+}
+
+fn memory_entity_observation_lock_key(entity_id: i64) -> (i32, i32) {
+    let id = entity_id.to_string();
+    memory_advisory_lock_key(b"memory:entity-observations:", &[id.as_str()])
+}
+
+fn memory_advisory_lock_key(prefix: &[u8], fields: &[&str]) -> (i32, i32) {
+    fn fnv1a32(seed: u32, bytes: &[u8]) -> u32 {
+        let mut hash = seed;
+        for byte in bytes {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(0x0100_0193);
+        }
+        hash
+    }
+
+    let mut high = fnv1a32(0x811c_9dc5, prefix);
+    let mut low = fnv1a32(0x811c_9dc5 ^ 0x9e37_79b9, prefix);
+    for field in fields {
+        high = fnv1a32(high, field.as_bytes());
+        high = fnv1a32(high, b"\0");
+        low = fnv1a32(low, field.as_bytes());
+        low = fnv1a32(low, b"\0");
+    }
+    (high as i32, low as i32)
+}
+
+async fn insert_active_observation_if_absent(
+    tx: &mut Transaction<'_, Postgres>,
+    entity_id: i64,
+    content: &str,
+    source: &str,
+) -> Result<Option<i64>, sqlx::Error> {
+    let sha = observation_sha256(content);
+    let existing: Option<i64> = sqlx::query_scalar(
+        "SELECT id FROM memory_observations
+         WHERE entity_id = $1
+           AND content_sha256 = $2
+           AND valid_to IS NULL
+         LIMIT 1",
+    )
+    .bind(entity_id)
+    .bind(&sha)
+    .fetch_optional(&mut **tx)
+    .await?;
+
+    if existing.is_some() {
+        return Ok(None);
+    }
+
+    sqlx::query_scalar(
+        "INSERT INTO memory_observations
+            (entity_id, content, content_sha256, source)
+         VALUES ($1, $2, $3, $4::memory_source)
+         ON CONFLICT DO NOTHING
+         RETURNING id",
+    )
+    .bind(entity_id)
+    .bind(content)
+    .bind(&sha)
+    .bind(source)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
 /// `memory_create_entities` payload row.
 #[derive(Debug, Clone)]
 pub struct NewEntityInput {
@@ -80,6 +175,13 @@ pub struct NewEntityInput {
     pub entity_type: String,
     /// Initial observations attached at entity-creation time. May be empty.
     pub observations: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemoryCreateEntitiesResult {
+    pub entity_ids: Vec<i64>,
+    pub entities_inserted: usize,
+    pub observations_inserted: usize,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
@@ -153,30 +255,43 @@ pub async fn concept_seed_topics(
     .await
 }
 
-pub async fn memory_create_entities(
+pub async fn memory_create_entities_detailed(
     pool: &PgPool,
     inputs: &[NewEntityInput],
     scope_id: i64,
     source: &str,
-) -> Result<Vec<i64>, sqlx::Error> {
+) -> Result<MemoryCreateEntitiesResult, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let mut out = Vec::with_capacity(inputs.len());
+    let mut entities_inserted = 0usize;
+    let mut observations_to_insert: Vec<(i64, &str)> = Vec::new();
+
+    let mut identity_locks: Vec<(String, String)> = inputs
+        .iter()
+        .map(|input| (input.name.clone(), input.entity_type.clone()))
+        .collect();
+    identity_locks.sort();
+    identity_locks.dedup();
+    for (name, entity_type) in &identity_locks {
+        lock_memory_entity_identity(&mut tx, name, entity_type).await?;
+    }
 
     for input in inputs {
         // Re-use the active row if one exists; otherwise insert.
-        let existing: Option<i64> = sqlx::query_scalar(
+        let existing_ids: Vec<i64> = sqlx::query_scalar(
             "SELECT id FROM memory_entities
              WHERE name = $1 AND entity_type = $2 AND valid_to IS NULL
-             LIMIT 1",
+             ORDER BY id",
         )
         .bind(&input.name)
         .bind(&input.entity_type)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
 
-        let entity_id: i64 = match existing {
-            Some(id) => id,
-            None => {
+        let entity_id: i64 = match existing_ids.as_slice() {
+            [id] => *id,
+            [] => {
+                entities_inserted += 1;
                 sqlx::query_scalar(
                     "INSERT INTO memory_entities
                         (name, entity_type, importance, source)
@@ -188,6 +303,14 @@ pub async fn memory_create_entities(
                 .bind(source)
                 .fetch_one(&mut *tx)
                 .await?
+            }
+            ids => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "ambiguous active memory entity identity ('{}', '{}') matched {} rows; repair duplicate active entities",
+                    input.name,
+                    input.entity_type,
+                    ids.len()
+                )));
             }
         };
 
@@ -202,29 +325,52 @@ pub async fn memory_create_entities(
         .execute(&mut *tx)
         .await?;
 
-        // Append observations (idempotent on (entity_id, content_sha256, valid_from);
-        // re-creating the same observation gets eaten by the UNIQUE).
         for obs in &input.observations {
-            let sha = observation_sha256(obs);
-            let _ = sqlx::query(
-                "INSERT INTO memory_observations
-                    (entity_id, content, content_sha256, source)
-                 VALUES ($1, $2, $3, $4::memory_source)
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(entity_id)
-            .bind(obs)
-            .bind(&sha)
-            .bind(source)
-            .execute(&mut *tx)
-            .await?;
+            observations_to_insert.push((entity_id, obs.as_str()));
         }
 
         out.push(entity_id);
     }
 
+    let mut observation_locks: Vec<i64> = observations_to_insert
+        .iter()
+        .map(|(entity_id, _)| *entity_id)
+        .collect();
+    observation_locks.sort_unstable();
+    observation_locks.dedup();
+    for entity_id in observation_locks {
+        lock_memory_entity_observations(&mut tx, entity_id).await?;
+    }
+
+    let mut observations_inserted = 0usize;
+    for (entity_id, obs) in observations_to_insert {
+        if insert_active_observation_if_absent(&mut tx, entity_id, obs, source)
+            .await?
+            .is_some()
+        {
+            observations_inserted += 1;
+        }
+    }
+
     tx.commit().await?;
-    Ok(out)
+    Ok(MemoryCreateEntitiesResult {
+        entity_ids: out,
+        entities_inserted,
+        observations_inserted,
+    })
+}
+
+pub async fn memory_create_entities(
+    pool: &PgPool,
+    inputs: &[NewEntityInput],
+    scope_id: i64,
+    source: &str,
+) -> Result<Vec<i64>, sqlx::Error> {
+    Ok(
+        memory_create_entities_detailed(pool, inputs, scope_id, source)
+            .await?
+            .entity_ids,
+    )
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -351,36 +497,49 @@ pub async fn memory_add_observations(
 ) -> Result<Vec<i64>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let mut out = Vec::new();
+    let mut observations_to_insert: Vec<(i64, &str)> = Vec::new();
 
     for input in inputs {
-        let entity_id: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM memory_entities WHERE name = $1 AND valid_to IS NULL LIMIT 1",
+        let entity_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM memory_entities
+             WHERE name = $1 AND valid_to IS NULL
+             ORDER BY id",
         )
         .bind(&input.entity_name)
-        .fetch_optional(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
-        let Some(entity_id) = entity_id else {
+        if entity_ids.is_empty() {
             continue;
-        };
+        }
+        if entity_ids.len() > 1 {
+            return Err(sqlx::Error::Protocol(format!(
+                "ambiguous memory entity name '{}' matched {} active entities; use a unique entity name",
+                input.entity_name,
+                entity_ids.len()
+            )));
+        }
+        let entity_id = entity_ids[0];
 
         for content in &input.contents {
-            let sha = observation_sha256(content);
-            let inserted: Option<i64> = sqlx::query_scalar(
-                "INSERT INTO memory_observations
-                    (entity_id, content, content_sha256, source)
-                 VALUES ($1, $2, $3, $4::memory_source)
-                 ON CONFLICT DO NOTHING
-                 RETURNING id",
-            )
-            .bind(entity_id)
-            .bind(content)
-            .bind(&sha)
-            .bind(source)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(id) = inserted {
-                out.push(id);
-            }
+            observations_to_insert.push((entity_id, content.as_str()));
+        }
+    }
+
+    let mut observation_locks: Vec<i64> = observations_to_insert
+        .iter()
+        .map(|(entity_id, _)| *entity_id)
+        .collect();
+    observation_locks.sort_unstable();
+    observation_locks.dedup();
+    for entity_id in observation_locks {
+        lock_memory_entity_observations(&mut tx, entity_id).await?;
+    }
+
+    for (entity_id, content) in observations_to_insert {
+        if let Some(id) =
+            insert_active_observation_if_absent(&mut tx, entity_id, content, source).await?
+        {
+            out.push(id);
         }
     }
 

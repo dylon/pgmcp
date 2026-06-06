@@ -54,6 +54,8 @@ pub struct TextSearchParams {
     pub limit: Option<i32>,
     #[schemars(description = "Filter by programming language")]
     pub language: Option<String>,
+    #[schemars(description = "Filter by project name")]
+    pub project: Option<String>,
     #[schemars(
         description = "If true, collapse cross-worktree duplicates (see semantic_search). \
                        Default false."

@@ -10,7 +10,6 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
-use parking_lot::Mutex;
 use tracing::{error, warn};
 
 use crate::config::CronConfig;
@@ -57,12 +56,12 @@ fn staggered_initial_delay_ms(job_name: &str, interval_ms: u64) -> u64 {
 /// and back to false on drop. Used by the four heavy cron bodies so the
 /// Prometheus `pgmcp_heavy_cron_running` gauge reflects live state regardless
 /// of early-return or panic.
-struct HeavyCronFlag {
+pub(crate) struct HeavyCronFlag {
     stats: Arc<StatsTracker>,
 }
 
 impl HeavyCronFlag {
-    fn new(stats: Arc<StatsTracker>) -> Self {
+    pub(crate) fn new(stats: Arc<StatsTracker>) -> Self {
         stats
             .heavy_cron_running
             .store(true, AtomicOrdering::Release);
@@ -128,8 +127,8 @@ macro_rules! heavy_gate_or_skip {
             return;
         }
         match $lock.try_lock() {
-            Some(g) => g,
-            None => {
+            Ok(g) => g,
+            Err(_) => {
                 tracing::info!(concat!("heavy cron busy, deferring ", $job));
                 $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::LockBusy), 0);
                 return;
@@ -951,7 +950,7 @@ pub fn schedule_maintenance_jobs(
     // initial-fire delay is relative to Ready (the daemon's scan completion),
     // not to scheduler start. This prevents the old pile-up where all four
     // overdue heavy crons fired within the same 60s window after Ready.
-    let heavy_cron_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+    let heavy_cron_lock = Arc::clone(system_ctx.heavy_cron_lock());
     // Dedicated lock for the cheap, read-mostly quality-history snapshot. It was
     // previously on `heavy_cron_lock`, where it lost the try_lock race to the
     // 20-30 min GPU jobs (topic-clustering / graph-analysis) every tick and
@@ -960,7 +959,7 @@ pub fn schedule_maintenance_jobs(
     // and the digest with an empty series. It only reads tables (MVCC-safe
     // alongside the GPU writers) and appends to quality_report_history, so it
     // needs to exclude only itself — its own lock decouples it from the GPU herd.
-    let quality_history_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+    let quality_history_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
 
     let stats_for_git = Arc::clone(&stats);
     let lc = lifecycle.clone();
@@ -2317,7 +2316,7 @@ mod tests {
         // returning reason; we want to isolate the shutdown gate.
         let ready: Arc<TestOnceLock<Instant>> = Arc::new(TestOnceLock::new());
         let _ = ready.set(Instant::now() - Duration::from_secs(3600));
-        let lock = Arc::new(parking_lot::Mutex::new(()));
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
         let proceeded = Arc::new(AtomicBool::new(false));
 
         let proceeded_for_closure = Arc::clone(&proceeded);

@@ -25,6 +25,7 @@ use crate::mcp::server::*;
 struct EnrichedFileInfo {
     path: String,
     relative_path: String,
+    project_name: Option<String>,
     language: String,
     size_bytes: i64,
     line_count: i32,
@@ -74,6 +75,7 @@ pub async fn tool_file_info(
     let enriched = EnrichedFileInfo {
         path: info.path,
         relative_path: info.relative_path,
+        project_name: info.project_name,
         extracted_kind: extracted_kind_for(&info.language),
         language: info.language,
         size_bytes: info.size_bytes,

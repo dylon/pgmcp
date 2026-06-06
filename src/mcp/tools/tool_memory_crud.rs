@@ -70,6 +70,57 @@ fn parse_scope(p: Option<&MemoryScopeParam>) -> Result<ScopeSpec, McpError> {
 // memory_create_entities
 // ----------------------------------------------------------------------------
 
+const MAX_CREATE_ENTITIES_BATCH: usize = 100;
+const MAX_ENTITY_FIELD_BYTES: usize = 256;
+const MAX_OBSERVATIONS_PER_ENTITY: usize = 64;
+const MAX_OBSERVATION_BYTES: usize = 16 * 1024;
+
+fn normalize_entity_field(value: String, field: &str) -> Result<String, McpError> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return Err(McpError::invalid_params(
+            format!("{field} must not be blank"),
+            None,
+        ));
+    }
+    if normalized.len() > MAX_ENTITY_FIELD_BYTES {
+        return Err(McpError::invalid_params(
+            format!("{field} must be at most {MAX_ENTITY_FIELD_BYTES} bytes"),
+            None,
+        ));
+    }
+    Ok(normalized.to_string())
+}
+
+fn validate_initial_observations(observations: Vec<String>) -> Result<Vec<String>, McpError> {
+    if observations.len() > MAX_OBSERVATIONS_PER_ENTITY {
+        return Err(McpError::invalid_params(
+            format!(
+                "observations must contain at most {MAX_OBSERVATIONS_PER_ENTITY} entries per entity"
+            ),
+            None,
+        ));
+    }
+
+    let mut out = Vec::with_capacity(observations.len());
+    for obs in observations {
+        if obs.trim().is_empty() {
+            return Err(McpError::invalid_params(
+                "observations must not contain blank entries",
+                None,
+            ));
+        }
+        if obs.len() > MAX_OBSERVATION_BYTES {
+            return Err(McpError::invalid_params(
+                format!("observations must be at most {MAX_OBSERVATION_BYTES} bytes each"),
+                None,
+            ));
+        }
+        out.push(obs);
+    }
+    Ok(out)
+}
+
 pub async fn tool_memory_create_entities(
     ctx: &SystemContext,
     params: MemoryCreateEntitiesParams,
@@ -79,52 +130,65 @@ pub async fn tool_memory_create_entities(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
     let scope = parse_scope(params.scope.as_ref())?;
-    let scope_id = queries::find_or_create_scope(pool, &scope)
-        .await
-        .map_err(|e| McpError::internal_error(format!("scope: {}", e), None))?;
 
     if params.entities.is_empty() {
         return Err(McpError::invalid_params("entities must not be empty", None));
+    }
+    if params.entities.len() > MAX_CREATE_ENTITIES_BATCH {
+        return Err(McpError::invalid_params(
+            format!("entities must contain at most {MAX_CREATE_ENTITIES_BATCH} entries"),
+            None,
+        ));
     }
 
     let inputs: Vec<NewEntityInput> = params
         .entities
         .into_iter()
-        .map(|e| NewEntityInput {
-            name: e.name,
-            entity_type: e.entity_type,
-            observations: e.observations.unwrap_or_default(),
+        .map(|e| {
+            Ok(NewEntityInput {
+                name: normalize_entity_field(e.name, "entity name")?,
+                entity_type: normalize_entity_field(e.entity_type, "entity_type")?,
+                observations: validate_initial_observations(e.observations.unwrap_or_default())?,
+            })
         })
-        .collect();
-    let total_obs: usize = inputs.iter().map(|i| i.observations.len()).sum();
+        .collect::<Result<_, McpError>>()?;
 
-    let ids = queries::memory_create_entities(pool, &inputs, scope_id, "agent_write")
+    let scope_id = queries::find_or_create_scope(pool, &scope)
+        .await
+        .map_err(|e| McpError::internal_error(format!("scope: {}", e), None))?;
+
+    let created = queries::memory_create_entities_detailed(pool, &inputs, scope_id, "agent_write")
         .await
         .map_err(|e| {
             error!(tool = "memory_create_entities", error = %e, "query failed");
-            McpError::internal_error(format!("query failed: {}", e), None)
+            match &e {
+                sqlx::Error::Protocol(msg) => McpError::invalid_params(msg.clone(), None),
+                _ => McpError::internal_error(format!("query failed: {}", e), None),
+            }
         })?;
 
     ctx.stats()
         .memory_entities_created
-        .fetch_add(ids.len() as u64, Ordering::Relaxed);
+        .fetch_add(created.entities_inserted as u64, Ordering::Relaxed);
     ctx.stats()
         .memory_observations_added
-        .fetch_add(total_obs as u64, Ordering::Relaxed);
+        .fetch_add(created.observations_inserted as u64, Ordering::Relaxed);
 
     debug!(
         tool = "memory_create_entities",
         scope_id,
-        count = ids.len(),
-        observations_added = total_obs,
+        count = created.entity_ids.len(),
+        entities_inserted = created.entities_inserted,
+        observations_added = created.observations_inserted,
         duration_ms = start.elapsed().as_millis() as u64,
         "MCP tool completed",
     );
     json_result(json!({
         "scope_id": scope_id,
-        "entities_created": ids.len(),
-        "ids": ids,
-        "observations_attached": total_obs,
+        "entities_created": created.entities_inserted,
+        "entities_processed": created.entity_ids.len(),
+        "ids": created.entity_ids,
+        "observations_attached": created.observations_inserted,
     }))
 }
 
@@ -196,7 +260,10 @@ pub async fn tool_memory_add_observations(
         .collect();
     let ids = queries::memory_add_observations(pool, &inputs, "agent_write")
         .await
-        .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
+        .map_err(|e| match &e {
+            sqlx::Error::Protocol(msg) => McpError::invalid_params(msg.clone(), None),
+            _ => McpError::internal_error(format!("query failed: {}", e), None),
+        })?;
     ctx.stats()
         .memory_observations_added
         .fetch_add(ids.len() as u64, Ordering::Relaxed);

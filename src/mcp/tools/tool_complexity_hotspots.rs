@@ -23,7 +23,7 @@ pub async fn tool_complexity_hotspots(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().complexity_scans.fetch_add(1, Ordering::Relaxed);
 
-    let limit = params.limit.unwrap_or(20);
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let sort_by = params.sort_by.as_deref().unwrap_or("composite");
 
     debug!(
@@ -34,11 +34,33 @@ pub async fn tool_complexity_hotspots(
         "MCP tool invoked",
     );
 
-    let file_data = ctx
+    let project_matches: Vec<_> = ctx
         .db()
-        .get_file_complexity_data(&params.project)
+        .list_projects()
         .await
-        .map_err(|e| McpError::internal_error(format!("Complexity query failed: {}", e), None))?;
+        .map_err(|e| McpError::internal_error(format!("Project lookup failed: {}", e), None))?
+        .into_iter()
+        .filter(|project| project.name.as_str() == params.project.as_str())
+        .collect();
+    if project_matches.len() > 1 {
+        return Err(McpError::invalid_params(
+            format!(
+                "ambiguous project name '{}' matched {} indexed projects; use a unique project name from list_projects",
+                params.project,
+                project_matches.len()
+            ),
+            None,
+        ));
+    }
+    let resolved_project_id = project_matches.first().map(|project| project.id);
+
+    let file_data = match (ctx.db().pool(), resolved_project_id) {
+        (Some(pool), Some(project_id)) => {
+            crate::db::queries::get_file_complexity_data_by_project_id(pool, project_id).await
+        }
+        _ => ctx.db().get_file_complexity_data(&params.project).await,
+    }
+    .map_err(|e| McpError::internal_error(format!("Complexity query failed: {}", e), None))?;
 
     if file_data.is_empty() {
         return Ok(CallToolResult::success(vec![Content::text(
@@ -83,12 +105,7 @@ pub async fn tool_complexity_hotspots(
         let Some(pool) = ctx.db().pool() else {
             return std::collections::HashMap::new();
         };
-        let pid: Option<i32> = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-            .bind(&params.project)
-            .fetch_optional(pool)
-            .await
-            .unwrap_or(None);
-        match pid {
+        match resolved_project_id {
             Some(pid) => crate::db::queries::get_file_ast_complexity_by_path(pool, pid)
                 .await
                 .unwrap_or_default()
@@ -223,13 +240,7 @@ pub async fn tool_complexity_hotspots(
         let Some(pool) = ctx.db().pool() else {
             return Vec::new();
         };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
+        match resolved_project_id {
             Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
                 .await
                 .unwrap_or_default()

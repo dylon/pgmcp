@@ -9,7 +9,7 @@
 //!   - The training cron produces a loadable model file at the
 //!     canonical path.
 //!   - `tool_hybrid_search` discovers the model from
-//!     `<data_dir>/hybrid_lm/<project>/model.bin`.
+//!     `<data_dir>/hybrid_lm/<slug>-p<project_id>/model.bin`.
 //!   - The lattice + LM rescoring produces a non-identity rewrite
 //!     for at least one query.
 
@@ -107,7 +107,7 @@ async fn seed_project_and_corpus(pool: &sqlx::PgPool, project_name: &str) -> i32
 async fn third_leg_activates_with_trained_lm_and_misspelled_query() {
     let testdb = require_test_db!();
     let project_name = "three_leg_test";
-    let _ = seed_project_and_corpus(testdb.pool(), project_name).await;
+    let project_id = seed_project_and_corpus(testdb.pool(), project_name).await;
 
     // Train the HybridLM into a tempdir.
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -119,7 +119,8 @@ async fn third_leg_activates_with_trained_lm_and_misspelled_query() {
         tmp.path().to_path_buf(),
     )
     .await;
-    let model_path = pgmcp::cron::ngram_lm_train::model_path_for(tmp.path(), project_name);
+    let model_path =
+        pgmcp::cron::ngram_lm_train::model_path_for_project(tmp.path(), project_id, project_name);
     assert!(
         model_path.exists(),
         "training prerequisite failed: model at {} missing",

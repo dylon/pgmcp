@@ -23,7 +23,7 @@ pub async fn tool_bug_prediction(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().bug_predictions.fetch_add(1, Ordering::Relaxed);
 
-    let limit = params.limit.unwrap_or(20);
+    let limit = params.limit.unwrap_or(20).clamp(1, 100);
 
     debug!(
         tool = "bug_prediction",
@@ -45,21 +45,48 @@ pub async fn tool_bug_prediction(
         out_degree: Option<i32>,
     }
 
+    let pool = ctx
+        .db()
+        .pool()
+        .ok_or_else(|| McpError::internal_error("raw pool unavailable", None))?;
+
+    let matching_project_ids: Vec<i32> =
+        sqlx::query_scalar("SELECT id FROM projects WHERE name = $1 ORDER BY id")
+            .bind(&params.project)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Project lookup failed: {}", e), None))?;
+
+    let project_id = match matching_project_ids.as_slice() {
+        [] => {
+            return Err(McpError::internal_error(
+                format!("Project not found: {}", params.project),
+                None,
+            ));
+        }
+        [project_id] => *project_id,
+        ids => {
+            return Err(McpError::invalid_params(
+                format!(
+                    "ambiguous project name '{}' matched {} indexed projects; use a unique project name from list_projects",
+                    params.project,
+                    ids.len()
+                ),
+                None,
+            ));
+        }
+    };
+
     let rows: Vec<BugRow> = sqlx::query_as::<_, BugRow>(
         "SELECT f.relative_path, f.language, f.line_count,
                 fm.churn_rate, fm.fix_commit_ratio, fm.commit_count,
                 fm.author_count, fm.in_degree, fm.out_degree
          FROM indexed_files f
          JOIN file_metrics fm ON fm.file_id = f.id
-         JOIN projects p ON f.project_id = p.id
-         WHERE p.name = $1",
+         WHERE f.project_id = $1",
     )
-    .bind(&params.project)
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .bind(project_id)
+    .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("Query failed: {}", e), None))?;
 
@@ -120,36 +147,25 @@ pub async fn tool_bug_prediction(
 
     // Shadow-ASR channel: bug-prone-effect symbols (unsafe / may_panic /
     // blocking_io). Composite bug-prediction can weigh these as features.
-    let bug_prone_effect_symbols = if let Some(pool) = ctx.db().pool() {
-        let project_id: Option<i32> = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-            .bind(&params.project)
-            .fetch_optional(pool)
-            .await
-            .unwrap_or(None);
-        match project_id {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect(
-                pool,
-                pid,
-                &[
-                    crate::parsing::type_tags::vocabulary::EFFECT_UNSAFE.to_string(),
-                    crate::parsing::type_tags::vocabulary::EFFECT_MAY_PANIC.to_string(),
-                    crate::parsing::type_tags::vocabulary::EFFECT_BLOCKING_IO.to_string(),
-                ],
-            )
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(symbol_id, file_id, name, scope_path)| {
-                serde_json::json!({
-                    "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
-                })
+    let bug_prone_effect_symbols =
+        crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect(
+            pool,
+            project_id,
+            &[
+                crate::parsing::type_tags::vocabulary::EFFECT_UNSAFE.to_string(),
+                crate::parsing::type_tags::vocabulary::EFFECT_MAY_PANIC.to_string(),
+                crate::parsing::type_tags::vocabulary::EFFECT_BLOCKING_IO.to_string(),
+            ],
+        )
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(symbol_id, file_id, name, scope_path)| {
+            serde_json::json!({
+                "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
             })
-            .collect::<Vec<_>>(),
-            None => Vec::new(),
-        }
-    } else {
-        Vec::new()
-    };
+        })
+        .collect::<Vec<_>>();
 
     let model_info = match score_kind_enum {
         crate::code_analysis::findings::ScoreKind::TrainedLogreg => serde_json::json!({
@@ -163,6 +179,7 @@ pub async fn tool_bug_prediction(
 
     let result = serde_json::json!({
         "project": params.project,
+        "limit": limit,
         "file_count": scored.len(),
         "score_kind": score_kind,
         "model": model_info,

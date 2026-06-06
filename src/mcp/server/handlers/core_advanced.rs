@@ -30,12 +30,13 @@ RRF gives more stable ordering than either branch alone for mixed queries."
         Parameters(params): Parameters<HybridSearchParams>,
         _ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        instrumented_tool_wrap(
+        instrumented_tool_wrap_with_project(
             self.stats(),
             "hybrid_search",
             30,
             &_ctx,
             &summarize_debug(&params),
+            params.project.clone(),
             crate::mcp::tools::tool_hybrid_search::tool_hybrid_search(self.ctx(), params),
         )
         .await
