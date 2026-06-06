@@ -1,8 +1,6 @@
 //! `tool_api_stability` — Per-public-symbol signature-change frequency
 //! across git history (SOTA Phase 7.4, Bogart EMSE 2016).
 
-#![allow(unused_imports)]
-
 use regex::Regex;
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
@@ -14,20 +12,34 @@ use crate::context::SystemContext;
 use crate::mcp::server::ApiStabilityParams;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 
+const DEFAULT_WINDOW_COMMITS: u32 = 100;
+const MAX_WINDOW_COMMITS: u32 = 1000;
+const DEFAULT_LIMIT: usize = 50;
+const MAX_LIMIT: usize = 250;
+
 pub async fn tool_api_stability(
     ctx: &SystemContext,
     params: ApiStabilityParams,
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "api_stability", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim().to_string();
+    let project_id = project_id_or_err(ctx, &project).await?;
     let pool = pool_or_err(ctx)?;
 
-    // Count distinct (file, function_signature) changes per public symbol
-    // across git_commit_chunks. The chunk_text is the commit diff hunk.
-    let window = params.window_commits.unwrap_or(100) as i64;
+    // Count signature-changing additions per public symbol across recent
+    // git_commit_chunks content. The current schema stores the indexed commit
+    // text in `content`; older docs called the same payload `chunk_text`.
+    let window = params
+        .window_commits
+        .unwrap_or(DEFAULT_WINDOW_COMMITS)
+        .clamp(1, MAX_WINDOW_COMMITS);
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_LIMIT as i32)
+        .clamp(1, MAX_LIMIT as i32) as usize;
     let rows: Vec<(String,)> = sqlx::query_as::<_, (String,)>(
-        "SELECT gcc.chunk_text
+        "SELECT gcc.content
          FROM git_commits gc
          JOIN git_commit_chunks gcc ON gcc.commit_id = gc.id
          WHERE gc.project_id = $1
@@ -35,7 +47,7 @@ pub async fn tool_api_stability(
          LIMIT $2",
     )
     .bind(project_id)
-    .bind(window)
+    .bind(i64::from(window))
     .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("Commit chunk query failed: {}", e), None))?;
@@ -57,13 +69,12 @@ pub async fn tool_api_stability(
     let mut rows_out: Vec<(String, u32, f64)> = changes
         .into_iter()
         .map(|(name, c)| {
-            let stability = 1.0 / (1.0 + c as f64 / (window.max(1) as f64));
+            let stability = 1.0 / (1.0 + c as f64 / f64::from(window));
             (name, c, stability)
         })
         .collect();
     rows_out.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
-    let limit = params.limit.unwrap_or(50);
-    rows_out.truncate(limit.max(0) as usize);
+    rows_out.truncate(limit);
     let syms: Vec<_> = rows_out
         .iter()
         .map(|(n, c, s)| json!({"name": n, "change_count": c, "stability_score": s}))
@@ -71,34 +82,25 @@ pub async fn tool_api_stability(
     // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown
     // for the project. Universal enrichment — every tool benefits from
     // surfacing the effect distribution alongside its primary output.
-    // Gracefully degrades to empty when the project lookup or
-    // shadow-ASR data isn't populated.
+    // Gracefully degrades to empty when shadow-ASR data isn't populated.
     let effect_breakdown: Vec<serde_json::Value> = (async {
         let Some(pool) = ctx.db().pool() else {
             return Vec::new();
         };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
-        }
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
     })
     .await;
 
     json_result(&json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
+        "project": project,
         "window_commits": window,
+        "limit": limit,
         "symbols": syms,
         "guidance": "Bogart EMSE 2016: stability = 1 / (1 + change_count/window). Low score = signature churn — these APIs predict ecosystem breakage."
     }))

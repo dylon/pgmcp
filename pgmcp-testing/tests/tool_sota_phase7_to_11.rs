@@ -2,6 +2,39 @@
 
 use pgmcp_testing::pool_tool_helpers::{seed_file, seed_project, server_with_pool};
 use pgmcp_testing::require_test_db;
+use serde_json::Value;
+
+fn text_of(result: &rmcp::model::CallToolResult) -> &str {
+    for content in &result.content {
+        if let rmcp::model::RawContent::Text(text) = &content.raw {
+            return &text.text;
+        }
+    }
+    panic!("tool returned no text content");
+}
+
+async fn seed_commit_chunk(pool: &sqlx::PgPool, project_id: i32, hash: &str, content: &str) {
+    let commit_id: i64 = sqlx::query_scalar(
+        "INSERT INTO git_commits (project_id, commit_hash, author, author_date, subject)
+         VALUES ($1, $2, 'tester', now(), 'api stability test')
+         RETURNING id",
+    )
+    .bind(project_id)
+    .bind(hash)
+    .fetch_one(pool)
+    .await
+    .expect("insert git commit");
+
+    sqlx::query(
+        "INSERT INTO git_commit_chunks (commit_id, chunk_index, content)
+         VALUES ($1, 0, $2)",
+    )
+    .bind(commit_id)
+    .bind(content)
+    .execute(pool)
+    .await
+    .expect("insert git commit chunk");
+}
 
 // ============================================================================
 // Phase 7 — API / contract
@@ -66,6 +99,56 @@ async fn api_stability_runs() {
         .await
         .expect("tool");
     assert!(r.is_error != Some(true));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn api_stability_bounds_and_scopes_commit_chunks() {
+    let db = require_test_db!();
+    let p1 = seed_project(db.pool(), "p7-as-scope", "/ws/p7-as-scope").await;
+    let p2 = seed_project(db.pool(), "p7-as-other", "/ws/p7-as-other").await;
+    seed_commit_chunk(
+        db.pool(),
+        p1,
+        "api-stability-scope-1",
+        "+ pub fn changed_api(input: i32) -> i32 { input }\n",
+    )
+    .await;
+    seed_commit_chunk(
+        db.pool(),
+        p2,
+        "api-stability-scope-2",
+        "+ pub fn leaked_api(input: i32) -> i32 { input }\n",
+    )
+    .await;
+
+    let server = server_with_pool(db.pool().clone());
+    let r = server
+        .call_tool_cli(
+            "api_stability",
+            serde_json::json!({
+                "project": " p7-as-scope ",
+                "window_commits": 0,
+                "limit": -10,
+            }),
+        )
+        .await
+        .expect("api_stability");
+    assert!(r.is_error != Some(true));
+    let v: Value = serde_json::from_str(text_of(&r)).expect("api_stability JSON");
+
+    assert_eq!(v["project"].as_str(), Some("p7-as-scope"));
+    assert_eq!(v["window_commits"].as_i64(), Some(1));
+    assert_eq!(v["limit"].as_i64(), Some(1));
+
+    let symbols = v["symbols"].as_array().expect("symbols array");
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0]["name"].as_str(), Some("changed_api"));
+    assert!(
+        !symbols
+            .iter()
+            .any(|sym| sym["name"].as_str() == Some("leaked_api")),
+        "api_stability leaked a commit chunk from another project: {v}"
+    );
 }
 
 // ============================================================================

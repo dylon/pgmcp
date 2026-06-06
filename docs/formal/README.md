@@ -63,6 +63,7 @@ correctness invariants. Modeled after libgrammstein's
 | `find-duplicates-traceability.md` | Similarity slice for `find_duplicates`: finite request bounds, overflow-safe fetch windows, bounded cluster output, filtered cross-language clone rows, and read-only execution. | Evidence ledger for `tla/FindDuplicatesBounds.tla` and `oracle_similarity_tools`. |
 | `refactoring-report-traceability.md` | Similarity/reporting slice for `refactoring_report`: finite similarity validation, bounded project/language/output filters, overflow-safe fetch windows, bounded candidate output, and read-only execution. | Evidence ledger for `tla/RefactoringReportBounds.tla` and filtered `mcp_tool_smoke` tests. |
 | `io-hotpath-traceability.md` | Concurrency/performance slice for `io_hotpath`: unique project resolution, finite scan/output bounds, stale metric rejection, scoped effect-symbol hints, and read-only execution. | Evidence ledger for `tla/IoHotpathScope.tla` and filtered `tool_sota_phase5` tests. |
+| `api-stability-traceability.md` | API-contract slice for `api_stability`: finite commit-window/output bounds, migrated commit-chunk column usage, resolved-project scoping, same-project effect enrichment, and read-only execution. | Evidence ledger for `tla/ApiStabilityScope.tla` and filtered `tool_sota_phase7_to_11` tests. |
 
 ## TLA+ specs
 
@@ -129,6 +130,7 @@ correctness invariants. Modeled after libgrammstein's
 | `tla/FindDuplicatesBounds.tla`                    | Find-duplicates boundary: non-finite thresholds reject, numeric filters clamp, fetch/output windows stay bounded, and cross-language rows satisfy threshold/language/same-repo/project-consistency filters. | `src/mcp/tools/tool_find_duplicates.rs` |
 | `tla/RefactoringReportBounds.tla`                 | Refactoring-report boundary: non-finite thresholds reject, numeric/language filters clamp, duplicate-pair fetch windows stay bounded, and candidate output respects the effective limit. | `src/mcp/tools/tool_refactoring_report.rs` |
 | `tla/IoHotpathScope.tla`                          | I/O hotpath boundary: invalid projects do not scan, limits and scan/effect outputs are bounded, stale metrics are rejected, and reported rows stay in the resolved project. | `src/mcp/tools/tool_io_hotpath.rs` |
+| `tla/ApiStabilityScope.tla`                       | API-stability boundary: invalid projects fail closed, commit windows and output limits are clamped, git commit chunk reads use `content`, reported symbols stay in-project, and effect enrichment reuses the resolved project id. | `src/mcp/tools/tool_api_stability.rs` |
 
 ## Rocq proofs
 
