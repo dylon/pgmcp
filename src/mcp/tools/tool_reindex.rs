@@ -9,17 +9,12 @@
 //! returns the same statistics inside a JSON envelope with
 //! `effect_breakdown` populated.
 
-#![allow(unused_imports)]
-
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
-use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, LoggingLevel};
-use serde_json::json;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, warn};
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
@@ -30,12 +25,42 @@ use crate::mcp::server::*;
 /// `DELETE`. 10k keeps each batch under a second on commodity hardware
 /// against the production schema (`(file_id, chunk_index)` index).
 const REINDEX_DELETE_BATCH: i64 = 10_000;
+const REINDEX_LANGUAGE_MAX_LEN: usize = 64;
+
+fn normalize_reindex_language(raw: Option<String>) -> Result<Option<String>, McpError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let language = raw.trim().to_ascii_lowercase();
+    if language.is_empty() {
+        return Err(McpError::invalid_params(
+            "language must be non-empty when supplied",
+            None,
+        ));
+    }
+    if language.len() > REINDEX_LANGUAGE_MAX_LEN {
+        return Err(McpError::invalid_params(
+            format!("language must be at most {REINDEX_LANGUAGE_MAX_LEN} bytes"),
+            None,
+        ));
+    }
+    if !language
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '+' | '#' | '.'))
+    {
+        return Err(McpError::invalid_params(
+            "language may contain only ASCII letters, digits, _, -, +, #, or .",
+            None,
+        ));
+    }
+    Ok(Some(language))
+}
 
 pub async fn tool_reindex(
     ctx: &SystemContext,
     params: ReindexParams,
 ) -> Result<CallToolResult, McpError> {
-    let language = params.language;
+    let language = normalize_reindex_language(params.language)?;
     let start = Instant::now();
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     debug!(tool = "reindex", language = ?language, "MCP tool invoked");

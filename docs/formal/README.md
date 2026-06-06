@@ -68,6 +68,7 @@ correctness invariants. Modeled after libgrammstein's
 | `dead-code-reachability-traceability.md` | Call-graph reachability slice for `dead_code_reachability`: normalized bounds, test-root opt-in, exact/bare-name edge policy, same-project source/target symbol traversal, bounded BFS, and read-only execution. | Evidence ledger for `tla/DeadCodeReachabilityScope.tla` and `oracle_dead_code_reachability`. |
 | `experiment-search-traceability.md` | Experiment retrieval slice for `experiment_search`: closed query/filter normalization, bounded limits, vector/FTS fallback parity, active-verdict filtering, scoped rows, and read-only execution. | Evidence ledger for `tla/ExperimentSearchScope.tla` and `oracle_experiment_search`. |
 | `memory-open-nodes-traceability.md` | Memory read slice for `memory_open_nodes`: bounded exact-name normalization, active entity/observation reads, active relation endpoint filtering, deterministic output, and read-only execution. | Evidence ledger for `tla/MemoryOpenNodesScope.tla` and `oracle_memory_open_nodes`. |
+| `reindex-serialization-traceability.md` | Operational reindex slice for destructive-row clearing: language-token validation, non-blocking serialization, scoped language deletion, cancellation ordering, and bounded full-delete batches. | Evidence ledger for `tla/ReindexSerializationScope.tla`, `oracle_reindex`, and `reindex_serialization`. |
 
 ## TLA+ specs
 
@@ -139,6 +140,7 @@ correctness invariants. Modeled after libgrammstein's
 | `tla/DeadCodeReachabilityScope.tla`               | Dead-code reachability boundary: invalid projects fail closed, no-symbol state soft-fails, limits are bounded, tests and bare-name edges are opt-in, traversed call edges are same-project, and BFS/read-only execution is bounded. | `src/mcp/tools/tool_dead_code_reachability.rs` |
 | `tla/ExperimentSearchScope.tla`                   | Experiment-search boundary: blank/invalid filters fail closed, limits are bounded, vector and FTS modes preserve project/kind/active-verdict filters, stale verdicts are ignored, and execution is read-only. | `src/mcp/tools/tool_experiments.rs::tool_experiment_search`, `src/db/queries/experiments.rs::{experiment_search_vector,experiment_search_fts}` |
 | `tla/MemoryOpenNodesScope.tla`                    | Memory open-nodes boundary: invalid name lists fail closed, exact names are trimmed/deduped and capped, active entities/observations are returned, inactive relation endpoints are suppressed, and execution is read-only. | `src/mcp/tools/tool_memory_crud.rs::tool_memory_open_nodes`, `src/db/queries/memory_search.rs::memory_open_nodes` |
+| `tla/ReindexSerializationScope.tla`                | Reindex operational boundary: invalid language tokens reject before locking, busy locks reject without writes, language mode is scoped, full mode deletes chunks before files, cancellation preserves file rows, and locks are released. | `src/mcp/tools/tool_reindex.rs`, `src/db/queries/files.rs::delete_files_by_language` |
 
 ## Rocq proofs
 
@@ -258,6 +260,7 @@ the separate well-founded T1/T2 argument, not coinduction.
 | DeadCodeReachabilityScope — bounded output, test-root/bare-name opt-in, same-project edge traversal, bounded BFS, and read-only execution | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh DeadCodeReachabilityScope.tla` exit 0; 6 distinct states, 12 generated |
 | ExperimentSearchScope — closed filters, bounded output, vector/FTS fallback parity, active-verdict filtering, and read-only execution | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh ExperimentSearchScope.tla` exit 0; 6 distinct states, 12 generated |
 | MemoryOpenNodesScope — bounded exact-name reads, active rows/endpoints, deterministic output, and read-only execution | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh MemoryOpenNodesScope.tla` exit 0; 4 distinct states, 8 generated |
+| ReindexSerializationScope — language validation, non-blocking serialization, scoped deletion, cancellation ordering, and bounded batches | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh ReindexSerializationScope.tla` exit 0; 9 distinct states, 18 generated |
 
 **P13.5 (2026-05-23) — Status integrity:** the previous version of
 this README claimed "Verified 2026-05-23" without any mechanical
