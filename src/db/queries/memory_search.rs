@@ -111,7 +111,8 @@ pub async fn memory_open_nodes(
         "SELECT id, name, entity_type, canonical_name, importance,
                 source::text AS source, created_at, valid_from, valid_to, superseded_by
          FROM memory_entities
-         WHERE name = ANY($1) AND valid_to IS NULL",
+         WHERE name = ANY($1) AND valid_to IS NULL
+         ORDER BY name, id",
     )
     .bind(names)
     .fetch_all(pool)
@@ -133,7 +134,11 @@ pub async fn memory_open_nodes(
              FROM memory_relations r
              JOIN memory_entities a ON a.id = r.from_entity_id
              JOIN memory_entities b ON b.id = r.to_entity_id
-             WHERE r.from_entity_id = $1 AND r.valid_to IS NULL",
+             WHERE r.from_entity_id = $1
+               AND r.valid_to IS NULL
+               AND a.valid_to IS NULL
+               AND b.valid_to IS NULL
+             ORDER BY b.name, r.relation_type",
         )
         .bind(e.id)
         .fetch_all(pool)
@@ -143,7 +148,11 @@ pub async fn memory_open_nodes(
              FROM memory_relations r
              JOIN memory_entities a ON a.id = r.from_entity_id
              JOIN memory_entities b ON b.id = r.to_entity_id
-             WHERE r.to_entity_id = $1 AND r.valid_to IS NULL",
+             WHERE r.to_entity_id = $1
+               AND r.valid_to IS NULL
+               AND a.valid_to IS NULL
+               AND b.valid_to IS NULL
+             ORDER BY a.name, r.relation_type",
         )
         .bind(e.id)
         .fetch_all(pool)

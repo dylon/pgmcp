@@ -15,6 +15,7 @@
 //! explicitly called CRUD. The LLM-driven extraction path (Phase 4)
 //! uses `'llm_extraction'`.
 
+use std::collections::HashSet;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -46,6 +47,39 @@ fn json_result(value: serde_json::Value) -> Result<CallToolResult, McpError> {
     Ok(CallToolResult::success(vec![rmcp::model::Content::text(
         text,
     )]))
+}
+
+const MEMORY_OPEN_NODES_MAX_NAMES: usize = 100;
+
+fn normalize_open_node_names(names: Vec<String>) -> Result<Vec<String>, McpError> {
+    if names.is_empty() {
+        return Err(McpError::invalid_params("names must not be empty", None));
+    }
+    if names.len() > MEMORY_OPEN_NODES_MAX_NAMES {
+        return Err(McpError::invalid_params(
+            format!(
+                "names must contain at most {} entries",
+                MEMORY_OPEN_NODES_MAX_NAMES
+            ),
+            None,
+        ));
+    }
+
+    let mut seen = HashSet::with_capacity(names.len());
+    let mut normalized = Vec::with_capacity(names.len());
+    for name in names {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Err(McpError::invalid_params(
+                "names must not contain blanks",
+                None,
+            ));
+        }
+        if seen.insert(name.clone()) {
+            normalized.push(name);
+        }
+    }
+    Ok(normalized)
 }
 
 fn parse_scope(p: Option<&MemoryScopeParam>) -> Result<ScopeSpec, McpError> {
@@ -459,10 +493,8 @@ pub async fn tool_memory_open_nodes(
         .memory_open_nodes_calls
         .fetch_add(1, Ordering::Relaxed);
     let pool = raw_pool(ctx)?;
-    if params.names.is_empty() {
-        return Err(McpError::invalid_params("names must not be empty", None));
-    }
-    let nodes = queries::memory_open_nodes(pool, &params.names)
+    let names = normalize_open_node_names(params.names)?;
+    let nodes = queries::memory_open_nodes(pool, &names)
         .await
         .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
     // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
@@ -487,6 +519,8 @@ pub async fn tool_memory_open_nodes(
 
     json_result(json!({
         "effect_breakdown": effect_breakdown,
+        "requested_names": names,
+        "name_cap": MEMORY_OPEN_NODES_MAX_NAMES,
         "count": nodes.len(),
         "nodes": nodes,
     }))
