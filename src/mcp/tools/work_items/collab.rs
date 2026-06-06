@@ -28,8 +28,26 @@ use crate::mcp::tools::work_items::nonblank;
 /// Resolve the effective agent id (non-empty, else a sentinel).
 pub(crate) fn agent_of(opt: &Option<String>) -> &str {
     opt.as_deref()
+        .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("unknown-agent")
+}
+
+fn required_agent_id(opt: &Option<String>) -> Result<&str, McpError> {
+    match opt.as_deref() {
+        Some(raw) => {
+            let agent = raw.trim();
+            if agent.is_empty() {
+                Err(McpError::invalid_params(
+                    "agent_id must be non-empty when supplied",
+                    None,
+                ))
+            } else {
+                Ok(agent)
+            }
+        }
+        None => Ok("unknown-agent"),
+    }
 }
 
 /// `work_item_claim` — atomically claim a specific item (CAS). Reports the
@@ -40,7 +58,7 @@ pub async fn tool_work_item_claim(
 ) -> Result<CallToolResult, McpError> {
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
-    let agent = agent_of(&params.agent_id);
+    let agent = required_agent_id(&params.agent_id)?;
     let id = id_of_public(pool, &params.public_id).await?;
     let lease = params.lease_secs.unwrap_or(300);
     match queries::claim_work_item(pool, id, agent, lease)
