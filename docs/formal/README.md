@@ -71,6 +71,7 @@ correctness invariants. Modeled after libgrammstein's
 | `reindex-serialization-traceability.md` | Operational reindex slice for destructive-row clearing: language-token validation, non-blocking serialization, scoped language deletion, cancellation ordering, and bounded full-delete batches. | Evidence ledger for `tla/ReindexSerializationScope.tla`, `oracle_reindex`, and `reindex_serialization`. |
 | `work-item-claim-traceability.md` | Tracker collaboration slice for `work_item_claim`: agent-id validation, row-CAS ownership, blocked/terminal no-write behavior, lease bounds, claim ledger/presence atomicity, and two-agent race safety. | Evidence ledger for `tla/WorkItemClaimAtomicity.tla`, `oracle_work_item_claim`, and filtered `work_items_smoke`. |
 | `work-item-tree-traceability.md` | Tracker read slice for `work_item_tree`: public-id validation, bounded recursive traversal, cycle suppression, deterministic ordering, duplicate-free rows, read-only behavior, and query-stat accounting. | Evidence ledger for `tla/WorkItemTreeScope.tla`, `oracle_work_item_tree`, and filtered `work_items_smoke`. |
+| `deadlock-candidates-traceability.md` | Legacy concurrency slice for `deadlock_candidates`: resolved-project file scans, scoped lock-order edges/cycles, scoped mutex/effect enrichment, and read-only execution. | Evidence ledger for `tla/DeadlockCandidatesScope.tla`, `oracle_deadlock_candidates`, and filtered `tool_sota_phase5`. |
 
 ## TLA+ specs
 
@@ -145,6 +146,7 @@ correctness invariants. Modeled after libgrammstein's
 | `tla/ReindexSerializationScope.tla`                | Reindex operational boundary: invalid language tokens reject before locking, busy locks reject without writes, language mode is scoped, full mode deletes chunks before files, cancellation preserves file rows, and locks are released. | `src/mcp/tools/tool_reindex.rs`, `src/db/queries/files.rs::delete_files_by_language` |
 | `tla/WorkItemClaimAtomicity.tla`                   | Work-item claim boundary: explicit blank agents reject, row-CAS ownership cases are no-write or atomic-write, leases clamp, blocked/terminal states do not mutate, and concurrent claim races have one winner. | `src/mcp/tools/work_items/collab.rs::tool_work_item_claim`, `src/db/queries/work_items.rs::claim_work_item` |
 | `tla/WorkItemTreeScope.tla`                        | Work-item tree boundary: invalid roots reject, recursive rows are bounded, corrupted parent cycles are suppressed, rows are duplicate-free and depth/priority ordered, and execution is read-only. | `src/mcp/tools/work_items/crud.rs::tool_work_item_tree`, `src/db/queries/work_items.rs::get_work_item_subtree` |
+| `tla/DeadlockCandidatesScope.tla`                  | Deadlock-candidates boundary: invalid projects reject, file scans/edges/cycles/effects are resolved-project scoped, and execution is read-only with no held locks. | `src/mcp/tools/tool_deadlock_candidates.rs` |
 
 ## Rocq proofs
 
@@ -267,6 +269,7 @@ the separate well-founded T1/T2 argument, not coinduction.
 | ReindexSerializationScope — language validation, non-blocking serialization, scoped deletion, cancellation ordering, and bounded batches | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh ReindexSerializationScope.tla` exit 0; 9 distinct states, 18 generated |
 | WorkItemClaimAtomicity — agent validation, row-CAS ownership, lease bounds, atomic ledger/presence writes, and concurrent race safety | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh WorkItemClaimAtomicity.tla` exit 0; 14 distinct states, 28 generated |
 | WorkItemTreeScope — bounded recursive tree reads, cycle suppression, deterministic ordering, read-only execution, and query stats | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh WorkItemTreeScope.tla` exit 0; 6 distinct states, 12 generated |
+| DeadlockCandidatesScope — project-scoped file scans, lock-order edges/cycles, effect enrichment, and read-only execution | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh DeadlockCandidatesScope.tla` exit 0; 2 distinct states, 4 generated |
 
 **P13.5 (2026-05-23) — Status integrity:** the previous version of
 this README claimed "Verified 2026-05-23" without any mechanical

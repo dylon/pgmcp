@@ -17,6 +17,7 @@ use serde_json::json;
 
 use crate::context::SystemContext;
 use crate::mcp::server::DeadlockCandidatesParams;
+use crate::mcp::tools::sema_helpers::effects::effect_counts;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::parsing::type_tags::vocabulary::TAG_MUTEX;
 
@@ -125,25 +126,14 @@ pub async fn tool_deadlock_candidates(
             })
         })
         .collect();
-    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT se.effect, COUNT(*)::int8
-             FROM symbol_effects se
-             GROUP BY se.effect
-             ORDER BY se.effect",
-        )
-        .fetch_all(pool)
+    // Shadow-ASR channel (Phase D2b): per-project effect distribution. Keep
+    // enrichment scoped to the same resolved project as the file scan.
+    let effect_breakdown: Vec<serde_json::Value> = effect_counts(pool, project_id)
         .await
-        .unwrap_or_default();
-        rows.into_iter()
-            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-            .collect()
-    })
-    .await;
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+        .collect();
 
     json_result(&json!({
         "effect_breakdown": effect_breakdown,
