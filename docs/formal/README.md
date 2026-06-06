@@ -74,6 +74,7 @@ correctness invariants. Modeled after libgrammstein's
 | `deadlock-candidates-traceability.md` | Legacy concurrency slice for `deadlock_candidates`: resolved-project file scans, scoped lock-order edges/cycles, scoped mutex/effect enrichment, and read-only execution. | Evidence ledger for `tla/DeadlockCandidatesScope.tla`, `oracle_deadlock_candidates`, and filtered `tool_sota_phase5`. |
 | `change-impact-analysis-traceability.md` | Graph/change-analysis slice for `change_impact_analysis`: unique project resolution, normalized file/depth input, same-project file-level channels, intentional cross-project dependents, and read-only execution. | Evidence ledger for `tla/ChangeImpactScope.tla`, `oracle_change_impact_analysis`, and filtered `tool_graph_integration`. |
 | `doc-code-drift-traceability.md` | Doc/code embedding-drift slice for `doc_code_drift`: normalized project/threshold/limit input, SQL-bounded rows, resolved-project drift/effect channels, and read-only execution. | Evidence ledger for `tla/DocCodeDriftScope.tla`, `oracle_doc_code_drift`, and filtered `tool_sota_phase4`. |
+| `experiment-list-traceability.md` | Experiment read/list slice for `experiment_list`: enum filter validation, bounded pagination, project scoping, newest-first ordering, and read-only execution. | Evidence ledger for `tla/ExperimentListScope.tla`, `oracle_experiment_list`, and filtered `tool_experiments_integration`. |
 
 ## TLA+ specs
 
@@ -151,6 +152,7 @@ correctness invariants. Modeled after libgrammstein's
 | `tla/DeadlockCandidatesScope.tla`                  | Deadlock-candidates boundary: invalid projects reject, file scans/edges/cycles/effects are resolved-project scoped, and execution is read-only with no held locks. | `src/mcp/tools/tool_deadlock_candidates.rs` |
 | `tla/ChangeImpactScope.tla`                        | Change-impact boundary: invalid project/file inputs reject, depth is clamped, import/co-change/semantic/resolved-caller/effect channels are project-scoped, and only dependent-project reporting crosses projects. | `src/mcp/tools/tool_change_impact_analysis.rs` |
 | `tla/DocCodeDriftScope.tla`                        | Doc-code-drift boundary: invalid projects reject, trimmed valid projects are accepted, thresholds/limits are bounded, SQL result rows are bounded, drift/effect channels are project-scoped, and execution is read-only. | `src/mcp/tools/tool_doc_code_drift.rs` |
+| `tla/ExperimentListScope.tla`                      | Experiment-list boundary: invalid filters reject, blank filters are omitted, valid filters trim, pagination is bounded, project scoping and newest-first order hold, and execution is read-only. | `src/mcp/tools/tool_experiments.rs::tool_experiment_list`, `src/db/queries/experiments.rs::list_experiments` |
 
 ## Rocq proofs
 
@@ -276,6 +278,7 @@ the separate well-founded T1/T2 argument, not coinduction.
 | DeadlockCandidatesScope — project-scoped file scans, lock-order edges/cycles, effect enrichment, and read-only execution | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh DeadlockCandidatesScope.tla` exit 0; 2 distinct states, 4 generated |
 | ChangeImpactScope — unique project resolution, depth bounds, same-project file-level impact channels, effect scoping, and read-only execution | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh ChangeImpactScope.tla` exit 0; 6 distinct states, 12 generated |
 | DocCodeDriftScope — normalized project/threshold/limit input, SQL-bounded rows, project-scoped drift/effect channels, and read-only execution | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh DocCodeDriftScope.tla` exit 0; 6 distinct states, 12 generated |
+| ExperimentListScope — enum filter validation, bounded pagination, project scoping, newest-first order, and read-only execution | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh ExperimentListScope.tla` exit 0; 7 distinct states, 14 generated |
 
 **P13.5 (2026-05-23) — Status integrity:** the previous version of
 this README claimed "Verified 2026-05-23" without any mechanical

@@ -1013,6 +1013,8 @@ pub async fn tool_experiment_decide(
 
 const EXPERIMENT_SEARCH_DEFAULT_LIMIT: i32 = 20;
 const EXPERIMENT_SEARCH_MAX_LIMIT: i32 = 100;
+const EXPERIMENT_LIST_DEFAULT_LIMIT: i32 = 50;
+const EXPERIMENT_LIST_MAX_LIMIT: i32 = 500;
 
 fn normalize_experiment_kind_filter(raw: Option<&str>) -> Result<Option<String>, McpError> {
     let Some(raw) = raw else {
@@ -1058,6 +1060,37 @@ fn normalize_experiment_verdict_filter(raw: Option<&str>) -> Result<Option<Strin
             "verdict must be one of pending, accepted, rejected, inconclusive",
             None,
         ))
+    }
+}
+
+fn normalize_experiment_status_filter(raw: Option<&str>) -> Result<Option<String>, McpError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let status = raw.trim().to_ascii_lowercase();
+    if status.is_empty() {
+        return Ok(None);
+    }
+    if matches!(
+        status.as_str(),
+        "open" | "measuring" | "decided" | "abandoned" | "superseded"
+    ) {
+        Ok(Some(status))
+    } else {
+        Err(McpError::invalid_params(
+            "status must be one of open, measuring, decided, abandoned, superseded",
+            None,
+        ))
+    }
+}
+
+fn normalize_experiment_project_filter(project_id: Option<i32>) -> Result<Option<i32>, McpError> {
+    match project_id {
+        Some(id) if id <= 0 => Err(McpError::invalid_params(
+            "project_id must be a positive integer",
+            None,
+        )),
+        other => Ok(other),
     }
 }
 
@@ -1229,13 +1262,19 @@ pub async fn tool_experiment_list(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
 
-    let limit = params.limit.unwrap_or(50).clamp(1, 500) as i64;
+    let project_id = normalize_experiment_project_filter(params.project_id)?;
+    let kind = normalize_experiment_kind_filter(params.kind.as_deref())?;
+    let status = normalize_experiment_status_filter(params.status.as_deref())?;
+    let limit = params
+        .limit
+        .unwrap_or(EXPERIMENT_LIST_DEFAULT_LIMIT)
+        .clamp(1, EXPERIMENT_LIST_MAX_LIMIT) as i64;
     let offset = params.offset.unwrap_or(0).max(0) as i64;
     let rows = queries::list_experiments(
         pool,
-        params.project_id,
-        params.kind.as_deref(),
-        params.status.as_deref(),
+        project_id,
+        kind.as_deref(),
+        status.as_deref(),
         limit,
         offset,
     )
@@ -1256,7 +1295,17 @@ pub async fn tool_experiment_list(
             })
         })
         .collect();
-    json_result(&json!({ "count": items.len(), "experiments": items }))
+    json_result(&json!({
+        "count": items.len(),
+        "limit": limit,
+        "offset": offset,
+        "filters": {
+            "project_id": project_id,
+            "kind": kind,
+            "status": status,
+        },
+        "experiments": items,
+    }))
 }
 
 pub async fn tool_experiment_timeline(

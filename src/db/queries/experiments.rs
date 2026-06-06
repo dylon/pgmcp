@@ -1078,8 +1078,8 @@ pub async fn list_experiments(
          LEFT JOIN projects p ON p.id = e.project_id
          WHERE e.valid_to IS NULL
            AND ($1::int IS NULL OR e.project_id = $1)
-           AND ($2::text IS NULL OR e.kind::text = $2)
-           AND ($3::text IS NULL OR e.status::text = $3)
+           AND ($2::experiment_kind IS NULL OR e.kind = $2)
+           AND ($3::experiment_status IS NULL OR e.status = $3)
          ORDER BY e.updated_at DESC
          LIMIT $4 OFFSET $5",
     )
