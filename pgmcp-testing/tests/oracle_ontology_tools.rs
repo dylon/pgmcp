@@ -10,8 +10,41 @@ use pgmcp::ontology::edge::OntologyRelation;
 use pgmcp::ontology::facet::{ConceptStatus, Facet};
 use pgmcp::tracker::transition::Actor;
 use serde_json::json;
+use uuid::Uuid;
 
 use common::{server_with_pool, text_of};
+
+async fn seed_project_and_file(
+    pool: &sqlx::PgPool,
+    name: &str,
+    root: &str,
+    relative_path: &str,
+) -> (i32, i64) {
+    let project_id: i32 = sqlx::query_scalar(
+        "INSERT INTO projects (workspace_path, path, name)
+         VALUES ($1, $2, $3)
+         RETURNING id",
+    )
+    .bind(root)
+    .bind(root)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .expect("project");
+    let file_id: i64 = sqlx::query_scalar(
+        "INSERT INTO indexed_files
+            (project_id, path, relative_path, language, size_bytes, line_count, modified_at)
+         VALUES ($1, $2, $3, 'rust', 100, 5, now())
+         RETURNING id",
+    )
+    .bind(project_id)
+    .bind(format!("{root}/{relative_path}"))
+    .bind(relative_path)
+    .fetch_one(pool)
+    .await
+    .expect("file");
+    (project_id, file_id)
+}
 
 #[tokio::test]
 async fn agent_asserted_invariant_is_candidate_only() {
@@ -44,6 +77,104 @@ async fn agent_asserted_invariant_is_candidate_only() {
         ev.iter().any(|e| e.evidence_kind == "agent"),
         "agent-kind evidence recorded"
     );
+}
+
+#[tokio::test]
+async fn invariants_for_file_tool_trims_and_returns_anchor() {
+    let db = pgmcp_testing::require_test_db!();
+    let pool = db.pool();
+    let suffix = Uuid::now_v7().simple().to_string();
+    let relative_path = format!("src/parser-{suffix}.rs");
+    let (_project_id, file_id) = seed_project_and_file(
+        pool,
+        &format!("ontology-inv-{suffix}"),
+        &format!("/ws/ontology-inv-{suffix}"),
+        &relative_path,
+    )
+    .await;
+    let entity_id = queries::agent_assert_invariant(
+        pool,
+        &format!("ParserInvariant{suffix}"),
+        "parser input must be validated before parse",
+        "tool regression",
+        Some(file_id),
+    )
+    .await
+    .expect("assert invariant");
+
+    let server = server_with_pool(pool.clone());
+    let result = server
+        .call_tool_cli(
+            "ontology_invariants_for_file",
+            json!({"file": format!("  {relative_path}  ")}),
+        )
+        .await
+        .expect("invariants tool");
+    let v: serde_json::Value = serde_json::from_str(&text_of(&result)).expect("json");
+    assert_eq!(v["file"].as_str(), Some(relative_path.as_str()));
+    assert_eq!(v["file_id"].as_i64(), Some(file_id));
+    let invariants = v["invariants"].as_array().expect("invariants");
+    assert!(
+        invariants
+            .iter()
+            .any(|row| row["entity_id"].as_i64() == Some(entity_id)),
+        "anchored invariant should surface: {v}"
+    );
+}
+
+#[tokio::test]
+async fn invariants_for_file_rejects_ambiguous_relative_path() {
+    let db = pgmcp_testing::require_test_db!();
+    let pool = db.pool();
+    let suffix = Uuid::now_v7().simple().to_string();
+    let relative_path = format!("src/lib-{suffix}.rs");
+    for label in ["a", "b"] {
+        seed_project_and_file(
+            pool,
+            &format!("ontology-amb-{label}-{suffix}"),
+            &format!("/ws/ontology-amb-{label}-{suffix}"),
+            &relative_path,
+        )
+        .await;
+    }
+
+    let server = server_with_pool(pool.clone());
+    let err = server
+        .call_tool_cli(
+            "ontology_invariants_for_file",
+            json!({"file": relative_path}),
+        )
+        .await
+        .expect_err("ambiguous relative path must fail closed");
+    assert!(
+        err.to_string().contains("ambiguous across indexed files"),
+        "unexpected ambiguity error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn invariants_for_file_treats_wildcards_literally() {
+    let db = pgmcp_testing::require_test_db!();
+    let pool = db.pool();
+    let suffix = Uuid::now_v7().simple().to_string();
+    let relative_path = format!("src/lib-{suffix}.rs");
+    seed_project_and_file(
+        pool,
+        &format!("ontology-wild-{suffix}"),
+        &format!("/ws/ontology-wild-{suffix}"),
+        &relative_path,
+    )
+    .await;
+
+    let server = server_with_pool(pool.clone());
+    let result = server
+        .call_tool_cli("ontology_invariants_for_file", json!({"file": "%"}))
+        .await
+        .expect("wildcard should be literal and miss");
+    let v: serde_json::Value = serde_json::from_str(&text_of(&result)).expect("json");
+    assert_eq!(v["file"].as_str(), Some("%"));
+    assert_eq!(v["note"].as_str(), Some("file not indexed"));
+    assert!(v["invariants"].as_array().expect("invariants").is_empty());
 }
 
 #[tokio::test]

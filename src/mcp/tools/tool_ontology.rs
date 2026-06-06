@@ -34,15 +34,39 @@ fn parse_facet(s: &str) -> Result<Facet, McpError> {
 }
 
 async fn resolve_file_id(pool: &sqlx::PgPool, path: &str) -> Result<Option<i64>, McpError> {
-    sqlx::query_scalar(
-        "SELECT id FROM indexed_files \
-         WHERE relative_path = $1 OR path = $1 OR path LIKE '%/' || $1 \
-         ORDER BY id LIMIT 1",
+    let path = path.trim();
+    if path.is_empty() {
+        return Err(McpError::invalid_params("file must be non-empty", None));
+    }
+    let ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT id
+         FROM indexed_files
+         WHERE relative_path = $1
+            OR path = $1
+            OR right(path, char_length($1) + 1) = '/' || $1
+         ORDER BY
+            CASE
+              WHEN path = $1 THEN 0
+              WHEN relative_path = $1 THEN 1
+              ELSE 2
+            END,
+            id
+         LIMIT 2",
     )
     .bind(path)
-    .fetch_optional(pool)
+    .fetch_all(pool)
     .await
-    .map_err(|e| McpError::internal_error(format!("file lookup failed: {e}"), None))
+    .map_err(|e| McpError::internal_error(format!("file lookup failed: {e}"), None))?;
+    match ids.as_slice() {
+        [] => Ok(None),
+        [id] => Ok(Some(*id)),
+        _ => Err(McpError::invalid_params(
+            format!(
+                "file path '{path}' is ambiguous across indexed files; use an absolute indexed path"
+            ),
+            None,
+        )),
+    }
 }
 
 fn db_err(e: sqlx::Error) -> McpError {
@@ -207,15 +231,14 @@ pub async fn tool_ontology_invariants_for_file(
     params: OntologyInvariantsForFileParams,
 ) -> Result<CallToolResult, McpError> {
     let pool = pool_or_err(ctx)?;
-    let Some(file_id) = resolve_file_id(pool, &params.file).await? else {
-        return json_result(
-            &json!({ "file": params.file, "invariants": [], "note": "file not indexed" }),
-        );
+    let file = params.file.trim();
+    let Some(file_id) = resolve_file_id(pool, file).await? else {
+        return json_result(&json!({ "file": file, "invariants": [], "note": "file not indexed" }));
     };
     let invariants = queries::invariants_for_file(pool, file_id)
         .await
         .map_err(db_err)?;
-    json_result(&json!({ "file": params.file, "file_id": file_id, "invariants": invariants }))
+    json_result(&json!({ "file": file, "file_id": file_id, "invariants": invariants }))
 }
 
 /// `ontology_assert_invariant` — agent-authored invariant (always `candidate`).
