@@ -14,6 +14,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
+
+const CHANGE_IMPACT_MAX_DEPTH: i32 = 12;
 
 pub async fn tool_change_impact_analysis(
     ctx: &SystemContext,
@@ -23,31 +26,25 @@ pub async fn tool_change_impact_analysis(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().impact_scans.fetch_add(1, Ordering::Relaxed);
 
-    let depth = params.depth.unwrap_or(3);
+    let project = params.project.trim();
+    let file = params.file.trim();
+    if file.is_empty() {
+        return Err(McpError::invalid_params("file must be non-empty", None));
+    }
+    let depth = params.depth.unwrap_or(3).clamp(1, CHANGE_IMPACT_MAX_DEPTH);
     let include_semantic = params.include_semantic.unwrap_or(true);
 
     debug!(
         tool = "change_impact_analysis",
-        project = %params.project,
-        file = %params.file,
+        project = %project,
+        file = %file,
         depth,
         include_semantic,
         "MCP tool invoked",
     );
 
-    // Resolve project and file
-    let project_id: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-            .bind(&params.project)
-            .fetch_optional(ctx.db().pool().expect(
-                "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-            ))
-            .await
-            .map_err(|e| McpError::internal_error(format!("Project lookup failed: {}", e), None))?;
-
-    let project_id = project_id.ok_or_else(|| {
-        McpError::internal_error(format!("Project not found: {}", params.project), None)
-    })?;
+    let pool = pool_or_err(ctx)?;
+    let project_id = project_id_or_err(ctx, project).await?;
 
     #[derive(sqlx::FromRow)]
     struct FileId {
@@ -58,18 +55,14 @@ pub async fn tool_change_impact_analysis(
         "SELECT id FROM indexed_files WHERE project_id = $1 AND relative_path = $2",
     )
     .bind(project_id)
-    .bind(&params.file)
-    .fetch_optional(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .bind(file)
+    .fetch_optional(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("File lookup failed: {}", e), None))?;
 
-    let target_file_id = target_file.map(|f| f.id).ok_or_else(|| {
-        McpError::internal_error(format!("File not found: {}", params.file), None)
-    })?;
+    let target_file_id = target_file
+        .map(|f| f.id)
+        .ok_or_else(|| McpError::internal_error(format!("File not found: {}", file), None))?;
 
     // 1. Import graph: reverse BFS (files that depend on target)
     #[derive(sqlx::FromRow)]
@@ -85,14 +78,11 @@ pub async fn tool_change_impact_analysis(
         "SELECT e.source_file_id as file_id, f.relative_path, e.edge_type
          FROM code_graph_edges e
          JOIN indexed_files f ON e.source_file_id = f.id
-         WHERE e.target_file_id = $1 AND e.edge_type = 'import'",
+         WHERE e.target_file_id = $1 AND f.project_id = $2 AND e.edge_type = 'import'",
     )
     .bind(target_file_id)
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .bind(project_id)
+    .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("Dependents query failed: {}", e), None))?;
 
@@ -115,19 +105,17 @@ pub async fn tool_change_impact_analysis(
         if d >= depth {
             continue;
         }
-        let transitive: Vec<DepRow> =
-            sqlx::query_as::<_, DepRow>(
-                "SELECT e.source_file_id as file_id, f.relative_path, e.edge_type
+        let transitive: Vec<DepRow> = sqlx::query_as::<_, DepRow>(
+            "SELECT e.source_file_id as file_id, f.relative_path, e.edge_type
              FROM code_graph_edges e
              JOIN indexed_files f ON e.source_file_id = f.id
-             WHERE e.target_file_id = $1 AND e.edge_type = 'import'",
-            )
-            .bind(node)
-            .fetch_all(ctx.db().pool().expect(
-                "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-            ))
-            .await
-            .unwrap_or_default();
+             WHERE e.target_file_id = $1 AND f.project_id = $2 AND e.edge_type = 'import'",
+        )
+        .bind(node)
+        .bind(project_id)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
 
         for dep in &transitive {
             if dep.file_id == target_file_id {
@@ -148,30 +136,27 @@ pub async fn tool_change_impact_analysis(
     // 2. Co-change coupling
     let co_change_pairs = ctx
         .db()
-        .find_coupled_files(&params.project, 0.2, 2)
+        .find_coupled_files(project, 0.2, 2)
         .await
         .unwrap_or_default();
 
     for pair in &co_change_pairs {
-        let (other_path, other_id_query) = if pair.file_a == params.file {
+        let (other_path, other_id_query) = if pair.file_a == file {
             (pair.file_b.clone(), pair.file_b.clone())
-        } else if pair.file_b == params.file {
+        } else if pair.file_b == file {
             (pair.file_a.clone(), pair.file_a.clone())
         } else {
             continue;
         };
 
-        let other_id: Option<i64> =
-            sqlx::query_scalar(
-                "SELECT id FROM indexed_files WHERE project_id = $1 AND relative_path = $2",
-            )
-            .bind(project_id)
-            .bind(&other_id_query)
-            .fetch_optional(ctx.db().pool().expect(
-                "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-            ))
-            .await
-            .unwrap_or(None);
+        let other_id: Option<i64> = sqlx::query_scalar(
+            "SELECT id FROM indexed_files WHERE project_id = $1 AND relative_path = $2",
+        )
+        .bind(project_id)
+        .bind(&other_id_query)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None);
 
         if let Some(oid) = other_id {
             impacted.entry(oid).or_insert((
@@ -189,7 +174,7 @@ pub async fn tool_change_impact_analysis(
             // Within-project change-impact: target_project is the same
             // project as the seed file, so the same-repo filter is a
             // no-op. Pass `false` to keep behavior identical.
-            .find_similar_files(target_file_id, 0.80, 10, Some(&params.project), false)
+            .find_similar_files(target_file_id, 0.80, 10, Some(project), false)
             .await
             .unwrap_or_default();
 
@@ -200,9 +185,7 @@ pub async fn tool_change_impact_analysis(
             )
             .bind(project_id)
             .bind(&sim.path_b)
-            .fetch_optional(ctx.db().pool().expect(
-                "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-            ))
+            .fetch_optional(pool)
             .await
             .unwrap_or(None);
 
@@ -226,9 +209,7 @@ pub async fn tool_change_impact_analysis(
         let target_syms: Vec<SymIdRow> =
             sqlx::query_as("SELECT id FROM file_symbols WHERE file_id = $1")
                 .bind(target_file_id)
-                .fetch_all(ctx.db().pool().expect(
-                    "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-                ))
+                .fetch_all(pool)
                 .await
                 .unwrap_or_default();
         let seed_ids: Vec<i64> = target_syms.iter().map(|(id,)| *id).collect();
@@ -246,14 +227,16 @@ pub async fn tool_change_impact_analysis(
                 let callers: Vec<i64> = sqlx::query_scalar(
                     "SELECT DISTINCT sr.source_symbol_id
                      FROM symbol_references sr
+                     JOIN file_symbols fs ON fs.id = sr.source_symbol_id
+                     JOIN indexed_files f ON f.id = fs.file_id
                      WHERE sr.target_symbol_id = $1
                        AND sr.source_symbol_id IS NOT NULL
-                       AND sr.resolution_kind IN ('exact_in_file', 'exact_via_import')",
+                       AND sr.resolution_kind IN ('exact_in_file', 'exact_via_import')
+                       AND f.project_id = $2",
                 )
                 .bind(sid)
-                .fetch_all(ctx.db().pool().expect(
-                    "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-                ))
+                .bind(project_id)
+                .fetch_all(pool)
                 .await
                 .unwrap_or_default();
                 for c in callers {
@@ -270,12 +253,11 @@ pub async fn tool_change_impact_analysis(
                     "SELECT DISTINCT fs.file_id, f.relative_path
                      FROM file_symbols fs
                      JOIN indexed_files f ON f.id = fs.file_id
-                     WHERE fs.id = ANY($1::int8[])",
+                     WHERE fs.id = ANY($1::int8[]) AND f.project_id = $2",
                 )
                 .bind(&visited_vec)
-                .fetch_all(ctx.db().pool().expect(
-                    "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-                ))
+                .bind(project_id)
+                .fetch_all(pool)
                 .await
                 .unwrap_or_default();
                 for (fid, path) in reached_files {
@@ -321,27 +303,13 @@ pub async fn tool_change_impact_analysis(
     // surfacing the effect distribution alongside its primary output.
     // Gracefully degrades to empty when the project lookup or
     // shadow-ASR data isn't populated.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
-        }
-    })
-    .await;
+    let effect_breakdown: Vec<serde_json::Value> =
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect();
 
     // Cross-project impact (Phase 4): OTHER projects that depend on this one may
     // break when its exported API changes. Surfaced at project granularity via
@@ -368,8 +336,8 @@ pub async fn tool_change_impact_analysis(
 
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
-        "target_file": params.file,
+        "project": project,
+        "target_file": file,
         "depth": depth,
         "include_semantic": include_semantic,
         "impacted_file_count": impact_list.len(),
