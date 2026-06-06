@@ -274,12 +274,75 @@ async fn clone_density_runs() {
 #[tokio::test(flavor = "multi_thread")]
 async fn io_hotpath_runs() {
     let db = require_test_db!();
-    let p = seed_project(db.pool(), "p5-ih", "/ws/p5-ih").await;
-    seed_file(db.pool(), p, "/ws/p5-ih/a.rs", "a.rs").await;
+    let suffix = Uuid::now_v7().simple();
+    let project = format!("p5-ih-{suffix}");
+    let p = seed_project(db.pool(), &project, &format!("/ws/{project}")).await;
+    let a = seed_file(db.pool(), p, &format!("/ws/{project}/a.rs"), "a.rs").await;
+    sqlx::query("UPDATE indexed_files SET content = $1, line_count = 1 WHERE id = $2")
+        .bind("fn read() { let _ = std::fs::read_to_string(\"x\"); }")
+        .bind(a)
+        .execute(db.pool())
+        .await
+        .expect("seed io content");
     let server = server_with_pool(db.pool().clone());
     let r = server
-        .call_tool_cli("io_hotpath", serde_json::json!({"project": "p5-ih"}))
+        .call_tool_cli(
+            "io_hotpath",
+            serde_json::json!({"project": format!(" {project} "), "limit": -10}),
+        )
         .await
         .expect("tool");
     assert!(r.is_error != Some(true));
+    let v: serde_json::Value = serde_json::from_str(&text_of(&r)).expect("io_hotpath JSON");
+    assert_eq!(v["project"].as_str(), Some(project.as_str()));
+    assert_eq!(v["limit"].as_u64(), Some(1));
+    assert_eq!(v["files"].as_array().expect("files").len(), 1);
+    assert_eq!(v["files"][0]["file"].as_str(), Some("a.rs"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn io_hotpath_rejects_stale_cross_project_metrics() {
+    let db = require_test_db!();
+    let suffix = Uuid::now_v7().simple();
+    let project = format!("p5-ih-scope-{suffix}");
+    let other = format!("p5-ih-scope-other-{suffix}");
+    let p = seed_project(db.pool(), &project, &format!("/ws/{project}")).await;
+    let q = seed_project(db.pool(), &other, &format!("/ws/{other}")).await;
+    let hot = seed_file(db.pool(), p, &format!("/ws/{project}/src/a.rs"), "src/a.rs").await;
+    let stale = seed_file(db.pool(), q, &format!("/ws/{other}/src/a.rs"), "src/a.rs").await;
+    sqlx::query("UPDATE indexed_files SET content = $1, line_count = 1 WHERE id = $2")
+        .bind("fn read() { let _ = std::fs::read_to_string(\"x\"); }")
+        .bind(hot)
+        .execute(db.pool())
+        .await
+        .expect("seed io content");
+    sqlx::query(
+        "INSERT INTO file_metrics (file_id, project_id, pagerank, betweenness)
+         VALUES ($1, $2, 0.9, 0.8)",
+    )
+    .bind(stale)
+    .bind(p)
+    .execute(db.pool())
+    .await
+    .expect("stale file_metrics");
+
+    let server = server_with_pool(db.pool().clone());
+    let r = server
+        .call_tool_cli(
+            "io_hotpath",
+            serde_json::json!({"project": project, "limit": 10}),
+        )
+        .await
+        .expect("tool");
+    assert!(r.is_error != Some(true));
+    let v: serde_json::Value = serde_json::from_str(&text_of(&r)).expect("io_hotpath JSON");
+    let files = v["files"].as_array().expect("files");
+
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["file"].as_str(), Some("src/a.rs"));
+    assert_eq!(
+        files[0]["pagerank"].as_f64(),
+        Some(0.0),
+        "stale metrics from another project's file must not weight this project's hit: {v}"
+    );
 }
