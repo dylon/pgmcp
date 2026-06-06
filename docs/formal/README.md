@@ -66,6 +66,7 @@ correctness invariants. Modeled after libgrammstein's
 | `api-stability-traceability.md` | API-contract slice for `api_stability`: finite commit-window/output bounds, migrated commit-chunk column usage, resolved-project scoping, same-project effect enrichment, and read-only execution. | Evidence ledger for `tla/ApiStabilityScope.tla` and filtered `tool_sota_phase7_to_11` tests. |
 | `community-detection-traceability.md` | Graph-analysis slice for `community_detection`: duplicate-name fail-closed behavior, closed graph-type validation, bounded finite resolution, stale cross-project edge exclusion, numeric community envelope, and same-project effect enrichment. | Evidence ledger for `tla/CommunityDetectionScope.tla` and `oracle_community_detection`. |
 | `dead-code-reachability-traceability.md` | Call-graph reachability slice for `dead_code_reachability`: normalized bounds, test-root opt-in, exact/bare-name edge policy, same-project source/target symbol traversal, bounded BFS, and read-only execution. | Evidence ledger for `tla/DeadCodeReachabilityScope.tla` and `oracle_dead_code_reachability`. |
+| `experiment-search-traceability.md` | Experiment retrieval slice for `experiment_search`: closed query/filter normalization, bounded limits, vector/FTS fallback parity, active-verdict filtering, scoped rows, and read-only execution. | Evidence ledger for `tla/ExperimentSearchScope.tla` and `oracle_experiment_search`. |
 
 ## TLA+ specs
 
@@ -135,6 +136,7 @@ correctness invariants. Modeled after libgrammstein's
 | `tla/ApiStabilityScope.tla`                       | API-stability boundary: invalid projects fail closed, commit windows and output limits are clamped, git commit chunk reads use `content`, reported symbols stay in-project, and effect enrichment reuses the resolved project id. | `src/mcp/tools/tool_api_stability.rs` |
 | `tla/CommunityDetectionScope.tla`                 | Community-detection boundary: invalid projects and graph types fail closed, finite resolution is bounded, stale cross-project edges are excluded, output exposes numeric graph fields, and effect enrichment reuses the resolved project id. | `src/mcp/tools/tool_community_detection.rs` |
 | `tla/DeadCodeReachabilityScope.tla`               | Dead-code reachability boundary: invalid projects fail closed, no-symbol state soft-fails, limits are bounded, tests and bare-name edges are opt-in, traversed call edges are same-project, and BFS/read-only execution is bounded. | `src/mcp/tools/tool_dead_code_reachability.rs` |
+| `tla/ExperimentSearchScope.tla`                   | Experiment-search boundary: blank/invalid filters fail closed, limits are bounded, vector and FTS modes preserve project/kind/active-verdict filters, stale verdicts are ignored, and execution is read-only. | `src/mcp/tools/tool_experiments.rs::tool_experiment_search`, `src/db/queries/experiments.rs::{experiment_search_vector,experiment_search_fts}` |
 
 ## Rocq proofs
 
@@ -252,6 +254,7 @@ the separate well-founded T1/T2 argument, not coinduction.
 | ApiStabilityScope — bounded commit windows, migrated commit-chunk reads, resolved-project scoping, and same-project enrichment | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh ApiStabilityScope.tla` exit 0; 5 distinct states, 10 generated |
 | CommunityDetectionScope — project/graph-type validation, bounded resolution, stale-edge exclusion, numeric output envelope, and same-project enrichment | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh CommunityDetectionScope.tla` exit 0; 7 distinct states, 14 generated |
 | DeadCodeReachabilityScope — bounded output, test-root/bare-name opt-in, same-project edge traversal, bounded BFS, and read-only execution | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh DeadCodeReachabilityScope.tla` exit 0; 6 distinct states, 12 generated |
+| ExperimentSearchScope — closed filters, bounded output, vector/FTS fallback parity, active-verdict filtering, and read-only execution | 2026-06-06 | 2026-06-06 | `scripts/tlc-capped.sh ExperimentSearchScope.tla` exit 0; 6 distinct states, 12 generated |
 
 **P13.5 (2026-05-23) — Status integrity:** the previous version of
 this README claimed "Verified 2026-05-23" without any mechanical

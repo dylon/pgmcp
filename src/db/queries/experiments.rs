@@ -883,7 +883,9 @@ pub async fn experiment_search_vector(
            AND ($3::text IS NULL OR e.kind::text = $3)
            AND ($4::text IS NULL OR EXISTS (
                  SELECT 1 FROM experiment_hypotheses h2
-                 WHERE h2.experiment_id = e.id AND h2.verdict::text = $4))
+                 WHERE h2.experiment_id = e.id
+                   AND h2.valid_to IS NULL
+                   AND h2.verdict::text = $4))
          ORDER BY e.embedding <=> $1
          LIMIT $5",
     )
@@ -902,6 +904,7 @@ pub async fn experiment_search_fts(
     query: &str,
     project_id: Option<i32>,
     kind: Option<&str>,
+    verdict: Option<&str>,
     limit: i64,
 ) -> Result<Vec<ExperimentSearchHit>, sqlx::Error> {
     sqlx::query_as::<_, ExperimentSearchHit>(
@@ -920,15 +923,21 @@ pub async fn experiment_search_fts(
          WHERE e.valid_to IS NULL
            AND ($2::int IS NULL OR e.project_id = $2)
            AND ($3::text IS NULL OR e.kind::text = $3)
+           AND ($4::text IS NULL OR EXISTS (
+                 SELECT 1 FROM experiment_hypotheses h2
+                 WHERE h2.experiment_id = e.id
+                   AND h2.valid_to IS NULL
+                   AND h2.verdict::text = $4))
            AND to_tsvector('english', coalesce(e.title,'') || ' ' ||
                  coalesce(e.question,'') || ' ' || coalesce(e.context,''))
                @@ plainto_tsquery('english', $1)
          ORDER BY similarity DESC
-         LIMIT $4",
+         LIMIT $5",
     )
     .bind(query)
     .bind(project_id)
     .bind(kind)
+    .bind(verdict)
     .bind(limit)
     .fetch_all(pool)
     .await

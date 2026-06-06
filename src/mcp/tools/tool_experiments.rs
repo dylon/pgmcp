@@ -1011,6 +1011,56 @@ pub async fn tool_experiment_decide(
 // experiment_search
 // ============================================================================
 
+const EXPERIMENT_SEARCH_DEFAULT_LIMIT: i32 = 20;
+const EXPERIMENT_SEARCH_MAX_LIMIT: i32 = 100;
+
+fn normalize_experiment_kind_filter(raw: Option<&str>) -> Result<Option<String>, McpError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let kind = raw.trim().to_ascii_lowercase();
+    if kind.is_empty() {
+        return Ok(None);
+    }
+    if matches!(
+        kind.as_str(),
+        "optimization"
+            | "feature_refactor"
+            | "feature_addition"
+            | "bugfix"
+            | "investigation"
+            | "other"
+    ) {
+        Ok(Some(kind))
+    } else {
+        Err(McpError::invalid_params(
+            "kind must be one of optimization, feature_refactor, feature_addition, bugfix, investigation, other",
+            None,
+        ))
+    }
+}
+
+fn normalize_experiment_verdict_filter(raw: Option<&str>) -> Result<Option<String>, McpError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let verdict = raw.trim().to_ascii_lowercase();
+    if verdict.is_empty() {
+        return Ok(None);
+    }
+    if matches!(
+        verdict.as_str(),
+        "pending" | "accepted" | "rejected" | "inconclusive"
+    ) {
+        Ok(Some(verdict))
+    } else {
+        Err(McpError::invalid_params(
+            "verdict must be one of pending, accepted, rejected, inconclusive",
+            None,
+        ))
+    }
+}
+
 pub async fn tool_experiment_search(
     ctx: &SystemContext,
     params: ExperimentSearchParams,
@@ -1021,37 +1071,49 @@ pub async fn tool_experiment_search(
         .fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
 
-    if params.query.trim().is_empty() {
+    let query = params.query.trim().to_string();
+    if query.is_empty() {
         return Err(McpError::invalid_params("query must be non-empty", None));
     }
-    let limit = params.limit.unwrap_or(20).clamp(1, 100) as i64;
+    let limit = params
+        .limit
+        .unwrap_or(EXPERIMENT_SEARCH_DEFAULT_LIMIT)
+        .clamp(1, EXPERIMENT_SEARCH_MAX_LIMIT) as i64;
+    let kind = normalize_experiment_kind_filter(params.kind.as_deref())?;
+    let verdict = normalize_experiment_verdict_filter(params.verdict.as_deref())?;
 
     // Prefer vector search over the experiment embeddings; fall back to FTS.
-    let hits = match ctx.embed().embed_query(&params.query).await {
+    let (search_mode, hits) = match ctx.embed().embed_query(&query).await {
         Ok(v) => {
             let qvec = Vector::from(v);
-            queries::experiment_search_vector(
-                pool,
-                &qvec,
-                params.project_id,
-                params.kind.as_deref(),
-                params.verdict.as_deref(),
-                limit,
+            (
+                "vector",
+                queries::experiment_search_vector(
+                    pool,
+                    &qvec,
+                    params.project_id,
+                    kind.as_deref(),
+                    verdict.as_deref(),
+                    limit,
+                )
+                .await,
             )
-            .await
         }
-        Err(_) => {
+        Err(_) => (
+            "fts",
             queries::experiment_search_fts(
                 pool,
-                &params.query,
+                &query,
                 params.project_id,
-                params.kind.as_deref(),
+                kind.as_deref(),
+                verdict.as_deref(),
                 limit,
             )
-            .await
-        }
-    }
-    .map_err(|e| McpError::internal_error(format!("experiment_search: {e}"), None))?;
+            .await,
+        ),
+    };
+    let hits =
+        hits.map_err(|e| McpError::internal_error(format!("experiment_search: {e}"), None))?;
 
     let results: Vec<_> = hits
         .into_iter()
@@ -1069,7 +1131,16 @@ pub async fn tool_experiment_search(
             })
         })
         .collect();
-    json_result(&json!({ "count": results.len(), "results": results }))
+    json_result(&json!({
+        "query": query,
+        "project_id": params.project_id,
+        "kind": kind,
+        "verdict": verdict,
+        "limit": limit,
+        "search_mode": search_mode,
+        "count": results.len(),
+        "results": results
+    }))
 }
 
 // ============================================================================
