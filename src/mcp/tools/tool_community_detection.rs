@@ -1,19 +1,45 @@
 //! `tool_community_detection` — MCP tool body, extracted from `super::super::server`.
 
-#![allow(unused_imports)]
-
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
-use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content, LoggingLevel};
+use rmcp::model::{CallToolResult, Content};
 use serde_json::json;
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
+
+const DEFAULT_RESOLUTION: f64 = 1.0;
+const MIN_RESOLUTION: f64 = 0.05;
+const MAX_RESOLUTION: f64 = 10.0;
+
+fn normalize_graph_type(raw: Option<&str>) -> Result<String, McpError> {
+    let graph_type = raw.unwrap_or("import").trim().to_ascii_lowercase();
+    let graph_type = if graph_type.is_empty() {
+        "import".to_string()
+    } else {
+        graph_type
+    };
+    if matches!(graph_type.as_str(), "import" | "co_change" | "combined") {
+        Ok(graph_type)
+    } else {
+        Err(McpError::invalid_params(
+            "graph_type must be 'import', 'co_change', or 'combined'",
+            None,
+        ))
+    }
+}
+
+fn normalize_resolution(raw: Option<f64>) -> Result<f64, McpError> {
+    let resolution = raw.unwrap_or(DEFAULT_RESOLUTION);
+    if !resolution.is_finite() {
+        return Err(McpError::invalid_params("resolution must be finite", None));
+    }
+    Ok(resolution.clamp(MIN_RESOLUTION, MAX_RESOLUTION))
+}
 
 pub async fn tool_community_detection(
     ctx: &SystemContext,
@@ -23,30 +49,19 @@ pub async fn tool_community_detection(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     ctx.stats().community_scans.fetch_add(1, Ordering::Relaxed);
 
-    let graph_type = params.graph_type.as_deref().unwrap_or("import");
-    let resolution = params.resolution.unwrap_or(1.0);
+    let project = params.project.trim().to_string();
+    let graph_type = normalize_graph_type(params.graph_type.as_deref())?;
+    let resolution = normalize_resolution(params.resolution)?;
+    let pool = pool_or_err(ctx)?;
+    let project_id = project_id_or_err(ctx, &project).await?;
 
     debug!(
         tool = "community_detection",
-        project = %params.project,
-        graph_type,
+        project = %project,
+        graph_type = %graph_type,
         resolution,
         "MCP tool invoked",
     );
-
-    // Resolve project_id
-    let project_id: Option<i32> =
-        sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-            .bind(&params.project)
-            .fetch_optional(ctx.db().pool().expect(
-                "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-            ))
-            .await
-            .map_err(|e| McpError::internal_error(format!("Project lookup failed: {}", e), None))?;
-
-    let project_id = project_id.ok_or_else(|| {
-        McpError::internal_error(format!("Project not found: {}", params.project), None)
-    })?;
 
     // Load edges
     #[derive(sqlx::FromRow)]
@@ -61,13 +76,7 @@ pub async fn tool_community_detection(
         weight: f64,
     }
 
-    let edge_type_filter = match graph_type {
-        "co_change" => "AND e.edge_type = 'co_change'",
-        "import" => "AND e.edge_type = 'import'",
-        _ => "", // combined: all edge types
-    };
-
-    let query = format!(
+    let db_edges: Vec<EdgeRowDb> = sqlx::query_as::<_, EdgeRowDb>(
         "SELECT
             e.source_file_id,
             sf.relative_path as source_relative_path,
@@ -78,20 +87,21 @@ pub async fn tool_community_detection(
             e.edge_type,
             e.weight
          FROM code_graph_edges e
-         JOIN indexed_files sf ON e.source_file_id = sf.id
-         LEFT JOIN indexed_files tf ON e.target_file_id = tf.id
-         WHERE e.project_id = $1 {}",
-        edge_type_filter
-    );
-
-    let db_edges: Vec<EdgeRowDb> =
-        sqlx::query_as::<_, EdgeRowDb>(&query)
-            .bind(project_id)
-            .fetch_all(ctx.db().pool().expect(
-                "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",
-            ))
-            .await
-            .map_err(|e| McpError::internal_error(format!("Edge query failed: {}", e), None))?;
+         JOIN indexed_files sf
+           ON e.source_file_id = sf.id
+          AND sf.project_id = e.project_id
+         LEFT JOIN indexed_files tf
+           ON e.target_file_id = tf.id
+          AND tf.project_id = e.project_id
+         WHERE e.project_id = $1
+           AND ($2::text = 'combined' OR e.edge_type = $2)
+           AND (e.target_file_id IS NULL OR tf.id IS NOT NULL)",
+    )
+    .bind(project_id)
+    .bind(&graph_type)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| McpError::internal_error(format!("Edge query failed: {}", e), None))?;
 
     // Build file metas
     #[derive(sqlx::FromRow)]
@@ -106,11 +116,7 @@ pub async fn tool_community_detection(
          FROM indexed_files WHERE project_id = $1",
     )
     .bind(project_id)
-    .fetch_all(
-        ctx.db()
-            .pool()
-            .expect("inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>"),
-    )
+    .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("File query failed: {}", e), None))?;
 
@@ -187,6 +193,7 @@ pub async fn tool_community_detection(
             "dominant_directory": dominant_dir,
             "directory_match_pct": format!("{:.1}%", dir_match_pct * 100.0),
             "files": files,
+            "members": files,
         }));
     }
 
@@ -199,36 +206,28 @@ pub async fn tool_community_detection(
     // Shadow-ASR channel (Phase D2b): per-effect symbol-count breakdown
     // for the project. Universal enrichment — every tool benefits from
     // surfacing the effect distribution alongside its primary output.
-    // Gracefully degrades to empty when the project lookup or
-    // shadow-ASR data isn't populated.
+    // Gracefully degrades to empty when shadow-ASR data isn't populated.
     let effect_breakdown: Vec<serde_json::Value> = (async {
         let Some(pool) = ctx.db().pool() else {
             return Vec::new();
         };
-        let project_id_opt: Option<i32> =
-            sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(&params.project)
-                .fetch_optional(pool)
-                .await
-                .unwrap_or(None);
-        match project_id_opt {
-            Some(pid) => crate::mcp::tools::sema_helpers::effects::effect_counts(pool, pid)
-                .await
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-                .collect(),
-            None => Vec::new(),
-        }
+        crate::mcp::tools::sema_helpers::effects::effect_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+            .collect()
     })
     .await;
 
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
+        "project": project,
         "graph_type": graph_type,
         "resolution": resolution,
+        "modularity": louvain.modularity,
         "modularity_q": format!("{:.4}", louvain.modularity),
+        "num_communities": louvain.num_communities,
         "community_count": louvain.num_communities,
         "communities": communities,
         "guidance": "Modularity Q > 0.3 indicates strong community structure. \

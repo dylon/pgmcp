@@ -14,6 +14,7 @@ mod common;
 
 use common::{server_with_pool, text_of};
 use pgmcp_testing::fixtures::synthetic_corpus::seed_graph_corpus;
+use pgmcp_testing::pool_tool_helpers::{seed_file, seed_project};
 use pgmcp_testing::require_test_db;
 
 #[tokio::test]
@@ -73,4 +74,69 @@ async fn community_detection_partitions_synthetic_graph_into_at_least_two_commun
             "all 5 nodes must be assigned to exactly one community; got {total_assigned}"
         );
     }
+}
+
+#[tokio::test]
+async fn community_detection_rejects_invalid_graph_type() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let _h = seed_graph_corpus(&pool).await;
+    let server = server_with_pool(pool);
+
+    let err = server
+        .call_tool_cli(
+            "community_detection",
+            serde_json::json!({"project": "graph-proj", "graph_type": "imports-plus"}),
+        )
+        .await;
+    assert!(err.is_err(), "unknown graph_type must fail closed");
+}
+
+#[tokio::test]
+async fn community_detection_clamps_resolution_and_rejects_stale_edges() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let h = seed_graph_corpus(&pool).await;
+    let other_project = seed_project(&pool, "community-other", "/ws/community-other").await;
+    let leaked_file = seed_file(
+        &pool,
+        other_project,
+        "/ws/community-other/leak.rs",
+        "leak.rs",
+    )
+    .await;
+
+    sqlx::query(
+        "INSERT INTO code_graph_edges
+            (project_id, source_file_id, target_file_id, edge_type, weight)
+         VALUES ($1, $2, $2, 'import', 1.0)",
+    )
+    .bind(h.project_id)
+    .bind(leaked_file)
+    .execute(&pool)
+    .await
+    .expect("insert stale cross-project edge");
+
+    let server = server_with_pool(pool);
+    let result = server
+        .call_tool_cli(
+            "community_detection",
+            serde_json::json!({
+                "project": " graph-proj ",
+                "graph_type": " combined ",
+                "resolution": 500.0,
+            }),
+        )
+        .await
+        .expect("community_detection");
+    let v: serde_json::Value = serde_json::from_str(&text_of(&result)).expect("json");
+    assert_eq!(v["project"].as_str(), Some("graph-proj"));
+    assert_eq!(v["graph_type"].as_str(), Some("combined"));
+    assert_eq!(v["resolution"].as_f64(), Some(10.0));
+
+    let body = v.to_string();
+    assert!(
+        !body.contains("leak.rs"),
+        "stale cross-project edge leaked into community output: {body}"
+    );
 }
