@@ -22,18 +22,30 @@ fn mode_str(m: AcqMode) -> &'static str {
     }
 }
 
+fn normalize_confidence_floor(raw: Option<f32>) -> Result<f32, McpError> {
+    let value = raw.unwrap_or(0.3);
+    if !value.is_finite() {
+        return Err(McpError::invalid_params(
+            "confidence_floor must be finite",
+            None,
+        ));
+    }
+    Ok(value.clamp(0.0, 1.0))
+}
+
 pub async fn tool_lock_order_graph(
     ctx: &SystemContext,
     params: LockOrderGraphParams,
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "lock_order_graph", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
 
     let opts = LockOrderOptions {
         max_call_depth: params.max_call_depth.unwrap_or(5).clamp(1, 12),
-        confidence_floor: params.confidence_floor.unwrap_or(0.3).clamp(0.0, 1.0),
+        confidence_floor: normalize_confidence_floor(params.confidence_floor)?,
         max_cycle_len: 6,
         call_confidence: 0.5,
     };
@@ -72,11 +84,14 @@ pub async fn tool_lock_order_graph(
 
     let nodes_vec: Vec<&str> = nodes.into_iter().collect();
     json_result(&json!({
+        "project": project,
         "nodes": nodes_vec,
         "edges": edges_json,
         "edge_count": view.len(),
         "cycles": sccs,
         "focus": focus,
+        "max_call_depth": opts.max_call_depth,
+        "confidence_floor": opts.confidence_floor,
         "guidance": "Directed lock-order graph from the sync_ops skeleton. An edge A→B means \
             B is acquired while A is held (intraprocedural or inlined across the call graph). \
             `cycles` are the SCCs = deadlock candidates (see deadlock_cycles for witnesses)."

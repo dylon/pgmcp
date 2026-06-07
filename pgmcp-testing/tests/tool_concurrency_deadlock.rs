@@ -259,11 +259,21 @@ async fn same_order_locks_have_no_cycle_and_sync_skeleton_reports_held_set() {
     let result = server
         .call_tool_cli(
             "deadlock_cycles",
-            serde_json::json!({"project": "conc-safe"}),
+            serde_json::json!({
+                "project": " conc-safe ",
+                "confidence_floor": 5.0,
+                "max_call_depth": 99,
+                "max_cycle_len": 1,
+                "limit": -20,
+            }),
         )
         .await
         .expect("deadlock_cycles call");
     let v = tool_json(&result);
+    assert_eq!(v["project"].as_str(), Some("conc-safe"));
+    assert_eq!(v["limit"].as_u64(), Some(1));
+    assert_eq!(v["max_call_depth"].as_u64(), Some(12));
+    assert_eq!(v["confidence_floor"].as_f64(), Some(1.0));
     assert_eq!(
         v["deadlock_cycles"].as_array().map(Vec::len),
         Some(0),
@@ -321,7 +331,11 @@ async fn lock_graph_bottlenecks_and_forecast_tools_dispatch() {
     let r = server
         .call_tool_cli(
             "lock_order_graph",
-            serde_json::json!({"project": "conc-inspect"}),
+            serde_json::json!({
+                "project": " conc-inspect ",
+                "confidence_floor": -7.5,
+                "max_call_depth": 0,
+            }),
         )
         .await
         .expect("lock_order_graph call");
@@ -329,6 +343,10 @@ async fn lock_graph_bottlenecks_and_forecast_tools_dispatch() {
         r.is_error != Some(true),
         "lock_order_graph returned an error envelope"
     );
+    let v = tool_json(&r);
+    assert_eq!(v["project"].as_str(), Some("conc-inspect"));
+    assert_eq!(v["max_call_depth"].as_u64(), Some(1));
+    assert_eq!(v["confidence_floor"].as_f64(), Some(0.0));
     let r = server
         .call_tool_cli(
             "concurrency_bottlenecks",

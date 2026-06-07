@@ -26,18 +26,30 @@ fn mode_str(m: AcqMode) -> &'static str {
     }
 }
 
+fn normalize_confidence_floor(raw: Option<f32>) -> Result<f32, McpError> {
+    let value = raw.unwrap_or(0.3);
+    if !value.is_finite() {
+        return Err(McpError::invalid_params(
+            "confidence_floor must be finite",
+            None,
+        ));
+    }
+    Ok(value.clamp(0.0, 1.0))
+}
+
 pub async fn tool_deadlock_cycles(
     ctx: &SystemContext,
     params: DeadlockCyclesParams,
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "deadlock_cycles", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
 
     let opts = LockOrderOptions {
         max_call_depth: params.max_call_depth.unwrap_or(5).clamp(1, 12),
-        confidence_floor: params.confidence_floor.unwrap_or(0.3).clamp(0.0, 1.0),
+        confidence_floor: normalize_confidence_floor(params.confidence_floor)?,
         max_cycle_len: params.max_cycle_len.unwrap_or(6).clamp(2, 12) as usize,
         call_confidence: 0.5,
     };
@@ -95,9 +107,11 @@ pub async fn tool_deadlock_cycles(
     }
 
     json_result(&json!({
+        "project": project,
         "deadlock_cycles": cycles_json,
         "returned": cycles_json.len(),
         "total_cycles": findings.len(),
+        "limit": limit,
         "max_call_depth": opts.max_call_depth,
         "confidence_floor": opts.confidence_floor,
         "guidance": "Cycles in the interprocedural lock-order graph are Havender (1968) \
