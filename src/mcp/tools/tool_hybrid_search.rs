@@ -13,6 +13,7 @@ use serde_json::json;
 use tracing::{debug, error, info, warn};
 
 use crate::context::SystemContext;
+use crate::fuzzy::limits::{bounded_limit, bounded_max_distance};
 use crate::mcp::server::*;
 
 /// Reciprocal Rank Fusion constant. Standard literature value (Cormack
@@ -21,6 +22,9 @@ use crate::mcp::server::*;
 /// curve so lower-ranked results contribute relatively more; lower k
 /// emphasizes the top of each list.
 pub const RRF_K: f64 = 60.0;
+const DEFAULT_BM25_WEIGHT: f64 = 0.5;
+const DEFAULT_SEMANTIC_WEIGHT: f64 = 0.5;
+const DEFAULT_WFST_LM_WEIGHT: f64 = 1.0;
 
 /// Per-result RRF contribution from a ranked list.
 ///
@@ -34,6 +38,34 @@ pub const RRF_K: f64 = 60.0;
 #[inline]
 pub fn rrf_score(weight: f64, k: f64, rank: usize) -> f64 {
     weight / (k + rank as f64 + 1.0)
+}
+
+fn bounded_hybrid_limit(raw: Option<i32>) -> i32 {
+    match raw {
+        Some(n) if n <= 0 => 1,
+        Some(n) => bounded_limit(Some(n as u32)) as i32,
+        None => bounded_limit(None) as i32,
+    }
+}
+
+fn bounded_hybrid_edit_distance(raw: Option<usize>) -> usize {
+    let raw = raw.map(|n| u32::try_from(n).unwrap_or(u32::MAX));
+    bounded_max_distance(raw)
+}
+
+fn finite_nonnegative_weight(
+    raw: Option<f64>,
+    default: f64,
+    name: &'static str,
+) -> Result<f64, McpError> {
+    let weight = raw.unwrap_or(default);
+    if !weight.is_finite() {
+        return Err(McpError::invalid_params(
+            format!("{name} must be finite"),
+            None,
+        ));
+    }
+    Ok(weight.max(0.0))
 }
 
 /// Per-leg outcome, reported in the `leg_status` response field so a caller
@@ -82,17 +114,38 @@ pub async fn tool_hybrid_search(
         ));
     }
 
-    let limit = params.limit.unwrap_or(20);
-    let bm25_weight = params.bm25_weight.unwrap_or(0.5);
-    let semantic_weight = params.semantic_weight.unwrap_or(0.5);
-    let wfst_lm_weight = params.wfst_lm_weight.unwrap_or(1.0);
-    let max_query_edit_distance = params.max_query_edit_distance.unwrap_or(2);
+    let project = params
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let language = params
+        .language
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let limit = bounded_hybrid_limit(params.limit);
+    let bm25_weight =
+        finite_nonnegative_weight(params.bm25_weight, DEFAULT_BM25_WEIGHT, "bm25_weight")?;
+    let semantic_weight = finite_nonnegative_weight(
+        params.semantic_weight,
+        DEFAULT_SEMANTIC_WEIGHT,
+        "semantic_weight",
+    )?;
+    let wfst_lm_weight = finite_nonnegative_weight(
+        params.wfst_lm_weight,
+        DEFAULT_WFST_LM_WEIGHT,
+        "wfst_lm_weight",
+    )?;
+    let max_query_edit_distance = bounded_hybrid_edit_distance(params.max_query_edit_distance);
 
     debug!(
         tool = "hybrid_search",
         query = %truncate(&params.query, 200),
-        project = params.project.as_deref().unwrap_or("*"),
-        language = params.language.as_deref().unwrap_or("*"),
+        project = project.as_deref().unwrap_or("*"),
+        language = language.as_deref().unwrap_or("*"),
         limit,
         bm25_weight,
         semantic_weight,
@@ -130,8 +183,8 @@ pub async fn tool_hybrid_search(
             ctx.db().text_search_bounded(
                 &params.query,
                 limit * 2, // fetch more for fusion
-                params.language.as_deref(),
-                params.project.as_deref(),
+                language.as_deref(),
+                project.as_deref(),
                 dedupe_worktrees,
                 text_leg_timeout_ms,
             ),
@@ -170,8 +223,8 @@ pub async fn tool_hybrid_search(
             .semantic_search(
                 &embedding,
                 limit * 2,
-                params.language.as_deref(),
-                params.project.as_deref(),
+                language.as_deref(),
+                project.as_deref(),
                 ef_search,
                 dedupe_worktrees,
             )
@@ -198,10 +251,12 @@ pub async fn tool_hybrid_search(
     // per-project model" baseline). It runs after the join because it depends
     // on neither leg's results.
     let (wfst_rewritten_results, wfst_rewritten_query, legs_fused, wfst_status) =
-        if wfst_lm_weight > 0.0 && params.project.is_some() {
+        if let Some(project_name) = project.as_deref().filter(|_| wfst_lm_weight > 0.0) {
             match try_third_leg(
                 ctx,
                 &params,
+                project_name,
+                language.as_deref(),
                 limit,
                 ef_search,
                 dedupe_worktrees,
@@ -364,8 +419,10 @@ pub async fn tool_hybrid_search(
     let result = serde_json::json!({
         "effect_breakdown": effect_breakdown,
         "query": params.query,
-        "project": params.project,
-        "language": params.language,
+        "project": project,
+        "language": language,
+        "limit": limit,
+        "fetch_window": limit * 2,
         "bm25_weight": bm25_weight,
         "semantic_weight": semantic_weight,
         "wfst_lm_weight": wfst_lm_weight,
@@ -415,6 +472,8 @@ pub async fn tool_hybrid_search(
 async fn try_third_leg(
     ctx: &SystemContext,
     params: &crate::mcp::server::HybridSearchParams,
+    project_name: &str,
+    language: Option<&str>,
     limit: i32,
     ef_search: i32,
     dedupe_worktrees: bool,
@@ -423,7 +482,6 @@ async fn try_third_leg(
 ) -> Option<(Vec<crate::db::queries::SearchResult>, String)> {
     let cfg_guard = ctx.config().load();
     let data_dir = cfg_guard.fuzzy.data_dir.clone();
-    let project_name = params.project.as_ref()?;
     let project_id =
         match crate::mcp::tools::sota_helpers::project_id_or_err(ctx, project_name).await {
             Ok(project_id) => project_id,
@@ -505,8 +563,8 @@ async fn try_third_leg(
         .semantic_search(
             &rewritten_embedding,
             limit * 2,
-            params.language.as_deref(),
-            params.project.as_deref(),
+            language,
+            Some(project_name),
             ef_search,
             dedupe_worktrees,
         )
@@ -514,4 +572,37 @@ async fn try_third_leg(
         .ok()?;
 
     Some((results, rewritten.rewritten))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fuzzy::limits::{DEFAULT_FUZZY_LIMIT, MAX_FUZZY_DISTANCE, MAX_FUZZY_LIMIT};
+
+    #[test]
+    fn hybrid_limit_is_nonempty_and_bounded() {
+        assert_eq!(bounded_hybrid_limit(None), DEFAULT_FUZZY_LIMIT as i32);
+        assert_eq!(bounded_hybrid_limit(Some(-10)), 1);
+        assert_eq!(bounded_hybrid_limit(Some(0)), 1);
+        assert_eq!(bounded_hybrid_limit(Some(i32::MAX)), MAX_FUZZY_LIMIT as i32);
+    }
+
+    #[test]
+    fn hybrid_edit_distance_is_bounded() {
+        assert_eq!(bounded_hybrid_edit_distance(Some(0)), 0);
+        assert_eq!(
+            bounded_hybrid_edit_distance(Some(usize::MAX)),
+            MAX_FUZZY_DISTANCE as usize
+        );
+    }
+
+    #[test]
+    fn hybrid_weights_reject_nonfinite_and_clamp_negative() {
+        assert!(finite_nonnegative_weight(Some(f64::NAN), 0.5, "w").is_err());
+        assert!(finite_nonnegative_weight(Some(f64::INFINITY), 0.5, "w").is_err());
+        assert_eq!(
+            finite_nonnegative_weight(Some(-1.0), 0.5, "w").expect("finite"),
+            0.0
+        );
+    }
 }
