@@ -16,11 +16,14 @@ use std::sync::atomic::Ordering;
 use crate::code_analysis::ast_rules;
 use crate::context::SystemContext;
 use crate::mcp::server::UnsafeDeserializationParams;
-use crate::mcp::tools::sema_helpers::effects::symbols_with_effect;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_effect_limited;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::mcp::tools::sota_regex_scan::scan_files_for_pattern;
 use crate::mcp::tools::tool_crypto_misuse::scan_project_ast_rules;
 use crate::parsing::type_tags::vocabulary::EFFECT_UNSAFE;
+
+const DEFAULT_DESERIALIZATION_FINDING_LIMIT: i32 = 50;
+const MAX_DESERIALIZATION_FINDING_LIMIT: i32 = 500;
 
 pub async fn tool_unsafe_deserialization(
     ctx: &SystemContext,
@@ -28,24 +31,27 @@ pub async fn tool_unsafe_deserialization(
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "unsafe_deserialization", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
-    let limit = params.limit.unwrap_or(50).max(0) as usize;
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_DESERIALIZATION_FINDING_LIMIT)
+        .clamp(1, MAX_DESERIALIZATION_FINDING_LIMIT) as usize;
 
     // Precise AST findings (deserialize category).
-    let mut ast_findings: Vec<serde_json::Value> = scan_project_ast_rules(pool, project_id)
-        .await
-        .map_err(|e| McpError::internal_error(format!("AST scan failed: {}", e), None))?
-        .into_iter()
-        .filter(|(_, _, h)| h.category == "deserialize")
-        .map(|(path, lang, h)| {
-            json!({
-                "rule": h.rule_id, "file": path, "language": lang,
-                "line": h.line, "message": h.message, "snippet": h.snippet,
+    let ast_findings: Vec<serde_json::Value> =
+        scan_project_ast_rules(pool, project_id, Some("deserialize"), limit)
+            .await
+            .map_err(|e| McpError::internal_error(format!("AST scan failed: {}", e), None))?
+            .into_iter()
+            .map(|(path, lang, h)| {
+                json!({
+                    "rule": h.rule_id, "file": path, "language": lang,
+                    "line": h.line, "message": h.message, "snippet": h.snippet,
+                })
             })
-        })
-        .collect();
-    ast_findings.truncate(limit);
+            .collect();
 
     // Regex heuristic for languages without an AST rule set.
     let pat = Regex::new(
@@ -60,19 +66,27 @@ pub async fn tool_unsafe_deserialization(
         .map(|h| json!({"file": h.relative_path, "language": h.language, "line": h.line, "snippet": h.snippet}))
         .collect();
 
-    let effect_symbols = symbols_with_effect(pool, project_id, EFFECT_UNSAFE)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(symbol_id, file_id, name, scope_path)| {
-            serde_json::json!({
-                "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
-            })
+    let effect_symbol_limit = i64::from(MAX_DESERIALIZATION_FINDING_LIMIT);
+    let effect_symbols = symbols_with_effect_limited(
+        pool,
+        project_id,
+        EFFECT_UNSAFE,
+        effect_symbol_limit,
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(symbol_id, file_id, name, scope_path)| {
+        serde_json::json!({
+            "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
         })
-        .collect::<Vec<_>>();
+    })
+    .collect::<Vec<_>>();
 
     json_result(&json!({
-        "project": params.project,
+        "project": project,
+        "limit": limit,
+        "effect_symbol_limit": effect_symbol_limit,
         "ast_findings": ast_findings,
         "heuristic_matches": heuristic_matches,
         "effect_symbols": effect_symbols,

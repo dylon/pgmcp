@@ -29,6 +29,34 @@ pub async fn symbols_with_effect(
     .await
 }
 
+/// Bounded variant for direct MCP responses. Keeps enrichment output from
+/// materializing every matching symbol in large projects.
+pub async fn symbols_with_effect_limited(
+    pool: &PgPool,
+    project_id: i32,
+    effect: &str,
+    limit: i64,
+) -> Result<Vec<(i64, i64, String, Option<String>)>, sqlx::Error> {
+    if limit <= 0 {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as(
+        "SELECT fs.id, fs.file_id, fs.name, fs.scope_path
+         FROM symbol_effects se
+         JOIN file_symbols fs ON fs.id = se.symbol_id
+         JOIN indexed_files f ON f.id = fs.file_id
+         WHERE f.project_id = $1
+           AND se.effect = $2
+         ORDER BY fs.file_id, fs.start_line
+         LIMIT $3",
+    )
+    .bind(project_id)
+    .bind(effect)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 /// Full effect set for a single symbol.
 pub async fn effect_set_for(pool: &PgPool, symbol_id: i64) -> Result<HashSet<String>, sqlx::Error> {
     let rows: Vec<String> =
@@ -127,16 +155,49 @@ pub async fn symbols_with_any_effect(
         return Ok(Vec::new());
     }
     sqlx::query_as(
-        "SELECT DISTINCT fs.id, fs.file_id, fs.name, fs.scope_path
-         FROM symbol_effects se
-         JOIN file_symbols fs ON fs.id = se.symbol_id
-         JOIN indexed_files f ON f.id = fs.file_id
-         WHERE f.project_id = $1
-           AND se.effect = ANY($2::text[])
-         ORDER BY fs.file_id, fs.start_line",
+        "SELECT id, file_id, name, scope_path
+         FROM (
+             SELECT DISTINCT fs.id, fs.file_id, fs.name, fs.scope_path, fs.start_line
+             FROM symbol_effects se
+             JOIN file_symbols fs ON fs.id = se.symbol_id
+             JOIN indexed_files f ON f.id = fs.file_id
+             WHERE f.project_id = $1
+               AND se.effect = ANY($2::text[])
+         ) deduped
+         ORDER BY file_id, start_line",
     )
     .bind(project_id)
     .bind(effects)
+    .fetch_all(pool)
+    .await
+}
+
+/// Bounded union query for direct MCP responses.
+pub async fn symbols_with_any_effect_limited(
+    pool: &PgPool,
+    project_id: i32,
+    effects: &[String],
+    limit: i64,
+) -> Result<Vec<(i64, i64, String, Option<String>)>, sqlx::Error> {
+    if effects.is_empty() || limit <= 0 {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as(
+        "SELECT id, file_id, name, scope_path
+         FROM (
+             SELECT DISTINCT fs.id, fs.file_id, fs.name, fs.scope_path, fs.start_line
+             FROM symbol_effects se
+             JOIN file_symbols fs ON fs.id = se.symbol_id
+             JOIN indexed_files f ON f.id = fs.file_id
+             WHERE f.project_id = $1
+               AND se.effect = ANY($2::text[])
+         ) deduped
+         ORDER BY file_id, start_line
+         LIMIT $3",
+    )
+    .bind(project_id)
+    .bind(effects)
+    .bind(limit)
     .fetch_all(pool)
     .await
 }

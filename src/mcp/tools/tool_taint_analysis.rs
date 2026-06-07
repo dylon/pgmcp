@@ -18,11 +18,13 @@ use serde_json::json;
 use sqlx::PgPool;
 use std::sync::atomic::Ordering;
 
+use futures::TryStreamExt;
+
 use crate::code_analysis::taint_dataflow::{TaintFinding, analyze_function};
 use crate::code_analysis::taint_interproc::{InterprocFinding, analyze_file};
 use crate::context::SystemContext;
 use crate::mcp::server::TaintAnalysisParams;
-use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect_limited;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::parsing::LanguageRegistry;
 use crate::parsing::type_tags::vocabulary::{
@@ -32,6 +34,9 @@ use crate::parsing::type_tags::vocabulary::{
 /// Languages whose backend implements `extract_dataflow` (real flow). Others
 /// use the regex co-occurrence fallback. Append as backends grow.
 pub(crate) const DATAFLOW_LANGUAGES: &[&str] = &["rust"];
+
+const DEFAULT_TAINT_FINDING_LIMIT: i32 = 30;
+const MAX_TAINT_FINDING_LIMIT: i32 = 500;
 
 /// One real source→sink flow, tagged with its file and language. Shared by
 /// `taint_analysis` and `injection_candidates`.
@@ -58,43 +63,77 @@ pub(crate) struct InterprocHit {
 pub(crate) async fn scan_project_dataflow(
     pool: &PgPool,
     project_id: i32,
+    limit: usize,
+    sink_kinds: Option<&[&str]>,
 ) -> Result<(Vec<DataflowHit>, Vec<InterprocHit>), sqlx::Error> {
-    let rows: Vec<(String, String, Option<String>)> =
-        sqlx::query_as::<_, (String, String, Option<String>)>(
-            "SELECT relative_path, language, content
-             FROM indexed_files
-             WHERE project_id = $1 AND content IS NOT NULL AND language = ANY($2)",
-        )
-        .bind(project_id)
-        .bind(DATAFLOW_LANGUAGES)
-        .fetch_all(pool)
-        .await?;
+    if limit == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
 
     let mut out = Vec::new();
     let mut interproc = Vec::new();
-    for (path, lang, content) in rows {
+    let mut rows = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT relative_path, language, content
+         FROM indexed_files
+         WHERE project_id = $1 AND content IS NOT NULL AND language = ANY($2)
+         ORDER BY id",
+    )
+    .bind(project_id)
+    .bind(DATAFLOW_LANGUAGES)
+    .fetch(pool);
+
+    while out.len() < limit || interproc.len() < limit {
+        let Some((path, lang, content)) = rows.try_next().await? else {
+            break;
+        };
         let Some(c) = content else { continue };
         let Some(backend) = LanguageRegistry::for_language(&lang) else {
             continue;
         };
         let dfs = backend.extract_dataflow(&c);
-        for df in &dfs {
-            for finding in analyze_function(df) {
-                out.push(DataflowHit {
+        if out.len() < limit {
+            for df in &dfs {
+                for finding in analyze_function(df) {
+                    if sink_kinds
+                        .map(|allowed| !allowed.contains(&finding.sink_kind.as_str()))
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    out.push(DataflowHit {
+                        path: path.clone(),
+                        language: lang.clone(),
+                        finding,
+                    });
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        if interproc.len() < limit {
+            for finding in analyze_file(&dfs) {
+                if sink_kinds
+                    .map(|allowed| !allowed.contains(&finding.sink_kind.as_str()))
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                interproc.push(InterprocHit {
                     path: path.clone(),
                     language: lang.clone(),
                     finding,
                 });
+                if interproc.len() >= limit {
+                    break;
+                }
             }
         }
-        for finding in analyze_file(&dfs) {
-            interproc.push(InterprocHit {
-                path: path.clone(),
-                language: lang.clone(),
-                finding,
-            });
-        }
     }
+    drop(rows);
     Ok((out, interproc))
 }
 
@@ -104,16 +143,21 @@ pub async fn tool_taint_analysis(
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "taint_analysis", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
-    let limit = params.limit.unwrap_or(30).max(0) as usize;
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_TAINT_FINDING_LIMIT)
+        .clamp(1, MAX_TAINT_FINDING_LIMIT) as usize;
 
     // Real source→sink flows (def-use backends): intraprocedural + (Phase 3.4)
     // interprocedural via within-file summaries.
-    let (intra_hits, interproc_hits) = scan_project_dataflow(pool, project_id)
-        .await
-        .map_err(|e| McpError::internal_error(format!("Dataflow scan failed: {}", e), None))?;
-    let mut dataflow_findings: Vec<serde_json::Value> = intra_hits
+    let (intra_hits, interproc_hits) =
+        scan_project_dataflow(pool, project_id, limit, None)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Dataflow scan failed: {}", e), None))?;
+    let dataflow_findings: Vec<serde_json::Value> = intra_hits
         .into_iter()
         .map(|h| {
             json!({
@@ -129,9 +173,8 @@ pub async fn tool_taint_analysis(
             })
         })
         .collect();
-    dataflow_findings.truncate(limit);
 
-    let mut interprocedural_findings: Vec<serde_json::Value> = interproc_hits
+    let interprocedural_findings: Vec<serde_json::Value> = interproc_hits
         .into_iter()
         .map(|h| {
             json!({
@@ -147,7 +190,6 @@ pub async fn tool_taint_analysis(
             })
         })
         .collect();
-    interprocedural_findings.truncate(limit);
 
     // Regex source/sink co-occurrence for languages without a def-use backend.
     let source_re = Regex::new(
@@ -158,22 +200,24 @@ pub async fn tool_taint_analysis(
         r"(?m)\b(Command::new|exec\(|eval\(|spawn_shell|subprocess\.run|os\.system|sql\.query\(|execute\(|Runtime\.exec|shell_exec|sqlx::query_unchecked)\b",
     )
     .expect("sink regex");
-    let rows: Vec<(String, String, Option<String>)> =
-        sqlx::query_as::<_, (String, String, Option<String>)>(
-            "SELECT relative_path, language, content
-             FROM indexed_files
-             WHERE project_id = $1 AND content IS NOT NULL AND NOT (language = ANY($2))",
-        )
-        .bind(project_id)
-        .bind(DATAFLOW_LANGUAGES)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| McpError::internal_error(format!("Scan failed: {}", e), None))?;
+    let mut rows = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT relative_path, language, content
+         FROM indexed_files
+         WHERE project_id = $1 AND content IS NOT NULL AND NOT (language = ANY($2))
+         ORDER BY id",
+    )
+    .bind(project_id)
+    .bind(DATAFLOW_LANGUAGES)
+    .fetch(pool);
     let mut heuristic_findings: Vec<serde_json::Value> = Vec::new();
-    for (path, lang, content) in rows {
-        if heuristic_findings.len() >= limit {
+    while heuristic_findings.len() < limit {
+        let Some((path, lang, content)) = rows
+            .try_next()
+            .await
+            .map_err(|e| McpError::internal_error(format!("Scan failed: {}", e), None))?
+        else {
             break;
-        }
+        };
         let Some(c) = content else { continue };
         let sources: Vec<u32> = source_re
             .find_iter(&c)
@@ -193,6 +237,7 @@ pub async fn tool_taint_analysis(
             "sink_lines": sinks,
         }));
     }
+    drop(rows);
 
     let io_effects = vec![
         EFFECT_NETWORK.to_string(),
@@ -200,22 +245,26 @@ pub async fn tool_taint_analysis(
         EFFECT_DATABASE.to_string(),
         EFFECT_CRYPTO.to_string(),
     ];
-    let io_symbols = symbols_with_any_effect(pool, project_id, &io_effects)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(symbol_id, file_id, name, scope_path)| {
-            json!({
-                "symbol_id": symbol_id,
-                "file_id": file_id,
-                "name": name,
-                "scope_path": scope_path,
+    let effect_symbol_limit = i64::from(MAX_TAINT_FINDING_LIMIT);
+    let io_symbols =
+        symbols_with_any_effect_limited(pool, project_id, &io_effects, effect_symbol_limit)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(symbol_id, file_id, name, scope_path)| {
+                json!({
+                    "symbol_id": symbol_id,
+                    "file_id": file_id,
+                    "name": name,
+                    "scope_path": scope_path,
+                })
             })
-        })
-        .collect::<Vec<_>>();
+            .collect::<Vec<_>>();
 
     json_result(&json!({
-        "project": params.project,
+        "project": project,
+        "limit": limit,
+        "effect_symbol_limit": effect_symbol_limit,
         "dataflow_findings": dataflow_findings,
         "interprocedural_findings": interprocedural_findings,
         "heuristic_findings": heuristic_findings,

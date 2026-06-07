@@ -14,38 +14,58 @@ use serde_json::json;
 use sqlx::PgPool;
 use std::sync::atomic::Ordering;
 
+use futures::TryStreamExt;
+
 use crate::code_analysis::ast_rules::{self, AstRuleHit};
 use crate::context::SystemContext;
 use crate::mcp::server::CryptoMisuseParams;
-use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect_limited;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::mcp::tools::sota_regex_scan::scan_files_for_pattern;
 use crate::parsing::type_tags::vocabulary::{EFFECT_CRYPTO, EFFECT_CRYPTO_WEAK};
 
+const DEFAULT_CRYPTO_FINDING_LIMIT: i32 = 50;
+const MAX_CRYPTO_FINDING_LIMIT: i32 = 500;
+
 /// Run the AST rule engine over every rule-capable file in the project.
-/// Shared by `crypto_misuse` and `unsafe_deserialization` (each filters by
-/// `AstRuleHit::category`).
+/// Shared by `crypto_misuse` and `unsafe_deserialization`.
 pub(crate) async fn scan_project_ast_rules(
     pool: &PgPool,
     project_id: i32,
+    category: Option<&str>,
+    limit: usize,
 ) -> Result<Vec<(String, String, AstRuleHit)>, sqlx::Error> {
-    let rows: Vec<(String, String, Option<String>)> =
-        sqlx::query_as::<_, (String, String, Option<String>)>(
-            "SELECT relative_path, language, content
-             FROM indexed_files
-             WHERE project_id = $1 AND content IS NOT NULL AND language = ANY($2)",
-        )
-        .bind(project_id)
-        .bind(ast_rules::AST_RULE_LANGUAGES)
-        .fetch_all(pool)
-        .await?;
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
     let mut out = Vec::new();
-    for (path, lang, content) in rows {
+    let mut rows = sqlx::query_as::<_, (String, String, Option<String>)>(
+        "SELECT relative_path, language, content
+         FROM indexed_files
+         WHERE project_id = $1 AND content IS NOT NULL AND language = ANY($2)
+         ORDER BY id",
+    )
+    .bind(project_id)
+    .bind(ast_rules::AST_RULE_LANGUAGES)
+    .fetch(pool);
+
+    while out.len() < limit {
+        let Some((path, lang, content)) = rows.try_next().await? else {
+            break;
+        };
         let Some(c) = content else { continue };
         for hit in ast_rules::scan(&lang, &c) {
+            if category.map(|c| hit.category != c).unwrap_or(false) {
+                continue;
+            }
             out.push((path.clone(), lang.clone(), hit));
+            if out.len() >= limit {
+                break;
+            }
         }
     }
+    drop(rows);
     Ok(out)
 }
 
@@ -55,24 +75,27 @@ pub async fn tool_crypto_misuse(
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "crypto_misuse", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
-    let limit = params.limit.unwrap_or(50).max(0) as usize;
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_CRYPTO_FINDING_LIMIT)
+        .clamp(1, MAX_CRYPTO_FINDING_LIMIT) as usize;
 
     // Precise AST findings (crypto category).
-    let mut ast_findings: Vec<serde_json::Value> = scan_project_ast_rules(pool, project_id)
-        .await
-        .map_err(|e| McpError::internal_error(format!("AST scan failed: {}", e), None))?
-        .into_iter()
-        .filter(|(_, _, h)| h.category == "crypto")
-        .map(|(path, lang, h)| {
-            json!({
-                "rule": h.rule_id, "file": path, "language": lang,
-                "line": h.line, "message": h.message, "snippet": h.snippet,
+    let ast_findings: Vec<serde_json::Value> =
+        scan_project_ast_rules(pool, project_id, Some("crypto"), limit)
+            .await
+            .map_err(|e| McpError::internal_error(format!("AST scan failed: {}", e), None))?
+            .into_iter()
+            .map(|(path, lang, h)| {
+                json!({
+                    "rule": h.rule_id, "file": path, "language": lang,
+                    "line": h.line, "message": h.message, "snippet": h.snippet,
+                })
             })
-        })
-        .collect();
-    ast_findings.truncate(limit);
+            .collect();
 
     // Regex heuristic for languages WITHOUT an AST rule set.
     let rules: &[(&str, &str)] = &[
@@ -116,10 +139,12 @@ pub async fn tool_crypto_misuse(
         }
     }
 
-    let effect_symbols = symbols_with_any_effect(
+    let effect_symbol_limit = i64::from(MAX_CRYPTO_FINDING_LIMIT);
+    let effect_symbols = symbols_with_any_effect_limited(
         pool,
         project_id,
         &[EFFECT_CRYPTO.to_string(), EFFECT_CRYPTO_WEAK.to_string()],
+        effect_symbol_limit,
     )
     .await
     .unwrap_or_default()
@@ -132,7 +157,9 @@ pub async fn tool_crypto_misuse(
     .collect::<Vec<_>>();
 
     json_result(&json!({
-        "project": params.project,
+        "project": project,
+        "limit": limit,
+        "effect_symbol_limit": effect_symbol_limit,
         "ast_findings": ast_findings,
         "heuristic_findings": heuristic_findings,
         "effect_symbols": effect_symbols,

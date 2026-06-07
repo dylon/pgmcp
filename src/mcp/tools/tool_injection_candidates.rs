@@ -16,11 +16,14 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::InjectionCandidatesParams;
-use crate::mcp::tools::sema_helpers::effects::symbols_with_effect;
+use crate::mcp::tools::sema_helpers::effects::symbols_with_effect_limited;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::mcp::tools::sota_regex_scan::scan_files_for_pattern;
 use crate::mcp::tools::tool_taint_analysis::scan_project_dataflow;
 use crate::parsing::type_tags::vocabulary::EFFECT_DATABASE;
+
+const DEFAULT_INJECTION_FINDING_LIMIT: i32 = 50;
+const MAX_INJECTION_FINDING_LIMIT: i32 = 500;
 
 pub async fn tool_injection_candidates(
     ctx: &SystemContext,
@@ -28,25 +31,35 @@ pub async fn tool_injection_candidates(
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "injection_candidates", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
-    let limit = params.limit.unwrap_or(50);
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_INJECTION_FINDING_LIMIT)
+        .clamp(1, MAX_INJECTION_FINDING_LIMIT) as usize;
 
-    let kind = params.kind.as_deref().unwrap_or("all");
+    let kind = params.kind.as_deref().unwrap_or("all").trim();
     // Which sink classes count as "injection" for this request.
     let allowed: &[&str] = match kind {
         "sql" => &["sql"],
         "shell" => &["command"],
-        _ => &["command", "sql", "eval"],
+        "all" => &["command", "sql", "eval"],
+        other => {
+            return Err(McpError::invalid_params(
+                format!("kind must be one of: all, sql, shell; got '{other}'"),
+                None,
+            ));
+        }
     };
 
     // High-confidence: real source→sink flows into an injection sink.
-    let (intra_hits, interproc_hits) = scan_project_dataflow(pool, project_id)
-        .await
-        .map_err(|e| McpError::internal_error(format!("Dataflow scan failed: {}", e), None))?;
+    let (intra_hits, interproc_hits) =
+        scan_project_dataflow(pool, project_id, limit, Some(allowed))
+            .await
+            .map_err(|e| McpError::internal_error(format!("Dataflow scan failed: {}", e), None))?;
     let mut injection_findings: Vec<serde_json::Value> = intra_hits
         .into_iter()
-        .filter(|h| allowed.contains(&h.finding.sink_kind.as_str()))
         .map(|h| {
             json!({
                 "file": h.path,
@@ -63,25 +76,20 @@ pub async fn tool_injection_candidates(
         .collect();
     // Interprocedural injection candidates (Phase 3.4): a tainted argument that
     // a called helper routes to an injection sink.
-    injection_findings.extend(
-        interproc_hits
-            .into_iter()
-            .filter(|h| allowed.contains(&h.finding.sink_kind.as_str()))
-            .map(|h| {
-                json!({
-                    "file": h.path,
-                    "language": h.language,
-                    "function": h.finding.caller,
-                    "source_kind": h.finding.source_kind,
-                    "source_line": h.finding.source_line,
-                    "sink_kind": h.finding.sink_kind,
-                    "sink_callee": h.finding.callee,
-                    "sink_line": h.finding.call_line,
-                    "interprocedural": true,
-                })
-            }),
-    );
-    injection_findings.truncate(limit.max(0) as usize);
+    injection_findings.extend(interproc_hits.into_iter().map(|h| {
+        json!({
+            "file": h.path,
+            "language": h.language,
+            "function": h.finding.caller,
+            "source_kind": h.finding.source_kind,
+            "source_line": h.finding.source_line,
+            "sink_kind": h.finding.sink_kind,
+            "sink_callee": h.finding.callee,
+            "sink_line": h.finding.call_line,
+            "interprocedural": true,
+        })
+    }));
+    injection_findings.truncate(limit);
 
     // Review-candidate heuristic: string concatenation into exec/query (regex),
     // for languages without a def-use backend.
@@ -97,7 +105,7 @@ pub async fn tool_injection_candidates(
         ),
     }
     .expect("inj regex");
-    let hits = scan_files_for_pattern(pool, project_id, &pat, None, limit.max(0) as usize)
+    let hits = scan_files_for_pattern(pool, project_id, &pat, None, limit)
         .await
         .map_err(|e| McpError::internal_error(format!("Scan failed: {}", e), None))?;
     let heuristic_matches: Vec<_> = hits
@@ -105,20 +113,28 @@ pub async fn tool_injection_candidates(
         .map(|h| json!({"file": h.relative_path, "language": h.language, "line": h.line, "snippet": h.snippet}))
         .collect();
 
-    let database_effect_symbols = symbols_with_effect(pool, project_id, EFFECT_DATABASE)
-        .await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(symbol_id, file_id, name, scope_path)| {
-            serde_json::json!({
-                "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
-            })
+    let effect_symbol_limit = i64::from(MAX_INJECTION_FINDING_LIMIT);
+    let database_effect_symbols = symbols_with_effect_limited(
+        pool,
+        project_id,
+        EFFECT_DATABASE,
+        effect_symbol_limit,
+    )
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(symbol_id, file_id, name, scope_path)| {
+        serde_json::json!({
+            "symbol_id": symbol_id, "file_id": file_id, "name": name, "scope_path": scope_path,
         })
-        .collect::<Vec<_>>();
+    })
+    .collect::<Vec<_>>();
 
     json_result(&json!({
-        "project": params.project,
+        "project": project,
         "kind": kind,
+        "limit": limit,
+        "effect_symbol_limit": effect_symbol_limit,
         "injection_findings": injection_findings,
         "heuristic_matches": heuristic_matches,
         "database_effect_symbols": database_effect_symbols,
