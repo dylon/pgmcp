@@ -85,6 +85,13 @@ pub async fn tool_ontology_tree(
     // Subtree mode: descendants of one concept (bounded depth). Correct over the
     // DAG via a recursive closure (see `queries::concept_descendants`).
     if let Some(root) = params.root_concept.as_deref() {
+        let root = root.trim();
+        if root.is_empty() {
+            return Err(McpError::invalid_params(
+                "root_concept must not be blank",
+                None,
+            ));
+        }
         let root_id = queries::resolve_concept(pool, root)
             .await
             .map_err(db_err)?

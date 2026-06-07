@@ -100,6 +100,21 @@ async fn lock_memory_entity_observations(
     Ok(())
 }
 
+async fn lock_memory_relation_identity(
+    tx: &mut Transaction<'_, Postgres>,
+    from: &str,
+    to: &str,
+    relation_type: &str,
+) -> Result<(), sqlx::Error> {
+    let (lock_a, lock_b) = memory_relation_identity_lock_key(from, to, relation_type);
+    sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
+        .bind(lock_a)
+        .bind(lock_b)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
 fn memory_entity_identity_lock_key(name: &str, entity_type: &str) -> (i32, i32) {
     memory_advisory_lock_key(b"memory:entity:", &[name, entity_type])
 }
@@ -107,6 +122,10 @@ fn memory_entity_identity_lock_key(name: &str, entity_type: &str) -> (i32, i32) 
 fn memory_entity_observation_lock_key(entity_id: i64) -> (i32, i32) {
     let id = entity_id.to_string();
     memory_advisory_lock_key(b"memory:entity-observations:", &[id.as_str()])
+}
+
+fn memory_relation_identity_lock_key(from: &str, to: &str, relation_type: &str) -> (i32, i32) {
+    memory_advisory_lock_key(b"memory:relation:", &[from, to, relation_type])
 }
 
 fn memory_advisory_lock_key(prefix: &[u8], fields: &[&str]) -> (i32, i32) {
@@ -380,6 +399,44 @@ pub struct NewRelationInput {
     pub relation_type: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct MemoryCreateRelationsResult {
+    pub relation_ids: Vec<i64>,
+    pub relations_inserted: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NormalizedRelationInput<'a> {
+    from: &'a str,
+    to: &'a str,
+    relation_type: &'a str,
+}
+
+const MAX_MEMORY_RELATION_FIELD_BYTES: usize = 256;
+
+fn normalize_relation_field<'a>(value: &'a str, field: &str) -> Result<&'a str, sqlx::Error> {
+    let normalized = value.trim();
+    if normalized.is_empty() {
+        return Err(sqlx::Error::Protocol(format!("{field} must not be blank")));
+    }
+    if normalized.len() > MAX_MEMORY_RELATION_FIELD_BYTES {
+        return Err(sqlx::Error::Protocol(format!(
+            "{field} must be at most {MAX_MEMORY_RELATION_FIELD_BYTES} bytes"
+        )));
+    }
+    Ok(normalized)
+}
+
+fn normalize_new_relation_input(
+    input: &NewRelationInput,
+) -> Result<NormalizedRelationInput<'_>, sqlx::Error> {
+    Ok(NormalizedRelationInput {
+        from: normalize_relation_field(&input.from, "relation from")?,
+        to: normalize_relation_field(&input.to, "relation to")?,
+        relation_type: normalize_relation_field(&input.relation_type, "relation_type")?,
+    })
+}
+
 // Renamed from `RelationRow` during the 2026-05-29 god-file split: the
 // pre-existing `work_items` submodule also defines a `RelationRow`, and once
 // both were exposed behind `pub use ...::*` globs the duplicate name tripped
@@ -400,54 +457,115 @@ pub struct MemoryRelationRow {
 }
 
 /// Create relations between existing entities (looked up by name). Returns
-/// the inserted relation ids; -1 sentinel for entries whose endpoints
-/// couldn't be found.
-pub async fn memory_create_relations(
+/// relation ids in input order, reusing active rows when present; `-1` is the
+/// sentinel for entries whose endpoints cannot be resolved or would self-loop.
+pub async fn memory_create_relations_detailed(
     pool: &PgPool,
     inputs: &[NewRelationInput],
     source: &str,
-) -> Result<Vec<i64>, sqlx::Error> {
+) -> Result<MemoryCreateRelationsResult, sqlx::Error> {
+    let normalized_inputs: Vec<NormalizedRelationInput<'_>> = inputs
+        .iter()
+        .map(normalize_new_relation_input)
+        .collect::<Result<_, _>>()?;
     let mut tx = pool.begin().await?;
     let mut out = Vec::with_capacity(inputs.len());
+    let mut relations_inserted = 0usize;
 
-    for input in inputs {
+    let mut relation_locks: Vec<(String, String, String)> = normalized_inputs
+        .iter()
+        .map(|input| {
+            (
+                input.from.to_string(),
+                input.to.to_string(),
+                input.relation_type.to_string(),
+            )
+        })
+        .collect();
+    relation_locks.sort();
+    relation_locks.dedup();
+    for (from, to, relation_type) in &relation_locks {
+        lock_memory_relation_identity(&mut tx, from, to, relation_type).await?;
+    }
+
+    for input in normalized_inputs {
         // Resolve endpoints (active rows only).
-        let from_id: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM memory_entities WHERE name = $1 AND valid_to IS NULL LIMIT 1",
+        let from_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM memory_entities
+             WHERE name = $1 AND valid_to IS NULL
+             ORDER BY id",
         )
-        .bind(&input.from)
-        .fetch_optional(&mut *tx)
+        .bind(input.from)
+        .fetch_all(&mut *tx)
         .await?;
-        let to_id: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM memory_entities WHERE name = $1 AND valid_to IS NULL LIMIT 1",
+        let to_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM memory_entities
+             WHERE name = $1 AND valid_to IS NULL
+             ORDER BY id",
         )
-        .bind(&input.to)
-        .fetch_optional(&mut *tx)
+        .bind(input.to)
+        .fetch_all(&mut *tx)
         .await?;
-        let (Some(from_id), Some(to_id)) = (from_id, to_id) else {
-            out.push(-1);
-            continue;
+        let from_id = match from_ids.as_slice() {
+            [id] => *id,
+            [] => {
+                out.push(-1);
+                continue;
+            }
+            ids => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "ambiguous memory relation endpoint name '{}' matched {} active entities; use a unique entity name",
+                    input.from,
+                    ids.len()
+                )));
+            }
+        };
+        let to_id = match to_ids.as_slice() {
+            [id] => *id,
+            [] => {
+                out.push(-1);
+                continue;
+            }
+            ids => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "ambiguous memory relation endpoint name '{}' matched {} active entities; use a unique entity name",
+                    input.to,
+                    ids.len()
+                )));
+            }
         };
         if from_id == to_id {
             out.push(-1);
             continue;
-        }
+        };
 
         // Existing active relation with same triple? Reuse.
-        let existing: Option<i64> = sqlx::query_scalar(
+        let existing_ids: Vec<i64> = sqlx::query_scalar(
             "SELECT id FROM memory_relations
              WHERE from_entity_id = $1 AND to_entity_id = $2 AND relation_type = $3
                AND valid_to IS NULL
-             LIMIT 1",
+             ORDER BY id",
         )
         .bind(from_id)
         .bind(to_id)
-        .bind(&input.relation_type)
-        .fetch_optional(&mut *tx)
+        .bind(input.relation_type)
+        .fetch_all(&mut *tx)
         .await?;
-        if let Some(id) = existing {
-            out.push(id);
-            continue;
+        match existing_ids.as_slice() {
+            [id] => {
+                out.push(*id);
+                continue;
+            }
+            [] => {}
+            ids => {
+                return Err(sqlx::Error::Protocol(format!(
+                    "ambiguous active memory relation ('{}', '{}', '{}') matched {} rows; repair duplicate active relations",
+                    input.from,
+                    input.to,
+                    input.relation_type,
+                    ids.len()
+                )));
+            }
         }
 
         let id: i64 = sqlx::query_scalar(
@@ -458,15 +576,29 @@ pub async fn memory_create_relations(
         )
         .bind(from_id)
         .bind(to_id)
-        .bind(&input.relation_type)
+        .bind(input.relation_type)
         .bind(source)
         .fetch_one(&mut *tx)
         .await?;
         out.push(id);
+        relations_inserted += 1;
     }
 
     tx.commit().await?;
-    Ok(out)
+    Ok(MemoryCreateRelationsResult {
+        relation_ids: out,
+        relations_inserted,
+    })
+}
+
+pub async fn memory_create_relations(
+    pool: &PgPool,
+    inputs: &[NewRelationInput],
+    source: &str,
+) -> Result<Vec<i64>, sqlx::Error> {
+    Ok(memory_create_relations_detailed(pool, inputs, source)
+        .await?
+        .relation_ids)
 }
 
 #[derive(Debug, Clone)]

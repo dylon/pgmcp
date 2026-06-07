@@ -198,8 +198,8 @@ async fn run_llm_concepts(
             relation_type: r.relation_type.clone(),
         })
         .collect();
-    let rel_ids = queries::memory_create_relations(pool, &rels, "auto_index").await?;
-    let rel_emitted = rel_ids.iter().filter(|&&id| id >= 0).count() as u64;
+    let rel_result = queries::memory_create_relations_detailed(pool, &rels, "auto_index").await?;
+    let rel_emitted = rel_result.relations_inserted as u64;
 
     stats
         .memory_concepts_emitted

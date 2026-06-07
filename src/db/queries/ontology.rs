@@ -517,24 +517,35 @@ pub async fn concept_descendants(
     max_depth: i32,
 ) -> Result<Vec<ConceptEdgeRow>, sqlx::Error> {
     sqlx::query_as(
-        "WITH RECURSIVE sub(child_id, parent_id, relation, depth) AS (
-             SELECT r.from_entity_id, r.to_entity_id, r.relation_type, 1
+        "WITH RECURSIVE sub(child_id, parent_id, relation, depth, path) AS (
+             SELECT r.from_entity_id, r.to_entity_id, r.relation_type, 1,
+                    ARRAY[$1, r.from_entity_id]::bigint[]
              FROM memory_relations r
+             JOIN ontology_concept_meta cm ON cm.entity_id = r.from_entity_id
+             JOIN ontology_concept_meta pm ON pm.entity_id = r.to_entity_id
+             JOIN memory_entities cf ON cf.id = r.from_entity_id AND cf.valid_to IS NULL
+             JOIN memory_entities pf ON pf.id = r.to_entity_id AND pf.valid_to IS NULL
              WHERE r.to_entity_id = $1
                AND r.relation_type IN ('is_a','part_of','broader') AND r.valid_to IS NULL
              UNION
-             SELECT r.from_entity_id, r.to_entity_id, r.relation_type, s.depth + 1
+             SELECT r.from_entity_id, r.to_entity_id, r.relation_type, s.depth + 1,
+                    s.path || r.from_entity_id
              FROM sub s
              JOIN memory_relations r
                ON r.to_entity_id = s.child_id
                AND r.relation_type IN ('is_a','part_of','broader') AND r.valid_to IS NULL
+             JOIN ontology_concept_meta cm ON cm.entity_id = r.from_entity_id
+             JOIN ontology_concept_meta pm ON pm.entity_id = r.to_entity_id
+             JOIN memory_entities cf ON cf.id = r.from_entity_id AND cf.valid_to IS NULL
+             JOIN memory_entities pf ON pf.id = r.to_entity_id AND pf.valid_to IS NULL
              WHERE s.depth < $2
+               AND NOT r.from_entity_id = ANY(s.path)
          )
-         SELECT s.child_id, cf.name AS child_name, s.parent_id, pf.name AS parent_name, s.relation
+         SELECT DISTINCT s.child_id, cf.name AS child_name, s.parent_id, pf.name AS parent_name, s.relation
          FROM sub s
          JOIN memory_entities cf ON cf.id = s.child_id AND cf.valid_to IS NULL
          JOIN memory_entities pf ON pf.id = s.parent_id AND pf.valid_to IS NULL
-         ORDER BY s.parent_id, s.child_id",
+         ORDER BY parent_id, child_id, relation",
     )
     .bind(root_id)
     .bind(max_depth)
@@ -639,7 +650,7 @@ pub async fn concept_hierarchy_edges(
     facet: Facet,
 ) -> Result<Vec<ConceptEdgeRow>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT r.from_entity_id AS child_id, cf.name AS child_name,
+        "SELECT DISTINCT r.from_entity_id AS child_id, cf.name AS child_name,
                 r.to_entity_id AS parent_id, pf.name AS parent_name, r.relation_type AS relation
          FROM memory_relations r
          JOIN ontology_concept_meta cm ON cm.entity_id = r.from_entity_id AND cm.facet = $1
@@ -647,7 +658,7 @@ pub async fn concept_hierarchy_edges(
          JOIN memory_entities cf ON cf.id = r.from_entity_id AND cf.valid_to IS NULL
          JOIN memory_entities pf ON pf.id = r.to_entity_id   AND pf.valid_to IS NULL
          WHERE r.relation_type IN ('is_a','part_of','broader') AND r.valid_to IS NULL
-         ORDER BY r.from_entity_id, r.to_entity_id",
+         ORDER BY child_id, parent_id, relation",
     )
     .bind(facet.as_str())
     .fetch_all(pool)

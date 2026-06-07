@@ -132,6 +132,67 @@ async fn phonetic_symbol_search_searches_the_trie() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn phonetic_symbol_search_rejects_blank_query_before_trie_open() {
+    let testdb = require_test_db!();
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ctx = build_ctx(Arc::new(testdb.pool().clone()), tmp.path().to_path_buf());
+
+    let err = tool_phonetic_symbol_search::run(
+        &ctx,
+        PhoneticSymbolSearchParams {
+            query: "   ".to_string(),
+            project: "   ".to_string(),
+            max_distance: Some(2),
+            limit: Some(20),
+        },
+    )
+    .await
+    .expect_err("blank query should reject before trie open");
+    assert!(
+        err.to_string().contains("query must be non-empty"),
+        "unexpected blank query error: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn phonetic_symbol_search_trims_project_query_and_reports_effective_bounds() {
+    let testdb = require_test_db!();
+    seed_symbols(
+        testdb.pool(),
+        "phon_trim_test",
+        &["phone_handler", "telephone_ringer", "decode_frame"],
+    )
+    .await;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let ctx = build_ctx(Arc::new(testdb.pool().clone()), tmp.path().to_path_buf());
+
+    let result = tool_phonetic_symbol_search::run(
+        &ctx,
+        PhoneticSymbolSearchParams {
+            query: "  fone  ".to_string(),
+            project: "  phon_trim_test  ".to_string(),
+            max_distance: Some(u32::MAX),
+            limit: Some(0),
+        },
+    )
+    .await
+    .expect("phonetic_symbol_search");
+    let val: serde_json::Value = serde_json::from_str(&result_text(&result)).expect("json");
+    assert_eq!(val["query"].as_str(), Some("fone"));
+    assert_eq!(val["project"].as_str(), Some("phon_trim_test"));
+    assert_eq!(
+        val["max_distance"].as_u64(),
+        Some(pgmcp::fuzzy::limits::MAX_FUZZY_DISTANCE as u64)
+    );
+    assert_eq!(val["limit"].as_u64(), Some(1));
+    assert!(
+        val["matches"].as_array().expect("matches array").len() <= 1,
+        "effective limit must cap results to one: {val:#}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn correct_query_corrects_against_project_vocab() {
     let testdb = require_test_db!();
     seed_symbols(

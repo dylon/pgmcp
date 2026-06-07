@@ -22,27 +22,43 @@ use crate::fuzzy::values::SymbolValue;
 use crate::mcp::server::PhoneticSymbolSearchParams;
 use crate::mcp::tools::sota_helpers::json_result;
 
+const MAX_PHONETIC_SYMBOL_QUERY_BYTES: usize = 512;
+
 pub async fn run(
     ctx: &SystemContext,
     params: PhoneticSymbolSearchParams,
 ) -> Result<CallToolResult, McpError> {
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    let project = params.project.trim();
+    let query = params.query.trim();
+    if query.is_empty() {
+        return Err(McpError::invalid_params("query must be non-empty", None));
+    }
+    if query.len() > MAX_PHONETIC_SYMBOL_QUERY_BYTES {
+        return Err(McpError::invalid_params(
+            format!("query must be at most {MAX_PHONETIC_SYMBOL_QUERY_BYTES} bytes"),
+            None,
+        ));
+    }
+    if project.is_empty() {
+        return Err(McpError::invalid_params("project must be non-empty", None));
+    }
     let max_d = bounded_max_distance(params.max_distance);
     let limit = bounded_limit(params.limit);
 
     // Consult the per-project persistent symbol trie (lazy-warmed from PG on
     // first call; kept current by the fuzzy-sync cron thereafter).
-    let idx = open_symbol_trie(ctx, &params.project).await?;
+    let idx = open_symbol_trie(ctx, project).await?;
     let vocab = idx.iter_with_values();
     let value_by_term: HashMap<String, SymbolValue> = vocab.iter().cloned().collect();
     let terms: Vec<String> = vocab.into_iter().map(|(term, _)| term).collect();
 
-    let phon = ctx.phonetics_for(Some(&params.project));
+    let phon = ctx.phonetics_for(Some(project));
     let mut hits: Vec<(String, usize, String, f64)> = phon
-        .phonetic_search(terms.iter(), &params.query, max_d)
+        .phonetic_search(terms.iter(), query, max_d)
         .into_iter()
         .map(|(term, distance, normalized)| {
-            let art = articulatory_distance_score(&params.query, &term);
+            let art = articulatory_distance_score(query, &term);
             (term, distance, normalized, art)
         })
         .collect();
@@ -54,9 +70,10 @@ pub async fn run(
     hits.truncate(limit);
 
     json_result(&json!({
-        "query": params.query,
-        "project": params.project,
+        "query": query,
+        "project": project,
         "max_distance": max_d,
+        "limit": limit,
         "matches": hits
             .into_iter()
             .map(|(term, distance, normalized, art)| {

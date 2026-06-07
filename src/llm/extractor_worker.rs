@@ -247,8 +247,9 @@ async fn run_once(
                 relation_type: r.relation_type.clone(),
             })
             .collect();
-        let rel_ids = queries::memory_create_relations(pool, &rels, "llm_extraction").await?;
-        writes.relations = rel_ids.iter().filter(|i| **i >= 0).count();
+        let result =
+            queries::memory_create_relations_detailed(pool, &rels, "llm_extraction").await?;
+        writes.relations = result.relations_inserted;
     }
 
     let _ = (job.user_id.as_ref(), config.max_extractions);

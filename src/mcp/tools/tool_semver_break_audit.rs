@@ -10,15 +10,22 @@ use regex::Regex;
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
 use serde_json::json;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::SemverBreakAuditParams;
 use crate::mcp::tools::sema_helpers::signatures::{
-    SignatureDescriptor, fetch_signature_descriptor, signature_shape_hash,
+    fetch_signature_descriptor, signature_shape_hash,
 };
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
+
+const DEFAULT_SEMVER_WINDOW_COMMITS: u32 = 50;
+const MAX_SEMVER_WINDOW_COMMITS: u32 = 1_000;
+const DEFAULT_SEMVER_LIMIT: i32 = 50;
+const MAX_SEMVER_LIMIT: i32 = 250;
+const MAX_PUBLIC_SYMBOLS: i64 = 50_000;
+const SEMVER_RENAME_MAX_DISTANCE: usize = 2;
 
 pub async fn tool_semver_break_audit(
     ctx: &SystemContext,
@@ -26,8 +33,37 @@ pub async fn tool_semver_break_audit(
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "semver_break_audit", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let window = params
+        .window_commits
+        .unwrap_or(DEFAULT_SEMVER_WINDOW_COMMITS)
+        .clamp(1, MAX_SEMVER_WINDOW_COMMITS);
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_SEMVER_LIMIT)
+        .clamp(1, MAX_SEMVER_LIMIT) as usize;
+
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
+
+    let public_symbol_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM file_symbols fs
+         JOIN indexed_files f ON fs.file_id = f.id
+         WHERE f.project_id = $1 AND fs.visibility = 'public'",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| McpError::internal_error(format!("API count failed: {e}"), None))?;
+    if public_symbol_count > MAX_PUBLIC_SYMBOLS {
+        return Err(McpError::invalid_params(
+            format!(
+                "project has {public_symbol_count} public symbols; max supported is {MAX_PUBLIC_SYMBOLS}"
+            ),
+            None,
+        ));
+    }
 
     // Current public API snapshot. Carry symbol_id so we can fetch
     // the shadow-ASR signature for each present-day public symbol.
@@ -36,13 +72,14 @@ pub async fn tool_semver_break_audit(
             "SELECT fs.id, f.relative_path, fs.name, fs.kind
              FROM file_symbols fs
              JOIN indexed_files f ON fs.file_id = f.id
-             WHERE f.project_id = $1 AND fs.visibility = 'public'",
+             WHERE f.project_id = $1 AND fs.visibility = 'public'
+             ORDER BY f.relative_path, fs.name, fs.kind, fs.id",
         )
         .bind(project_id)
         .fetch_all(pool)
         .await
         .map_err(|e| McpError::internal_error(format!("API query failed: {}", e), None))?;
-    let now_set: HashSet<(String, String, String)> = now
+    let now_set: BTreeSet<(String, String, String)> = now
         .iter()
         .map(|(_, path, name, kind)| (path.clone(), name.clone(), kind.clone()))
         .collect();
@@ -50,9 +87,8 @@ pub async fn tool_semver_break_audit(
     // Build a "previous public API" candidate set by scanning the commit-chunk
     // text from the last N commits for public-marker patterns (Rust `pub fn` /
     // Python top-level `def` / JS `export`).
-    let window = params.window_commits.unwrap_or(50) as i64;
     let candidate_rows: Vec<(String,)> = sqlx::query_as::<_, (String,)>(
-        "SELECT gcc.chunk_text
+        "SELECT gcc.content
          FROM git_commits gc
          JOIN git_commit_chunks gcc ON gcc.commit_id = gc.id
          WHERE gc.project_id = $1
@@ -60,12 +96,12 @@ pub async fn tool_semver_break_audit(
          LIMIT $2",
     )
     .bind(project_id)
-    .bind(window)
+    .bind(i64::from(window))
     .fetch_all(pool)
     .await
     .unwrap_or_default();
     let pub_re = Regex::new(r"(?m)\bpub(?:\(crate\))?\s+(fn|struct|enum|trait|const|static|type)\s+([A-Za-z_][A-Za-z0-9_]*)|\bexport\s+(function|class|const|let|var|interface|enum|type)\s+([A-Za-z_][A-Za-z0-9_]*)|^def\s+([A-Za-z_][A-Za-z0-9_]*)").expect("pub regex");
-    let mut historical: HashSet<(String, String)> = HashSet::new();
+    let mut historical: BTreeSet<(String, String)> = BTreeSet::new();
     for (text,) in &candidate_rows {
         for cap in pub_re.captures_iter(text) {
             let (kind, name) = if let (Some(k), Some(n)) = (cap.get(1), cap.get(2)) {
@@ -88,7 +124,7 @@ pub async fn tool_semver_break_audit(
     // over `now_names` and query via liblevenshtein's `Transducer`. The
     // automaton-based query is O(automaton-state-traversal) per probe,
     // vs the previous brute-force O(|now_names| × L²) per removed symbol.
-    let now_names: HashSet<String> = now_set.iter().map(|(_, n, _)| n.clone()).collect();
+    let now_names: BTreeSet<String> = now_set.iter().map(|(_, n, _)| n.clone()).collect();
     let now_terms: Vec<&str> = now_names.iter().map(|s| s.as_str()).collect();
     let now_dict: DynamicDawgChar<()> = DynamicDawgChar::from_terms(now_terms);
     let now_transducer = Transducer::with_transposition(now_dict);
@@ -106,33 +142,20 @@ pub async fn tool_semver_break_audit(
             // (consonant-cluster change). Plan reference:
             // ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
             // Phase 10.
-            let candidates: Vec<liblevenshtein::transducer::Candidate> =
-                now_transducer.query_with_distance(name, 2).collect();
-            let likely_rename = match candidates.len() {
-                0 => None,
-                1 => Some(candidates.into_iter().next().expect("len 1").term),
-                _ => {
-                    // Pick the candidate with the smallest articulatory
-                    // distance to `name`. Tied articulatory distances
-                    // fall back to the smaller Damerau-Levenshtein.
-                    candidates
-                        .into_iter()
-                        .min_by(|a, b| {
-                            let aad =
-                                crate::fuzzy::phonetic::articulatory_distance_score(name, &a.term);
-                            let bad =
-                                crate::fuzzy::phonetic::articulatory_distance_score(name, &b.term);
-                            aad.partial_cmp(&bad)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                                .then_with(|| a.distance.cmp(&b.distance))
-                        })
-                        .map(|c| c.term)
-                }
-            };
+            let likely_rename = now_transducer
+                .query_with_distance(name, SEMVER_RENAME_MAX_DISTANCE)
+                .min_by(|a, b| {
+                    let aad = crate::fuzzy::phonetic::articulatory_distance_score(name, &a.term);
+                    let bad = crate::fuzzy::phonetic::articulatory_distance_score(name, &b.term);
+                    aad.partial_cmp(&bad)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then_with(|| a.distance.cmp(&b.distance))
+                        .then_with(|| a.term.cmp(&b.term))
+                })
+                .map(|c| c.term);
             removed.push((kind.clone(), name.clone(), likely_rename));
         }
     }
-    let limit = params.limit.unwrap_or(50) as usize;
     removed.truncate(limit);
     let rows_json: Vec<_> = removed
         .into_iter()
@@ -173,8 +196,9 @@ pub async fn tool_semver_break_audit(
     }
 
     json_result(&json!({
-        "project": params.project,
+        "project": project,
         "window_commits": window,
+        "limit": limit,
         "removed_or_renamed": rows_json,
         "current_public_signatures": current_signatures,
         "guidance": "Removed/renamed public symbols are major-version breakages under semver. Rename candidates within Levenshtein <= 2 are flagged for clarification. The `current_public_signatures` channel carries structured signature descriptors (with `signature_shape_hash`) for every present-day public function — consumers can persist these per-release and diff via the canonical sema_helpers::signatures::signature_diff for precise breaking-change classification."

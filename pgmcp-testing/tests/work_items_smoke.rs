@@ -569,6 +569,75 @@ async fn work_item_tracker_full_round_trip() {
     let cv: Value = serde_json::from_str(&text_of(&crit)).expect("criterion body JSON");
     let crit_id = cv["criterion_id"].as_i64().expect("criterion_id present");
 
+    let criterion_count_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM acceptance_criteria ac
+          JOIN work_items wi ON wi.id = ac.item_id
+         WHERE wi.public_id = $1",
+    )
+    .bind(&task_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("criterion count before invalid request");
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_add_criterion",
+                json!({
+                    "public_id": task_id,
+                    "criterion_kind": "not_a_kind",
+                    "description": "invalid criterion must not write",
+                }),
+            )
+            .await
+            .is_err(),
+        "invalid criterion_kind is rejected before insert"
+    );
+    let criterion_count_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM acceptance_criteria ac
+          JOIN work_items wi ON wi.id = ac.item_id
+         WHERE wi.public_id = $1",
+    )
+    .bind(&task_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("criterion count after invalid request");
+    assert_eq!(
+        criterion_count_before, criterion_count_after,
+        "invalid criterion metadata leaves no row behind"
+    );
+
+    let evidence_count_before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM verification_evidence WHERE criterion_id = $1")
+            .bind(crit_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("evidence count before invalid request");
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_record_evidence",
+                json!({
+                    "criterion_id": crit_id,
+                    "verdict": "pass",
+                    "coverage_count": 3,
+                    "coverage_total": 2,
+                }),
+            )
+            .await
+            .is_err(),
+        "coverage_count above coverage_total is rejected before insert"
+    );
+    let evidence_count_after: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM verification_evidence WHERE criterion_id = $1")
+            .bind(crit_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("evidence count after invalid request");
+    assert_eq!(
+        evidence_count_before, evidence_count_after,
+        "invalid evidence metadata leaves no row behind"
+    );
+
     let ev = server
         .call_tool_cli(
             "work_item_record_evidence",
@@ -599,6 +668,16 @@ async fn work_item_tracker_full_round_trip() {
             .is_err(),
         "attempt_verify must be REFUSED: only manual (untrusted) evidence exists — an agent cannot self-verify"
     );
+    let status_after_manual_attempt: String =
+        sqlx::query_scalar("SELECT status FROM work_items WHERE public_id = $1")
+            .bind(&task_id)
+            .fetch_one(db.pool())
+            .await
+            .expect("status after rejected manual verification attempt");
+    assert_eq!(
+        status_after_manual_attempt, "claimed_done",
+        "rejected manual verification attempts leave status unchanged"
+    );
 
     // ── defer is USER-only: a wrong token is refused; the right token works;
     //    then reinstate brings it back to in_progress. ──
@@ -621,6 +700,37 @@ async fn work_item_tracker_full_round_trip() {
         .expect("defer with the correct user token must succeed");
     let dv: Value = serde_json::from_str(&text_of(&deferred)).expect("defer body JSON");
     assert_eq!(dv["status"].as_str(), Some("deferred"));
+
+    let negotiations_after_defer: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scope_negotiations
+         WHERE item_id = $1 AND action = 'defer'",
+    )
+    .bind(dv["id"].as_i64().expect("deferred work item id"))
+    .fetch_one(db.pool())
+    .await
+    .expect("negotiation count after defer");
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_defer",
+                json!({ "public_id": task_id, "reason": "duplicate defer", "user_token": "smoke-token" }),
+            )
+            .await
+            .is_err(),
+        "a duplicate defer is rejected by the transition matrix"
+    );
+    let negotiations_after_failed_defer: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scope_negotiations
+         WHERE item_id = $1 AND action = 'defer'",
+    )
+    .bind(dv["id"].as_i64().expect("deferred work item id"))
+    .fetch_one(db.pool())
+    .await
+    .expect("negotiation count after failed duplicate defer");
+    assert_eq!(
+        negotiations_after_defer, negotiations_after_failed_defer,
+        "failed defer transitions roll back their negotiation audit row"
+    );
 
     let reinstated = server
         .call_tool_cli(
@@ -1064,6 +1174,33 @@ async fn work_item_link_experiment_smoke() {
             .is_err(),
         "linking an unknown experiment must be rejected"
     );
+
+    let oversized_title = "x".repeat(513);
+    let before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_items WHERE kind = 'experiment' AND title = $1",
+    )
+    .bind(&oversized_title)
+    .fetch_one(db.pool())
+    .await
+    .expect("count before invalid auto-create");
+    assert!(
+        server
+            .call_tool_cli(
+                "work_item_link_experiment",
+                json!({ "experiment_slug": "smoke-exp", "title": oversized_title.clone() })
+            )
+            .await
+            .is_err(),
+        "oversized auto-create title must reject before any tracker write"
+    );
+    let after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM work_items WHERE kind = 'experiment' AND title = $1",
+    )
+    .bind(&oversized_title)
+    .fetch_one(db.pool())
+    .await
+    .expect("count after invalid auto-create");
+    assert_eq!(before, after);
 }
 
 #[tokio::test]

@@ -1,6 +1,8 @@
 //! SOTA Phases 7-11 integration tests.
 
-use pgmcp_testing::pool_tool_helpers::{seed_file, seed_project, server_with_pool};
+use pgmcp_testing::pool_tool_helpers::{
+    seed_file, seed_file_symbol, seed_project, server_with_pool,
+};
 use pgmcp_testing::require_test_db;
 use serde_json::Value;
 
@@ -70,6 +72,40 @@ async fn semver_break_audit_runs() {
         .await
         .expect("tool");
     assert!(r.is_error != Some(true));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn semver_break_audit_uses_current_commit_chunk_schema_and_bounds() {
+    let db = require_test_db!();
+    let p = seed_project(db.pool(), "p7-sba-scope", "/ws/p7-sba-scope").await;
+    let f = seed_file(db.pool(), p, "/ws/p7-sba-scope/a.rs", "a.rs").await;
+    seed_file_symbol(db.pool(), f, "old_api2", "fn", 1, Some("public")).await;
+    seed_commit_chunk(db.pool(), p, "sba-old", "+ pub fn old_api() {}\n").await;
+
+    let server = server_with_pool(db.pool().clone());
+    let r = server
+        .call_tool_cli(
+            "semver_break_audit",
+            serde_json::json!({
+                "project": " p7-sba-scope ",
+                "window_commits": 0,
+                "limit": -10
+            }),
+        )
+        .await
+        .expect("semver_break_audit");
+    assert!(r.is_error != Some(true));
+    let v: Value = serde_json::from_str(text_of(&r)).expect("semver_break_audit JSON");
+
+    assert_eq!(v["project"].as_str(), Some("p7-sba-scope"));
+    assert_eq!(v["window_commits"].as_i64(), Some(1));
+    assert_eq!(v["limit"].as_i64(), Some(1));
+    let rows = v["removed_or_renamed"]
+        .as_array()
+        .expect("removed_or_renamed array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["name"].as_str(), Some("old_api"));
+    assert_eq!(rows[0]["likely_rename_to"].as_str(), Some("old_api2"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

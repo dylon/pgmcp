@@ -10,6 +10,7 @@
 
 #![allow(unused_imports)]
 
+use futures::TryStreamExt;
 use regex::Regex;
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
@@ -22,25 +23,29 @@ use crate::mcp::tools::sema_helpers::effects::symbols_with_all_effects;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::parsing::type_tags::vocabulary::{EFFECT_ASYNC, EFFECT_BLOCKING_IO};
 
+const MAX_BLOCKING_IN_ASYNC_LIMIT: i32 = 1_000;
+
 pub async fn tool_blocking_in_async(
     ctx: &SystemContext,
     params: BlockingInAsyncParams,
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "blocking_in_async", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
-    let limit = params.limit.unwrap_or(50);
+    let limit = params
+        .limit
+        .unwrap_or(50)
+        .clamp(1, MAX_BLOCKING_IN_ASYNC_LIMIT);
 
-    let rows: Vec<(String, String, Option<String>)> = sqlx::query_as::<_, (String, String, Option<String>)>(
+    let mut rows = sqlx::query_as::<_, (String, String, Option<String>)>(
         "SELECT relative_path, language, content
          FROM indexed_files
          WHERE project_id = $1 AND content IS NOT NULL AND language IN ('rust','javascript','typescript','python')"
     )
     .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| McpError::internal_error(format!("Scan failed: {}", e), None))?;
+    .fetch(pool);
 
     let async_fn_re =
         Regex::new(r"(?m)\b(async\s+fn|async\s+function|async\s+def)\b").expect("async fn regex");
@@ -49,7 +54,11 @@ pub async fn tool_blocking_in_async(
     ).expect("blocking regex");
 
     let mut findings: Vec<serde_json::Value> = Vec::new();
-    for (path, lang, content) in rows {
+    while let Some((path, lang, content)) = rows
+        .try_next()
+        .await
+        .map_err(|e| McpError::internal_error(format!("Scan failed: {}", e), None))?
+    {
         let Some(c) = content else { continue };
         // For each async fn body, count blocking calls.
         let mut anchors: Vec<usize> = async_fn_re.find_iter(&c).map(|m| m.end()).collect();
@@ -85,24 +94,28 @@ pub async fn tool_blocking_in_async(
                     "line": line,
                     "blocking_call": m.as_str(),
                 }));
-                if findings.len() >= limit.max(0) as usize {
+                if findings.len() >= limit as usize {
+                    drop(rows);
                     let effect_intersection = effect_channel(pool, project_id).await;
-                    return done_with_effects(&params.project, findings, effect_intersection);
+                    return done_with_effects(project, limit, findings, effect_intersection);
                 }
             }
         }
     }
+    drop(rows);
     let effect_intersection = effect_channel(pool, project_id).await;
-    done_with_effects(&params.project, findings, effect_intersection)
+    done_with_effects(project, limit, findings, effect_intersection)
 }
 
 fn done_with_effects(
     project: &str,
+    limit: i32,
     regex_matches: Vec<serde_json::Value>,
     effect_intersection: Vec<serde_json::Value>,
 ) -> Result<CallToolResult, McpError> {
     json_result(&json!({
         "project": project,
+        "limit": limit,
         "regex_matches": regex_matches,
         "effect_intersection": effect_intersection,
         "guidance": "Sync I/O / Mutex / sleep inside async functions blocks the runtime executor. Replace with tokio::fs, tokio::sync::Mutex, tokio::time::sleep, or a spawn_blocking shim. The `effect_intersection` channel surfaces symbols where the extractor flagged BOTH async and blocking_io effects (Rust backend only as of this writing)."

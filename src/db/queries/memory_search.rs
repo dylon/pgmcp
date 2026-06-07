@@ -386,11 +386,15 @@ pub async fn memory_hybrid_search(
                    ROW_NUMBER() OVER (ORDER BY o.embedding <=> $1) AS rnk
             FROM memory_observations o
             JOIN memory_entities e ON e.id = o.entity_id AND e.valid_to IS NULL
-            LEFT JOIN memory_entity_scope es ON es.entity_id = e.id
-            LEFT JOIN memory_entity_tier  et ON et.entity_id = e.id
             WHERE o.embedding IS NOT NULL AND o.valid_to IS NULL
-              AND ($3::bigint IS NULL OR es.scope_id = $3)
-              AND ($4::text   IS NULL OR et.tier::text = $4)
+              AND ($3::bigint IS NULL OR EXISTS (
+                  SELECT 1 FROM memory_entity_scope es
+                  WHERE es.entity_id = e.id AND es.scope_id = $3
+              ))
+              AND ($4::text IS NULL OR EXISTS (
+                  SELECT 1 FROM memory_entity_tier et
+                  WHERE et.entity_id = e.id AND et.tier::text = $4
+              ))
             ORDER BY o.embedding <=> $1
             LIMIT $5
          ),
@@ -405,11 +409,15 @@ pub async fn memory_hybrid_search(
                    ) AS rnk
             FROM memory_observations o
             JOIN memory_entities e ON e.id = o.entity_id AND e.valid_to IS NULL
-            LEFT JOIN memory_entity_scope es ON es.entity_id = e.id
-            LEFT JOIN memory_entity_tier  et ON et.entity_id = e.id
             WHERE o.valid_to IS NULL
-              AND ($3::bigint IS NULL OR es.scope_id = $3)
-              AND ($4::text   IS NULL OR et.tier::text = $4)
+              AND ($3::bigint IS NULL OR EXISTS (
+                  SELECT 1 FROM memory_entity_scope es
+                  WHERE es.entity_id = e.id AND es.scope_id = $3
+              ))
+              AND ($4::text IS NULL OR EXISTS (
+                  SELECT 1 FROM memory_entity_tier et
+                  WHERE et.entity_id = e.id AND et.tier::text = $4
+              ))
               AND to_tsvector('english', o.content) @@ plainto_tsquery('english', $2)
             LIMIT $5
          ),

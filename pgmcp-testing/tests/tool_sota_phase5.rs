@@ -53,6 +53,35 @@ async fn seed_panic_function(
     symbol_id
 }
 
+async fn seed_effect_symbol(
+    pool: &sqlx::PgPool,
+    file_id: i64,
+    name: &str,
+    effects: &[&str],
+) -> i64 {
+    let symbol_id: i64 = sqlx::query_scalar(
+        "INSERT INTO file_symbols (file_id, name, kind, start_line, end_line, visibility)
+         VALUES ($1, $2, 'function', 1, 3, 'private')
+         RETURNING id",
+    )
+    .bind(file_id)
+    .bind(name)
+    .fetch_one(pool)
+    .await
+    .expect("file symbol");
+
+    for effect in effects {
+        sqlx::query("INSERT INTO symbol_effects (symbol_id, effect) VALUES ($1, $2)")
+            .bind(symbol_id)
+            .bind(effect)
+            .execute(pool)
+            .await
+            .expect("symbol effect");
+    }
+
+    symbol_id
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn lockset_races_runs() {
     let db = require_test_db!();
@@ -67,6 +96,49 @@ async fn lockset_races_runs() {
         .await
         .expect("tool");
     assert!(r.is_error != Some(true));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lockset_races_scopes_effect_breakdown_to_project() {
+    let db = require_test_db!();
+    let suffix = Uuid::now_v7().simple();
+    let target = format!("p5-lockset-scope-{suffix}");
+    let other = format!("p5-lockset-other-{suffix}");
+    let target_id = seed_project(db.pool(), &target, &format!("/ws/{target}")).await;
+    let other_id = seed_project(db.pool(), &other, &format!("/ws/{other}")).await;
+    let target_file = seed_file(db.pool(), target_id, &format!("/ws/{target}/a.rs"), "a.rs").await;
+    let other_file = seed_file(db.pool(), other_id, &format!("/ws/{other}/b.rs"), "b.rs").await;
+    sqlx::query("UPDATE indexed_files SET content = $1, language = 'rust' WHERE id = $2")
+        .bind("fn guarded(m: std::sync::Mutex<u8>) { let _g = m.lock(); }\n")
+        .bind(target_file)
+        .execute(db.pool())
+        .await
+        .expect("seed target content");
+
+    seed_effect_symbol(db.pool(), target_file, "guarded", &["lock_acquire"]).await;
+    seed_effect_symbol(db.pool(), other_file, "unrelated", &["may_panic"]).await;
+
+    let server = server_with_pool(db.pool().clone());
+    let r = server
+        .call_tool_cli(
+            "lockset_races",
+            serde_json::json!({"project": format!(" {target} "), "limit": 5}),
+        )
+        .await
+        .expect("tool");
+    assert!(r.is_error != Some(true));
+    let v: serde_json::Value = serde_json::from_str(&text_of(&r)).expect("lockset JSON");
+    assert_eq!(v["project"].as_str(), Some(target.as_str()));
+    assert_eq!(v["limit"].as_u64(), Some(5));
+    let effects = v["effect_breakdown"].as_array().expect("effect_breakdown");
+    assert!(
+        effects.iter().any(|e| e["effect"] == "lock_acquire"),
+        "target effect missing: {effects:?}"
+    );
+    assert!(
+        effects.iter().all(|e| e["effect"] != "may_panic"),
+        "other project effect leaked into lockset_races: {effects:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -380,6 +452,46 @@ async fn blocking_in_async_runs() {
         .await
         .expect("tool");
     assert!(r.is_error != Some(true));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn blocking_in_async_streams_and_clamps_limit() {
+    let db = require_test_db!();
+    let suffix = Uuid::now_v7().simple();
+    let project = format!("p5-ba-bound-{suffix}");
+    let p = seed_project(db.pool(), &project, &format!("/ws/{project}")).await;
+    let file_id = seed_file(db.pool(), p, &format!("/ws/{project}/a.rs"), "a.rs").await;
+    sqlx::query("UPDATE indexed_files SET content = $1, language = 'rust' WHERE id = $2")
+        .bind(
+            "async fn blocked() {\n    std::thread::sleep(std::time::Duration::from_millis(1));\n    std::fs::read_to_string(\"x\").ok();\n}\n",
+        )
+        .bind(file_id)
+        .execute(db.pool())
+        .await
+        .expect("seed blocking async content");
+
+    seed_effect_symbol(db.pool(), file_id, "blocked", &["async", "blocking_io"]).await;
+
+    let server = server_with_pool(db.pool().clone());
+    let r = server
+        .call_tool_cli(
+            "blocking_in_async",
+            serde_json::json!({"project": format!(" {project} "), "limit": -50}),
+        )
+        .await
+        .expect("tool");
+    assert!(r.is_error != Some(true));
+    let v: serde_json::Value = serde_json::from_str(&text_of(&r)).expect("blocking JSON");
+    assert_eq!(v["project"].as_str(), Some(project.as_str()));
+    assert_eq!(v["limit"].as_u64(), Some(1));
+    let regex_matches = v["regex_matches"].as_array().expect("regex_matches");
+    assert_eq!(regex_matches.len(), 1);
+    assert_eq!(regex_matches[0]["file"].as_str(), Some("a.rs"));
+    let effect_intersection = v["effect_intersection"]
+        .as_array()
+        .expect("effect_intersection");
+    assert_eq!(effect_intersection.len(), 1);
+    assert_eq!(effect_intersection[0]["name"].as_str(), Some("blocked"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

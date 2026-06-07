@@ -9,9 +9,10 @@
 //! `docs/scientific-ledger/` so generated and legacy ledgers chunk identically
 //! once markdown heading-aware chunking is in effect.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::db::queries::{
     self, ExperimentCoreRow, ExperimentEvent, ExperimentHypothesisRow, ExperimentResultRow,
@@ -30,6 +31,67 @@ fn fmt_opt_f64(v: Option<f64>) -> String {
         Some(x) if x.is_finite() => format!("{x:.6}"),
         _ => "n/a".to_string(),
     }
+}
+
+fn safe_ledger_dir(raw: &str) -> anyhow::Result<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("ledger_dir must be non-empty");
+    }
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        anyhow::bail!("ledger_dir must be relative");
+    }
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("ledger_dir must not contain parent/root components")
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        anyhow::bail!("ledger_dir must contain at least one normal component");
+    }
+    Ok(out)
+}
+
+fn safe_ledger_slug(raw: &str) -> anyhow::Result<String> {
+    let slug = raw.trim();
+    if slug.is_empty() {
+        anyhow::bail!("experiment slug must be non-empty");
+    }
+    if slug.len() > 160 {
+        anyhow::bail!("experiment slug is too long for a ledger filename");
+    }
+    if !slug
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        anyhow::bail!(
+            "experiment slug must contain only ASCII letters, digits, '-' or '_' for ledger rendering"
+        );
+    }
+    Ok(slug.to_string())
+}
+
+fn atomic_write(path: &Path, content: &str) -> anyhow::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("ledger path has no parent directory"))?;
+    std::fs::create_dir_all(dir)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("ledger path has no file name"))?
+        .to_string_lossy();
+    let tmp = dir.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+    if let Err(e) = std::fs::write(&tmp, content).and_then(|_| std::fs::rename(&tmp, path)) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    Ok(())
 }
 
 /// Render the markdown body (pure; no I/O) from the fetched record.
@@ -206,9 +268,20 @@ pub async fn render_and_write(
     base_dir: &Path,
     dry_run: bool,
 ) -> anyhow::Result<RenderedLedger> {
+    if let Some(id) = experiment_id
+        && id <= 0
+    {
+        anyhow::bail!("experiment_id must be positive");
+    }
+    let slug = slug.map(str::trim).filter(|s| !s.is_empty());
+    if experiment_id.is_none() && slug.is_none() {
+        anyhow::bail!("experiment_id or non-empty slug is required");
+    }
+    let ledger_dir = safe_ledger_dir(ledger_dir)?;
     let core = queries::get_experiment_core(pool, experiment_id, slug)
         .await?
         .ok_or_else(|| anyhow::anyhow!("experiment not found"))?;
+    let slug = safe_ledger_slug(&core.slug)?;
     let hyps = queries::list_experiment_hypotheses(pool, core.id).await?;
     let results = queries::list_experiment_results(pool, core.id).await?;
     let events = queries::experiment_timeline(pool, core.id).await?;
@@ -216,13 +289,12 @@ pub async fn render_and_write(
     let content = render_markdown(&core, &hyps, &results, &events);
     let date = core.created_at.format("%Y-%m-%d").to_string();
     let dir = base_dir.join(ledger_dir);
-    let path = dir.join(format!("{}-{}.md", core.slug, date));
+    let path = dir.join(format!("{slug}-{date}.md"));
 
     let written = if dry_run {
         false
     } else {
-        std::fs::create_dir_all(&dir)?;
-        std::fs::write(&path, &content)?;
+        atomic_write(&path, &content)?;
         true
     };
     Ok(RenderedLedger {
@@ -265,5 +337,17 @@ mod tests {
         assert!(md.contains("## Measurements & Decisions"));
         assert!(md.contains("## What did NOT work"));
         assert!(md.contains("## Timeline"));
+    }
+
+    #[test]
+    fn ledger_path_guards_reject_escape_inputs() {
+        assert!(safe_ledger_dir("docs/scientific-ledger").is_ok());
+        assert!(safe_ledger_dir("../outside").is_err());
+        assert!(safe_ledger_dir("/tmp/ledger").is_err());
+        assert!(safe_ledger_dir(" ").is_err());
+        assert!(safe_ledger_slug("safe-slug_1").is_ok());
+        assert!(safe_ledger_slug("../escape").is_err());
+        assert!(safe_ledger_slug("bad/slug").is_err());
+        assert!(safe_ledger_slug(" ").is_err());
     }
 }

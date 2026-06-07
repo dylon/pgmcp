@@ -53,6 +53,17 @@ impl ReportFormat {
     pub fn valid_values() -> &'static str {
         "markdown|org|latex|html|text|json"
     }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReportFormat::Markdown => "markdown",
+            ReportFormat::Org => "org",
+            ReportFormat::Latex => "latex",
+            ReportFormat::Html => "html",
+            ReportFormat::Text => "text",
+            ReportFormat::Json => "json",
+        }
+    }
 }
 
 /// The structured report as a JSON value (for the `include_underlying_json`

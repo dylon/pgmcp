@@ -9,11 +9,18 @@ use rmcp::model::CallToolResult;
 use serde_json::json;
 use std::sync::atomic::Ordering;
 
+use futures::TryStreamExt;
+
 use crate::context::SystemContext;
 use crate::mcp::server::SecretDetectionParams;
 use crate::mcp::tools::sema_helpers::effects::symbols_with_any_effect;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::parsing::type_tags::vocabulary::{EFFECT_CRYPTO, EFFECT_CRYPTO_WEAK};
+
+const DEFAULT_SECRET_MIN_ENTROPY: f64 = 4.0;
+const MAX_SECRET_MIN_ENTROPY: f64 = 8.0;
+const DEFAULT_SECRET_FINDING_LIMIT: i32 = 100;
+const MAX_SECRET_FINDING_LIMIT: i32 = 500;
 
 /// Shannon entropy of a byte string (uses base-2 log; max for 64 distinct
 /// chars ≈ 6.0). Hardcoded keys typically score above 4.0.
@@ -43,10 +50,19 @@ pub async fn tool_secret_detection(
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "secret_detection", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let min_entropy = params.min_entropy.unwrap_or(DEFAULT_SECRET_MIN_ENTROPY);
+    if !min_entropy.is_finite() {
+        return Err(McpError::invalid_params("min_entropy must be finite", None));
+    }
+    let min_entropy = min_entropy.clamp(0.0, MAX_SECRET_MIN_ENTROPY);
+    let limit = params
+        .limit
+        .unwrap_or(DEFAULT_SECRET_FINDING_LIMIT)
+        .clamp(1, MAX_SECRET_FINDING_LIMIT) as usize;
+
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
-    let min_entropy = params.min_entropy.unwrap_or(4.0);
-    let limit = params.limit.unwrap_or(100);
 
     // Known prefix patterns + generic high-entropy quoted strings.
     let prefix_re = Regex::new(
@@ -55,16 +71,23 @@ pub async fn tool_secret_detection(
     .expect("secret prefix regex");
     let highent_re = Regex::new(r#"["']([A-Za-z0-9/_+=-]{20,})["']"#).expect("high entropy regex");
 
-    let rows: Vec<(String, Option<String>)> = sqlx::query_as::<_, (String, Option<String>)>(
-        "SELECT relative_path, content FROM indexed_files WHERE project_id = $1 AND content IS NOT NULL",
+    let mut rows = sqlx::query_as::<_, (String, Option<String>)>(
+        "SELECT relative_path, content FROM indexed_files
+         WHERE project_id = $1 AND content IS NOT NULL
+         ORDER BY id",
     )
     .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| McpError::internal_error(format!("Scan failed: {}", e), None))?;
+    .fetch(pool);
 
     let mut findings: Vec<serde_json::Value> = Vec::new();
-    'outer: for (path, content) in rows {
+    while findings.len() < limit {
+        let Some((path, content)) = rows
+            .try_next()
+            .await
+            .map_err(|e| McpError::internal_error(format!("Scan failed: {e}"), None))?
+        else {
+            break;
+        };
         let Some(c) = content else { continue };
         for cap in prefix_re.captures_iter(&c) {
             if let Some(secret) = cap.get(1) {
@@ -75,10 +98,13 @@ pub async fn tool_secret_detection(
                     "kind": "known-prefix",
                     "preview": &secret.as_str()[..secret.as_str().len().min(8)],
                 }));
-                if findings.len() >= limit.max(0) as usize {
-                    break 'outer;
+                if findings.len() >= limit {
+                    break;
                 }
             }
+        }
+        if findings.len() >= limit {
+            break;
         }
         for cap in highent_re.captures_iter(&c) {
             if let Some(s) = cap.get(1) {
@@ -93,13 +119,15 @@ pub async fn tool_secret_detection(
                         "entropy": h,
                         "len": txt.len(),
                     }));
-                    if findings.len() >= limit.max(0) as usize {
-                        break 'outer;
+                    if findings.len() >= limit {
+                        break;
                     }
                 }
             }
         }
     }
+    drop(rows);
+
     // Shadow-ASR channel: symbols flagged with crypto effects — these are
     // priority targets for secret-detection review (the symbol's body or
     // arguments likely touch crypto material).
@@ -118,8 +146,9 @@ pub async fn tool_secret_detection(
     })
     .collect::<Vec<_>>();
     json_result(&json!({
-        "project": params.project,
+        "project": project,
         "min_entropy": min_entropy,
+        "limit": limit,
         "findings": findings,
         "crypto_symbols": crypto_symbols,
         "guidance": "Combines regex prefix-matching (AWS keys, GitHub PATs, OpenAI keys, Slack tokens, PEM headers) with Shannon entropy ≥ threshold on string literals. Review preview bytes carefully — false positives are possible on base64 test data."

@@ -19,6 +19,7 @@ use pgmcp::ontology::edge::OntologyRelation;
 use pgmcp::ontology::facet::Facet;
 use pgmcp::tracker::transition::Actor;
 use tempfile::tempdir;
+use uuid::Uuid;
 
 /// Accel A — concept trie rebuilt from PG answers typo-tolerant + prefix lookups.
 #[tokio::test]
@@ -146,5 +147,88 @@ async fn concept_descendants_returns_bounded_subtree() {
     assert!(
         !shallow.iter().any(|e| e.child_id == b),
         "the depth-2 node is excluded at depth=1"
+    );
+}
+
+#[tokio::test]
+async fn concept_descendants_suppresses_cycles_and_non_concepts() {
+    let db = pgmcp_testing::require_test_db!();
+    let pool = db.pool();
+    let suffix = Uuid::new_v4().simple();
+
+    let (root, _) = queries::create_concept(
+        pool,
+        &format!("CycleRoot{suffix}"),
+        Facet::DataStructure,
+        Actor::User,
+    )
+    .await
+    .expect("root");
+    let (a, _) = queries::create_concept(
+        pool,
+        &format!("CycleA{suffix}"),
+        Facet::DataStructure,
+        Actor::User,
+    )
+    .await
+    .expect("a");
+    let (b, _) = queries::create_concept(
+        pool,
+        &format!("CycleB{suffix}"),
+        Facet::DataStructure,
+        Actor::User,
+    )
+    .await
+    .expect("b");
+
+    queries::insert_ontology_edge(pool, a, root, OntologyRelation::IsA, 1.0)
+        .await
+        .expect("a is_a root");
+    queries::insert_ontology_edge(pool, b, a, OntologyRelation::IsA, 1.0)
+        .await
+        .expect("b is_a a");
+    queries::insert_ontology_edge(pool, root, b, OntologyRelation::IsA, 1.0)
+        .await
+        .expect("corrupt root cycle");
+
+    let non_concept: i64 = sqlx::query_scalar(
+        "INSERT INTO memory_entities (name, entity_type, source)
+         VALUES ($1, 'note', 'agent_write'::memory_source)
+         RETURNING id",
+    )
+    .bind(format!("NotAConcept{suffix}"))
+    .fetch_one(pool)
+    .await
+    .expect("non-concept entity");
+    sqlx::query(
+        "INSERT INTO memory_relations (from_entity_id, to_entity_id, relation_type, source)
+         VALUES ($1, $2, 'is_a', 'agent_write'::memory_source)",
+    )
+    .bind(non_concept)
+    .bind(root)
+    .execute(pool)
+    .await
+    .expect("non-concept hierarchy-like relation");
+
+    let edges = queries::concept_descendants(pool, root, 5)
+        .await
+        .expect("descendants");
+    assert!(
+        edges
+            .iter()
+            .all(|edge| edge.child_id != root && edge.child_id != non_concept),
+        "subtree must not contain the root as its own descendant or non-concept endpoints: {edges:?}"
+    );
+
+    let mut keys: Vec<_> = edges
+        .iter()
+        .map(|edge| (edge.child_id, edge.parent_id, edge.relation.clone()))
+        .collect();
+    keys.sort();
+    keys.dedup();
+    assert_eq!(
+        keys.len(),
+        edges.len(),
+        "subtree edges must be duplicate-free"
     );
 }

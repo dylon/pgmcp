@@ -562,146 +562,16 @@ pub async fn set_work_item_status(
     negotiation_id: Option<i64>,
 ) -> Result<WorkItemRow, WorkItemOpError> {
     let mut tx = pool.begin().await?;
-    let res = async {
-        let current = sqlx::query_as::<_, WorkItemRow>(&format!(
-            "SELECT {WORK_ITEM_COLS} FROM work_items WHERE id = $1 FOR UPDATE"
-        ))
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .ok_or(WorkItemOpError::NotFound)?;
-        let from = WorkItemStatus::parse(&current.status).ok_or_else(|| {
-            WorkItemOpError::Db(sqlx::Error::Decode(
-                format!("unknown stored status '{}'", current.status).into(),
-            ))
-        })?;
-
-        let row: (bool, bool) = sqlx::query_as(
-            "SELECT
-                EXISTS (SELECT 1 FROM verification_evidence WHERE item_id = $1) AS present,
-                (
-                  EXISTS (SELECT 1 FROM acceptance_criteria WHERE item_id = $1 AND required)
-                  AND NOT EXISTS (
-                    SELECT 1 FROM acceptance_criteria ac
-                    WHERE ac.item_id = $1 AND ac.required
-                      AND NOT EXISTS (
-                        SELECT 1 FROM verification_evidence e
-                        WHERE e.criterion_id = ac.id
-                          AND e.verdict = 'pass'
-                          AND e.source IN ('ci','stop_hook','subagent_audit',
-                                           'external_auditor','user_signoff','experiment')
-                      )
-                  )
-                ) AS passing",
-        )
-        .bind(id)
-        .fetch_one(&mut *tx)
-        .await?;
-        let ctx = TransitionContext {
-            evidence_present: row.0,
-            evidence_passing: row.1,
-            user_negotiation: negotiation_id.is_some(),
-        };
-        check_transition(from, to, actor, ctx).map_err(WorkItemOpError::Transition)?;
-
-        let updated = sqlx::query_as::<_, WorkItemRow>(&format!(
-            "UPDATE work_items SET
-                status = $2,
-                updated_at = NOW(),
-                started_at = CASE WHEN $2 = 'in_progress' AND started_at IS NULL
-                                  THEN NOW() ELSE started_at END,
-                verified_at = CASE WHEN $2 = 'verified' THEN NOW() ELSE verified_at END,
-                completed_at = CASE WHEN $2 IN ('verified','cancelled')
-                                    THEN NOW() ELSE completed_at END
-             WHERE id = $1
-             RETURNING {WORK_ITEM_COLS}"
-        ))
-        .bind(id)
-        .bind(to.as_str())
-        .fetch_one(&mut *tx)
-        .await?;
-
-        sqlx::query(
-            "INSERT INTO work_item_status_history
-                (item_id, from_status, to_status, actor_kind, actor_id, evidence_id,
-                 negotiation_id, reason)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
-        )
-        .bind(id)
-        .bind(from.as_str())
-        .bind(to.as_str())
-        .bind(actor.as_str())
-        .bind(actor_id)
-        .bind(evidence_id)
-        .bind(negotiation_id)
-        .bind(reason)
-        .execute(&mut *tx)
-        .await?;
-
-        // Auto-unblock cascade: when an item reaches `verified`, dependents that
-        // were `blocked` solely on it may now be actionable. In the SAME tx, move
-        // each such dependent `blocked → ready` as `Actor::System` — legal
-        // (System is in the Blocked→Ready actor set) and provably incapable of
-        // reaching a judgment state (System has NO arm into verified/rejected/
-        // deferred/confirmed; see `transition.rs::system_absent_from_judgment_columns`).
-        // Routed through `check_transition` so the gate is never bypassed.
-        if to == WorkItemStatus::Verified {
-            let candidates: Vec<i64> = sqlx::query_scalar(
-                "SELECT DISTINCT w.id FROM work_items w
-                 JOIN item_relations r ON (
-                     (r.relation_type = 'depends_on' AND r.from_item_id = w.id AND r.to_item_id = $1)
-                     OR (r.relation_type = 'blocks' AND r.to_item_id = w.id AND r.from_item_id = $1))
-                 WHERE w.status = 'blocked'",
-            )
-            .bind(id)
-            .fetch_all(&mut *tx)
-            .await?;
-            for dep_id in candidates {
-                // Still blocked iff an UNRESOLVED blocker remains (the inverse of the
-                // NOT_BLOCKED predicate, evaluated within this tx so the just-verified
-                // row counts as cleared).
-                let still_blocked: bool = sqlx::query_scalar(
-                    "SELECT EXISTS (
-                        SELECT 1 FROM item_relations r JOIN work_items b ON (
-                            (r.relation_type = 'depends_on' AND r.from_item_id = $1 AND b.id = r.to_item_id)
-                            OR (r.relation_type = 'blocks' AND r.to_item_id = $1 AND b.id = r.from_item_id))
-                        WHERE b.status NOT IN ('verified','claimed_done','deferred','cancelled'))",
-                )
-                .bind(dep_id)
-                .fetch_one(&mut *tx)
-                .await?;
-                if still_blocked {
-                    continue;
-                }
-                // Trust gate: System may perform ONLY Blocked → Ready.
-                check_transition(
-                    WorkItemStatus::Blocked,
-                    WorkItemStatus::Ready,
-                    Actor::System,
-                    TransitionContext::default(),
-                )
-                .map_err(WorkItemOpError::Transition)?;
-                sqlx::query(
-                    "UPDATE work_items SET status = 'ready', updated_at = NOW()
-                     WHERE id = $1 AND status = 'blocked'",
-                )
-                .bind(dep_id)
-                .execute(&mut *tx)
-                .await?;
-                sqlx::query(
-                    "INSERT INTO work_item_status_history
-                        (item_id, from_status, to_status, actor_kind, actor_id, reason)
-                     VALUES ($1, 'blocked', 'ready', 'system', 'system',
-                             'auto-unblocked: last blocker verified')",
-                )
-                .bind(dep_id)
-                .execute(&mut *tx)
-                .await?;
-            }
-        }
-
-        Ok::<WorkItemRow, WorkItemOpError>(updated)
-    }
+    let res = set_work_item_status_in_tx(
+        &mut tx,
+        id,
+        to,
+        actor,
+        actor_id,
+        reason,
+        evidence_id,
+        negotiation_id,
+    )
     .await;
 
     match res {
@@ -714,6 +584,160 @@ pub async fn set_work_item_status(
             Err(e)
         }
     }
+}
+
+/// Transactional variant of [`set_work_item_status`]. Callers that need to
+/// commit the status transition together with sidecar/audit rows should use
+/// this helper inside their existing transaction.
+#[allow(clippy::too_many_arguments)]
+pub async fn set_work_item_status_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    id: i64,
+    to: WorkItemStatus,
+    actor: Actor,
+    actor_id: Option<&str>,
+    reason: Option<&str>,
+    evidence_id: Option<i64>,
+    negotiation_id: Option<i64>,
+) -> Result<WorkItemRow, WorkItemOpError> {
+    let current = sqlx::query_as::<_, WorkItemRow>(&format!(
+        "SELECT {WORK_ITEM_COLS} FROM work_items WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or(WorkItemOpError::NotFound)?;
+    let from = WorkItemStatus::parse(&current.status).ok_or_else(|| {
+        WorkItemOpError::Db(sqlx::Error::Decode(
+            format!("unknown stored status '{}'", current.status).into(),
+        ))
+    })?;
+
+    let row: (bool, bool) = sqlx::query_as(
+        "SELECT
+            EXISTS (SELECT 1 FROM verification_evidence WHERE item_id = $1) AS present,
+            (
+              EXISTS (SELECT 1 FROM acceptance_criteria WHERE item_id = $1 AND required)
+              AND NOT EXISTS (
+                SELECT 1 FROM acceptance_criteria ac
+                WHERE ac.item_id = $1 AND ac.required
+                  AND NOT EXISTS (
+                    SELECT 1 FROM verification_evidence e
+                    WHERE e.criterion_id = ac.id
+                      AND e.verdict = 'pass'
+                      AND e.source IN ('ci','stop_hook','subagent_audit',
+                                       'external_auditor','user_signoff','experiment')
+                  )
+              )
+            ) AS passing",
+    )
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let ctx = TransitionContext {
+        evidence_present: row.0,
+        evidence_passing: row.1,
+        user_negotiation: negotiation_id.is_some(),
+    };
+    check_transition(from, to, actor, ctx).map_err(WorkItemOpError::Transition)?;
+
+    let updated = sqlx::query_as::<_, WorkItemRow>(&format!(
+        "UPDATE work_items SET
+            status = $2,
+            updated_at = NOW(),
+            started_at = CASE WHEN $2 = 'in_progress' AND started_at IS NULL
+                              THEN NOW() ELSE started_at END,
+            verified_at = CASE WHEN $2 = 'verified' THEN NOW() ELSE verified_at END,
+            completed_at = CASE WHEN $2 IN ('verified','cancelled')
+                                THEN NOW() ELSE completed_at END
+         WHERE id = $1
+         RETURNING {WORK_ITEM_COLS}"
+    ))
+    .bind(id)
+    .bind(to.as_str())
+    .fetch_one(&mut **tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO work_item_status_history
+            (item_id, from_status, to_status, actor_kind, actor_id, evidence_id,
+             negotiation_id, reason)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+    )
+    .bind(id)
+    .bind(from.as_str())
+    .bind(to.as_str())
+    .bind(actor.as_str())
+    .bind(actor_id)
+    .bind(evidence_id)
+    .bind(negotiation_id)
+    .bind(reason)
+    .execute(&mut **tx)
+    .await?;
+
+    // Auto-unblock cascade: when an item reaches `verified`, dependents that
+    // were `blocked` solely on it may now be actionable. In the SAME tx, move
+    // each such dependent `blocked → ready` as `Actor::System` — legal
+    // (System is in the Blocked→Ready actor set) and provably incapable of
+    // reaching a judgment state (System has NO arm into verified/rejected/
+    // deferred/confirmed; see `transition.rs::system_absent_from_judgment_columns`).
+    // Routed through `check_transition` so the gate is never bypassed.
+    if to == WorkItemStatus::Verified {
+        let candidates: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT w.id FROM work_items w
+             JOIN item_relations r ON (
+                 (r.relation_type = 'depends_on' AND r.from_item_id = w.id AND r.to_item_id = $1)
+                 OR (r.relation_type = 'blocks' AND r.to_item_id = w.id AND r.from_item_id = $1))
+             WHERE w.status = 'blocked'",
+        )
+        .bind(id)
+        .fetch_all(&mut **tx)
+        .await?;
+        for dep_id in candidates {
+            // Still blocked iff an UNRESOLVED blocker remains (the inverse of
+            // the NOT_BLOCKED predicate, evaluated within this tx so the
+            // just-verified row counts as cleared).
+            let still_blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1 FROM item_relations r JOIN work_items b ON (
+                        (r.relation_type = 'depends_on' AND r.from_item_id = $1 AND b.id = r.to_item_id)
+                        OR (r.relation_type = 'blocks' AND r.to_item_id = $1 AND b.id = r.from_item_id))
+                    WHERE b.status NOT IN ('verified','claimed_done','deferred','cancelled'))",
+            )
+            .bind(dep_id)
+            .fetch_one(&mut **tx)
+            .await?;
+            if still_blocked {
+                continue;
+            }
+            // Trust gate: System may perform ONLY Blocked → Ready.
+            check_transition(
+                WorkItemStatus::Blocked,
+                WorkItemStatus::Ready,
+                Actor::System,
+                TransitionContext::default(),
+            )
+            .map_err(WorkItemOpError::Transition)?;
+            sqlx::query(
+                "UPDATE work_items SET status = 'ready', updated_at = NOW()
+                 WHERE id = $1 AND status = 'blocked'",
+            )
+            .bind(dep_id)
+            .execute(&mut **tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO work_item_status_history
+                    (item_id, from_status, to_status, actor_kind, actor_id, reason)
+                 VALUES ($1, 'blocked', 'ready', 'system', 'system',
+                         'auto-unblocked: last blocker verified')",
+            )
+            .bind(dep_id)
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+
+    Ok(updated)
 }
 
 /// Set (or clear) an item's durable `assignee` (v16). `assignee=None` unassigns
@@ -1650,6 +1674,20 @@ pub async fn record_scope_negotiation(
     granted_by: &str,
     reason: &str,
 ) -> Result<i64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let id = record_scope_negotiation_in_tx(&mut tx, item_id, action, granted_by, reason).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+/// Transactional variant of [`record_scope_negotiation`].
+pub async fn record_scope_negotiation_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    item_id: i64,
+    action: &str,
+    granted_by: &str,
+    reason: &str,
+) -> Result<i64, sqlx::Error> {
     sqlx::query_scalar::<_, i64>(
         "INSERT INTO scope_negotiations (item_id, action, granted_by, actor_kind, reason)
          VALUES ($1, $2, $3, 'user', $4) RETURNING id",
@@ -1658,7 +1696,7 @@ pub async fn record_scope_negotiation(
     .bind(action)
     .bind(granted_by)
     .bind(reason)
-    .fetch_one(pool)
+    .fetch_one(&mut **tx)
     .await
 }
 
@@ -2609,6 +2647,26 @@ pub async fn link_work_item_experiment(
     hypothesis_id: Option<i64>,
     experiment_slug: &str,
 ) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    link_work_item_experiment_in_tx(
+        &mut tx,
+        work_item_id,
+        experiment_id,
+        hypothesis_id,
+        experiment_slug,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn link_work_item_experiment_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    work_item_id: i64,
+    experiment_id: i64,
+    hypothesis_id: Option<i64>,
+    experiment_slug: &str,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO work_item_experiment
             (work_item_id, experiment_id, hypothesis_id, experiment_slug)
@@ -2621,7 +2679,7 @@ pub async fn link_work_item_experiment(
     .bind(experiment_id)
     .bind(hypothesis_id)
     .bind(experiment_slug)
-    .execute(pool)
+    .execute(&mut **tx)
     .await?;
     Ok(())
 }
@@ -2631,13 +2689,23 @@ pub async fn experiment_verdict_criterion_id(
     pool: &PgPool,
     work_item_id: i64,
 ) -> Result<Option<i64>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let id = experiment_verdict_criterion_id_in_tx(&mut tx, work_item_id).await?;
+    tx.commit().await?;
+    Ok(id)
+}
+
+pub async fn experiment_verdict_criterion_id_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    work_item_id: i64,
+) -> Result<Option<i64>, sqlx::Error> {
     let row: Option<(i64,)> = sqlx::query_as(
         "SELECT id FROM acceptance_criteria
           WHERE item_id = $1 AND criterion_kind = 'experiment_verdict'
           ORDER BY id ASC LIMIT 1",
     )
     .bind(work_item_id)
-    .fetch_optional(pool)
+    .fetch_optional(&mut **tx)
     .await?;
     Ok(row.map(|(id,)| id))
 }

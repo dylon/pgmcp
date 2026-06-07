@@ -11,6 +11,7 @@
 use pgmcp_testing::pool_tool_helpers::server_with_pool;
 use pgmcp_testing::require_test_db;
 use serde_json::Value;
+use uuid::Uuid;
 
 fn extract_json(call_result: &rmcp::model::CallToolResult) -> Value {
     for content in &call_result.content {
@@ -199,6 +200,160 @@ async fn memory_semantic_search_dedupes_multi_scope_and_tier_entities() {
             .count(),
         1,
         "tier filters should still return the observation once"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_hybrid_search_rejects_blank_query_before_embedding() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let server = server_with_pool(pool.clone());
+    let result = server
+        .call_tool_cli("memory_hybrid_search", serde_json::json!({"query": "   "}))
+        .await;
+    match result {
+        Err(e) => assert!(
+            format!("{e}").contains("query must be non-empty"),
+            "expected blank-query validation, got: {e}"
+        ),
+        Ok(r) => assert_eq!(r.is_error, Some(true), "expected error, got {r:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_hybrid_search_avoids_scope_tier_rank_inflation() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let suffix = Uuid::new_v4().simple().to_string();
+
+    let close_entity: i64 = sqlx::query_scalar(
+        "INSERT INTO memory_entities (name, entity_type, source)
+         VALUES ($1, 'concept', 'agent_write'::memory_source)
+         RETURNING id",
+    )
+    .bind(format!("hybrid-close-{suffix}"))
+    .fetch_one(pool)
+    .await
+    .expect("close entity");
+    let inflated_entity: i64 = sqlx::query_scalar(
+        "INSERT INTO memory_entities (name, entity_type, source)
+         VALUES ($1, 'concept', 'agent_write'::memory_source)
+         RETURNING id",
+    )
+    .bind(format!("hybrid-inflated-{suffix}"))
+    .fetch_one(pool)
+    .await
+    .expect("inflated entity");
+
+    let close_embedding: Vec<f32> = (0..1024).map(|i| if i == 0 { 1.0 } else { 0.0 }).collect();
+    let far_embedding: Vec<f32> = (0..1024).map(|i| if i == 99 { 1.0 } else { 0.0 }).collect();
+    let pg_close = pgvector::Vector::from(close_embedding.clone());
+    let pg_far = pgvector::Vector::from(far_embedding);
+
+    sqlx::query(
+        "INSERT INTO memory_observations
+            (entity_id, content, content_sha256, embedding, source)
+         VALUES ($1, $2, $3, $4, 'agent_write'::memory_source)",
+    )
+    .bind(close_entity)
+    .bind(format!("hybrid close content {suffix}"))
+    .bind(format!("{:0<64}", Uuid::new_v4().simple()))
+    .bind(&pg_close)
+    .execute(pool)
+    .await
+    .expect("close observation");
+    sqlx::query(
+        "INSERT INTO memory_observations
+            (entity_id, content, content_sha256, embedding, source)
+         VALUES ($1, $2, $3, $4, 'agent_write'::memory_source)",
+    )
+    .bind(inflated_entity)
+    .bind(format!("hybrid far content {suffix}"))
+    .bind(format!("{:0<64}", Uuid::new_v4().simple()))
+    .bind(&pg_far)
+    .execute(pool)
+    .await
+    .expect("inflated observation");
+
+    let scope_a = pgmcp::db::queries::find_or_create_scope(
+        pool,
+        &pgmcp::db::queries::ScopeSpec {
+            user_id: Some(format!("hybrid-user-a-{suffix}")),
+            agent_id: None,
+            session_id: None,
+            project_id: None,
+        },
+    )
+    .await
+    .expect("scope a");
+    let scope_b = pgmcp::db::queries::find_or_create_scope(
+        pool,
+        &pgmcp::db::queries::ScopeSpec {
+            user_id: Some(format!("hybrid-user-b-{suffix}")),
+            agent_id: None,
+            session_id: None,
+            project_id: None,
+        },
+    )
+    .await
+    .expect("scope b");
+
+    sqlx::query(
+        "INSERT INTO memory_entity_scope (entity_id, scope_id)
+         VALUES ($1, $2)",
+    )
+    .bind(close_entity)
+    .bind(scope_a)
+    .execute(pool)
+    .await
+    .expect("close entity scope");
+
+    for scope_id in [scope_a, scope_b] {
+        sqlx::query(
+            "INSERT INTO memory_entity_scope (entity_id, scope_id)
+             VALUES ($1, $2)",
+        )
+        .bind(inflated_entity)
+        .bind(scope_id)
+        .execute(pool)
+        .await
+        .expect("inflated entity scope");
+    }
+    for tier in ["semantic", "procedural"] {
+        sqlx::query(
+            "INSERT INTO memory_entity_tier (entity_id, tier)
+             VALUES ($1, $2::memory_tier)",
+        )
+        .bind(inflated_entity)
+        .bind(tier)
+        .execute(pool)
+        .await
+        .expect("inflated entity tier");
+    }
+
+    let rows = pgmcp::db::queries::memory_hybrid_search(
+        pool,
+        "token-not-present-in-memory",
+        &close_embedding,
+        Some(scope_a),
+        None,
+        10,
+        64,
+    )
+    .await
+    .expect("memory_hybrid_search");
+
+    assert!(!rows.is_empty(), "expected hybrid rows");
+    assert_eq!(
+        rows[0].entity_id, close_entity,
+        "multi-scope/tier memberships must not inflate a worse dense hit above the closest hit"
+    );
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.entity_id == inflated_entity)
+            .count(),
+        1,
+        "the multi-membership entity should still appear at most once"
     );
 }
 

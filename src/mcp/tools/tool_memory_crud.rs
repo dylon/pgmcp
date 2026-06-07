@@ -230,6 +230,12 @@ pub async fn tool_memory_create_entities(
 // memory_create_relations
 // ----------------------------------------------------------------------------
 
+const MAX_CREATE_RELATIONS_BATCH: usize = 500;
+
+fn normalize_relation_field(value: String, field: &str) -> Result<String, McpError> {
+    normalize_entity_field(value, field)
+}
+
 pub async fn tool_memory_create_relations(
     ctx: &SystemContext,
     params: MemoryCreateRelationsParams,
@@ -243,27 +249,39 @@ pub async fn tool_memory_create_relations(
             None,
         ));
     }
+    if params.relations.len() > MAX_CREATE_RELATIONS_BATCH {
+        return Err(McpError::invalid_params(
+            format!("relations must contain at most {MAX_CREATE_RELATIONS_BATCH} entries"),
+            None,
+        ));
+    }
     let inputs: Vec<NewRelationInput> = params
         .relations
         .into_iter()
-        .map(|r| NewRelationInput {
-            from: r.from,
-            to: r.to,
-            relation_type: r.relation_type,
+        .map(|r| {
+            Ok(NewRelationInput {
+                from: normalize_relation_field(r.from, "relation from")?,
+                to: normalize_relation_field(r.to, "relation to")?,
+                relation_type: normalize_relation_field(r.relation_type, "relation_type")?,
+            })
         })
-        .collect();
-    let ids = queries::memory_create_relations(pool, &inputs, "agent_write")
+        .collect::<Result<_, McpError>>()?;
+    let created = queries::memory_create_relations_detailed(pool, &inputs, "agent_write")
         .await
-        .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
-    let resolved = ids.iter().filter(|i| **i >= 0).count();
-    let unresolved = ids.iter().filter(|i| **i < 0).count();
+        .map_err(|e| match &e {
+            sqlx::Error::Protocol(msg) => McpError::invalid_params(msg.clone(), None),
+            _ => McpError::internal_error(format!("query failed: {}", e), None),
+        })?;
+    let resolved = created.relation_ids.iter().filter(|i| **i >= 0).count();
+    let unresolved = created.relation_ids.iter().filter(|i| **i < 0).count();
     ctx.stats()
         .memory_relations_created
-        .fetch_add(resolved as u64, Ordering::Relaxed);
+        .fetch_add(created.relations_inserted as u64, Ordering::Relaxed);
     json_result(json!({
-        "relations_created": resolved,
+        "relations_created": created.relations_inserted,
+        "relations_resolved": resolved,
         "unresolved_endpoints": unresolved,
-        "ids": ids,
+        "ids": created.relation_ids,
     }))
 }
 

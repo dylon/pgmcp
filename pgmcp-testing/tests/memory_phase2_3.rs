@@ -11,7 +11,7 @@
 //!
 //! Skips cleanly with `SKIPPED:` if no test DB is configured.
 
-use pgmcp::db::queries::{self, NewEntityInput, ScopeSpec};
+use pgmcp::db::queries::{self, NewEntityInput, NewRelationInput, ScopeSpec};
 use pgmcp_testing::pool_tool_helpers::server_with_pool;
 use pgmcp_testing::require_test_db;
 use serde_json::Value;
@@ -266,6 +266,305 @@ async fn create_and_delete_relations_round_trip() {
             .all(|r| r.get("relation_type").and_then(Value::as_str) != Some("maintains")),
         "deleted relation must not surface in active read_graph: {relations:?}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_relations_normalizes_and_reports_actual_inserts() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let server = server_with_pool(pool.clone());
+    let from = format!("rel-from-{}", Uuid::new_v4().simple());
+    let to = format!("rel-to-{}", Uuid::new_v4().simple());
+    let relation_type = format!("maintains-{}", Uuid::new_v4().simple());
+
+    server
+        .call_tool_cli(
+            "memory_create_entities",
+            serde_json::json!({
+                "entities": [
+                    {"name": from.clone(), "entity_type": "person"},
+                    {"name": to.clone(), "entity_type": "project"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed relation endpoints");
+
+    let first = server
+        .call_tool_cli(
+            "memory_create_relations",
+            serde_json::json!({
+                "relations": [
+                    {
+                        "from": format!("  {from}  "),
+                        "to": format!("  {to}  "),
+                        "relation_type": format!("  {relation_type}  ")
+                    },
+                    {
+                        "from": from.clone(),
+                        "to": to.clone(),
+                        "relation_type": relation_type.clone()
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("create relation twice in one request");
+    let first_body = extract_json(&first);
+    assert_eq!(
+        first_body.get("relations_created").and_then(Value::as_i64),
+        Some(1),
+        "duplicate active relation should insert once"
+    );
+    assert_eq!(
+        first_body.get("relations_resolved").and_then(Value::as_i64),
+        Some(2),
+        "both normalized inputs should resolve to an active relation id"
+    );
+    let ids = first_body
+        .get("ids")
+        .and_then(Value::as_array)
+        .expect("ids array");
+    assert_eq!(ids.len(), 2);
+    assert_eq!(ids[0], ids[1], "duplicate inputs should reuse one row id");
+
+    let second = server
+        .call_tool_cli(
+            "memory_create_relations",
+            serde_json::json!({
+                "relations": [
+                    {
+                        "from": from.clone(),
+                        "to": to.clone(),
+                        "relation_type": relation_type.clone()
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("idempotent relation create");
+    let second_body = extract_json(&second);
+    assert_eq!(
+        second_body.get("relations_created").and_then(Value::as_i64),
+        Some(0),
+        "idempotent retry should not be counted as a new insert"
+    );
+    assert_eq!(
+        second_body
+            .get("relations_resolved")
+            .and_then(Value::as_i64),
+        Some(1)
+    );
+
+    let active_relations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM memory_relations r
+         JOIN memory_entities a ON a.id = r.from_entity_id
+         JOIN memory_entities b ON b.id = r.to_entity_id
+         WHERE a.name = $1
+           AND b.name = $2
+           AND r.relation_type = $3
+           AND r.valid_to IS NULL",
+    )
+    .bind(&from)
+    .bind(&to)
+    .bind(&relation_type)
+    .fetch_one(pool)
+    .await
+    .expect("count active relations");
+    assert_eq!(active_relations, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_relations_rejects_blank_fields_before_write() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let server = server_with_pool(pool.clone());
+    let from = format!("blank-rel-from-{}", Uuid::new_v4().simple());
+    let to = format!("blank-rel-to-{}", Uuid::new_v4().simple());
+
+    server
+        .call_tool_cli(
+            "memory_create_entities",
+            serde_json::json!({
+                "entities": [
+                    {"name": from.clone(), "entity_type": "person"},
+                    {"name": to.clone(), "entity_type": "project"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed relation endpoints");
+
+    let err = server
+        .call_tool_cli(
+            "memory_create_relations",
+            serde_json::json!({
+                "relations": [
+                    {"from": from.clone(), "to": to.clone(), "relation_type": "   "}
+                ]
+            }),
+        )
+        .await
+        .expect_err("blank relation_type must fail");
+    assert!(
+        err.to_string().contains("relation_type must not be blank"),
+        "unexpected validation error: {err}"
+    );
+
+    let active_relations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM memory_relations r
+         JOIN memory_entities a ON a.id = r.from_entity_id
+         JOIN memory_entities b ON b.id = r.to_entity_id
+         WHERE a.name = $1
+           AND b.name = $2
+           AND r.valid_to IS NULL",
+    )
+    .bind(&from)
+    .bind(&to)
+    .fetch_one(pool)
+    .await
+    .expect("count active relations");
+    assert_eq!(active_relations, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn create_relations_rejects_ambiguous_active_endpoint_name() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let server = server_with_pool(pool.clone());
+    let ambiguous = format!("ambiguous-rel-{}", Uuid::new_v4().simple());
+    let target = format!("ambiguous-rel-target-{}", Uuid::new_v4().simple());
+
+    sqlx::query(
+        "INSERT INTO memory_entities (name, entity_type, source)
+         VALUES
+            ($1, 'person', 'agent_write'::memory_source),
+            ($1, 'project', 'agent_write'::memory_source),
+            ($2, 'concept', 'agent_write'::memory_source)",
+    )
+    .bind(&ambiguous)
+    .bind(&target)
+    .execute(pool)
+    .await
+    .expect("seed ambiguous endpoint name");
+
+    let err = server
+        .call_tool_cli(
+            "memory_create_relations",
+            serde_json::json!({
+                "relations": [
+                    {
+                        "from": ambiguous.clone(),
+                        "to": target.clone(),
+                        "relation_type": "maintains"
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect_err("ambiguous endpoint must fail closed");
+    assert!(
+        err.to_string()
+            .contains("ambiguous memory relation endpoint name"),
+        "unexpected ambiguous endpoint error: {err}"
+    );
+
+    let active_relations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM memory_relations r
+         JOIN memory_entities a ON a.id = r.from_entity_id
+         JOIN memory_entities b ON b.id = r.to_entity_id
+         WHERE a.name = $1
+           AND b.name = $2
+           AND r.valid_to IS NULL",
+    )
+    .bind(&ambiguous)
+    .bind(&target)
+    .fetch_one(pool)
+    .await
+    .expect("count active relations");
+    assert_eq!(
+        active_relations, 0,
+        "ambiguous endpoint request must not create a relation"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn create_relations_concurrent_same_triple_is_single_active_row() {
+    let db = require_test_db!();
+    let pool = db.pool();
+    let from = format!("concurrent-rel-from-{}", Uuid::new_v4().simple());
+    let to = format!("concurrent-rel-to-{}", Uuid::new_v4().simple());
+    let relation_type = "observes";
+
+    sqlx::query(
+        "INSERT INTO memory_entities (name, entity_type, source)
+         VALUES
+            ($1, 'person', 'agent_write'::memory_source),
+            ($2, 'project', 'agent_write'::memory_source)",
+    )
+    .bind(&from)
+    .bind(&to)
+    .execute(pool)
+    .await
+    .expect("seed concurrent relation endpoints");
+
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let pool = pool.clone();
+        let input = NewRelationInput {
+            from: from.clone(),
+            to: to.clone(),
+            relation_type: relation_type.to_string(),
+        };
+        handles.push(tokio::spawn(async move {
+            queries::memory_create_relations_detailed(&pool, &[input], "agent_write").await
+        }));
+    }
+
+    let mut inserted = 0usize;
+    let mut ids = Vec::new();
+    for handle in handles {
+        let result = handle
+            .await
+            .expect("join concurrent relation create")
+            .expect("concurrent relation create");
+        inserted += result.relations_inserted;
+        ids.extend(result.relation_ids);
+    }
+
+    assert_eq!(
+        inserted, 1,
+        "concurrent creates should insert one active relation"
+    );
+    assert!(ids.iter().all(|id| *id >= 0));
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(
+        ids.len(),
+        1,
+        "all concurrent callers should observe one relation id"
+    );
+
+    let active_relations: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM memory_relations r
+         JOIN memory_entities a ON a.id = r.from_entity_id
+         JOIN memory_entities b ON b.id = r.to_entity_id
+         WHERE a.name = $1
+           AND b.name = $2
+           AND r.relation_type = $3
+           AND r.valid_to IS NULL",
+    )
+    .bind(&from)
+    .bind(&to)
+    .bind(relation_type)
+    .fetch_one(pool)
+    .await
+    .expect("count active concurrent relations");
+    assert_eq!(active_relations, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

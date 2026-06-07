@@ -98,3 +98,104 @@ async fn quality_report_grades_three_pillars_and_renders_every_format() {
         "unknown min_severity must error"
     );
 }
+
+#[tokio::test]
+async fn quality_report_normalizes_project_and_bounds_side_effects() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let h = seed_graph_corpus(&pool).await;
+
+    sqlx::query("DELETE FROM quality_report_history WHERE project_id = $1")
+        .bind(h.project_id)
+        .execute(&pool)
+        .await
+        .expect("clear history");
+    sqlx::query(
+        "INSERT INTO quality_report_history
+            (project_id, computed_at, engineering_gpa, architecture_gpa, security_gpa, overall_gpa, raw_summary)
+         SELECT $1,
+                NOW() - make_interval(secs => g::int),
+                2.0,
+                2.0,
+                2.0,
+                2.0,
+                '{}'::jsonb
+         FROM generate_series(1, 200) AS g",
+    )
+    .bind(h.project_id)
+    .execute(&pool)
+    .await
+    .expect("seed history");
+
+    let server = server_with_pool(pool.clone());
+    let res = server
+        .call_tool_cli(
+            "quality_report",
+            serde_json::json!({
+                "project": " graph-proj ",
+                "format": " md ",
+                "include_underlying_json": true,
+                "trend_points": 1000
+            }),
+        )
+        .await
+        .expect("quality_report padded project");
+    let envelope: serde_json::Value = serde_json::from_str(&text_of(&res)).expect("valid envelope");
+
+    assert_eq!(envelope["format"], "markdown");
+    assert_eq!(envelope["report"]["project"], "graph-proj");
+    let trend = envelope["report"]["trend"].as_array().expect("trend array");
+    assert!(!trend.is_empty(), "trend should include seeded history");
+    for pillar in trend {
+        let gpas = pillar["gpas"].as_array().expect("gpa array");
+        assert!(
+            gpas.len() <= 121,
+            "trend_points must clamp at 120 persisted samples plus the current run"
+        );
+    }
+
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM quality_report_history WHERE project_id = $1")
+            .bind(h.project_id)
+            .fetch_one(&pool)
+            .await
+            .expect("history count");
+    assert_eq!(
+        count, 201,
+        "padded project input must persist exactly one history row for the resolved project"
+    );
+
+    assert!(
+        server
+            .call_tool_cli(
+                "quality_report",
+                serde_json::json!({"project": "graph-proj", "refresh_crons": [""]}),
+            )
+            .await
+            .is_err(),
+        "blank refresh_crons entries must reject before cron dispatch"
+    );
+    assert!(
+        server
+            .call_tool_cli(
+                "quality_report",
+                serde_json::json!({
+                    "project": "graph-proj",
+                    "refresh_crons": [
+                        "symbol-extraction",
+                        "call-graph",
+                        "function-metrics",
+                        "graph-analysis",
+                        "a2a-reflect",
+                        "msm-calibrate",
+                        "fuzzy-sync",
+                        "symbol-extraction",
+                        "call-graph"
+                    ]
+                }),
+            )
+            .await
+            .is_err(),
+        "refresh_crons must be explicitly bounded"
+    );
+}

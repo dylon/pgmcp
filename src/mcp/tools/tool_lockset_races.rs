@@ -15,9 +15,12 @@ use std::sync::atomic::Ordering;
 
 use crate::context::SystemContext;
 use crate::mcp::server::LocksetRacesParams;
+use crate::mcp::tools::sema_helpers::effects::effect_counts;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err, project_id_or_err};
 use crate::mcp::tools::sota_regex_scan::scan_files_for_pattern;
 use crate::parsing::type_tags::vocabulary::{TAG_ATOMIC, TAG_MUTEX};
+
+const MAX_LOCKSET_RACE_LIMIT: i32 = 1_000;
 
 pub async fn tool_lockset_races(
     ctx: &SystemContext,
@@ -25,15 +28,16 @@ pub async fn tool_lockset_races(
 ) -> Result<CallToolResult, McpError> {
     tracing::debug!(tool = "lockset_races", "MCP tool invoked");
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let project = params.project.trim();
+    let project_id = project_id_or_err(ctx, project).await?;
     let pool = pool_or_err(ctx)?;
-    let limit = params.limit.unwrap_or(50);
+    let limit = params.limit.unwrap_or(50).clamp(1, MAX_LOCKSET_RACE_LIMIT);
 
     // Mutex/lock usage patterns across Rust, C++, Java, Go.
     let pat = Regex::new(
         r"(?m)\b(std::sync::Mutex|parking_lot::Mutex|tokio::sync::Mutex|RwLock|std::mutex|pthread_mutex_lock|synchronized\s*\(|Lock\.acquire|threading\.Lock|asyncio\.Lock|sync\.Mutex|sync\.RWMutex)\b"
     ).expect("lock pattern");
-    let hits = scan_files_for_pattern(pool, project_id, &pat, None, limit.max(0) as usize)
+    let hits = scan_files_for_pattern(pool, project_id, &pat, None, limit as usize)
         .await
         .map_err(|e| McpError::internal_error(format!("Scan failed: {}", e), None))?;
 
@@ -67,29 +71,22 @@ pub async fn tool_lockset_races(
             })
         })
         .collect();
-    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT se.effect, COUNT(*)::int8
-             FROM symbol_effects se
-             GROUP BY se.effect
-             ORDER BY se.effect",
-        )
-        .fetch_all(pool)
+    // Shadow-ASR channel (Phase D2b): project-scoped effect distribution.
+    let mut effect_breakdown: Vec<(String, i64)> = effect_counts(pool, project_id)
         .await
-        .unwrap_or_default();
-        rows.into_iter()
-            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-            .collect()
-    })
-    .await;
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    effect_breakdown.sort_by(|a, b| a.0.cmp(&b.0));
+    let effect_breakdown: Vec<serde_json::Value> = effect_breakdown
+        .into_iter()
+        .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
+        .collect();
 
     json_result(&json!({
         "effect_breakdown": effect_breakdown,
-        "project": params.project,
+        "project": project,
+        "limit": limit,
         "matches": rows,
         "mutex_typed_symbols": mutex_typed_symbols,
         "guidance": "Surfaces concurrency primitives. To detect actual races (disjoint lock-sets across shared accesses) requires intra-procedural lockset analysis beyond regex; treat these as audit candidates and follow with manual review of variable scoping vs lock acquisition."
