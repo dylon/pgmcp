@@ -29,7 +29,6 @@ use libgrammstein::ngram::NgramEntry;
 use libgrammstein::ngram::open_or_create_vocabulary;
 use libgrammstein::ngram::vocabulary_indexed::VocabularyIndexedDictionary;
 use lling_llang::layers::rescoring::lm_rerank::LanguageModel as LlingLanguageModel;
-use parking_lot::RwLock;
 use thiserror::Error;
 
 /// Concrete dictionary backend pgmcp uses for the per-project LM: a
@@ -65,10 +64,12 @@ pub(crate) fn try_build_lm_dictionary(
 ) -> Result<PgmcpLmDictionary, LmError> {
     let vocab = open_or_create_vocabulary(vocab_path)
         .map_err(|e| LmError::Grammstein(format!("vocab trie: {e}")))?;
-    let counts: SharedCharARTrie<NgramEntry> = Arc::new(RwLock::new(
+    // `SharedCharARTrie<V> = Arc<PersistentARTrieChar<V>>` since libdictenstein's
+    // overlay refactor moved concurrency inside the trie (no external `RwLock`).
+    let counts: SharedCharARTrie<NgramEntry> = Arc::new(
         PersistentARTrieChar::<NgramEntry>::create(counts_path)
             .map_err(|e| LmError::Grammstein(format!("counts trie: {e}")))?,
-    ));
+    );
     Ok(VocabularyIndexedDictionary::with_delimiter(
         counts,
         vocab,

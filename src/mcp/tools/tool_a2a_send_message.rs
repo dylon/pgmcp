@@ -14,18 +14,14 @@ use tracing::debug;
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
 
 pub async fn tool_a2a_send_message(
     ctx: &SystemContext,
     params: A2aSendMessageParams,
 ) -> Result<CallToolResult, McpError> {
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let Some(pool) = ctx.db().pool() else {
-        return Err(McpError::internal_error(
-            "database pool unavailable".to_string(),
-            None,
-        ));
-    };
+    let pool = pool_or_err(ctx)?;
 
     if params.to_session.is_none() && params.to_project.is_none() && params.to_agent.is_none() {
         return Err(McpError::invalid_params(
@@ -34,7 +30,23 @@ pub async fn tool_a2a_send_message(
         ));
     }
 
-    let kind = params.kind.as_deref().unwrap_or("message");
+    // The message body is required — trim it and reject blank.
+    let body = params.body.trim();
+    if body.is_empty() {
+        return Err(McpError::invalid_params(
+            "body must be non-empty".to_string(),
+            None,
+        ));
+    }
+
+    // Kind defaults to 'message'; trim and treat blank as the default, then
+    // validate against the closed MessageKind vocabulary.
+    let kind = params
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("message");
     if crate::a2a::mailbox::MessageKind::parse(kind).is_none() {
         return Err(McpError::invalid_params(
             format!(
@@ -44,19 +56,18 @@ pub async fn tool_a2a_send_message(
         ));
     }
 
-    // Resolve to_project name → id (must exist if given).
-    let to_project_id = match &params.to_project {
-        Some(name) => {
-            let id: Option<i32> = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-                .bind(name)
-                .fetch_optional(pool)
-                .await
-                .map_err(|e| McpError::internal_error(format!("project lookup: {e}"), None))?;
-            Some(id.ok_or_else(|| {
-                McpError::invalid_params(format!("unknown project '{name}'"), None)
-            })?)
-        }
-        None => None,
+    // Optional short subject: trim and treat blank as absent.
+    let subject = params
+        .subject
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    // Resolve to_project name → id (must exist if given) — fail closed on
+    // blank/unknown/duplicate via project_id_or_err.
+    let to_project_id = match params.to_project.as_deref().map(str::trim) {
+        Some(name) if !name.is_empty() => Some(project_id_or_err(ctx, name).await?),
+        _ => None,
     };
 
     let from_agent = params.from_agent.as_deref().unwrap_or("unknown");
@@ -71,8 +82,8 @@ pub async fn tool_a2a_send_message(
         to_project_id,
         to_agent: params.to_agent.as_deref(),
         kind,
-        subject: params.subject.as_deref(),
-        body: &params.body,
+        subject,
+        body,
         reply_to: params.reply_to,
         expires_at,
     };

@@ -13,29 +13,15 @@ use tracing::debug;
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
 
 pub async fn tool_project_dependents(
     ctx: &SystemContext,
     params: ProjectDependentsParams,
 ) -> Result<CallToolResult, McpError> {
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let Some(pool) = ctx.db().pool() else {
-        return Err(McpError::internal_error(
-            "database pool unavailable".to_string(),
-            None,
-        ));
-    };
-    let id: Option<i32> = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-        .bind(&params.project)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| McpError::internal_error(format!("project lookup: {e}"), None))?;
-    let Some(id) = id else {
-        return Err(McpError::invalid_params(
-            format!("unknown project '{}'", params.project),
-            None,
-        ));
-    };
+    let pool = pool_or_err(ctx)?;
+    let id = project_id_or_err(ctx, &params.project).await?;
 
     let rows = crate::deps::store::dependents_of(pool, id)
         .await

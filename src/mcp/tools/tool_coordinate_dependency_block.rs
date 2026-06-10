@@ -16,44 +16,24 @@ use tracing::debug;
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
 
 pub async fn tool_coordinate_dependency_block(
     ctx: &SystemContext,
     params: CoordinateDependencyBlockParams,
 ) -> Result<CallToolResult, McpError> {
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let Some(pool) = ctx.db().pool() else {
-        return Err(McpError::internal_error(
-            "database pool unavailable".to_string(),
-            None,
-        ));
-    };
+    let pool = pool_or_err(ctx)?;
 
-    // Resolve the dependency (U) by name.
-    let u_id: Option<i32> = sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-        .bind(&params.dependency)
-        .fetch_optional(pool)
-        .await
-        .map_err(|e| McpError::internal_error(format!("dependency lookup: {e}"), None))?;
-    let Some(u_id) = u_id else {
-        return Err(McpError::invalid_params(
-            format!(
-                "unknown dependency project '{}' (use the project name from list_projects)",
-                params.dependency
-            ),
-            None,
-        ));
-    };
+    // Resolve the dependency (U) by name — fail closed on blank/unknown/duplicate.
+    let u_id = project_id_or_err(ctx, &params.dependency).await?;
 
-    // Resolve the dependent (D) by name, if given.
-    let d_id: Option<i32> = match &params.dependent_project {
-        Some(dp) => sqlx::query_scalar("SELECT id FROM projects WHERE name = $1")
-            .bind(dp)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten(),
-        None => None,
+    // Resolve the dependent (D) by name, if given. When present and non-blank
+    // after trimming, resolve it FAIL-CLOSED (propagate not-found/duplicate)
+    // rather than silently dropping an unresolvable name.
+    let d_id: Option<i32> = match params.dependent_project.as_deref().map(str::trim) {
+        Some(dp) if !dp.is_empty() => Some(project_id_or_err(ctx, dp).await?),
+        _ => None,
     };
 
     // Record the asserted edge (compiler ground truth) so the dependency graph

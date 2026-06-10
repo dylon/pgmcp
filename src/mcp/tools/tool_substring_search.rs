@@ -16,6 +16,10 @@ const MAX_SUBSTRING_HAYSTACK_TERMS: usize = 5_000;
 const MAX_SUBSTRING_TERM_BYTES: usize = 4_096;
 const MAX_SUBSTRING_TOTAL_BYTES: usize = 1_048_576;
 
+/// Alias so the `dispatch_tool!` CLI macro (which calls `tool_<name>`) can reach
+/// this tool's `run` body — the MCP `#[tool_router]` path calls `run` directly.
+pub use self::run as tool_substring_search;
+
 pub async fn run(
     ctx: &SystemContext,
     params: SubstringSearchParams,

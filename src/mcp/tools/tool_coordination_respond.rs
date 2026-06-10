@@ -16,20 +16,16 @@ use tracing::debug;
 use crate::context::SystemContext;
 use crate::deps::coordination::CoordinationStatus;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
 
 pub async fn tool_coordination_respond(
     ctx: &SystemContext,
     params: CoordinationRespondParams,
 ) -> Result<CallToolResult, McpError> {
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let Some(pool) = ctx.db().pool() else {
-        return Err(McpError::internal_error(
-            "database pool unavailable".to_string(),
-            None,
-        ));
-    };
+    let pool = pool_or_err(ctx)?;
 
-    let status = match params.response.as_str() {
+    let status = match params.response.trim() {
         "accept" | "accepted" => CoordinationStatus::Accepted,
         "decline" | "declined" => CoordinationStatus::Declined,
         "moved" => CoordinationStatus::Moved,

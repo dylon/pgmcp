@@ -20,6 +20,10 @@ const RENAME_ORACLE_MAX_CANDIDATES: usize = 5_000;
 const RENAME_ORACLE_MAX_NAME_BYTES: usize = 256;
 const RENAME_ORACLE_MAX_TOTAL_NAME_BYTES: usize = 1_048_576;
 
+/// Alias so the `dispatch_tool!` CLI macro (which calls `tool_<name>`) can reach
+/// this tool's `run` body — the MCP `#[tool_router]` path calls `run` directly.
+pub use self::run as tool_rename_oracle;
+
 pub async fn run(
     ctx: &SystemContext,
     params: RenameOracleParams,

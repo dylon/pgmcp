@@ -13,6 +13,7 @@ use tracing::debug;
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
 
 pub async fn tool_active_clients(
     ctx: &SystemContext,
@@ -22,19 +23,18 @@ pub async fn tool_active_clients(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     debug!(tool = "active_clients", "MCP tool invoked");
 
-    let Some(pool) = ctx.db().pool() else {
-        return Err(McpError::internal_error(
-            "database pool unavailable".to_string(),
-            None,
-        ));
-    };
+    let pool = pool_or_err(ctx)?;
 
-    let rows =
-        crate::db::queries::active_clients(pool, params.project.as_deref(), params.include_exited)
-            .await
-            .map_err(|e| {
-                McpError::internal_error(format!("active_clients query failed: {e}"), None)
-            })?;
+    // Optional project-name filter: trim and treat blank as "no filter".
+    let project_filter = params
+        .project
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let rows = crate::db::queries::active_clients(pool, project_filter, params.include_exited)
+        .await
+        .map_err(|e| McpError::internal_error(format!("active_clients query failed: {e}"), None))?;
 
     let total = rows.len();
 

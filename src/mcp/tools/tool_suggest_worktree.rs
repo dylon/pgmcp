@@ -14,28 +14,28 @@ use tracing::debug;
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;
+use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
 
 pub async fn tool_suggest_worktree(
     ctx: &SystemContext,
     params: SuggestWorktreeParams,
 ) -> Result<CallToolResult, McpError> {
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
-    let Some(pool) = ctx.db().pool() else {
-        return Err(McpError::internal_error(
-            "database pool unavailable".to_string(),
-            None,
-        ));
-    };
+    let pool = pool_or_err(ctx)?;
 
-    let row: Option<(i32, String, Option<String>)> =
-        sqlx::query_as("SELECT id, path, stable_branch FROM projects WHERE name = $1")
-            .bind(&params.project)
+    // Resolve the project name fail-closed (trimmed, blank-rejected, dup-checked)
+    // to a single id, then load its path/stable_branch by that id so a duplicate
+    // or blank name can never select an arbitrary row.
+    let project_id = project_id_or_err(ctx, &params.project).await?;
+    let row: Option<(String, Option<String>)> =
+        sqlx::query_as("SELECT path, stable_branch FROM projects WHERE id = $1")
+            .bind(project_id)
             .fetch_optional(pool)
             .await
             .map_err(|e| McpError::internal_error(format!("project lookup: {e}"), None))?;
-    let Some((project_id, path, stable_branch)) = row else {
-        return Err(McpError::invalid_params(
-            format!("unknown project '{}'", params.project),
+    let Some((path, stable_branch)) = row else {
+        return Err(McpError::internal_error(
+            format!("Project not found: {}", params.project),
             None,
         ));
     };
@@ -61,7 +61,12 @@ pub async fn tool_suggest_worktree(
         .collect();
     let path = path.trim_end_matches('/').to_string();
     let stable = stable_branch.as_deref().unwrap_or("main");
-    let feat = params.feature_branch.as_deref().unwrap_or("wip");
+    let feat = params
+        .feature_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("wip");
 
     // Move the in-flight work onto a feature branch, restore the stable branch in
     // the main tree, and continue the work in a separate worktree. Preserves the

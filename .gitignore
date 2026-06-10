@@ -15,5 +15,12 @@ docs/formal/rocq/*.vok
 docs/formal/rocq/*.glob
 docs/formal/rocq/.*.aux
 docs/formal/tla/states/
+docs/formal/states/
+# TLAPS (`tlapm`) proof cache + fingerprints, and stray TLC/Coq aux files —
+# all reproducible from the committed `.tla`/`.v` sources by the verify.sh
+# advisory Formal gate (and ad-hoc `tlapm`/`tlc`/`coqc` runs).
+docs/formal/**/.tlacache/
+docs/formal/**/*.thy
+docs/formal/**/.*.aux
 
 .pgmcp.toml

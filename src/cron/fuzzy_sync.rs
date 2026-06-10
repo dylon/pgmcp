@@ -39,6 +39,38 @@ pub fn concept_trie_path(data_dir: &Path) -> PathBuf {
 /// Cache slug for the single global concept-trie handle in `FuzzyCache`.
 pub const CONCEPT_TRIE_SLUG: &str = "_global";
 
+/// On-disk format generation for the fuzzy ARTrie indices. **BUMP this whenever
+/// the libdictenstein on-disk trie format changes incompatibly.** The 2026-06
+/// lock-free *overlay* refactor (the trie now owns its concurrency; the old
+/// `Arc<RwLock<…>>`-era on-disk layout is not readable by the new code) is such a
+/// change — so existing `.artrie` files must be discarded and rebuilt from
+/// PostgreSQL (the canonical source) rather than mis-read.
+pub const FUZZY_FORMAT_VERSION: &str = "2-overlay-2026-06";
+
+/// Ensure the on-disk fuzzy index format matches this binary. Reads the
+/// `$data_dir/fuzzy/.format_version` sentinel; when it is absent or stale (an
+/// upgrade across an incompatible [`FUZZY_FORMAT_VERSION`]), the ENTIRE
+/// `$data_dir/fuzzy/` tree is removed and the sentinel rewritten — the
+/// `fuzzy-sync` cron then repopulates every trie from PG. Returns `Ok(true)` iff
+/// an existing index tree was wiped (so the caller can log the rebuild). Called
+/// once at daemon startup, before any trie is opened, so the new binary never
+/// opens a stale-format file. Idempotent: a matching sentinel is a cheap no-op;
+/// a fresh install (no tree) just stamps the sentinel.
+pub fn ensure_fuzzy_format_version(data_dir: &Path) -> std::io::Result<bool> {
+    let fuzzy_root = data_dir.join("fuzzy");
+    let sentinel = fuzzy_root.join(".format_version");
+    if std::fs::read_to_string(&sentinel).ok().as_deref() == Some(FUZZY_FORMAT_VERSION) {
+        return Ok(false);
+    }
+    let had_existing = fuzzy_root.exists();
+    if had_existing {
+        std::fs::remove_dir_all(&fuzzy_root)?;
+    }
+    std::fs::create_dir_all(&fuzzy_root)?;
+    std::fs::write(&sentinel, FUZZY_FORMAT_VERSION)?;
+    Ok(had_existing)
+}
+
 /// Run the fuzzy-sync job once across every active project.
 ///
 /// `data_dir` is the root of the trie storage layout
@@ -230,6 +262,47 @@ mod tests {
         assert_ne!(
             project_artifact_key(7, "foo/bar"),
             project_artifact_key(8, "foo_bar")
+        );
+    }
+
+    #[test]
+    fn fuzzy_format_guard_stamps_fresh_wipes_stale_and_noops_on_match() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let data_dir = tmp.path();
+        let fuzzy_root = data_dir.join("fuzzy");
+        let sentinel = fuzzy_root.join(".format_version");
+
+        // Fresh install: no existing tree → stamps the sentinel, reports no wipe.
+        assert!(
+            !ensure_fuzzy_format_version(data_dir).expect("fresh"),
+            "fresh install does not report a wipe"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("sentinel written"),
+            FUZZY_FORMAT_VERSION
+        );
+
+        // Matching sentinel → cheap no-op, leaves any contents intact.
+        let marker = fuzzy_root.join("symbols").join("p1").join("symbols.artrie");
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::write(&marker, b"trie-bytes").unwrap();
+        assert!(
+            !ensure_fuzzy_format_version(data_dir).expect("match"),
+            "matching version is a no-op"
+        );
+        assert!(marker.exists(), "no-op must not wipe existing tries");
+
+        // Stale (incompatible old) format: a tree with a mismatched/absent
+        // sentinel → wipes the whole tree and re-stamps.
+        std::fs::write(&sentinel, "1-legacy-rwlock").unwrap();
+        assert!(
+            ensure_fuzzy_format_version(data_dir).expect("stale"),
+            "stale format reports a wipe"
+        );
+        assert!(!marker.exists(), "stale tries are wiped for rebuild");
+        assert_eq!(
+            std::fs::read_to_string(&sentinel).expect("re-stamped"),
+            FUZZY_FORMAT_VERSION
         );
     }
 }

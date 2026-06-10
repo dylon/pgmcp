@@ -936,6 +936,14 @@ impl McpServer {
                 "coordinate_dependency_block"    => coordinate_dependency_block(CoordinateDependencyBlockParams),
                 "coordination_respond"           => coordination_respond(CoordinationRespondParams),
                 "suggest_worktree"               => suggest_worktree(SuggestWorktreeParams),
+                // Fuzzy/WFST + ontology tools — CLI-dispatched so their `oracle_*`
+                // regression tests (which drive `call_tool_cli`) can reach them.
+                // `substring_search`/`rename_oracle` expose `run`, re-exported in
+                // their modules as `tool_<name>` to fit the macro's fn convention.
+                "substring_search"               => substring_search(SubstringSearchParams) in tool_substring_search,
+                "rename_oracle"                  => rename_oracle(RenameOracleParams) in tool_rename_oracle,
+                "ontology_create_concept"        => ontology_create_concept(OntologyCreateConceptParams) in tool_ontology,
+                "ontology_invariants_for_file"   => ontology_invariants_for_file(OntologyInvariantsForFileParams) in tool_ontology,
             }, no_params: {
                 "list_projects" => list_projects,
                 "index_stats"   => index_stats,

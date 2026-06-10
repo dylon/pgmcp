@@ -17,6 +17,10 @@ use libdictenstein::MappedDictionary;
 use libdictenstein::MutableMappedDictionary;
 use libdictenstein::persistent_artrie::eviction::{EvictionConfig, EvictionStats};
 use libdictenstein::persistent_artrie::recovery::RecoveryReport;
+// `read()`/`write()` on the shared trie handle now come from this trait (the
+// libdictenstein overlay refactor moved concurrency inside the trie — both are
+// lock-free shared borrows; see the doc on `SharedTrieAccess`).
+use libdictenstein::persistent_artrie::SharedTrieAccess;
 use libdictenstein::persistent_artrie_char::{PersistentARTrieChar, SharedCharARTrie};
 use liblevenshtein::transducer::{Algorithm, Transducer};
 
@@ -36,11 +40,12 @@ impl From<libdictenstein::persistent_artrie::error::PersistentARTrieError> for F
 
 /// A disk-backed fuzzy index over `(term, V)` pairs.
 ///
-/// Backed by `PersistentARTrieChar` wrapped in
-/// `SharedCharARTrie<V> = Arc<RwLock<PersistentARTrieChar<V>>>`. Reads
-/// take a parking_lot read guard (lock-free in the contention-free
-/// case); writes take the write guard. Queries build a fresh
-/// `Transducer` per call — the underlying `Arc<RwLock<...>>` clones
+/// Backed by `SharedCharARTrie<V> = Arc<PersistentARTrieChar<V>>` — the
+/// libdictenstein overlay refactor moved concurrency *inside* the trie
+/// (a lock-free overlay heap), so there is no external `RwLock`. The
+/// `read()`/`write()` accessors (from the `SharedTrieAccess` trait) are
+/// now lock-free shared borrows; the `&self` mutators route to lock-free
+/// CAS. Queries build a fresh `Transducer` per call — the `Arc` clones
 /// cheaply, and the transducer is a tiny wrapper around the dictionary
 /// + algorithm choice.
 pub struct FuzzyIndex<V>
@@ -66,7 +71,7 @@ where
         // path itself as the primary file; if it doesn't exist, create.
         if path.exists() {
             let (trie, report) = PersistentARTrieChar::<V>::open_with_recovery(path)?;
-            let storage = std::sync::Arc::new(parking_lot::RwLock::new(trie));
+            let storage = std::sync::Arc::new(trie);
             Ok((
                 Self {
                     storage,
@@ -76,7 +81,7 @@ where
             ))
         } else {
             let trie = PersistentARTrieChar::<V>::create(path)?;
-            let storage = std::sync::Arc::new(parking_lot::RwLock::new(trie));
+            let storage = std::sync::Arc::new(trie);
             Ok((
                 Self {
                     storage,
@@ -100,7 +105,7 @@ where
 
     /// Remove a term. Returns `true` if the term was present.
     pub fn remove(&self, term: &str) -> Result<bool, FuzzyError> {
-        let mut guard = self.storage.write();
+        let guard = self.storage.write();
         guard.remove(term).map_err(Into::into)
     }
 

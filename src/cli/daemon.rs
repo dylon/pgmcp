@@ -187,6 +187,21 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     db::migrations::run_migrations_with_lock_retry(&db_pool, &config_snapshot.vector).await?;
     info!("Database initialized");
 
+    // 1a′. On-disk fuzzy ARTrie format guard. The libdictenstein lock-free overlay
+    // refactor changed the trie's on-disk format incompatibly, so any `.artrie`
+    // written by a prior binary must be discarded and rebuilt from PG (canonical)
+    // rather than mis-read. This wipes `$data_dir/fuzzy/` ONCE on a format-version
+    // mismatch, before any trie is opened; the `fuzzy-sync` cron repopulates it.
+    match cron::fuzzy_sync::ensure_fuzzy_format_version(&config_snapshot.fuzzy.data_dir) {
+        Ok(true) => warn!(
+            data_dir = %config_snapshot.fuzzy.data_dir.display(),
+            "fuzzy index on-disk format changed (libdictenstein overlay); wiped stale tries — \
+             the fuzzy-sync cron will rebuild them from PostgreSQL"
+        ),
+        Ok(false) => {}
+        Err(e) => warn!(error = %e, "fuzzy format-version guard failed (non-fatal; continuing)"),
+    }
+
     // 1b. Log the active embedding signature for operator visibility. The
     // MiniLM/384 path has been removed: BGE-M3 (bge-m3-v1, 1024-d) is the only
     // supported signature and the schema is pinned to it at migration time, so
