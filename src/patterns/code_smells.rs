@@ -22,6 +22,31 @@ pub(super) fn seeds() -> Vec<PatternSeed> {
             "https://refactoring.guru/smells/long-method",
         ),
         pat(
+            "imports_in_function_body",
+            "Imports Inside Function Bodies",
+            "code_smell",
+            "organization",
+            "Import statements (`use`, `import`, `require`) placed inside a function / method / \
+             lambda body instead of at the top of the file or module.",
+            "An import that resolves to a callable enclosing scope rather than the file or module \
+             top. pgmcp's `import_hygiene` tool / sweep collector flags exactly these (it joins \
+             each `import_use` reference to its resolved enclosing symbol).",
+            "Added ad hoc where first needed (often by codegen or LLM edits); lazy-loading habits \
+             carried over from dynamic languages.",
+            "Hoist the import to the top of the file — or, for test-only dependencies, to the top \
+             of the test module where the test functions live. Collapse copies that were re-typed \
+             across several function bodies into one top-level import.",
+            "A scope's real dependencies are visible at a glance; duplicated `use` lines disappear; \
+             formatters (e.g. rustfmt) can keep imports grouped and ordered.",
+            &[
+                "procedural_programming",
+                "object_oriented_programming",
+                "functional_programming",
+            ],
+            &["smell", "organization", "imports"],
+            "https://doc.rust-lang.org/reference/items/use-declarations.html",
+        ),
+        pat(
             "large_class",
             "Large Class",
             "code_smell",

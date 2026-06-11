@@ -166,6 +166,7 @@ pub mod tool_cochange_mutual_information;
 pub mod tool_compression_distance;
 pub mod tool_identifier_entropy;
 pub mod tool_import_entropy;
+pub mod tool_import_hygiene;
 
 // SOTA Phase 4 — evolution + quality
 pub mod tool_bus_factor;

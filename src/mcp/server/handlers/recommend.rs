@@ -500,6 +500,31 @@ ships, returns `divergences[]` with `recommended_fix(action=move_function)`."
     }
 
     #[tool(
+        description = "Flag imports embedded inside function / method bodies instead of at the top \
+of the file or module (imports at a `mod tests { … }` top are fine). Imports belong at the top of \
+their scope; nested ones hide a scope's real dependencies and breed duplicated `use` lines. \
+USE WHEN: auditing import hygiene or hunting duplicated imports across a project. \
+DO NOT USE WHEN: file_symbols data is absent — requires the Tier-0e symbol-extraction pass; \
+soft-fails with `health.symbols_present:false`. Returns `violations[]` (file, line, import, \
+enclosing symbol, per-import duplication count) plus a `by_file` rollup."
+    )]
+    async fn import_hygiene(
+        &self,
+        Parameters(params): Parameters<ImportHygieneParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "import_hygiene",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_import_hygiene::tool_import_hygiene(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Project- or file-level growth trajectory over time: commits, authors, and \
 optionally LOC per bucket (week/month/quarter). \
 USE WHEN: investigating whether a module is growing fast enough to need a preemptive split, or \

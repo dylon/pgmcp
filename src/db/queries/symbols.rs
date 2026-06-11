@@ -1004,6 +1004,80 @@ pub async fn get_imports_from_symbols(
     .await
 }
 
+/// One import-hygiene violation: an `import_use` reference whose resolved
+/// enclosing symbol (`source_symbol_id`) is a callable body — `function` /
+/// `method` / `lambda` — rather than a file / module / test-module top.
+/// `dup_count` is how many violation rows in the same file share this
+/// `target_raw`: the "same import re-typed in N function bodies" signal that
+/// hoisting to the top eliminates.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct NestedImportRow {
+    pub relative_path: String,
+    pub language: String,
+    pub source_line: i32,
+    pub target_raw: String,
+    pub enclosing_name: String,
+    pub enclosing_kind: String,
+    pub enclosing_line: i32,
+    pub dup_count: i64,
+}
+
+/// Imports that sit inside a callable body rather than at the top of their scope —
+/// the import-hygiene violation set surfaced by the `import_hygiene` collector/tool.
+///
+/// Pure shadow-ASR analysis over the *persisted* scope resolution: the
+/// symbol-extraction cron's `resolve_source_symbol_ids` has already pointed each
+/// `import_use` row at its innermost enclosing symbol, so this is a direct FK join
+/// (`symbol_references.source_symbol_id` → `file_symbols.id`) filtered to callable
+/// enclosing kinds. A `use`/`import` at a file root resolves to no symbol (`NULL`)
+/// and one at a module / test-module top resolves to that `module`; both are
+/// excluded by the inner join + the kind filter, so only function-body imports
+/// survive. `language = Some("rust")` scopes to one backend; `None` spans all.
+///
+/// Returns empty until the symbol-extraction cron has run (and resolved
+/// `source_symbol_id`) for the project — the same "empty until cron" posture as the
+/// other quality collectors. Stale (pre-resolution) projects under-report rather
+/// than mis-report, and self-heal on the next extraction.
+pub async fn nested_import_violations(
+    pool: &PgPool,
+    project_id: i32,
+    language: Option<&str>,
+) -> Result<Vec<NestedImportRow>, sqlx::Error> {
+    sqlx::query_as::<_, NestedImportRow>(
+        "WITH violations AS (
+             SELECT sr.source_file_id,
+                    f.relative_path,
+                    f.language,
+                    sr.source_line,
+                    sr.target_raw,
+                    fs.name       AS enclosing_name,
+                    fs.kind       AS enclosing_kind,
+                    fs.start_line AS enclosing_line
+             FROM symbol_references sr
+             JOIN indexed_files f  ON f.id  = sr.source_file_id
+             JOIN file_symbols   fs ON fs.id = sr.source_symbol_id
+             WHERE f.project_id = $1
+               AND sr.ref_kind = 'import_use'
+               AND ($2::text IS NULL OR f.language = $2)
+               AND fs.kind IN ('function', 'method', 'lambda')
+         )
+         SELECT relative_path,
+                language,
+                source_line,
+                target_raw,
+                enclosing_name,
+                enclosing_kind,
+                enclosing_line,
+                COUNT(*) OVER (PARTITION BY source_file_id, target_raw) AS dup_count
+         FROM violations
+         ORDER BY relative_path, source_line",
+    )
+    .bind(project_id)
+    .bind(language)
+    .fetch_all(pool)
+    .await
+}
+
 /// Return the subset of `file_ids` that have at least one row in
 /// `symbol_references`. Used by graph_analysis to decide which files take
 /// the symbol-aware path vs the regex fallback.

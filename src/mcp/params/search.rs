@@ -449,3 +449,17 @@ pub struct NamingConsistencyParams {
     )]
     pub include_fixes: Option<bool>,
 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ImportHygieneParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "Filter by programming language (e.g. \"rust\", \"python\"). Omit to scan every backend language."
+    )]
+    pub language: Option<String>,
+    #[schemars(
+        description = "Maximum violations to return (default: 100; clamped to [1, 1000]). The full count is still reported in `total_violations`."
+    )]
+    pub limit: Option<i32>,
+}

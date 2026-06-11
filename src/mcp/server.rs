@@ -911,6 +911,7 @@ impl McpServer {
                 "shotgun_surgery_fix"            => shotgun_surgery_fix(ShotgunSurgeryFixParams),
                 "pr_scope_recommender"           => pr_scope(PrScopeRecommenderParams) in tool_pr_scope,
                 "naming_consistency"             => naming_consistency(NamingConsistencyParams),
+                "import_hygiene"                 => import_hygiene(ImportHygieneParams),
                 "adoption_lag"                   => adoption_lag(AdoptionLagParams),
                 "merge_conflict_risk"            => merge_conflict_risk(MergeConflictRiskParams),
                 "hot_path_audit"                 => hot_path_audit(HotPathAuditParams),

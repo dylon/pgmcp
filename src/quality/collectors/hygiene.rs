@@ -318,6 +318,59 @@ pub async fn collect_naming_consistency(
     Ok(out)
 }
 
+/// Imports embedded inside a function/method/lambda body instead of at the top of
+/// the file or module (a `mod tests { … }` top is fine — it resolves to the module,
+/// not a callable). Pure shadow-ASR analysis: `nested_import_violations` joins each
+/// `import_use` row to its resolved enclosing symbol and keeps only callable
+/// enclosers. Severity rides `dup_count` — the same import re-typed across several
+/// function bodies is the strongest "hoist me to the top" signal (and the
+/// duplication that hoisting eliminates). Cross-language by design (every backend
+/// language); empty until the symbol-extraction cron has run.
+pub async fn collect_import_hygiene(
+    ctx: &SystemContext,
+    project_id: i32,
+    project_name: &str,
+) -> Result<Vec<Finding>, McpError> {
+    let pool = pool_or_err(ctx)?;
+    let rows = crate::db::queries::nested_import_violations(pool, project_id, None)
+        .await
+        .map_err(|e| McpError::internal_error(format!("import_hygiene query failed: {e}"), None))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let severity = match r.dup_count {
+                n if n >= 4 => Severity::High,
+                n if n >= 2 => Severity::Medium,
+                _ => Severity::Low,
+            };
+            let mut description = format!(
+                "`{}` is imported inside {} `{}` — move it to the file/module top",
+                r.target_raw, r.enclosing_kind, r.enclosing_name
+            );
+            if r.dup_count >= 2 {
+                description.push_str(&format!(
+                    " (appears in {} function bodies in this file)",
+                    r.dup_count
+                ));
+            }
+            Finding::new("import_hygiene", HY, project_name, severity, description)
+                .at(&r.relative_path, r.source_line.max(0) as u32)
+                .with_score(r.dup_count as f64)
+                .with_kind("nested_import")
+                .with_raw(json!({
+                    "file": r.relative_path,
+                    "line": r.source_line,
+                    "import": r.target_raw,
+                    "in_symbol": r.enclosing_name,
+                    "in_kind": r.enclosing_kind,
+                    "dup_count": r.dup_count,
+                    "language": r.language,
+                }))
+        })
+        .collect())
+}
+
 #[derive(PartialEq, Clone, Copy)]
 enum Case {
     Snake,

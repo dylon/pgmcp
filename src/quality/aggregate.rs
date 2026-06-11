@@ -536,6 +536,11 @@ async fn run_collectors(
             Box::pin(hy_c::collect_naming_consistency(ctx, pid, name)),
         ),
         (
+            "import_hygiene",
+            Hygiene,
+            Box::pin(hy_c::collect_import_hygiene(ctx, pid, name)),
+        ),
+        (
             "test_coverage_gaps",
             TestsDocs,
             Box::pin(td_c::collect_test_coverage_gaps(ctx, pid, name)),
