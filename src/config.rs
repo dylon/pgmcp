@@ -94,6 +94,75 @@ pub struct Config {
     /// over a workspace's git repos). Per-call params always override these.
     #[serde(default)]
     pub worklog: WorklogConfig,
+    /// `[security_scan]` — external security-scanner subsystem
+    /// (`src/cron/security_scan.rs`): runs installed scanners (gitleaks, semgrep,
+    /// trivy, cargo-audit, …) over each indexed project, persisting findings to
+    /// `external_scanner_findings`. The scheduled cron is off by default; the
+    /// on-demand `security_scan` MCP tool works regardless.
+    #[serde(default)]
+    pub security_scan: SecurityScanConfig,
+}
+
+/// `[security_scan]` — the external security-scanner subsystem
+/// (`src/cron/security_scan.rs`). Runs installed scanners (gitleaks, semgrep,
+/// trivy, cargo-audit, …) over each indexed project, persisting findings to
+/// `external_scanner_findings`. Off by default (local-first; opt-in).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecurityScanConfig {
+    /// Master switch for the scheduled cron (default false). The on-demand
+    /// `security_scan` MCP tool works regardless of this flag.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Cron cadence in seconds (default 604800 = weekly). 0 disables the cron.
+    #[serde(default = "default_security_scan_interval")]
+    pub cron_interval_secs: u64,
+    /// Scanner allow-list: when non-empty, only these scanners run. Empty
+    /// (default) = every applicable scanner that is installed. Names match the
+    /// tool-card slugs (gitleaks, trufflehog, detect-secrets, semgrep, bandit,
+    /// cppcheck, clang-tidy, cargo-audit, cargo-deny, grype, trivy, hadolint, syft).
+    #[serde(default)]
+    pub tools: Vec<String>,
+    /// Per-scanner, per-project wall-clock timeout in seconds (default 300). A
+    /// scanner exceeding it is killed and recorded with `status='timeout'`.
+    #[serde(default = "default_security_scan_timeout")]
+    pub per_project_timeout_secs: u64,
+    /// Maximum scanner subprocesses running concurrently across the sweep
+    /// (default 1 — gentle on a busy workstation).
+    #[serde(default = "default_security_scan_concurrency")]
+    pub max_concurrent: usize,
+    /// Project-name substrings to exclude from the sweep (case-insensitive).
+    #[serde(default)]
+    pub exclude_projects: Vec<String>,
+    /// When true, skip scanners that fetch advisory/vuln DBs or rule packs over
+    /// the network (cargo-audit, grype, trivy, semgrep `--config auto`) for
+    /// air-gapped operation; the fully-local scanners still run (default false).
+    /// Source is never uploaded either way — this only governs DB/rule fetches.
+    #[serde(default)]
+    pub offline_only: bool,
+}
+
+impl Default for SecurityScanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            cron_interval_secs: default_security_scan_interval(),
+            tools: Vec::new(),
+            per_project_timeout_secs: default_security_scan_timeout(),
+            max_concurrent: default_security_scan_concurrency(),
+            exclude_projects: Vec::new(),
+            offline_only: false,
+        }
+    }
+}
+
+fn default_security_scan_interval() -> u64 {
+    604_800
+}
+fn default_security_scan_timeout() -> u64 {
+    300
+}
+fn default_security_scan_concurrency() -> usize {
+    1
 }
 
 /// `[worklog]` — defaults for the `work_summary` MCP tool.

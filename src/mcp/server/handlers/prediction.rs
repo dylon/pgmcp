@@ -175,4 +175,31 @@ Each invocation runs to completion (no background queuing); typical durations ar
         )
         .await
     }
+
+    #[tool(
+        description = "Run installed external security scanners (gitleaks, trufflehog, detect-secrets, \
+semgrep, bandit, cppcheck, cargo-audit, cargo-deny, grype, trivy, hadolint, syft) over your indexed \
+projects and query their findings. \
+USE WHEN: auditing a project (or all projects) for committed secrets, dependency CVEs, SAST issues, \
+or IaC/Dockerfile misconfigurations. Returns CACHED findings by default; pass refresh=true to run \
+the scanners now (a subprocess sweep). Scope with project / scanners / severity_min. Findings are \
+advisory; enable [tracker] auto_promote_findings to materialize high/critical ones as pending bugs."
+    )]
+    async fn security_scan(
+        &self,
+        Parameters(params): Parameters<SecurityScanParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        // Long inner timeout: a refresh sweep spawns scanner subprocesses over
+        // every applicable project and can exceed the default 30s tool budget.
+        instrumented_tool_wrap(
+            self.stats(),
+            "security_scan",
+            600,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_security_scan::tool_security_scan(self.ctx(), params),
+        )
+        .await
+    }
 }

@@ -62,6 +62,7 @@ pub mod ontology_reason;
 pub mod quality_history;
 #[allow(dead_code)]
 pub mod scheduler;
+pub mod security_scan;
 #[allow(dead_code)]
 pub mod semantic_edges;
 pub mod shutdown;

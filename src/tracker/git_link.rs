@@ -94,6 +94,12 @@ pub enum FindingSource {
     /// A channel deadlock — `blocked_recv` / `channel_cycle` (ADR-011) → a
     /// `pending` `bug` item.
     ChannelDeadlock,
+    /// A high-severity finding from an external security-scanner run over a
+    /// project (the `security_scan` cron / tool — gitleaks, semgrep, trivy, …)
+    /// → a `pending` `bug` item. The specific scanner is carried in the
+    /// `provenance_key` and the `external_scanner_findings.scanner` column, so
+    /// this one source value preserves full per-scanner provenance.
+    SecurityScan,
 }
 
 impl FindingSource {
@@ -103,6 +109,7 @@ impl FindingSource {
         Self::DocumentedTechDebt,
         Self::DeadlockCycle,
         Self::ChannelDeadlock,
+        Self::SecurityScan,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -111,6 +118,7 @@ impl FindingSource {
             Self::DocumentedTechDebt => "documented_tech_debt",
             Self::DeadlockCycle => "deadlock_cycle",
             Self::ChannelDeadlock => "channel_deadlock",
+            Self::SecurityScan => "security_scan",
         }
     }
 
@@ -136,6 +144,8 @@ impl FindingSource {
             Self::DocumentedTechDebt => "fixme",
             // Deadlock cycles are correctness defects → first-class `bug`.
             Self::DeadlockCycle | Self::ChannelDeadlock => "bug",
+            // External security-scanner findings are first-class `bug`s.
+            Self::SecurityScan => "bug",
         }
     }
 }
@@ -172,6 +182,7 @@ mod tests {
             "documented_tech_debt",
             "deadlock_cycle",
             "channel_deadlock",
+            "security_scan",
         ]
         .into_iter()
         .collect();
@@ -179,8 +190,8 @@ mod tests {
             got, expected,
             "FindingSource vocabulary drifted from pinned set"
         );
-        assert_eq!(FindingSource::ALL.len(), 4);
-        assert_eq!(got.len(), 4, "duplicate as_str() value in FindingSource");
+        assert_eq!(FindingSource::ALL.len(), 5);
+        assert_eq!(got.len(), 5, "duplicate as_str() value in FindingSource");
     }
 
     #[test]

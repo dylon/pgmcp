@@ -719,6 +719,7 @@ impl McpServer {
                 "code_on_fire"           => code_on_fire(CodeOnFireParams),
                 "documented_tech_debt"   => documented_tech_debt(DocumentedTechDebtParams),
                 "trigger_cron"           => trigger_cron(TriggerCronParams),
+                "security_scan"          => security_scan(SecurityScanParams),
                 // A2A inter-agent IPC bridge
                 "a2a_send_task"          => a2a_send_task(A2aSendTaskParams),
                 "a2a_get_task"           => a2a_get_task(A2aGetTaskParams),

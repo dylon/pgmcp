@@ -202,6 +202,7 @@ pub mod tool_crypto_misuse;
 pub mod tool_cve_supply_chain;
 pub mod tool_injection_candidates;
 pub mod tool_secret_detection;
+pub mod tool_security_scan;
 pub mod tool_taint_analysis;
 pub mod tool_unprotected_routes;
 pub mod tool_unsafe_deserialization;

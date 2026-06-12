@@ -102,6 +102,7 @@ async fn promote_for_project(
     let mut created = 0u64;
     created += promote_bug_prediction(pool, project_id, project_name, bug_score_threshold).await?;
     created += promote_documented_tech_debt(pool, project_id, project_name).await?;
+    created += promote_security_scan(pool, project_id).await?;
     Ok(created)
 }
 
@@ -319,6 +320,128 @@ async fn promote_documented_tech_debt(
         }
     }
     Ok(created)
+}
+
+/// High-severity (critical/high) open external-scanner findings → `pending`
+/// `bug` items (the `security_scan` source). Idempotent on each finding's own
+/// `provenance_key` (`security_scan:<scanner>:<sha256>`), stored in
+/// `external_scanner_findings` by the `security_scan` cron / tool.
+async fn promote_security_scan(pool: &PgPool, project_id: i32) -> Result<u64, sqlx::Error> {
+    // Rank floor 3 = High (covers critical + high), open findings only.
+    let findings = queries::query_scanner_findings(
+        pool,
+        Some(project_id),
+        None,
+        3,
+        Some("open"),
+        MAX_PROMOTIONS_PER_SOURCE as i64,
+    )
+    .await?;
+
+    let mut created = 0u64;
+    for f in &findings {
+        let location = match (&f.file_path, f.line) {
+            (Some(p), Some(l)) => format!("{p}:{l}"),
+            (Some(p), None) => p.clone(),
+            _ => "—".to_string(),
+        };
+        let title = format!("[{}] {}", f.scanner, f.title);
+        let body = format!(
+            "Auto-promoted by the findings-promotion cron from the `{}` scanner \
+             ({} severity).\n\nRule: {}\nLocation: {}\n\n{}",
+            f.scanner,
+            f.severity,
+            f.rule_id.as_deref().unwrap_or("—"),
+            location,
+            f.message.as_deref().unwrap_or(""),
+        );
+        let priority = match f.severity.as_str() {
+            "critical" => 90,
+            "high" => 70,
+            "medium" => 40,
+            _ => 20,
+        };
+        let public_id = gen_finding_public_id("sec");
+        let file_id = match &f.file_path {
+            Some(p) => resolve_file_id(pool, project_id, p).await,
+            None => None,
+        };
+        let item = NewWorkItem {
+            public_id: &public_id,
+            project_id: Some(project_id),
+            // External security findings are first-class `bug`s, born `pending`
+            // (NOT confirmed — confirmation is user-only). severity carried over.
+            kind: FindingSource::SecurityScan.item_kind(),
+            status: "pending",
+            title: &title,
+            body: Some(&body),
+            priority,
+            origin: "agent_write",
+            severity: Some(f.severity.as_str()),
+            ..Default::default()
+        };
+        let anchor = FindingAnchor {
+            file_id,
+            ..Default::default()
+        };
+        match queries::promote_finding(
+            pool,
+            &f.provenance_key,
+            FindingSource::SecurityScan.as_str(),
+            item,
+            anchor,
+        )
+        .await
+        {
+            Ok((item_id, was_created)) => {
+                if was_created {
+                    created += 1;
+                    // Structured bug-detail sidecar: a scanner finding carries a
+                    // real actual-behavior (its message), environment (scanner +
+                    // severity), and root cause (the rule that fired). Only on
+                    // first creation, so a later re-promotion never clobbers any
+                    // user edits to the sidecar.
+                    let environment = format!("scanner: {}; severity: {}", f.scanner, f.severity);
+                    let details = queries::BugDetailFields {
+                        actual_behavior: f.message.as_deref(),
+                        environment: Some(&environment),
+                        root_cause: f.rule_id.as_deref(),
+                        reported_by: Some("security_scan"),
+                        ..Default::default()
+                    };
+                    if let Err(e) = queries::upsert_bug_details(pool, item_id, &details).await {
+                        warn!(
+                            error = ?e,
+                            scanner = %f.scanner,
+                            "findings-promotion: security bug_details upsert failed"
+                        );
+                    }
+                }
+            }
+            Err(e) => warn!(
+                error = ?e,
+                scanner = %f.scanner,
+                "findings-promotion: promote security_scan finding failed"
+            ),
+        }
+    }
+    Ok(created)
+}
+
+/// Best-effort resolution of a scanner-reported path to an `indexed_files.id`,
+/// so a promoted item carries a code anchor. `None` when the path isn't indexed
+/// (e.g. a synthetic `Cargo.lock` target or an absolute path outside the index).
+async fn resolve_file_id(pool: &PgPool, project_id: i32, path: &str) -> Option<i64> {
+    let rel = path.trim_start_matches("./");
+    sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM indexed_files WHERE project_id = $1 AND relative_path = $2 LIMIT 1",
+    )
+    .bind(project_id)
+    .bind(rel)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
 }
 
 /// A stable, human-legible `public_id` for a promoted finding: a fixed prefix

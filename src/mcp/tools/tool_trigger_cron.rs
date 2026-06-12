@@ -54,11 +54,13 @@ pub async fn tool_trigger_cron(
         "msm-calibrate",
         "fuzzy-sync",
         "target-cleanup",
+        "security-scan",
+        "findings-promotion",
     ];
     if !VALID_JOBS.contains(&job) {
         return Err(McpError::invalid_params(
             format!(
-                "Unknown job {job:?}. Valid: symbol-extraction | call-graph | function-metrics | graph-analysis | a2a-reflect | msm-calibrate | fuzzy-sync | target-cleanup"
+                "Unknown job {job:?}. Valid: symbol-extraction | call-graph | function-metrics | graph-analysis | a2a-reflect | msm-calibrate | fuzzy-sync | target-cleanup | security-scan | findings-promotion"
             ),
             None,
         ));
@@ -113,6 +115,58 @@ pub async fn tool_trigger_cron(
                     "job": job,
                     "status": "skipped",
                     "reason": "DbClient has no PgPool (target-cleanup needs Postgres)",
+                }))
+            }
+        }
+        "security-scan" => {
+            // External security-scanner sweep over the indexed projects (the
+            // opt-in cron's on-demand counterpart). Honors the live
+            // [security_scan] config; an optional `project` filter scopes by
+            // name / path substring. Findings land in external_scanner_findings.
+            let cfg = ctx.config().load().security_scan.clone();
+            if let Some(pool) = db.pool().cloned() {
+                let report =
+                    crate::cron::security_scan::run_security_scan(&pool, &cfg, project.as_deref())
+                        .await;
+                report.log_summary();
+                json_result(&json!({
+                    "job": job,
+                    "project": project,
+                    "status": "completed",
+                    "projects_scanned": report.projects_scanned,
+                    "findings_upserted": report.findings_upserted,
+                    "findings_resolved": report.findings_resolved,
+                    "runs_ok": report.runs_ok,
+                    "runs_timeout": report.runs_timeout,
+                    "runs_error": report.runs_error,
+                    "scanners_available": report.scanners_available,
+                    "scanners_missing": report.scanners_missing,
+                    "guidance": "Scanners ran over the indexed projects; findings are in external_scanner_findings (query/refresh via the security_scan tool). Enable [tracker] auto_promote_findings and run trigger_cron job=\"findings-promotion\" to materialize high/critical findings as pending bugs.",
+                }))
+            } else {
+                json_result(&json!({
+                    "job": job,
+                    "status": "skipped",
+                    "reason": "DbClient has no PgPool (security-scan needs Postgres)",
+                }))
+            }
+        }
+        "findings-promotion" => {
+            // Materialize high-signal analytic findings (bug_prediction,
+            // documented_tech_debt, deadlock cycles, security_scan) into pending
+            // work items for opted-in projects ([tracker] auto_promote_findings).
+            if let Some(pool) = db.pool().cloned() {
+                crate::cron::findings_promotion::run_or_log(pool, Arc::clone(stats)).await;
+                json_result(&json!({
+                    "job": job,
+                    "status": "completed",
+                    "guidance": "Promotion swept the opted-in projects. New pending items (if any) are in the tracker — triage bugs with work_item_triage.",
+                }))
+            } else {
+                json_result(&json!({
+                    "job": job,
+                    "status": "skipped",
+                    "reason": "DbClient has no PgPool (findings-promotion needs Postgres)",
                 }))
             }
         }

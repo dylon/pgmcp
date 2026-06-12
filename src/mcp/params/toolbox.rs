@@ -19,7 +19,9 @@ pub struct ToolboxSearchParams {
     pub query: String,
     #[schemars(description = "Maximum number of tool cards to return (default: 10)")]
     pub limit: Option<i32>,
-    #[schemars(description = "Filter by domain: formal_verification, developer_tooling, or security")]
+    #[schemars(
+        description = "Filter by domain: formal_verification, developer_tooling, or security"
+    )]
     pub domain: Option<String>,
     #[schemars(
         description = "Filter by category slug, e.g. proof_assistant, smt_solver, model_checker, \
@@ -36,7 +38,9 @@ pub struct ToolboxGetParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ToolboxListParams {
-    #[schemars(description = "Filter by domain: formal_verification, developer_tooling, or security")]
+    #[schemars(
+        description = "Filter by domain: formal_verification, developer_tooling, or security"
+    )]
     pub domain: Option<String>,
     #[schemars(description = "Filter by category slug")]
     pub category: Option<String>,

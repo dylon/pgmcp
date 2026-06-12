@@ -659,6 +659,29 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         });
     }
 
+    // 11d-ter. Schedule the security-scan cron: run installed external security
+    // scanners (gitleaks, semgrep, trivy, cargo-audit, …) over each indexed
+    // project, persisting findings to external_scanner_findings. Off by default
+    // ([security_scan] enabled = false; cron_interval_secs = 0 also disables).
+    // The on-demand security_scan MCP tool works regardless of this gate.
+    if config_snapshot.security_scan.enabled
+        && config_snapshot.security_scan.cron_interval_secs > 0
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let sec_cfg = config_snapshot.security_scan.clone();
+        let interval_ms = sec_cfg.cron_interval_secs.saturating_mul(1000);
+        let rt_for_sec = tokio::runtime::Handle::current();
+        // 105s initial delay so we don't run during the startup window.
+        cron_handle.schedule_recurring(105_000, interval_ms, "security-scan", move || {
+            let pool = pool.clone();
+            let cfg = sec_cfg.clone();
+            rt_for_sec.spawn(async move {
+                cron::security_scan::run_or_log(pool, cfg).await;
+            });
+            true
+        });
+    }
+
     // 11e. Schedule the memory-graph-refresh cron: keep the unified
     // knowledge-graph matviews (memory_unified_nodes + memory_unified_edges)
     // current with the indexed corpus so the traversal tools see fresh nodes/

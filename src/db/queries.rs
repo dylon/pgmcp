@@ -98,6 +98,10 @@ pub use queries_advisories::*;
 mod queries_ontology;
 pub use queries_ontology::*;
 
+#[path = "queries/external_scanner.rs"]
+mod queries_external_scanner;
+pub use queries_external_scanner::*;
+
 // The digest rate-limit ledger keeps its own namespace (`queries::digest::*`)
 // rather than being flattened with `pub use`, so the digest's sole write
 // surface stays obviously distinct from the read queries. See `src/digest/`.
