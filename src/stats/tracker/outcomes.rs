@@ -27,12 +27,21 @@ use chrono::{DateTime, Utc};
 ///   "closed pool" / "disconnected channel" errors out of the log. See
 ///   plan ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
 ///   F3.
+/// - `DbDown`: the `crate::health` DB-availability breaker reports the
+///   database unreachable. The cron skips quietly (the prober owns the
+///   single "database unreachable" log line) instead of stalling on a 10 s
+///   `acquire_timeout` and logging an error every tick. See `crate::health`.
+/// - `DiskPressure`: the `crate::health` disk watchdog has paused pgmcp's
+///   disk-growing work because a watched filesystem is below its free-bytes
+///   or free-inode floor. Applies to heavy crons (which write/grow data).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     PhaseGate,
     Cooldown,
     LockBusy,
     Shutdown,
+    DbDown,
+    DiskPressure,
 }
 
 impl SkipReason {
@@ -42,6 +51,8 @@ impl SkipReason {
             SkipReason::Cooldown => "cooldown",
             SkipReason::LockBusy => "lock_busy",
             SkipReason::Shutdown => "shutdown",
+            SkipReason::DbDown => "db_down",
+            SkipReason::DiskPressure => "disk_pressure",
         }
     }
 }
@@ -75,6 +86,8 @@ impl CronJobOutcome {
             CronJobOutcome::Skipped(SkipReason::Cooldown) => "skipped:cooldown",
             CronJobOutcome::Skipped(SkipReason::LockBusy) => "skipped:lock_busy",
             CronJobOutcome::Skipped(SkipReason::Shutdown) => "skipped:shutdown",
+            CronJobOutcome::Skipped(SkipReason::DbDown) => "skipped:db_down",
+            CronJobOutcome::Skipped(SkipReason::DiskPressure) => "skipped:disk_pressure",
             CronJobOutcome::Panicked => "panicked",
         }
     }

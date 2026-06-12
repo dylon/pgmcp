@@ -58,7 +58,9 @@ pub const NODE_TYPES: &[NodeTypeMeta] = &[
         key: "memory_entity",
         display: "Memory Entity",
         source_table: "memory_entities",
-        has_embedding: false,
+        // v31: entities gained a 1024-d embedding (name + entity_type) so the KB
+        // entity hubs are vector-seeded in the unified graph, not graph-only.
+        has_embedding: true,
     },
     NodeTypeMeta {
         key: "observation",
@@ -186,6 +188,46 @@ pub const NODE_TYPES: &[NodeTypeMeta] = &[
         display: "Channel (concurrency)",
         source_table: "sync_ops",
         has_embedding: false,
+    },
+    // v31 graph-RAG coverage: A2A conversations, mandate-source prompts, JSON
+    // data tables, and worktree-coordination negotiations as first-class nodes.
+    // `a2a_task` is a non-embedded HUB (like `commit`), reached via `in_task` /
+    // `evidenced_by` edges; the rest carry 1024-d embeddings (cron-backfilled).
+    NodeTypeMeta {
+        key: "agent_message",
+        display: "Agent Message (social mailbox)",
+        source_table: "agent_messages",
+        has_embedding: true,
+    },
+    NodeTypeMeta {
+        key: "a2a_message",
+        display: "A2A Message (task transcript)",
+        source_table: "a2a_messages",
+        has_embedding: true,
+    },
+    NodeTypeMeta {
+        key: "a2a_task",
+        display: "A2A Task (hub)",
+        source_table: "a2a_tasks",
+        has_embedding: false,
+    },
+    NodeTypeMeta {
+        key: "prompt",
+        display: "Session Prompt",
+        source_table: "session_prompts",
+        has_embedding: true,
+    },
+    NodeTypeMeta {
+        key: "data_table",
+        display: "Data Table (JSON)",
+        source_table: "data_tables",
+        has_embedding: true,
+    },
+    NodeTypeMeta {
+        key: "coordination_request",
+        display: "Coordination Request (worktree negotiation)",
+        source_table: "coordination_requests",
+        has_embedding: true,
     },
 ];
 
@@ -321,6 +363,43 @@ pub const EDGE_TYPES_CORE: &[EdgeTypeMeta] = &[
     EdgeTypeMeta {
         key: "lock_order",
         display: "Lock Order (lock_resource→lock_resource, bitemporal)",
+        directed: true,
+    },
+    // v31 graph-RAG edges. `in_task` binds a transcript message to its A2A task;
+    // `reply_to` threads the social mailbox; `extracted_from` links a mandate to
+    // the prompt it was distilled from; `sent` attributes a mailbox message to its
+    // author agent; `concerns` connects a coordination negotiation to the work
+    // item it blocks and the mailbox message that carries it; `requested`
+    // attributes a negotiation to the requesting agent. (a2a_task→observation
+    // reuses `evidenced_by`; data_table/coordination→project reuse `in_project`.)
+    EdgeTypeMeta {
+        key: "in_task",
+        display: "In Task (a2a_message→a2a_task)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "reply_to",
+        display: "Reply To (agent_message→agent_message)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "extracted_from",
+        display: "Extracted From (mandate→prompt)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "sent",
+        display: "Sent (agent→agent_message)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "concerns",
+        display: "Concerns (coordination_request→work_item / agent_message)",
+        directed: true,
+    },
+    EdgeTypeMeta {
+        key: "requested",
+        display: "Requested (agent→coordination_request)",
         directed: true,
     },
 ];

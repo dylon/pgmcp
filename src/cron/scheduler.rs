@@ -114,6 +114,20 @@ macro_rules! heavy_gate_or_skip {
             $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::Shutdown), 0);
             return;
         }
+        // DB-availability breaker (src/health): if the database is unreachable,
+        // skip quietly rather than stall this heavy cron on a 10 s
+        // `acquire_timeout` and log an error every tick. The prober owns the
+        // single "database unreachable" line.
+        if !$stats.db_health().is_up() {
+            $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::DbDown), 0);
+            return;
+        }
+        // Disk-pressure gate (src/health): heavy crons write/grow data, so pause
+        // them while the watchdog reports a watched filesystem under pressure.
+        if $stats.disk_pressure().is_paused() {
+            $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::DiskPressure), 0);
+            return;
+        }
         let first_seen = $ready.get_or_init(Instant::now);
         if first_seen.elapsed() < $cooldown {
             tracing::debug!(
@@ -708,6 +722,16 @@ pub fn schedule_maintenance_jobs(
                 return false;
             }
             let stats = Arc::clone(&stats_clone);
+            if !stats.db_health().is_up() {
+                stats.record_cron_outcome(
+                    "work-item-presence",
+                    crate::stats::tracker::CronJobOutcome::Skipped(
+                        crate::stats::tracker::SkipReason::DbDown,
+                    ),
+                    0,
+                );
+                return true;
+            }
             if let Some(pool) = db_clone.pool().cloned() {
                 rt_clone.spawn(async move {
                     crate::cron::work_item_presence::run_or_log(
@@ -742,6 +766,16 @@ pub fn schedule_maintenance_jobs(
                 return false;
             }
             let stats = Arc::clone(&stats_lv);
+            if !stats.db_health().is_up() {
+                stats.record_cron_outcome(
+                    "mcp-client-liveness",
+                    crate::stats::tracker::CronJobOutcome::Skipped(
+                        crate::stats::tracker::SkipReason::DbDown,
+                    ),
+                    0,
+                );
+                return true;
+            }
             if let Some(pool) = db_lv.pool().cloned() {
                 rt_lv.spawn(async move {
                     crate::cron::mcp_client_liveness::run_or_log(pool, stats, liveness_proc_fd)
@@ -794,6 +828,16 @@ pub fn schedule_maintenance_jobs(
                 return false;
             }
             let stats = Arc::clone(&stats_gs);
+            if !stats.db_health().is_up() {
+                stats.record_cron_outcome(
+                    "git-state-scan",
+                    crate::stats::tracker::CronJobOutcome::Skipped(
+                        crate::stats::tracker::SkipReason::DbDown,
+                    ),
+                    0,
+                );
+                return true;
+            }
             if let Some(pool) = db_gs.pool().cloned() {
                 rt_gs.spawn(async move {
                     crate::cron::git_state_scan::run_or_log(pool, stats).await;
@@ -856,6 +900,40 @@ pub fn schedule_maintenance_jobs(
                 if let Some(pool) = db_clone_cs.pool().cloned() {
                     rt_clone_cs.spawn(async move {
                         crate::cron::concurrency_scan::run_or_log(pool, stats, cs_promote).await;
+                    });
+                }
+                true
+            },
+        );
+    }
+
+    // target-cleanup (disk reclamation): tiered removal of regeneratable Rust
+    // `target/` build artifacts + a provenance-first `/tmp`+`/var/tmp` sweep.
+    // Light I/O job — runs on the runtime like the presence/findings sweeps (no
+    // heavy-cron gate); the blocking filesystem work is dispatched via
+    // spawn_blocking inside run_or_log. Ships enabled-but-dry-run; interval 0
+    // disables. A fixed ~10-min initial delay surfaces the first dry-run
+    // manifest soon after a restart (the projects table persists across
+    // restarts, so discovery is populated immediately) without colliding with
+    // the startup scan storm; the configured cadence (default weekly) thereafter.
+    if config.target_cleanup.interval_secs > 0 {
+        let db_clone_tc = Arc::clone(&db);
+        let rt_clone_tc = rt.clone();
+        let lc_tc = lifecycle.clone();
+        let tc_interval = config.target_cleanup.interval_secs;
+        let tc_cfg = config.target_cleanup.clone();
+        handle.schedule_recurring(
+            600_000, // 10-minute ready-independent initial delay
+            tc_interval * 1000,
+            "target-cleanup",
+            move || {
+                if lc_tc.is_stopping() {
+                    return false;
+                }
+                let cfg = tc_cfg.clone();
+                if let Some(pool) = db_clone_tc.pool().cloned() {
+                    rt_clone_tc.spawn(async move {
+                        crate::cron::target_cleanup::run_or_log(pool, cfg).await;
                     });
                 }
                 true

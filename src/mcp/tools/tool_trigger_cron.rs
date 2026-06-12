@@ -53,11 +53,12 @@ pub async fn tool_trigger_cron(
         "a2a-reflect",
         "msm-calibrate",
         "fuzzy-sync",
+        "target-cleanup",
     ];
     if !VALID_JOBS.contains(&job) {
         return Err(McpError::invalid_params(
             format!(
-                "Unknown job {job:?}. Valid: symbol-extraction | call-graph | function-metrics | graph-analysis | a2a-reflect | msm-calibrate | fuzzy-sync"
+                "Unknown job {job:?}. Valid: symbol-extraction | call-graph | function-metrics | graph-analysis | a2a-reflect | msm-calibrate | fuzzy-sync | target-cleanup"
             ),
             None,
         ));
@@ -80,6 +81,41 @@ pub async fn tool_trigger_cron(
     let _cron_flag = crate::cron::scheduler::HeavyCronFlag::new(Arc::clone(stats));
 
     match job {
+        "target-cleanup" => {
+            // Disk reclamation: tiered `target/` removal + provenance-first
+            // tmp sweep. Honors the live `[cron.target_cleanup]` config, so a
+            // manual run produces a dry-run manifest while `dry_run = true` and
+            // actually reclaims once armed. An optional `project` filter scopes
+            // the sweep by project name / path substring.
+            let cfg = ctx.config().load().cron.target_cleanup.clone();
+            if let Some(pool) = db.pool().cloned() {
+                let report = crate::cron::target_cleanup::run_target_cleanup(
+                    &pool,
+                    &cfg,
+                    project.as_deref(),
+                )
+                .await;
+                report.log_summary();
+                json_result(&json!({
+                    "job": job,
+                    "project": project,
+                    "status": "completed",
+                    "dry_run": report.dry_run,
+                    "targets_scanned": report.targets_scanned,
+                    "total_bytes": report.total_bytes(),
+                    "tmp_files_removed": report.tmp_files_removed,
+                    "tmp_protected_live": report.tmp_protected_live,
+                    "manifest": report.manifest_path,
+                    "guidance": "Cleanup ran. Review the manifest under $XDG_STATE_HOME/pgmcp/target-cleanup/ (else ~/.local/state/pgmcp/target-cleanup/). While dry_run=true nothing was deleted; set [cron.target_cleanup] dry_run=false to arm actual removal.",
+                }))
+            } else {
+                json_result(&json!({
+                    "job": job,
+                    "status": "skipped",
+                    "reason": "DbClient has no PgPool (target-cleanup needs Postgres)",
+                }))
+            }
+        }
         "symbol-extraction" => {
             match project.as_deref() {
                 Some(p) => {

@@ -7,7 +7,7 @@
 //! MCP tools (Phase 8).
 
 use libdictenstein::Dictionary;
-use libdictenstein::suffix_automaton_char::SuffixAutomatonChar;
+use libdictenstein::suffix_automaton::char::SuffixAutomatonChar;
 
 /// In-memory substring index.
 pub struct SubstringIndex {

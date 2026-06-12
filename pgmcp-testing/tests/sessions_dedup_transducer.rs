@@ -19,7 +19,7 @@
 //! and remains the canonical end-to-end gate. This file exercises the
 //! pure Transducer layer that pgmcp wraps around the PG row fetch.
 
-use libdictenstein::dynamic_dawg_char::DynamicDawgChar;
+use libdictenstein::dynamic_dawg::char::DynamicDawgChar;
 use liblevenshtein::transducer::Transducer;
 use std::collections::HashMap;
 

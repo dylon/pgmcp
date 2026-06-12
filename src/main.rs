@@ -39,6 +39,7 @@ mod fcm;
 #[allow(dead_code)]
 mod fuzzy;
 mod graph;
+mod health;
 mod indexer;
 mod llm;
 mod logging;
@@ -60,12 +61,14 @@ mod rmas;
 mod sessions;
 mod shutdown;
 mod stats;
+mod tools_catalog;
 #[allow(dead_code)]
 mod topic_store;
 mod tracker;
 #[allow(dead_code)]
 mod wfst;
 mod work_pool;
+mod worklog;
 
 use std::path::PathBuf;
 

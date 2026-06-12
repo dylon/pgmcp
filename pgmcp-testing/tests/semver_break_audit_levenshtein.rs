@@ -20,7 +20,7 @@
 //!    adjacent swaps as a single edit, matching the documented behavior.
 
 use libdictenstein::Dictionary;
-use libdictenstein::dynamic_dawg_char::DynamicDawgChar;
+use libdictenstein::dynamic_dawg::char::DynamicDawgChar;
 use liblevenshtein::transducer::Transducer;
 
 /// Build the same dictionary + transducer pair the tool builds at runtime.

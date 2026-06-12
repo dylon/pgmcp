@@ -32,16 +32,26 @@ use crate::db::queries::{StatusSnapshot, status_snapshot};
 /// Intended to be polled at high frequency. Distinct from `/api/status`,
 /// which returns a rich snapshot but issues ~10 SQL `COUNT(*)` queries.
 pub async fn health(State(state): State<ApiState>) -> impl IntoResponse {
-    let db_ready = state.db.pool().is_some();
+    // Live DB readiness from the `crate::health` breaker (a pure atomic read —
+    // still no DB query on this hot path). The pool object outlives an outage,
+    // so the old `pool().is_some()` stayed `true` for the entire 2026-06-11
+    // downtime; the breaker reflects the *live* state. Require both: a pool must
+    // exist (false in CLI mode) AND the breaker must report up.
+    let db_snap = state.stats.db_health().snapshot();
+    let db_ready = db_snap.up && state.db.pool().is_some();
     let embedder_ready = state.query_embedder.is_ready();
     let serving_ready = db_ready && embedder_ready;
-    let body = Json(serde_json::json!({
+    let mut payload = serde_json::json!({
         "phase": state.lifecycle.current().label(),
         "serving_ready": serving_ready,
         "db_ready": db_ready,
         "embedder_ready": embedder_ready,
         "ready_workers": state.query_embedder.ready_workers(),
-    }));
+    });
+    if !db_snap.up {
+        payload["db_down_since"] = serde_json::json!(db_snap.down_since_epoch);
+    }
+    let body = Json(payload);
     if serving_ready {
         (StatusCode::OK, body)
     } else {
@@ -474,7 +484,7 @@ pub async fn search(
 // POST /api/client/file_event — record a client file-touch (Phase 2A hook)
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ClientFileEventRequest {
     pub session_id: uuid::Uuid,
     pub cwd: String,
@@ -523,6 +533,22 @@ pub async fn client_file_event(
             req.op
         ),
     ))?;
+
+    // DB-availability breaker (src/health): spool to the outbox while the DB is
+    // down (replayed on recovery) instead of stalling the PostToolUse hook.
+    if !state.stats.db_health().is_up() {
+        if let Some(ob) = state.outbox.as_ref() {
+            ob.append(
+                "/api/client/file_event",
+                serde_json::to_value(&req).unwrap_or_default(),
+            );
+        }
+        return Ok(Json(ClientFileEventResponse {
+            recorded: false,
+            project_id: None,
+            file_id: None,
+        }));
+    }
 
     let pool = state.db.pool().ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -701,7 +727,7 @@ pub async fn tracker_project_event(
 // POST /api/session/observe — Session-mandate observation + re-injection
 // ============================================================================
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ObserveRequest {
     pub session_id: uuid::Uuid,
     pub cwd: String,
@@ -735,6 +761,29 @@ pub async fn session_observe(
     State(state): State<ApiState>,
     Json(req): Json<ObserveRequest>,
 ) -> Result<Json<ObserveResponse>, (StatusCode, String)> {
+    // DB-availability breaker (src/health): if the database is unreachable,
+    // spool the raw request to the outbox (replayed on recovery via re-POST to
+    // this same endpoint) and return a neutral response, rather than stalling on
+    // the pool acquire and failing the UserPromptSubmit hook. The prompt is the
+    // highest-value ephemeral datum (it drives cross-session retrieval + mandate
+    // re-injection) and has no other durable source.
+    if !state.stats.db_health().is_up() {
+        if let Some(ob) = state.outbox.as_ref() {
+            ob.append(
+                "/api/session/observe",
+                serde_json::to_value(&req).unwrap_or_default(),
+            );
+        }
+        return Ok(Json(ObserveResponse {
+            session_id: req.session_id,
+            prompt_id: -1,
+            extracted: Vec::new(),
+            active_mandates: Vec::new(),
+            rag_hits: Vec::new(),
+            additional_context: String::new(),
+        }));
+    }
+
     let pool = state.db.pool().ok_or((
         StatusCode::INTERNAL_SERVER_ERROR,
         "raw pool unavailable".to_string(),

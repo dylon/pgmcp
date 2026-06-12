@@ -45,6 +45,7 @@ pub mod fcm;
 #[allow(dead_code)]
 pub mod fuzzy;
 pub mod graph;
+pub mod health;
 pub mod indexer;
 pub mod llm;
 pub mod logging;
@@ -66,9 +67,11 @@ pub mod rmas;
 pub mod sessions;
 pub mod shutdown;
 pub mod stats;
+pub mod tools_catalog;
 #[allow(dead_code)]
 pub mod topic_store;
 pub mod tracker;
 #[allow(dead_code)]
 pub mod wfst;
 pub mod work_pool;
+pub mod worklog;

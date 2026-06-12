@@ -23,7 +23,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use libdictenstein::persistent_artrie_char::{PersistentARTrieChar, SharedCharARTrie};
+use libdictenstein::persistent_artrie::char::{PersistentARTrieChar, SharedCharARTrie};
 use libgrammstein::hybrid::{HybridConfig, HybridLanguageModel, InterpolationStrategy};
 use libgrammstein::ngram::NgramEntry;
 use libgrammstein::ngram::open_or_create_vocabulary;

@@ -44,6 +44,8 @@ mod v28_project_deps_gitstate;
 mod v29_coordination;
 mod v2_shadow_asr;
 mod v30_chunk_delete_index_hardening;
+mod v31_graph_embeddings;
+mod v32_toolbox_catalog;
 mod v3_cross_language_signatures;
 mod v4_work_items;
 mod v5_work_items_collab;
@@ -192,6 +194,59 @@ async fn ensure_data_tables_hnsw_index(
              ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
         )
         .bind(meta_key)
+        .bind(&current_params)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
+/// HNSW index on a 1024-d `embedding` column for a table that gains one in v31
+/// (`agent_messages` / `a2a_messages` / `memory_entities` /
+/// `coordination_requests`). Same params-tracked drop+rebuild discipline as
+/// `ensure_work_items_hnsw_index`, but generic over the table name and guarded by
+/// `column_exists` so a partial install where v31 has not yet added the column
+/// simply no-ops. `table` is always a compile-time literal from the call sites
+/// (no untrusted interpolation). The matview's own HNSW already covers unified
+/// search; these per-base-table indexes serve future direct semantic queries.
+async fn ensure_v31_embedding_hnsw_index(
+    pool: &PgPool,
+    config: &VectorConfig,
+    table: &str,
+) -> Result<(), sqlx::Error> {
+    if !column_exists(pool, table, "embedding").await? {
+        return Ok(());
+    }
+    let current_params = format!(
+        "m={},ef_construction={}",
+        config.hnsw_m, config.hnsw_ef_construction
+    );
+    let meta_key = format!("{table}_hnsw_params");
+    let index_name = format!("idx_{table}_embedding");
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT value FROM pgmcp_metadata WHERE key = $1")
+            .bind(&meta_key)
+            .fetch_optional(pool)
+            .await?;
+    if stored.as_deref() != Some(&current_params) {
+        sqlx::query(&format!("DROP INDEX IF EXISTS {index_name}"))
+            .execute(pool)
+            .await?;
+        build_hnsw_index(
+            pool,
+            config,
+            &format!(
+                "CREATE INDEX IF NOT EXISTS {index_name} ON {table} \
+                 USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
+                config.hnsw_m, config.hnsw_ef_construction
+            ),
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO pgmcp_metadata (key, value) VALUES ($1, $2)
+             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        )
+        .bind(&meta_key)
         .bind(&current_params)
         .execute(pool)
         .await?;
@@ -2434,6 +2489,22 @@ pub async fn run_migrations(
     )
     .await?;
 
+    apply_step(
+        pool,
+        v31_graph_embeddings::GRAPH_EMBEDDINGS_V1,
+        v31_graph_embeddings::GRAPH_EMBEDDINGS_V1_NAME,
+        || v31_graph_embeddings::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v32_toolbox_catalog::TOOLBOX_CATALOG_V1,
+        v32_toolbox_catalog::TOOLBOX_CATALOG_V1_NAME,
+        || v32_toolbox_catalog::apply(pool),
+    )
+    .await?;
+
     // Every-boot vocabulary-catalog reconcile (RC1 durable fix). Unconditional
     // and idempotent; closes the post-v2 catalog-drift gap that silently
     // FK-skipped symbol extraction for files carrying a newly-added effect.
@@ -2448,6 +2519,25 @@ pub async fn run_migrations(
     // Build/refresh the data_tables HNSW index (semantic table discovery via
     // `data_table_search`); same params-tracked rebuild discipline.
     ensure_data_tables_hnsw_index(pool, vector_config).await?;
+
+    // Build/refresh HNSW indexes on the v31 graph-RAG embedding columns. Runs
+    // after the v31 apply_step (above) so the columns exist; each call is
+    // column_exists-guarded for partial installs. These rows also become
+    // embedding-bearing arms in memory_unified_nodes below.
+    for table in [
+        "agent_messages",
+        "a2a_messages",
+        "memory_entities",
+        "coordination_requests",
+    ] {
+        ensure_v31_embedding_hnsw_index(pool, vector_config, table).await?;
+    }
+
+    // Build/refresh the tool_cards HNSW index (semantic developer-tool discovery
+    // via `toolbox_search`). The generic helper builds `idx_tool_cards_embedding`
+    // on the 1024-d `embedding` column with the same params-tracked discipline,
+    // column_exists-guarded; runs after the v32 apply_step so the column exists.
+    ensure_v31_embedding_hnsw_index(pool, vector_config, "tool_cards").await?;
 
     // Stage 5c: trajectory-similarity edge store (must exist before the edges
     // view, which UNIONs it as the `evolves_like` arm).
@@ -2577,7 +2667,7 @@ pub(crate) const MEMORY_UNIFIED_NODES_SQL: &str = "CREATE MATERIALIZED VIEW memo
     SELECT 'memory_entity:' || id::TEXT AS node_id,
            'memory_entity'::TEXT AS node_type,
            name AS label,
-           NULL::VECTOR(1024) AS embedding,
+           embedding,
            importance
       FROM memory_entities WHERE valid_to IS NULL
     UNION ALL
@@ -2686,7 +2776,57 @@ pub(crate) const MEMORY_UNIFIED_NODES_SQL: &str = "CREATE MATERIALIZED VIEW memo
     SELECT DISTINCT 'channel:' || resource_key, 'channel',
            resource_key, NULL::VECTOR(1024), 0.3
       FROM sync_ops
-      WHERE resource_kind = 'channel' AND resource_key IS NOT NULL";
+      WHERE resource_kind = 'channel' AND resource_key IS NOT NULL
+    UNION ALL
+    -- v31 — A2A task HUB (non-embedded, like `commit`): surfaces skill/status as a
+    -- label for graph traversal; reached via `in_task` / `evidenced_by` edges.
+    SELECT 'a2a_task:' || id::TEXT, 'a2a_task',
+           COALESCE(skill_id, status, 'task'), NULL::VECTOR(1024), 0.5
+      FROM a2a_tasks
+    UNION ALL
+    -- v31 — A2A message (task transcript). Label = first 200 chars of the
+    -- concatenated text parts; the embedding is cron-backfilled from the SAME text
+    -- (jsonb text-part extraction), so label and vector never skew. COALESCE to
+    -- `role` keeps a File/Data-only message labeled.
+    SELECT 'a2a_message:' || m.id::TEXT, 'a2a_message',
+           LEFT(COALESCE((
+             SELECT string_agg(p->>'text', ' ' ORDER BY ord)
+             FROM jsonb_array_elements(m.parts) WITH ORDINALITY AS e(p, ord)
+             WHERE p->>'type' = 'text'
+           ), m.role), 200),
+           m.embedding, 0.45
+      FROM a2a_messages m
+      WHERE m.embedding IS NOT NULL
+    UNION ALL
+    -- v31 — agent social-mailbox message (v27). Label = subject — body prefix.
+    SELECT 'agent_message:' || id::TEXT, 'agent_message',
+           LEFT(COALESCE(subject || ' — ', '') || body, 200),
+           embedding, 0.45
+      FROM agent_messages
+      WHERE embedding IS NOT NULL
+    UNION ALL
+    -- v31 — session prompt (already embedded in embedding_v2). Down-weighted (0.4)
+    -- so prompts enrich recall without dominating default unified search.
+    SELECT 'prompt:' || id::TEXT, 'prompt',
+           LEFT(prompt_text, 200), embedding_v2, 0.4
+      FROM session_prompts
+      WHERE embedding_v2 IS NOT NULL
+    UNION ALL
+    -- v31 — JSON data table (v19), table-grain embedding (name+description, already
+    -- populated by migrate_data_tables_batch; same BGE-M3 1024-d space). Rows reach
+    -- via the table node + data_table_search.
+    SELECT 'data_table:' || id::TEXT, 'data_table',
+           COALESCE(name, 'table'), embedding, 0.5
+      FROM data_tables
+      WHERE embedding IS NOT NULL
+    UNION ALL
+    -- v31 — worktree-coordination negotiation (v29). Embeds reason/error_excerpt so
+    -- a blocked negotiation is semantically findable; links work_item/agent/
+    -- message/project via the edge arms below.
+    SELECT 'coordination_request:' || id::TEXT, 'coordination_request',
+           LEFT(COALESCE(reason, error_excerpt, status), 200), embedding, 0.55
+      FROM coordination_requests
+      WHERE embedding IS NOT NULL";
 
 /// Edges-view definition. Same single-source-of-truth posture as
 /// `MEMORY_UNIFIED_NODES_SQL` — F9's hash-gate covers both.
@@ -3053,6 +3193,99 @@ pub(crate) const MEMORY_UNIFIED_EDGES_SQL: &str = "CREATE MATERIALIZED VIEW memo
            'projects_to', 1.0::DOUBLE PRECISION,
            NULL::TIMESTAMPTZ, NULL::TIMESTAMPTZ
       FROM csm_projections
+    UNION ALL
+    -- v31 — a2a_message → its task (containment). valid_from = message created_at.
+    SELECT 'a2a_message:' || id::TEXT, 'a2a_message',
+           'a2a_task:' || task_id::TEXT, 'a2a_task',
+           'in_task', 1.0::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM a2a_messages
+    UNION ALL
+    -- v31 — a2a_task → observation (evidenced_by) via agent_outcomes; restores the
+    -- outcome→task context lost when outcomes were only mirrored into observations.
+    -- DISTINCT collapses outcomes that share a (task, observation) pair; coexists
+    -- with the work_item/experiment evidenced_by arms (disjoint from_id prefix).
+    SELECT DISTINCT 'a2a_task:' || parent_task_id::TEXT, 'a2a_task',
+           'observation:' || observation_id::TEXT, 'observation',
+           'evidenced_by', 1.0::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM agent_outcomes
+      WHERE parent_task_id IS NOT NULL AND observation_id IS NOT NULL
+    UNION ALL
+    -- v31 — agent_message reply chain. BITEMPORAL: created_at → valid_from,
+    -- expires_at → valid_to (expired replies drop from an as_of=now() query).
+    SELECT 'agent_message:' || id::TEXT, 'agent_message',
+           'agent_message:' || reply_to::TEXT, 'agent_message',
+           'reply_to', 0.6::DOUBLE PRECISION,
+           created_at, expires_at
+      FROM agent_messages WHERE reply_to IS NOT NULL
+    UNION ALL
+    -- v31 — agent → agent_message (authored). from_agent shares the TEXT `agent`
+    -- namespace; gated to the SAME agent set as the `agent` node arm (IN-subquery)
+    -- so the edge never dangles. Bitemporal (created_at/expires_at).
+    SELECT 'agent:' || am.from_agent, 'agent',
+           'agent_message:' || am.id::TEXT, 'agent_message',
+           'sent', 0.5::DOUBLE PRECISION,
+           am.created_at, am.expires_at
+      FROM agent_messages am
+      WHERE am.from_agent <> ''
+        AND am.from_agent IN (
+          SELECT agent_id FROM agent_presence
+          UNION SELECT agent_id FROM work_item_claims
+          UNION SELECT to_agent_id FROM work_item_claims WHERE to_agent_id IS NOT NULL
+          UNION SELECT claimed_by FROM work_items WHERE claimed_by IS NOT NULL
+        )
+    UNION ALL
+    -- v31 — session_mandate → its source prompt (extracted_from). Dense: every
+    -- mandate has source_prompt_id.
+    SELECT 'session_mandate:' || id::TEXT, 'session_mandate',
+           'prompt:' || source_prompt_id::TEXT, 'prompt',
+           'extracted_from', 0.7::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM session_mandates WHERE source_prompt_id IS NOT NULL
+    UNION ALL
+    -- v31 — data_table → its project.
+    SELECT 'data_table:' || id::TEXT, 'data_table',
+           'project:' || project_id::TEXT, 'project',
+           'in_project', 0.5::DOUBLE PRECISION,
+           created_at, NULL::TIMESTAMPTZ
+      FROM data_tables WHERE project_id IS NOT NULL
+    UNION ALL
+    -- v31 — coordination_request → the blocked work_item (close-the-loop).
+    -- BITEMPORAL: created_at → valid_from, resolved_at → valid_to.
+    SELECT 'coordination_request:' || id::TEXT, 'coordination_request',
+           'work_item:' || blocked_work_item_id::TEXT, 'work_item',
+           'concerns', 0.7::DOUBLE PRECISION,
+           created_at, resolved_at
+      FROM coordination_requests WHERE blocked_work_item_id IS NOT NULL
+    UNION ALL
+    -- v31 — coordination_request → the mailbox message that carries it.
+    SELECT 'coordination_request:' || id::TEXT, 'coordination_request',
+           'agent_message:' || message_id::TEXT, 'agent_message',
+           'concerns', 0.6::DOUBLE PRECISION,
+           created_at, resolved_at
+      FROM coordination_requests WHERE message_id IS NOT NULL
+    UNION ALL
+    -- v31 — requester agent → coordination_request (gated to the agent namespace).
+    SELECT 'agent:' || cr.requester_agent, 'agent',
+           'coordination_request:' || cr.id::TEXT, 'coordination_request',
+           'requested', 0.5::DOUBLE PRECISION,
+           cr.created_at, cr.resolved_at
+      FROM coordination_requests cr
+      WHERE cr.requester_agent IS NOT NULL AND cr.requester_agent <> ''
+        AND cr.requester_agent IN (
+          SELECT agent_id FROM agent_presence
+          UNION SELECT agent_id FROM work_item_claims
+          UNION SELECT to_agent_id FROM work_item_claims WHERE to_agent_id IS NOT NULL
+          UNION SELECT claimed_by FROM work_items WHERE claimed_by IS NOT NULL
+        )
+    UNION ALL
+    -- v31 — coordination_request → the dependency project being edited.
+    SELECT 'coordination_request:' || id::TEXT, 'coordination_request',
+           'project:' || dependency_project_id::TEXT, 'project',
+           'in_project', 0.4::DOUBLE PRECISION,
+           created_at, resolved_at
+      FROM coordination_requests
       ) e
      GROUP BY from_id, from_type, to_id, to_type, edge_type";
 

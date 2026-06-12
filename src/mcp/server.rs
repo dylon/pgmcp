@@ -79,6 +79,8 @@ mod handlers_security;
 mod handlers_sema;
 #[path = "server/handlers/similarity.rs"]
 mod handlers_similarity;
+#[path = "server/handlers/toolbox.rs"]
+mod handlers_toolbox;
 #[path = "server/handlers/topics.rs"]
 mod handlers_topics;
 #[path = "server/handlers/trajectory.rs"]
@@ -450,6 +452,7 @@ impl McpServer {
             + Self::router_sema()
             + Self::router_fuzzy()
             + Self::router_ontology()
+            + Self::router_toolbox()
     }
 }
 
@@ -611,6 +614,12 @@ impl McpServer {
                 "list_software_patterns"     => list_software_patterns(ListSoftwarePatternsParams) in tool_software_patterns,
                 "refresh_pattern_catalog"    => refresh_pattern_catalog(RefreshPatternCatalogParams) in tool_software_patterns,
                 "upsert_pattern_source"      => upsert_pattern_source(UpsertPatternSourceParams) in tool_software_patterns,
+                // Developer-tool ("toolbox") catalog — all share the `tool_toolbox` module.
+                "toolbox_search"             => toolbox_search(ToolboxSearchParams) in tool_toolbox,
+                "toolbox_recommend"          => toolbox_recommend(ToolboxRecommendParams) in tool_toolbox,
+                "toolbox_get"                => toolbox_get(ToolboxGetParams) in tool_toolbox,
+                "toolbox_list"               => toolbox_list(ToolboxListParams) in tool_toolbox,
+                "toolbox_refresh"            => toolbox_refresh(ToolboxRefreshParams) in tool_toolbox,
                 // Session-level mandates — `promote_session_mandate` shares the `tool_session_mandates` module.
                 "session_mandates"           => session_mandates(SessionMandatesParams),
                 "promote_session_mandate"    => promote_session_mandate(PromoteSessionMandateParams) in tool_session_mandates,
@@ -639,6 +648,8 @@ impl McpServer {
                 "memory_reflect"                => memory_reflect(MemoryReflectParams) in tool_memory_reflect,
                 // Memory-server Phase 6 graph-enhanced retrieval.
                 "memory_unified_search"         => memory_unified_search(MemoryUnifiedSearchParams) in tool_memory_graph_rag,
+                // v31 — A2A/coordination conversation search (wraps memory_unified_search).
+                "conversation_search"           => conversation_search(ConversationSearchParams),
                 "memory_neighbors"              => memory_neighbors(MemoryNeighborsParams) in tool_memory_graph_rag,
                 "graph_neighbors"               => graph_neighbors(GraphNeighborsParams) in tool_memory_graph_rag,
                 "memory_path_search"            => memory_path_search(MemoryPathSearchParams) in tool_memory_graph_rag,
@@ -653,6 +664,7 @@ impl McpServer {
                 "read_file"              => read_file(ReadFileParams),
                 "mandate_context"        => mandate_context(MandateContextParams),
                 "project_tree"           => project_tree(ProjectTreeParams),
+                "work_summary"           => work_summary(WorkSummaryParams),
                 "file_info"              => file_info(FileInfoParams),
                 // Similarity
                 "compare_files"          => compare_files(CompareFilesParams),
@@ -949,6 +961,7 @@ impl McpServer {
                 "list_projects" => list_projects,
                 "index_stats"   => index_stats,
                 "pattern_catalog_stats" => pattern_catalog_stats in tool_software_patterns,
+                "toolbox_stats" => toolbox_stats in tool_toolbox,
             })
         };
         instrumented_tool_run(

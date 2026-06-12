@@ -16,6 +16,20 @@
 NVCC_CCBIN = { value = "g++-14", force = true }
 CUDA_COMPUTE_CAP = { value = "89", force = true }
 
+# CUDA toolkit version pin for cudarc. The system toolkit is CUDA 13.3
+# (nvcc V13.3.x), but cudarc's build-system version detection panics on any
+# minor it doesn't enumerate: cudarc 0.19.4 (pgmcp + candle-core) tops out at
+# 13.2, and ug-cuda's transitive cudarc 0.17.8 tops out at 13.0. `13000`
+# (CUDA 13.0) is the ONLY value BOTH crates accept. CUDA preserves
+# runtime-library ABI across a major version's minors and cudarc dynamic-links
+# the runtime (`libcudart`/`libcublas`/`libcublasLt` `.so.13`), so building the
+# 13.0 bindings against the installed 13.3 libraries is safe. `detect_version_
+# from_env` is checked before nvcc detection, so this fully bypasses the probe.
+# `force = true` for the same shadowing reason as NVCC_CCBIN. Without this a
+# cold build panics: "Unsupported cuda toolkit version: `13.3`". Remove (or
+# raise) once both cudarc 0.19.4 and 0.17.8 enumerate 13.3.
+CUDARC_CUDA_VERSION = { value = "13000", force = true }
+
 # libgrammstein (transitive: `gxhash 3.x`) compile-errors out without
 # AES-NI and SSE2 intrinsics — the crate has no software fallback. The
 # user's hardware is x86_64 with AES-NI; setting `+aes,+sse2` here

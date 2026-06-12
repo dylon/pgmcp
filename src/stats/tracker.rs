@@ -2,6 +2,7 @@
 mod outcomes;
 pub use outcomes::*;
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -10,6 +11,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
+use crate::health::{DbHealth, DiskPressure};
 use crate::stats::client_writer::ClientObservation;
 use crate::stats::telemetry_writer::TelemetryRow;
 
@@ -769,6 +771,14 @@ pub struct StatsTracker {
 
     // Uptime
     pub uptime_start: Instant,
+
+    // Resilience (src/health). Shared breaker + disk-pressure state written by
+    // the prober / watchdog loops and read lock-free by every DB-using
+    // subsystem (heavy/light crons, the embed-pool intake gate, `/health`).
+    // Hung off StatsTracker because it is already Arc-threaded everywhere, so
+    // no subsystem constructor needs a new parameter.
+    db_health: Arc<DbHealth>,
+    disk_pressure: Arc<DiskPressure>,
 }
 
 impl StatsTracker {
@@ -1048,6 +1058,8 @@ impl StatsTracker {
             client_seen: DashMap::new(),
             mcp_server_port: AtomicU16::new(0),
             uptime_start: Instant::now(),
+            db_health: Arc::new(DbHealth::new()),
+            disk_pressure: Arc::new(DiskPressure::new()),
         }
     }
 
@@ -1157,6 +1169,22 @@ impl StatsTracker {
         );
     }
 
+    /// Shared DB-availability breaker (the prober loop is its only writer).
+    /// Consulted by crons, the embed-pool intake gate, and `/health` to
+    /// short-circuit work while the database is unreachable — instead of each
+    /// caller independently eating a 10 s `acquire_timeout`. See `crate::health`.
+    pub fn db_health(&self) -> &Arc<DbHealth> {
+        &self.db_health
+    }
+
+    /// Shared disk-pressure flag (the watchdog loop is its only writer).
+    /// Consulted by the embed-pool intake gate and the heavy-cron gate to pause
+    /// pgmcp's own disk-growing work under low free space / inodes. See
+    /// `crate::health`.
+    pub fn disk_pressure(&self) -> &Arc<DiskPressure> {
+        &self.disk_pressure
+    }
+
     /// Mark a named cron job as permanently disabled until daemon
     /// restart. Idempotent — later calls overwrite the reason string.
     /// Un-named tasks are skipped (same reasoning as
@@ -1207,6 +1235,8 @@ impl StatsTracker {
 
     /// Get a JSON snapshot of all counters.
     pub fn snapshot(&self) -> serde_json::Value {
+        let db_health = self.db_health.snapshot();
+        let disk_pressure = self.disk_pressure.snapshot();
         serde_json::json!({
             "files_indexed": self.files_indexed.load(Ordering::Acquire),
             "files_failed": self.files_failed.load(Ordering::Acquire),
@@ -1471,6 +1501,15 @@ impl StatsTracker {
             "memory_concept_llm_skips": self.memory_concept_llm_skips.load(Ordering::Acquire),
             "trajectory_similarity_runs": self.trajectory_similarity_runs.load(Ordering::Acquire),
             "trajectory_edges_emitted": self.trajectory_edges_emitted.load(Ordering::Acquire),
+            // Resilience (src/health) — DB-availability breaker + disk-watchdog
+            // state, so an operator polling /api/status sees the live picture
+            // (these are also why crons may show `skipped:db_down` / `disk_pressure`).
+            "db_up": db_health.up,
+            "db_down_since": db_health.down_since_epoch,
+            "db_health_generation": db_health.generation,
+            "disk_pressure": disk_pressure.paused,
+            "disk_avail_bytes": disk_pressure.last_avail_bytes,
+            "disk_pressure_generation": disk_pressure.generation,
             "tool_invocations": serde_json::Value::Object(
                 self.tool_invocations.iter()
                     .map(|e| (e.key().clone(), serde_json::Value::from(e.value().count.load(Ordering::Relaxed))))
@@ -1508,6 +1547,42 @@ impl Default for StatsTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn breaker_seam_records_quiet_skip_and_status_reflects_state() {
+        let stats = StatsTracker::new();
+        // Optimistic start: up, not paused.
+        assert!(stats.db_health().is_up());
+        assert!(!stats.disk_pressure().is_paused());
+
+        // Prober observes an outage.
+        assert!(stats.db_health().record_failure());
+        assert!(!stats.db_health().is_up());
+
+        // A light cron consults the breaker and records a quiet skip — this is
+        // what replaces the per-tick `warn!` flood during an outage.
+        stats.record_cron_outcome(
+            "work-item-presence",
+            CronJobOutcome::Skipped(SkipReason::DbDown),
+            0,
+        );
+
+        // /api/status reflects the live breaker state.
+        let snap = stats.snapshot();
+        assert_eq!(snap["db_up"], serde_json::json!(false));
+        assert!(snap["db_down_since"].as_u64().expect("down_since") > 0);
+
+        // Recovery flips it back.
+        assert!(stats.db_health().record_success().is_some());
+        assert!(stats.db_health().is_up());
+        assert_eq!(stats.snapshot()["db_up"], serde_json::json!(true));
+
+        // Disk-pressure path: enter → status paused → exit.
+        assert!(stats.disk_pressure().enter_pressure());
+        assert_eq!(stats.snapshot()["disk_pressure"], serde_json::json!(true));
+        assert!(stats.disk_pressure().exit_pressure());
+        assert_eq!(stats.snapshot()["disk_pressure"], serde_json::json!(false));
+    }
 
     #[test]
     fn record_cron_outcome_skips_unnamed_tasks() {

@@ -37,6 +37,17 @@ pub struct Config {
     pub system: SystemConfig,
     #[serde(default)]
     pub memory: MemoryConfig,
+    /// `[disk_guard]` — pressure-driven disk-space watchdog (src/health). Pauses
+    /// pgmcp's own disk-growing work and triggers `target-cleanup` out-of-band
+    /// when a watched filesystem runs low on bytes or inodes. On by default
+    /// (`pause_floor_gb = 0` disables).
+    #[serde(default)]
+    pub disk_guard: DiskGuardConfig,
+    /// `[outbox]` — durable store-and-forward for fire-and-forget hook ingress
+    /// while the DB is down (src/health). Replayed on recovery. On by default,
+    /// self-limiting (capped + own-filesystem self-floor).
+    #[serde(default)]
+    pub outbox: OutboxConfig,
     /// `[fuzzy]` — disk-backed PersistentARTrieChar fuzzy-index layout.
     /// Populated in Phase 4 of the integration plan
     /// `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`.
@@ -79,6 +90,77 @@ pub struct Config {
     /// and `/proc`-fd file-event sources are opt-in.
     #[serde(default)]
     pub clients: ClientsConfig,
+    /// `[worklog]` — defaults for the `work_summary` tool (period work summaries
+    /// over a workspace's git repos). Per-call params always override these.
+    #[serde(default)]
+    pub worklog: WorklogConfig,
+}
+
+/// `[worklog]` — defaults for the `work_summary` MCP tool.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorklogConfig {
+    /// Output format when the call omits `format` (markdown|org|json).
+    #[serde(default = "default_worklog_format")]
+    pub default_format: String,
+    /// Author filter when the call omits `author`. `None` resolves the local
+    /// `git config user.name` ("my work"); set to "all" for every contributor.
+    #[serde(default)]
+    pub default_author: Option<String>,
+    /// Temporal-graph enrichment mode when omitted (auto|on|off).
+    #[serde(default = "default_worklog_graph")]
+    pub graph_enrichment: String,
+    /// Default for `narrative` (deterministic prose bullets) when omitted.
+    #[serde(default)]
+    pub narrative_default: bool,
+    /// Cap on repos scanned when the call omits `max_repos`.
+    #[serde(default = "default_worklog_max_repos")]
+    pub max_repos: u32,
+    /// Cap on projects rendered when the call omits `limit`.
+    #[serde(default = "default_worklog_max_projects")]
+    pub max_projects: u32,
+    /// Local LLM backend for `narrative=true` prose generation: `qwen3-4b`
+    /// (default, ~2.5 GB Q4_K_M) or `qwen3-8b` (~5 GB). Any other value — or an
+    /// unavailable model / GPU — falls back to deterministic prose. The model is
+    /// loaded (from the HuggingFace cache) only when a call sets `narrative=true`.
+    #[serde(default = "default_worklog_narrative_backend")]
+    pub narrative_backend: String,
+    /// Token budget per project for narrative generation (default 160).
+    #[serde(default = "default_worklog_narrative_max_tokens")]
+    pub narrative_max_tokens: u32,
+}
+
+impl Default for WorklogConfig {
+    fn default() -> Self {
+        Self {
+            default_format: default_worklog_format(),
+            default_author: None,
+            graph_enrichment: default_worklog_graph(),
+            narrative_default: false,
+            max_repos: default_worklog_max_repos(),
+            max_projects: default_worklog_max_projects(),
+            narrative_backend: default_worklog_narrative_backend(),
+            narrative_max_tokens: default_worklog_narrative_max_tokens(),
+        }
+    }
+}
+
+fn default_worklog_format() -> String {
+    "markdown".to_string()
+}
+fn default_worklog_graph() -> String {
+    "auto".to_string()
+}
+fn default_worklog_max_repos() -> u32 {
+    200
+}
+fn default_worklog_max_projects() -> u32 {
+    100
+}
+fn default_worklog_narrative_backend() -> String {
+    "qwen3-4b".to_string()
+}
+fn default_worklog_narrative_max_tokens() -> u32 {
+    160
 }
 
 /// `[clients]` — MCP-client tracking and file-event attribution knobs.
@@ -1951,6 +2033,18 @@ pub struct DatabaseConfig {
     /// Postgres restarts.
     #[serde(default = "default_test_before_acquire")]
     pub test_before_acquire: bool,
+
+    /// `crate::health` DB-availability prober cadence (seconds). The prober
+    /// runs `SELECT 1` on this interval and flips the shared breaker; consumers
+    /// short-circuit while down instead of each eating a 10 s `acquire_timeout`.
+    #[serde(default = "default_health_probe_interval_secs")]
+    pub health_probe_interval_secs: u64,
+
+    /// Per-probe timeout (seconds). Bounds each probe below the 10 s
+    /// `acquire_timeout` so a hung pool cannot make the prober sit on the full
+    /// timeout every cycle — an elapsed probe is counted as a failure.
+    #[serde(default = "default_health_probe_timeout_secs")]
+    pub health_probe_timeout_secs: u64,
 }
 
 impl Default for DatabaseConfig {
@@ -1970,8 +2064,166 @@ impl Default for DatabaseConfig {
             pool_idle_timeout_secs: default_pool_idle_timeout_secs(),
             pool_max_lifetime_secs: default_pool_max_lifetime_secs(),
             test_before_acquire: default_test_before_acquire(),
+            health_probe_interval_secs: default_health_probe_interval_secs(),
+            health_probe_timeout_secs: default_health_probe_timeout_secs(),
         }
     }
+}
+
+fn default_health_probe_interval_secs() -> u64 {
+    10
+}
+fn default_health_probe_timeout_secs() -> u64 {
+    5
+}
+
+/// `[disk_guard]` — pressure-driven disk-space watchdog (src/health/watchdog.rs).
+///
+/// Complements the interval-driven `target-cleanup` cron: monitors free **bytes
+/// and inodes** continuously and, when a watched filesystem crosses a pause
+/// floor on either axis, pauses pgmcp's own disk-growing work (indexing + heavy
+/// crons) and triggers cleanup out-of-band. Hysteresis (`resume > pause`)
+/// prevents flapping. `pause_floor_gb = 0` disables the guard.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskGuardConfig {
+    #[serde(default = "default_disk_guard_poll_secs")]
+    pub poll_interval_secs: u64,
+    /// Free GiB below which to log an early warning (0 disables this axis).
+    #[serde(default = "default_disk_guard_warn_gb")]
+    pub warn_floor_gb: u64,
+    /// Free GiB below which to enter pressure (0 disables the whole guard).
+    #[serde(default = "default_disk_guard_pause_gb")]
+    pub pause_floor_gb: u64,
+    /// Free GiB above which to exit pressure (clamped > pause at runtime).
+    #[serde(default = "default_disk_guard_resume_gb")]
+    pub resume_floor_gb: u64,
+    /// Free inodes below which to warn (0 disables the inode warn axis).
+    #[serde(default = "default_disk_guard_warn_inodes")]
+    pub warn_floor_inodes: u64,
+    /// Free inodes below which to enter pressure (0 disables the inode axis).
+    #[serde(default = "default_disk_guard_pause_inodes")]
+    pub pause_floor_inodes: u64,
+    /// Free inodes above which to exit pressure (clamped > pause at runtime).
+    #[serde(default = "default_disk_guard_resume_inodes")]
+    pub resume_floor_inodes: u64,
+    /// Filesystems to watch; empty falls back to `[cron.target_cleanup] roots`,
+    /// then `[workspace] paths`, then `/`.
+    #[serde(default)]
+    pub paths: Vec<String>,
+}
+
+impl Default for DiskGuardConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: default_disk_guard_poll_secs(),
+            warn_floor_gb: default_disk_guard_warn_gb(),
+            pause_floor_gb: default_disk_guard_pause_gb(),
+            resume_floor_gb: default_disk_guard_resume_gb(),
+            warn_floor_inodes: default_disk_guard_warn_inodes(),
+            pause_floor_inodes: default_disk_guard_pause_inodes(),
+            resume_floor_inodes: default_disk_guard_resume_inodes(),
+            paths: Vec::new(),
+        }
+    }
+}
+
+fn default_disk_guard_poll_secs() -> u64 {
+    30
+}
+fn default_disk_guard_warn_gb() -> u64 {
+    20
+}
+fn default_disk_guard_pause_gb() -> u64 {
+    10
+}
+fn default_disk_guard_resume_gb() -> u64 {
+    25
+}
+fn default_disk_guard_warn_inodes() -> u64 {
+    2_000_000
+}
+fn default_disk_guard_pause_inodes() -> u64 {
+    1_000_000
+}
+fn default_disk_guard_resume_inodes() -> u64 {
+    3_000_000
+}
+
+/// `[outbox]` — durable ephemeral-event outbox (src/health/outbox.rs).
+///
+/// Store-and-forward for the fire-and-forget hook ingress (session-observe /
+/// client-file-event) while the DB is down; replayed on recovery. Self-limiting:
+/// capped at `max_bytes` and refuses to write when its own filesystem is below
+/// `self_floor_*` (so the spool cannot become the next ENOSPC).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxConfig {
+    #[serde(default = "default_outbox_enabled")]
+    pub enabled: bool,
+    /// Spool directory; empty resolves to `$XDG_STATE_HOME/pgmcp/outbox` at
+    /// runtime. STRONGLY recommend a separate filesystem or tmpfs (`/dev/shm`):
+    /// the outage that motivated this was disk-full on the primary filesystem.
+    #[serde(default)]
+    pub dir: String,
+    /// Total spool size cap.
+    #[serde(default = "default_outbox_max_bytes")]
+    pub max_bytes: u64,
+    /// Refuse to spool when the outbox filesystem has fewer than this many GiB
+    /// free (0 disables this guard).
+    #[serde(default = "default_outbox_self_floor_gb")]
+    pub self_floor_gb: u64,
+    /// Refuse to spool when the outbox filesystem has fewer than this many free
+    /// inodes (0 disables this guard).
+    #[serde(default = "default_outbox_self_floor_inodes")]
+    pub self_floor_inodes: u64,
+    /// Behavior at `max_bytes`: `stop` (drop new) or `drop_oldest` (trim).
+    #[serde(default = "default_outbox_on_full")]
+    pub on_full: String,
+}
+
+impl Default for OutboxConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_outbox_enabled(),
+            dir: String::new(),
+            max_bytes: default_outbox_max_bytes(),
+            self_floor_gb: default_outbox_self_floor_gb(),
+            self_floor_inodes: default_outbox_self_floor_inodes(),
+            on_full: default_outbox_on_full(),
+        }
+    }
+}
+
+impl OutboxConfig {
+    /// Resolve the spool directory: explicit `dir`, else
+    /// `$XDG_STATE_HOME/pgmcp/outbox` (or `$HOME/.local/state/...`).
+    pub fn resolved_dir(&self) -> std::path::PathBuf {
+        if !self.dir.is_empty() {
+            return std::path::PathBuf::from(&self.dir);
+        }
+        let base = std::env::var_os("XDG_STATE_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/state"))
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
+        base.join("pgmcp").join("outbox")
+    }
+}
+
+fn default_outbox_enabled() -> bool {
+    true
+}
+fn default_outbox_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+fn default_outbox_self_floor_gb() -> u64 {
+    2
+}
+fn default_outbox_self_floor_inodes() -> u64 {
+    100_000
+}
+fn default_outbox_on_full() -> String {
+    "stop".to_string()
 }
 
 impl DatabaseConfig {
@@ -2689,6 +2941,14 @@ pub struct CronConfig {
     /// Default 45.
     #[serde(default = "default_git_state_scan_interval")]
     pub git_state_scan_interval_secs: u64,
+
+    /// `target-cleanup` cron: periodic, safe reclamation of regeneratable Rust
+    /// `target/` build artifacts plus a provenance-first sweep of `/tmp` +
+    /// `/var/tmp`. Nested so its (many) knobs live under
+    /// `[cron.target_cleanup]`. Ships **enabled but dry-run**; see
+    /// [`TargetCleanupConfig`] and `src/cron/target_cleanup.rs`.
+    #[serde(default)]
+    pub target_cleanup: TargetCleanupConfig,
 }
 
 impl Default for CronConfig {
@@ -2760,8 +3020,134 @@ impl Default for CronConfig {
             mcp_client_liveness_interval_secs: default_mcp_client_liveness_interval(),
             project_deps_index_interval_secs: default_project_deps_index_interval(),
             git_state_scan_interval_secs: default_git_state_scan_interval(),
+            target_cleanup: TargetCleanupConfig::default(),
         }
     }
+}
+
+/// Configuration for the `target-cleanup` cron (`[cron.target_cleanup]`).
+///
+/// Two phases per run: (1) reclaim regeneratable Rust `target/` build
+/// artifacts under the resolved roots, tiered by project staleness; and (2) a
+/// provenance-first sweep of `/tmp` + `/var/tmp`. Ships **enabled but
+/// `dry_run = true`** — every run writes a manifest of what it *would* delete
+/// and removes nothing until an operator sets `dry_run = false`. Build
+/// artifacts are recoverable-by-rebuild, and the deletion chokepoint refuses
+/// any path not inside a genuine `*/target` (sibling `Cargo.toml`), so
+/// unattended operation cannot touch a source file or the running daemon's own
+/// binary. Full design: `src/cron/target_cleanup.rs`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TargetCleanupConfig {
+    /// Cadence in seconds (default 604800 = weekly). 0 disables the cron.
+    #[serde(default = "default_target_cleanup_interval")]
+    pub interval_secs: u64,
+    /// Log-only when true (default true): a manifest is written but nothing is
+    /// deleted. Set false to arm actual removal.
+    #[serde(default = "default_target_cleanup_dry_run")]
+    pub dry_run: bool,
+    /// A project with git/source activity within this many days is "active":
+    /// Tier 1 keeps artifacts newer than this and trims older ones (default 14).
+    #[serde(default = "default_target_cleanup_active_days")]
+    pub active_days: u64,
+    /// A project idle longer than this many days is "stale": its whole
+    /// `target/` is Tier-2 eligible for a full wipe (default 60).
+    #[serde(default = "default_target_cleanup_stale_days")]
+    pub stale_days: u64,
+    /// Skip any `target/` with a file modified within this many minutes — a
+    /// build may be in progress (default 10).
+    #[serde(default = "default_target_cleanup_build_quiet_mins")]
+    pub build_quiet_mins: u64,
+    /// When > 0, gate the aggressive tiers (1 and 2) on disk pressure: run them
+    /// only when free space on the roots' filesystem is below this many GiB.
+    /// 0 (default) = always run the tiers on schedule ("Moderate").
+    #[serde(default)]
+    pub free_floor_gb: u64,
+    /// Extra directories to bounded-walk for `target/` dirs. Empty (default) =
+    /// discover from the indexed `projects` table (every known project's
+    /// `<path>/target`). Set to force-include roots the index does not cover.
+    #[serde(default)]
+    pub roots: Vec<String>,
+    /// Project roots that must never be touched (in addition to the running
+    /// daemon's own project, which is always protected).
+    #[serde(default)]
+    pub allowlist: Vec<String>,
+    /// Also sweep `/tmp` + `/var/tmp` (default true), provenance-first.
+    #[serde(default = "default_target_cleanup_sweep_tmp")]
+    pub sweep_tmp: bool,
+    /// Temp directories swept when `sweep_tmp` is true.
+    #[serde(default = "default_target_cleanup_tmp_dirs")]
+    pub tmp_dirs: Vec<String>,
+    /// After the agent that created/last-touched an attributed tmp file is
+    /// gone, wait this many seconds before deleting it (default 3600).
+    #[serde(default = "default_target_cleanup_tmp_attributed_grace")]
+    pub tmp_attributed_grace_secs: u64,
+    /// A session whose `last_seen` is older than this many seconds counts as
+    /// gone (hook-sourced provenance liveness; default 7200).
+    #[serde(default = "default_target_cleanup_tmp_session_grace")]
+    pub tmp_session_grace_secs: u64,
+    /// Age threshold (days, by mtime AND atime) for deleting an *unattributed*
+    /// file under `/tmp` (default 10, matching systemd-tmpfiles).
+    #[serde(default = "default_target_cleanup_tmp_unattributed_age_days")]
+    pub tmp_unattributed_age_days: u64,
+    /// Age threshold (days) for an *unattributed* file under `/var/tmp`
+    /// (default 30, matching systemd-tmpfiles).
+    #[serde(default = "default_target_cleanup_tmp_unattributed_var_age_days")]
+    pub tmp_unattributed_var_age_days: u64,
+}
+
+impl Default for TargetCleanupConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_target_cleanup_interval(),
+            dry_run: default_target_cleanup_dry_run(),
+            active_days: default_target_cleanup_active_days(),
+            stale_days: default_target_cleanup_stale_days(),
+            build_quiet_mins: default_target_cleanup_build_quiet_mins(),
+            free_floor_gb: 0,
+            roots: Vec::new(),
+            allowlist: Vec::new(),
+            sweep_tmp: default_target_cleanup_sweep_tmp(),
+            tmp_dirs: default_target_cleanup_tmp_dirs(),
+            tmp_attributed_grace_secs: default_target_cleanup_tmp_attributed_grace(),
+            tmp_session_grace_secs: default_target_cleanup_tmp_session_grace(),
+            tmp_unattributed_age_days: default_target_cleanup_tmp_unattributed_age_days(),
+            tmp_unattributed_var_age_days: default_target_cleanup_tmp_unattributed_var_age_days(),
+        }
+    }
+}
+
+fn default_target_cleanup_interval() -> u64 {
+    604800
+}
+fn default_target_cleanup_dry_run() -> bool {
+    true
+}
+fn default_target_cleanup_active_days() -> u64 {
+    14
+}
+fn default_target_cleanup_stale_days() -> u64 {
+    60
+}
+fn default_target_cleanup_build_quiet_mins() -> u64 {
+    10
+}
+fn default_target_cleanup_sweep_tmp() -> bool {
+    true
+}
+fn default_target_cleanup_tmp_dirs() -> Vec<String> {
+    vec!["/tmp".to_string(), "/var/tmp".to_string()]
+}
+fn default_target_cleanup_tmp_attributed_grace() -> u64 {
+    3600
+}
+fn default_target_cleanup_tmp_session_grace() -> u64 {
+    7200
+}
+fn default_target_cleanup_tmp_unattributed_age_days() -> u64 {
+    10
+}
+fn default_target_cleanup_tmp_unattributed_var_age_days() -> u64 {
+    30
 }
 
 fn default_work_item_presence_interval() -> u64 {

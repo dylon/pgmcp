@@ -186,8 +186,10 @@ Pass exactly one of file_id, chunk_id, topic_id."
     #[tool(
         description = "Use WHEN you need prior project knowledge before acting — START HERE for \
 memory retrieval: vector search over the heterogeneous unified-nodes view (memory_entity / \
-observation / chunk / topic / durable_mandate / commit; optionally filter node_types). Narrower \
-alternatives: `memory_semantic_search` (observations, vector only), `memory_hybrid_search` \
+observation / chunk / topic / durable_mandate / commit / work_item / experiment / prompt / \
+data_table / agent_message / a2a_message / coordination_request; optionally filter node_types). \
+For A2A/coordination conversations specifically, `conversation_search` pins the right node_types. \
+Narrower alternatives: `memory_semantic_search` (observations, vector only), `memory_hybrid_search` \
 (observations, vector + keyword)."
     )]
     async fn memory_unified_search(
@@ -202,6 +204,32 @@ alternatives: `memory_semantic_search` (observations, vector only), `memory_hybr
             &_ctx,
             &summarize_debug(&params),
             crate::mcp::tools::tool_memory_graph_rag::tool_memory_unified_search(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "v31 convenience: vector search over the agent-to-agent CONVERSATION nodes \
+in the unified graph (a2a_message / agent_message / a2a_task / coordination_request). USE WHEN: \
+'what did the agents discuss / negotiate about X', or to recall an A2A task transcript or a \
+worktree-coordination request by content. Equivalent to `memory_unified_search` with node_types \
+pinned to the conversation family."
+    )]
+    async fn conversation_search(
+        &self,
+        Parameters(params): Parameters<ConversationSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "conversation_search",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_conversation_search::tool_conversation_search(
                 self.ctx(),
                 params,
             ),

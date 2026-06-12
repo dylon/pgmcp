@@ -4,7 +4,7 @@
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 
-use libdictenstein::dynamic_dawg_char::DynamicDawgChar;
+use libdictenstein::dynamic_dawg::char::DynamicDawgChar;
 use liblevenshtein::transducer::Transducer;
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;

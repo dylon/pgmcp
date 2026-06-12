@@ -633,6 +633,26 @@ fn run_task_caught(id: usize, stats: &StatsTracker, kind: &str, task: impl FnOnc
     }
 }
 
+/// Handle one `query_rx` select result. Returns `false` when the channel has
+/// disconnected (the worker should return). Extracted so the intake-gated and
+/// ungated `select!` branches share one query path with no drift.
+fn handle_query_select(
+    id: usize,
+    model: &Embedder,
+    stats: &StatsTracker,
+    msg: std::result::Result<EmbedQueryRequest, crossbeam_channel::RecvError>,
+) -> bool {
+    match msg {
+        Ok(req) => {
+            run_task_caught(id, stats, "query", || {
+                process_query_request(model, req, stats)
+            });
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 fn run_worker_event_loop(
     id: usize,
     model: &Embedder,
@@ -660,40 +680,55 @@ fn run_worker_event_loop(
             }
         }
 
-        // Then select between query (priority) and index channels, with timeout
-        crossbeam_channel::select! {
-            recv(query_rx) -> msg => {
-                match msg {
-                    Ok(req) => {
-                        run_task_caught(id, stats, "query", || {
-                            process_query_request(model, req, stats)
-                        });
+        // Intake gate (src/health): when the DB is down or disk is under
+        // pressure, do NOT pull the next index task — leave it buffered on the
+        // bounded channel so the scanner/watcher backpressures and no indexing
+        // work is pulled-and-dropped. Queries (read-only) keep flowing either
+        // way. The file already in hand (if the DB drops mid-task) rides the
+        // existing retry helpers and, on ultimate failure, is re-picked-up by
+        // the mtime `rescan_workspace` reconciliation — see docs ADR-015.
+        let intake_open = stats.db_health().is_up() && !stats.disk_pressure().is_paused();
+        if intake_open {
+            crossbeam_channel::select! {
+                recv(query_rx) -> msg => {
+                    if !handle_query_select(id, model, stats, msg) {
+                        return;
                     }
-                    Err(_) => return,
                 }
-            }
-            recv(index_rx) -> msg => {
-                match msg {
-                    Ok(req) => {
-                        let start = std::time::Instant::now();
-                        run_task_caught(id, stats, "index", || match req {
-                            EmbedIndexRequest::IndexFile(task) => {
-                                process_index_file_task(model, task, stats, rt, id);
-                            }
-                            EmbedIndexRequest::File(file_req) => {
-                                process_file_request(model, file_req, stats, rt, id);
-                            }
-                            EmbedIndexRequest::Commit(commit_req) => {
-                                process_commit_request(model, commit_req, stats, rt, id);
-                            }
-                        });
-                        let elapsed = start.elapsed().as_millis() as u64;
-                        stats.embedding_duration_ms.fetch_add(elapsed, Ordering::Relaxed);
+                recv(index_rx) -> msg => {
+                    match msg {
+                        Ok(req) => {
+                            let start = std::time::Instant::now();
+                            run_task_caught(id, stats, "index", || match req {
+                                EmbedIndexRequest::IndexFile(task) => {
+                                    process_index_file_task(model, task, stats, rt, id);
+                                }
+                                EmbedIndexRequest::File(file_req) => {
+                                    process_file_request(model, file_req, stats, rt, id);
+                                }
+                                EmbedIndexRequest::Commit(commit_req) => {
+                                    process_commit_request(model, commit_req, stats, rt, id);
+                                }
+                            });
+                            let elapsed = start.elapsed().as_millis() as u64;
+                            stats.embedding_duration_ms.fetch_add(elapsed, Ordering::Relaxed);
+                        }
+                        Err(_) => return,
                     }
-                    Err(_) => return,
                 }
+                default(std::time::Duration::from_millis(500)) => {}
             }
-            default(std::time::Duration::from_millis(500)) => {}
+        } else {
+            // Gate closed: block only on queries, re-polling the gate every
+            // 500 ms. Index work stays queued (backpressure), not lost.
+            crossbeam_channel::select! {
+                recv(query_rx) -> msg => {
+                    if !handle_query_select(id, model, stats, msg) {
+                        return;
+                    }
+                }
+                default(std::time::Duration::from_millis(500)) => {}
+            }
         }
     }
 }

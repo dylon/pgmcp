@@ -28,9 +28,22 @@ pub struct MemoryFindEntitiesForCodeParams {
 pub struct MemoryUnifiedSearchParams {
     pub query: String,
     #[schemars(
-        description = "Optional whitelist of node_types to include (e.g. ['memory_entity','observation','chunk','topic','durable_mandate','commit'])."
+        description = "Optional whitelist of node_types to include (e.g. ['memory_entity','observation','chunk','topic','durable_mandate','commit','work_item','experiment','prompt','data_table','agent_message','a2a_message','coordination_request'])."
     )]
     pub node_types: Option<Vec<String>>,
+    pub k: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ConversationSearchParams {
+    #[schemars(
+        description = "Free-text query. Vector-searches the A2A / coordination conversation \
+                       nodes in the unified graph (a2a_message, agent_message, a2a_task, \
+                       coordination_request). A convenience wrapper over memory_unified_search \
+                       with node_types pinned to the conversation family."
+    )]
+    pub query: String,
+    #[schemars(description = "Max rows (default 10).")]
     pub k: Option<i32>,
 }
 
@@ -177,6 +190,12 @@ pub struct SearchMandatesParams {
     pub project_id: Option<i32>,
     #[schemars(description = "Max rows (1..=200, default 20).")]
     pub limit: Option<i32>,
+    #[schemars(
+        description = "Ranking mode: 'fts' (Postgres full-text, default), 'semantic' (BGE-M3 \
+                       vector similarity over the mandate embedding), or 'hybrid' (RRF-fused \
+                       FTS + semantic). Semantic/hybrid embed the query."
+    )]
+    pub mode: Option<String>,
 }
 
 // ============================================================================

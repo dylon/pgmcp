@@ -54,6 +54,7 @@ pub mod tool_code_summarize;
 pub mod tool_community_detection;
 pub mod tool_compare_files;
 pub mod tool_complexity_hotspots;
+pub mod tool_conversation_search;
 pub mod tool_coordinate_dependency_block;
 pub mod tool_coordination_respond;
 pub mod tool_coupling_cohesion_report;
@@ -128,6 +129,7 @@ pub mod tool_topic_hierarchy;
 pub mod tool_topic_hierarchy_fcm;
 pub mod tool_type_shape_search;
 pub mod tool_type_tag_dictionary;
+pub mod tool_work_summary;
 
 // Phase 8 — code-analysis + fuzzy + phonetic MCP tools (full surface).
 pub mod tool_articulatory_distance;
@@ -203,6 +205,9 @@ pub mod tool_secret_detection;
 pub mod tool_taint_analysis;
 pub mod tool_unprotected_routes;
 pub mod tool_unsafe_deserialization;
+
+// Developer-tool ("toolbox") catalog — installed FV + profiling/debug tools (v32).
+pub mod tool_toolbox;
 
 // SOTA Phase 7 — API / contract
 pub mod tool_api_stability;
@@ -327,6 +332,7 @@ pub use tool_code_summarize::tool_code_summarize;
 pub use tool_community_detection::tool_community_detection;
 pub use tool_compare_files::tool_compare_files;
 pub use tool_complexity_hotspots::tool_complexity_hotspots;
+pub use tool_conversation_search::tool_conversation_search;
 pub use tool_coordinate_dependency_block::tool_coordinate_dependency_block;
 pub use tool_coordination_respond::tool_coordination_respond;
 pub use tool_coupling_cohesion_report::tool_coupling_cohesion_report;
@@ -398,3 +404,4 @@ pub use tool_topic_hierarchy::tool_topic_hierarchy;
 pub use tool_topic_hierarchy_fcm::tool_topic_hierarchy_fcm;
 pub use tool_type_shape_search::tool_type_shape_search;
 pub use tool_type_tag_dictionary::tool_type_tag_dictionary;
+pub use tool_work_summary::tool_work_summary;

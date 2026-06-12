@@ -4,7 +4,7 @@
 
 #![allow(unused_imports)]
 
-use libdictenstein::dynamic_dawg_char::DynamicDawgChar;
+use libdictenstein::dynamic_dawg::char::DynamicDawgChar;
 use liblevenshtein::transducer::Transducer;
 use regex::Regex;
 use rmcp::ErrorData as McpError;

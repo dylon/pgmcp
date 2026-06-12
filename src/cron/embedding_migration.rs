@@ -94,6 +94,15 @@ pub struct MigrationPassReport {
     /// JSON data tables (name+description vector). Embed-on-write at
     /// data_table_create/_alter is the primary path; this is the net.
     pub data_tables_migrated: u64,
+    /// v31 graph-RAG sources: social-mailbox messages, A2A task transcripts,
+    /// memory-entity hubs (active rows), and worktree-coordination negotiations.
+    /// Cron-backfill is the only embed path for these (no synchronous write-path
+    /// embed); they become embedding-bearing arms in `memory_unified_nodes`.
+    pub agent_messages_migrated: u64,
+    pub a2a_messages_migrated: u64,
+    pub memory_entities_migrated: u64,
+    pub coordination_requests_migrated: u64,
+    pub tool_cards_migrated: u64,
     /// Phase 2.3: file_chunks whose BGE-M3 learned-sparse vector was backfilled.
     pub file_chunks_sparse_backfilled: u64,
     /// Phase 2.4: file_chunks re-embedded with a contextual-retrieval prefix.
@@ -470,6 +479,107 @@ pub async fn run_embedding_migration_pass(
         }
     }
 
+    // v31 graph-RAG sources. `memory_entities` needs valid_to scoping (a
+    // dedicated helper, mirroring memory_observations); the message/coordination
+    // tables are plain 1024d-direct embed-column tables, so they reuse the generic
+    // helper with a per-table text fragment (a2a_messages extracts text from its
+    // `parts` JSONB — the SAME expression the node arm labels with, so the vector
+    // and label never skew).
+    for _ in 0..config.max_batches {
+        match migrate_memory_entities_batch(pool, &embedder, config.batch_size).await {
+            Ok(n) if n > 0 => {
+                report.memory_entities_migrated += n;
+                report.batches_completed += 1;
+            }
+            Ok(_) => break,
+            Err(e) => {
+                warn!(error = %e, "memory_entities embedding backfill batch failed");
+                report.errors += 1;
+                stats
+                    .embeddings_migration_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+    for (table, text_select) in [
+        (
+            "agent_messages",
+            "concat_ws(' — ', NULLIF(subject,''), body)",
+        ),
+        (
+            "a2a_messages",
+            "COALESCE((SELECT string_agg(p->>'text', ' ' ORDER BY ord) \
+                       FROM jsonb_array_elements(parts) WITH ORDINALITY AS e(p, ord) \
+                       WHERE p->>'type' = 'text'), role)",
+        ),
+        (
+            "coordination_requests",
+            "concat_ws(' ', reason, error_excerpt)",
+        ),
+    ] {
+        for _ in 0..config.max_batches {
+            match migrate_embedding_table_batch(
+                pool,
+                &embedder,
+                config.batch_size,
+                table,
+                text_select,
+            )
+            .await
+            {
+                Ok(n) if n > 0 => {
+                    match table {
+                        "agent_messages" => report.agent_messages_migrated += n,
+                        "a2a_messages" => report.a2a_messages_migrated += n,
+                        "coordination_requests" => report.coordination_requests_migrated += n,
+                        _ => {}
+                    }
+                    report.batches_completed += 1;
+                }
+                Ok(_) => break,
+                Err(e) => {
+                    warn!(error = %e, table, "v31 graph-RAG embedding backfill batch failed");
+                    report.errors += 1;
+                    stats
+                        .embeddings_migration_errors
+                        .fetch_add(1, Ordering::Relaxed);
+                    break;
+                }
+            }
+        }
+    }
+
+    // Developer-tool catalog (v32 `tool_cards`): same 1024d-direct backfill. The
+    // text_select mirrors `tools_catalog::card_content`'s embedded field set so
+    // the cron embeds exactly the prose a seed-time edit re-hashed against.
+    for _ in 0..config.max_batches {
+        match migrate_embedding_table_batch(
+            pool,
+            &embedder,
+            config.batch_size,
+            "tool_cards",
+            "concat_ws(' ', name, summary, what_it_does, when_to_use, inputs_outputs, \
+             invocation, strengths, limitations, availability)",
+        )
+        .await
+        {
+            Ok(n) if n > 0 => {
+                report.tool_cards_migrated += n;
+                report.batches_completed += 1;
+            }
+            Ok(_) => break,
+            Err(e) => {
+                warn!(error = %e, "tool_cards embedding backfill batch failed");
+                report.errors += 1;
+                stats
+                    .embeddings_migration_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+
     if report.file_chunks_migrated > 0
         || report.session_prompts_migrated > 0
         || report.git_commit_chunks_migrated > 0
@@ -483,6 +593,11 @@ pub async fn run_embedding_migration_pass(
         || report.experiment_artifacts_migrated > 0
         || report.work_items_migrated > 0
         || report.data_tables_migrated > 0
+        || report.agent_messages_migrated > 0
+        || report.a2a_messages_migrated > 0
+        || report.memory_entities_migrated > 0
+        || report.coordination_requests_migrated > 0
+        || report.tool_cards_migrated > 0
     {
         info!(
             file_chunks = report.file_chunks_migrated,
@@ -498,6 +613,11 @@ pub async fn run_embedding_migration_pass(
             experiment_artifacts = report.experiment_artifacts_migrated,
             work_items = report.work_items_migrated,
             data_tables = report.data_tables_migrated,
+            agent_messages = report.agent_messages_migrated,
+            a2a_messages = report.a2a_messages_migrated,
+            memory_entities = report.memory_entities_migrated,
+            coordination_requests = report.coordination_requests_migrated,
+            tool_cards = report.tool_cards_migrated,
             batches = report.batches_completed,
             errors = report.errors,
             "embedding-migration pass complete",
@@ -984,6 +1104,55 @@ async fn migrate_memory_observations_batch(
     Ok(count)
 }
 
+/// NULL-`embedding` backfill for `memory_entities` (the v31 KB-entity hub
+/// vector: name + entity_type). Scoped to active rows (`valid_to IS NULL`) so it
+/// stays consistent with `full_backlog_counts` and never embeds a superseded
+/// entity. Same SKIP LOCKED batch shape as `migrate_memory_observations_batch`.
+async fn migrate_memory_entities_batch(
+    pool: &PgPool,
+    embedder: &Arc<Embedder>,
+    batch_size: usize,
+) -> Result<u64, sqlx::Error> {
+    let rows: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, concat_ws(' ', name, entity_type) AS t FROM memory_entities
+         WHERE embedding IS NULL AND valid_to IS NULL
+         ORDER BY id
+         LIMIT $1
+         FOR UPDATE SKIP LOCKED",
+    )
+    .bind(batch_size as i64)
+    .fetch_all(pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let texts: Vec<&str> = rows.iter().map(|(_, c)| c.as_str()).collect();
+    let vectors = match embedder.embed(&texts) {
+        Ok(v) => v,
+        Err(e) => return Err(sqlx::Error::Configuration(e.to_string().into())),
+    };
+
+    let mut tx = pool.begin().await?;
+    let mut count = 0_u64;
+    for ((id, _), vec) in rows.into_iter().zip(vectors) {
+        let v = Vector::from(vec);
+        sqlx::query(
+            "UPDATE memory_entities
+             SET embedding = $1, embedding_signature = $2
+             WHERE id = $3",
+        )
+        .bind(&v)
+        .bind(BGE_M3_SIGNATURE)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        count += 1;
+    }
+    tx.commit().await?;
+    Ok(count)
+}
+
 /// Generic NULL-`embedding` backfill for a 1024d-direct table. `table` and
 /// `text_select` are TRUSTED, hardcoded-per-call-site SQL fragments (no user
 /// input → no injection); `text_select` must `coalesce` to non-NULL text.
@@ -1101,10 +1270,15 @@ pub async fn run_or_log(
 /// experiment tables — zero un-embedded rows).
 ///
 /// Phase 5 C5 extended the Phase 1 check from 2 tables to 6; the
-/// experiment subsystem brings it to 11: file_chunks, session_prompts,
+/// experiment subsystem brought it to 11, then work_items + data_tables to 13,
+/// and the v31 graph-RAG sources (agent_messages, a2a_messages, memory_entities
+/// — active rows only, coordination_requests) to 17, and the v32 tool_cards
+/// catalog to 18: file_chunks, session_prompts,
 /// git_commit_chunks, software_pattern_chunks, durable_mandates,
 /// session_mandates, memory_observations (active rows only), experiments,
-/// experiment_hypotheses, experiment_results, experiment_artifacts.
+/// experiment_hypotheses, experiment_results, experiment_artifacts, work_items,
+/// data_tables, agent_messages, a2a_messages, memory_entities (active rows only),
+/// coordination_requests, tool_cards.
 /// Reports whether the 1024-d `embedding_v2` backfill has fully drained
 /// across every bearing table — true means no rows are left with a NULL
 /// (or otherwise un-embedded) 1024-d column.
@@ -1133,6 +1307,11 @@ pub struct BacklogCounts {
     pub experiment_artifacts: i64,
     pub work_items: i64,
     pub data_tables: i64,
+    pub agent_messages: i64,
+    pub a2a_messages: i64,
+    pub memory_entities: i64,
+    pub coordination_requests: i64,
+    pub tool_cards: i64,
 }
 
 impl BacklogCounts {
@@ -1150,10 +1329,15 @@ impl BacklogCounts {
             + self.experiment_artifacts
             + self.work_items
             + self.data_tables
+            + self.agent_messages
+            + self.a2a_messages
+            + self.memory_entities
+            + self.coordination_requests
+            + self.tool_cards
     }
 }
 
-/// Read the per-table backlog. One round trip via thirteen COUNT(*) probes.
+/// Read the per-table backlog. One round trip via eighteen COUNT(*) probes.
 pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::Error> {
     sqlx::query_as::<_, BacklogCounts>(
         "SELECT
@@ -1169,7 +1353,12 @@ pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::E
             (SELECT COUNT(*) FROM experiment_results     WHERE embedding    IS NULL) AS experiment_results,
             (SELECT COUNT(*) FROM experiment_artifacts   WHERE embedding    IS NULL) AS experiment_artifacts,
             (SELECT COUNT(*) FROM work_items             WHERE embedding    IS NULL) AS work_items,
-            (SELECT COUNT(*) FROM data_tables            WHERE embedding    IS NULL) AS data_tables",
+            (SELECT COUNT(*) FROM data_tables            WHERE embedding    IS NULL) AS data_tables,
+            (SELECT COUNT(*) FROM agent_messages         WHERE embedding    IS NULL) AS agent_messages,
+            (SELECT COUNT(*) FROM a2a_messages           WHERE embedding    IS NULL) AS a2a_messages,
+            (SELECT COUNT(*) FROM memory_entities        WHERE embedding    IS NULL AND valid_to IS NULL) AS memory_entities,
+            (SELECT COUNT(*) FROM coordination_requests  WHERE embedding    IS NULL) AS coordination_requests,
+            (SELECT COUNT(*) FROM tool_cards             WHERE embedding    IS NULL) AS tool_cards",
     )
     .fetch_one(pool)
     .await

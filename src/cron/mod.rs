@@ -69,6 +69,7 @@ pub mod shutdown;
 pub mod similarity;
 #[allow(dead_code)]
 pub mod symbol_extraction;
+pub mod target_cleanup;
 #[allow(dead_code)]
 pub mod telemetry_retention;
 #[allow(dead_code)]

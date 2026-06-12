@@ -530,6 +530,60 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         None
     };
 
+    // 11b″. Resilience (src/health): DB-availability breaker prober + disk-space
+    // watchdog + ephemeral-event outbox. The prober is the single writer of the
+    // shared breaker that lets crons / the embed pool / `/health` short-circuit
+    // during a DB outage instead of each eating a 10 s acquire-timeout (the
+    // 2026-06-11 ENOSPC incident → 1447 PoolTimedOut lines). The watchdog pauses
+    // pgmcp's own disk-growing work and triggers target-cleanup out-of-band under
+    // low free bytes / inodes. Both spawn after the pool + migrations + stats are
+    // up, so they never probe a not-yet-ready pool.
+    let outbox: Option<Arc<crate::health::Outbox>> = if config_snapshot.outbox.enabled {
+        let oc = &config_snapshot.outbox;
+        crate::health::Outbox::new(
+            oc.resolved_dir(),
+            oc.max_bytes,
+            oc.self_floor_gb.saturating_mul(1 << 30),
+            oc.self_floor_inodes,
+            crate::health::OnFull::parse(&oc.on_full),
+        )
+        .map(Arc::new)
+    } else {
+        tracing::info!("outbox disabled ([outbox] enabled = false)");
+        None
+    };
+
+    if let Some(pool) = system_ctx.db().pool().cloned() {
+        let replayer = outbox.clone().map(|ob| {
+            Arc::new(crate::health::OutboxReplayer::new(
+                ob,
+                &config_snapshot.mcp.host,
+                config_snapshot.mcp.port,
+                Arc::clone(stats_tracker.db_health()),
+            ))
+        });
+        let _db_prober_handle = crate::health::prober::spawn_db_prober(
+            pool.clone(),
+            Arc::clone(&stats_tracker),
+            replayer,
+            config_snapshot.database.health_probe_interval_secs,
+            config_snapshot.database.health_probe_timeout_secs,
+            shutdown.cancellation_token(),
+        );
+        if config_snapshot.disk_guard.pause_floor_gb > 0 {
+            let _disk_watchdog_handle = crate::health::watchdog::spawn_disk_watchdog(
+                pool,
+                Arc::clone(&stats_tracker),
+                Arc::clone(&config),
+                shutdown.cancellation_token(),
+            );
+        } else {
+            tracing::info!("disk-watchdog disabled ([disk_guard] pause_floor_gb = 0)");
+        }
+    } else {
+        tracing::warn!("resilience prober/watchdog disabled: DbClient has no PgPool (CLI mode?)");
+    }
+
     // 11c. Schedule the daily `telemetry-retention` cron job. Runs every
     // 24h and DELETEs `mcp_tool_calls` rows older than
     // `metrics.telemetry_retention_days` (default 30).
@@ -811,6 +865,19 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         });
     }
 
+    // 12b. Background-seed the developer-tool ("toolbox") catalog (v32). Same
+    // rationale as 12a: the embedding-migration cron backfills the vectors, so
+    // this only upserts ~100 compact cards and returns quickly.
+    {
+        let warm_ctx = system_ctx.clone();
+        tokio::spawn(async move {
+            match mcp::tools::tool_toolbox::warm_toolbox_catalog(&warm_ctx).await {
+                Ok(()) => tracing::info!("Developer-tool catalog warm-up complete"),
+                Err(e) => tracing::warn!(error = %e, "Developer-tool catalog warm-up failed"),
+            }
+        });
+    }
+
     let cancel_token = shutdown.cancellation_token();
 
     if is_daemon {
@@ -905,6 +972,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             extractor_debounce,
             system_ctx: system_ctx.clone(),
             reranker: api_reranker,
+            outbox: outbox.clone(),
         };
 
         let router = axum::Router::new()

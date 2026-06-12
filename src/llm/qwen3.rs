@@ -167,6 +167,13 @@ impl Qwen3LocalExtractor {
         })
     }
 
+    /// Public one-shot greedy completion for non-memory callers (e.g. the
+    /// `work_summary` narrative path). Bounded by `max_new_tokens`; serialized
+    /// through the same KV-cache mutex as the extraction path.
+    pub fn complete(&self, prompt: &str, max_new_tokens: usize) -> Result<String> {
+        self.generate(prompt, max_new_tokens)
+    }
+
     fn generate(&self, prompt: &str, max_new_tokens: usize) -> Result<String> {
         let mut inner = self
             .inner

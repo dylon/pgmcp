@@ -9,6 +9,7 @@ use crate::context::SystemContext;
 use crate::daemon_state::DaemonLifecycle;
 use crate::db::DbClient;
 use crate::embed::pool::QueryEmbedder;
+use crate::health::Outbox;
 use crate::llm::LlmExtractor;
 use crate::llm::extractor_worker::DebounceMap;
 use crate::reranker::Reranker;
@@ -43,4 +44,9 @@ pub struct ApiState {
     /// VRAM-exclusive with the Qwen3 extractor, so it's opt-in). The RRF
     /// dense+BM25 fusion runs regardless; this just adds a rerank stage.
     pub reranker: Arc<parking_lot::RwLock<Option<Arc<dyn Reranker>>>>,
+    /// Durable ephemeral-event outbox (src/health). `Some` when `[outbox]
+    /// enabled` and its spool directory is writable. The session-observe and
+    /// client-file-event handlers append the raw request here when the breaker
+    /// reports the DB down; the prober replays them on recovery.
+    pub outbox: Option<Arc<Outbox>>,
 }

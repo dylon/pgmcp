@@ -1133,7 +1133,7 @@ pub async fn mark_near_duplicate_superseded(
     imperative: &str,
     max_distance: i32,
 ) -> Result<u64, sqlx::Error> {
-    use libdictenstein::dynamic_dawg_char::DynamicDawgChar;
+    use libdictenstein::dynamic_dawg::char::DynamicDawgChar;
     use liblevenshtein::transducer::Transducer;
 
     // 1. Pull candidate active mandates for the same session + polarity.

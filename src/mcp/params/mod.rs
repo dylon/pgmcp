@@ -22,8 +22,10 @@ pub mod ontology;
 pub mod recommend;
 pub mod search;
 pub mod sota_a;
+pub mod toolbox;
 pub mod work_items_a;
 pub mod work_items_b;
+pub mod worklog;
 
 pub use a2a_csm::*;
 pub use core_memory_a::*;
@@ -34,5 +36,7 @@ pub use ontology::*;
 pub use recommend::*;
 pub use search::*;
 pub use sota_a::*;
+pub use toolbox::*;
 pub use work_items_a::*;
 pub use work_items_b::*;
+pub use worklog::*;

@@ -301,4 +301,30 @@ file's incremental skip."
         )
         .await
     }
+
+    #[tool(
+        description = "Summarize a time period's work (typically a month) across the git repos in \
+a workspace, as bullet-pointed descriptions. USE WHEN: 'summarize my work for May', a monthly \
+status / invoice basis, or a contributor-activity digest over a date range. Live git is the \
+authoritative source (commits + line churn via `git log --numstat`, plus uncommitted / mid-stream \
+state); the temporal-graph index is consulted only as a freshness-gated enrichment. Params: \
+workspace_root (defaults to the first configured workspace), month 'YYYY-MM' or since/until, \
+author (default = local git user.name; 'all' for everyone), format markdown|org|json, group_by \
+project|theme|week."
+    )]
+    async fn work_summary(
+        &self,
+        Parameters(params): Parameters<WorkSummaryParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_summary",
+            120,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_work_summary::tool_work_summary(self.ctx(), params),
+        )
+        .await
+    }
 }

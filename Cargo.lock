@@ -2962,11 +2962,12 @@ dependencies = [
  "bincode 2.0.1",
  "crossbeam-channel",
  "dashmap",
+ "llattice",
  "log",
  "lru 0.18.0",
  "memmap2",
  "parking_lot",
- "pathmap 0.2.2",
+ "pathmap",
  "rustc-hash 1.1.0",
  "serde",
  "serde_json",
@@ -3004,7 +3005,7 @@ dependencies = [
  "ndarray",
  "ordered-float",
  "parking_lot",
- "pathmap 0.3.0",
+ "pathmap",
  "petgraph 0.6.5",
  "quick-xml",
  "rand 0.8.5",
@@ -3032,14 +3033,14 @@ dependencies = [
 
 [[package]]
 name = "liblevenshtein"
-version = "0.8.0"
+version = "0.9.0"
 dependencies = [
  "arc-swap",
  "bincode 1.3.3",
  "libdictenstein",
  "memmap2",
  "parking_lot",
- "pathmap 0.2.2",
+ "pathmap",
  "rayon",
  "rustc-hash 1.1.0",
  "serde",
@@ -3147,6 +3148,10 @@ dependencies = [
  "tracing",
  "uuid",
 ]
+
+[[package]]
+name = "llattice"
+version = "0.1.0"
 
 [[package]]
 name = "lling-llang"
@@ -3832,36 +3837,10 @@ dependencies = [
  "local-or-heap",
  "maybe-dangling",
  "num-traits",
- "pathmap-derive 0.2.1 (registry+https://github.com/rust-lang/crates.io-index)",
+ "pathmap-derive",
  "reusing-vec",
  "smallvec",
  "xxhash-rust",
-]
-
-[[package]]
-name = "pathmap"
-version = "0.3.0"
-dependencies = [
- "arrayvec",
- "dyn-clone",
- "fast-slice-utils",
- "libz-ng-sys",
- "local-or-heap",
- "maybe-dangling",
- "num-traits",
- "pathmap-derive 0.2.1",
- "reusing-vec",
- "smallvec",
- "xxhash-rust",
-]
-
-[[package]]
-name = "pathmap-derive"
-version = "0.2.1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
@@ -3974,6 +3953,7 @@ dependencies = [
  "sha2",
  "sqlparser",
  "sqlx",
+ "sse-stream",
  "statrs",
  "syn",
  "tempfile",

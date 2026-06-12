@@ -21,7 +21,7 @@ use libdictenstein::persistent_artrie::recovery::RecoveryReport;
 // libdictenstein overlay refactor moved concurrency inside the trie — both are
 // lock-free shared borrows; see the doc on `SharedTrieAccess`).
 use libdictenstein::persistent_artrie::SharedTrieAccess;
-use libdictenstein::persistent_artrie_char::{PersistentARTrieChar, SharedCharARTrie};
+use libdictenstein::persistent_artrie::char::{PersistentARTrieChar, SharedCharARTrie};
 use liblevenshtein::transducer::{Algorithm, Transducer};
 
 /// Errors surfaced by the FuzzyIndex layer.

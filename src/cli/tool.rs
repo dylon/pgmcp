@@ -5,10 +5,23 @@
 //! values into i64 / f64 / bool / string. Repeated keys collapse into an
 //! array (for tools that take `Vec<T>` params like `edge_types`).
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
+use futures::{StreamExt, stream::BoxStream};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderName, HeaderValue, WWW_AUTHENTICATE};
+use rmcp::model::{
+    CallToolRequestParams, CallToolResult, ClientJsonRpcMessage, ServerJsonRpcMessage,
+};
+use rmcp::transport::StreamableHttpClientTransport;
+use rmcp::transport::streamable_http_client::{
+    AuthRequiredError, InsufficientScopeError, SseError, StreamableHttpClient,
+    StreamableHttpClientTransportConfig, StreamableHttpError, StreamableHttpPostResponse,
+};
+use sse_stream::{Sse, SseStream};
 
 use crate::config::Config;
 use crate::context::SystemContext;
@@ -41,6 +54,29 @@ pub async fn run(
             Ok(())
         }
         Some(ref tool_name) => {
+            let tool_args = parse_tool_args(&args);
+            if should_forward_tool_to_daemon(tool_name) {
+                match call_daemon_tool(&config, tool_name, tool_args.clone()).await {
+                    Ok(result) => {
+                        print_tool_result(&result, json);
+                        if result.is_error == Some(true) {
+                            std::process::exit(1);
+                        }
+                        return Ok(());
+                    }
+                    Err(DaemonToolError::Unavailable(e)) => {
+                        eprintln!(
+                            "warning: daemon at {} unavailable ({e}); running {tool_name} locally",
+                            daemon_mcp_url(&config)
+                        );
+                    }
+                    Err(DaemonToolError::Remote(e)) => {
+                        eprintln!("Error: daemon {tool_name} failed: {e}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+
             // Tier 2+3: tool execution — DB required, embed model lazy
             let pool = db::pool::create_pool(&config.database).await?;
             db::migrations::run_migrations(&pool, &config.vector).await?;
@@ -66,7 +102,6 @@ pub async fn run(
             );
             let server = mcp::server::McpServer::new(cli_ctx);
 
-            let tool_args = parse_tool_args(&args);
             match server.call_tool_cli(tool_name, tool_args).await {
                 Ok(result) => {
                     print_tool_result(&result, json);
@@ -81,6 +116,276 @@ pub async fn run(
                 }
             }
         }
+    }
+}
+
+#[derive(Debug)]
+enum DaemonToolError {
+    Unavailable(anyhow::Error),
+    Remote(anyhow::Error),
+}
+
+fn should_forward_tool_to_daemon(tool_name: &str) -> bool {
+    tool_name == "refresh_pattern_catalog"
+}
+
+fn daemon_mcp_url(config: &Config) -> String {
+    format!("http://{}:{}/mcp", config.mcp.host, config.mcp.port)
+}
+
+async fn call_daemon_tool(
+    config: &Config,
+    tool_name: &str,
+    args: serde_json::Value,
+) -> Result<CallToolResult, DaemonToolError> {
+    let transport = StreamableHttpClientTransport::with_client(
+        Reqwest12StreamableClient::default(),
+        StreamableHttpClientTransportConfig::with_uri(daemon_mcp_url(config)),
+    );
+    let client = rmcp::serve_client((), transport)
+        .await
+        .map_err(|e| DaemonToolError::Unavailable(anyhow::anyhow!("{e}")))?;
+    let arguments = args.as_object().cloned().ok_or_else(|| {
+        DaemonToolError::Remote(anyhow::anyhow!("tool arguments must be a JSON object"))
+    })?;
+    let request = CallToolRequestParams::new(tool_name.to_string()).with_arguments(arguments);
+    client
+        .peer()
+        .call_tool(request)
+        .await
+        .map_err(|e| DaemonToolError::Remote(anyhow::anyhow!("{e}")))
+}
+
+#[derive(Clone, Default)]
+struct Reqwest12StreamableClient {
+    client: reqwest::Client,
+}
+
+const HEADER_SESSION_ID: &str = "Mcp-Session-Id";
+const HEADER_LAST_EVENT_ID: &str = "Last-Event-Id";
+const HEADER_MCP_PROTOCOL_VERSION: &str = "MCP-Protocol-Version";
+const EVENT_STREAM_MIME_TYPE: &str = "text/event-stream";
+const JSON_MIME_TYPE: &str = "application/json";
+
+const RESERVED_DAEMON_HEADERS: &[&str] = &[
+    "accept",
+    HEADER_SESSION_ID,
+    HEADER_MCP_PROTOCOL_VERSION,
+    HEADER_LAST_EVENT_ID,
+];
+
+fn apply_daemon_custom_headers(
+    mut builder: reqwest::RequestBuilder,
+    custom_headers: HashMap<HeaderName, HeaderValue>,
+) -> Result<reqwest::RequestBuilder, StreamableHttpError<reqwest::Error>> {
+    for (name, value) in custom_headers {
+        if RESERVED_DAEMON_HEADERS
+            .iter()
+            .any(|reserved| name.as_str().eq_ignore_ascii_case(reserved))
+        {
+            if name
+                .as_str()
+                .eq_ignore_ascii_case(HEADER_MCP_PROTOCOL_VERSION)
+            {
+                builder = builder.header(name, value);
+                continue;
+            }
+            return Err(StreamableHttpError::ReservedHeaderConflict(
+                name.to_string(),
+            ));
+        }
+        builder = builder.header(name, value);
+    }
+    Ok(builder)
+}
+
+impl StreamableHttpClient for Reqwest12StreamableClient {
+    type Error = reqwest::Error;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let mut request = self
+            .client
+            .post(uri.as_ref())
+            .header(ACCEPT, [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "));
+        if let Some(auth_header) = auth_header {
+            request = request.bearer_auth(auth_header);
+        }
+        request = apply_daemon_custom_headers(request, custom_headers)?;
+        if let Some(session_id) = session_id {
+            request = request.header(HEADER_SESSION_ID, session_id.as_ref());
+        }
+
+        let response = request
+            .json(&message)
+            .send()
+            .await
+            .map_err(StreamableHttpError::Client)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED
+            && let Some(header) = response.headers().get(WWW_AUTHENTICATE)
+        {
+            let header = header
+                .to_str()
+                .map_err(|_| {
+                    StreamableHttpError::UnexpectedServerResponse(Cow::from(
+                        "invalid www-authenticate header value",
+                    ))
+                })?
+                .to_string();
+            return Err(StreamableHttpError::AuthRequired(AuthRequiredError {
+                www_authenticate_header: header,
+            }));
+        }
+        if response.status() == reqwest::StatusCode::FORBIDDEN
+            && let Some(header) = response.headers().get(WWW_AUTHENTICATE)
+        {
+            let header_str = header.to_str().map_err(|_| {
+                StreamableHttpError::UnexpectedServerResponse(Cow::from(
+                    "invalid www-authenticate header value",
+                ))
+            })?;
+            return Err(StreamableHttpError::InsufficientScope(
+                InsufficientScopeError {
+                    www_authenticate_header: header_str.to_string(),
+                    required_scope: extract_scope_from_header(header_str),
+                },
+            ));
+        }
+
+        let status = response.status();
+        if matches!(
+            status,
+            reqwest::StatusCode::ACCEPTED | reqwest::StatusCode::NO_CONTENT
+        ) {
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read response body>".to_owned());
+            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                format!("HTTP {status}: {body}"),
+            )));
+        }
+
+        let content_type = response.headers().get(CONTENT_TYPE).cloned();
+        let session_id = response
+            .headers()
+            .get(HEADER_SESSION_ID)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        match content_type.as_ref() {
+            Some(ct) if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes()) => {
+                let event_stream = SseStream::from_byte_stream(response.bytes_stream()).boxed();
+                Ok(StreamableHttpPostResponse::Sse(event_stream, session_id))
+            }
+            Some(ct) if ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {
+                match response.json::<ServerJsonRpcMessage>().await {
+                    Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
+                    Err(e) => {
+                        tracing::warn!(
+                            "could not parse daemon JSON response as ServerJsonRpcMessage; treating as accepted: {e}"
+                        );
+                        Ok(StreamableHttpPostResponse::Accepted)
+                    }
+                }
+            }
+            _ => Err(StreamableHttpError::UnexpectedContentType(
+                content_type.map(|ct| String::from_utf8_lossy(ct.as_bytes()).to_string()),
+            )),
+        }
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), StreamableHttpError<Self::Error>> {
+        let mut request = self
+            .client
+            .delete(uri.as_ref())
+            .header(HEADER_SESSION_ID, session_id.as_ref());
+        if let Some(auth_header) = auth_header {
+            request = request.bearer_auth(auth_header);
+        }
+        request = apply_daemon_custom_headers(request, custom_headers)?;
+        let response = request.send().await.map_err(StreamableHttpError::Client)?;
+        if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            tracing::debug!("daemon does not support deleting streamable HTTP sessions");
+            return Ok(());
+        }
+        response
+            .error_for_status()
+            .map_err(StreamableHttpError::Client)?;
+        Ok(())
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        let mut request = self
+            .client
+            .get(uri.as_ref())
+            .header(ACCEPT, [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "))
+            .header(HEADER_SESSION_ID, session_id.as_ref());
+        if let Some(last_event_id) = last_event_id {
+            request = request.header(HEADER_LAST_EVENT_ID, last_event_id);
+        }
+        if let Some(auth_header) = auth_header {
+            request = request.bearer_auth(auth_header);
+        }
+        request = apply_daemon_custom_headers(request, custom_headers)?;
+        let response = request.send().await.map_err(StreamableHttpError::Client)?;
+        if response.status() == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+            return Err(StreamableHttpError::ServerDoesNotSupportSse);
+        }
+        let response = response
+            .error_for_status()
+            .map_err(StreamableHttpError::Client)?;
+        match response.headers().get(CONTENT_TYPE) {
+            Some(ct)
+                if ct.as_bytes().starts_with(EVENT_STREAM_MIME_TYPE.as_bytes())
+                    || ct.as_bytes().starts_with(JSON_MIME_TYPE.as_bytes()) => {}
+            Some(ct) => {
+                return Err(StreamableHttpError::UnexpectedContentType(Some(
+                    String::from_utf8_lossy(ct.as_bytes()).to_string(),
+                )));
+            }
+            None => return Err(StreamableHttpError::UnexpectedContentType(None)),
+        }
+        Ok(SseStream::from_byte_stream(response.bytes_stream()).boxed())
+    }
+}
+
+fn extract_scope_from_header(header: &str) -> Option<String> {
+    let header_lowercase = header.to_ascii_lowercase();
+    let scope_key = "scope=";
+    let start = header_lowercase.find(scope_key)? + scope_key.len();
+    let value_slice = &header[start..];
+
+    if let Some(stripped) = value_slice.strip_prefix('"') {
+        stripped
+            .find('"')
+            .map(|end_quote| stripped[..end_quote].to_string())
+    } else {
+        let end = value_slice
+            .find(|c: char| c == ',' || c == ';' || c.is_whitespace())
+            .unwrap_or(value_slice.len());
+        (end > 0).then(|| value_slice[..end].to_string())
     }
 }
 
@@ -411,6 +716,21 @@ mod tests {
         let args = vec!["q=a=b=c".to_string()];
         let v = parse_tool_args(&args);
         assert_eq!(v["q"], "a=b=c");
+    }
+
+    #[test]
+    fn only_refresh_pattern_catalog_forwards_to_daemon() {
+        assert!(should_forward_tool_to_daemon("refresh_pattern_catalog"));
+        assert!(!should_forward_tool_to_daemon("pattern_catalog_stats"));
+        assert!(!should_forward_tool_to_daemon("semantic_search"));
+    }
+
+    #[test]
+    fn daemon_mcp_url_uses_config_host_and_port() {
+        let mut cfg = Config::default();
+        cfg.mcp.host = "127.0.0.2".to_string();
+        cfg.mcp.port = 31337;
+        assert_eq!(daemon_mcp_url(&cfg), "http://127.0.0.2:31337/mcp");
     }
 
     proptest! {

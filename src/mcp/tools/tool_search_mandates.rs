@@ -69,10 +69,23 @@ pub async fn tool_search_mandates(
             None,
         ));
     }
+    let mode = params
+        .mode
+        .as_deref()
+        .unwrap_or("fts")
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(mode.as_str(), "fts" | "semantic" | "hybrid") {
+        return Err(McpError::invalid_params(
+            "mode must be 'fts', 'semantic', or 'hybrid'",
+            None,
+        ));
+    }
 
     debug!(
         tool = "search_mandates",
         query = %truncate(&params.query, 200),
+        mode = %mode,
         polarity = params.polarity.as_deref().unwrap_or("*"),
         scope = params.scope.as_deref().unwrap_or("*"),
         project_id = params.project_id.unwrap_or(-1),
@@ -80,15 +93,66 @@ pub async fn tool_search_mandates(
         "MCP tool invoked",
     );
 
-    let results = crate::db::queries::search_mandates_fts(
-        pool,
-        &params.query,
-        params.polarity.as_deref(),
-        params.scope.as_deref(),
-        params.project_id,
-        limit,
-    )
-    .await
+    // FTS is the default; semantic/hybrid embed the query and read the v31
+    // `durable_mandates.embedding` column. Hybrid RRF-fuses both legs over a
+    // widened candidate pool, then truncates to `limit`.
+    let polarity = params.polarity.as_deref();
+    let scope = params.scope.as_deref();
+    let results = match mode.as_str() {
+        "fts" => {
+            crate::db::queries::search_mandates_fts(
+                pool,
+                &params.query,
+                polarity,
+                scope,
+                params.project_id,
+                limit,
+            )
+            .await
+        }
+        "semantic" => {
+            let embedding = embed_mandate_query(ctx, &params.query).await?;
+            let ef = ctx.config().load().vector.ef_search;
+            crate::db::queries::search_mandates_semantic(
+                pool,
+                &embedding,
+                polarity,
+                scope,
+                params.project_id,
+                limit,
+                ef,
+            )
+            .await
+        }
+        _ => {
+            let embedding = embed_mandate_query(ctx, &params.query).await?;
+            let ef = ctx.config().load().vector.ef_search;
+            let pool_size = (limit.saturating_mul(4)).clamp(limit, 200);
+            let fts = crate::db::queries::search_mandates_fts(
+                pool,
+                &params.query,
+                polarity,
+                scope,
+                params.project_id,
+                pool_size,
+            )
+            .await;
+            let sem = crate::db::queries::search_mandates_semantic(
+                pool,
+                &embedding,
+                polarity,
+                scope,
+                params.project_id,
+                pool_size,
+                ef,
+            )
+            .await;
+            match (fts, sem) {
+                (Ok(f), Ok(s)) => Ok(rrf_merge_mandates(f, s, limit)),
+                (Err(e), _) | (_, Err(e)) => Err(e),
+            }
+        }
+    }
     .map_err(|e| {
         error!(tool = "search_mandates", error = %e, "query failed");
         McpError::internal_error(format!("query failed: {}", e), None)
@@ -118,7 +182,7 @@ pub async fn tool_search_mandates(
     let json = serde_json::to_string_pretty(&serde_json::json!({
         "effect_breakdown": effect_breakdown,
         "count": count,
-        "mode": "fts",
+        "mode": mode,
         "results": results,
     }))
     .map_err(|e| McpError::internal_error(format!("serialization failed: {}", e), None))?;
@@ -141,4 +205,49 @@ fn truncate(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Embed the mandate query for the semantic / hybrid legs. Maps an embed
+/// failure to an MCP internal error (mirrors `recall_prompts`).
+async fn embed_mandate_query(ctx: &SystemContext, query: &str) -> Result<Vec<f32>, McpError> {
+    ctx.embed().embed_query(query).await.map_err(|e| {
+        error!(tool = "search_mandates", error = %e, "embedding failed");
+        McpError::internal_error(format!("embedding failed: {}", e), None)
+    })
+}
+
+/// Reciprocal-rank fusion of the FTS and semantic mandate legs for `mode=hybrid`.
+/// Each list contributes `1 / (60 + rank)` per shared mandate id; the fused score
+/// is written into `rank`, and the merged set is truncated to `limit`.
+fn rrf_merge_mandates(
+    fts: Vec<crate::db::queries::MandateSearchResult>,
+    sem: Vec<crate::db::queries::MandateSearchResult>,
+    limit: i32,
+) -> Vec<crate::db::queries::MandateSearchResult> {
+    use std::collections::HashMap;
+    const K: f64 = 60.0;
+    let mut score: HashMap<i64, f64> = HashMap::new();
+    let mut by_id: HashMap<i64, crate::db::queries::MandateSearchResult> = HashMap::new();
+    for (rank, m) in fts.into_iter().enumerate() {
+        *score.entry(m.id).or_insert(0.0) += 1.0 / (K + (rank as f64) + 1.0);
+        by_id.entry(m.id).or_insert(m);
+    }
+    for (rank, m) in sem.into_iter().enumerate() {
+        *score.entry(m.id).or_insert(0.0) += 1.0 / (K + (rank as f64) + 1.0);
+        by_id.entry(m.id).or_insert(m);
+    }
+    let mut merged: Vec<crate::db::queries::MandateSearchResult> = by_id
+        .into_values()
+        .map(|mut m| {
+            m.rank = Some(score.get(&m.id).copied().unwrap_or(0.0) as f32);
+            m
+        })
+        .collect();
+    merged.sort_by(|a, b| {
+        b.rank
+            .partial_cmp(&a.rank)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    merged.truncate(limit.clamp(1, 200) as usize);
+    merged
 }

@@ -6,7 +6,7 @@
 
 use libdictenstein::Dictionary;
 use libdictenstein::DictionaryValue;
-use libdictenstein::dynamic_dawg_char::DynamicDawgChar;
+use libdictenstein::dynamic_dawg::char::DynamicDawgChar;
 use liblevenshtein::transducer::{Algorithm, Transducer};
 
 // `MappedDictionary` / `MutableMappedDictionary` traits are pulled in via

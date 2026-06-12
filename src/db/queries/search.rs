@@ -675,6 +675,57 @@ pub async fn search_mandates_fts(
     .await
 }
 
+/// Vector-similarity search over `durable_mandates` — the v31 semantic leg of
+/// `search_mandates`. Same `polarity`/`scope`/`project_id` filters as
+/// `search_mandates_fts`; `rank` carries the cosine similarity (`1 - distance`,
+/// cast to `float4` to dodge the NUMERIC-decode trap) instead of the FTS rank.
+/// Reads the 1024-d BGE-M3 `embedding` column; a non-1024 query embedding is
+/// rejected so a misconfiguration surfaces clearly rather than as wrong-shape
+/// vector arithmetic.
+pub async fn search_mandates_semantic(
+    pool: &PgPool,
+    embedding: &[f32],
+    polarity: Option<&str>,
+    scope: Option<&str>,
+    project_id: Option<i32>,
+    limit: i32,
+    ef_search: i32,
+) -> Result<Vec<MandateSearchResult>, sqlx::Error> {
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "search_mandates: expected a 1024-dimension BGE-M3 query embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let embedding_vec = pgvector::Vector::from(embedding.to_vec());
+    let mut tx = pool.begin().await?;
+    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query_as::<_, MandateSearchResult>(
+        "SELECT m.id, m.scope, m.project_id, p.name AS project_name,
+                m.polarity, m.imperative, m.target, m.promoted_at, m.file_path,
+                (1.0 - (m.embedding <=> $1))::float4 AS rank
+         FROM durable_mandates m
+         LEFT JOIN projects p ON p.id = m.project_id
+         WHERE m.embedding IS NOT NULL
+           AND ($2::text IS NULL OR m.polarity = $2)
+           AND ($3::text IS NULL OR m.scope = $3)
+           AND ($4::int  IS NULL OR m.project_id = $4 OR m.scope = 'workspace')
+         ORDER BY m.embedding <=> $1
+         LIMIT $5",
+    )
+    .bind(&embedding_vec)
+    .bind(polarity)
+    .bind(scope)
+    .bind(project_id)
+    .bind(limit.clamp(1, 200))
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows)
+}
+
 /// Chunk-anchored grep match. Returned by the per-chunk variant of
 /// `grep_search`. The chunk metadata lets the tool body (or the agent)
 /// expand context lines on demand without re-querying the full file.
