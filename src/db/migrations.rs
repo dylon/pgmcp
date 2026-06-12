@@ -46,6 +46,7 @@ mod v2_shadow_asr;
 mod v30_chunk_delete_index_hardening;
 mod v31_graph_embeddings;
 mod v32_toolbox_catalog;
+mod v33_toolbox_domain_security;
 mod v3_cross_language_signatures;
 mod v4_work_items;
 mod v5_work_items_collab;
@@ -2502,6 +2503,14 @@ pub async fn run_migrations(
         v32_toolbox_catalog::TOOLBOX_CATALOG_V1,
         v32_toolbox_catalog::TOOLBOX_CATALOG_V1_NAME,
         || v32_toolbox_catalog::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v33_toolbox_domain_security::TOOLBOX_DOMAIN_SECURITY,
+        v33_toolbox_domain_security::TOOLBOX_DOMAIN_SECURITY_NAME,
+        || v33_toolbox_domain_security::apply(pool),
     )
     .await?;
 

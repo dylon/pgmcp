@@ -290,8 +290,8 @@ async fn reembed_missing(ctx: &SystemContext, pool: &PgPool) -> Result<u64, McpE
     Ok(embedded)
 }
 
-/// Heuristic domain inference from the task text. Returns `None` (search both
-/// domains) when the signal is absent or ambiguous.
+/// Heuristic domain inference from the task text. Returns `None` (search all
+/// domains) when the signal is absent or ambiguous (zero or multiple domains hit).
 fn infer_domain(task: &str) -> Option<String> {
     let t = task.to_lowercase();
     const FV_KW: &[&str] = &[
@@ -346,11 +346,37 @@ fn infer_domain(task: &str) -> Option<String> {
         "monitor",
         "bandwidth",
     ];
+    // Security keywords are chosen to NOT collide with FV_KW / DEV_KW (e.g.
+    // bare "leak" stays a DEV signal; "protocol"/"verify" stay FV) so the
+    // exclusive-match arms below keep their existing behavior.
+    const SEC_KW: &[&str] = &[
+        "secret",
+        "credential",
+        "vulnerab",
+        "cve",
+        "malware",
+        "antivirus",
+        "exploit",
+        "sast",
+        "supply-chain",
+        "supply chain",
+        "sbom",
+        "port scan",
+        "fuzz",
+        "reverse engineer",
+        "disassembl",
+        "forensic",
+        "harden",
+        "pentest",
+        "penetration",
+    ];
     let fv = FV_KW.iter().any(|k| t.contains(k));
     let dev = DEV_KW.iter().any(|k| t.contains(k));
-    match (fv, dev) {
-        (true, false) => Some("formal_verification".to_string()),
-        (false, true) => Some("developer_tooling".to_string()),
+    let sec = SEC_KW.iter().any(|k| t.contains(k));
+    match (fv, dev, sec) {
+        (true, false, false) => Some("formal_verification".to_string()),
+        (false, true, false) => Some("developer_tooling".to_string()),
+        (false, false, true) => Some("security".to_string()),
         _ => None,
     }
 }

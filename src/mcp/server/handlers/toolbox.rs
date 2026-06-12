@@ -41,8 +41,8 @@ DO NOT USE WHEN: searching indexed source files — use semantic_search/hybrid_s
 
     #[tool(description = "Recommend installed tools for a task, ranked. \
 USE WHEN: planning an approach and you want the best installed verifier/profiler/debugger for the \
-job (e.g. 'verify Rust panic-freedom', 'diagnose lock contention'); domain is inferred from the \
-task or can be hinted (formal_verification | developer_tooling).")]
+job (e.g. 'verify Rust panic-freedom', 'diagnose lock contention', 'scan for committed secrets'); \
+domain is inferred from the task or can be hinted (formal_verification | developer_tooling | security).")]
     async fn toolbox_recommend(
         &self,
         Parameters(params): Parameters<ToolboxRecommendParams>,
@@ -82,7 +82,7 @@ limitations, availability, and cross-linked alternatives."
 
     #[tool(
         description = "Browse the toolbox catalog by domain (formal_verification | \
-developer_tooling) and/or category (e.g. smt_solver, model_checker, cpu_profiler, ebpf_tracer)."
+developer_tooling | security) and/or category (e.g. smt_solver, model_checker, cpu_profiler, secret_scanner)."
     )]
     async fn toolbox_list(
         &self,

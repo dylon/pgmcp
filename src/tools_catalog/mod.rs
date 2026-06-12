@@ -1,8 +1,8 @@
 //! Built-in developer-tool catalog metadata ("tool cards").
 //!
 //! This is the local, repo-bundled "card" layer for the user's installed
-//! toolbox — formal-verification tools and profiling/benchmarking/debugging
-//! tools — mirroring `src/patterns/` exactly in spirit. Each [`ToolSeed`] is a
+//! toolbox — formal-verification tools, profiling/benchmarking/debugging tools,
+//! and security tooling — mirroring `src/patterns/` exactly in spirit. Each [`ToolSeed`] is a
 //! compact, LLM-oriented description of one installed tool: what it does, when
 //! to reach for it, how to invoke it *on this machine*, its strengths and
 //! limitations, and cross-links to alternatives.
@@ -27,7 +27,10 @@ mod profilers_cpu;
 mod profilers_memory_cache;
 mod proof_assistants;
 mod rewriting_termination;
+mod security_binary;
 mod security_gpu_algebra;
+mod security_scanning;
+mod security_static;
 mod smt_sat_atp;
 mod system_monitors;
 mod tracers_bench;
@@ -45,7 +48,7 @@ pub struct ToolSeed {
     pub slug: &'static str,
     /// Display name (`Z3`, `TLA⁺ / TLC`).
     pub name: &'static str,
-    /// `formal_verification` | `developer_tooling` (see [`ToolDomain`]).
+    /// `formal_verification` | `developer_tooling` | `security` (see [`ToolDomain`]).
     pub domain: &'static str,
     /// Tool class — references a seeded [`ToolCategorySeed`] slug.
     pub category: &'static str,
@@ -82,22 +85,29 @@ pub struct ToolCategorySeed {
     pub domain: &'static str,
 }
 
-/// The two top-level domains. Closed set: the `tool_cards.domain` CHECK
-/// constraint in the v32 migration is built from [`ToolDomain::sql_in_list`],
-/// and [`tests::tool_domains_are_valid`] pins every seed to this set.
+/// The three top-level domains. Closed set: the `tool_cards.domain` CHECK
+/// constraint is built from [`ToolDomain::sql_in_list`] (created by the v32
+/// migration, widened to admit `security` by the v33 migration), and
+/// [`tests::tool_domains_are_valid`] pins every seed to this set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolDomain {
     FormalVerification,
     DeveloperTooling,
+    Security,
 }
 
 impl ToolDomain {
-    pub const ALL: [ToolDomain; 2] = [ToolDomain::FormalVerification, ToolDomain::DeveloperTooling];
+    pub const ALL: [ToolDomain; 3] = [
+        ToolDomain::FormalVerification,
+        ToolDomain::DeveloperTooling,
+        ToolDomain::Security,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             ToolDomain::FormalVerification => "formal_verification",
             ToolDomain::DeveloperTooling => "developer_tooling",
+            ToolDomain::Security => "security",
         }
     }
 
@@ -148,14 +158,16 @@ pub(crate) const fn tool(
     }
 }
 
-/// Convenience constructors for the two domain string literals, so per-family
-/// files read `FV` / `DEV` instead of repeating the slug.
+/// Convenience constructors for the three domain string literals, so per-family
+/// files read `FV` / `DEV` / `SEC` instead of repeating the slug.
 pub(crate) const FV: &str = ToolDomain::FormalVerification.as_str();
 pub(crate) const DEV: &str = ToolDomain::DeveloperTooling.as_str();
+pub(crate) const SEC: &str = ToolDomain::Security.as_str();
 
 pub fn tool_category_seeds() -> Vec<ToolCategorySeed> {
     let fv = ToolDomain::FormalVerification.as_str();
     let dev = ToolDomain::DeveloperTooling.as_str();
+    let sec = ToolDomain::Security.as_str();
     vec![
         // ---- formal_verification ----
         ToolCategorySeed {
@@ -339,11 +351,90 @@ pub fn tool_category_seeds() -> Vec<ToolCategorySeed> {
             description: "Live system / resource monitor (CPU, memory, I/O, network, hardware counters).",
             domain: dev,
         },
+        // ---- security ----
+        ToolCategorySeed {
+            slug: "secret_scanner",
+            name: "Secret / credential scanner",
+            description: "Detects committed secrets, API keys, and credential leaks in source, git history, or filesystems.",
+            domain: sec,
+        },
+        ToolCategorySeed {
+            slug: "secrets_management",
+            name: "Secrets management / encryption",
+            description: "Encrypts secrets at rest (age/PGP/KMS) so they are never committed in cleartext.",
+            domain: sec,
+        },
+        ToolCategorySeed {
+            slug: "sast",
+            name: "Static application security testing (SAST)",
+            description: "Source-level static analyzer flagging security-relevant defects (memory/injection/CERT/bugprone classes).",
+            domain: sec,
+        },
+        ToolCategorySeed {
+            slug: "supply_chain_audit",
+            name: "Dependency / supply-chain audit",
+            description: "Scans dependency graphs / SBOMs for known advisories, banned crates, and license/source policy violations.",
+            domain: sec,
+        },
+        ToolCategorySeed {
+            slug: "vulnerability_scanner",
+            name: "Vulnerability scanner",
+            description: "Scans images, filesystems, repos, or endpoints for known CVEs and misconfigurations.",
+            domain: sec,
+        },
+        ToolCategorySeed {
+            slug: "iac_container_security",
+            name: "IaC / container config security",
+            description: "Lints infrastructure & container definitions (Dockerfiles, IaC) for security best practice.",
+            domain: sec,
+        },
+        ToolCategorySeed {
+            slug: "tls_ssh_audit",
+            name: "TLS / SSH configuration audit",
+            description: "Audits transport crypto configuration (cipher suites, protocol versions, host-key/cert posture).",
+            domain: sec,
+        },
+        ToolCategorySeed {
+            slug: "network_recon",
+            name: "Network scanner / recon utility",
+            description: "Host/port/service discovery and raw socket connection/relay utilities for network reconnaissance.",
+            domain: sec,
+        },
+        ToolCategorySeed {
+            slug: "fuzzer",
+            name: "Coverage-guided fuzzer",
+            description: "Mutates inputs under coverage feedback to drive a target into crashes / sanitizer trips.",
+            domain: sec,
+        },
+        ToolCategorySeed {
+            slug: "malware_scanner",
+            name: "Malware / antivirus scanner",
+            description: "Signature/pattern malware detection for files and directories.",
+            domain: sec,
+        },
+        ToolCategorySeed {
+            slug: "binary_analysis",
+            name: "Binary / ELF inspection & hardening",
+            description: "Disassembly, symbol/ELF inspection, hardening checks, and binary patching.",
+            domain: sec,
+        },
+        ToolCategorySeed {
+            slug: "reverse_engineering",
+            name: "Reverse-engineering framework",
+            description: "Interactive disassembler / analysis platform for binaries.",
+            domain: sec,
+        },
+        ToolCategorySeed {
+            slug: "forensics",
+            name: "Digital forensics",
+            description: "File carving, disk-image forensics, and metadata extraction.",
+            domain: sec,
+        },
     ]
 }
 
 pub fn tool_seeds() -> Vec<ToolSeed> {
-    let mut v = Vec::with_capacity(120);
+    let mut v = Vec::with_capacity(160);
     v.extend(proof_assistants::seeds());
     v.extend(auto_active::seeds());
     v.extend(smt_sat_atp::seeds());
@@ -355,6 +446,9 @@ pub fn tool_seeds() -> Vec<ToolSeed> {
     v.extend(tracers_bench::seeds());
     v.extend(debuggers_sanitizers::seeds());
     v.extend(system_monitors::seeds());
+    v.extend(security_static::seeds());
+    v.extend(security_scanning::seeds());
+    v.extend(security_binary::seeds());
     v
 }
 
@@ -487,7 +581,7 @@ mod tests {
         // domain can't silently pass the Rust side while the DB rejects it.
         assert_eq!(
             ToolDomain::sql_in_list(),
-            "'formal_verification', 'developer_tooling'"
+            "'formal_verification', 'developer_tooling', 'security'"
         );
     }
 }
