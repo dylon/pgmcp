@@ -51,6 +51,13 @@ pub struct TelemetryRow {
     pub error_class: Option<String>,
     pub request_id: Option<String>,
     pub params_sha256: Option<String>,
+    /// Serialized result size in bytes (None on error / non-success). Feeds the
+    /// `mcp_tool_telemetry` `output_bytes` aggregation so result-payload slimming
+    /// targets the measured top-N offenders per client (v39 columns).
+    pub result_bytes: Option<i32>,
+    /// ~4-chars/token estimate of `result_bytes` (relative ranking only; not an
+    /// exact tokenizer count).
+    pub result_tokens_est: Option<i32>,
 }
 
 /// Spawn the writer task. Returns the join handle; the caller stores it
@@ -161,6 +168,8 @@ async fn flush_batch(pool: &PgPool, stats: &StatsTracker, rows: &[TelemetryRow])
     let mut error_classes: Vec<Option<String>> = Vec::with_capacity(n);
     let mut request_ids: Vec<Option<String>> = Vec::with_capacity(n);
     let mut params_hashes: Vec<Option<String>> = Vec::with_capacity(n);
+    let mut result_bytes: Vec<Option<i32>> = Vec::with_capacity(n);
+    let mut result_tokens: Vec<Option<i32>> = Vec::with_capacity(n);
     for r in rows {
         tools.push(r.tool.clone());
         client_names.push(r.client_name.clone());
@@ -174,12 +183,14 @@ async fn flush_batch(pool: &PgPool, stats: &StatsTracker, rows: &[TelemetryRow])
         error_classes.push(clean_optional_text(&r.error_class));
         request_ids.push(clean_optional_text(&r.request_id));
         params_hashes.push(clean_optional_text(&r.params_sha256));
+        result_bytes.push(r.result_bytes);
+        result_tokens.push(r.result_tokens_est);
     }
 
     let sql = "INSERT INTO mcp_tool_calls
         (tool, client_name, client_version, protocol_version,
          mcp_session_id, project, cwd, duration_ms, outcome,
-         error_class, request_id, params_sha256)
+         error_class, request_id, params_sha256, result_bytes, result_tokens_est)
         SELECT *
         FROM UNNEST(
             $1::text[],
@@ -193,7 +204,9 @@ async fn flush_batch(pool: &PgPool, stats: &StatsTracker, rows: &[TelemetryRow])
             $9::text[],
             $10::text[],
             $11::text[],
-            $12::text[]
+            $12::text[],
+            $13::int[],
+            $14::int[]
         )";
 
     let result = sqlx::query(sql)
@@ -209,6 +222,8 @@ async fn flush_batch(pool: &PgPool, stats: &StatsTracker, rows: &[TelemetryRow])
         .bind(&error_classes)
         .bind(&request_ids)
         .bind(&params_hashes)
+        .bind(&result_bytes)
+        .bind(&result_tokens)
         .execute(pool)
         .await;
     match result {

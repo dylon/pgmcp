@@ -901,6 +901,36 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         });
     }
 
+    // 12c. Adaptive tool surface (v37/v38): seed the usage-adaptive tool-policy
+    // snapshot from `client_tool_policy` so `list_tools` has learned defaults
+    // before the first `tool-policy-refresh` cron pass, and re-seed the
+    // `mcp_tool_catalog` from the live tool list (catches description edits since
+    // the last boot; the embedding-migration cron backfills the vectors).
+    {
+        let warm_ctx = system_ctx.clone();
+        tokio::spawn(async move {
+            if let Some(pool) = warm_ctx.db().pool() {
+                match crate::mcp::tool_policy::load_snapshot(
+                    pool,
+                    &crate::mcp::tool_policy::ToolPolicyConfig::default(),
+                )
+                .await
+                {
+                    Ok(snapshot) => {
+                        let clients = snapshot.client_count();
+                        warm_ctx.set_tool_policy(snapshot);
+                        tracing::info!(clients, "Tool-policy snapshot loaded");
+                    }
+                    Err(e) => tracing::warn!(error = %e, "Tool-policy snapshot load failed"),
+                }
+            }
+            match mcp::tools::tool_meta::warm_mcp_tool_catalog(&warm_ctx).await {
+                Ok(()) => tracing::info!("MCP tool catalog warm-up complete"),
+                Err(e) => tracing::warn!(error = %e, "MCP tool catalog warm-up failed"),
+            }
+        });
+    }
+
     let cancel_token = shutdown.cancellation_token();
 
     if is_daemon {

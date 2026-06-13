@@ -44,6 +44,17 @@ pub struct SemanticSearchParams {
                        \"function\", \"trait\", \"class\"). Optional."
     )]
     pub scope_kind: Option<String>,
+    #[schemars(
+        description = "Max characters of each hit's content to return (truncated with an ellipsis; \
+                       the line range is preserved). Omit for full content. Token-sensitive clients \
+                       default to a ~500-char preview."
+    )]
+    pub snippet_length: Option<i64>,
+    #[schemars(
+        description = "Return only these fields per hit (e.g. [\"path\",\"start_line\",\"end_line\",\
+                       \"score\"]). Omit to return all fields."
+    )]
+    pub fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -76,6 +87,17 @@ pub struct TextSearchParams {
                        matches. Optional."
     )]
     pub scope_kind: Option<String>,
+    #[schemars(
+        description = "Max characters of each hit's content to return (truncated with an ellipsis; \
+                       the line range is preserved). Omit for full content. Token-sensitive clients \
+                       default to a ~500-char preview."
+    )]
+    pub snippet_length: Option<i64>,
+    #[schemars(
+        description = "Return only these fields per hit (e.g. [\"path\",\"start_line\",\"end_line\",\
+                       \"score\"]). Omit to return all fields."
+    )]
+    pub fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -135,6 +157,17 @@ pub struct GrepParams {
                        matches. Optional."
     )]
     pub scope_kind: Option<String>,
+    #[schemars(
+        description = "Max characters of each hit's content to return (truncated with an ellipsis; \
+                       the line range is preserved). Omit for full content. Token-sensitive clients \
+                       default to a ~500-char preview."
+    )]
+    pub snippet_length: Option<i64>,
+    #[schemars(
+        description = "Return only these fields per hit (e.g. [\"path\",\"start_line\",\"end_line\",\
+                       \"score\"]). Omit to return all fields."
+    )]
+    pub fields: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

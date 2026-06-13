@@ -112,8 +112,8 @@ async fn deadlock_candidates_scopes_edges_and_effects_to_project() {
     );
 
     let effects = body["effect_breakdown"]
-        .as_array()
-        .expect("effect breakdown array");
+        .as_object()
+        .expect("effect breakdown object");
     assert!(
         effects.is_empty(),
         "effect_breakdown must not include effects from another project: {effects:?}"

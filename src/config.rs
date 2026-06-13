@@ -2786,6 +2786,15 @@ pub struct CronConfig {
     #[serde(default = "default_quality_history_interval")]
     pub quality_history_interval_secs: u64,
 
+    /// Interval for the `tool-policy-refresh` cron (seconds). 0 disables (the
+    /// adaptive per-client tool surface then stays on whatever snapshot was
+    /// loaded at startup). Default 6h. Recomputes each client's default tool set
+    /// (a recency-decayed usage-frequency score, not a trained model — see
+    /// `docs/design/tool-policy-recency-decay.md`) from `mcp_tool_calls` into
+    /// `client_tool_policy` and hot-swaps the snapshot consulted by `list_tools`.
+    #[serde(default = "default_tool_policy_interval")]
+    pub tool_policy_interval_secs: u64,
+
     /// `findings-promotion` cron interval (seconds, default 6h). The cron only
     /// acts on projects that opt in via `[tracker] auto_promote_findings = true`
     /// in their `.pgmcp.toml`; a global interval of 0 disables it entirely.
@@ -3039,6 +3048,7 @@ impl Default for CronConfig {
             topic_dendrogram_interval_secs: default_topic_dendrogram_interval(),
             embedding_migration_interval_secs: default_embedding_migration_interval(),
             quality_history_interval_secs: default_quality_history_interval(),
+            tool_policy_interval_secs: default_tool_policy_interval(),
             findings_promotion_interval_secs: default_findings_promotion_interval(),
             concurrency_scan_interval_secs: default_concurrency_scan_interval(),
             concurrency_auto_promote: false,
@@ -3366,6 +3376,10 @@ fn default_topic_dendrogram_interval() -> u64 {
     43200
 } // 12 h
 fn default_quality_history_interval() -> u64 {
+    21_600 // 6h
+}
+
+fn default_tool_policy_interval() -> u64 {
     21_600 // 6h
 }
 

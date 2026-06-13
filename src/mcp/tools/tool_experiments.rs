@@ -21,6 +21,9 @@ use sha2::{Digest, Sha256};
 
 use crate::context::SystemContext;
 use crate::db::queries::{self, InsertExperimentResult};
+use crate::experiment::vocab::{
+    EffectDirection, ExperimentArmKind, ExperimentKind, ExperimentStatus, HypothesisVerdict,
+};
 use crate::experiment::{extract, ledger, mirror, protocol};
 use crate::mcp::server::{
     ExperimentDecideParams, ExperimentGetParams, ExperimentListParams, ExperimentLogArtifactParams,
@@ -31,16 +34,10 @@ use crate::mcp::tools::sota_helpers::{json_result, pool_or_err};
 use crate::stats::acceptance::{self, AcceptanceCriterion};
 use crate::stats::inference::{self, Correction, TestResult};
 
-const VALID_KINDS: &[&str] = &[
-    "optimization",
-    "feature_refactor",
-    "feature_addition",
-    "bugfix",
-    "investigation",
-    "other",
-];
-const VALID_ARM_KINDS: &[&str] = &["control", "treatment", "baseline"];
-const VALID_DIRECTIONS: &[&str] = &["increase", "decrease", "either", "none"];
+// kind / status / verdict / arm_kind / predicted_direction vocabularies live in
+// `crate::experiment::vocab` (the ADR-003 single source of truth shared with the
+// DB CHECK constraints). `VALID_MEASUREMENT_SOURCES` is a separate, non-enum
+// vocabulary and stays here.
 const VALID_MEASUREMENT_SOURCES: &[&str] = &[
     "external_benchmark",
     "pgmcp_metric",
@@ -229,18 +226,20 @@ pub async fn tool_experiment_open(
         ));
     }
     let kind = nonblank_str(params.kind.as_deref()).unwrap_or("other");
-    if !VALID_KINDS.contains(&kind) {
+    if ExperimentKind::parse(kind).is_none() {
+        let allowed: Vec<&str> = ExperimentKind::ALL.iter().map(|k| k.as_str()).collect();
         return Err(McpError::invalid_params(
-            format!("unknown kind '{kind}'; expected one of {VALID_KINDS:?}"),
+            format!("unknown kind '{kind}'; expected one of {allowed:?}"),
             None,
         ));
     }
     let predicted_direction =
         nonblank_str(params.predicted_direction.as_deref()).unwrap_or("either");
-    if !VALID_DIRECTIONS.contains(&predicted_direction) {
+    if EffectDirection::parse(predicted_direction).is_none() {
+        let allowed: Vec<&str> = EffectDirection::ALL.iter().map(|d| d.as_str()).collect();
         return Err(McpError::invalid_params(
             format!(
-                "unknown predicted_direction '{predicted_direction}'; expected one of {VALID_DIRECTIONS:?}"
+                "unknown predicted_direction '{predicted_direction}'; expected one of {allowed:?}"
             ),
             None,
         ));
@@ -480,9 +479,10 @@ pub async fn tool_experiment_record_measurement(
         ));
     }
     let arm_kind = params.arm_kind.trim();
-    if !VALID_ARM_KINDS.contains(&arm_kind) {
+    if ExperimentArmKind::parse(arm_kind).is_none() {
+        let allowed: Vec<&str> = ExperimentArmKind::ALL.iter().map(|a| a.as_str()).collect();
         return Err(McpError::invalid_params(
-            format!("arm_kind must be one of {VALID_ARM_KINDS:?}"),
+            format!("arm_kind must be one of {allowed:?}"),
             None,
         ));
     }
@@ -1024,19 +1024,16 @@ fn normalize_experiment_kind_filter(raw: Option<&str>) -> Result<Option<String>,
     if kind.is_empty() {
         return Ok(None);
     }
-    if matches!(
-        kind.as_str(),
-        "optimization"
-            | "feature_refactor"
-            | "feature_addition"
-            | "bugfix"
-            | "investigation"
-            | "other"
-    ) {
+    if ExperimentKind::parse(&kind).is_some() {
         Ok(Some(kind))
     } else {
+        let allowed = ExperimentKind::ALL
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         Err(McpError::invalid_params(
-            "kind must be one of optimization, feature_refactor, feature_addition, bugfix, investigation, other",
+            format!("kind must be one of {allowed}"),
             None,
         ))
     }
@@ -1050,14 +1047,16 @@ fn normalize_experiment_verdict_filter(raw: Option<&str>) -> Result<Option<Strin
     if verdict.is_empty() {
         return Ok(None);
     }
-    if matches!(
-        verdict.as_str(),
-        "pending" | "accepted" | "rejected" | "inconclusive"
-    ) {
+    if HypothesisVerdict::parse(&verdict).is_some() {
         Ok(Some(verdict))
     } else {
+        let allowed = HypothesisVerdict::ALL
+            .iter()
+            .map(|v| v.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         Err(McpError::invalid_params(
-            "verdict must be one of pending, accepted, rejected, inconclusive",
+            format!("verdict must be one of {allowed}"),
             None,
         ))
     }
@@ -1071,14 +1070,16 @@ fn normalize_experiment_status_filter(raw: Option<&str>) -> Result<Option<String
     if status.is_empty() {
         return Ok(None);
     }
-    if matches!(
-        status.as_str(),
-        "open" | "measuring" | "decided" | "abandoned" | "superseded"
-    ) {
+    if ExperimentStatus::parse(&status).is_some() {
         Ok(Some(status))
     } else {
+        let allowed = ExperimentStatus::ALL
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         Err(McpError::invalid_params(
-            "status must be one of open, measuring, decided, abandoned, superseded",
+            format!("status must be one of {allowed}"),
             None,
         ))
     }

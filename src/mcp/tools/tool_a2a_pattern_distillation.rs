@@ -31,6 +31,9 @@ pub async fn tool_a2a_pattern_distillation(
         .a2a_pattern_distillation_invocations
         .fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
+    let pid =
+        crate::mcp::tools::sema_helpers::effects::project_id_opt(pool, params.project.as_deref())
+            .await;
 
     // Read-before-act (Part A): peer best practices, prepended to the
     // Expert prompt. Empty unless [a2a] inject_best_practices = true.
@@ -48,6 +51,7 @@ pub async fn tool_a2a_pattern_distillation(
             "learner_agent": params.learner_agent,
             "message": params.message,
         }),
+        pid,
     )
     .await?;
     let parent_opts = SendOptions {
@@ -107,25 +111,9 @@ pub async fn tool_a2a_pattern_distillation(
     )
     .await;
 
-    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT se.effect, COUNT(*)::int8
-             FROM symbol_effects se
-             GROUP BY se.effect
-             ORDER BY se.effect",
-        )
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-        rows.into_iter()
-            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-            .collect()
-    })
-    .await;
+    // Shadow-ASR channel (Phase D2b): project-scoped effect distribution.
+    let effect_breakdown =
+        crate::mcp::tools::sema_helpers::effects::effect_breakdown_json(pool, pid).await;
 
     let protocol_report = crate::csm::driver::driver_report(
         crate::csm::registry::ProtocolId::Distillation,

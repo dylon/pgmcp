@@ -61,6 +61,8 @@ mod handlers_inventory;
 mod handlers_memory_crud;
 #[path = "server/handlers/memory_search.rs"]
 mod handlers_memory_search;
+#[path = "server/handlers/meta.rs"]
+mod handlers_meta;
 #[path = "server/handlers/ml_embedding.rs"]
 mod handlers_ml_embedding;
 #[path = "server/handlers/ontology.rs"]
@@ -342,6 +344,22 @@ where
     } else {
         Some(format!("{:x}", Sha256::digest(params_summary.as_bytes())))
     };
+    // Measure the serialized result size (success only) for the `output_bytes`
+    // telemetry: sum of text-content byte lengths plus any structured content.
+    // O(result length), on the async telemetry path — no hot-path cost.
+    let result_bytes: Option<i32> = result.as_ref().ok().map(|r| {
+        let mut total: usize = r
+            .content
+            .iter()
+            .filter_map(|c| c.as_text())
+            .map(|t| t.text.len())
+            .sum();
+        if let Some(sc) = &r.structured_content {
+            total += sc.to_string().len();
+        }
+        total.min(i32::MAX as usize) as i32
+    });
+    let result_tokens_est = result_bytes.map(|b| (b + 3) / 4);
     let row = crate::stats::telemetry_writer::TelemetryRow {
         tool: name.to_string(),
         client_name: caller.client_name.clone(),
@@ -355,8 +373,49 @@ where
         error_class,
         request_id,
         params_sha256,
+        result_bytes,
+        result_tokens_est,
     };
     crate::stats::telemetry_writer::try_enqueue(stats, row);
+    result
+}
+
+/// Re-encode a tool result's JSON text content into the caller's preferred
+/// wire format. Applied centrally at the `call_tool` dispatch boundary so EVERY
+/// tool — the ~88 that serialize through `sota_helpers::json_result`, the handful
+/// with their own `json_result`, and the ~87 that inline `to_string_pretty` —
+/// honors a token-sensitive client's compact format without threading a
+/// parameter through 300+ tool signatures or editing every body.
+///
+/// Only `CompactJson` callers (e.g. codex) trigger work: each text block that is
+/// pretty-printed JSON (cheap `'\n'` guard) is parsed and re-serialized compact,
+/// trimming the ~30-40% whitespace overhead. Non-JSON text (markdown/org reports
+/// from `src/render`, plain prose) fails the parse and is left untouched; the
+/// default `Markdown` posture (claude-code) is a no-op, so rich clients keep
+/// byte-identical pretty output. Idempotent: already-compact JSON has no newline
+/// and is skipped.
+pub(crate) fn reencode_result_for_format(
+    mut result: CallToolResult,
+    rc: crate::mcp::client_profile::RenderCtx,
+) -> CallToolResult {
+    use crate::mcp::client_profile::OutputFormat;
+    if rc.output_format != OutputFormat::CompactJson {
+        return result;
+    }
+    for content in result.content.iter_mut() {
+        let compact = content.as_text().and_then(|t| {
+            if t.text.contains('\n') {
+                serde_json::from_str::<serde_json::Value>(&t.text)
+                    .ok()
+                    .map(|v| v.to_string())
+            } else {
+                None
+            }
+        });
+        if let Some(compact) = compact {
+            *content = Content::text(compact);
+        }
+    }
     result
 }
 
@@ -453,6 +512,7 @@ impl McpServer {
             + Self::router_fuzzy()
             + Self::router_ontology()
             + Self::router_toolbox()
+            + Self::router_meta()
     }
 }
 
@@ -475,6 +535,58 @@ impl McpServer {
     /// all tools.
     pub fn static_tool_catalog() -> Vec<rmcp::model::Tool> {
         Self::assembled_tool_router().list_all()
+    }
+
+    /// The tool names of each per-domain router, in `assembled_tool_router`
+    /// order. Single source of truth for the runtime-derived name→domain map
+    /// (`crate::mcp::tool_domains`) that the adaptive per-client tool surface
+    /// gates on. Mirrors `assembled_tool_router()`; keep the two in lockstep —
+    /// `tool_domains::tests::every_assembled_tool_has_exactly_one_domain` fails
+    /// if a router is summed into the assembly but omitted here.
+    pub(crate) fn domain_tool_names() -> Vec<(&'static str, Vec<String>)> {
+        fn names(router: ToolRouter<McpServer>) -> Vec<String> {
+            router
+                .list_all()
+                .into_iter()
+                .map(|t| t.name.to_string())
+                .collect()
+        }
+        vec![
+            ("core", names(Self::router_core())),
+            ("memory_crud", names(Self::router_memory_crud())),
+            ("memory_search", names(Self::router_memory_search())),
+            ("inventory", names(Self::router_inventory())),
+            ("similarity", names(Self::router_similarity())),
+            ("recommend", names(Self::router_recommend())),
+            ("patterns", names(Self::router_patterns())),
+            ("topics", names(Self::router_topics())),
+            ("graph_core", names(Self::router_graph_core())),
+            ("architecture", names(Self::router_architecture())),
+            ("prediction", names(Self::router_prediction())),
+            ("a2a", names(Self::router_a2a())),
+            ("csm", names(Self::router_csm())),
+            ("experiments", names(Self::router_experiments())),
+            ("work_items_a", names(Self::router_work_items_a())),
+            ("work_items_b", names(Self::router_work_items_b())),
+            ("data_tables", names(Self::router_data_tables())),
+            ("trajectory", names(Self::router_trajectory())),
+            ("graph_advanced", names(Self::router_graph_advanced())),
+            ("infotheory", names(Self::router_infotheory())),
+            ("quality_evo", names(Self::router_quality_evo())),
+            ("graph_func", names(Self::router_graph_func())),
+            ("concurrency", names(Self::router_concurrency())),
+            ("security", names(Self::router_security())),
+            ("api_contract", names(Self::router_api_contract())),
+            ("ml_embedding", names(Self::router_ml_embedding())),
+            ("data_eng", names(Self::router_data_eng())),
+            ("callgraph_evo", names(Self::router_callgraph_evo())),
+            ("core_advanced", names(Self::router_core_advanced())),
+            ("sema", names(Self::router_sema())),
+            ("fuzzy", names(Self::router_fuzzy())),
+            ("ontology", names(Self::router_ontology())),
+            ("toolbox", names(Self::router_toolbox())),
+            ("meta", names(Self::router_meta())),
+        ]
     }
 
     /// Escape hatch for tool methods + cron-orchestrator calls that still
@@ -598,369 +710,6 @@ impl McpServer {
         };
         let params_summary = summarize_json(&args);
         let project_hint = telemetry_project_from_json(&args);
-        let fut = async move {
-            dispatch_tool!(self, name, args, {
-                // Search
-                "semantic_search"        => semantic_search(SemanticSearchParams),
-                "text_search"            => text_search(TextSearchParams),
-                "grep"                   => grep(GrepParams),
-                "hybrid_search"          => hybrid_search(HybridSearchParams),
-                "search_commits"         => search_commits(SearchCommitsParams),
-                // Pattern knowledge — all share the `tool_software_patterns` module.
-                "software_pattern_search"    => software_pattern_search(SoftwarePatternSearchParams) in tool_software_patterns,
-                "recommend_design_patterns"  => recommend_design_patterns(RecommendDesignPatternsParams) in tool_software_patterns,
-                "review_design_patterns"     => review_design_patterns(ReviewDesignPatternsParams) in tool_software_patterns,
-                "get_software_pattern"       => get_software_pattern(GetSoftwarePatternParams) in tool_software_patterns,
-                "list_software_patterns"     => list_software_patterns(ListSoftwarePatternsParams) in tool_software_patterns,
-                "refresh_pattern_catalog"    => refresh_pattern_catalog(RefreshPatternCatalogParams) in tool_software_patterns,
-                "upsert_pattern_source"      => upsert_pattern_source(UpsertPatternSourceParams) in tool_software_patterns,
-                // Developer-tool ("toolbox") catalog — all share the `tool_toolbox` module.
-                "toolbox_search"             => toolbox_search(ToolboxSearchParams) in tool_toolbox,
-                "toolbox_recommend"          => toolbox_recommend(ToolboxRecommendParams) in tool_toolbox,
-                "toolbox_get"                => toolbox_get(ToolboxGetParams) in tool_toolbox,
-                "toolbox_list"               => toolbox_list(ToolboxListParams) in tool_toolbox,
-                "toolbox_refresh"            => toolbox_refresh(ToolboxRefreshParams) in tool_toolbox,
-                // Session-level mandates — `promote_session_mandate` shares the `tool_session_mandates` module.
-                "session_mandates"           => session_mandates(SessionMandatesParams),
-                "promote_session_mandate"    => promote_session_mandate(PromoteSessionMandateParams) in tool_session_mandates,
-                // Memory-server Phase 0 quick wins.
-                "recall_prompts"             => recall_prompts(RecallPromptsParams),
-                "search_mandates"            => search_mandates(SearchMandatesParams),
-                // Memory-server Phase 3.1 official-compat CRUD (9 tools share the `tool_memory_crud` module).
-                "memory_create_entities"     => memory_create_entities(MemoryCreateEntitiesParams) in tool_memory_crud,
-                "memory_create_relations"    => memory_create_relations(MemoryCreateRelationsParams) in tool_memory_crud,
-                "memory_add_observations"    => memory_add_observations(MemoryAddObservationsParams) in tool_memory_crud,
-                "memory_delete_entities"     => memory_delete_entities(MemoryDeleteEntitiesParams) in tool_memory_crud,
-                "memory_delete_observations" => memory_delete_observations(MemoryDeleteObservationsParams) in tool_memory_crud,
-                "memory_delete_relations"    => memory_delete_relations(MemoryDeleteRelationsParams) in tool_memory_crud,
-                "memory_read_graph"          => memory_read_graph(MemoryReadGraphParams) in tool_memory_crud,
-                "memory_search_nodes"        => memory_search_nodes(MemorySearchNodesParams) in tool_memory_crud,
-                "memory_open_nodes"          => memory_open_nodes(MemoryOpenNodesParams) in tool_memory_crud,
-                // Memory-server Phase 3.2 extensions (share the tool_memory_ext module).
-                "memory_semantic_search"        => memory_semantic_search(MemorySemanticSearchParams) in tool_memory_ext,
-                "memory_hybrid_search"          => memory_hybrid_search(MemoryHybridSearchParams) in tool_memory_ext,
-                "memory_facts_at"               => memory_facts_at(MemoryFactsAtParams) in tool_memory_ext,
-                "memory_relations_traverse"     => memory_relations_traverse(MemoryRelationsTraverseParams) in tool_memory_ext,
-                "memory_anchor_entity"          => memory_anchor_entity(MemoryAnchorEntityParams) in tool_memory_ext,
-                "memory_unanchor_entity"        => memory_unanchor_entity(MemoryUnanchorEntityParams) in tool_memory_ext,
-                "memory_find_code_for_entity"   => memory_find_code_for_entity(MemoryFindCodeForEntityParams) in tool_memory_ext,
-                "memory_find_entities_for_code" => memory_find_entities_for_code(MemoryFindEntitiesForCodeParams) in tool_memory_ext,
-                "memory_reflect"                => memory_reflect(MemoryReflectParams) in tool_memory_reflect,
-                // Memory-server Phase 6 graph-enhanced retrieval.
-                "memory_unified_search"         => memory_unified_search(MemoryUnifiedSearchParams) in tool_memory_graph_rag,
-                // v31 — A2A/coordination conversation search (wraps memory_unified_search).
-                "conversation_search"           => conversation_search(ConversationSearchParams),
-                "memory_neighbors"              => memory_neighbors(MemoryNeighborsParams) in tool_memory_graph_rag,
-                "graph_neighbors"               => graph_neighbors(GraphNeighborsParams) in tool_memory_graph_rag,
-                "memory_path_search"            => memory_path_search(MemoryPathSearchParams) in tool_memory_graph_rag,
-                "memory_ppr_search"             => memory_ppr_search(MemoryPprSearchParams) in tool_memory_graph_rag,
-                "memory_raptor_search"          => memory_raptor_search(MemoryRaptorSearchParams) in tool_memory_graph_rag,
-                // Memory-server Phase 8: forget + retention.
-                "memory_forget"                 => memory_forget(MemoryForgetParams) in tool_memory_forget,
-                "memory_purge_expired"          => memory_purge_expired(MemoryPurgeExpiredParams) in tool_memory_forget,
-                // Memory-server Phase 10: client-profile introspection.
-                "pgmcp_client_profile"          => pgmcp_client_profile(PgmcpClientProfileParams) in tool_client_profile,
-                // File info
-                "read_file"              => read_file(ReadFileParams),
-                "mandate_context"        => mandate_context(MandateContextParams),
-                "project_tree"           => project_tree(ProjectTreeParams),
-                "work_summary"           => work_summary(WorkSummaryParams),
-                "file_info"              => file_info(FileInfoParams),
-                // Similarity
-                "compare_files"          => compare_files(CompareFilesParams),
-                "find_similar_modules"   => find_similar_modules(FindSimilarModulesParams),
-                "find_duplicates"        => find_duplicates(FindDuplicatesParams),
-                "refactoring_report"     => refactoring_report(RefactoringReportParams),
-                // Topics
-                "discover_topics"        => discover_topics(DiscoverTopicsParams),
-                "find_orphans"           => find_orphans(FindOrphansParams),
-                "find_misplaced_code"    => find_misplaced_code(FindMisplacedCodeParams),
-                "find_coupled_files"     => find_coupled_files(FindCoupledFilesParams),
-                "test_coverage_gaps"     => test_coverage_gaps(TestCoverageGapsParams),
-                "complexity_hotspots"    => complexity_hotspots(ComplexityHotspotsParams),
-                "topic_hierarchy"        => topic_hierarchy(TopicHierarchyParams),
-                "suggest_merges"         => suggest_merges(SuggestMergesParams),
-                "suggest_splits"         => suggest_splits(SuggestSplitsParams),
-                "doc_coverage_gaps"      => doc_coverage_gaps(DocCoverageGapsParams),
-                // Graph
-                "dependency_graph"       => dependency_graph(DependencyGraphParams),
-                "centrality_analysis"    => centrality_analysis(CentralityAnalysisParams),
-                "community_detection"    => community_detection(CommunityDetectionParams),
-                "circular_dependencies"  => circular_dependencies(CircularDependenciesParams),
-                "change_impact_analysis" => change_impact_analysis(ChangeImpactAnalysisParams),
-                // Graph-roadmap Phase 1.1 — function-level call-graph analytics
-                "central_functions"      => central_functions(CentralFunctionsParams),
-                "function_communities"   => function_communities(FunctionCommunitiesParams),
-                "function_kcore"         => function_kcore(FunctionKcoreParams),
-                "recursive_clusters"     => recursive_clusters(RecursiveClustersParams),
-                "extended_centrality"    => extended_centrality(ExtendedCentralityParams),
-                "articulation_points"    => articulation_points(ArticulationPointsParams),
-                "hits"                   => hits(HitsParams),
-                "dominator_tree"         => dominator_tree(DominatorTreeParams),
-                // Graph-roadmap Phase 3-4 — connectivity / spectral / DSM / CK /
-                // graph-aware retrieval (file or call graph).
-                "graph_connectivity"     => graph_connectivity(GraphConnectivityParams),
-                "spectral_analysis"      => spectral_analysis(SpectralAnalysisParams),
-                "architecture_dsm"       => architecture_dsm(ArchitectureDsmParams),
-                "ck_metrics"             => ck_metrics(CkMetricsParams),
-                "code_ppr_search"        => code_ppr_search(CodePprSearchParams),
-                "code_path_search"       => code_path_search(CodePathSearchParams),
-                "code_raptor_search"     => code_raptor_search(CodeRaptorSearchParams),
-                // Architecture
-                "coupling_cohesion_report"  => coupling_cohesion_report(CouplingCohesionReportParams),
-                "architecture_violations"   => architecture_violations(ArchitectureViolationsParams),
-                "design_smell_detection"    => design_smell_detection(DesignSmellDetectionParams),
-                "architecture_quality"      => architecture_quality(ArchitectureQualityParams),
-                "design_metrics"            => design_metrics(DesignMetricsParams),
-                // Prediction
-                "bug_prediction"         => bug_prediction(BugPredictionParams),
-                "technical_debt_analysis" => technical_debt_analysis(TechnicalDebtAnalysisParams),
-                "anomaly_detection"      => anomaly_detection(AnomalyDetectionParams),
-                "code_on_fire"           => code_on_fire(CodeOnFireParams),
-                "documented_tech_debt"   => documented_tech_debt(DocumentedTechDebtParams),
-                "trigger_cron"           => trigger_cron(TriggerCronParams),
-                "security_scan"          => security_scan(SecurityScanParams),
-                // A2A inter-agent IPC bridge
-                "a2a_send_task"          => a2a_send_task(A2aSendTaskParams),
-                "a2a_get_task"           => a2a_get_task(A2aGetTaskParams),
-                "a2a_subscribe_task"     => a2a_subscribe_task(A2aSubscribeTaskParams),
-                "a2a_cancel_task"        => a2a_cancel_task(A2aCancelTaskParams),
-                "a2a_register_agent"     => a2a_register_agent(A2aRegisterAgentParams),
-                "a2a_list_agents"        => a2a_list_agents(A2aListAgentsParams),
-                "a2a_active_agents"      => a2a_active_agents(A2aActiveAgentsParams),
-                "a2a_send_message"       => a2a_send_message(A2aSendMessageParams),
-                "a2a_inbox"              => a2a_inbox(A2aInboxParams),
-                "a2a_reply_message"      => a2a_reply_message(A2aReplyMessageParams),
-                "a2a_ack_message"        => a2a_ack_message(A2aAckMessageParams),
-                // A2A RecursiveMAS-inspired extensions
-                "a2a_find_agents_by_specialty"
-                    => a2a_find_agents_by_specialty(A2aFindAgentsBySpecialtyParams),
-                "a2a_pattern_sequential" => a2a_pattern_sequential(A2aPatternSequentialParams),
-                "a2a_pattern_mixture"    => a2a_pattern_mixture(A2aPatternMixtureParams),
-                "a2a_pattern_distillation"
-                    => a2a_pattern_distillation(A2aPatternDistillationParams),
-                "a2a_pattern_deliberation"
-                    => a2a_pattern_deliberation(A2aPatternDeliberationParams),
-                // CSM / MPST coordination observer tools (ADR-009)
-                "csm_list_protocols"      => csm_list_protocols(CsmListProtocolsParams),
-                "csm_protocol_of_pattern" => csm_protocol_of_pattern(CsmProtocolOfPatternParams),
-                "csm_show_projection"     => csm_show_projection(CsmShowProjectionParams),
-                "csm_validate_run"        => csm_validate_run(CsmValidateRunParams),
-                "csm_protocol_plan"       => csm_protocol_plan(CsmProtocolPlanParams),
-                "csm_infer_peer_fsm"      => csm_infer_peer_fsm(CsmInferPeerFsmParams),
-                "a2a_report_outcome"     => a2a_report_outcome(A2aReportOutcomeParams),
-                // Scientific-experiment subsystem (share the tool_experiments module).
-                "experiment_open"               => experiment_open(ExperimentOpenParams) in tool_experiments,
-                "experiment_protocol"           => experiment_protocol(ExperimentProtocolParams) in tool_experiments,
-                "experiment_record_measurement" => experiment_record_measurement(ExperimentRecordMeasurementParams) in tool_experiments,
-                "experiment_decide"             => experiment_decide(ExperimentDecideParams) in tool_experiments,
-                "experiment_search"             => experiment_search(ExperimentSearchParams) in tool_experiments,
-                "experiment_get"                => experiment_get(ExperimentGetParams) in tool_experiments,
-                "experiment_list"               => experiment_list(ExperimentListParams) in tool_experiments,
-                "experiment_timeline"           => experiment_timeline(ExperimentTimelineParams) in tool_experiments,
-                "experiment_log_artifact"       => experiment_log_artifact(ExperimentLogArtifactParams) in tool_experiments,
-                "experiment_render_ledger"      => experiment_render_ledger(ExperimentRenderLedgerParams) in tool_experiments,
-                // JSON data tables (share the data_tables module).
-                "data_table_create"      => data_table_create(DataTableCreateParams) in data_tables,
-                "data_table_alter"       => data_table_alter(DataTableAlterParams) in data_tables,
-                "data_table_drop"        => data_table_drop(DataTableDropParams) in data_tables,
-                "data_table_list"        => data_table_list(DataTableListParams) in data_tables,
-                "data_table_describe"    => data_table_describe(DataTableDescribeParams) in data_tables,
-                "data_table_insert"      => data_table_insert(DataTableInsertParams) in data_tables,
-                "data_table_select"      => data_table_select(DataTableSelectParams) in data_tables,
-                "data_table_update"      => data_table_update(DataTableUpdateParams) in data_tables,
-                "data_table_delete"      => data_table_delete(DataTableDeleteParams) in data_tables,
-                "data_table_aggregate"   => data_table_aggregate(DataTableAggregateParams) in data_tables,
-                "data_table_report"      => data_table_report(DataTableReportParams) in data_tables,
-                "data_table_search"      => data_table_search(DataTableSearchParams) in data_tables,
-                // Work-item / plan tracker subsystem (share the work_items module).
-                "work_item_create"       => work_item_create(WorkItemCreateParams) in work_items,
-                "work_item_get"          => work_item_get(WorkItemGetParams) in work_items,
-                "work_item_update"       => work_item_update(WorkItemUpdateParams) in work_items,
-                "work_item_list"         => work_item_list(WorkItemListParams) in work_items,
-                "work_item_tree"         => work_item_tree(WorkItemTreeParams) in work_items,
-                "work_item_reparent"     => work_item_reparent(WorkItemReparentParams) in work_items,
-                "work_item_set_status"   => work_item_set_status(WorkItemSetStatusParams) in work_items,
-                // Work-item tracker Phase 2 — tags + progress (share the work_items module).
-                "tag_create"             => tag_create(TagCreateParams) in work_items,
-                "tag_list"               => tag_list(TagListParams) in work_items,
-                "tag_merge"              => tag_merge(TagMergeParams) in work_items,
-                "tag_rename"             => tag_rename(TagRenameParams) in work_items,
-                "work_item_tag"          => work_item_tag(WorkItemTagParams) in work_items,
-                "work_item_untag"        => work_item_untag(WorkItemUntagParams) in work_items,
-                "work_item_record_progress" => work_item_record_progress(WorkItemRecordProgressParams) in work_items,
-                "work_item_progress_log" => work_item_progress_log(WorkItemProgressLogParams) in work_items,
-                "work_item_completion"   => work_item_completion(WorkItemCompletionParams) in work_items,
-                "work_item_reprioritize" => work_item_reprioritize(WorkItemReprioritizeParams) in work_items,
-                "work_item_search"       => work_item_search(WorkItemSearchParams) in work_items,
-                "plan_define"            => plan_define(PlanDefineParams) in work_items,
-                "plan_validate"          => plan_validate(PlanValidateParams) in work_items,
-                "plan_definition_export" => plan_definition_export(PlanDefinitionExportParams) in work_items,
-                "plan_definition_import" => plan_definition_import(PlanDefinitionImportParams) in work_items,
-                "work_item_add_criterion" => work_item_add_criterion(WorkItemAddCriterionParams) in work_items,
-                "work_item_record_evidence" => work_item_record_evidence(WorkItemRecordEvidenceParams) in work_items,
-                "work_item_attempt_verify" => work_item_attempt_verify(WorkItemAttemptVerifyParams) in work_items,
-                "work_item_defer"        => work_item_defer(WorkItemDeferParams) in work_items,
-                "work_item_reinstate"    => work_item_reinstate(WorkItemReinstateParams) in work_items,
-                "work_item_triage"       => work_item_triage(WorkItemTriageParams) in work_items,
-                "work_item_resolve"      => work_item_resolve(WorkItemResolveParams) in work_items,
-                // Work-item tracker Phase 2 — smart-views, next-action, assign, history, bulk.
-                "work_item_view"            => work_item_view(WorkItemViewParams) in work_items,
-                "work_item_next_actionable" => work_item_next_actionable(WorkItemNextActionableParams) in work_items,
-                "work_item_assign"          => work_item_assign(WorkItemAssignParams) in work_items,
-                "work_item_history"         => work_item_history(WorkItemHistoryParams) in work_items,
-                "work_item_bulk"            => work_item_bulk(WorkItemBulkParams) in work_items,
-                "work_item_ingest_plan"  => work_item_ingest_plan(WorkItemIngestPlanParams) in work_items,
-                "work_item_promote_marker" => work_item_promote_marker(WorkItemPromoteMarkerParams) in work_items,
-                "work_item_claim"        => work_item_claim(WorkItemClaimParams) in work_items,
-                "work_item_claim_next"   => work_item_claim_next(WorkItemClaimNextParams) in work_items,
-                "work_item_release"      => work_item_release(WorkItemReleaseParams) in work_items,
-                "work_item_handoff"      => work_item_handoff(WorkItemHandoffParams) in work_items,
-                "agent_heartbeat"        => agent_heartbeat(AgentHeartbeatParams) in work_items,
-                "work_item_who_owns"     => work_item_who_owns(WorkItemWhoOwnsParams) in work_items,
-                "agent_activity"         => agent_activity(AgentActivityParams) in work_items,
-                "work_item_activity"     => work_item_activity(WorkItemActivityParams) in work_items,
-                "work_item_link"         => work_item_link(WorkItemLinkParams) in work_items,
-                "work_item_unlink"       => work_item_unlink(WorkItemUnlinkParams) in work_items,
-                "work_item_cycles"       => work_item_cycles(WorkItemCyclesParams) in work_items,
-                "work_item_anchor_code"  => work_item_anchor_code(WorkItemAnchorCodeParams) in work_items,
-                "work_item_link_commit"  => work_item_link_commit(WorkItemLinkCommitParams) in work_items,
-                "work_item_burndown"     => work_item_burndown(WorkItemBurndownParams) in work_items,
-                "work_item_export"       => work_item_export(WorkItemExportParams) in work_items,
-                "work_item_link_experiment" => work_item_link_experiment(WorkItemLinkExperimentParams) in work_items,
-                "a2a_pattern_recursive"  => a2a_pattern_recursive(A2aPatternRecursiveParams),
-                "trajectory_similarity"  => trajectory_similarity(TrajectorySimilarityParams),
-                "recognize_trajectory"   => recognize_trajectory(RecognizeTrajectoryParams) in tool_trajectory_similarity,
-                // SOTA Phase 2 — graph algorithms
-                "kcore_analysis"         => kcore_analysis(KcoreAnalysisParams),
-                "ktruss_analysis"        => ktruss_analysis(KtrussAnalysisParams),
-                "personalized_pagerank"  => personalized_pagerank(PersonalizedPagerankParams),
-                "edge_betweenness"       => edge_betweenness(EdgeBetweennessParams),
-                "structural_holes"       => structural_holes(StructuralHolesParams),
-                "motif_census"           => motif_census(MotifCensusParams),
-                "attack_vulnerability"   => attack_vulnerability(AttackVulnerabilityParams),
-                // SOTA Phase 3 — information theory
-                "compression_distance"   => compression_distance(CompressionDistanceParams),
-                "cochange_mutual_information" => cochange_mutual_information(CochangeMutualInformationParams),
-                "import_entropy"         => import_entropy(ImportEntropyParams),
-                "identifier_entropy"     => identifier_entropy(IdentifierEntropyParams),
-                // SOTA Phase 4 — evolution + quality
-                "bus_factor"             => bus_factor(BusFactorParams),
-                "knowledge_silos"        => knowledge_silos(KnowledgeSilosParams),
-                "ownership_coupling_mismatch" => ownership_coupling_mismatch(OwnershipCouplingMismatchParams),
-                "doc_code_drift"         => doc_code_drift(DocCodeDriftParams),
-                "test_smells"            => test_smells(TestSmellsParams),
-                "mutation_score_surrogate" => mutation_score_surrogate(MutationScoreSurrogateParams),
-                "flaky_test_candidates"  => flaky_test_candidates(FlakyTestCandidatesParams),
-                // SOTA Phase 5 — concurrency / safety / performance
-                "lockset_races"          => lockset_races(LocksetRacesParams),
-                "unsafe_clusters"        => unsafe_clusters(UnsafeClustersParams),
-                "panic_paths"            => panic_paths(PanicPathsParams),
-                "deadlock_candidates"    => deadlock_candidates(DeadlockCandidatesParams),
-                // Shadow-ASR interprocedural concurrency (ADR-011): registered in
-                // `router_concurrency` for the MCP transport; these entries give the
-                // CLI / `call_tool_cli` path the same reach (and the coverage gate
-                // its hook). `tool_concurrency_deadlock.rs` exercises them.
-                "deadlock_cycles"        => deadlock_cycles(DeadlockCyclesParams),
-                "channel_deadlock"       => channel_deadlock(ChannelDeadlockParams),
-                "lock_order_graph"       => lock_order_graph(LockOrderGraphParams),
-                "sync_skeleton"          => sync_skeleton(SyncSkeletonParams),
-                "concurrency_bottlenecks" => concurrency_bottlenecks(ConcurrencyBottlenecksParams),
-                "concurrency_forecast"   => concurrency_forecast(ConcurrencyForecastParams),
-                "send_sync_violations"   => send_sync_violations(SendSyncViolationsParams),
-                "quadratic_loops"        => quadratic_loops(QuadraticLoopsParams),
-                "missing_preallocation"  => missing_preallocation(MissingPreallocationParams),
-                "blocking_in_async"      => blocking_in_async(BlockingInAsyncParams),
-                "clone_density"          => clone_density(CloneDensityParams),
-                "io_hotpath"             => io_hotpath(IoHotpathParams),
-                // SOTA Phase 6 — security
-                "taint_analysis"         => taint_analysis(TaintAnalysisParams),
-                "secret_detection"       => secret_detection(SecretDetectionParams),
-                "crypto_misuse"          => crypto_misuse(CryptoMisuseParams),
-                "unsafe_deserialization" => unsafe_deserialization(UnsafeDeserializationParams),
-                "injection_candidates"   => injection_candidates(InjectionCandidatesParams),
-                "unprotected_routes"     => unprotected_routes(UnprotectedRoutesParams),
-                "cve_supply_chain"       => cve_supply_chain(CveSupplyChainParams),
-                // SOTA Phase 7 — API / contract
-                "public_api_surface"     => public_api_surface(PublicApiSurfaceParams),
-                "semver_break_audit"     => semver_break_audit(SemverBreakAuditParams),
-                "deprecated_but_used"    => deprecated_but_used(DeprecatedButUsedParams),
-                "api_stability"          => api_stability(ApiStabilityParams),
-                // SOTA Phase 8 — ML / embedding-based
-                "lsh_clone_detection"    => lsh_clone_detection(LshCloneDetectionParams),
-                "semantic_drift"         => semantic_drift(SemanticDriftParams),
-                "embedding_outliers"     => embedding_outliers(EmbeddingOutliersParams),
-                "multi_resolution_pagerank" => multi_resolution_pagerank(MultiResolutionPagerankParams),
-                // SOTA Phase 9 — data engineering
-                "migration_safety"       => migration_safety(MigrationSafetyParams),
-                "dead_columns"           => dead_columns(DeadColumnsParams),
-                "pii_spread"             => pii_spread(PiiSpreadParams),
-                // SOTA Phase 10 — call-graph downstream
-                "dead_code_reachability" => dead_code_reachability(DeadCodeReachabilityParams),
-                "feature_envy"           => feature_envy(FeatureEnvyParams),
-                "shotgun_surgery"        => shotgun_surgery(ShotgunSurgeryParams),
-                "lcom4"                  => lcom4(Lcom4Params),
-                // SOTA Phase 11 — evolution analytics
-                "refactor_pressure"      => refactor_pressure(RefactorPressureParams),
-                "commit_changepoint"     => commit_changepoint(CommitChangepointParams),
-                "commit_topic_drift"     => commit_topic_drift(CommitTopicDriftParams),
-                "release_api_stability"  => release_api_stability(ReleaseApiStabilityParams),
-                // Advanced
-                "code_summarize"         => code_summarize(CodeSummarizeParams),
-                "engineering_scorecard"  => engineering_scorecard(EngineeringScorecardParams),
-                "quality_report"         => quality_report(QualityReportParams),
-                // Phase 1 — trends & forecasting (quality-history trajectory)
-                "quality_trend"          => quality_trend(QualityTrendParams),
-                "quality_forecast"       => quality_forecast(QualityForecastParams),
-                // Telemetry
-                "mcp_tool_telemetry"     => mcp_tool_telemetry(McpToolTelemetryParams),
-                "adoption_report"        => adoption_report(AdoptionReportParams),
-                // Orientation / multi-axis tools previously omitted from the
-                // dispatch — added so `call_tool_cli` can drive every #[tool]
-                // method from harness tests. See `query_smoke_mcp_tools.rs`.
-                "orient"                         => orient(OrientParams),
-                "topic_hierarchy_fcm"            => topic_hierarchy_fcm(TopicHierarchyFcmParams),
-                "dependency_health"              => dependency_health(DependencyHealthParams),
-                "shotgun_surgery_fix"            => shotgun_surgery_fix(ShotgunSurgeryFixParams),
-                "pr_scope_recommender"           => pr_scope(PrScopeRecommenderParams) in tool_pr_scope,
-                "naming_consistency"             => naming_consistency(NamingConsistencyParams),
-                "import_hygiene"                 => import_hygiene(ImportHygieneParams),
-                "adoption_lag"                   => adoption_lag(AdoptionLagParams),
-                "merge_conflict_risk"            => merge_conflict_risk(MergeConflictRiskParams),
-                "hot_path_audit"                 => hot_path_audit(HotPathAuditParams),
-                "bus_factor_map"                 => bus_factor_map(BusFactorMapParams),
-                "module_growth_trajectory"       => module_growth(ModuleGrowthParams) in tool_module_growth,
-                "stale_zombie_detector"          => stale_zombie(StaleZombieParams) in tool_stale_zombie,
-                "tech_debt_burn_down"            => tech_debt_burn_down(TechDebtBurnDownParams),
-                "internal_dry"                   => internal_dry(InternalDryParams),
-                "extraction_candidates"          => extraction_candidates(ExtractionCandidatesParams),
-                "boilerplate_clusters"           => boilerplate_clusters(BoilerplateClustersParams),
-                "chunk_clusters"                 => chunk_clusters(ChunkClustersParams),
-                "pattern_abstraction_candidates" => pattern_abstraction(PatternAbstractionParams) in tool_pattern_abstraction,
-                "pattern_search"                 => pattern_search(PatternSearchParams),
-                "recommend_layering"             => recommend_layering(RecommendLayeringParams),
-                "recommend_module_split"         => recommend_module_split(RecommendModuleSplitParams),
-                "reviewer_recommender"           => reviewer_recommender(ReviewerRecommenderParams),
-                "fix_circular_dependency"        => fix_circular_dependency(FixCircularDependencyParams),
-                "reindex"                        => reindex(ReindexParams),
-                "active_clients"                 => active_clients(ActiveClientsParams),
-                "client_project_matrix"          => client_project_matrix(ClientProjectMatrixParams),
-                "project_dependents"             => project_dependents(ProjectDependentsParams),
-                "project_dependencies"           => project_dependencies(ProjectDependenciesParams),
-                "coordinate_dependency_block"    => coordinate_dependency_block(CoordinateDependencyBlockParams),
-                "coordination_respond"           => coordination_respond(CoordinationRespondParams),
-                "suggest_worktree"               => suggest_worktree(SuggestWorktreeParams),
-                // Ontology tools — CLI-dispatched so their `oracle_*`
-                // regression tests (which drive `call_tool_cli`) can reach them.
-                "ontology_create_concept"        => ontology_create_concept(OntologyCreateConceptParams) in tool_ontology,
-                "ontology_invariants_for_file"   => ontology_invariants_for_file(OntologyInvariantsForFileParams) in tool_ontology,
-            }, no_params: {
-                "list_projects" => list_projects,
-                "index_stats"   => index_stats,
-                "pattern_catalog_stats" => pattern_catalog_stats in tool_software_patterns,
-                "toolbox_stats" => toolbox_stats in tool_toolbox,
-            })
-        };
         instrumented_tool_run(
             self.stats(),
             name,
@@ -970,9 +719,413 @@ impl McpServer {
             None,
             None,
             project_hint,
-            fut,
+            self.dispatch_named(name, args),
         )
         .await
+    }
+
+    /// Dispatch an inner tool on behalf of the `call_tool` meta-tool, attributing
+    /// the durable telemetry row to the INNER tool name + the real caller (so the
+    /// adaptive tool-policy learner sees true tool usage, not the `call_tool`
+    /// wrapper). A 30 s budget matches the default MCP tool timeout.
+    pub(crate) async fn dispatch_for_call_tool(
+        &self,
+        ctx: &RequestContext<RoleServer>,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<CallToolResult, McpError> {
+        let caller = extract_caller(ctx);
+        let request_id = Some(format!("{:?}", ctx.id));
+        let mcp_session_id = extract_mcp_session_id(ctx);
+        let project_hint = telemetry_project_from_json(&args);
+        let params_summary = summarize_json(&args);
+        instrumented_tool_run(
+            self.stats(),
+            name,
+            Some(30),
+            caller,
+            &params_summary,
+            request_id,
+            mcp_session_id,
+            project_hint,
+            self.dispatch_named(name, args),
+        )
+        .await
+    }
+
+    /// Raw name→body dispatch shared by `call_tool_cli` and
+    /// `dispatch_for_call_tool`. No instrumentation — each caller wraps it in
+    /// `instrumented_tool_run` with the tool name + caller it wants recorded.
+    async fn dispatch_named(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+    ) -> Result<CallToolResult, McpError> {
+        dispatch_tool!(self, name, args, {
+            // Search
+            "semantic_search"        => semantic_search(SemanticSearchParams),
+            "text_search"            => text_search(TextSearchParams),
+            "grep"                   => grep(GrepParams),
+            "hybrid_search"          => hybrid_search(HybridSearchParams),
+            "search_commits"         => search_commits(SearchCommitsParams),
+            // Pattern knowledge — all share the `tool_software_patterns` module.
+            "software_pattern_search"    => software_pattern_search(SoftwarePatternSearchParams) in tool_software_patterns,
+            "recommend_design_patterns"  => recommend_design_patterns(RecommendDesignPatternsParams) in tool_software_patterns,
+            "review_design_patterns"     => review_design_patterns(ReviewDesignPatternsParams) in tool_software_patterns,
+            "get_software_pattern"       => get_software_pattern(GetSoftwarePatternParams) in tool_software_patterns,
+            "list_software_patterns"     => list_software_patterns(ListSoftwarePatternsParams) in tool_software_patterns,
+            "refresh_pattern_catalog"    => refresh_pattern_catalog(RefreshPatternCatalogParams) in tool_software_patterns,
+            "upsert_pattern_source"      => upsert_pattern_source(UpsertPatternSourceParams) in tool_software_patterns,
+            // Developer-tool ("toolbox") catalog — all share the `tool_toolbox` module.
+            "toolbox_search"             => toolbox_search(ToolboxSearchParams) in tool_toolbox,
+            "toolbox_recommend"          => toolbox_recommend(ToolboxRecommendParams) in tool_toolbox,
+            "toolbox_get"                => toolbox_get(ToolboxGetParams) in tool_toolbox,
+            "toolbox_list"               => toolbox_list(ToolboxListParams) in tool_toolbox,
+            "toolbox_refresh"            => toolbox_refresh(ToolboxRefreshParams) in tool_toolbox,
+            // Session-level mandates — `promote_session_mandate` shares the `tool_session_mandates` module.
+            "session_mandates"           => session_mandates(SessionMandatesParams),
+            "promote_session_mandate"    => promote_session_mandate(PromoteSessionMandateParams) in tool_session_mandates,
+            // Memory-server Phase 0 quick wins.
+            "recall_prompts"             => recall_prompts(RecallPromptsParams),
+            "search_mandates"            => search_mandates(SearchMandatesParams),
+            // Memory-server Phase 3.1 official-compat CRUD (9 tools share the `tool_memory_crud` module).
+            "memory_create_entities"     => memory_create_entities(MemoryCreateEntitiesParams) in tool_memory_crud,
+            "memory_create_relations"    => memory_create_relations(MemoryCreateRelationsParams) in tool_memory_crud,
+            "memory_add_observations"    => memory_add_observations(MemoryAddObservationsParams) in tool_memory_crud,
+            "memory_delete_entities"     => memory_delete_entities(MemoryDeleteEntitiesParams) in tool_memory_crud,
+            "memory_delete_observations" => memory_delete_observations(MemoryDeleteObservationsParams) in tool_memory_crud,
+            "memory_delete_relations"    => memory_delete_relations(MemoryDeleteRelationsParams) in tool_memory_crud,
+            "memory_read_graph"          => memory_read_graph(MemoryReadGraphParams) in tool_memory_crud,
+            "memory_search_nodes"        => memory_search_nodes(MemorySearchNodesParams) in tool_memory_crud,
+            "memory_open_nodes"          => memory_open_nodes(MemoryOpenNodesParams) in tool_memory_crud,
+            // Memory-server Phase 3.2 extensions (share the tool_memory_ext module).
+            "memory_semantic_search"        => memory_semantic_search(MemorySemanticSearchParams) in tool_memory_ext,
+            "memory_hybrid_search"          => memory_hybrid_search(MemoryHybridSearchParams) in tool_memory_ext,
+            "memory_facts_at"               => memory_facts_at(MemoryFactsAtParams) in tool_memory_ext,
+            "memory_relations_traverse"     => memory_relations_traverse(MemoryRelationsTraverseParams) in tool_memory_ext,
+            "memory_anchor_entity"          => memory_anchor_entity(MemoryAnchorEntityParams) in tool_memory_ext,
+            "memory_unanchor_entity"        => memory_unanchor_entity(MemoryUnanchorEntityParams) in tool_memory_ext,
+            "memory_find_code_for_entity"   => memory_find_code_for_entity(MemoryFindCodeForEntityParams) in tool_memory_ext,
+            "memory_find_entities_for_code" => memory_find_entities_for_code(MemoryFindEntitiesForCodeParams) in tool_memory_ext,
+            "memory_reflect"                => memory_reflect(MemoryReflectParams) in tool_memory_reflect,
+            // Memory-server Phase 6 graph-enhanced retrieval.
+            "memory_unified_search"         => memory_unified_search(MemoryUnifiedSearchParams) in tool_memory_graph_rag,
+            // v31 — A2A/coordination conversation search (wraps memory_unified_search).
+            "conversation_search"           => conversation_search(ConversationSearchParams),
+            "memory_neighbors"              => memory_neighbors(MemoryNeighborsParams) in tool_memory_graph_rag,
+            "graph_neighbors"               => graph_neighbors(GraphNeighborsParams) in tool_memory_graph_rag,
+            "memory_path_search"            => memory_path_search(MemoryPathSearchParams) in tool_memory_graph_rag,
+            "memory_ppr_search"             => memory_ppr_search(MemoryPprSearchParams) in tool_memory_graph_rag,
+            "memory_raptor_search"          => memory_raptor_search(MemoryRaptorSearchParams) in tool_memory_graph_rag,
+            // Memory-server Phase 8: forget + retention.
+            "memory_forget"                 => memory_forget(MemoryForgetParams) in tool_memory_forget,
+            "memory_purge_expired"          => memory_purge_expired(MemoryPurgeExpiredParams) in tool_memory_forget,
+            // Memory-server Phase 10: client-profile introspection.
+            "pgmcp_client_profile"          => pgmcp_client_profile(PgmcpClientProfileParams) in tool_client_profile,
+            // File info
+            "read_file"              => read_file(ReadFileParams),
+            "mandate_context"        => mandate_context(MandateContextParams),
+            "project_tree"           => project_tree(ProjectTreeParams),
+            "work_summary"           => work_summary(WorkSummaryParams),
+            "file_info"              => file_info(FileInfoParams),
+            // Similarity
+            "compare_files"          => compare_files(CompareFilesParams),
+            "find_similar_modules"   => find_similar_modules(FindSimilarModulesParams),
+            "find_duplicates"        => find_duplicates(FindDuplicatesParams),
+            "refactoring_report"     => refactoring_report(RefactoringReportParams),
+            // Topics
+            "discover_topics"        => discover_topics(DiscoverTopicsParams),
+            "find_orphans"           => find_orphans(FindOrphansParams),
+            "find_misplaced_code"    => find_misplaced_code(FindMisplacedCodeParams),
+            "find_coupled_files"     => find_coupled_files(FindCoupledFilesParams),
+            "test_coverage_gaps"     => test_coverage_gaps(TestCoverageGapsParams),
+            "complexity_hotspots"    => complexity_hotspots(ComplexityHotspotsParams),
+            "topic_hierarchy"        => topic_hierarchy(TopicHierarchyParams),
+            "suggest_merges"         => suggest_merges(SuggestMergesParams),
+            "suggest_splits"         => suggest_splits(SuggestSplitsParams),
+            "doc_coverage_gaps"      => doc_coverage_gaps(DocCoverageGapsParams),
+            // Graph
+            "dependency_graph"       => dependency_graph(DependencyGraphParams),
+            "centrality_analysis"    => centrality_analysis(CentralityAnalysisParams),
+            "community_detection"    => community_detection(CommunityDetectionParams),
+            "circular_dependencies"  => circular_dependencies(CircularDependenciesParams),
+            "change_impact_analysis" => change_impact_analysis(ChangeImpactAnalysisParams),
+            // Graph-roadmap Phase 1.1 — function-level call-graph analytics
+            "central_functions"      => central_functions(CentralFunctionsParams),
+            "function_communities"   => function_communities(FunctionCommunitiesParams),
+            "function_kcore"         => function_kcore(FunctionKcoreParams),
+            "recursive_clusters"     => recursive_clusters(RecursiveClustersParams),
+            "extended_centrality"    => extended_centrality(ExtendedCentralityParams),
+            "articulation_points"    => articulation_points(ArticulationPointsParams),
+            "hits"                   => hits(HitsParams),
+            "dominator_tree"         => dominator_tree(DominatorTreeParams),
+            // Graph-roadmap Phase 3-4 — connectivity / spectral / DSM / CK /
+            // graph-aware retrieval (file or call graph).
+            "graph_connectivity"     => graph_connectivity(GraphConnectivityParams),
+            "spectral_analysis"      => spectral_analysis(SpectralAnalysisParams),
+            "architecture_dsm"       => architecture_dsm(ArchitectureDsmParams),
+            "ck_metrics"             => ck_metrics(CkMetricsParams),
+            "code_ppr_search"        => code_ppr_search(CodePprSearchParams),
+            "code_path_search"       => code_path_search(CodePathSearchParams),
+            "code_raptor_search"     => code_raptor_search(CodeRaptorSearchParams),
+            // Architecture
+            "coupling_cohesion_report"  => coupling_cohesion_report(CouplingCohesionReportParams),
+            "architecture_violations"   => architecture_violations(ArchitectureViolationsParams),
+            "design_smell_detection"    => design_smell_detection(DesignSmellDetectionParams),
+            "architecture_quality"      => architecture_quality(ArchitectureQualityParams),
+            "design_metrics"            => design_metrics(DesignMetricsParams),
+            // Prediction
+            "bug_prediction"         => bug_prediction(BugPredictionParams),
+            "technical_debt_analysis" => technical_debt_analysis(TechnicalDebtAnalysisParams),
+            "anomaly_detection"      => anomaly_detection(AnomalyDetectionParams),
+            "code_on_fire"           => code_on_fire(CodeOnFireParams),
+            "documented_tech_debt"   => documented_tech_debt(DocumentedTechDebtParams),
+            "trigger_cron"           => trigger_cron(TriggerCronParams),
+            "security_scan"          => security_scan(SecurityScanParams),
+            // A2A inter-agent IPC bridge
+            "a2a_send_task"          => a2a_send_task(A2aSendTaskParams),
+            "a2a_get_task"           => a2a_get_task(A2aGetTaskParams),
+            "a2a_subscribe_task"     => a2a_subscribe_task(A2aSubscribeTaskParams),
+            "a2a_cancel_task"        => a2a_cancel_task(A2aCancelTaskParams),
+            "a2a_register_agent"     => a2a_register_agent(A2aRegisterAgentParams),
+            "a2a_list_agents"        => a2a_list_agents(A2aListAgentsParams),
+            "a2a_active_agents"      => a2a_active_agents(A2aActiveAgentsParams),
+            "a2a_send_message"       => a2a_send_message(A2aSendMessageParams),
+            "a2a_inbox"              => a2a_inbox(A2aInboxParams),
+            "a2a_reply_message"      => a2a_reply_message(A2aReplyMessageParams),
+            "a2a_ack_message"        => a2a_ack_message(A2aAckMessageParams),
+            // A2A RecursiveMAS-inspired extensions
+            "a2a_find_agents_by_specialty"
+                => a2a_find_agents_by_specialty(A2aFindAgentsBySpecialtyParams),
+            "a2a_pattern_sequential" => a2a_pattern_sequential(A2aPatternSequentialParams),
+            "a2a_pattern_mixture"    => a2a_pattern_mixture(A2aPatternMixtureParams),
+            "a2a_pattern_distillation"
+                => a2a_pattern_distillation(A2aPatternDistillationParams),
+            "a2a_pattern_deliberation"
+                => a2a_pattern_deliberation(A2aPatternDeliberationParams),
+            // CSM / MPST coordination observer tools (ADR-009)
+            "csm_list_protocols"      => csm_list_protocols(CsmListProtocolsParams),
+            "csm_protocol_of_pattern" => csm_protocol_of_pattern(CsmProtocolOfPatternParams),
+            "csm_show_projection"     => csm_show_projection(CsmShowProjectionParams),
+            "csm_validate_run"        => csm_validate_run(CsmValidateRunParams),
+            "csm_protocol_plan"       => csm_protocol_plan(CsmProtocolPlanParams),
+            "csm_infer_peer_fsm"      => csm_infer_peer_fsm(CsmInferPeerFsmParams),
+            "a2a_report_outcome"     => a2a_report_outcome(A2aReportOutcomeParams),
+            // Scientific-experiment subsystem (share the tool_experiments module).
+            "experiment_open"               => experiment_open(ExperimentOpenParams) in tool_experiments,
+            "experiment_protocol"           => experiment_protocol(ExperimentProtocolParams) in tool_experiments,
+            "experiment_record_measurement" => experiment_record_measurement(ExperimentRecordMeasurementParams) in tool_experiments,
+            "experiment_decide"             => experiment_decide(ExperimentDecideParams) in tool_experiments,
+            "experiment_search"             => experiment_search(ExperimentSearchParams) in tool_experiments,
+            "experiment_get"                => experiment_get(ExperimentGetParams) in tool_experiments,
+            "experiment_list"               => experiment_list(ExperimentListParams) in tool_experiments,
+            "experiment_timeline"           => experiment_timeline(ExperimentTimelineParams) in tool_experiments,
+            "experiment_log_artifact"       => experiment_log_artifact(ExperimentLogArtifactParams) in tool_experiments,
+            "experiment_render_ledger"      => experiment_render_ledger(ExperimentRenderLedgerParams) in tool_experiments,
+            // JSON data tables (share the data_tables module).
+            "data_table_create"      => data_table_create(DataTableCreateParams) in data_tables,
+            "data_table_alter"       => data_table_alter(DataTableAlterParams) in data_tables,
+            "data_table_drop"        => data_table_drop(DataTableDropParams) in data_tables,
+            "data_table_list"        => data_table_list(DataTableListParams) in data_tables,
+            "data_table_describe"    => data_table_describe(DataTableDescribeParams) in data_tables,
+            "data_table_insert"      => data_table_insert(DataTableInsertParams) in data_tables,
+            "data_table_select"      => data_table_select(DataTableSelectParams) in data_tables,
+            "data_table_update"      => data_table_update(DataTableUpdateParams) in data_tables,
+            "data_table_delete"      => data_table_delete(DataTableDeleteParams) in data_tables,
+            "data_table_aggregate"   => data_table_aggregate(DataTableAggregateParams) in data_tables,
+            "data_table_report"      => data_table_report(DataTableReportParams) in data_tables,
+            "data_table_search"      => data_table_search(DataTableSearchParams) in data_tables,
+            // Work-item / plan tracker subsystem (share the work_items module).
+            "work_item_create"       => work_item_create(WorkItemCreateParams) in work_items,
+            "work_item_get"          => work_item_get(WorkItemGetParams) in work_items,
+            "work_item_update"       => work_item_update(WorkItemUpdateParams) in work_items,
+            "work_item_list"         => work_item_list(WorkItemListParams) in work_items,
+            "work_item_tree"         => work_item_tree(WorkItemTreeParams) in work_items,
+            "work_item_reparent"     => work_item_reparent(WorkItemReparentParams) in work_items,
+            "work_item_set_status"   => work_item_set_status(WorkItemSetStatusParams) in work_items,
+            // Work-item tracker Phase 2 — tags + progress (share the work_items module).
+            "tag_create"             => tag_create(TagCreateParams) in work_items,
+            "tag_list"               => tag_list(TagListParams) in work_items,
+            "tag_merge"              => tag_merge(TagMergeParams) in work_items,
+            "tag_rename"             => tag_rename(TagRenameParams) in work_items,
+            "work_item_tag"          => work_item_tag(WorkItemTagParams) in work_items,
+            "work_item_untag"        => work_item_untag(WorkItemUntagParams) in work_items,
+            "work_item_record_progress" => work_item_record_progress(WorkItemRecordProgressParams) in work_items,
+            "work_item_progress_log" => work_item_progress_log(WorkItemProgressLogParams) in work_items,
+            "work_item_completion"   => work_item_completion(WorkItemCompletionParams) in work_items,
+            "work_item_reprioritize" => work_item_reprioritize(WorkItemReprioritizeParams) in work_items,
+            "work_item_search"       => work_item_search(WorkItemSearchParams) in work_items,
+            "plan_define"            => plan_define(PlanDefineParams) in work_items,
+            "plan_validate"          => plan_validate(PlanValidateParams) in work_items,
+            "plan_definition_export" => plan_definition_export(PlanDefinitionExportParams) in work_items,
+            "plan_definition_import" => plan_definition_import(PlanDefinitionImportParams) in work_items,
+            "work_item_add_criterion" => work_item_add_criterion(WorkItemAddCriterionParams) in work_items,
+            "work_item_record_evidence" => work_item_record_evidence(WorkItemRecordEvidenceParams) in work_items,
+            "work_item_attempt_verify" => work_item_attempt_verify(WorkItemAttemptVerifyParams) in work_items,
+            "work_item_defer"        => work_item_defer(WorkItemDeferParams) in work_items,
+            "work_item_reinstate"    => work_item_reinstate(WorkItemReinstateParams) in work_items,
+            "work_item_triage"       => work_item_triage(WorkItemTriageParams) in work_items,
+            "work_item_resolve"      => work_item_resolve(WorkItemResolveParams) in work_items,
+            // Work-item tracker Phase 2 — smart-views, next-action, assign, history, bulk.
+            "work_item_view"            => work_item_view(WorkItemViewParams) in work_items,
+            "work_item_next_actionable" => work_item_next_actionable(WorkItemNextActionableParams) in work_items,
+            "work_item_assign"          => work_item_assign(WorkItemAssignParams) in work_items,
+            "work_item_history"         => work_item_history(WorkItemHistoryParams) in work_items,
+            "work_item_bulk"            => work_item_bulk(WorkItemBulkParams) in work_items,
+            "work_item_ingest_plan"  => work_item_ingest_plan(WorkItemIngestPlanParams) in work_items,
+            "work_item_promote_marker" => work_item_promote_marker(WorkItemPromoteMarkerParams) in work_items,
+            "work_item_claim"        => work_item_claim(WorkItemClaimParams) in work_items,
+            "work_item_claim_next"   => work_item_claim_next(WorkItemClaimNextParams) in work_items,
+            "work_item_release"      => work_item_release(WorkItemReleaseParams) in work_items,
+            "work_item_handoff"      => work_item_handoff(WorkItemHandoffParams) in work_items,
+            "agent_heartbeat"        => agent_heartbeat(AgentHeartbeatParams) in work_items,
+            "work_item_who_owns"     => work_item_who_owns(WorkItemWhoOwnsParams) in work_items,
+            "agent_activity"         => agent_activity(AgentActivityParams) in work_items,
+            "work_item_activity"     => work_item_activity(WorkItemActivityParams) in work_items,
+            "work_item_link"         => work_item_link(WorkItemLinkParams) in work_items,
+            "work_item_unlink"       => work_item_unlink(WorkItemUnlinkParams) in work_items,
+            "work_item_cycles"       => work_item_cycles(WorkItemCyclesParams) in work_items,
+            "work_item_anchor_code"  => work_item_anchor_code(WorkItemAnchorCodeParams) in work_items,
+            "work_item_link_commit"  => work_item_link_commit(WorkItemLinkCommitParams) in work_items,
+            "work_item_burndown"     => work_item_burndown(WorkItemBurndownParams) in work_items,
+            "work_item_export"       => work_item_export(WorkItemExportParams) in work_items,
+            "work_item_link_experiment" => work_item_link_experiment(WorkItemLinkExperimentParams) in work_items,
+            "a2a_pattern_recursive"  => a2a_pattern_recursive(A2aPatternRecursiveParams),
+            "trajectory_similarity"  => trajectory_similarity(TrajectorySimilarityParams),
+            "recognize_trajectory"   => recognize_trajectory(RecognizeTrajectoryParams) in tool_trajectory_similarity,
+            // SOTA Phase 2 — graph algorithms
+            "kcore_analysis"         => kcore_analysis(KcoreAnalysisParams),
+            "ktruss_analysis"        => ktruss_analysis(KtrussAnalysisParams),
+            "personalized_pagerank"  => personalized_pagerank(PersonalizedPagerankParams),
+            "edge_betweenness"       => edge_betweenness(EdgeBetweennessParams),
+            "structural_holes"       => structural_holes(StructuralHolesParams),
+            "motif_census"           => motif_census(MotifCensusParams),
+            "attack_vulnerability"   => attack_vulnerability(AttackVulnerabilityParams),
+            // SOTA Phase 3 — information theory
+            "compression_distance"   => compression_distance(CompressionDistanceParams),
+            "cochange_mutual_information" => cochange_mutual_information(CochangeMutualInformationParams),
+            "import_entropy"         => import_entropy(ImportEntropyParams),
+            "identifier_entropy"     => identifier_entropy(IdentifierEntropyParams),
+            // SOTA Phase 4 — evolution + quality
+            "bus_factor"             => bus_factor(BusFactorParams),
+            "knowledge_silos"        => knowledge_silos(KnowledgeSilosParams),
+            "ownership_coupling_mismatch" => ownership_coupling_mismatch(OwnershipCouplingMismatchParams),
+            "doc_code_drift"         => doc_code_drift(DocCodeDriftParams),
+            "test_smells"            => test_smells(TestSmellsParams),
+            "mutation_score_surrogate" => mutation_score_surrogate(MutationScoreSurrogateParams),
+            "flaky_test_candidates"  => flaky_test_candidates(FlakyTestCandidatesParams),
+            // SOTA Phase 5 — concurrency / safety / performance
+            "lockset_races"          => lockset_races(LocksetRacesParams),
+            "unsafe_clusters"        => unsafe_clusters(UnsafeClustersParams),
+            "panic_paths"            => panic_paths(PanicPathsParams),
+            "deadlock_candidates"    => deadlock_candidates(DeadlockCandidatesParams),
+            // Shadow-ASR interprocedural concurrency (ADR-011): registered in
+            // `router_concurrency` for the MCP transport; these entries give the
+            // CLI / `call_tool_cli` path the same reach (and the coverage gate
+            // its hook). `tool_concurrency_deadlock.rs` exercises them.
+            "deadlock_cycles"        => deadlock_cycles(DeadlockCyclesParams),
+            "channel_deadlock"       => channel_deadlock(ChannelDeadlockParams),
+            "lock_order_graph"       => lock_order_graph(LockOrderGraphParams),
+            "sync_skeleton"          => sync_skeleton(SyncSkeletonParams),
+            "concurrency_bottlenecks" => concurrency_bottlenecks(ConcurrencyBottlenecksParams),
+            "concurrency_forecast"   => concurrency_forecast(ConcurrencyForecastParams),
+            "send_sync_violations"   => send_sync_violations(SendSyncViolationsParams),
+            "quadratic_loops"        => quadratic_loops(QuadraticLoopsParams),
+            "missing_preallocation"  => missing_preallocation(MissingPreallocationParams),
+            "blocking_in_async"      => blocking_in_async(BlockingInAsyncParams),
+            "clone_density"          => clone_density(CloneDensityParams),
+            "io_hotpath"             => io_hotpath(IoHotpathParams),
+            // SOTA Phase 6 — security
+            "taint_analysis"         => taint_analysis(TaintAnalysisParams),
+            "secret_detection"       => secret_detection(SecretDetectionParams),
+            "crypto_misuse"          => crypto_misuse(CryptoMisuseParams),
+            "unsafe_deserialization" => unsafe_deserialization(UnsafeDeserializationParams),
+            "injection_candidates"   => injection_candidates(InjectionCandidatesParams),
+            "unprotected_routes"     => unprotected_routes(UnprotectedRoutesParams),
+            "cve_supply_chain"       => cve_supply_chain(CveSupplyChainParams),
+            // SOTA Phase 7 — API / contract
+            "public_api_surface"     => public_api_surface(PublicApiSurfaceParams),
+            "semver_break_audit"     => semver_break_audit(SemverBreakAuditParams),
+            "deprecated_but_used"    => deprecated_but_used(DeprecatedButUsedParams),
+            "api_stability"          => api_stability(ApiStabilityParams),
+            // SOTA Phase 8 — ML / embedding-based
+            "lsh_clone_detection"    => lsh_clone_detection(LshCloneDetectionParams),
+            "semantic_drift"         => semantic_drift(SemanticDriftParams),
+            "embedding_outliers"     => embedding_outliers(EmbeddingOutliersParams),
+            "multi_resolution_pagerank" => multi_resolution_pagerank(MultiResolutionPagerankParams),
+            // SOTA Phase 9 — data engineering
+            "migration_safety"       => migration_safety(MigrationSafetyParams),
+            "dead_columns"           => dead_columns(DeadColumnsParams),
+            "pii_spread"             => pii_spread(PiiSpreadParams),
+            // SOTA Phase 10 — call-graph downstream
+            "dead_code_reachability" => dead_code_reachability(DeadCodeReachabilityParams),
+            "feature_envy"           => feature_envy(FeatureEnvyParams),
+            "shotgun_surgery"        => shotgun_surgery(ShotgunSurgeryParams),
+            "lcom4"                  => lcom4(Lcom4Params),
+            // SOTA Phase 11 — evolution analytics
+            "refactor_pressure"      => refactor_pressure(RefactorPressureParams),
+            "commit_changepoint"     => commit_changepoint(CommitChangepointParams),
+            "commit_topic_drift"     => commit_topic_drift(CommitTopicDriftParams),
+            "release_api_stability"  => release_api_stability(ReleaseApiStabilityParams),
+            // Advanced
+            "code_summarize"         => code_summarize(CodeSummarizeParams),
+            "engineering_scorecard"  => engineering_scorecard(EngineeringScorecardParams),
+            "quality_report"         => quality_report(QualityReportParams),
+            // Phase 1 — trends & forecasting (quality-history trajectory)
+            "quality_trend"          => quality_trend(QualityTrendParams),
+            "quality_forecast"       => quality_forecast(QualityForecastParams),
+            // Telemetry
+            "mcp_tool_telemetry"     => mcp_tool_telemetry(McpToolTelemetryParams),
+            "adoption_report"        => adoption_report(AdoptionReportParams),
+            // Orientation / multi-axis tools previously omitted from the
+            // dispatch — added so `call_tool_cli` can drive every #[tool]
+            // method from harness tests. See `query_smoke_mcp_tools.rs`.
+            "orient"                         => orient(OrientParams),
+            "topic_hierarchy_fcm"            => topic_hierarchy_fcm(TopicHierarchyFcmParams),
+            "dependency_health"              => dependency_health(DependencyHealthParams),
+            "shotgun_surgery_fix"            => shotgun_surgery_fix(ShotgunSurgeryFixParams),
+            "pr_scope_recommender"           => pr_scope(PrScopeRecommenderParams) in tool_pr_scope,
+            "naming_consistency"             => naming_consistency(NamingConsistencyParams),
+            "import_hygiene"                 => import_hygiene(ImportHygieneParams),
+            "adoption_lag"                   => adoption_lag(AdoptionLagParams),
+            "merge_conflict_risk"            => merge_conflict_risk(MergeConflictRiskParams),
+            "hot_path_audit"                 => hot_path_audit(HotPathAuditParams),
+            "bus_factor_map"                 => bus_factor_map(BusFactorMapParams),
+            "module_growth_trajectory"       => module_growth(ModuleGrowthParams) in tool_module_growth,
+            "stale_zombie_detector"          => stale_zombie(StaleZombieParams) in tool_stale_zombie,
+            "tech_debt_burn_down"            => tech_debt_burn_down(TechDebtBurnDownParams),
+            "internal_dry"                   => internal_dry(InternalDryParams),
+            "extraction_candidates"          => extraction_candidates(ExtractionCandidatesParams),
+            "boilerplate_clusters"           => boilerplate_clusters(BoilerplateClustersParams),
+            "chunk_clusters"                 => chunk_clusters(ChunkClustersParams),
+            "pattern_abstraction_candidates" => pattern_abstraction(PatternAbstractionParams) in tool_pattern_abstraction,
+            "pattern_search"                 => pattern_search(PatternSearchParams),
+            "recommend_layering"             => recommend_layering(RecommendLayeringParams),
+            "recommend_module_split"         => recommend_module_split(RecommendModuleSplitParams),
+            "reviewer_recommender"           => reviewer_recommender(ReviewerRecommenderParams),
+            "fix_circular_dependency"        => fix_circular_dependency(FixCircularDependencyParams),
+            "reindex"                        => reindex(ReindexParams),
+            "active_clients"                 => active_clients(ActiveClientsParams),
+            "client_project_matrix"          => client_project_matrix(ClientProjectMatrixParams),
+            "project_dependents"             => project_dependents(ProjectDependentsParams),
+            "project_dependencies"           => project_dependencies(ProjectDependenciesParams),
+            "coordinate_dependency_block"    => coordinate_dependency_block(CoordinateDependencyBlockParams),
+            "coordination_respond"           => coordination_respond(CoordinationRespondParams),
+            "suggest_worktree"               => suggest_worktree(SuggestWorktreeParams),
+            // Ontology tools — CLI-dispatched so their `oracle_*`
+            // regression tests (which drive `call_tool_cli`) can reach them.
+            "ontology_create_concept"        => ontology_create_concept(OntologyCreateConceptParams) in tool_ontology,
+            "ontology_invariants_for_file"   => ontology_invariants_for_file(OntologyInvariantsForFileParams) in tool_ontology,
+            // Adaptive tool surface: catalog browse/search (the stateful
+            // meta-tools enable_tools/disable_tools/call_tool need a live MCP
+            // session/peer and are NOT CLI-dispatchable).
+            "tool_catalog"                   => tool_catalog(ToolCatalogParams) in tool_meta,
+        }, no_params: {
+            "list_projects" => list_projects,
+            "index_stats"   => index_stats,
+            "pattern_catalog_stats" => pattern_catalog_stats in tool_software_patterns,
+            "toolbox_stats" => toolbox_stats in tool_toolbox,
+        })
     }
 }
 
@@ -1050,6 +1203,7 @@ impl ServerHandler for McpServer {
         ServerInfo::new(
             ServerCapabilities::builder()
                 .enable_tools()
+                .enable_tool_list_changed()
                 .enable_resources()
                 .enable_completions()
                 .enable_logging()
@@ -1059,7 +1213,7 @@ impl ServerHandler for McpServer {
         .with_server_info(Implementation::new("pgmcp", env!("CARGO_PKG_VERSION")))
         .with_instructions(
             "pgmcp indexes the user's development workspaces into PostgreSQL+pgvector and \
-             exposes ~72 tools for cross-project search, semantic queries, graph analysis, \
+             exposes ~330 tools for cross-project search, semantic queries, graph analysis, \
              code-health metrics, and recommendation-shaped refactoring actions.\n\n\
              USE THESE TOOLS BEFORE built-in Read/Grep/Glob when the question is conceptual \
              ('how does X work?'), cross-project ('does this pattern exist elsewhere?'), \
@@ -1072,6 +1226,13 @@ impl ServerHandler for McpServer {
              have to scatter across half a dozen tools to get oriented. Use `mandate_context` \
              when you specifically need the effective AGENTS.md/CLAUDE.md/.pgmcp.toml bundle \
              for a project or cwd.\n\n\
+             TOOL DISCOVERY: you may be served a focused default working set rather than the \
+             full catalog (the server learns each client's set from its own usage and grows it \
+             on demand). If you need a capability you do not see in tools/list, call \
+             `tool_catalog({query:\"...\"})` to find the right tool, then `enable_tools({names:[...]})` \
+             to add it natively (it appears after your client refreshes tools/list), or \
+             `call_tool({name, args})` to invoke it directly without enabling. Clients served the \
+             full catalog can ignore this — every tool is already visible.\n\n\
              The 'claude' project indexes ~/.claude/ — past Claude Code sessions, memory \
              files, plans. Use semantic_search or text_search with project: \"claude\" to \
              retrieve prior context, decisions, and plans.\n\n\
@@ -1167,8 +1328,19 @@ impl ServerHandler for McpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        // Resolve the caller's rendering posture (output format / brief) BEFORE
+        // moving `context` into the dispatch ctx, and install it as a
+        // request-scoped task-local so tool bodies serialize in the caller's
+        // preferred `OutputFormat` without threading a parameter through 300+
+        // tool signatures. See `crate::mcp::client_profile::with_render_ctx`.
+        let client = extract_caller(&context).client_name;
+        let rc = crate::mcp::client_profile::RenderCtx::from_profile(
+            self.ctx().client_profiles().for_client(&client),
+        );
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        self.tool_router.call(tcc).await
+        crate::mcp::client_profile::with_render_ctx(rc, self.tool_router.call(tcc))
+            .await
+            .map(|result| reencode_result_for_format(result, rc))
     }
 
     async fn list_tools(
@@ -1177,15 +1349,30 @@ impl ServerHandler for McpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, McpError> {
         let mut tools = self.tool_router.list_all();
-        // Per-client tool-description overrides (e.g. terser descriptions for
-        // codex). `peer_info()` is set by `initialize` before `tools/list`, so
-        // `extract_caller` yields the real client name here. Unknown clients fall
-        // through to the `generic` profile (no overrides).
+        // `peer_info()` is set by `initialize` before `tools/list`, so
+        // `extract_caller` yields the real client name here; unknown clients fall
+        // through to the `generic` profile.
         let client = extract_caller(&context).client_name;
+        let profile = self.ctx().client_profiles().for_client(&client);
+        // Adaptive per-client tool surface: `All` (claude-code) is a no-op — the
+        // full catalog, byte-identical to the unfiltered router. `Learned` / `Fixed`
+        // expose `mandatory_core ∪ learned_defaults(client) ∪ this session's
+        // enable_tools overlay`. The session overlay is keyed by the mcp-session-id
+        // header (None for stdio/CLI → no overlay).
+        let session_enabled = extract_mcp_session_id(&context)
+            .and_then(|sid| {
+                self.ctx()
+                    .tool_sessions()
+                    .get(&sid)
+                    .map(|s| s.enabled.clone())
+            })
+            .unwrap_or_default();
         self.ctx()
-            .client_profiles()
-            .for_client(&client)
-            .apply_description_overrides(&mut tools);
+            .tool_policy()
+            .retain_exposed(&mut tools, profile, &client, &session_enabled);
+        // Per-client tool-description overrides (e.g. terser descriptions for
+        // codex), applied to the survivors.
+        profile.apply_description_overrides(&mut tools);
         Ok(ListToolsResult {
             tools,
             meta: None,
@@ -1642,6 +1829,48 @@ mod telemetry_tests {
         assert_eq!(row.tool, "semantic_search");
         assert_eq!(row.project.as_deref(), Some("pgmcp"));
         assert!(row.params_sha256.is_some());
+        // Result-size telemetry: "ok" is 2 bytes → ~1 token.
+        assert_eq!(row.result_bytes, Some(2));
+        assert_eq!(row.result_tokens_est, Some(1));
+    }
+
+    #[test]
+    fn reencode_compacts_pretty_json_only_for_compact_clients() {
+        use crate::mcp::client_profile::{OutputFormat, RenderCtx};
+
+        let pretty = serde_json::to_string_pretty(&json!({"a": 1, "b": [2, 3]})).unwrap();
+        assert!(pretty.contains('\n'));
+        let result = CallToolResult::success(vec![Content::text(pretty.clone())]);
+
+        // CompactJson client: the pretty JSON is re-encoded compact.
+        let compact_rc = RenderCtx {
+            output_format: OutputFormat::CompactJson,
+            default_brief: true,
+            include_provenance: false,
+        };
+        let out = super::reencode_result_for_format(result.clone(), compact_rc);
+        let text = out.content[0].as_text().unwrap().text.clone();
+        assert!(
+            !text.contains('\n'),
+            "compact client must get newline-free JSON"
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            json!({"a": 1, "b": [2, 3]}),
+            "compaction must be lossless"
+        );
+
+        // Markdown client (claude-code): unchanged, byte-identical.
+        let out_md = super::reencode_result_for_format(result.clone(), RenderCtx::default());
+        assert_eq!(out_md.content[0].as_text().unwrap().text, pretty);
+
+        // Non-JSON text under a compact client: left untouched.
+        let prose = CallToolResult::success(vec![Content::text("not json\nat all")]);
+        let out_prose = super::reencode_result_for_format(prose, compact_rc);
+        assert_eq!(
+            out_prose.content[0].as_text().unwrap().text,
+            "not json\nat all"
+        );
     }
 }
 

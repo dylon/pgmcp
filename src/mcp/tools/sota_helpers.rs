@@ -56,11 +56,18 @@ pub fn pool_or_err(ctx: &SystemContext) -> Result<&PgPool, McpError> {
     })
 }
 
-/// Wrap a serializable result as a CallToolResult text content.
+/// Wrap a serializable result as a `CallToolResult` text content, encoded in the
+/// CALLER's preferred [`crate::mcp::client_profile::OutputFormat`] (pretty
+/// Markdown JSON for claude-code, compact JSON for codex, …). The format is read
+/// from the request-scoped `RenderCtx` task-local installed by
+/// `McpServer::call_tool`; outside a request scope it falls back to pretty JSON,
+/// so CLI / test callers are unchanged. This is the single serialization
+/// chokepoint for the ~88 SOTA tool bodies that call it.
 pub fn json_result<T: serde::Serialize>(v: &T) -> Result<CallToolResult, McpError> {
-    let json = serde_json::to_string_pretty(v)
+    let value = serde_json::to_value(v)
         .map_err(|e| McpError::internal_error(format!("Serialization failed: {}", e), None))?;
-    Ok(CallToolResult::success(vec![Content::text(json)]))
+    let rendered = crate::mcp::client_profile::current_render_ctx().serialize_value(&value);
+    Ok(CallToolResult::success(vec![Content::text(rendered)]))
 }
 
 /// Convenience text result.

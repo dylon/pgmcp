@@ -113,6 +113,11 @@ pub struct A2aSendTaskParams {
                        Inspired by Yang et al. 2026 RecursiveMAS Section 5."
     )]
     pub recursion_rounds: Option<u32>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project name (list_projects) to scope the effect_breakdown channel; omit for an empty breakdown."
+    )]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -160,10 +165,21 @@ pub struct A2aRegisterAgentParams {
                        (e.g. \"Search Specialist\", \"Summarizer\", \"Critic\"). \
                        Used by orchestration patterns.")]
     pub recommended_role: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project name (list_projects) to scope the effect_breakdown channel; omit for an empty breakdown."
+    )]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct A2aListAgentsParams {}
+pub struct A2aListAgentsParams {
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project name (list_projects) to scope the effect_breakdown channel; omit for an empty breakdown."
+    )]
+    pub project: Option<String>,
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct A2aActiveAgentsParams {
@@ -286,6 +302,11 @@ pub struct A2aFindAgentsBySpecialtyParams {
         description = "Optional typed-capability filter: agents must carry ALL of these effects (e.g. \"network\", \"database\") in their structured capabilities descriptor (AND-logic)."
     )]
     pub required_effects: Option<Vec<String>>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project name (list_projects) to scope the effect_breakdown channel; omit for an empty breakdown."
+    )]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -300,6 +321,11 @@ pub struct A2aPatternSequentialParams {
     pub message: String,
     #[schemars(description = "Optional outer-loop recursion over the trio (1..=5)")]
     pub recursion_rounds: Option<u32>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project name (list_projects) to scope the effect_breakdown channel; omit for an empty breakdown."
+    )]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -310,6 +336,11 @@ pub struct A2aPatternMixtureParams {
     pub summarizer_agent: String,
     #[schemars(description = "User query (sent to every specialist in parallel)")]
     pub message: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project name (list_projects) to scope the effect_breakdown channel; omit for an empty breakdown."
+    )]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -320,6 +351,11 @@ pub struct A2aPatternDistillationParams {
     pub learner_agent: String,
     #[schemars(description = "User query")]
     pub message: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project name (list_projects) to scope the effect_breakdown channel; omit for an empty breakdown."
+    )]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -332,6 +368,11 @@ pub struct A2aPatternDeliberationParams {
     pub message: String,
     #[schemars(description = "Max deliberation rounds (default 3, hard cap 10)")]
     pub max_rounds: Option<u32>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project name (list_projects) to scope the effect_breakdown channel; omit for an empty breakdown."
+    )]
+    pub project: Option<String>,
 }
 
 // ── CSM / MPST coordination observer tools (ADR-009) ──────────────────────────

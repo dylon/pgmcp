@@ -24,7 +24,7 @@ async fn insert_experiment(
     sqlx::query_scalar(
         "INSERT INTO experiments
             (slug, title, question, kind, project_id, status, updated_at)
-         VALUES ($1, $2, $3, $4::experiment_kind, $5, $6::experiment_status,
+         VALUES ($1, $2, $3, $4, $5, $6,
                  NOW() + ($7::int * INTERVAL '1 second'))
          RETURNING id",
     )

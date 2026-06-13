@@ -103,6 +103,9 @@ pub struct MigrationPassReport {
     pub memory_entities_migrated: u64,
     pub coordination_requests_migrated: u64,
     pub tool_cards_migrated: u64,
+    /// v38 `mcp_tool_catalog`: the server's own tools, embedded for the
+    /// `tool_catalog` meta-tool's semantic discovery. Cron-backfill only.
+    pub mcp_tool_catalog_migrated: u64,
     /// Phase 2.3: file_chunks whose BGE-M3 learned-sparse vector was backfilled.
     pub file_chunks_sparse_backfilled: u64,
     /// Phase 2.4: file_chunks re-embedded with a contextual-retrieval prefix.
@@ -580,6 +583,35 @@ pub async fn run_embedding_migration_pass(
         }
     }
 
+    // The server's own MCP-tool catalog (v38 `mcp_tool_catalog`): same 1024d-direct
+    // backfill. The text_select mirrors `db::mcp_tool_catalog`'s embedded prose
+    // (name + description) so the cron embeds exactly what a seed-time edit hashed.
+    for _ in 0..config.max_batches {
+        match migrate_embedding_table_batch(
+            pool,
+            &embedder,
+            config.batch_size,
+            "mcp_tool_catalog",
+            "concat_ws(' ', name, description)",
+        )
+        .await
+        {
+            Ok(n) if n > 0 => {
+                report.mcp_tool_catalog_migrated += n;
+                report.batches_completed += 1;
+            }
+            Ok(_) => break,
+            Err(e) => {
+                warn!(error = %e, "mcp_tool_catalog embedding backfill batch failed");
+                report.errors += 1;
+                stats
+                    .embeddings_migration_errors
+                    .fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+        }
+    }
+
     if report.file_chunks_migrated > 0
         || report.session_prompts_migrated > 0
         || report.git_commit_chunks_migrated > 0
@@ -598,6 +630,7 @@ pub async fn run_embedding_migration_pass(
         || report.memory_entities_migrated > 0
         || report.coordination_requests_migrated > 0
         || report.tool_cards_migrated > 0
+        || report.mcp_tool_catalog_migrated > 0
     {
         info!(
             file_chunks = report.file_chunks_migrated,
@@ -618,6 +651,7 @@ pub async fn run_embedding_migration_pass(
             memory_entities = report.memory_entities_migrated,
             coordination_requests = report.coordination_requests_migrated,
             tool_cards = report.tool_cards_migrated,
+            mcp_tool_catalog = report.mcp_tool_catalog_migrated,
             batches = report.batches_completed,
             errors = report.errors,
             "embedding-migration pass complete",
@@ -1312,6 +1346,7 @@ pub struct BacklogCounts {
     pub memory_entities: i64,
     pub coordination_requests: i64,
     pub tool_cards: i64,
+    pub mcp_tool_catalog: i64,
 }
 
 impl BacklogCounts {
@@ -1334,6 +1369,7 @@ impl BacklogCounts {
             + self.memory_entities
             + self.coordination_requests
             + self.tool_cards
+            + self.mcp_tool_catalog
     }
 }
 
@@ -1358,7 +1394,8 @@ pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::E
             (SELECT COUNT(*) FROM a2a_messages           WHERE embedding    IS NULL) AS a2a_messages,
             (SELECT COUNT(*) FROM memory_entities        WHERE embedding    IS NULL AND valid_to IS NULL) AS memory_entities,
             (SELECT COUNT(*) FROM coordination_requests  WHERE embedding    IS NULL) AS coordination_requests,
-            (SELECT COUNT(*) FROM tool_cards             WHERE embedding    IS NULL) AS tool_cards",
+            (SELECT COUNT(*) FROM tool_cards             WHERE embedding    IS NULL) AS tool_cards,
+            (SELECT COUNT(*) FROM mcp_tool_catalog       WHERE embedding    IS NULL) AS mcp_tool_catalog",
     )
     .fetch_one(pool)
     .await

@@ -402,6 +402,8 @@ fn telemetry_writer_try_enqueue_when_channel_absent_returns_false() {
         error_class: None,
         request_id: None,
         params_sha256: None,
+        result_bytes: None,
+        result_tokens_est: None,
     };
     let ok = pgmcp::stats::telemetry_writer::try_enqueue(&stats, row);
     assert!(!ok, "try_enqueue must be false when writer is not started");
@@ -440,6 +442,8 @@ async fn telemetry_writer_flushes_null_optional_text_and_project() {
             error_class: None,
             request_id: Some("  ".into()),
             params_sha256: Some(" hash ".into()),
+            result_bytes: Some(1234),
+            result_tokens_est: Some(309),
         }
     ));
     assert!(telemetry_writer::try_enqueue(
@@ -457,6 +461,8 @@ async fn telemetry_writer_flushes_null_optional_text_and_project() {
             error_class: Some(" Regex ".into()),
             request_id: Some("req-1".into()),
             params_sha256: None,
+            result_bytes: None,
+            result_tokens_est: None,
         }
     ));
 

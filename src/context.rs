@@ -102,6 +102,17 @@ pub struct SystemContext {
     /// query; entries self-invalidate when the `fuzzy-sync` cron rewrites the
     /// on-disk `.artrie` (mtime change). See `crate::fuzzy::cache::FuzzyCache`.
     fuzzy_cache: Arc<crate::fuzzy::cache::FuzzyCache>,
+    /// Per-MCP-session tool overlay: the set each connection has explicitly
+    /// `enable_tools`-ed on top of its learned defaults. Keyed by the
+    /// `mcp-session-id`; bounded + TTL-pruned in the `enable_tools` body. Empty
+    /// in CLI mode (no session). Backs the dynamic `tools/list_changed` surface.
+    tool_sessions: Arc<DashMap<String, crate::mcp::tool_policy::SessionToolState>>,
+    /// Usage-adaptive (recency-decayed) per-client default tool surface,
+    /// hot-swapped by the `tool-policy-refresh` cron and consulted (O(1)) by
+    /// `list_tools`. Starts empty (cold start = `mandatory_core` only) and is
+    /// loaded from `client_tool_policy` at daemon startup, then refreshed on the
+    /// cron. See `docs/design/tool-policy-recency-decay.md`.
+    tool_policy: Arc<ArcSwap<crate::mcp::tool_policy::ToolPolicySnapshot>>,
 }
 
 impl SystemContext {
@@ -134,6 +145,10 @@ impl SystemContext {
             default_phonetics: Arc::new(OnceLock::new()),
             client_profiles: Arc::new(OnceLock::new()),
             fuzzy_cache: Arc::new(crate::fuzzy::cache::FuzzyCache::new()),
+            tool_sessions: Arc::new(DashMap::new()),
+            tool_policy: Arc::new(ArcSwap::from_pointee(
+                crate::mcp::tool_policy::ToolPolicySnapshot::default(),
+            )),
         }
     }
 
@@ -166,6 +181,10 @@ impl SystemContext {
             default_phonetics: Arc::new(OnceLock::new()),
             client_profiles: Arc::new(OnceLock::new()),
             fuzzy_cache: Arc::new(crate::fuzzy::cache::FuzzyCache::new()),
+            tool_sessions: Arc::new(DashMap::new()),
+            tool_policy: Arc::new(ArcSwap::from_pointee(
+                crate::mcp::tool_policy::ToolPolicySnapshot::default(),
+            )),
         }
     }
 
@@ -227,6 +246,27 @@ impl SystemContext {
                 &crate::mcp::tools::tool_client_profile::profiles_path(),
             ))
         })
+    }
+
+    /// Per-MCP-session tool overlay (the dynamic `enable_tools` surface). The
+    /// `enable_tools` / `disable_tools` meta-tools mutate it; `list_tools` reads
+    /// the calling session's entry to union explicitly-enabled tools into the
+    /// exposed set.
+    pub fn tool_sessions(&self) -> &DashMap<String, crate::mcp::tool_policy::SessionToolState> {
+        &self.tool_sessions
+    }
+
+    /// The current usage-adaptive tool-policy snapshot (cheap atomic Arc load;
+    /// call per use so a cron hot-swap is picked up immediately).
+    pub fn tool_policy(&self) -> Arc<crate::mcp::tool_policy::ToolPolicySnapshot> {
+        self.tool_policy.load_full()
+    }
+
+    /// Hot-swap the tool-policy snapshot. Called by the `tool-policy-refresh`
+    /// cron after it recomputes `client_tool_policy`, and once at startup to seed
+    /// the snapshot from the persisted table.
+    pub fn set_tool_policy(&self, snapshot: crate::mcp::tool_policy::ToolPolicySnapshot) {
+        self.tool_policy.store(Arc::new(snapshot));
     }
 
     pub fn db(&self) -> &Arc<dyn DbClient> {

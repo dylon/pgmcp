@@ -22,3 +22,4 @@ pub mod protocol;
 pub mod relation;
 pub mod runner;
 pub mod spec;
+pub mod vocab;

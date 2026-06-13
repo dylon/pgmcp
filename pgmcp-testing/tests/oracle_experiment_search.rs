@@ -73,7 +73,7 @@ async fn insert_experiment(
         "INSERT INTO experiments (slug, title, question, context, kind, project_id)
          VALUES ($1, $2, 'Does arena allocation reduce dispatch latency?',
                  'arena allocation dispatch latency fallback oracle',
-                 $3::experiment_kind, $4)
+                 $3, $4)
          RETURNING id",
     )
     .bind(slug)
@@ -91,7 +91,7 @@ async fn insert_hypothesis(pool: &sqlx::PgPool, experiment_id: i64, verdict: &st
             (experiment_id, statement, primary_metric, acceptance_criterion,
              verdict, valid_to)
          VALUES ($1, 'arena allocation lowers latency', 'latency_ms', '{}'::jsonb,
-                 $2::hypothesis_verdict,
+                 $2,
                  CASE WHEN $3::bool THEN now() ELSE NULL END)",
     )
     .bind(experiment_id)

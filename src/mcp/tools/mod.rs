@@ -24,6 +24,7 @@ pub mod fix_helpers;
 // `sema_helpers` is the home for shadow-ASR-aware JOIN patterns shared
 // across the Phase D2b tool upgrades (signatures, effects, resolved
 // edges, type-tag filters, cross-language equivalence reads).
+pub mod result_shaping;
 pub mod sema_helpers;
 pub mod sota_helpers;
 pub mod sota_regex_scan;
@@ -91,6 +92,7 @@ pub mod tool_memory_forget;
 pub mod tool_memory_graph_rag;
 pub mod tool_memory_reflect;
 pub mod tool_merge_conflict_risk;
+pub mod tool_meta;
 pub mod tool_module_growth;
 pub mod tool_naming_consistency;
 pub mod tool_orient;

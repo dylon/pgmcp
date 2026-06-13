@@ -5,6 +5,13 @@
 *.cache
 *.log
 
+# Node tooling. The diagramming-catalog npm tools (vega-cli, mscgenjs,
+# bytefield-svg, wavedrom-cli, dbml-renderer) live in the workspace-parent
+# node_modules, not here — this guards against a stray `npm install` in the
+# crate root polluting the repo.
+node_modules/
+package-lock.json
+
 # Rocq compilation artifacts (P13.5). The proof source
 # (`docs/formal/rocq/*.v`) is committed; `coqc` outputs (`*.vo`,
 # `*.vos`, `*.vok`, `*.glob`, `.*.aux`) are reproducible from

@@ -22,6 +22,9 @@
 
 mod auto_active;
 mod debuggers_sanitizers;
+mod diagramming_graph;
+mod diagramming_plotting;
+mod diagramming_render;
 mod model_checkers;
 mod profilers_cpu;
 mod profilers_memory_cache;
@@ -94,13 +97,15 @@ pub enum ToolDomain {
     FormalVerification,
     DeveloperTooling,
     Security,
+    Diagramming,
 }
 
 impl ToolDomain {
-    pub const ALL: [ToolDomain; 3] = [
+    pub const ALL: [ToolDomain; 4] = [
         ToolDomain::FormalVerification,
         ToolDomain::DeveloperTooling,
         ToolDomain::Security,
+        ToolDomain::Diagramming,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -108,6 +113,7 @@ impl ToolDomain {
             ToolDomain::FormalVerification => "formal_verification",
             ToolDomain::DeveloperTooling => "developer_tooling",
             ToolDomain::Security => "security",
+            ToolDomain::Diagramming => "diagramming",
         }
     }
 
@@ -163,11 +169,13 @@ pub(crate) const fn tool(
 pub(crate) const FV: &str = ToolDomain::FormalVerification.as_str();
 pub(crate) const DEV: &str = ToolDomain::DeveloperTooling.as_str();
 pub(crate) const SEC: &str = ToolDomain::Security.as_str();
+pub(crate) const DIA: &str = ToolDomain::Diagramming.as_str();
 
 pub fn tool_category_seeds() -> Vec<ToolCategorySeed> {
     let fv = ToolDomain::FormalVerification.as_str();
     let dev = ToolDomain::DeveloperTooling.as_str();
     let sec = ToolDomain::Security.as_str();
+    let dia = ToolDomain::Diagramming.as_str();
     vec![
         // ---- formal_verification ----
         ToolCategorySeed {
@@ -430,11 +438,60 @@ pub fn tool_category_seeds() -> Vec<ToolCategorySeed> {
             description: "File carving, disk-image forensics, and metadata extraction.",
             domain: sec,
         },
+        // ---- diagramming ----
+        ToolCategorySeed {
+            slug: "graph_layout",
+            name: "Graph / network layout",
+            description: "Automatic node-edge graph drawing — force-directed, hierarchical, radial, and circular layout of relationships.",
+            domain: dia,
+        },
+        ToolCategorySeed {
+            slug: "uml_architecture",
+            name: "UML / architecture / sequence (diagrams-as-code)",
+            description: "Semantic software diagrams generated from text — UML, sequence, C4/architecture, ER, and flowcharts.",
+            domain: dia,
+        },
+        ToolCategorySeed {
+            slug: "scientific_plotting",
+            name: "Scientific plotting & charting",
+            description: "Data- and function-plotting / charting for scientific, statistical, and engineering visualization.",
+            domain: dia,
+        },
+        ToolCategorySeed {
+            slug: "diagram_language",
+            name: "Vector picture / diagram language",
+            description: "Programmatic vector-graphics / picture languages that draw from coordinates, paths, and macros.",
+            domain: dia,
+        },
+        ToolCategorySeed {
+            slug: "ascii_diagram",
+            name: "ASCII-art → diagram",
+            description: "Converts ASCII / Unicode line-art into rendered SVG / PNG diagrams.",
+            domain: dia,
+        },
+        ToolCategorySeed {
+            slug: "diagram_conversion",
+            name: "Diagram format conversion & rendering",
+            description: "Renders and converts diagram / vector formats (SVG / PDF / PNG / EPS, .fig / .odg, DVI) for headless pipelines.",
+            domain: dia,
+        },
+        ToolCategorySeed {
+            slug: "circuit_diagram",
+            name: "Circuit / EDA schematics",
+            description: "Electronic-circuit schematic capture and EDA export — schematic / PCB, netlists, ERC / DRC.",
+            domain: dia,
+        },
+        ToolCategorySeed {
+            slug: "protocol_data_diagram",
+            name: "Protocol / packet / timing diagrams",
+            description: "Byte-field / packet-layout and digital-timing / waveform diagrams for protocol and hardware work.",
+            domain: dia,
+        },
     ]
 }
 
 pub fn tool_seeds() -> Vec<ToolSeed> {
-    let mut v = Vec::with_capacity(160);
+    let mut v = Vec::with_capacity(208);
     v.extend(proof_assistants::seeds());
     v.extend(auto_active::seeds());
     v.extend(smt_sat_atp::seeds());
@@ -449,6 +506,9 @@ pub fn tool_seeds() -> Vec<ToolSeed> {
     v.extend(security_static::seeds());
     v.extend(security_scanning::seeds());
     v.extend(security_binary::seeds());
+    v.extend(diagramming_graph::seeds());
+    v.extend(diagramming_render::seeds());
+    v.extend(diagramming_plotting::seeds());
     v
 }
 
@@ -581,7 +641,7 @@ mod tests {
         // domain can't silently pass the Rust side while the DB rejects it.
         assert_eq!(
             ToolDomain::sql_in_list(),
-            "'formal_verification', 'developer_tooling', 'security'"
+            "'formal_verification', 'developer_tooling', 'security', 'diagramming'"
         );
     }
 }

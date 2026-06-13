@@ -166,10 +166,10 @@ async fn doc_code_drift_trims_project_scopes_effects_and_is_read_only() {
     assert_eq!(v["directories"][0]["directory"].as_str(), Some("docs"));
 
     let effects: std::collections::BTreeMap<&str, i64> = v["effect_breakdown"]
-        .as_array()
+        .as_object()
         .unwrap()
         .iter()
-        .map(|e| (e["effect"].as_str().unwrap(), e["count"].as_i64().unwrap()))
+        .map(|(effect, count)| (effect.as_str(), count.as_i64().unwrap()))
         .collect();
     assert_eq!(
         effects.get(pgmcp::parsing::type_tags::vocabulary::EFFECT_ASYNC),
