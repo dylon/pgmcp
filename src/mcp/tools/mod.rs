@@ -131,28 +131,19 @@ pub mod tool_type_shape_search;
 pub mod tool_type_tag_dictionary;
 pub mod tool_work_summary;
 
-// Phase 8 — code-analysis + fuzzy + phonetic MCP tools (full surface).
-pub mod tool_articulatory_distance;
-pub mod tool_articulatory_naming_consistency;
-pub mod tool_code_property_graph;
+// Phase 8 — index-backed fuzzy / phonetic / correction MCP tools.
+// The caller-supplied "haystack" tool family (substring_search, token_grep,
+// fuzzy_grep, phonetic_grep_comments, time_series_fuzzy_match, mandate_dedup_v2,
+// rename_oracle, articulatory_distance, {phonetic,articulatory}_naming_consistency,
+// phonetic_normalize, expand_query_to_phonetic_pattern, code_property_graph,
+// subtree_mining, paradigm_profile, gnn_semantic_issues) was removed 2026-06-13:
+// it searched data the agent supplied inline, with no linkage to the indexed
+// corpus. Only the index-backed members remain.
 pub mod tool_correct_query;
 pub mod tool_dendrogram_topic_hierarchy;
-pub mod tool_expand_query_to_phonetic_pattern;
-pub mod tool_fuzzy_grep;
 pub mod tool_fuzzy_path_search;
 pub mod tool_fuzzy_symbol_search;
-pub mod tool_gnn_semantic_issues;
-pub mod tool_mandate_dedup_v2;
-pub mod tool_paradigm_profile;
-pub mod tool_phonetic_grep_comments;
-pub mod tool_phonetic_naming_consistency;
-pub mod tool_phonetic_normalize;
 pub mod tool_phonetic_symbol_search;
-pub mod tool_rename_oracle;
-pub mod tool_substring_search;
-pub mod tool_subtree_mining;
-pub mod tool_time_series_fuzzy_match;
-pub mod tool_token_grep;
 
 // SOTA Phase 2 — graph algorithms
 pub mod tool_attack_vulnerability;

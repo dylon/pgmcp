@@ -18,8 +18,9 @@ assumptions). The investigation is recorded in
    `FuzzyCache`, rebuilt by the `fuzzy-sync` cron) is the proven persistent-trie
    seam already powering `fuzzy_symbol_search` / `fuzzy_path_search`.
 2. `SuffixAutomatonChar` (`SubstringIndex`) is **in-memory only** — it has no
-   persistence and is rebuilt per call; it is already wired into `substring_search`
-   / `fuzzy_grep` for ad-hoc (request-supplied) corpora.
+   persistence and is rebuilt per call; pgmcp uses it for the software-pattern
+   automata catalog (`src/patterns/`). It formerly also backed the
+   `substring_search` / `fuzzy_grep` MCP tools, removed 2026-06-13.
 3. `ontology_tree` is **not** a recursive CTE — it returns a flat per-facet edge
    list. The recursive traversals are `concept_ancestors` (in `ontology_query`) and
    `detect_is_a_cycles` (in `ontology_check`).
@@ -68,8 +69,7 @@ matches `constraint_text`, so an invariant surfaces by a word in its constraint
 sentence ("find the invariant about *ambiguity*"), not only its name. A persistent
 `SuffixAutomatonChar` index was rejected: the automaton is in-memory only (it does
 not fit the persistent `fuzzy-sync`/`FuzzyCache` model), a per-call rebuild over the
-whole concept corpus costs more than the SQL scan at ontology scale, and ad-hoc
-substring search is already provided by `substring_search` / `fuzzy_grep`.
+whole concept corpus costs more than the SQL scan at ontology scale.
 
 ### Not built — with evidence
 

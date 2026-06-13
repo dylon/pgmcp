@@ -804,10 +804,6 @@ pub struct FuzzyConfig {
     /// acceptance. Default 3.0.
     #[serde(default = "default_phonetic_max_total_cost")]
     pub phonetic_max_total_cost: f64,
-    /// Max allowed syllable-count delta before
-    /// `phonetic_naming_consistency` flags drift. Default 1.
-    #[serde(default = "default_syllable_drift_max_delta")]
-    pub syllable_drift_max_delta: u32,
     /// `tool_find_similar_modules` / `tool_find_duplicates` fold
     /// near-name symbols whose articulatory distance ≤ this value
     /// before computing module similarity. Default 2.0 — empirically
@@ -858,7 +854,6 @@ impl Default for FuzzyConfig {
             articulatory_manner_default: default_articulatory_manner_default(),
             phonetic_cost_weight: default_phonetic_cost_weight(),
             phonetic_max_total_cost: default_phonetic_max_total_cost(),
-            syllable_drift_max_delta: default_syllable_drift_max_delta(),
             phonetic_merge_threshold: default_phonetic_merge_threshold(),
         }
     }
@@ -878,9 +873,6 @@ fn default_phonetic_cost_weight() -> f64 {
 }
 fn default_phonetic_max_total_cost() -> f64 {
     3.0
-}
-fn default_syllable_drift_max_delta() -> u32 {
-    1
 }
 fn default_phonetic_merge_threshold() -> f64 {
     2.0
@@ -2775,12 +2767,6 @@ pub struct CronConfig {
     #[serde(default = "default_topic_dendrogram_interval")]
     pub topic_dendrogram_interval_secs: u64,
 
-    /// Interval between TreeminerD subtree-pattern mining runs in
-    /// seconds (default: 43200 = 12 h). Backs Phase 6's
-    /// `subtree_mining` MCP tool.
-    #[serde(default = "default_subtree_mining_interval")]
-    pub subtree_mining_interval_secs: u64,
-
     /// Interval between BGE-M3 embedding-backfill cron passes in
     /// seconds (default: 0 = disabled). When non-zero, the daemon
     /// drains `file_chunks` and `session_prompts` rows whose
@@ -3051,7 +3037,6 @@ impl Default for CronConfig {
             fuzzy_sync_interval_secs: default_fuzzy_sync_interval(),
             ngram_lm_train_interval_secs: default_ngram_lm_train_interval(),
             topic_dendrogram_interval_secs: default_topic_dendrogram_interval(),
-            subtree_mining_interval_secs: default_subtree_mining_interval(),
             embedding_migration_interval_secs: default_embedding_migration_interval(),
             quality_history_interval_secs: default_quality_history_interval(),
             findings_promotion_interval_secs: default_findings_promotion_interval(),
@@ -3380,9 +3365,6 @@ fn default_ngram_lm_train_interval() -> u64 {
 fn default_topic_dendrogram_interval() -> u64 {
     43200
 } // 12 h
-fn default_subtree_mining_interval() -> u64 {
-    43200
-} // 12 h
 fn default_quality_history_interval() -> u64 {
     21_600 // 6h
 }
@@ -3571,11 +3553,10 @@ pub struct ProjectOverride {
     pub git: Option<GitConfig>,
     /// Per-project phonetic-framework override (P14.4). When
     /// `rules_path` is set, the daemon's event_processor installs a
-    /// `PgmcpPhonetics` watcher on that path so the three phonetic
-    /// MCP tools (`phonetic_normalize`,
-    /// `expand_query_to_phonetic_pattern`, `phonetic_grep_comments`)
-    /// pick up the project's rule set when their `project` param
-    /// resolves to this root.
+    /// `PgmcpPhonetics` watcher on that path so the index-backed
+    /// phonetic search (`phonetic_symbol_search`) and query
+    /// correction (`correct_query`) pick up the project's rule set
+    /// when their `project` param resolves to this root.
     #[serde(default)]
     pub phonetics: Option<ProjectPhoneticsOverride>,
     /// Declared layer-dependency rules for reflexion-model conformance checking

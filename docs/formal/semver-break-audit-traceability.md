@@ -69,7 +69,8 @@ Result: pending until sibling `libgrammstein` builds successfully.
 
 ## Inherited Proof Surface
 
-This tool reuses the same fuzzy stack as `rename_oracle`:
+This tool reuses pgmcp's Damerau-Levenshtein + articulatory fuzzy stack
+(the `rename_oracle` tool that shared it was removed 2026-06-13):
 
 | Project | Inherited evidence used here |
 | --- | --- |

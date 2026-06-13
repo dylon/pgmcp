@@ -292,68 +292,12 @@ pub struct SignatureLintParams {
     pub limit: Option<i32>,
 }
 
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ParadigmProfileParams {
-    #[schemars(
-        description = "Source code to analyze (raw string). For per-file analysis, the caller \
-                       should read the file first and pass its content."
-    )]
-    pub code: String,
-}
-
-// ─────────────────────────────────────────────────────────────────
-// Phase 8 — additional MCP tool params (fuzzy + phonetic +
-// code-analysis). Each is a thin wrapper over the Phase 4/6/9/10
-// helper layers; the tool bodies live in src/mcp/tools/tool_*.rs.
-// ─────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct CodePropertyGraphParams {
-    #[schemars(description = "Source code to build a CPG for.")]
-    pub code: String,
-    #[schemars(description = "Language identifier (currently: python).")]
-    pub language: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SubtreeMiningParams {
-    #[schemars(description = "Source-code strings to mine across (same language).")]
-    pub sources: Vec<String>,
-    #[schemars(description = "Language identifier (python).")]
-    pub language: String,
-    #[schemars(description = "Min support fraction (0..1, default 0.1).")]
-    pub min_support: Option<f64>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PhoneticNormalizeParams {
-    #[schemars(description = "String to normalize via liblevenshtein's articulatory framework.")]
-    pub term: String,
-    /// Optional project name. When set and the project has a
-    /// `.pgmcp/rules.llev` override loaded by `event_processor.rs`,
-    /// the tool uses that project's rule set instead of the
-    /// embedded English default.
-    #[schemars(description = "Project name (optional — uses per-project rules if loaded).")]
-    pub project: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ExpandQueryToPhoneticPatternParams {
-    #[schemars(description = "Query term to reverse-expand into a regex.")]
-    pub term: String,
-    /// Optional project name. See `PhoneticNormalizeParams.project`.
-    #[schemars(description = "Project name (optional — uses per-project rules if loaded).")]
-    pub project: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ArticulatoryDistanceParams {
-    #[schemars(description = "First string.")]
-    pub a: String,
-    #[schemars(description = "Second string.")]
-    pub b: String,
-}
-
+// Phase 8 — index-backed fuzzy / phonetic / correction tool params.
+// The caller-supplied "haystack" param family (substring/token/fuzzy/phonetic
+// grep, time-series, mandate-dedup, rename-oracle, articulatory & phonetic
+// distance/naming, code_property_graph/subtree_mining/paradigm_profile/
+// gnn_semantic_issues) was removed 2026-06-13 — it described data the agent
+// supplied inline, with no linkage to the indexed corpus.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DendrogramTopicHierarchyParams {
     #[schemars(description = "Project name.")]
@@ -399,40 +343,6 @@ pub struct FuzzyPathSearchParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct SubstringSearchParams {
-    #[schemars(description = "Substring to search for (exact, case-sensitive).")]
-    pub needle: String,
-    #[schemars(description = "Haystack — list of strings to search within (in-memory)")]
-    pub haystack: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct TokenGrepParams {
-    #[schemars(description = "Query token (matched fuzzily against each haystack token).")]
-    pub query: String,
-    #[schemars(description = "Haystack tokens.")]
-    pub haystack: Vec<String>,
-    #[schemars(description = "Max edit distance per token (default 2).")]
-    pub max_distance: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct TimeSeriesFuzzyMatchParams {
-    #[schemars(description = "Probe series (commits per week / similar cadence vector).")]
-    pub probe: Vec<f64>,
-    #[schemars(description = "Library of candidate series (each with an opaque id).")]
-    pub library: Vec<TimeSeriesEntry>,
-    #[schemars(description = "K nearest to return (default 5).")]
-    pub k: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct TimeSeriesEntry {
-    pub id: i64,
-    pub series: Vec<f64>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CorrectQueryParams {
     #[schemars(description = "User query to correct.")]
     pub query: String,
@@ -449,50 +359,6 @@ pub struct CorrectQueryParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MandateDedupV2Params {
-    #[schemars(description = "Imperative to compare against the candidate set.")]
-    pub new_imperative: String,
-    #[schemars(description = "Existing mandates as `[id, imperative]` pairs.")]
-    pub active: Vec<MandateEntry>,
-    #[schemars(description = "Max Damerau-Levenshtein edit distance (default 3).")]
-    pub max_distance: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct MandateEntry {
-    pub id: i64,
-    pub imperative: String,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct FuzzyGrepParams {
-    #[schemars(description = "Query substring (approximate-match candidate).")]
-    pub query: String,
-    #[schemars(description = "Haystack strings.")]
-    pub haystack: Vec<String>,
-    #[schemars(description = "Max edit distance for verification (default 2).")]
-    pub max_distance: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PhoneticGrepCommentsParams {
-    #[schemars(description = "Query (phonetic-fuzzy match).")]
-    pub query: String,
-    #[schemars(description = "Haystack lines.")]
-    pub haystack: Vec<String>,
-    /// Max edit distance allowed on top of phonetic normalization.
-    /// Default 1 — tolerates a single character drift after the
-    /// rule-set has normalized both sides. Increase to widen the
-    /// match envelope; 0 means "exact normalized-form match only".
-    #[schemars(description = "Max edit distance on top of phonetic normalization. \
-                       Default 1; set 0 for exact normalized match, higher to widen.")]
-    pub max_distance: Option<u32>,
-    /// Optional project name. See `PhoneticNormalizeParams.project`.
-    #[schemars(description = "Project name (optional — uses per-project rules if loaded).")]
-    pub project: Option<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct PhoneticSymbolSearchParams {
     #[schemars(description = "Query symbol (composed phonetic∘edit match in normalized space).")]
     pub query: String,
@@ -502,38 +368,4 @@ pub struct PhoneticSymbolSearchParams {
     pub max_distance: Option<u32>,
     #[schemars(description = "Maximum number of results (default 20).")]
     pub limit: Option<u32>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct PhoneticNamingConsistencyParams {
-    #[schemars(description = "Identifiers in a directory / class scope to check.")]
-    pub identifiers: Vec<String>,
-    #[schemars(
-        description = "Max articulatory distance to flag as phonetically similar (default: [fuzzy].phonetic_merge_threshold)."
-    )]
-    pub max_distance: Option<f64>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct ArticulatoryNamingConsistencyParams {
-    #[schemars(description = "Identifiers to compare via articulatory edit distance.")]
-    pub identifiers: Vec<String>,
-    #[schemars(description = "Max articulatory distance to flag as similar (default 0.5).")]
-    pub max_distance: Option<f64>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct RenameOracleParams {
-    #[schemars(description = "Removed/old symbol name.")]
-    pub removed_name: String,
-    #[schemars(description = "Candidate current-day names.")]
-    pub current_names: Vec<String>,
-}
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-pub struct GnnSemanticIssuesParams {
-    #[schemars(description = "Source code to scan for semantic issues.")]
-    pub code: String,
-    #[schemars(description = "Language identifier (currently: python).")]
-    pub language: String,
 }

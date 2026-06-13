@@ -3,18 +3,15 @@
 //! Hosts:
 //!
 //! - Two free helpers that wrap `articulatory_distance` /
-//!   `articulatory_edit_distance` (used by the existing rename /
-//!   semver / phonetic_naming_consistency tools).
+//!   `articulatory_edit_distance` (used by the kept `semver_break_audit`
+//!   and `naming_consistency` tools, among others).
 //! - `PgmcpPhonetics`: the per-project phonetic state holder that
 //!   owns the active `RewriteRuleChar` set behind an `ArcSwap` for
 //!   hot-reload, the BCP-47 language tag, and an optional
 //!   filesystem watcher on a `.pgmcp/rules.llev` override. Used by
-//!   the Phase-13.4 phonetic MCP tool implementations
-//!   (`tool_phonetic_normalize`,
-//!   `tool_expand_query_to_phonetic_pattern`,
-//!   `tool_phonetic_grep_comments`) and by Phase-13.3's
-//!   articulatory-distance integration in
-//!   `tool_naming_consistency`, `tool_find_similar_modules`,
+//!   the index-backed phonetic tools (`phonetic_symbol_search`,
+//!   `correct_query`) and by the articulatory-distance integration
+//!   in `tool_naming_consistency`, `tool_find_similar_modules`,
 //!   `tool_find_duplicates`.
 //!
 //! Plan: `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`

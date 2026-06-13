@@ -3,8 +3,10 @@
 //! Where the `FuzzyIndex` answers "which terms are within edit distance
 //! k of this string?", the suffix automaton answers "which terms
 //! contain this string as a substring?" and "where in each term does
-//! the match start?". Used by the `substring_search` and `fuzzy_grep`
-//! MCP tools (Phase 8).
+//! the match start?". Used by the software-pattern catalog
+//! (`src/patterns/`). The Phase-8 `substring_search` MCP tool that
+//! also used it was removed 2026-06-13 (caller-supplied haystack,
+//! no linkage to the indexed corpus).
 
 use libdictenstein::Dictionary;
 use libdictenstein::suffix_automaton::char::SuffixAutomatonChar;

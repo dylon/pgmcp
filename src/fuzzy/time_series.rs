@@ -5,8 +5,10 @@
 //! fixed-length vector of weekly commit counts; queries find files
 //! whose recent commit rhythms match a probe vector under MSM distance.
 //!
-//! Used by the `time_series_fuzzy_match` MCP tool (Phase 8) for
-//! commit-pattern similarity.
+//! Exercised by the `time_series_nearest` benchmark. The Phase-8
+//! `time_series_fuzzy_match` MCP tool that surfaced this index was
+//! removed 2026-06-13 (it matched only caller-supplied series, with
+//! no linkage to the indexed corpus).
 
 use liblevenshtein::time_series::{MsmConfig, search_with_lb_parallel};
 use serde::{Deserialize, Serialize};
