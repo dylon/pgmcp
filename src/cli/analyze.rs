@@ -21,6 +21,10 @@ pub enum AnalyzeJob {
     Topics,
     /// Run only the graph analysis (import extraction + metrics)
     Graph,
+    /// Run the topic-clustering bake-off (baseline vs PCA vs RP vs graph) over a
+    /// representative project set and write a scientific-ledger comparison.
+    /// Override the project set with `PGMCP_BAKEOFF_PROJECTS` (comma-separated).
+    TopicBakeoff,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -68,6 +72,9 @@ pub async fn run(
         }
         Some(AnalyzeJob::Graph) => {
             run_analyze_graph(db_client.as_ref(), &stats).await;
+        }
+        Some(AnalyzeJob::TopicBakeoff) => {
+            run_analyze_bakeoff(db_client.as_ref(), &cron_config, &stats).await?;
         }
         None => {
             run_analyze_similarity(db_client.as_ref(), &cron_config, &config.vector, &stats).await;
@@ -143,6 +150,43 @@ async fn run_analyze_topics(
         noise,
         elapsed.as_secs_f64(),
     );
+}
+
+async fn run_analyze_bakeoff(
+    db: &dyn db::DbClient,
+    cron_config: &config::CronConfig,
+    stats: &Arc<stats::tracker::StatsTracker>,
+) -> anyhow::Result<()> {
+    // Project set: env override or the harness default.
+    let projects: Vec<String> = match std::env::var("PGMCP_BAKEOFF_PROJECTS") {
+        Ok(v) if !v.trim().is_empty() => v
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect(),
+        _ => cron::topic_bakeoff::default_projects()
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    };
+    println!("Running topic bake-off over {} projects...", projects.len());
+    let start = std::time::Instant::now();
+    let md = cron::topic_bakeoff::run_bakeoff(db, cron_config, &projects, stats).await?;
+
+    // Write the scientific-ledger file.
+    let date = chrono::Utc::now().format("%Y-%m-%d");
+    let dir = std::path::Path::new("docs/scientific-ledger");
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(format!("topic-clustering-bakeoff-{date}.md"));
+    std::fs::write(&path, &md)?;
+    println!(
+        "Bake-off complete in {:.1}s → {}",
+        start.elapsed().as_secs_f64(),
+        path.display()
+    );
+    // Echo to stdout too so a piped run captures it.
+    println!("\n{md}");
+    Ok(())
 }
 
 async fn run_analyze_graph(db: &dyn db::DbClient, stats: &Arc<stats::tracker::StatsTracker>) {

@@ -585,6 +585,41 @@ async fn collect_health(
             ));
         }
     }
+
+    // Topic-model health (Phase 1 quality gate, `pgmcp_metadata['topics_quality']`).
+    // A degenerate scope means discover_topics / topic_hierarchy are unreliable
+    // there. Read-only SELECT — consistent with the digest trust boundary.
+    if let Some(q) = crate::db::queries::get_topic_quality(pool).await
+        && let Some(obj) = q.as_object()
+    {
+        let mut degenerate: Vec<String> = obj
+            .iter()
+            .filter(|(_, v)| {
+                v.get("distinct_label_ratio")
+                    .and_then(|x| x.as_f64())
+                    .map(|r| r < 0.3)
+                    .unwrap_or(false)
+            })
+            .map(|(scope, _)| scope.clone())
+            .collect();
+        if !degenerate.is_empty() {
+            degenerate.sort();
+            let shown = degenerate
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            out.push(DigestItem::new(
+                DigestSeverity::Notice,
+                DigestCategory::Health,
+                format!(
+                    "{} topic scope(s) degenerate (e.g. {shown}); discover_topics unreliable there",
+                    degenerate.len()
+                ),
+            ));
+        }
+    }
 }
 
 /// Whole days since a project was last scanned, or `None` when never scanned.

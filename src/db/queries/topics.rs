@@ -34,6 +34,84 @@ pub async fn set_topics_algo_signature(pool: &PgPool, sig: &str) -> Result<(), s
     Ok(())
 }
 
+/// Persist the latest topic-quality metrics for `scope` into
+/// `pgmcp_metadata['topics_quality']` — a JSON object keyed by scope — and
+/// append a snapshot to the bounded `topics_quality_history` array.
+///
+/// No schema change: `pgmcp_metadata` is a `(key text, value text)` table. This
+/// is the authoritative quality store consulted by `orient` / the digest and is
+/// what makes a topic-model regression *visible* (the breakage on 2026-06-13 was
+/// invisible for ~3 weeks precisely because no such signal was ever stored).
+pub async fn set_topic_quality(
+    pool: &PgPool,
+    scope: &str,
+    metrics: &serde_json::Value,
+) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+
+    // Stamp scope + timestamp onto the snapshot.
+    let mut entry = metrics.clone();
+    if let Some(m) = entry.as_object_mut() {
+        m.insert("scope".to_string(), serde_json::json!(scope));
+        m.insert("computed_at".to_string(), serde_json::json!(now));
+    }
+
+    // Read-modify-write the per-scope object.
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT value FROM pgmcp_metadata WHERE key = 'topics_quality'")
+            .fetch_optional(pool)
+            .await?;
+    let mut obj = existing
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .filter(|v| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    obj.as_object_mut()
+        .expect("obj is an object")
+        .insert(scope.to_string(), entry.clone());
+    sqlx::query(
+        "INSERT INTO pgmcp_metadata (key, value) VALUES ('topics_quality', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(obj.to_string())
+    .execute(pool)
+    .await?;
+
+    // Append to the bounded history (most-recent-last, cap 500 snapshots).
+    let hist_existing: Option<String> =
+        sqlx::query_scalar("SELECT value FROM pgmcp_metadata WHERE key = 'topics_quality_history'")
+            .fetch_optional(pool)
+            .await?;
+    let mut hist = hist_existing
+        .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
+        .unwrap_or_default();
+    hist.push(entry);
+    let len = hist.len();
+    if len > 500 {
+        hist.drain(0..len - 500);
+    }
+    sqlx::query(
+        "INSERT INTO pgmcp_metadata (key, value) VALUES ('topics_quality_history', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(serde_json::Value::Array(hist).to_string())
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Read the per-scope topic-quality object (`pgmcp_metadata['topics_quality']`).
+/// Returns `None` if never computed or unparseable — callers (orient/digest)
+/// treat that as "topic quality unknown".
+pub async fn get_topic_quality(pool: &PgPool) -> Option<serde_json::Value> {
+    sqlx::query_scalar::<_, String>("SELECT value FROM pgmcp_metadata WHERE key = 'topics_quality'")
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
 /// Whether the global code-topic model is stale relative to the current
 /// algorithm signature and the indexed corpus.
 ///
@@ -113,6 +191,89 @@ pub async fn clear_topics_for_scope(pool: &PgPool, scope: &str) -> Result<(), sq
         .execute(pool)
         .await?;
 
+    Ok(())
+}
+
+/// A `scope='global'` roll-up meta-topic: an aggregation of similar per-project
+/// topics across the workspace. Carries an EXPLICIT aggregated `chunk_count`
+/// (summed from its member per-project topics) and `parent_topic_ids` linking to
+/// those members. Stored WITHOUT `chunk_topic_assignments` rows — the per-chunk
+/// links live on the per-project topics; duplicating them under 'global' would
+/// double the multi-million-row assignment table.
+#[derive(Debug, Clone)]
+pub struct GlobalRollupRow {
+    pub cluster_index: i32,
+    pub label: String,
+    pub keywords: Vec<String>,
+    pub keyword_scores: Vec<f32>,
+    pub centroid: Vec<f32>,
+    pub chunk_count: i32,
+    pub file_count: i32,
+    pub project_names: Vec<String>,
+    pub representative_chunk_id: i64,
+    pub representative_snippet: String,
+    pub parent_topic_ids: Vec<i64>,
+}
+
+/// Store the global roll-up meta-topics under `scope='global'`. Each row carries
+/// its explicit aggregated `chunk_count` and `parent_topic_ids`; no
+/// `chunk_topic_assignments` are written (see [`GlobalRollupRow`]). The caller
+/// is responsible for `clear_topics_for_scope("global")` first.
+pub async fn store_global_rollup(
+    pool: &PgPool,
+    rows: &[GlobalRollupRow],
+) -> Result<(), sqlx::Error> {
+    for r in rows {
+        let centroid_opt: Option<&[f32]> = if r.centroid.is_empty() {
+            None
+        } else {
+            Some(&r.centroid)
+        };
+        let parent_ids_opt: Option<&[i64]> = if r.parent_topic_ids.is_empty() {
+            None
+        } else {
+            Some(&r.parent_topic_ids)
+        };
+        sqlx::query(
+            "INSERT INTO code_topics
+                (scope, cluster_index, label, chunk_count, file_count, project_count,
+                 project_names, avg_internal_similarity, representative_chunk_id,
+                 representative_snippet, top_files, keywords, keyword_scores,
+                 centroid, parent_topic_ids)
+             VALUES (
+                'global', $1, $2, $3, $4, $5, $6, 0.0,
+                (SELECT id FROM file_chunks WHERE id = $7 FOR KEY SHARE),
+                $8, '[]'::jsonb, $9, $10, $11, $12
+             )
+             ON CONFLICT (scope, cluster_index) DO UPDATE SET
+                label = EXCLUDED.label,
+                chunk_count = EXCLUDED.chunk_count,
+                file_count = EXCLUDED.file_count,
+                project_count = EXCLUDED.project_count,
+                project_names = EXCLUDED.project_names,
+                representative_chunk_id = EXCLUDED.representative_chunk_id,
+                representative_snippet = EXCLUDED.representative_snippet,
+                keywords = EXCLUDED.keywords,
+                keyword_scores = EXCLUDED.keyword_scores,
+                centroid = COALESCE(EXCLUDED.centroid, code_topics.centroid),
+                parent_topic_ids = EXCLUDED.parent_topic_ids,
+                computed_at = NOW()",
+        )
+        .bind(r.cluster_index)
+        .bind(&r.label)
+        .bind(r.chunk_count)
+        .bind(r.file_count)
+        .bind(r.project_names.len() as i32)
+        .bind(&r.project_names)
+        .bind(r.representative_chunk_id)
+        .bind(&r.representative_snippet)
+        .bind(&r.keywords)
+        .bind(&r.keyword_scores)
+        .bind(centroid_opt)
+        .bind(parent_ids_opt)
+        .execute(pool)
+        .await?;
+    }
     Ok(())
 }
 

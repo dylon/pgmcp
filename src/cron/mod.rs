@@ -23,6 +23,8 @@ pub mod gpu_fcm;
 #[allow(dead_code)]
 pub mod graph_analysis;
 #[allow(dead_code)]
+pub mod hdbscan;
+#[allow(dead_code)]
 pub mod job;
 #[allow(dead_code)]
 pub mod k_selector;
@@ -75,13 +77,21 @@ pub mod target_cleanup;
 pub mod telemetry_retention;
 pub mod tool_policy_refresh;
 #[allow(dead_code)]
+pub mod topic_bakeoff;
+#[allow(dead_code)]
 pub mod topic_clustering;
 #[allow(dead_code)]
 pub mod topic_clustering_online;
 #[allow(dead_code)]
 pub mod topic_dendrogram;
 #[allow(dead_code)]
+pub mod topic_graph;
+#[allow(dead_code)]
 pub mod topic_hierarchy;
+#[allow(dead_code)]
+pub mod topic_label_llm;
+#[allow(dead_code)]
+pub mod topic_reduce;
 #[allow(dead_code)]
 pub mod trajectory_similarity;
 pub mod work_item_presence;

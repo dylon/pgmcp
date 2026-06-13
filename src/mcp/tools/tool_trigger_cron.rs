@@ -56,11 +56,15 @@ pub async fn tool_trigger_cron(
         "target-cleanup",
         "security-scan",
         "findings-promotion",
+        "topic-clustering",
+        "code-raptor",
+        "topic-dendrogram",
+        "memory-raptor",
     ];
     if !VALID_JOBS.contains(&job) {
         return Err(McpError::invalid_params(
             format!(
-                "Unknown job {job:?}. Valid: symbol-extraction | call-graph | function-metrics | graph-analysis | a2a-reflect | msm-calibrate | fuzzy-sync | target-cleanup | security-scan | findings-promotion"
+                "Unknown job {job:?}. Valid: symbol-extraction | call-graph | function-metrics | graph-analysis | a2a-reflect | msm-calibrate | fuzzy-sync | target-cleanup | security-scan | findings-promotion | topic-clustering | code-raptor | topic-dendrogram | memory-raptor"
             ),
             None,
         ));
@@ -363,6 +367,113 @@ pub async fn tool_trigger_cron(
                 "status": "completed",
                 "guidance": "Import/co-change/semantic edges rebuilt from symbol_references. Repairs dependency_graph / coupling_cohesion_report / architecture_* once import_use refs exist (run symbol-extraction first).",
             }))
+        }
+        "topic-clustering" => {
+            // Topic engine (default: graph-hybrid per-project + global roll-up +
+            // hierarchy + LLM labels), with the degeneracy gate. Forces an
+            // immediate refresh without waiting for the 12h interval / ready delay.
+            let config = ctx.config().load();
+            crate::cron::topic_clustering::run_global_topic_scan(
+                db.as_ref(),
+                &config.cron,
+                stats,
+                ctx.lifecycle(),
+            )
+            .await;
+            json_result(&json!({
+                "job": job,
+                "status": "completed",
+                "method": config.cron.topic_clustering_method.clone(),
+                "topics_discovered": stats.topics_discovered.load(Ordering::Relaxed),
+                "degenerate_refusals": stats.topic_degenerate_refusals.load(Ordering::Relaxed),
+                "guidance": "Topics recomputed. discover_topics (per-project scope='project:NAME' + a 'global' roll-up) and topic quality (orient health / pgmcp_metadata['topics_quality']) are refreshed. The degeneracy gate preserves prior topics if the new model is degenerate.",
+            }))
+        }
+        "code-raptor" => {
+            // Per-project RAPTOR summary tree (code_summary_tree); powers
+            // code_raptor_search.
+            crate::cron::code_raptor::run_code_raptor(db.as_ref(), stats, ctx.lifecycle()).await;
+            json_result(&json!({
+                "job": job,
+                "status": "completed",
+                "summaries_written": stats.code_raptor_summaries_written.load(Ordering::Relaxed),
+                "guidance": "code_summary_tree rebuilt per project (FCM clusters + summaries).",
+            }))
+        }
+        "topic-dendrogram" => {
+            // Hierarchical-agglomerative topic dendrogram (topic_dendrograms);
+            // powers dendrogram_topic_hierarchy. Large projects are
+            // strided-subsampled to avoid the O(n²) distance-matrix OOM.
+            if let Some(pool) = db.pool() {
+                match crate::cron::topic_dendrogram::run_pass(pool, stats).await {
+                    Ok(report) => json_result(&json!({
+                        "job": job,
+                        "status": "completed",
+                        "projects_processed": report.projects_processed,
+                        "topics_generated": report.topics_generated,
+                        "errors": report.errors,
+                        "guidance": "topic_dendrograms rebuilt; powers dendrogram_topic_hierarchy.",
+                    })),
+                    Err(e) => json_result(&json!({
+                        "job": job,
+                        "status": "error",
+                        "error": e.to_string(),
+                    })),
+                }
+            } else {
+                json_result(&json!({
+                    "job": job,
+                    "status": "skipped",
+                    "reason": "DbClient has no PgPool (topic-dendrogram needs Postgres)",
+                }))
+            }
+        }
+        "memory-raptor" => {
+            // Memory-server RAPTOR: recursive LLM summarization over the agent
+            // memory_observations knowledge graph → memory_summary_tree (powers
+            // memory_raptor_search). Loads the configured local LLM for this run.
+            let backend = ctx.config().load().cron.topic_llm_backend.clone();
+            let extractor = match crate::llm::parse_backend_choice(&backend)
+                .and_then(crate::llm::make_extractor)
+            {
+                Ok(Some(e)) => {
+                    let arc: Arc<dyn crate::llm::LlmExtractor> = Arc::from(e);
+                    arc
+                }
+                Ok(None) => {
+                    return json_result(&json!({
+                        "job": job,
+                        "status": "skipped",
+                        "reason": format!("LLM backend {backend:?} is disabled; set [cron] topic_llm_backend to qwen3-4b or qwen3-8b"),
+                    }));
+                }
+                Err(e) => {
+                    return json_result(&json!({
+                        "job": job,
+                        "status": "error",
+                        "error": format!("LLM extractor load failed: {e}"),
+                    }));
+                }
+            };
+            if let Some(pool) = db.pool().cloned() {
+                crate::cron::memory_raptor::run_or_log(
+                    Arc::new(pool),
+                    Arc::clone(stats),
+                    extractor,
+                )
+                .await;
+                json_result(&json!({
+                    "job": job,
+                    "status": "completed",
+                    "guidance": "memory_summary_tree rebuilt from memory_observations; powers memory_raptor_search. Heavy (loads the local LLM); run on demand.",
+                }))
+            } else {
+                json_result(&json!({
+                    "job": job,
+                    "status": "skipped",
+                    "reason": "DbClient has no PgPool (memory-raptor needs Postgres)",
+                }))
+            }
         }
         _ => unreachable!("validated trigger_cron job must match a branch"),
     }
