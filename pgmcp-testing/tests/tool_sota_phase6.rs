@@ -223,9 +223,8 @@ async fn injection_candidates_rejects_unknown_kind() {
         )
         .await;
 
-    match r {
-        Ok(result) => assert_eq!(result.is_error, Some(true), "unknown kind must reject"),
-        Err(_) => {}
+    if let Ok(result) = r {
+        assert_eq!(result.is_error, Some(true), "unknown kind must reject");
     }
 }
 

@@ -1782,6 +1782,56 @@ pub fn schedule_maintenance_jobs(
         );
     }
 
+    if config.tool_policy_interval_secs > 0 {
+        let rt_clone_tp = rt.clone();
+        let stats_for_tp = Arc::clone(&stats);
+        let tp_interval = config.tool_policy_interval_secs;
+        let cron_pool_tp = Arc::clone(&cron_pool);
+        let lc_tp = lifecycle.clone();
+        // Cheap learner pass (a few SQL statements) — its own lock so it never
+        // starves behind the GPU herd; it only reads `mcp_tool_calls` and rewrites
+        // the small `client_tool_policy` table.
+        let lock_tp: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+        let ready_tp: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
+        let tp_ready_delay = Duration::from_secs(120);
+        let ctx_tp = system_ctx.clone();
+        handle.schedule_recurring(
+            staggered_initial_delay_ms("tool-policy-refresh", tp_interval * 1000),
+            tp_interval * 1000,
+            "tool-policy-refresh",
+            move || {
+                if lc_tp.is_stopping() {
+                    return false;
+                }
+                let lc = lc_tp.clone();
+                let lock = Arc::clone(&lock_tp);
+                let ready = Arc::clone(&ready_tp);
+                let stats = Arc::clone(&stats_for_tp);
+                let rt = rt_clone_tp.clone();
+                let ctx = ctx_tp.clone();
+                cron_pool_tp.submit(
+                    move || {
+                        let _guard = heavy_gate_or_skip!(
+                            job = "tool-policy-refresh",
+                            lc = lc,
+                            ready = ready,
+                            cooldown = tp_ready_delay,
+                            lock = lock,
+                            stats = stats,
+                        );
+                        let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
+                        let stats_run = Arc::clone(&stats);
+                        rt.block_on(async move {
+                            crate::cron::tool_policy_refresh::run_or_log(ctx, stats_run).await;
+                        });
+                    },
+                    crate::work_pool::pool::Priority::Low,
+                );
+                true
+            },
+        );
+    }
+
     if config.embedding_migration_interval_secs > 0 {
         let db_clone_mig = Arc::clone(&db);
         let rt_clone_mig = rt.clone();

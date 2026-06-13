@@ -394,25 +394,21 @@ pub async fn tool_memory_raptor_search(
         "memory_raptor_search",
         start.elapsed().as_millis() as u64,
     );
-    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT se.effect, COUNT(*)::int8
-             FROM symbol_effects se
-             GROUP BY se.effect
-             ORDER BY se.effect",
+    // Shadow-ASR channel (Phase D2b): project-scoped effect distribution
+    // (resolved from the requested memory scope's owning project).
+    let project_id: Option<i32> = match params.scope_id {
+        Some(scope_id) => sqlx::query_scalar::<_, i32>(
+            "SELECT project_id FROM memory_scope WHERE id = $1 AND project_id IS NOT NULL",
         )
-        .fetch_all(pool)
+        .bind(scope_id)
+        .fetch_optional(pool)
         .await
-        .unwrap_or_default();
-        rows.into_iter()
-            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-            .collect()
-    })
-    .await;
+        .ok()
+        .flatten(),
+        None => None,
+    };
+    let effect_breakdown =
+        crate::mcp::tools::sema_helpers::effects::effect_breakdown_json(pool, project_id).await;
 
     json_result(json!({
         "effect_breakdown": effect_breakdown,

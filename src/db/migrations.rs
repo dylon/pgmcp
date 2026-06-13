@@ -48,6 +48,11 @@ mod v31_graph_embeddings;
 mod v32_toolbox_catalog;
 mod v33_toolbox_domain_security;
 mod v34_external_scanner_findings;
+mod v35_toolbox_domain_diagramming;
+mod v36_experiment_enum_to_text;
+mod v37_client_tool_policy;
+mod v38_mcp_tool_catalog;
+mod v39_mcp_tool_call_result_size;
 mod v3_cross_language_signatures;
 mod v4_work_items;
 mod v5_work_items_collab;
@@ -311,39 +316,12 @@ async fn ensure_work_item_experiment_bridge(pool: &PgPool) -> Result<(), sqlx::E
 /// `durable_mandates` model) — the embedding-migration cron backfills NULLs
 /// and `experiment_open`/`experiment_decide` embed synchronously on write.
 async fn ensure_experiment_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
-    // ENUMs (idempotent pg_type probe, matching `ensure_memory_phase2_tables`).
-    let enum_stmts = [
-        (
-            "experiment_kind",
-            "CREATE TYPE experiment_kind AS ENUM ('optimization','feature_refactor','feature_addition','bugfix','investigation','other')",
-        ),
-        (
-            "experiment_status",
-            "CREATE TYPE experiment_status AS ENUM ('open','measuring','decided','abandoned','superseded')",
-        ),
-        (
-            "hypothesis_verdict",
-            "CREATE TYPE hypothesis_verdict AS ENUM ('pending','accepted','rejected','inconclusive')",
-        ),
-        (
-            "experiment_arm_kind",
-            "CREATE TYPE experiment_arm_kind AS ENUM ('control','treatment','baseline')",
-        ),
-        (
-            "effect_direction",
-            "CREATE TYPE effect_direction AS ENUM ('increase','decrease','either','none')",
-        ),
-    ];
-    for (name, create_sql) in enum_stmts {
-        let exists: bool =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_type WHERE typname = $1)")
-                .bind(name)
-                .fetch_one(pool)
-                .await?;
-        if !exists {
-            sqlx::query(create_sql).execute(pool).await?;
-        }
-    }
+    // Closed vocabularies (kind/status/verdict/arm_kind/predicted_direction)
+    // are TEXT + CHECK per ADR-003 (see `crate::experiment::vocab`), NOT native
+    // PG enums. Earlier versions created native enums here; the
+    // `v36_experiment_enum_to_text` migration converts the columns to TEXT,
+    // installs the CHECK constraints, and drops those enum types. Fresh installs
+    // create the columns as plain TEXT below and pick up the CHECKs when v36 runs.
 
     // Root experiment: the observation/question + kind + provenance, with a
     // bi-temporal supersession chain (a re-run can obsolete an earlier one).
@@ -354,9 +332,9 @@ async fn ensure_experiment_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
             title               TEXT NOT NULL,
             question            TEXT NOT NULL,
             context             TEXT,
-            kind                experiment_kind NOT NULL DEFAULT 'other',
+            kind                TEXT NOT NULL DEFAULT 'other',
             project_id          INTEGER REFERENCES projects(id) ON DELETE CASCADE,
-            status              experiment_status NOT NULL DEFAULT 'open',
+            status              TEXT NOT NULL DEFAULT 'open',
             hardware            JSONB NOT NULL DEFAULT '{}'::jsonb,
             git_ref             TEXT,
             plan_ref            TEXT,
@@ -419,11 +397,11 @@ async fn ensure_experiment_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
             statement            TEXT NOT NULL,
             primary_metric       TEXT NOT NULL,
             unit                 TEXT,
-            predicted_direction  effect_direction NOT NULL DEFAULT 'either',
+            predicted_direction  TEXT NOT NULL DEFAULT 'either',
             acceptance_criterion JSONB NOT NULL,
             criterion_locked_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             planned_n            INTEGER,
-            verdict              hypothesis_verdict NOT NULL DEFAULT 'pending',
+            verdict              TEXT NOT NULL DEFAULT 'pending',
             embedding            vector(1024),
             embedding_signature  TEXT NOT NULL DEFAULT 'bge-m3-v1',
             created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -452,7 +430,7 @@ async fn ensure_experiment_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
             experiment_id BIGINT NOT NULL REFERENCES experiments(id) ON DELETE CASCADE,
             hypothesis_id BIGINT REFERENCES experiment_hypotheses(id) ON DELETE SET NULL,
             arm_label     TEXT NOT NULL,
-            arm_kind      experiment_arm_kind NOT NULL,
+            arm_kind      TEXT NOT NULL,
             command_spec  JSONB NOT NULL DEFAULT '{}'::jsonb,
             run_plan      JSONB NOT NULL DEFAULT '{}'::jsonb,
             host_meta     JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -519,7 +497,7 @@ async fn ensure_experiment_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
             ci_low              DOUBLE PRECISION,
             ci_high             DOUBLE PRECISION,
             ci_level            DOUBLE PRECISION DEFAULT 0.95,
-            verdict             hypothesis_verdict NOT NULL,
+            verdict             TEXT NOT NULL,
             accepted            BOOLEAN NOT NULL,
             correction          TEXT,
             criterion_snapshot  JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -1664,7 +1642,8 @@ pub async fn run_migrations(
             metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
             recursion_rounds INTEGER NOT NULL DEFAULT 1,
             current_round INTEGER NOT NULL DEFAULT 0,
-            parent_task_id UUID REFERENCES a2a_tasks(id) ON DELETE SET NULL
+            parent_task_id UUID REFERENCES a2a_tasks(id) ON DELETE SET NULL,
+            project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL
         )",
     )
     .execute(pool)
@@ -1689,6 +1668,18 @@ pub async fn run_migrations(
     )
     .execute(pool)
     .await?;
+    // Project scope for the effect_breakdown channel on a2a tools (nullable,
+    // ON DELETE SET NULL = backward-compatible; pre-existing tasks get NULL).
+    sqlx::query(
+        "ALTER TABLE a2a_tasks
+            ADD COLUMN IF NOT EXISTS project_id INTEGER
+                REFERENCES projects(id) ON DELETE SET NULL",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_a2a_tasks_project ON a2a_tasks(project_id)")
+        .execute(pool)
+        .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_a2a_tasks_status ON a2a_tasks(status)")
         .execute(pool)
         .await?;
@@ -2080,6 +2071,8 @@ pub async fn run_migrations(
             error_class      TEXT,
             request_id       TEXT,
             params_sha256    TEXT,
+            result_bytes     INTEGER,
+            result_tokens_est INTEGER,
             CHECK (outcome IN ('ok', 'error', 'timeout', 'cancelled'))
         )",
     )
@@ -2523,6 +2516,46 @@ pub async fn run_migrations(
     )
     .await?;
 
+    apply_step(
+        pool,
+        v35_toolbox_domain_diagramming::TOOLBOX_DOMAIN_DIAGRAMMING,
+        v35_toolbox_domain_diagramming::TOOLBOX_DOMAIN_DIAGRAMMING_NAME,
+        || v35_toolbox_domain_diagramming::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v36_experiment_enum_to_text::EXPERIMENT_ENUM_TO_TEXT,
+        v36_experiment_enum_to_text::EXPERIMENT_ENUM_TO_TEXT_NAME,
+        || v36_experiment_enum_to_text::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v37_client_tool_policy::CLIENT_TOOL_POLICY,
+        v37_client_tool_policy::CLIENT_TOOL_POLICY_NAME,
+        || v37_client_tool_policy::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v38_mcp_tool_catalog::MCP_TOOL_CATALOG,
+        v38_mcp_tool_catalog::MCP_TOOL_CATALOG_NAME,
+        || v38_mcp_tool_catalog::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v39_mcp_tool_call_result_size::MCP_TOOL_CALL_RESULT_SIZE,
+        v39_mcp_tool_call_result_size::MCP_TOOL_CALL_RESULT_SIZE_NAME,
+        || v39_mcp_tool_call_result_size::apply(pool),
+    )
+    .await?;
+
     // Every-boot vocabulary-catalog reconcile (RC1 durable fix). Unconditional
     // and idempotent; closes the post-v2 catalog-drift gap that silently
     // FK-skipped symbol extraction for files carrying a newly-added effect.
@@ -2556,6 +2589,12 @@ pub async fn run_migrations(
     // on the 1024-d `embedding` column with the same params-tracked discipline,
     // column_exists-guarded; runs after the v32 apply_step so the column exists.
     ensure_v31_embedding_hnsw_index(pool, vector_config, "tool_cards").await?;
+
+    // Build/refresh the mcp_tool_catalog HNSW index (semantic discovery of the
+    // server's OWN tools via the `tool_catalog` meta-tool). Same generic helper /
+    // params-tracked discipline as tool_cards; runs after the v38 apply_step so
+    // the column exists.
+    ensure_v31_embedding_hnsw_index(pool, vector_config, "mcp_tool_catalog").await?;
 
     // Stage 5c: trajectory-similarity edge store (must exist before the edges
     // view, which UNIONs it as the `evolves_like` arm).

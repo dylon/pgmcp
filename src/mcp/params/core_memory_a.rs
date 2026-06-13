@@ -228,7 +228,7 @@ pub struct McpToolTelemetryParams {
     #[schemars(description = "Result limit for `aggregation=\"raw\"` (default 100, max 1000).")]
     pub limit: Option<i32>,
     #[schemars(
-        description = "Aggregation shape: one of `summary`, `top_tools`, `top_callers`, `top_projects`, `error_rate`, `histogram`, `raw`. Default `summary`."
+        description = "Aggregation shape: one of `summary`, `top_tools`, `top_callers`, `top_projects`, `error_rate`, `histogram`, `output_bytes` (top tools by serialized result size — the result-payload-slimming targeting view), `raw`. Default `summary`."
     )]
     pub aggregation: Option<String>,
 }
@@ -522,6 +522,11 @@ pub struct MemorySearchNodesParams {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MemoryOpenNodesParams {
     pub names: Vec<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project name (list_projects) to scope the effect_breakdown channel; omit for an empty breakdown."
+    )]
+    pub project: Option<String>,
 }
 
 // ----------------------------------------------------------------------------

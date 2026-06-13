@@ -184,7 +184,7 @@ async fn change_impact_analysis_scopes_import_call_and_effect_rows() {
         "cross-project import/caller rows must not leak into impact list: {paths:?}"
     );
     assert!(
-        v["effect_breakdown"].as_array().unwrap().is_empty(),
+        v["effect_breakdown"].as_object().unwrap().is_empty(),
         "effect breakdown must not include another project's effects"
     );
 }

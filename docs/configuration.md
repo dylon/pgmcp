@@ -132,6 +132,7 @@ topic_min_cluster_size = 5
 topic_fuzziness = 2.0
 graph_analysis_interval_secs = 7200
 quality_history_interval_secs = 21600    # snapshot quality GPAs (trend/forecast); 0 disables
+tool_policy_interval_secs = 21600        # recompute per-client learned tool surface from usage; 0 disables
 findings_promotion_interval_secs = 21600 # auto-promote findings → items (opted-in projects); 0 disables
 
 # Proactive digest — OFF by default (local-first). Rides the SessionStart
@@ -216,6 +217,7 @@ proc_fd_supplement = false   # also sample /proc/<pid>/fd on each liveness tick 
 | `cron`       | `topic_fuzziness`                 | `2.0`                               | FCM fuzziness exponent                         |
 | `cron`       | `graph_analysis_interval_secs`    | `7200`                              | Graph analysis interval                        |
 | `cron`       | `quality_history_interval_secs`   | `21600`                             | Quality-GPA snapshot interval (trend/forecast); 0 disables |
+| `cron`       | `tool_policy_interval_secs`       | `21600`                             | Adaptive tool-surface refresh interval (recompute per-client defaults via recency-decayed usage frequency); 0 disables |
 | `cron`       | `findings_promotion_interval_secs`| `21600`                             | Findings→work-item promotion interval (opted-in projects only); 0 disables globally |
 | `digest`     | `enabled`                         | `false`                             | Master switch for the proactive digest         |
 | `digest`     | `session_start`                   | `true`                              | Append digest to the SessionStart `pgmcp context` output |

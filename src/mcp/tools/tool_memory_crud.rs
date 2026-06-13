@@ -515,25 +515,12 @@ pub async fn tool_memory_open_nodes(
     let nodes = queries::memory_open_nodes(pool, &names)
         .await
         .map_err(|e| McpError::internal_error(format!("query failed: {}", e), None))?;
-    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT se.effect, COUNT(*)::int8
-             FROM symbol_effects se
-             GROUP BY se.effect
-             ORDER BY se.effect",
-        )
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-        rows.into_iter()
-            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-            .collect()
-    })
-    .await;
+    // Shadow-ASR channel (Phase D2b): project-scoped effect distribution.
+    let pid =
+        crate::mcp::tools::sema_helpers::effects::project_id_opt(pool, params.project.as_deref())
+            .await;
+    let effect_breakdown =
+        crate::mcp::tools::sema_helpers::effects::effect_breakdown_json(pool, pid).await;
 
     json_result(json!({
         "effect_breakdown": effect_breakdown,

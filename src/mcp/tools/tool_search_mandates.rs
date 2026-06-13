@@ -159,25 +159,14 @@ pub async fn tool_search_mandates(
     })?;
 
     let count = results.len();
-    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT se.effect, COUNT(*)::int8
-             FROM symbol_effects se
-             GROUP BY se.effect
-             ORDER BY se.effect",
-        )
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-        rows.into_iter()
-            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-            .collect()
-    })
-    .await;
+    // Shadow-ASR channel (Phase D2b): project-scoped effect distribution.
+    let effect_breakdown = match ctx.db().pool() {
+        Some(pool) => {
+            crate::mcp::tools::sema_helpers::effects::effect_breakdown_json(pool, params.project_id)
+                .await
+        }
+        None => serde_json::json!({}),
+    };
 
     let json = serde_json::to_string_pretty(&serde_json::json!({
         "effect_breakdown": effect_breakdown,

@@ -130,13 +130,15 @@ async fn lockset_races_scopes_effect_breakdown_to_project() {
     let v: serde_json::Value = serde_json::from_str(&text_of(&r)).expect("lockset JSON");
     assert_eq!(v["project"].as_str(), Some(target.as_str()));
     assert_eq!(v["limit"].as_u64(), Some(5));
-    let effects = v["effect_breakdown"].as_array().expect("effect_breakdown");
+    let effects = v["effect_breakdown"]
+        .as_object()
+        .expect("effect_breakdown object map");
     assert!(
-        effects.iter().any(|e| e["effect"] == "lock_acquire"),
+        effects.contains_key("lock_acquire"),
         "target effect missing: {effects:?}"
     );
     assert!(
-        effects.iter().all(|e| e["effect"] != "may_panic"),
+        !effects.contains_key("may_panic"),
         "other project effect leaked into lockset_races: {effects:?}"
     );
 }

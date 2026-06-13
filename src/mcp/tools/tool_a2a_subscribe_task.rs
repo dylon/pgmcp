@@ -39,25 +39,21 @@ pub async fn tool_a2a_subscribe_task(
         .strip_suffix("/a2a/jsonrpc")
         .unwrap_or(url.trim_end_matches('/'));
     let sse_url = format!("{}/a2a/sse/{}", base, params.task_id);
-    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT se.effect, COUNT(*)::int8
-             FROM symbol_effects se
-             GROUP BY se.effect
-             ORDER BY se.effect",
+    // Shadow-ASR channel (Phase D2b): project-scoped effect distribution
+    // (resolved from the local parent-task row, if this id is a local task).
+    let pid: Option<i32> = match uuid::Uuid::parse_str(&params.task_id) {
+        Ok(task_id) => sqlx::query_scalar::<_, i32>(
+            "SELECT project_id FROM a2a_tasks WHERE id = $1 AND project_id IS NOT NULL",
         )
-        .fetch_all(pool)
+        .bind(task_id)
+        .fetch_optional(pool)
         .await
-        .unwrap_or_default();
-        rows.into_iter()
-            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-            .collect()
-    })
-    .await;
+        .ok()
+        .flatten(),
+        Err(_) => None,
+    };
+    let effect_breakdown =
+        crate::mcp::tools::sema_helpers::effects::effect_breakdown_json(pool, pid).await;
 
     json_result(&json!({
         "effect_breakdown": effect_breakdown,

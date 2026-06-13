@@ -120,24 +120,11 @@ pub async fn tool_memory_reflect(
         .await
         .map_err(|e| McpError::internal_error(format!("reflection failed: {}", e), None))?;
 
-    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT se.effect, COUNT(*)::int8
-             FROM symbol_effects se
-             GROUP BY se.effect
-             ORDER BY se.effect",
-        )
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-        rows.into_iter()
-            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-            .collect()
-    })
+    // Shadow-ASR channel (Phase D2b): project-scoped effect distribution.
+    let effect_breakdown = crate::mcp::tools::sema_helpers::effects::effect_breakdown_json(
+        pool,
+        params.scope.as_ref().and_then(|s| s.project_id),
+    )
     .await;
 
     let envelope = serde_json::json!({

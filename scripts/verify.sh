@@ -47,6 +47,33 @@ if [ "${ccbin_major}" != "14" ]; then
     exit 2
 fi
 
+# Test-DB visibility preflight (NOT a hard gate — the real-DB suites are
+# designed to self-skip without a local Postgres+pgvector so verify stays green
+# for contributors, see Gate 8 below). But a *silent* skip is how an
+# enum-vs-text SQL regression once shipped green: the oracle test that would
+# have caught it self-skipped and nobody noticed. So surface the skip LOUDLY
+# here — never silently — without failing the run.
+test_db_authority=""
+if [ -n "${PGMCP_TEST_DATABASE_URL:-}" ]; then
+    test_db_authority="PGMCP_TEST_DATABASE_URL"
+elif [ -f "${HOME}/.config/pgmcp/test-config.toml" ]; then
+    test_db_authority="~/.config/pgmcp/test-config.toml"
+elif [ -f "${HOME}/.config/pgmcp/config.toml" ]; then
+    test_db_authority="~/.config/pgmcp/config.toml"
+fi
+if [ -n "${test_db_authority}" ]; then
+    echo "verify.sh: test-DB authority = ${test_db_authority}; real-DB suites will RUN."
+    echo
+else
+    echo "verify.sh: WARNING — no test-DB authority configured" >&2
+    echo "  (PGMCP_TEST_DATABASE_URL / ~/.config/pgmcp/{test-,}config.toml)." >&2
+    echo "  The real-DB suites (Gate 5 + the Tier-C tests in Gate 8) will SELF-SKIP," >&2
+    echo "  so SQL/schema regressions — enum-vs-text, CHECK drift, project-scoping —" >&2
+    echo "  will NOT be caught. Point PGMCP_TEST_DATABASE_URL at a scratch" >&2
+    echo "  Postgres+pgvector DB to make this a full integration check." >&2
+    echo
+fi
+
 run_gate() {
     local name="$1"; shift
     local start

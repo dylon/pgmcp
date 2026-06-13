@@ -88,6 +88,66 @@ pub async fn effect_counts(
     Ok(rows.into_iter().collect())
 }
 
+/// Project-scoped effect distribution rendered as response-envelope JSON:
+/// `[{ "effect": <name>, "count": <n> }, ...]`, stable-sorted by effect name.
+///
+/// This is the project-correct replacement for the inline workspace-wide
+/// `GROUP BY se.effect` blocks (the Shadow-ASR D2b "effect_breakdown" channel)
+/// that several tool handlers previously hand-coded without a project join.
+/// Returns a compact `{effect: count}` object map (e.g. `{"io": 127, "network":
+/// 45}`), sorted by effect name, or `{}` when `project_id` is `None` (no project
+/// to scope by) or the query errors — so callers can attach the result
+/// unconditionally. The object form drops the repeated `"effect"`/`"count"` keys
+/// an array-of-objects would carry (~18-24 bytes/effect) across the ~37
+/// sema-enriched tools.
+pub async fn effect_breakdown_json(pool: &PgPool, project_id: Option<i32>) -> serde_json::Value {
+    let Some(pid) = project_id else {
+        return serde_json::json!({});
+    };
+    // BTreeMap → deterministic (effect-sorted) JSON object key order.
+    let counts: std::collections::BTreeMap<String, i64> = effect_counts(pool, pid)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    serde_json::to_value(counts).unwrap_or_else(|_| serde_json::json!({}))
+}
+
+/// Resolve a project display name to its `projects.id`, non-erroring.
+///
+/// Returns `None` for a missing / blank / unknown name (and the first id for an
+/// ambiguous name) so advisory enrichment — the `effect_breakdown` channel —
+/// degrades to empty rather than failing the tool call. Use
+/// [`crate::mcp::tools::sota_helpers::project_id_or_err`] instead when a tool's
+/// primary work must hard-fail on an unknown or ambiguous project.
+pub async fn project_id_opt(pool: &PgPool, name: Option<&str>) -> Option<i32> {
+    let name = name?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    sqlx::query_scalar("SELECT id FROM projects WHERE name = $1 ORDER BY id LIMIT 1")
+        .bind(name)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Resolve the owning `projects.id` for an indexed file path, non-erroring.
+///
+/// The path-addressed tools (`read_file`, `file_info`, `compare_files`, …) have
+/// no `project` argument but a file uniquely belongs to a project, so the
+/// `effect_breakdown` channel can still be project-scoped. Returns `None` for an
+/// unknown path so enrichment degrades to empty.
+pub async fn project_id_for_path(pool: &PgPool, path: &str) -> Option<i32> {
+    sqlx::query_scalar("SELECT project_id FROM indexed_files WHERE path = $1 LIMIT 1")
+        .bind(path)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
 /// Forward-reachable effect set from a seed symbol: all effects observed
 /// on any symbol transitively callable from the seed via resolved call
 /// edges. The traversal is bounded by `max_depth` to keep work O(N·d).

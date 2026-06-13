@@ -73,6 +73,7 @@ pub mod symbol_extraction;
 pub mod target_cleanup;
 #[allow(dead_code)]
 pub mod telemetry_retention;
+pub mod tool_policy_refresh;
 #[allow(dead_code)]
 pub mod topic_clustering;
 #[allow(dead_code)]

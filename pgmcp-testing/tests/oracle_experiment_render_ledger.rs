@@ -21,7 +21,7 @@ use uuid::Uuid;
 async fn insert_experiment(pool: &sqlx::PgPool, slug: &str) -> i64 {
     sqlx::query_scalar(
         "INSERT INTO experiments (slug, title, question, kind, status)
-         VALUES ($1, $2, $3, 'investigation'::experiment_kind, 'open'::experiment_status)
+         VALUES ($1, $2, $3, 'investigation', 'open')
          RETURNING id",
     )
     .bind(slug)

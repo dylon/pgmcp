@@ -160,27 +160,18 @@ pub async fn tool_pattern_search(
         _ => None,
     };
 
-    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution
-    // (sum across all projects). Gives consumers a baseline against which
-    // their tool-specific output's effect concentration can be compared.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT se.effect, COUNT(*)::int8
-             FROM symbol_effects se
-             GROUP BY se.effect
-             ORDER BY se.effect",
-        )
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-        rows.into_iter()
-            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-            .collect()
-    })
-    .await;
+    // Shadow-ASR channel (Phase D2b): project-scoped effect distribution.
+    // pattern_search is inherently cross-project (it searches every project and
+    // only offers `exclude_project`, never a single `project` to scope by), so
+    // there is no project id to anchor the breakdown to. Passing `None` yields an
+    // empty list — the field stays present but no longer dumps the entire
+    // workspace's effect totals.
+    let effect_breakdown = match ctx.db().pool() {
+        Some(pool) => {
+            crate::mcp::tools::sema_helpers::effects::effect_breakdown_json(pool, None).await
+        }
+        None => serde_json::json!({}),
+    };
 
     let result = json!({
         "effect_breakdown": effect_breakdown,

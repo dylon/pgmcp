@@ -56,6 +56,7 @@ pub async fn tool_a2a_pattern_recursive(
             "sub_agent": params.sub_agent,
             "query": params.query,
         }),
+        None,
     )
     .await?;
 

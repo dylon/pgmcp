@@ -72,7 +72,7 @@ pub async fn insert_experiment_in_tx(
         "INSERT INTO experiments
             (slug, title, question, context, kind, project_id, hardware, git_ref,
              plan_ref, correction, embedding, embedding_signature)
-         VALUES ($1, $2, $3, $4, $5::experiment_kind, $6, $7::jsonb, $8, $9, $10, $11,
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11,
                  CASE WHEN $11 IS NULL THEN 'bge-m3-v1' ELSE 'bge-m3-v1' END)
          RETURNING id",
     )
@@ -138,7 +138,7 @@ pub async fn insert_experiment_hypothesis_in_tx(
         "INSERT INTO experiment_hypotheses
             (experiment_id, statement, primary_metric, unit, predicted_direction,
              acceptance_criterion, planned_n, embedding)
-         VALUES ($1, $2, $3, $4, $5::effect_direction, $6::jsonb, $7, $8)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
          RETURNING id",
     )
     .bind(experiment_id)
@@ -246,7 +246,7 @@ pub async fn upsert_experiment_run(
     if let Some(id) = existing {
         sqlx::query(
             "UPDATE experiment_runs
-             SET arm_kind = $2::experiment_arm_kind, command_spec = $3::jsonb,
+             SET arm_kind = $2, command_spec = $3::jsonb,
                  run_plan = $4::jsonb, host_meta = $5::jsonb, git_ref = $6,
                  runner = $7, seed = $8, status = 'complete', finished_at = NOW()
              WHERE id = $1",
@@ -269,7 +269,7 @@ pub async fn upsert_experiment_run(
         "INSERT INTO experiment_runs
             (id, experiment_id, hypothesis_id, arm_label, arm_kind, command_spec,
              run_plan, host_meta, git_ref, runner, seed, status, started_at, finished_at)
-         VALUES ($1, $2, $3, $4, $5::experiment_arm_kind, $6::jsonb, $7::jsonb,
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb,
                  $8::jsonb, $9, $10, $11, 'complete', NOW(), NOW())",
     )
     .bind(id)
@@ -384,7 +384,7 @@ pub async fn record_experiment_measurement(
         let run_id = if let Some(id) = existing {
             sqlx::query(
                 "UPDATE experiment_runs
-                 SET arm_kind = $2::experiment_arm_kind, command_spec = $3::jsonb,
+                 SET arm_kind = $2, command_spec = $3::jsonb,
                      run_plan = $4::jsonb, host_meta = $5::jsonb, git_ref = $6,
                      runner = $7, seed = $8, status = 'complete', finished_at = NOW()
                  WHERE id = $1",
@@ -406,7 +406,7 @@ pub async fn record_experiment_measurement(
                 "INSERT INTO experiment_runs
                     (id, experiment_id, hypothesis_id, arm_label, arm_kind, command_spec,
                      run_plan, host_meta, git_ref, runner, seed, status, started_at, finished_at)
-                 VALUES ($1, $2, $3, $4, $5::experiment_arm_kind, $6::jsonb, $7::jsonb,
+                 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb,
                          $8::jsonb, $9, $10, $11, 'complete', NOW(), NOW())",
             )
             .bind(id)
@@ -453,7 +453,7 @@ pub async fn record_experiment_measurement(
         };
 
         sqlx::query(
-            "UPDATE experiments SET status = 'measuring'::experiment_status, updated_at = NOW()
+            "UPDATE experiments SET status = 'measuring', updated_at = NOW()
              WHERE id = $1",
         )
         .bind(r.experiment_id)
@@ -502,13 +502,11 @@ pub async fn set_experiment_status(
     experiment_id: i64,
     status: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE experiments SET status = $2::experiment_status, updated_at = NOW() WHERE id = $1",
-    )
-    .bind(experiment_id)
-    .bind(status)
-    .execute(pool)
-    .await?;
+    sqlx::query("UPDATE experiments SET status = $2, updated_at = NOW() WHERE id = $1")
+        .bind(experiment_id)
+        .bind(status)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -688,7 +686,7 @@ pub async fn insert_experiment_result(
              criterion_snapshot, test_result, rationale, decided_by, embedding,
              observation_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                 $15::hypothesis_verdict, $16, $17, $18::jsonb, $19::jsonb, $20, $21, $22, $23)
+                 $15, $16, $17, $18::jsonb, $19::jsonb, $20, $21, $22, $23)
          RETURNING id",
     )
     .bind(r.experiment_id)
@@ -738,7 +736,7 @@ pub async fn insert_experiment_decision(
              criterion_snapshot, test_result, rationale, decided_by, embedding,
              observation_id)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                 $15::hypothesis_verdict, $16, $17, $18::jsonb, $19::jsonb, $20, $21, $22, $23)
+                 $15, $16, $17, $18::jsonb, $19::jsonb, $20, $21, $22, $23)
          RETURNING id",
     )
     .bind(r.experiment_id)
@@ -767,18 +765,16 @@ pub async fn insert_experiment_decision(
     .fetch_one(&mut *tx)
     .await?;
 
-    sqlx::query("UPDATE experiment_hypotheses SET verdict = $2::hypothesis_verdict WHERE id = $1")
+    sqlx::query("UPDATE experiment_hypotheses SET verdict = $2 WHERE id = $1")
         .bind(hypothesis_id)
         .bind(&verdict)
         .execute(&mut *tx)
         .await?;
-    sqlx::query(
-        "UPDATE experiments SET status = $2::experiment_status, updated_at = NOW() WHERE id = $1",
-    )
-    .bind(experiment_id)
-    .bind("decided")
-    .execute(&mut *tx)
-    .await?;
+    sqlx::query("UPDATE experiments SET status = $2, updated_at = NOW() WHERE id = $1")
+        .bind(experiment_id)
+        .bind("decided")
+        .execute(&mut *tx)
+        .await?;
     if let Some(oid) = observation_id {
         sqlx::query("UPDATE experiment_results SET observation_id = $2 WHERE id = $1")
             .bind(result_id)
@@ -802,7 +798,7 @@ pub async fn set_hypothesis_verdict(
     hypothesis_id: i64,
     verdict: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE experiment_hypotheses SET verdict = $2::hypothesis_verdict WHERE id = $1")
+    sqlx::query("UPDATE experiment_hypotheses SET verdict = $2 WHERE id = $1")
         .bind(hypothesis_id)
         .bind(verdict)
         .execute(pool)
@@ -1078,8 +1074,8 @@ pub async fn list_experiments(
          LEFT JOIN projects p ON p.id = e.project_id
          WHERE e.valid_to IS NULL
            AND ($1::int IS NULL OR e.project_id = $1)
-           AND ($2::experiment_kind IS NULL OR e.kind = $2)
-           AND ($3::experiment_status IS NULL OR e.status = $3)
+           AND ($2::text IS NULL OR e.kind::text = $2)
+           AND ($3::text IS NULL OR e.status::text = $3)
          ORDER BY e.updated_at DESC
          LIMIT $4 OFFSET $5",
     )

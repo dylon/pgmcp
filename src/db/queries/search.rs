@@ -10,6 +10,19 @@ use sqlx::PgPool;
 // Search queries
 // ============================================================================
 
+/// Serialize a similarity score rounded to 4 decimal places. Cosine scores carry
+/// ~16 significant digits off pgvector, but 4 decimals is ample for ranking and
+/// trims ~12 bytes/hit. Serialization-only — the `FromRow` decode is unaffected.
+fn serialize_rounded_score<S>(score: &Option<f64>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match score {
+        Some(v) => serializer.serialize_f64((v * 1e4).round() / 1e4),
+        None => serializer.serialize_none(),
+    }
+}
+
 #[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
 pub struct SearchResult {
     pub path: String,
@@ -18,6 +31,7 @@ pub struct SearchResult {
     pub chunk_content: String,
     pub start_line: i32,
     pub end_line: i32,
+    #[serde(serialize_with = "serialize_rounded_score")]
     pub score: Option<f64>,
     pub project_name: String,
     /// Chunk id, surfaced by `hybrid_search_chunks` so the API handler can fetch

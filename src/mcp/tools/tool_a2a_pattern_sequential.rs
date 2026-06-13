@@ -34,6 +34,9 @@ pub async fn tool_a2a_pattern_sequential(
         .a2a_pattern_sequential_invocations
         .fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
+    let pid =
+        crate::mcp::tools::sema_helpers::effects::project_id_opt(pool, params.project.as_deref())
+            .await;
 
     // Read-before-act (Part A): peer best practices, prepended to the lead
     // role prompt. Empty unless [a2a] inject_best_practices = true.
@@ -53,6 +56,7 @@ pub async fn tool_a2a_pattern_sequential(
             "solver_agent": params.solver_agent,
             "message": params.message,
         }),
+        pid,
     )
     .await?;
 
@@ -126,25 +130,9 @@ pub async fn tool_a2a_pattern_sequential(
     )
     .await;
 
-    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT se.effect, COUNT(*)::int8
-             FROM symbol_effects se
-             GROUP BY se.effect
-             ORDER BY se.effect",
-        )
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-        rows.into_iter()
-            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-            .collect()
-    })
-    .await;
+    // Shadow-ASR channel (Phase D2b): project-scoped effect distribution.
+    let effect_breakdown =
+        crate::mcp::tools::sema_helpers::effects::effect_breakdown_json(pool, pid).await;
 
     let protocol_report = crate::csm::driver::driver_report(
         crate::csm::registry::ProtocolId::Sequential,
@@ -214,16 +202,18 @@ pub(crate) async fn persist_parent_task(
     pool: &PgPool,
     skill_id: &str,
     metadata: &serde_json::Value,
+    project_id: Option<i32>,
 ) -> Result<Uuid, McpError> {
     let parent_id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO a2a_tasks
-            (id, skill_id, status, metadata, recursion_rounds, current_round)
-         VALUES ($1, $2, 'working', $3, 1, 0)",
+            (id, skill_id, status, metadata, recursion_rounds, current_round, project_id)
+         VALUES ($1, $2, 'working', $3, 1, 0, $4)",
     )
     .bind(parent_id)
     .bind(skill_id)
     .bind(metadata)
+    .bind(project_id)
     .execute(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("Persist parent task failed: {}", e), None))?;

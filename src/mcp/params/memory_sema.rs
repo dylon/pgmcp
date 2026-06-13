@@ -153,6 +153,11 @@ pub struct MemoryPurgeExpiredParams {
     pub importance_threshold: Option<f32>,
     #[schemars(description = "When true (default), report counts only — do not delete.")]
     pub dry_run: Option<bool>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional project name (list_projects) to scope the effect_breakdown channel; omit for an empty breakdown."
+    )]
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

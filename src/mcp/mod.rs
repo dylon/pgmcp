@@ -4,4 +4,6 @@ pub mod logging;
 pub mod resources;
 pub mod server;
 pub mod tasks;
+pub mod tool_domains;
+pub mod tool_policy;
 pub mod tools;

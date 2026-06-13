@@ -75,12 +75,13 @@ pub async fn tool_mcp_tool_telemetry(
         "top_projects" => agg_top_projects(pool, &query).await?,
         "error_rate" => agg_error_rate(pool, &query).await?,
         "histogram" => agg_histogram(pool, &query).await?,
+        "output_bytes" => agg_output_bytes(pool, &query).await?,
         "raw" => agg_raw(pool, &query).await?,
         other => {
             return Err(McpError::invalid_params(
                 format!(
                     "Unknown aggregation '{}': expected one of summary | top_tools | \
-                     top_callers | top_projects | error_rate | histogram | raw",
+                     top_callers | top_projects | error_rate | histogram | output_bytes | raw",
                     other
                 ),
                 None,
@@ -88,25 +89,18 @@ pub async fn tool_mcp_tool_telemetry(
         }
     };
 
-    // Shadow-ASR channel (Phase D2b): workspace-wide effect distribution.
-    let effect_breakdown: Vec<serde_json::Value> = (async {
-        let Some(pool) = ctx.db().pool() else {
-            return Vec::new();
-        };
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT se.effect, COUNT(*)::int8
-             FROM symbol_effects se
-             GROUP BY se.effect
-             ORDER BY se.effect",
-        )
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-        rows.into_iter()
-            .map(|(eff, count)| serde_json::json!({ "effect": eff, "count": count }))
-            .collect()
-    })
-    .await;
+    // Shadow-ASR channel (Phase D2b): project-scoped effect distribution.
+    let effect_breakdown = match ctx.db().pool() {
+        Some(pool) => {
+            let pid = crate::mcp::tools::sema_helpers::effects::project_id_opt(
+                pool,
+                query.project.as_deref(),
+            )
+            .await;
+            crate::mcp::tools::sema_helpers::effects::effect_breakdown_json(pool, pid).await
+        }
+        None => serde_json::json!({}),
+    };
 
     let envelope = json!({
         "effect_breakdown": effect_breakdown,
@@ -400,6 +394,54 @@ async fn agg_raw(pool: &sqlx::PgPool, query: &TelemetryQuery) -> Result<Value, M
             "error_class": err_class,
             "request_id": req_id,
         })).collect::<Vec<_>>(),
+    }))
+}
+
+/// Top tools by serialized result size (the `result_bytes` / `result_tokens_est`
+/// columns recorded by `instrumented_tool_run`). This is the data-driven targeting
+/// surface for result-payload slimming: after telemetry accrues, query
+/// `aggregation=output_bytes` to find the real top-N byte offenders per (tool,
+/// client) rather than guessing.
+async fn agg_output_bytes(pool: &sqlx::PgPool, query: &TelemetryQuery) -> Result<Value, McpError> {
+    let rows: Vec<(String, String, i64, i64, f64, i64, i64)> = sqlx::query_as(
+        "SELECT tool, client_name,
+                COUNT(*)::bigint                                AS measured_calls,
+                COALESCE(SUM(result_bytes), 0)::bigint          AS total_bytes,
+                COALESCE(AVG(result_bytes), 0)::float8          AS avg_bytes,
+                COALESCE(SUM(result_tokens_est), 0)::bigint     AS total_tokens_est,
+                COALESCE(MAX(result_bytes), 0)::bigint          AS max_bytes
+         FROM mcp_tool_calls
+         WHERE ts > now() - ($1::int * interval '1 minute')
+           AND result_bytes IS NOT NULL
+           AND ($2::text IS NULL OR tool = $2)
+           AND ($3::text IS NULL OR client_name = $3)
+           AND ($4::text IS NULL OR NULLIF(project, '') = $4)
+         GROUP BY tool, client_name
+         ORDER BY total_bytes DESC
+         LIMIT 50",
+    )
+    .bind(query.since_minutes)
+    .bind(query.tool.as_deref())
+    .bind(query.client_name.as_deref())
+    .bind(query.project.as_deref())
+    .fetch_all(pool)
+    .await
+    .map_err(map_db_err)?;
+
+    Ok(json!({
+        "note": "Serialized result-size telemetry (result_bytes); token estimate is ~bytes/4, not an \
+                 exact tokenizer count. Use to target result-payload slimming at the real offenders.",
+        "rows": rows.into_iter().map(
+            |(tool, client, calls, total, avg, tokens, max)| json!({
+                "tool": tool,
+                "client_name": client,
+                "measured_calls": calls,
+                "total_bytes": total,
+                "avg_bytes": avg,
+                "total_tokens_est": tokens,
+                "max_bytes": max,
+            })
+        ).collect::<Vec<_>>(),
     }))
 }
 
