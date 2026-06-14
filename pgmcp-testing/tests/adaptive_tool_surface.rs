@@ -7,7 +7,7 @@ mod common;
 
 use std::collections::HashSet;
 
-use common::{server_with_pool, text_of};
+use common::{context_with_pool, server_with_pool, text_of};
 use pgmcp::mcp::client_profile::{ClientProfile, ToolSurface};
 use pgmcp::mcp::server::McpServer;
 use pgmcp::mcp::tool_policy::{ToolPolicyConfig, recompute_and_persist};
@@ -139,5 +139,116 @@ async fn learner_promotes_used_tools_and_decays_old_ones() {
     assert!(
         tools.iter().all(|t| t.name.as_ref() != "ancient_tool"),
         "a decayed/absent tool must not appear"
+    );
+}
+
+/// Fix 1 (warm-up embed): `warm_mcp_tool_catalog` must seed AND embed every row,
+/// so `tool_catalog` semantic ranking works out of the box without the
+/// (default-off) embedding-migration cron. With embeddings present, a semantic
+/// query then returns scored rows (non-null `score`) — the path that was dead when
+/// every embedding stayed NULL.
+#[tokio::test(flavor = "multi_thread")]
+async fn warm_up_embeds_catalog_and_semantic_search_scores() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let ctx = context_with_pool(pool.clone());
+
+    pgmcp::mcp::tools::tool_meta::warm_mcp_tool_catalog(&ctx)
+        .await
+        .expect("warm-up must seed + embed");
+
+    let (total, missing) = pgmcp::db::mcp_tool_catalog::counts(&pool)
+        .await
+        .expect("counts");
+    assert!(total > 0, "warm-up must seed the server's own tools");
+    assert_eq!(
+        missing, 0,
+        "warm-up must embed every row, got {missing}/{total} still NULL"
+    );
+
+    // With embeddings present, the semantic path returns scored rows.
+    let server = server_with_pool(pool);
+    let r = server
+        .call_tool_cli(
+            "tool_catalog",
+            json!({ "query": "rank graph nodes by importance", "limit": 5 }),
+        )
+        .await
+        .expect("tool_catalog query");
+    let v: serde_json::Value = serde_json::from_str(&text_of(&r)).expect("query JSON");
+    let results = v["results"].as_array().expect("results array");
+    assert!(
+        !results.is_empty(),
+        "semantic search must return rows once the catalog is embedded"
+    );
+    assert!(
+        results[0]["score"].is_number(),
+        "semantic ranking must yield a non-null score, got {:?}",
+        results[0]
+    );
+}
+
+/// Fix 2 (tokenized keyword fallback): a multi-word natural-language query must
+/// match a tool via ANY token as a substring — not only as a verbatim contiguous
+/// phrase (the old whole-string `ILIKE` returned nothing for such queries, even
+/// when individual words appeared in a description).
+#[tokio::test(flavor = "multi_thread")]
+async fn keyword_fallback_matches_multiword_query() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+
+    // A probe whose description holds the tokens but NOT the contiguous phrase.
+    pgmcp::db::mcp_tool_catalog::upsert_tool(
+        &pool,
+        "zzz_probe_centrality",
+        "graph_core",
+        "rank nodes by centrality and pagerank importance",
+        "{}",
+    )
+    .await
+    .expect("seed probe row");
+
+    let rows = pgmcp::db::mcp_tool_catalog::keyword_search(
+        &pool,
+        "centrality pagerank graph importance ranking",
+        10,
+        None,
+    )
+    .await
+    .expect("keyword_search");
+
+    assert!(
+        rows.iter().any(|r| r.name == "zzz_probe_centrality"),
+        "tokenized fallback must match a multi-word query; got {:?}",
+        rows.iter().map(|r| &r.name).collect::<Vec<_>>()
+    );
+}
+
+/// Fix 3 (honest, cross-linked guidance): an empty `tool_catalog` result must
+/// point the caller at `toolbox_search` — EXTERNAL installed dev tools live in a
+/// separate catalog — instead of only blaming a transient embedding backfill.
+#[tokio::test(flavor = "multi_thread")]
+async fn empty_result_guidance_cross_links_toolbox() {
+    let db = require_test_db!();
+    let server = server_with_pool(db.pool().clone());
+
+    // A non-existent domain guarantees an empty result regardless of embedding state.
+    let r = server
+        .call_tool_cli(
+            "tool_catalog",
+            json!({ "query": "formal verification rocq coq tla", "domain": "zzz_nonexistent_domain" }),
+        )
+        .await
+        .expect("tool_catalog");
+    let v: serde_json::Value = serde_json::from_str(&text_of(&r)).expect("JSON");
+    assert_eq!(
+        v["result_count"].as_i64(),
+        Some(0),
+        "a non-existent domain must yield an empty result"
+    );
+    let guidance = v["guidance"].as_str().unwrap_or_default();
+    assert!(
+        guidance.contains("toolbox_search"),
+        "empty-result guidance must cross-link toolbox_search; got: {guidance}"
     );
 }

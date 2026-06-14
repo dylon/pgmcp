@@ -15,7 +15,7 @@ use rmcp::model::CallToolResult;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::atomic::Ordering;
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::context::SystemContext;
 use crate::db::mcp_tool_catalog::{self, ToolCatalogSearchRow};
@@ -51,18 +51,46 @@ pub async fn tool_tool_catalog(
     );
 
     let rows = search_catalog(ctx, pool, query.as_deref(), limit, domain.clone()).await?;
+    let guidance = catalog_guidance(pool, rows.is_empty()).await;
 
     json_result(&json!({
         "query": query,
         "domain": domain,
         "result_count": rows.len(),
         "results": rows,
-        "guidance": "These are this server's OWN MCP tools. You currently see only your default \
-    working set in tools/list; to use a tool listed here that is not yet visible, call \
-    `enable_tools({names:[...]})` (or `enable_tools({query:\"...\"})` / `{domain:\"...\"}`) — it then \
-    appears natively. As a direct fallback you can also `call_tool({name, args})` without enabling. \
-    Empty results may mean embeddings are still backfilling — keyword matching is used until then.",
+        "guidance": guidance,
     }))
+}
+
+/// Guidance line for `tool_catalog`. Always explains `enable_tools` / `call_tool`;
+/// on an empty result it additionally (a) cross-links `toolbox_search` — EXTERNAL
+/// installed developer tools (Coq/Rocq, TLA+, Z3, perf, valgrind…) live in a
+/// separate catalog, not here — and (b) reports the real embedding-backfill status
+/// from [`mcp_tool_catalog::counts`] instead of unconditionally asserting a
+/// transient "still backfilling".
+async fn catalog_guidance(pool: &PgPool, empty: bool) -> String {
+    let mut g = String::from(
+        "These are this server's OWN MCP tools. You currently see only your default working set in \
+         tools/list; to use a tool listed here that is not yet visible, call enable_tools({names:[...]}) \
+         (or enable_tools({query:\"...\"}) / {domain:\"...\"}) — it then appears natively. As a direct \
+         fallback you can also call_tool({name, args}) without enabling.",
+    );
+    if empty {
+        g.push_str(
+            " No own-tools matched. For EXTERNAL installed developer tools (e.g. Coq/Rocq, TLA+/TLC, \
+             Z3, perf, valgrind) use toolbox_search / toolbox_recommend instead — those live in a \
+             separate catalog.",
+        );
+        if let Ok((total, missing)) = mcp_tool_catalog::counts(pool).await
+            && missing > 0
+        {
+            g.push_str(&format!(
+                " (Semantic ranking is degraded: {missing}/{total} tools are not yet embedded; \
+                 keyword matching is used until the warm-up embed pass completes.)"
+            ));
+        }
+    }
+    g
 }
 
 /// Resolve a `tool_catalog` / `enable_tools(query=…)` search to ranked rows.
@@ -198,11 +226,51 @@ pub async fn seed_mcp_tool_catalog(pool: &PgPool) -> Result<u64, McpError> {
 }
 
 /// Daemon-startup warm path: re-seed the catalog from the live tool list so
-/// description edits since the last boot propagate (and deleted tools are pruned).
-/// Embedding stays with the embedding-migration cron.
+/// description edits since the last boot propagate (and deleted tools are pruned),
+/// then synchronously embed any NULL-embedding rows so `tool_catalog` semantic
+/// ranking works out of the box — without waiting on the embedding-migration cron,
+/// which is disabled by default (`[cron] embedding_migration_interval_secs = 0`).
+/// The embed is a near-no-op on a warm restart: `upsert_tool` preserves unchanged
+/// vectors, so only new/edited rows are missing. An embed failure is non-fatal —
+/// the seed already succeeded and the tokenized keyword fallback covers discovery
+/// until the next pass.
 pub async fn warm_mcp_tool_catalog(ctx: &SystemContext) -> Result<(), McpError> {
     let pool = raw_pool(ctx)?;
-    seed_mcp_tool_catalog(pool).await.map(|_| ())
+    seed_mcp_tool_catalog(pool).await?;
+    match reembed_missing(ctx, pool).await {
+        Ok(n) if n > 0 => debug!(
+            embedded = n,
+            "mcp_tool_catalog: embedded NULL rows on warm-up"
+        ),
+        Ok(_) => {}
+        Err(e) => {
+            warn!(error = ?e, "mcp_tool_catalog warm-up embed failed; keyword fallback active until next pass")
+        }
+    }
+    Ok(())
+}
+
+/// Synchronously embed every NULL-embedding catalog row using the same embedder
+/// the query path uses (`ctx.embed()`), so the in-process vector matches what the
+/// embedding-migration cron would write. Per-row single-query embed — fine for the
+/// ~330 compact rows, and self-throttling (only NULL rows are returned). Mirrors
+/// [`crate::mcp::tools::tool_toolbox`]'s `reembed_missing`.
+async fn reembed_missing(ctx: &SystemContext, pool: &PgPool) -> Result<u64, McpError> {
+    let batch = mcp_tool_catalog::ids_missing_embeddings(pool, 10_000)
+        .await
+        .map_err(sql_error("tool_catalog_reembed"))?;
+    let mut embedded = 0u64;
+    for (id, text) in batch {
+        let embedding = ctx.embed().embed_query(&text).await.map_err(|e| {
+            error!(tool = "tool_catalog_reembed", error = %e, "Embedding failed");
+            McpError::internal_error(format!("Embedding failed: {e}"), None)
+        })?;
+        mcp_tool_catalog::update_embedding(pool, id, &embedding)
+            .await
+            .map_err(sql_error("tool_catalog_reembed"))?;
+        embedded += 1;
+    }
+    Ok(embedded)
 }
 
 fn normalize_opt(value: Option<String>) -> Option<String> {

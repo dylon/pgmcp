@@ -36,7 +36,7 @@ pub fn server_with_pool(pool: PgPool) -> McpServer {
     server_with_db_arc(db, Config::default())
 }
 
-fn server_with_db_arc(db: Arc<dyn DbClient>, cfg: Config) -> McpServer {
+fn context_with_db_arc(db: Arc<dyn DbClient>, cfg: Config) -> SystemContext {
     let stats = Arc::new(StatsTracker::new());
     let config = Arc::new(ArcSwap::from_pointee(cfg));
     let log_broadcaster = Arc::new(LogBroadcaster::new());
@@ -44,7 +44,7 @@ fn server_with_db_arc(db: Arc<dyn DbClient>, cfg: Config) -> McpServer {
     let embed_backend: Arc<dyn pgmcp::embed::EmbeddingBackend> =
         Arc::new(DeterministicEmbeddingBackend::new(1024));
     let embed_source = EmbedSource::backend(embed_backend);
-    let ctx = SystemContext::production(
+    SystemContext::production(
         db,
         embed_source,
         stats,
@@ -56,8 +56,19 @@ fn server_with_db_arc(db: Arc<dyn DbClient>, cfg: Config) -> McpServer {
             __l.transition(pgmcp::daemon_state::DaemonPhase::Ready);
             __l
         },
-    );
-    McpServer::new(ctx)
+    )
+}
+
+fn server_with_db_arc(db: Arc<dyn DbClient>, cfg: Config) -> McpServer {
+    McpServer::new(context_with_db_arc(db, cfg))
+}
+
+/// Build a `SystemContext` over a real `PgPool` with the deterministic 1024-d
+/// embedder — for tests that exercise context-level helpers (e.g. the
+/// `tool_catalog` warm-up embed) directly rather than through `McpServer`.
+#[allow(dead_code)]
+pub fn context_with_pool(pool: PgPool) -> SystemContext {
+    context_with_db_arc(Arc::new(pool), Config::default())
 }
 
 /// Pull the first text-Content payload out of an MCP tool result.

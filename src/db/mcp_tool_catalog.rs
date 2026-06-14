@@ -123,23 +123,42 @@ pub async fn semantic_search(
 }
 
 /// Keyword fallback used before embeddings backfill (or when the embedder is
-/// unavailable): ranks by `name`/`description` `ILIKE`. An empty query lists the
-/// catalog (optionally domain-filtered), name-ordered.
+/// unavailable). Tokenizes the query on whitespace and matches **any** token as a
+/// substring of `name`/`description`, ranking by the number of distinct tokens
+/// that hit — so a multi-word natural-language query (e.g. "centrality pagerank
+/// graph") still finds tools, unlike a single contiguous-substring `ILIKE` which
+/// only matched a verbatim phrase. An empty query lists the catalog (optionally
+/// domain-filtered), name-ordered.
 pub async fn keyword_search(
     pool: &PgPool,
     query: &str,
     limit: i64,
     domain: Option<String>,
 ) -> Result<Vec<ToolCatalogSearchRow>, sqlx::Error> {
+    // `%token%` ILIKE patterns from the whitespace-split query. An empty set (no
+    // query) falls through to a plain name-ordered catalog browse.
+    let patterns: Vec<String> = query
+        .split_whitespace()
+        .map(|tok| format!("%{tok}%"))
+        .collect();
     sqlx::query_as::<_, ToolCatalogSearchRow>(
         "SELECT name, domain, description, NULL::float8 AS score
          FROM mcp_tool_catalog
          WHERE ($3::text IS NULL OR domain = $3)
-           AND ($1 = '' OR name ILIKE '%' || $1 || '%' OR description ILIKE '%' || $1 || '%')
-         ORDER BY (name ILIKE $1 || '%') DESC, name
+           AND (
+             cardinality($1::text[]) = 0
+             OR EXISTS (
+               SELECT 1 FROM unnest($1::text[]) AS pat
+               WHERE name ILIKE pat OR description ILIKE pat
+             )
+           )
+         ORDER BY (
+             SELECT count(*) FROM unnest($1::text[]) AS pat
+             WHERE name ILIKE pat OR description ILIKE pat
+           ) DESC, name
          LIMIT $2",
     )
-    .bind(query)
+    .bind(patterns)
     .bind(limit)
     .bind(domain)
     .fetch_all(pool)
@@ -156,4 +175,50 @@ pub async fn counts(pool: &PgPool) -> Result<(i64, i64), sqlx::Error> {
             .fetch_one(pool)
             .await?;
     Ok((total, missing))
+}
+
+/// Row ids (with their embed prose) whose `embedding` is still NULL, up to
+/// `limit`. The text mirrors the embedding-migration cron's `text_select` for
+/// `mcp_tool_catalog` (`concat_ws(' ', name, description)`) — and the seed-path
+/// [`embed_text`] — so an in-process warm-up reembed produces the same vector the
+/// cron would. Drives [`crate::mcp::tools::tool_meta::warm_mcp_tool_catalog`].
+pub async fn ids_missing_embeddings(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<(i64, String)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT id, concat_ws(' ', name, description) AS t
+         FROM mcp_tool_catalog
+         WHERE embedding IS NULL
+         ORDER BY id
+         LIMIT $1",
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Write one row's 1024-dim BGE-M3 embedding, stamping the `bge-m3-v1` signature
+/// the cron uses (the v38 column default). Used by the warm-up reembed so
+/// `tool_catalog` semantic ranking works without the (default-off) cron.
+pub async fn update_embedding(
+    pool: &PgPool,
+    id: i64,
+    embedding: &[f32],
+) -> Result<(), sqlx::Error> {
+    if embedding.len() != 1024 {
+        return Err(sqlx::Error::Protocol(format!(
+            "mcp_tool_catalog::update_embedding: expected a 1024-dim BGE-M3 embedding, got {}",
+            embedding.len()
+        )));
+    }
+    let embedding_vec = Vector::from(embedding.to_vec());
+    sqlx::query(
+        "UPDATE mcp_tool_catalog SET embedding = $1, embedding_signature = 'bge-m3-v1' WHERE id = $2",
+    )
+    .bind(&embedding_vec)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
