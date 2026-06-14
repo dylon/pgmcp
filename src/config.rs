@@ -2733,6 +2733,68 @@ pub struct CronConfig {
     /// Number of top keywords per topic from c-TF-IDF (default: 5)
     #[serde(default = "default_topic_label_top_k")]
     pub topic_label_top_k: usize,
+
+    // ── Phase 1 degeneracy gate (src/quality/topic_metrics.rs) ──────────────
+    // Thresholds the topic scan consults BEFORE overwriting good topics, so a
+    // collapsed model (uniform memberships / one repeated label / corpus-wide
+    // smearing) can never again silently replace a healthy one. See ADR on the
+    // topic-clustering redesign.
+    /// Gate floor for `mean_max_membership` is `factor / K`. Uniform (collapsed)
+    /// memberships are exactly `1/K`; require at least `factor ×` that. Default 2.0.
+    #[serde(default = "default_topic_min_mean_max_membership_factor")]
+    pub topic_min_mean_max_membership_factor: f64,
+    /// Minimum `distinct(labels)/n_topics`. Default 0.30.
+    #[serde(default = "default_topic_min_distinct_label_ratio")]
+    pub topic_min_distinct_label_ratio: f64,
+    /// Maximum mean topics-per-doc (the v3 per-chunk cap is 4). Default 6.0.
+    #[serde(default = "default_topic_max_topics_per_doc")]
+    pub topic_max_topics_per_doc: f64,
+    /// Maximum single-topic share of all assignments. Default 0.60.
+    #[serde(default = "default_topic_max_topic_share")]
+    pub topic_max_topic_share: f64,
+    /// Minimum fuzzy silhouette to accept. Default -1.0 (disabled; the
+    /// membership/label signals are the load-bearing gates).
+    #[serde(default = "default_topic_min_fuzzy_silhouette")]
+    pub topic_min_fuzzy_silhouette: f64,
+
+    // ── Phase 2 topic-clustering engine selection ───────────────────────────
+    /// Which topic-clustering engine to use:
+    /// - `"baseline"` — FCM on raw 1024-d embeddings (the path that collapsed);
+    /// - `"embedding_pca"` — FCM on PCA-reduced embeddings (breaks the
+    ///   curse-of-dimensionality collapse; the embedding-BERTopic track);
+    /// - `"embedding_rp"` — FCM on JL-random-projection-reduced embeddings;
+    /// - `"graph"` — Leiden/Louvain communities over the fused semantic+import+
+    ///   co-change graph (`src/cron/topic_graph.rs`).
+    ///
+    /// Default `"embedding_pca"` — the bake-off (Phase 3) confirms the winner.
+    #[serde(default = "default_topic_clustering_method")]
+    pub topic_clustering_method: String,
+    /// Target dimensionality for the embedding-track reducers. Default 30.
+    #[serde(default = "default_topic_reduce_dim")]
+    pub topic_reduce_dim: usize,
+    /// Per-edge-type weights for the graph track `[knn_semantic, import,
+    /// co_change]`. Default `[1.0, 1.0, 1.0]` (equal fusion).
+    #[serde(default = "default_topic_graph_edge_weights")]
+    pub topic_graph_edge_weights: Vec<f64>,
+    /// Louvain/Leiden resolution for the graph track. Higher → more, smaller
+    /// communities. Default 1.0.
+    #[serde(default = "default_topic_graph_resolution")]
+    pub topic_graph_resolution: f64,
+
+    // ── Phase 4: LLM topic labeling ─────────────────────────────────────────
+    /// Replace each stored topic's deterministic c-TF-IDF label with a
+    /// human-readable label from the local qwen3 model. The c-TF-IDF keywords
+    /// are always kept as the fallback (used verbatim if the model is
+    /// unavailable). Applied in the per-project graph cron (authoritative store);
+    /// the on-demand `discover_topics` path stays deterministic for speed.
+    /// Default true (honoring "LLM labels for all"); set false to disable.
+    #[serde(default = "default_topic_llm_labels")]
+    pub topic_llm_labels: bool,
+    /// Local LLM backend for topic labels: `qwen3-4b` (default) or `qwen3-8b`.
+    /// Any other value disables LLM labeling (deterministic labels kept).
+    #[serde(default = "default_topic_llm_backend")]
+    pub topic_llm_backend: String,
+
     /// Interval between graph analysis runs in seconds (default: 7200 = 2 hours)
     #[serde(default = "default_graph_analysis_interval")]
     pub graph_analysis_interval_secs: u64,
@@ -3041,6 +3103,17 @@ impl Default for CronConfig {
             topic_fcm_tolerance: default_topic_fcm_tolerance(),
             topic_membership_threshold: default_topic_membership_threshold(),
             topic_label_top_k: default_topic_label_top_k(),
+            topic_min_mean_max_membership_factor: default_topic_min_mean_max_membership_factor(),
+            topic_min_distinct_label_ratio: default_topic_min_distinct_label_ratio(),
+            topic_max_topics_per_doc: default_topic_max_topics_per_doc(),
+            topic_max_topic_share: default_topic_max_topic_share(),
+            topic_min_fuzzy_silhouette: default_topic_min_fuzzy_silhouette(),
+            topic_clustering_method: default_topic_clustering_method(),
+            topic_reduce_dim: default_topic_reduce_dim(),
+            topic_graph_edge_weights: default_topic_graph_edge_weights(),
+            topic_graph_resolution: default_topic_graph_resolution(),
+            topic_llm_labels: default_topic_llm_labels(),
+            topic_llm_backend: default_topic_llm_backend(),
             graph_analysis_interval_secs: default_graph_analysis_interval(),
             symbol_extraction_interval_secs: default_symbol_extraction_interval(),
             fuzzy_sync_interval_secs: default_fuzzy_sync_interval(),
@@ -3359,6 +3432,45 @@ fn default_topic_membership_threshold() -> f64 {
 }
 fn default_topic_label_top_k() -> usize {
     5
+}
+fn default_topic_min_mean_max_membership_factor() -> f64 {
+    2.0
+}
+fn default_topic_min_distinct_label_ratio() -> f64 {
+    0.30
+}
+fn default_topic_max_topics_per_doc() -> f64 {
+    6.0
+}
+fn default_topic_max_topic_share() -> f64 {
+    0.60
+}
+fn default_topic_min_fuzzy_silhouette() -> f64 {
+    -1.0
+}
+fn default_topic_clustering_method() -> String {
+    // The bake-off (2026-06-13) found the graph-hybrid engine the clear winner
+    // on real embeddings: non-degenerate, clean 1-topic-per-doc partition, real
+    // coherence (NPMI 0.39) + diversity (0.71) + modularity (1.22), and ~10×
+    // faster than the FCM embedding tracks (which stay diffuse/poorly-separated
+    // even after PCA). Works for prose too (fuses the semantic-similarity edges
+    // when import/call edges are sparse). Override per `topic_clustering_method`.
+    "graph".to_string()
+}
+fn default_topic_reduce_dim() -> usize {
+    30
+}
+fn default_topic_graph_edge_weights() -> Vec<f64> {
+    vec![1.0, 1.0, 1.0]
+}
+fn default_topic_graph_resolution() -> f64 {
+    1.0
+}
+fn default_topic_llm_labels() -> bool {
+    true
+}
+fn default_topic_llm_backend() -> String {
+    "qwen3-4b".to_string()
 }
 fn default_graph_analysis_interval() -> u64 {
     7200

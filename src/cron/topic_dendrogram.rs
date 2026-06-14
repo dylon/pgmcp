@@ -20,6 +20,12 @@ use tracing::{debug, info, warn};
 
 use crate::stats::tracker::StatsTracker;
 
+/// Upper bound on chunks fed to the O(n²) agglomerative extractor. ~6k chunks
+/// → ~280 MB distance matrix; larger projects are strided-subsampled. This is
+/// the fix for the empty-`topic_dendrograms` bug (giant projects OOMed the
+/// extractor and the error was swallowed).
+const MAX_DENDROGRAM_CHUNKS: usize = 6_000;
+
 /// Per-run outcome.
 #[derive(Debug, Default, Clone)]
 pub struct DendrogramRunReport {
@@ -89,8 +95,46 @@ async fn run_project(
         return Ok(0);
     }
 
-    let embeddings: Vec<Vec<f32>> = chunks.iter().map(|c| c.embedding.clone()).collect();
-    let documents: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+    // Bound the input before the agglomerative extractor. libgrammstein's
+    // `TopicExtractor::extract` builds an O(n²) distance matrix, so a giant
+    // project (e.g. `claude` at ~167k chunks → ~114 GB) OOMs and the error is
+    // swallowed by `run_pass`, leaving `topic_dendrograms` permanently empty.
+    // A deterministic strided subsample caps n at `MAX_DENDROGRAM_CHUNKS`
+    // (~6k → ~280 MB matrix), which makes the dendrogram populate for ALL
+    // projects, including the giants, while spanning the whole corpus.
+    let (embeddings, documents) = if chunks.len() > MAX_DENDROGRAM_CHUNKS {
+        let stride = chunks.len() / MAX_DENDROGRAM_CHUNKS;
+        let stride = stride.max(1);
+        let sampled: Vec<&crate::db::queries::ChunkEmbeddingRow> = chunks
+            .iter()
+            .step_by(stride)
+            .take(MAX_DENDROGRAM_CHUNKS)
+            .collect();
+        info!(
+            project = project_name,
+            total = chunks.len(),
+            sampled = sampled.len(),
+            "topic-dendrogram: subsampling large project before agglomerative clustering"
+        );
+        (
+            sampled
+                .iter()
+                .map(|c| c.embedding.clone())
+                .collect::<Vec<_>>(),
+            sampled
+                .iter()
+                .map(|c| c.content.clone())
+                .collect::<Vec<_>>(),
+        )
+    } else {
+        (
+            chunks
+                .iter()
+                .map(|c| c.embedding.clone())
+                .collect::<Vec<_>>(),
+            chunks.iter().map(|c| c.content.clone()).collect::<Vec<_>>(),
+        )
+    };
     let mut extractor = TopicExtractor::new(TopicConfig::default());
     let result = match extractor.extract(&embeddings, &documents) {
         Ok(r) => r,

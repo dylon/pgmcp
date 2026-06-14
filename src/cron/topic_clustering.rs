@@ -19,6 +19,7 @@ use crate::config::CronConfig;
 use crate::db::DbClient;
 use crate::db::queries::ChunkEmbeddingRow;
 use crate::fcm;
+use crate::quality::topic_metrics::{DegeneracyThresholds, TopicMetrics};
 mod similarity;
 use similarity::*;
 
@@ -81,6 +82,12 @@ pub struct ClusteringSummary {
     pub converged: bool,
     pub iterations: usize,
     pub topics: Vec<TopicResult>,
+    /// Quality metrics for this clustering result (coherence, validity,
+    /// degeneracy signals). `None` for empty/degenerate-early-return summaries.
+    /// Computed in the clustering paths where the membership matrix is in scope;
+    /// consulted by the pre-overwrite degeneracy gate and persisted for trend.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<crate::quality::topic_metrics::TopicMetrics>,
 }
 
 // ============================================================================
@@ -325,6 +332,30 @@ fn cap_chunk_memberships(chunk_topics: &mut Vec<(usize, f64)>) {
         chunk_topics.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         chunk_topics.truncate(MAX_MEMBERSHIPS_PER_CHUNK);
     }
+}
+
+/// The strongest topics for chunk `i` (membership > 1e-8), capped to
+/// `MAX_MEMBERSHIPS_PER_CHUNK`. Shared by both c-TF-IDF paths so a chunk's
+/// tokens feed only its dominant topics.
+///
+/// Without this cap, diffuse fuzzy memberships (FCM with m=2, large K) place
+/// non-trivial mass on nearly every topic, so every word ends up in every
+/// topic's bag — and the max-document-frequency cutoff in c-TF-IDF then drops
+/// *all* of them, yielding empty keyword lists (the empty-label failure the
+/// bake-off exposed for the embedding tracks). Capping to the top memberships
+/// keeps per-topic word distributions sparse and discriminative, exactly
+/// mirroring the assignment cap. For K ≤ `MAX_MEMBERSHIPS_PER_CHUNK` this is a
+/// no-op, so the small-K golden fixtures are unaffected.
+fn top_membership_topics(membership: &Array2<f32>, i: usize, k: usize) -> Vec<(usize, f64)> {
+    let mut v: Vec<(usize, f64)> = (0..k)
+        .map(|t| (t, membership[[i, t]] as f64))
+        .filter(|&(_, mu)| mu > 1e-8)
+        .collect();
+    if v.len() > MAX_MEMBERSHIPS_PER_CHUNK {
+        v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        v.truncate(MAX_MEMBERSHIPS_PER_CHUNK);
+    }
+    v
 }
 
 // Stopword tiers for c-TF-IDF topic labeling.
@@ -653,7 +684,11 @@ pub struct TopicKeyword {
 /// `Vec<String>` per chunk. Splits on non-alphanumeric, then splits each raw
 /// identifier into concept sub-tokens ([`split_identifier`]), lowercases, and
 /// applies the length / all-digit / stopword filters. Clears `buf` first.
-fn tokenize_into(content: &str, buf: &mut Vec<String>) {
+///
+/// `pub(crate)` so `crate::quality::topic_metrics` can tokenise documents the
+/// same way the labels were derived — NPMI coherence requires term presence to
+/// match the keyword vocabulary exactly.
+pub(crate) fn tokenize_into(content: &str, buf: &mut Vec<String>) {
     buf.clear();
     let stopwords = code_stopwords();
     let user_extras = user_stopwords();
@@ -690,7 +725,6 @@ pub fn compute_ctf_idf(
     membership: &Array2<f32>,
     top_k: usize,
 ) -> Vec<Vec<TopicKeyword>> {
-    let n = contents.len();
     let k = membership.ncols();
 
     // For each topic, accumulate weighted token counts.
@@ -701,8 +735,8 @@ pub fn compute_ctf_idf(
     let mut scratch_tokens: Vec<String> = Vec::with_capacity(256);
     let mut local_counts: HashMap<String, u32> = HashMap::with_capacity(256);
 
-    for i in 0..n {
-        tokenize_into(contents[i], &mut scratch_tokens);
+    for (i, content) in contents.iter().enumerate() {
+        tokenize_into(content, &mut scratch_tokens);
 
         // Count tokens in this chunk (reuse local_counts map).
         local_counts.clear();
@@ -710,12 +744,10 @@ pub fn compute_ctf_idf(
             *local_counts.entry(token.clone()).or_insert(0) += 1;
         }
 
-        // Distribute to each topic weighted by membership (skip near-zero).
-        for t in 0..k {
-            let mu = membership[[i, t]] as f64;
-            if mu < 1e-8 {
-                continue;
-            }
+        // Distribute tokens to this chunk's strongest topics only (top-J cap),
+        // so diffuse fuzzy memberships don't smear every word into every topic
+        // and trip the max-df cutoff (which would empty all keyword lists).
+        for (t, mu) in top_membership_topics(membership, i, k) {
             for (word, &count) in &local_counts {
                 let weighted = mu * count as f64;
                 *topic_word_counts[t].entry(word.clone()).or_insert(0.0) += weighted;
@@ -809,6 +841,11 @@ struct FcmParams {
     tolerance: f64,
     membership_threshold: f64,
     label_top_k: usize,
+    /// Phase 2 (Track B): optional dimensionality reduction applied to the
+    /// embedding matrix before FCM. `None` = cluster raw 1024-d (baseline).
+    reduce_method: Option<crate::cron::topic_reduce::ReduceMethod>,
+    /// Target dimensionality when `reduce_method` is `Some`.
+    reduce_dim: usize,
     /// GPU precision selector ("fp32" | "fp16" | "bf16"). Read in
     /// `dispatch_fcm` to pick the CUDA backend.
     gpu_fcm_precision: String,
@@ -839,6 +876,16 @@ impl FcmParams {
             tolerance: config.topic_fcm_tolerance,
             membership_threshold: config.topic_membership_threshold,
             label_top_k: config.topic_label_top_k,
+            reduce_method: match config.topic_clustering_method.as_str() {
+                "embedding_pca" | "pca" => Some(crate::cron::topic_reduce::ReduceMethod::Pca),
+                "embedding_rp" | "embedding_random" | "rp" => {
+                    Some(crate::cron::topic_reduce::ReduceMethod::RandomProjection)
+                }
+                // "baseline" clusters raw 1024-d; "graph" is handled by a
+                // separate entry point (topic_graph) and never reaches here.
+                _ => None,
+            },
+            reduce_dim: config.topic_reduce_dim,
             gpu_fcm_precision: config.gpu_fcm_precision.clone(),
             k_selector: config.topic_k_selector.clone(),
             k_candidates: config.topic_k_candidates.clone(),
@@ -1039,6 +1086,7 @@ where
             converged: false,
             iterations: 0,
             topics: Vec::new(),
+            metrics: None,
         };
     }
 
@@ -1057,6 +1105,27 @@ where
             data.row_mut(i).mapv_inplace(|x| x / norm);
         }
     }
+
+    // Phase 2 (Track B): optional dimensionality reduction BEFORE clustering.
+    // Clustering raw 1024-d embeddings is what caused the collapse (distance
+    // concentration → uniform memberships); reducing to ~30-d restores contrast.
+    // All downstream work (FCM, centroids, avg-similarity, metrics) then runs in
+    // the reduced space — `data` and `d` are rebound to the reduced matrix.
+    let (data, d) = match params.reduce_method {
+        Some(method) => {
+            let target = params.reduce_dim.min(d).max(2);
+            info!(
+                from_dim = d,
+                to_dim = target,
+                method = ?method,
+                "Track B: reducing embeddings before FCM"
+            );
+            let reduced = crate::cron::topic_reduce::reduce(data.view(), target, method, 42);
+            let rd = reduced.ncols();
+            (reduced, rd)
+        }
+        None => (data, d),
+    };
 
     // Determine K — adaptive sweep (Phase 12) when num_clusters is None.
     let k = match params.num_clusters {
@@ -1232,6 +1301,25 @@ where
     // Sort by chunk count descending
     topics.sort_by_key(|b| std::cmp::Reverse(b.chunk_ids.len()));
 
+    // Phase 1: compute quality metrics on the FINAL model — the membership
+    // matrix, centroids, data, and chunk contents are all still in scope here.
+    // Coherence (NPMI / UMass) reuses the same tokenizer the labels were derived
+    // from. The scan paths consult `summary.metrics` for the degeneracy gate and
+    // persist it for trend.
+    let mut metrics = TopicMetrics::compute(
+        data.view(),
+        fcm_result.membership.view(),
+        fcm_result.centroids.view(),
+        params.fuzziness,
+        k,
+        &topics,
+    );
+    metrics.fill_coherence(
+        &contents,
+        &topics,
+        crate::quality::topic_metrics::DEFAULT_COHERENCE_TOP_N,
+    );
+
     ClusteringSummary {
         scope: scope.to_string(),
         chunks_analyzed: n,
@@ -1242,6 +1330,7 @@ where
         converged: fcm_result.converged,
         iterations: fcm_result.iterations,
         topics,
+        metrics: Some(metrics),
     }
 }
 
@@ -1335,6 +1424,58 @@ pub(crate) fn check_memory_budget(
     }
 }
 
+/// Phase 1 degeneracy gate. Returns `true` if the scan should ABORT the
+/// clear+store (preserving the prior, presumably-good topics) because the new
+/// model is degenerate. Logs the reason and bumps `topic_degenerate_refusals`
+/// on rejection.
+///
+/// This is the structural fix for the silent collapse: the prior
+/// `store_topics` guard only withheld the algo-signature *after* it had already
+/// cleared and overwritten the previous topics. This gate runs *before* the
+/// destructive clear, so a degenerate cycle cannot replace good data with junk.
+fn topic_gate_rejects(
+    summary: &ClusteringSummary,
+    config: &CronConfig,
+    stats: &Arc<StatsTracker>,
+) -> bool {
+    let Some(metrics) = summary.metrics.as_ref() else {
+        // No metrics computed (e.g. the online >1M path). Fall back to the
+        // existing iterations==0 wipe-protection the caller already applied.
+        return false;
+    };
+    let thresholds = DegeneracyThresholds::from_config(config);
+    if let Some(reason) = metrics.degeneracy_reason(&thresholds) {
+        warn!(
+            scope = %summary.scope,
+            k = summary.num_clusters,
+            topics = summary.topics_found,
+            mean_max_membership = metrics.mean_max_membership,
+            distinct_label_ratio = metrics.distinct_label_ratio,
+            topics_per_doc = metrics.topics_per_doc_mean,
+            max_topic_share = metrics.max_topic_share,
+            fuzzy_silhouette = metrics.fuzzy_silhouette,
+            reason = %reason,
+            "topic degeneracy gate: REFUSING to overwrite prior topics with a degenerate model"
+        );
+        stats
+            .topic_degenerate_refusals
+            .fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
+    false
+}
+
+/// Persist the scan's quality metrics to `pgmcp_metadata['topics_quality']`
+/// (best-effort; a failure here does not fail the scan). Called after a
+/// successful `store_topics`.
+async fn persist_topic_quality(db: &dyn DbClient, scope: &str, summary: &ClusteringSummary) {
+    if let (Some(pool), Some(metrics)) = (db.pool(), summary.metrics.as_ref())
+        && let Err(e) = crate::db::queries::set_topic_quality(pool, scope, &metrics.to_json()).await
+    {
+        warn!(scope, error = %e, "failed to persist topic quality metrics");
+    }
+}
+
 /// Run a global topic scan over all chunks, storing results in the DB.
 pub async fn run_global_topic_scan(
     db: &dyn DbClient,
@@ -1364,6 +1505,18 @@ pub async fn run_global_topic_scan(
             return;
         }
         Some(_) => {}
+    }
+
+    // Phase 6: the per-project engines (graph-hybrid — the default — and
+    // embedding-HDBSCAN) run a per-project scan instead of the global FCM
+    // strategy paths. Each project is clustered independently (bounded memory),
+    // gated + quality-persisted + LLM-labeled, stored under `scope='project:NAME'`,
+    // then rolled up into `scope='global'`. (HDBSCAN is O(n²) so it cannot run on
+    // the whole-corpus FCM paths anyway.)
+    let method = config.topic_clustering_method.as_str();
+    if method == "graph" || method == "embedding_hdbscan" {
+        run_graph_topic_scan(db, config, stats).await;
+        return;
     }
 
     // Strategy dispatch: online (huge) → mmap (medium) → in-memory (small).
@@ -1491,6 +1644,12 @@ pub async fn run_global_topic_scan(
         return;
     }
 
+    // Phase 1 degeneracy gate: refuse to overwrite good topics with a collapsed
+    // model (uniform memberships / label collapse / corpus-wide smearing).
+    if topic_gate_rejects(&summary, config, stats) {
+        return;
+    }
+
     // Store results
     if let Err(e) = db.clear_topics_for_scope("global").await {
         error!(
@@ -1516,6 +1675,9 @@ pub async fn run_global_topic_scan(
         topics = summary.topics_found,
         "Global topic clustering scan complete"
     );
+
+    // Phase 1: persist quality metrics for trend + health surfacing.
+    persist_topic_quality(db, "global", &summary).await;
 
     // Phase 9: chain meta-clustering hierarchy on the global centroids.
     run_hierarchy_pass(db, config, stats).await;
@@ -1869,6 +2031,20 @@ async fn run_mmap_global_topic_scan(
     )
     .await;
 
+    // Phase 1: geometry/spread/label metrics on the final model. The mmap path
+    // streams content for c-TF-IDF and never holds it all in RAM, so coherence
+    // (NPMI/UMass) is left unset here; the structural collapse signals
+    // (mean_max_membership, distinct_label_ratio, topics_per_doc,
+    // max_topic_share) are computed and are sufficient for the degeneracy gate.
+    let metrics = TopicMetrics::compute(
+        mmap.view(),
+        fcm_result.membership.view(),
+        fcm_result.centroids.view(),
+        params.fuzziness,
+        k,
+        &topics,
+    );
+
     let summary = ClusteringSummary {
         scope: "global".to_string(),
         chunks_analyzed: n,
@@ -1879,6 +2055,7 @@ async fn run_mmap_global_topic_scan(
         converged: fcm_result.converged,
         iterations: fcm_result.iterations,
         topics,
+        metrics: Some(metrics),
     };
 
     // Record what FCM discovered BEFORE attempting persistence. If storage
@@ -1902,6 +2079,13 @@ async fn run_mmap_global_topic_scan(
             chunks_analyzed = n,
             "mmap-streaming: FCM produced no topics; preserving prior-cycle global topics"
         );
+        return;
+    }
+
+    // Phase 1 degeneracy gate (the live global path). This is the exact path
+    // that silently produced the 2026-06-13 collapse; the gate now refuses to
+    // overwrite prior topics when the new model is degenerate.
+    if topic_gate_rejects(&summary, config, stats) {
         return;
     }
     if let Err(e) = db.clear_topics_for_scope("global").await {
@@ -1929,6 +2113,9 @@ async fn run_mmap_global_topic_scan(
         topics = summary.topics_found,
         "mmap-streaming global topic scan complete"
     );
+
+    // Phase 1: persist quality metrics for trend + health surfacing.
+    persist_topic_quality(db, "global", &summary).await;
 
     drop(data_view_owned);
     drop(mmap);
@@ -2035,11 +2222,7 @@ async fn compute_ctf_idf_streaming(
             for token in &scratch {
                 *local_counts.entry(token.clone()).or_insert(0) += 1;
             }
-            for t in 0..k {
-                let mu = membership[[i, t]] as f64;
-                if mu < 1e-8 {
-                    continue;
-                }
+            for (t, mu) in top_membership_topics(membership, i, k) {
                 for (word, &count) in &local_counts {
                     let weighted = mu * count as f64;
                     *topic_word_counts[t].entry(word.clone()).or_insert(0.0) += weighted;
@@ -2534,6 +2717,389 @@ async fn count_chunks(db: &dyn DbClient) -> Option<usize> {
     }
 }
 
+/// Phase 6 — per-project graph-hybrid topic scan (the default engine since the
+/// 2026-06-13 bake-off). For each project: cluster its fused semantic+import+
+/// co-change file graph into community-topics, apply the degeneracy gate,
+/// optionally LLM-relabel, persist quality, and store under `scope='project:NAME'`.
+///
+/// Memory-safe by construction (one project's chunks at a time), so it sidesteps
+/// the global-corpus memory pressure that motivated the FCM mmap/online paths.
+/// `chunk_topic_assignments` is populated per-project, so the global analysis
+/// tools (orphans / coverage / misplaced-code) keep working.
+async fn run_graph_topic_scan(db: &dyn DbClient, config: &CronConfig, stats: &Arc<StatsTracker>) {
+    let pool = match db.pool() {
+        Some(p) => p,
+        None => {
+            error!("run_graph_topic_scan requires a real &PgPool");
+            return;
+        }
+    };
+    let projects: Vec<(i32, String)> =
+        match sqlx::query_as::<_, (i32, String)>("SELECT id, name FROM projects ORDER BY id")
+            .fetch_all(pool)
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                error!(error = %e, "graph topic scan: failed to list projects");
+                return;
+            }
+        };
+
+    let w = &config.topic_graph_edge_weights;
+    let ew = [
+        w.first().copied().unwrap_or(1.0),
+        w.get(1).copied().unwrap_or(1.0),
+        w.get(2).copied().unwrap_or(1.0),
+    ];
+
+    let mut total_topics = 0usize;
+    let mut total_noise = 0usize;
+    for (pid, name) in &projects {
+        let rows = match db.bulk_extract_project_embeddings(name, None).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(project = %name, error = %e, "graph topic scan: extract failed; skipping");
+                continue;
+            }
+        };
+        if rows.is_empty() {
+            continue;
+        }
+        let scope = format!("project:{name}");
+        let mut summary = if config.topic_clustering_method == "embedding_hdbscan" {
+            cluster_embeddings_hdbscan(&rows, config, config.topic_min_cluster_size, &scope)
+        } else {
+            let edges = crate::cron::topic_graph::load_project_graph_edges(db, *pid)
+                .await
+                .unwrap_or_default();
+            crate::cron::topic_graph::cluster_graph(
+                &rows,
+                &edges,
+                ew,
+                config.topic_graph_resolution,
+                config.topic_min_cluster_size,
+                config.topic_label_top_k,
+                &scope,
+            )
+        };
+        // Wipe-protection + degeneracy gate before the destructive clear.
+        if summary.iterations == 0 && summary.topics_found == 0 {
+            warn!(project = %name, "graph topic scan: no topics; preserving prior");
+            continue;
+        }
+        if topic_gate_rejects(&summary, config, stats) {
+            continue;
+        }
+        // LLM-relabel all topics (config-gated; deterministic fallback). Runs on
+        // the authoritative per-project store, not the on-demand path.
+        summary.topics = crate::cron::topic_label_llm::maybe_relabel(
+            std::mem::take(&mut summary.topics),
+            config,
+        )
+        .await;
+        if let Err(e) = db.clear_topics_for_scope(&scope).await {
+            warn!(project = %name, error = %e, "graph topic scan: clear failed; preserving prior");
+            continue;
+        }
+        if let Err(e) = db.store_topics(&scope, &summary.topics).await {
+            error!(project = %name, error = %e, "graph topic scan: store failed");
+            continue;
+        }
+        persist_topic_quality(db, &scope, &summary).await;
+        total_topics += summary.topics_found;
+        total_noise += summary.noise_chunks;
+    }
+
+    // Cross-project global roll-up (scope='global') by meta-clustering the
+    // per-project topic centroids, then the hierarchy overlay (scope='hierarchy')
+    // on top of the fresh global centroids.
+    build_global_rollup(db, config, stats).await;
+    run_hierarchy_pass(db, config, stats).await;
+
+    stats.topic_scans.fetch_add(1, Ordering::Relaxed);
+    stats
+        .topics_discovered
+        .store(total_topics as u64, Ordering::Relaxed);
+    stats
+        .topic_noise_chunks
+        .store(total_noise as u64, Ordering::Relaxed);
+    info!(
+        projects = projects.len(),
+        total_topics, total_noise, "graph topic scan complete (per-project; scope='project:NAME')"
+    );
+}
+
+/// Build the cross-project global roll-up: meta-cluster the per-project topic
+/// centroids into `scope='global'` topics so `discover_topics` with no project
+/// returns a cross-project view ("error handling", "parsing", … as they recur
+/// across projects). Uses cosine-kNN + Louvain over the centroids (robust at the
+/// centroid level, consistent with the graph engine); each global topic
+/// aggregates its member per-project topics (summed `chunk_count`, merged
+/// keywords, mean centroid, `parent_topic_ids` → members) and is stored WITHOUT
+/// duplicating `chunk_topic_assignments`. Gated + quality-persisted + LLM-labeled
+/// like the per-project pass.
+async fn build_global_rollup(db: &dyn DbClient, config: &CronConfig, stats: &Arc<StatsTracker>) {
+    /// kNN degree over centroids for the meta-graph.
+    const KNN: usize = 10;
+    /// Minimum cosine to draw a meta-edge (centroids are L2-normalized).
+    const MIN_COS: f32 = 0.30;
+
+    let pool = match db.pool() {
+        Some(p) => p,
+        None => return,
+    };
+
+    #[derive(sqlx::FromRow)]
+    struct ProjTopicRow {
+        id: i32,
+        label: String,
+        keywords: Option<Vec<String>>,
+        keyword_scores: Option<Vec<f32>>,
+        chunk_count: i32,
+        file_count: i32,
+        representative_chunk_id: Option<i64>,
+        representative_snippet: Option<String>,
+        project_names: Option<Vec<String>>,
+        centroid: Option<Vec<f32>>,
+    }
+
+    let rows = match sqlx::query_as::<_, ProjTopicRow>(
+        "SELECT id, label, keywords, keyword_scores, chunk_count, file_count,
+                representative_chunk_id, representative_snippet, project_names, centroid
+         FROM code_topics
+         WHERE scope LIKE 'project:%' AND centroid IS NOT NULL
+         ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(error = %e, "global rollup: failed to load per-project topics");
+            return;
+        }
+    };
+
+    let cand: Vec<ProjTopicRow> = rows
+        .into_iter()
+        .filter(|r| r.centroid.as_ref().is_some_and(|c| !c.is_empty()))
+        .collect();
+    if cand.len() < 4 {
+        info!(
+            candidates = cand.len(),
+            "global rollup: too few per-project topics; skipping"
+        );
+        return;
+    }
+    let d = cand[0].centroid.as_ref().expect("filtered Some").len();
+
+    // Centroid matrix (defensively re-L2-normalized).
+    let n = cand.len();
+    let mut cen = Array2::<f32>::zeros((n, d));
+    for (i, r) in cand.iter().enumerate() {
+        let c = r.centroid.as_ref().expect("filtered Some");
+        for (j, &v) in c.iter().take(d).enumerate() {
+            cen[[i, j]] = v;
+        }
+        let norm: f32 = cen.row(i).dot(&cen.row(i)).sqrt();
+        if norm > 1e-12 {
+            cen.row_mut(i).mapv_inplace(|x| x / norm);
+        }
+    }
+
+    // Cosine-kNN meta-graph over centroids → Louvain communities.
+    use petgraph::graph::{DiGraph, NodeIndex};
+    let mut g: DiGraph<usize, crate::graph::types::EdgeWeight> = DiGraph::new();
+    let nodes: Vec<NodeIndex> = (0..n).map(|i| g.add_node(i)).collect();
+    for i in 0..n {
+        let mut sims: Vec<(usize, f32)> = (0..n)
+            .filter(|&j| j != i)
+            .map(|j| (j, cen.row(i).dot(&cen.row(j))))
+            .filter(|&(_, s)| s >= MIN_COS)
+            .collect();
+        sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (j, s) in sims.into_iter().take(KNN) {
+            g.add_edge(
+                nodes[i],
+                nodes[j],
+                crate::graph::types::EdgeWeight {
+                    edge_type: crate::graph::types::EdgeType::Semantic,
+                    weight: s as f64,
+                },
+            );
+        }
+    }
+    let louvain = crate::graph::algorithms::louvain_communities(&g, config.topic_graph_resolution);
+
+    // community id → member candidate indices.
+    let mut comm: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (node, c) in &louvain.communities {
+        comm.entry(*c).or_default().push(node.index());
+    }
+    let mut communities: Vec<Vec<usize>> = comm.into_values().collect();
+    communities
+        .sort_by_key(|m| std::cmp::Reverse(m.iter().map(|&i| cand[i].chunk_count).sum::<i32>()));
+
+    // Aggregate each community into a GlobalRollupRow.
+    let mut rollup: Vec<crate::db::queries::GlobalRollupRow> =
+        Vec::with_capacity(communities.len());
+    for (ci, members) in communities.iter().enumerate() {
+        if members.is_empty() {
+            continue;
+        }
+        let mut kw_scores: HashMap<String, f64> = HashMap::new();
+        let mut chunk_count = 0i32;
+        let mut file_count = 0i32;
+        let mut projects: HashSet<String> = HashSet::new();
+        let mut parent_ids: Vec<i64> = Vec::with_capacity(members.len());
+        let mut rep_idx = members[0];
+        let mut mean = vec![0.0f32; d];
+        for &mi in members {
+            let r = &cand[mi];
+            chunk_count += r.chunk_count;
+            file_count += r.file_count;
+            parent_ids.push(r.id as i64);
+            if let Some(ps) = &r.project_names {
+                projects.extend(ps.iter().cloned());
+            }
+            match (&r.keywords, &r.keyword_scores) {
+                (Some(ws), Some(ss)) => {
+                    for (w, s) in ws.iter().zip(ss.iter()) {
+                        *kw_scores.entry(w.clone()).or_insert(0.0) += *s as f64;
+                    }
+                }
+                (Some(ws), None) => {
+                    for w in ws {
+                        *kw_scores.entry(w.clone()).or_insert(0.0) += 1.0;
+                    }
+                }
+                _ => {}
+            }
+            if cand[mi].chunk_count > cand[rep_idx].chunk_count {
+                rep_idx = mi;
+            }
+            let c = r.centroid.as_ref().expect("filtered Some");
+            for (j, &v) in c.iter().take(d).enumerate() {
+                mean[j] += v;
+            }
+        }
+        let m = members.len() as f32;
+        for v in &mut mean {
+            *v /= m;
+        }
+        let norm: f32 = mean.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-12 {
+            for v in &mut mean {
+                *v /= norm;
+            }
+        }
+        let mut scored: Vec<(String, f64)> = kw_scores.into_iter().collect();
+        scored.sort_by(|a, b| {
+            b.1.partial_cmp(&a.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        scored.truncate(config.topic_label_top_k.max(1));
+        let keywords: Vec<String> = scored.iter().map(|(w, _)| w.clone()).collect();
+        let keyword_scores: Vec<f32> = scored.iter().map(|(_, s)| *s as f32).collect();
+        let label = if keywords.is_empty() {
+            format!("topic_{ci}")
+        } else {
+            keywords.join(" / ")
+        };
+        let mut project_names: Vec<String> = projects.into_iter().collect();
+        project_names.sort();
+        rollup.push(crate::db::queries::GlobalRollupRow {
+            cluster_index: ci as i32,
+            label,
+            keywords,
+            keyword_scores,
+            centroid: mean,
+            chunk_count,
+            file_count,
+            project_names,
+            representative_chunk_id: cand[rep_idx].representative_chunk_id.unwrap_or(0),
+            representative_snippet: cand[rep_idx]
+                .representative_snippet
+                .clone()
+                .unwrap_or_default(),
+            parent_topic_ids: parent_ids,
+        });
+    }
+
+    if rollup.is_empty() {
+        warn!("global rollup: produced no meta-topics; preserving prior global scope");
+        return;
+    }
+
+    // Degeneracy guard on the roll-up labels (no membership matrix here).
+    let distinct: HashSet<&str> = rollup.iter().map(|r| r.label.as_str()).collect();
+    let distinct_ratio = distinct.len() as f64 / rollup.len() as f64;
+    if rollup.len() >= 5 && distinct_ratio < config.topic_min_distinct_label_ratio {
+        warn!(
+            rollup = rollup.len(),
+            distinct_ratio, "global rollup: labels degenerate; preserving prior global scope"
+        );
+        stats
+            .topic_degenerate_refusals
+            .fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+
+    // LLM-relabel the global meta-topics (config-gated; deterministic fallback).
+    if config.topic_llm_labels {
+        let shim: Vec<TopicResult> = rollup
+            .iter()
+            .map(|r| TopicResult {
+                cluster_index: r.cluster_index,
+                label: r.label.clone(),
+                keywords: r.keywords.clone(),
+                keyword_scores: r.keyword_scores.iter().map(|&s| s as f64).collect(),
+                chunk_ids: Vec::new(),
+                memberships: Vec::new(),
+                file_ids: Vec::new(),
+                project_names: r.project_names.clone(),
+                avg_internal_similarity: 0.0,
+                representative_chunk_id: r.representative_chunk_id,
+                representative_snippet: r.representative_snippet.clone(),
+                top_files: Vec::new(),
+                centroid: Vec::new(),
+                parent_topic_ids: r.parent_topic_ids.clone(),
+            })
+            .collect();
+        let relabeled = crate::cron::topic_label_llm::maybe_relabel(shim, config).await;
+        for (r, t) in rollup.iter_mut().zip(relabeled) {
+            r.label = t.label;
+        }
+    }
+
+    if let Err(e) = db.clear_topics_for_scope("global").await {
+        warn!(error = %e, "global rollup: clear failed; preserving prior");
+        return;
+    }
+    if let Err(e) = crate::db::queries::store_global_rollup(pool, &rollup).await {
+        error!(error = %e, "global rollup: store failed");
+        return;
+    }
+
+    let q = serde_json::json!({
+        "n_topics": rollup.len(),
+        "distinct_label_ratio": distinct_ratio,
+        "source": "global_rollup_over_per_project_centroids",
+    });
+    if let Err(e) = crate::db::queries::set_topic_quality(pool, "global", &q).await {
+        warn!(error = %e, "global rollup: persist quality failed");
+    }
+
+    info!(
+        meta_topics = rollup.len(),
+        from_project_topics = n,
+        modularity = format!("{:.4}", louvain.modularity),
+        "global rollup complete (scope='global')"
+    );
+}
+
 /// Emergency fallback: when global clustering's memory prediction exceeds the
 /// budget, cluster each project in isolation so *some* topic coverage exists
 /// for this cycle. Topic IDs stored this way are NOT cross-project-comparable
@@ -2584,6 +3150,10 @@ async fn run_per_project_emergency_fallback(
                     );
                     continue;
                 }
+                // Phase 1 degeneracy gate (per-project failsafe path).
+                if topic_gate_rejects(&summary, config, stats) {
+                    continue;
+                }
                 if let Err(e) = db.clear_topics_for_scope(&scope).await {
                     warn!(
                         project = %project_name,
@@ -2602,6 +3172,7 @@ async fn run_per_project_emergency_fallback(
                 }
                 total_topics += summary.topics_found;
                 total_noise += summary.noise_chunks;
+                persist_topic_quality(db, &scope, &summary).await;
                 let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
                 info!(
                     project = %project_name,
@@ -2664,12 +3235,358 @@ pub async fn run_project_topic_scan(
             converged: false,
             iterations: 0,
             topics: Vec::new(),
+            metrics: None,
         });
     }
 
-    let params = FcmParams::with_min_cluster_size(config, min_cluster_size);
     let scope = format!("project:{}", project_name);
-    Ok(cluster_embeddings(&rows, &params, &scope))
+
+    // Dispatch on the configured engine. The graph track is a separate entry
+    // point that needs the project's file graph; the embedding tracks
+    // (baseline / pca / rp) go through `cluster_embeddings`, which reads
+    // `reduce_method` from the config-derived params.
+    let mut summary = if config.topic_clustering_method == "graph" {
+        let pid = if let Some(pool) = db.pool() {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT id FROM projects WHERE name = $1 ORDER BY id LIMIT 1",
+            )
+            .bind(project_name)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+        let edges = match pid {
+            Some(pid) => crate::cron::topic_graph::load_project_graph_edges(db, pid)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let w = &config.topic_graph_edge_weights;
+        let ew = [
+            w.first().copied().unwrap_or(1.0),
+            w.get(1).copied().unwrap_or(1.0),
+            w.get(2).copied().unwrap_or(1.0),
+        ];
+        crate::cron::topic_graph::cluster_graph(
+            &rows,
+            &edges,
+            ew,
+            config.topic_graph_resolution,
+            min_cluster_size,
+            config.topic_label_top_k,
+            &scope,
+        )
+    } else if config.topic_clustering_method == "embedding_hdbscan" {
+        cluster_embeddings_hdbscan(&rows, config, min_cluster_size, &scope)
+    } else {
+        let params = FcmParams::with_min_cluster_size(config, min_cluster_size);
+        cluster_embeddings(&rows, &params, &scope)
+    };
+
+    // LLM-label all topics on the on-demand path too (config-gated; deterministic
+    // c-TF-IDF fallback). `maybe_relabel` runs inference under `spawn_blocking`
+    // so it doesn't stall the async runtime.
+    summary.topics =
+        crate::cron::topic_label_llm::maybe_relabel(std::mem::take(&mut summary.topics), config)
+            .await;
+    Ok(summary)
+}
+
+/// Embedding-track engine selector for the bake-off (Phase 3) and the
+/// production dispatch (Phase 6). The graph track is a separate entry point
+/// ([`crate::cron::topic_graph::cluster_graph`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TopicEngine {
+    /// FCM on raw 1024-d embeddings (the path that collapsed).
+    Baseline,
+    /// FCM on PCA-reduced embeddings.
+    EmbeddingPca,
+    /// FCM on JL-random-projection-reduced embeddings.
+    EmbeddingRp,
+    /// HDBSCAN\* on PCA-reduced embeddings (canonical BERTopic clusterer).
+    EmbeddingHdbscan,
+}
+
+/// Run one embedding-track engine on already-extracted rows, independent of the
+/// configured `topic_clustering_method`. Used by the bake-off to compare engines
+/// on identical input. Warm-start LMDB is disabled so engines don't cross-
+/// contaminate each other's centroids.
+pub fn cluster_embeddings_engine(
+    rows: &[ChunkEmbeddingRow],
+    config: &CronConfig,
+    min_cluster_size: usize,
+    scope: &str,
+    engine: TopicEngine,
+) -> ClusteringSummary {
+    if engine == TopicEngine::EmbeddingHdbscan {
+        return cluster_embeddings_hdbscan(rows, config, min_cluster_size, scope);
+    }
+    let mut params = FcmParams::with_min_cluster_size(config, min_cluster_size);
+    params.reduce_method = match engine {
+        TopicEngine::Baseline => None,
+        TopicEngine::EmbeddingPca => Some(crate::cron::topic_reduce::ReduceMethod::Pca),
+        TopicEngine::EmbeddingRp => Some(crate::cron::topic_reduce::ReduceMethod::RandomProjection),
+        TopicEngine::EmbeddingHdbscan => unreachable!("handled above"),
+    };
+    params.reduce_dim = config.topic_reduce_dim;
+    params.lmdb_enabled = false;
+    cluster_embeddings(rows, &params, scope)
+}
+
+/// HDBSCAN\*-on-PCA-reduced topic engine (the canonical BERTopic clusterer).
+///
+/// HDBSCAN\* is O(n²) (pairwise distances), so for tractability the clustering
+/// *decision* is made on a strided subsample of the reduced space and every
+/// chunk is then assigned to its nearest cluster centroid — an
+/// approximate-at-scale scheme (cluster-on-sample, assign-all) that keeps full
+/// coverage while bounding cost. Topics are a hard partition (like the graph
+/// engine), labeled with the same c-TF-IDF.
+fn cluster_embeddings_hdbscan(
+    rows: &[ChunkEmbeddingRow],
+    config: &CronConfig,
+    min_cluster_size: usize,
+    scope: &str,
+) -> ClusteringSummary {
+    /// Cap on points fed to the O(n²) HDBSCAN clustering decision.
+    const HDBSCAN_MAX_N: usize = 6_000;
+
+    let n = rows.len();
+    let empty = || ClusteringSummary {
+        scope: scope.to_string(),
+        chunks_analyzed: n,
+        topics_found: 0,
+        noise_chunks: n,
+        num_clusters: 0,
+        fuzziness: 0.0,
+        converged: true,
+        iterations: 1,
+        topics: Vec::new(),
+        metrics: None,
+    };
+    if n == 0 {
+        return empty();
+    }
+
+    // L2-normalized embedding matrix (original space, for cohesion/centroid).
+    let d = rows[0].embedding.len();
+    let mut data = Array2::<f32>::zeros((n, d));
+    for (i, row) in rows.iter().enumerate() {
+        for (j, &v) in row.embedding.iter().enumerate() {
+            data[[i, j]] = v;
+        }
+        let norm: f32 = data.row(i).dot(&data.row(i)).sqrt();
+        if norm > 1e-12 {
+            data.row_mut(i).mapv_inplace(|x| x / norm);
+        }
+    }
+
+    // PCA-reduce (breaks distance concentration so HDBSCAN's Euclidean is sane).
+    let rdim = config.topic_reduce_dim.min(d).max(2);
+    let reduced = crate::cron::topic_reduce::reduce(
+        data.view(),
+        rdim,
+        crate::cron::topic_reduce::ReduceMethod::Pca,
+        42,
+    );
+    let rdim = reduced.ncols();
+
+    // Strided subsample for the clustering decision.
+    let sample_idx: Vec<usize> = if n > HDBSCAN_MAX_N {
+        let stride = (n / HDBSCAN_MAX_N).max(1);
+        (0..n).step_by(stride).take(HDBSCAN_MAX_N).collect()
+    } else {
+        (0..n).collect()
+    };
+    let mut sample = Array2::<f32>::zeros((sample_idx.len(), rdim));
+    for (si, &i) in sample_idx.iter().enumerate() {
+        sample.row_mut(si).assign(&reduced.row(i));
+    }
+    let ms = min_cluster_size.clamp(1, 25);
+    let sample_labels = crate::cron::hdbscan::hdbscan(sample.view(), min_cluster_size, ms);
+
+    let k = sample_labels
+        .iter()
+        .filter(|&&l| l >= 0)
+        .map(|&l| l as usize + 1)
+        .max()
+        .unwrap_or(0);
+    if k == 0 {
+        return empty();
+    }
+
+    // Cluster centroids in reduced space from the sample's labeled points.
+    let mut cent = vec![vec![0.0f32; rdim]; k];
+    let mut cnt = vec![0usize; k];
+    for (si, &lab) in sample_labels.iter().enumerate() {
+        if lab >= 0 {
+            let c = lab as usize;
+            let r = reduced.row(sample_idx[si]);
+            for (acc, &v) in cent[c].iter_mut().zip(r.iter()) {
+                *acc += v;
+            }
+            cnt[c] += 1;
+        }
+    }
+    for (c, ct) in cnt.iter().enumerate() {
+        if *ct > 0 {
+            for v in &mut cent[c] {
+                *v /= *ct as f32;
+            }
+        }
+    }
+
+    // Assign every chunk to its nearest centroid (reduced-space Euclidean).
+    let mut members: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let r = reduced.row(i);
+        let mut best = 0usize;
+        let mut best_d = f32::INFINITY;
+        for (c, ce) in cent.iter().enumerate() {
+            if cnt[c] == 0 {
+                continue;
+            }
+            let mut s = 0.0f32;
+            for (a, b) in r.iter().zip(ce.iter()) {
+                let diff = a - b;
+                s += diff * diff;
+            }
+            if s < best_d {
+                best_d = s;
+                best = c;
+            }
+        }
+        members.entry(best).or_default().push(i);
+    }
+
+    // Assemble hard-partition topics (reuse the in-module helpers).
+    let mut kept: Vec<(usize, Vec<usize>)> = members
+        .into_iter()
+        .filter(|(_, v)| v.len() >= min_cluster_size.max(1))
+        .collect();
+    kept.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+    let topic_k = kept.len();
+    let assigned: usize = kept.iter().map(|(_, v)| v.len()).sum();
+    if topic_k == 0 {
+        return empty();
+    }
+
+    let mut membership = Array2::<f32>::zeros((n, topic_k));
+    for (ti, (_c, idxs)) in kept.iter().enumerate() {
+        for &i in idxs {
+            membership[[i, ti]] = 1.0;
+        }
+    }
+    let contents: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
+    let keyword_sets = compute_ctf_idf(&contents, &membership, config.topic_label_top_k);
+
+    let mut topics: Vec<TopicResult> = Vec::with_capacity(topic_k);
+    for (ti, (_c, idxs)) in kept.iter().enumerate() {
+        let chunk_ids: Vec<i64> = idxs.iter().map(|&i| rows[i].chunk_id).collect();
+        let file_ids: Vec<i64> = idxs
+            .iter()
+            .map(|&i| rows[i].file_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let project_names: Vec<String> = idxs
+            .iter()
+            .map(|&i| rows[i].project_name.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let avg_sim = avg_internal_similarity(&data.view(), idxs);
+        let representative_chunk_id = find_representative(&data.view(), &chunk_ids, idxs);
+        let representative_snippet = rows
+            .iter()
+            .find(|r| r.chunk_id == representative_chunk_id)
+            .map(|r| {
+                if r.content.len() > 500 {
+                    format!("{}...", &r.content[..r.content.floor_char_boundary(500)])
+                } else {
+                    r.content.clone()
+                }
+            })
+            .unwrap_or_default();
+        let mut file_counts: HashMap<(&str, &str), i32> = HashMap::new();
+        for &i in idxs {
+            *file_counts
+                .entry((rows[i].path.as_str(), rows[i].project_name.as_str()))
+                .or_insert(0) += 1;
+        }
+        let mut top_files: Vec<TopicFileEntry> = file_counts
+            .into_iter()
+            .map(|((path, project), c)| TopicFileEntry {
+                path: path.to_string(),
+                project: project.to_string(),
+                chunks_in_topic: c,
+            })
+            .collect();
+        top_files.sort_by_key(|b| std::cmp::Reverse(b.chunks_in_topic));
+        // 1024-d centroid from original embeddings (hierarchy/warm-start compat).
+        let mut centroid = vec![0.0f32; d];
+        for &i in idxs {
+            for (acc, &v) in centroid.iter_mut().zip(data.row(i).iter()) {
+                *acc += v;
+            }
+        }
+        let m = idxs.len() as f32;
+        for v in &mut centroid {
+            *v /= m;
+        }
+        let norm: f32 = centroid.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 1e-12 {
+            for v in &mut centroid {
+                *v /= norm;
+            }
+        }
+        let empty_kw: Vec<TopicKeyword> = Vec::new();
+        let kw = keyword_sets.get(ti).unwrap_or(&empty_kw);
+        let keywords: Vec<String> = kw.iter().map(|k| k.word.clone()).collect();
+        let keyword_scores: Vec<f64> = kw.iter().map(|k| k.score).collect();
+        let label = label_from_keywords(kw, ti as i32);
+        let memberships = vec![1.0f64; chunk_ids.len()];
+        topics.push(TopicResult {
+            cluster_index: ti as i32,
+            label,
+            keywords,
+            keyword_scores,
+            chunk_ids,
+            memberships,
+            file_ids,
+            project_names,
+            avg_internal_similarity: avg_sim,
+            representative_chunk_id,
+            representative_snippet,
+            top_files,
+            centroid,
+            parent_topic_ids: Vec::new(),
+        });
+    }
+
+    let mut metrics = TopicMetrics::from_topics(topic_k, &topics);
+    metrics.fill_coherence(
+        &contents,
+        &topics,
+        crate::quality::topic_metrics::DEFAULT_COHERENCE_TOP_N,
+    );
+    metrics.mean_max_membership = 1.0;
+    metrics.n_scored = n;
+
+    ClusteringSummary {
+        scope: scope.to_string(),
+        chunks_analyzed: n,
+        topics_found: topics.len(),
+        noise_chunks: n - assigned,
+        num_clusters: topic_k,
+        fuzziness: 0.0,
+        converged: true,
+        iterations: 1,
+        topics,
+        metrics: Some(metrics),
+    }
 }
 
 // ============================================================================
@@ -3048,6 +3965,50 @@ mod tests {
     }
 
     #[test]
+    fn test_ctf_idf_diffuse_membership_not_nuked() {
+        // Regression for the bake-off finding: with diffuse fuzzy memberships
+        // (every chunk has non-trivial mass on EVERY topic) and K >
+        // MAX_MEMBERSHIPS_PER_CHUNK, distributing tokens to all topics would put
+        // every word in every topic, so the max-df cutoff empties ALL keyword
+        // lists. The top-J cap (`top_membership_topics`) must keep keywords
+        // non-empty by feeding each chunk's tokens only to its dominant topics.
+        let k = 8usize;
+        let n = 24usize; // 3 chunks per home topic
+        let contents: Vec<String> = (0..n)
+            .map(|j| {
+                let home = j % k;
+                // Distinct per-topic vocabulary + a ubiquitous "shared" token.
+                format!("concept{home} concept{home} concept{home} shared payload{home}")
+            })
+            .collect();
+        let refs: Vec<&str> = contents.iter().map(|s| s.as_str()).collect();
+        // Diffuse membership: home 0.6, every other topic 0.4/(k-1) (all > 1e-8).
+        let membership: Array2<f32> = Array2::from_shape_fn((n, k), |(i, t)| {
+            let home = i % k;
+            if t == home {
+                0.6
+            } else {
+                0.4 / (k as f32 - 1.0)
+            }
+        });
+        let keywords = compute_ctf_idf(&refs, &membership, 5);
+        let total: usize = keywords.iter().map(|t| t.len()).sum();
+        assert!(
+            total > 0,
+            "diffuse membership must still yield keywords (df-nuke regression); got all-empty"
+        );
+        // The per-topic distinctive "concept{h}" token should survive somewhere.
+        let any_concept = keywords
+            .iter()
+            .flatten()
+            .any(|kw| kw.word.starts_with("concept"));
+        assert!(
+            any_concept,
+            "expected a distinctive concept term to survive"
+        );
+    }
+
+    #[test]
     fn test_ctf_idf_stopwords() {
         let contents = ["fn pub let mut use impl struct enum const"];
         let membership: Array2<f32> = Array2::from_elem((1, 1), 1.0);
@@ -3232,6 +4193,9 @@ mod tests {
             tolerance: 1e-5,
             membership_threshold: 0.05,
             label_top_k: 5,
+            // Tests cluster raw embeddings (no reduction) for determinism.
+            reduce_method: None,
+            reduce_dim: 30,
             // Tests use fp32 for deterministic CUDA arithmetic.
             gpu_fcm_precision: "fp32".into(),
             k_selector: "xie_beni".into(),

@@ -216,6 +216,17 @@ pub async fn tool_orient(
         crate::cron::topic_clustering::TOPICS_ALGO_SIGNATURE,
     )
     .await;
+    // Phase 1: topic-quality snapshot (coherence + collapse signals). Surfaced
+    // so a degenerate/stale topic model is visible in the first-step `orient`
+    // rather than discovered only by querying `discover_topics` and getting junk.
+    let topic_quality = crate::db::queries::get_topic_quality(pool).await;
+    let topics_degenerate = topic_quality
+        .as_ref()
+        .and_then(|q| q.get("global"))
+        .and_then(|g| g.get("distinct_label_ratio"))
+        .and_then(|v| v.as_f64())
+        .map(|r| r < 0.3)
+        .unwrap_or(false);
     let config = ctx.config().load();
     let mandates = crate::mandates::resolve_effective_mandates(&config, Some(&project));
 
@@ -265,7 +276,16 @@ pub async fn tool_orient(
             "phase": phase_label,
             "graph_stale": graph_stale,
             "topics_stale": topics_stale,
-            "guidance": if graph_stale || topics_stale {
+            "topics_degenerate": topics_degenerate,
+            "topic_quality_global": topic_quality
+                .as_ref()
+                .and_then(|q| q.get("global"))
+                .cloned(),
+            "guidance": if topics_degenerate {
+                "The global topic model is DEGENERATE (labels collapsed / clusters \
+                not separated); discover_topics/topic_hierarchy results are unreliable \
+                until the topic engine is re-run and passes the quality gate."
+            } else if graph_stale || topics_stale {
                 "Some derived data (graph metrics, topics) is missing or stale; \
                 results from centrality_analysis/discover_topics will be limited \
                 until the corresponding cron jobs have run."

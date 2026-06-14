@@ -324,6 +324,11 @@ pub struct StatsTracker {
     pub topic_scans: AtomicU64,
     pub topics_discovered: AtomicU64,
     pub topic_noise_chunks: AtomicU64,
+    /// Times the Phase-1 degeneracy gate refused to overwrite the prior topic
+    /// model because the new clustering was degenerate (collapsed memberships /
+    /// label collapse / smearing). A nonzero, climbing value means the topic
+    /// engine is producing junk and the prior (good) topics are being preserved.
+    pub topic_degenerate_refusals: AtomicU64,
 
     // Fuzzy-index sync counters (PersistentARTrieChar disk-backed
     // fuzzy indexes; refreshed by `cron::fuzzy_sync`).
@@ -881,6 +886,7 @@ impl StatsTracker {
             topic_scans: AtomicU64::new(0),
             topics_discovered: AtomicU64::new(0),
             topic_noise_chunks: AtomicU64::new(0),
+            topic_degenerate_refusals: AtomicU64::new(0),
             fuzzy_sync_runs: AtomicU64::new(0),
             fuzzy_sync_rows_synced: AtomicU64::new(0),
             fuzzy_disk_cap_exceeded: AtomicU64::new(0),
@@ -1339,6 +1345,7 @@ impl StatsTracker {
             "topic_scans": self.topic_scans.load(Ordering::Acquire),
             "topics_discovered": self.topics_discovered.load(Ordering::Acquire),
             "topic_noise_chunks": self.topic_noise_chunks.load(Ordering::Acquire),
+            "topic_degenerate_refusals": self.topic_degenerate_refusals.load(Ordering::Acquire),
             "embed_file_batches": self.embed_file_batches.load(Ordering::Acquire),
             "embed_commit_batches": self.embed_commit_batches.load(Ordering::Acquire),
             "embed_query_count": self.embed_query_count.load(Ordering::Acquire),

@@ -33,7 +33,7 @@ where *T* is the evaluation time (a cron tick) and *W* the lookback window. The
 **score** is
 
     ┌─────────────────────────────────────────────┐
-    │   w_{c,t}(T)  =  Σᵢ  exp( −(T − sᵢ) / τ )     │   (1)
+    │   w_{c,t}(T)  =  Σᵢ  exp( −(T − sᵢ) / τ )   │   (1)
     └─────────────────────────────────────────────┘
 
 with **decay time-constant** τ > 0 (in the same time unit as the ages). Each use
@@ -183,12 +183,12 @@ over as it accrues. N = 25 by default.
 
 ## 7. Hyperparameters and tuning
 
-| Symbol | Field | Default | Meaning / effect |
-|---|---|---|---|
-| τ | `decay_tau_days` | 14 d | Memory length. Half-life τ·ln2 ≈ 9.7 d. ↑τ ⇒ longer memory, smoother, slower to forget. |
-| θ | `weight_threshold` | 0.5 | Inclusion gate. Equivalent rate θ/τ ≈ 1/28 d⁻¹ (8). ↑θ ⇒ smaller, higher-rate sets. |
-| W | `lookback_days` | 90 d | Truncation horizon. Keep W ≳ 5τ so (9) is negligible. |
-| N | `global_top_n` | 25 | Cold-start prior size for unseen clients (10). |
+| Symbol | Field              | Default | Meaning / effect                                                                        |
+|--------|--------------------|---------|-----------------------------------------------------------------------------------------|
+| τ      | `decay_tau_days`   | 14 d    | Memory length. Half-life τ·ln2 ≈ 9.7 d. ↑τ ⇒ longer memory, smoother, slower to forget. |
+| θ      | `weight_threshold` | 0.5     | Inclusion gate. Equivalent rate θ/τ ≈ 1/28 d⁻¹ (8). ↑θ ⇒ smaller, higher-rate sets.     |
+| W      | `lookback_days`    | 90 d    | Truncation horizon. Keep W ≳ 5τ so (9) is negligible.                                   |
+| N      | `global_top_n`     | 25      | Cold-start prior size for unseen clients (10).                                          |
 
 **Data-driven tuning.** Because E[w]=λτ and the gate is a rate θ/τ, θ can be set
 to hit a target surface size: pick the θ whose induced median learned-set

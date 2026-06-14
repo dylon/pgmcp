@@ -21,6 +21,7 @@ pub mod findings;
 pub mod forecast;
 pub mod history;
 pub mod report;
+pub mod topic_metrics;
 
 pub use findings::{Finding, FindingCategory, Pillar, Severity};
 pub use report::{PillarReport, QualityReport};
