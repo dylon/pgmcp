@@ -1,21 +1,35 @@
 [Unit]
 Description=pgmcp - PostgreSQL MCP File Indexer
-After=postgresql.service
-Wants=postgresql.service
+# User unit (systemctl --user): cannot order against the system-scoped
+# postgresql.service, so the old After=/Wants= lines were removed — they were
+# silently ineffective here. The ExecStartPre pg_isready gate below restores a
+# real "wait for PostgreSQL" guarantee; Restart=on-failure + the daemon's own
+# DB-connect retry are the backstop.
 
 [Service]
 Type=notify
-ExecStart=/usr/local/bin/pgmcp daemon
-ExecReload=/bin/kill -HUP $MAINPID
+# Block startup until PostgreSQL accepts connections — restores the ordering a
+# user unit can't get from After=postgresql.service. Host/port must match [db]
+# in config.toml (defaults localhost:5432). This wait counts against
+# TimeoutStartSec below; if PG never comes up the start fails and Restart kicks in.
+ExecStartPre=/bin/sh -c 'until /usr/bin/pg_isready -h localhost -p 5432 -q; do sleep 1; done'
+# %h = your home directory (this is a user unit; %h → /home/dylon).
+ExecStart=%h/.local/bin/pgmcp daemon
+
+# sd_notify(READY=1) fires after DB migration + BGE-M3 GPU model-load, when the
+# HTTP listener binds (src/cli/daemon.rs:1082). On a cold cache that can exceed
+# systemd's 90s default and get the start killed, so widen the start gate.
+TimeoutStartSec=300
+# Graceful shutdown is SIGTERM-driven with an internal ~15s hard-stop watchdog.
+TimeoutStopSec=30
 Restart=on-failure
 RestartSec=5
-User=%i
-Environment=PGMCP_CONFIG=%h/.config/pgmcp/config.toml
+
 # Bound glibc thread arenas. Default is 8 × num_cpus (= 512 on a 64-CPU host).
 # Each arena retains its high-water mark forever, so a transient burst of
 # allocations across many threads bloats RSS by tens of GB that never get
-# returned to the kernel. Capping at 2 keeps total resident memory close to
-# the actual live working set without measurably hurting throughput.
+# returned to the kernel. Capping at 2 keeps resident memory close to the
+# actual live working set without measurably hurting throughput.
 Environment=MALLOC_ARENA_MAX=2
 
 [Install]
