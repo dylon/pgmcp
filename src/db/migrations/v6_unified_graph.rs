@@ -14,10 +14,12 @@
 //!   provenance (so auto-created concept entities never collide with the
 //!   user/agent/reflection namespaces).
 //!
-//! NOT created here: the `work_item_experiment` bridge — it already exists
-//! (`super::super::ensure_work_item_experiment_bridge`); Stage 2 wires it into
-//! the unified graph view. Also NOT here: `ensure_work_items_hnsw_index`, which
-//! already runs unconditionally in `run_migrations`.
+//! NOT created here: the `work_item_experiment` bridge — it is created by
+//! `super::super::ensure_work_item_experiment_bridge`, run late (just before the
+//! unified graph views) so its `work_items`/`experiments` parents exist; Stage 2
+//! wires it into the unified graph view. Also NOT here:
+//! `ensure_work_items_hnsw_index`, which already runs unconditionally in
+//! `run_migrations`.
 //!
 //! Every statement is idempotent (`ADD COLUMN IF NOT EXISTS`,
 //! `CREATE TABLE/INDEX IF NOT EXISTS`, `ADD VALUE IF NOT EXISTS`, a guarded

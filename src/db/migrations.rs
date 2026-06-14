@@ -2146,17 +2146,15 @@ pub async fn run_migrations(
     ensure_experiment_tables(pool).await?;
     ensure_experiment_hnsw_index(pool, vector_config).await?;
 
-    // Tracker ↔ experiment bridge (Phase 10). Created LATE and guarded by a
-    // to_regclass preflight because `experiments` is itself an inline ensure_*
-    // (above) and the tracker's `work_items` is the numbered v4 step — this
-    // keeps migration order-independent and resilient to either subsystem being
-    // absent in a partial install.
-    ensure_work_item_experiment_bridge(pool).await?;
-
-    // (memory_unified_views is built LAST — after all numbered migration steps
-    // — because its node/edge arms reference columns/tables added by v6
-    // (work_items.observation_id, experiment_relations, memory_code_anchor
-    // .symbol_id/.project_id). See the call after the v6 step below.)
+    // (The tracker ↔ experiment bridge `work_item_experiment` and the
+    // memory_unified_views are BOTH built LAST — after all numbered migration
+    // steps — because they reference tables/columns those steps create: the
+    // tracker's `work_items` (a numbered step, below), plus the v6 additions
+    // (work_items.observation_id, experiment_relations,
+    // memory_code_anchor.symbol_id/.project_id). The bridge is a guarded
+    // ensure_* that SKIPS (it does not defer-and-retry) when a parent table is
+    // absent, so it MUST run after `work_items` exists and before
+    // ensure_memory_unified_views. Both calls live just above that step below.)
 
     // Record the baseline. From this point on, future migration steps
     // can call `apply_step(pool, N, ...)`-style logic to land changes
@@ -2251,8 +2249,9 @@ pub async fn run_migrations(
     // Unified knowledge-graph foundation: work_items.observation_id,
     // experiment_relations (inter-experiment DAG), memory_code_anchor
     // +symbol_id/+project_id (relaxed CHECK), and the 'auto_index'
-    // memory_source value. The work_item_experiment bridge already exists
-    // (ensure_work_item_experiment_bridge); Stage 2 wires it into the views.
+    // memory_source value. (The work_item_experiment bridge is created later by
+    // ensure_work_item_experiment_bridge, just before the unified views; v6's
+    // Stage 2 design wires it into those views.)
     // See `src/db/migrations/v6_unified_graph.rs`.
     // ================================================================
     apply_step(
@@ -2599,6 +2598,17 @@ pub async fn run_migrations(
     // Stage 5c: trajectory-similarity edge store (must exist before the edges
     // view, which UNIONs it as the `evolves_like` arm).
     ensure_trajectory_similarities(pool).await?;
+
+    // Tracker ↔ experiment bridge (Phase 10), built LATE + guarded by a
+    // to_regclass preflight: its parents are the inline ensure_* steps
+    // (`experiments` / `experiment_hypotheses`, far above) and a numbered tracker
+    // step (`work_items`). Both now exist, so the guard creates the table. MUST
+    // precede ensure_memory_unified_views — the edges matview UNIONs
+    // `work_item_experiment` as a graph arm. (It used to be called before the
+    // numbered steps, where `work_items` did not yet exist; the guard then
+    // silently skipped it and the matview build failed on a fresh DB with
+    // "relation work_item_experiment does not exist".)
+    ensure_work_item_experiment_bridge(pool).await?;
 
     // ================================================================
     // Memory-server Phase 6.3 + unified-graph: the heterogeneous node/edge

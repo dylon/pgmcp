@@ -783,7 +783,12 @@ pub struct UnifiedNodeHit {
     pub node_id: String,
     pub node_type: String,
     pub label: String,
-    pub importance: f64,
+    // `real` (FLOAT4) in the `memory_unified_nodes` matview: the leading UNION
+    // arm selects `memory_entities.importance` (REAL), and PostgreSQL resolves
+    // the column against the trailing numeric literals to `real`. Decoding it as
+    // `f64` aborts at fetch with a FLOAT4/FLOAT8 mismatch. Matches every sibling
+    // importance struct (EntitySearchHit, MemorySemanticHit, EntityRow, …).
+    pub importance: f32,
     pub similarity: Option<f64>,
 }
 

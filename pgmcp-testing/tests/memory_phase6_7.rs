@@ -88,6 +88,19 @@ async fn unified_search_returns_observation_matching_query_axis() {
         "near observation should rank in top-k: {:?}",
         hits.iter().map(|h| &h.label).collect::<Vec<_>>()
     );
+    // Regression guard: `memory_unified_nodes.importance` is `real` (FLOAT4), so
+    // `UnifiedNodeHit.importance` must be `f32`. A type-mismatched struct field
+    // aborts the `fetch_all` above with a FLOAT4/FLOAT8 decode error; touching
+    // the decoded value here documents that expectation explicitly.
+    let near = hits
+        .iter()
+        .find(|h| h.label == "near observation")
+        .expect("near observation present");
+    assert!(
+        near.importance.is_finite() && near.importance >= 0.0,
+        "decoded importance should be a sane f32: {}",
+        near.importance
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
