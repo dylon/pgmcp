@@ -211,11 +211,12 @@ pub async fn tool_orient(
     // degenerate topics (computed by pre-stopword code) as "current"; the
     // signature leg of `topics_global_stale` now flags exactly that case.
     let graph_stale = crate::db::queries::graph_stale(pool, project.id).await;
-    let topics_stale = crate::db::queries::topics_global_stale(
-        pool,
-        crate::cron::topic_clustering::TOPICS_ALGO_SIGNATURE,
-    )
-    .await;
+    // Effective signature folds the active engine so a graph-vs-FCM mismatch or an
+    // engine switch is detected, not only a label-pipeline version bump. Compute
+    // the owned string before the await so no config guard is held across it.
+    let topics_sig =
+        crate::cron::topic_clustering::topics_effective_signature(&ctx.config().load().cron);
+    let topics_stale = crate::db::queries::topics_global_stale(pool, &topics_sig).await;
     // Phase 1: topic-quality snapshot (coherence + collapse signals). Surfaced
     // so a degenerate/stale topic model is visible in the first-step `orient`
     // rather than discovered only by querying `discover_topics` and getting junk.

@@ -1986,19 +1986,15 @@ pub fn schedule_maintenance_jobs(
     let rt_clone_topic = rt.clone();
     let stats_for_topic = Arc::clone(&stats);
     let lc_for_topic = lifecycle.clone();
-    let topic_cron_config = CronConfig {
-        topic_scan_interval_secs: config.topic_scan_interval_secs,
-        topic_min_cluster_size: config.topic_min_cluster_size,
-        topic_num_clusters: config.topic_num_clusters,
-        topic_fuzziness: config.topic_fuzziness,
-        topic_fcm_max_iters: config.topic_fcm_max_iters,
-        topic_fcm_tolerance: config.topic_fcm_tolerance,
-        topic_membership_threshold: config.topic_membership_threshold,
-        topic_label_top_k: config.topic_label_top_k,
-        topic_max_mem_fraction: config.topic_max_mem_fraction,
-        topic_scratch_dir: config.topic_scratch_dir.clone(),
-        ..CronConfig::default()
-    };
+    // Thread the FULL topic config (engine `topic_clustering_method`, gate
+    // thresholds, LLM-label toggle, reducer dims, graph edge weights, …) from the
+    // loaded TOML. The prior field-by-field literal with `..CronConfig::default()`
+    // silently reset every un-listed knob back to its default — including
+    // `topic_clustering_method`, the engine the effective staleness signature is
+    // keyed on — so an operator's engine/gate overrides were ignored by the cron
+    // and the stamped signature could disagree with what the consumers compute.
+    // Mirrors `sem_cron_config = config.clone()` above.
+    let topic_cron_config = config.clone();
     register_heavy_cron(
         handle,
         &lifecycle,

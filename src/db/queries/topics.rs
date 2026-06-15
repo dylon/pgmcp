@@ -455,36 +455,14 @@ pub async fn store_topics(
         }
     }
 
-    // Stamp the algorithm signature ONLY for a healthy global topic set, so the
-    // staleness check (`topics_global_stale`) clears only when fresh AND
-    // non-degenerate topics have been written. A degenerate result — labels
-    // collapsed onto a few repeated lead keywords, the failure mode that produced
-    // the `the/and/dylon` labels — is logged and left UNstamped, so the model
-    // stays "stale" and is recomputed rather than trusted (degeneracy assertion).
-    if scope == "global" && (topics.is_empty() || errors.len() != topics.len()) {
-        let n = topics.len();
-        let with_kw = topics.iter().filter(|t| !t.keywords.is_empty()).count();
-        let distinct_lead: std::collections::HashSet<&str> = topics
-            .iter()
-            .filter_map(|t| t.keywords.first().map(|s| s.as_str()))
-            .collect();
-        let degenerate = n >= 5 && (with_kw * 2 < n || distinct_lead.len() * 2 < with_kw.max(1));
-        if degenerate {
-            tracing::warn!(
-                topics = n,
-                labeled = with_kw,
-                distinct_lead = distinct_lead.len(),
-                "store_topics: global topic labels look degenerate (collapsed/repeated keywords); \
-                 leaving topics_algo_signature unstamped so the model is treated as stale and recomputed"
-            );
-        } else if let Err(e) =
-            set_topics_algo_signature(pool, crate::cron::topic_clustering::TOPICS_ALGO_SIGNATURE)
-                .await
-        {
-            tracing::warn!(error = %e, "store_topics: failed to stamp topics_algo_signature");
-        }
-    }
-
+    // NOTE: `store_topics` is a pure storage primitive — it does NOT stamp the
+    // algorithm signature. Stamping is owned by the cron orchestration layer
+    // (`topic_clustering::stamp_topics_signature`), called once per global-refresh
+    // strategy after the canonical degeneracy gate (`topic_gate_rejects`) passes
+    // and a global store succeeds. Keeping the model-quality policy out of the DB
+    // query layer avoids a second, divergent degeneracy definition (the prior
+    // inline `with_kw`/`distinct_lead` heuristic disagreed with the canonical gate
+    // and silently left the keyword-less online-FCM path permanently "stale").
     Ok(())
 }
 

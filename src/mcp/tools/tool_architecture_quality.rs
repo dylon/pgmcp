@@ -52,11 +52,11 @@ pub(crate) async fn collect_architecture_dimensions(
     // tokenizer/label pipeline, the case that produced the `the/and/dylon`
     // stopword labels), this dimension is reported N/A and excluded from the
     // pillar mean — never scored a misleading 0.0.
-    let topics_stale = crate::db::queries::topics_global_stale(
-        pool,
-        crate::cron::topic_clustering::TOPICS_ALGO_SIGNATURE,
-    )
-    .await;
+    // Effective signature folds the active engine (graph vs FCM tracks) so this
+    // dimension is N/A under an engine switch, not only a label-pipeline bump.
+    let topics_sig =
+        crate::cron::topic_clustering::topics_effective_signature(&ctx.config().load().cron);
+    let topics_stale = crate::db::queries::topics_global_stale(pool, &topics_sig).await;
     let soc_dim = if avg_topics.is_none() || topics_stale {
         DimensionScore::absent(
             "separation_of_concerns",

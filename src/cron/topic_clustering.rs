@@ -296,18 +296,59 @@ fn degenerate_result(n: usize, d: usize, k: usize) -> FcmResult {
 // c-TF-IDF topic labeling
 // ============================================================================
 
-/// Algorithm/representation signature of the code-topic labels this binary
-/// produces. Persisted to `pgmcp_metadata['topics_algo_signature']` at the end
-/// of a successful global scan and compared by the staleness check
-/// (`db::queries::topics_global_stale`). Bump it whenever the tokenizer,
+/// Static algorithm/representation signature of the code-topic *label pipeline*
+/// this binary produces. Combined with the active clustering engine by
+/// [`topics_effective_signature`] and persisted to
+/// `pgmcp_metadata['topics_algo_signature']` by [`stamp_topics_signature`] at the
+/// end of a successful, non-degenerate global refresh; compared by the staleness
+/// check (`db::queries::topics_global_stale`). Bump it whenever the tokenizer,
 /// stopword tiers, or keyword-extraction logic change so that topics computed by
 /// older code are reported stale (and recomputed) rather than trusted — the same
 /// idiom as the `pgmcp-pattern-embedding-v3` pattern-catalog signature.
 ///
-/// `v2` = stopword-tiered c-TF-IDF with identifier splitting + embedding-based
-/// (KeyBERT/MMR) keyword refinement. Topics carrying no signature (NULL) were
-/// computed by pre-signature code and are always treated as stale.
+/// `v3` = stopword-tiered c-TF-IDF with identifier splitting + embedding-based
+/// (KeyBERT/MMR) keyword refinement, under the `MAX_MEMBERSHIPS_PER_CHUNK` cap.
+/// Topics carrying no signature (NULL) were computed by pre-signature code and
+/// are always treated as stale.
 pub const TOPICS_ALGO_SIGNATURE: &str = "pgmcp-topics-v3";
+
+/// The *effective* topics-algorithm signature: the static label-pipeline version
+/// ([`TOPICS_ALGO_SIGNATURE`]) folded with the active clustering engine
+/// (`topic_clustering_method`). This is the value persisted to
+/// `pgmcp_metadata['topics_algo_signature']` and compared for staleness.
+///
+/// Folding the engine in means switching `topic_clustering_method` (e.g. `graph`
+/// → `embedding_hdbscan`) automatically invalidates a model produced by a
+/// different engine — their partition geometries differ (graph is a hard
+/// 1-topic-per-doc partition; the FCM tracks are soft, up to
+/// `MAX_MEMBERSHIPS_PER_CHUNK` per chunk), so trusting one engine's topics as
+/// current under another would be wrong. Bump [`TOPICS_ALGO_SIGNATURE`] for
+/// label-pipeline changes; the engine suffix handles engine switches with no
+/// manual bump.
+pub fn topics_effective_signature(config: &CronConfig) -> String {
+    format!("{TOPICS_ALGO_SIGNATURE}+{}", config.topic_clustering_method)
+}
+
+/// Stamp the effective signature ([`topics_effective_signature`]) for a
+/// just-completed global refresh. Call ONLY after the canonical degeneracy gate
+/// ([`topic_gate_rejects`]) has passed (where the strategy has one) *and* a
+/// global-scope store has succeeded — i.e. on the non-early-return success path
+/// of each global-refresh strategy (in-memory / mmap / online FCM, and the graph
+/// global roll-up). Paths that intentionally do not refresh the authoritative
+/// `global` scope — the per-project emergency fallback, the `hierarchy` overlay,
+/// and on-demand single-project `discover_topics` — must NOT call this; leaving
+/// the signature untouched keeps the model honestly "stale" until a real global
+/// refresh, which is the correct signal for those paths.
+///
+/// Best-effort: a stamp failure is logged, not fatal — the stored model is still
+/// good and the next successful scan re-stamps.
+async fn stamp_topics_signature(db: &dyn DbClient, config: &CronConfig) {
+    let Some(pool) = db.pool() else { return };
+    let sig = topics_effective_signature(config);
+    if let Err(e) = crate::db::queries::set_topics_algo_signature(pool, &sig).await {
+        warn!(error = %e, sig = %sig, "failed to stamp topics_algo_signature");
+    }
+}
 
 /// Maximum number of topics a single chunk is assigned to. The FCM
 /// soft-membership matrix (fuzziness m=2, K up to ~500) places non-trivial mass
@@ -1679,6 +1720,10 @@ pub async fn run_global_topic_scan(
     // Phase 1: persist quality metrics for trend + health surfacing.
     persist_topic_quality(db, "global", &summary).await;
 
+    // Mark the global model fresh under the active engine's effective signature:
+    // the degeneracy gate passed and the global store succeeded above.
+    stamp_topics_signature(db, config).await;
+
     // Phase 9: chain meta-clustering hierarchy on the global centroids.
     run_hierarchy_pass(db, config, stats).await;
 }
@@ -2116,6 +2161,10 @@ async fn run_mmap_global_topic_scan(
 
     // Phase 1: persist quality metrics for trend + health surfacing.
     persist_topic_quality(db, "global", &summary).await;
+
+    // Mark the global model fresh under the active engine's effective signature:
+    // the degeneracy gate passed and the global store succeeded above.
+    stamp_topics_signature(db, config).await;
 
     drop(data_view_owned);
     drop(mmap);
@@ -2647,8 +2696,16 @@ async fn run_online_global_topic_scan(
     if let Err(e) = db.clear_topics_for_scope("global").await {
         warn!(error = %e, "online FCM: clear global failed");
     }
-    if let Err(e) = db.store_topics("global", &topics_built).await {
-        warn!(error = %e, "online FCM: store global topics failed");
+    // The online mini-batch path persists per-chunk membership to LMDB rather
+    // than RAM (to bound memory on huge corpora) and so does not compute the
+    // full membership/label metrics the canonical `topic_gate_rejects` gate
+    // needs; the signature's contract is freshness ("the global model is current
+    // under this engine"), not label quality (that is the separate
+    // `topics_quality`/`topics_degenerate` channel), so a successful store is the
+    // correct stamp condition here.
+    match db.store_topics("global", &topics_built).await {
+        Err(e) => warn!(error = %e, "online FCM: store global topics failed"),
+        Ok(()) => stamp_topics_signature(db, config).await,
     }
 
     stats.topic_scans.fetch_add(1, Ordering::Relaxed);
@@ -3091,6 +3148,12 @@ async fn build_global_rollup(db: &dyn DbClient, config: &CronConfig, stats: &Arc
     if let Err(e) = crate::db::queries::set_topic_quality(pool, "global", &q).await {
         warn!(error = %e, "global rollup: persist quality failed");
     }
+
+    // Mark the global model fresh: the roll-up cleared the per-project degeneracy
+    // guards above and the `global`-scope store succeeded. This is the success
+    // point for the default `graph` engine (it never calls `store_topics`
+    // with scope="global").
+    stamp_topics_signature(db, config).await;
 
     info!(
         meta_topics = rollup.len(),
@@ -3596,6 +3659,41 @@ fn cluster_embeddings_hdbscan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn topics_effective_signature_folds_engine() {
+        let sig = |m: &str| {
+            topics_effective_signature(&crate::config::CronConfig {
+                topic_clustering_method: m.to_string(),
+                ..Default::default()
+            })
+        };
+        assert_eq!(sig("graph"), "pgmcp-topics-v3+graph");
+        assert_eq!(
+            sig("embedding_hdbscan"),
+            "pgmcp-topics-v3+embedding_hdbscan"
+        );
+        assert_eq!(sig("baseline"), "pgmcp-topics-v3+baseline");
+    }
+
+    #[test]
+    fn effective_signature_distinguishes_engines_and_carries_pipeline_version() {
+        let sig = |m: &str| {
+            topics_effective_signature(&crate::config::CronConfig {
+                topic_clustering_method: m.to_string(),
+                ..Default::default()
+            })
+        };
+        // Distinct engines ⇒ distinct signatures, so switching `topic_clustering_method`
+        // invalidates a model produced by a different engine (D3).
+        assert_ne!(sig("graph"), sig("embedding_pca"));
+        // Stable for the same engine (idempotent comparison).
+        assert_eq!(sig("graph"), sig("graph"));
+        // Always carries the static label-pipeline version as the prefix, so a
+        // `TOPICS_ALGO_SIGNATURE` bump still invalidates every engine's stored model.
+        assert!(sig("graph").starts_with(TOPICS_ALGO_SIGNATURE));
+        assert!(sig("graph").starts_with("pgmcp-topics-v3+"));
+    }
 
     fn test_fcm(
         data: ndarray::ArrayView2<'_, f32>,

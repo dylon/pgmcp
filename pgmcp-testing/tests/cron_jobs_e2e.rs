@@ -8,9 +8,10 @@ use std::sync::Arc;
 use pgmcp::config::{CronConfig, VectorConfig};
 use pgmcp::cron::graph_analysis::run_graph_analysis;
 use pgmcp::cron::similarity::run_similarity_scan;
-use pgmcp::cron::topic_clustering::run_global_topic_scan;
+use pgmcp::cron::topic_clustering::{run_global_topic_scan, topics_effective_signature};
 use pgmcp::daemon_state::DaemonLifecycle;
 use pgmcp::db::DbClient;
+use pgmcp::db::queries;
 use pgmcp::embed::EmbeddingBackend;
 use pgmcp::stats::tracker::StatsTracker;
 use pgmcp_testing::mocks::DeterministicEmbeddingBackend;
@@ -169,6 +170,148 @@ async fn topic_clustering_populates_code_topics() {
         topic_count >= 1,
         "topic clustering must produce ≥ 1 topic, got {}",
         topic_count
+    );
+}
+
+/// D1 end-to-end: a global topic refresh must stamp the *effective* (engine-aware)
+/// signature, and ONLY when a `global`-scope model was actually stored. The
+/// invariant `(global stored) ⟺ (signature stamped to the effective value)` holds
+/// regardless of whether the graph engine's roll-up succeeds on this small fixture,
+/// so the test is robust. When stored, the consumer staleness check must clear and
+/// an engine switch must invalidate (D3).
+#[tokio::test(flavor = "multi_thread")]
+async fn topic_scan_stamps_iff_global_stored() {
+    let testdb = require_test_db!();
+    let backend: Arc<dyn EmbeddingBackend> = Arc::new(DeterministicEmbeddingBackend::new(1024));
+    let chunk_strings: Vec<String> = (0..20)
+        .map(|i| format!("chunk content number {} with unique tokens", i))
+        .collect();
+    let contents: Vec<&str> = chunk_strings.iter().map(|s| s.as_str()).collect();
+    seed_chunks(
+        testdb.pool(),
+        "sigproj",
+        "/ws/sigproj",
+        "src/wide.rs",
+        contents,
+        &backend,
+    )
+    .await;
+
+    let db: Arc<dyn DbClient> = Arc::new(testdb.pool().clone());
+    let stats = Arc::new(StatsTracker::new());
+    // Pin the engine so the asserted suffix is stable (default is already "graph").
+    let cron_cfg = CronConfig {
+        topic_clustering_method: "graph".to_string(),
+        topic_min_cluster_size: 3,
+        topic_num_clusters: Some(3),
+        topic_fcm_max_iters: 20,
+        ..Default::default()
+    };
+
+    run_global_topic_scan(db.as_ref(), &cron_cfg, &stats, &DaemonLifecycle::new()).await;
+
+    let effective = topics_effective_signature(&cron_cfg);
+    assert_eq!(effective, "pgmcp-topics-v3+graph");
+
+    let (global_count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM code_topics WHERE scope = 'global'")
+            .fetch_one(testdb.pool())
+            .await
+            .expect("count");
+    let sig: Option<String> =
+        sqlx::query_scalar("SELECT value FROM pgmcp_metadata WHERE key = 'topics_algo_signature'")
+            .fetch_optional(testdb.pool())
+            .await
+            .expect("sig query");
+
+    if global_count > 0 {
+        assert_eq!(
+            sig.as_deref(),
+            Some(effective.as_str()),
+            "global topics stored but signature not stamped to the effective value"
+        );
+        assert!(
+            !queries::topics_global_stale(testdb.pool(), &effective).await,
+            "a freshly-stamped global model must not read as stale"
+        );
+        let switched = topics_effective_signature(&CronConfig {
+            topic_clustering_method: "embedding_hdbscan".to_string(),
+            ..Default::default()
+        });
+        assert!(
+            queries::topics_global_stale(testdb.pool(), &switched).await,
+            "an engine switch must read as stale (D3)"
+        );
+    } else {
+        assert_eq!(
+            sig, None,
+            "no global topics stored, so the signature must remain unstamped"
+        );
+    }
+}
+
+/// D3 + consumer mechanism, no clustering: the *effective* signature drives
+/// `topics_global_stale`. Unstamped ⟹ stale; matching engine + fresh topics ⟹
+/// not stale; a switched engine ⟹ stale.
+#[tokio::test]
+async fn effective_signature_staleness_contract() {
+    let testdb = require_test_db!();
+    let graph_sig = topics_effective_signature(&CronConfig {
+        topic_clustering_method: "graph".to_string(),
+        ..Default::default()
+    });
+    let hdbscan_sig = topics_effective_signature(&CronConfig {
+        topic_clustering_method: "embedding_hdbscan".to_string(),
+        ..Default::default()
+    });
+
+    // Fresh DB, never stamped ⟹ stale under any signature.
+    assert!(
+        queries::topics_global_stale(testdb.pool(), &graph_sig).await,
+        "an unstamped model must read as stale"
+    );
+
+    // A fresh global topic row + a matching stamp ⟹ not stale (no indexed_files,
+    // so the corpus-freshness leg cannot trip).
+    sqlx::query(
+        "INSERT INTO code_topics \
+         (scope, cluster_index, label, chunk_count, file_count, project_count, project_names) \
+         VALUES ('global', 0, 'demo', 1, 1, 1, ARRAY['p']::text[])",
+    )
+    .execute(testdb.pool())
+    .await
+    .expect("insert topic");
+    queries::set_topics_algo_signature(testdb.pool(), &graph_sig)
+        .await
+        .expect("stamp");
+
+    assert!(
+        !queries::topics_global_stale(testdb.pool(), &graph_sig).await,
+        "matching engine + fresh topics must not be stale"
+    );
+    assert!(
+        queries::topics_global_stale(testdb.pool(), &hdbscan_sig).await,
+        "a switched-engine signature must read as stale (D3)"
+    );
+}
+
+/// D4 / refactor regression lock: `store_topics` is now a pure storage primitive.
+/// Even a `global`-scope store must NOT stamp the algorithm signature (stamping
+/// moved to the cron orchestration layer). The prior code stamped here.
+#[tokio::test]
+async fn store_topics_does_not_stamp_signature() {
+    let testdb = require_test_db!();
+    queries::store_topics(testdb.pool(), "global", &[])
+        .await
+        .expect("store_topics");
+    let sig: Option<String> =
+        sqlx::query_scalar("SELECT value FROM pgmcp_metadata WHERE key = 'topics_algo_signature'")
+            .fetch_optional(testdb.pool())
+            .await
+            .expect("sig query");
+    assert_eq!(
+        sig, None,
+        "store_topics must not stamp the algo signature anymore"
     );
 }
 

@@ -2764,9 +2764,12 @@ pub struct CronConfig {
     ///   curse-of-dimensionality collapse; the embedding-BERTopic track);
     /// - `"embedding_rp"` — FCM on JL-random-projection-reduced embeddings;
     /// - `"graph"` — Leiden/Louvain communities over the fused semantic+import+
-    ///   co-change graph (`src/cron/topic_graph.rs`).
+    ///   co-change graph (`src/cron/topic_graph.rs`);
+    /// - `"embedding_hdbscan"` — HDBSCAN over reduced embeddings (per-project).
     ///
-    /// Default `"embedding_pca"` — the bake-off (Phase 3) confirms the winner.
+    /// Default `"graph"` — the bake-off (2026-06-13) confirmed it the winner
+    /// (non-degenerate, clean 1-topic-per-doc partition, ~10× faster than the FCM
+    /// embedding tracks); see `default_topic_clustering_method`.
     #[serde(default = "default_topic_clustering_method")]
     pub topic_clustering_method: String,
     /// Target dimensionality for the embedding-track reducers. Default 30.

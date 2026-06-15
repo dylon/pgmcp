@@ -188,3 +188,76 @@ Verified: `cargo check` + `cargo clippy --bin pgmcp --all-targets` clean, 81 top
 - **UMAP + HDBSCAN now** — SOTA-canonical but adds a heavy dependency surface
   (`ndarray-linalg`/LAPACK); deferred behind vetting since in-tree PCA + graph already repair
   the failure.
+
+## Addendum A (2026-06-15): algorithm-signature staleness correctness across all engines
+
+The "honest staleness detection" of Decision §1 / `grading-reliability.md` §6 keyed
+`orient.health.topics_stale` and `architecture_quality`'s `separation_of_concerns`
+dimension on a stored algorithm signature
+(`pgmcp_metadata['topics_algo_signature']` vs `TOPICS_ALGO_SIGNATURE`). When `graph`
+became the **default** engine (this ADR), the signature mechanism silently broke: the
+graph engine never stamped the signature, so the model read as *permanently stale* even
+seconds after a fully successful scan. Measured 2026-06-15: 5,882 fresh topics across 66
+projects, yet `SELECT … WHERE key='topics_algo_signature'` returned **zero rows**.
+
+### Defects (all fixed here)
+
+| # | Defect |
+|---|---|
+| D1 | Graph engine (the default) never stamped: it stores `global` via `store_global_rollup` and per-project via `store_topics("project:…")`, both bypassing the lone stamp site (guarded by `scope=="global"` inside `store_topics`). |
+| D2 | Online FCM path also never stamped: its keyword-less shell topics tripped an inline `with_kw`/`distinct_lead` heuristic, so even the FCM family did not stamp uniformly. |
+| D3 | The signature was a bare const with **no engine identity** — switching `topic_clustering_method` was undetectable; stale cross-engine topics were trusted (graph's hard 1-topic/doc partition vs the FCM tracks' soft up-to-`MAX_MEMBERSHIPS_PER_CHUNK` partition are not interchangeable). |
+| D4 | Two divergent degeneracy definitions: the canonical `topic_gate_rejects` gate vs the ad-hoc heuristic buried in the DB-layer `store_topics`; they disagreed (and did, for online). |
+| D5 | `config.rs` doc-comment claimed default `"embedding_pca"`; the code returns `"graph"`. |
+| D6 | The scheduler's `topic_cron_config` was a lossy field-by-field literal with `..CronConfig::default()` that **reset every un-listed topic knob** (engine method, gate thresholds, LLM-label toggle, reducer dims, graph weights) back to default — so operator TOML overrides were ignored by the cron, and the cron's `topic_clustering_method` (hence the stamped signature) could disagree with what the consumers compute. |
+
+### Resolution
+
+1. **Stamping is a cron-orchestration concern, not a storage-primitive one.** Removed the
+   stamp block *and its ad-hoc degeneracy heuristic* from `db::queries::store_topics` (now a
+   pure storage primitive — kills D4). Added one private helper
+   `topic_clustering::stamp_topics_signature(db, config)`, called on the **success path** of
+   each global-refresh strategy after the canonical gate passed and the global store
+   succeeded: FCM in-memory, FCM mmap, FCM online, and the graph global roll-up
+   (`build_global_rollup`, after `store_global_rollup` + quality persist). The invariant is
+   uniform: **stamp ⟺ (gate passed, where the strategy has one) ∧ (global store succeeded)**.
+   The per-project emergency fallback, the `hierarchy` overlay, and on-demand single-project
+   `discover_topics` deliberately do **not** stamp (they do not refresh the authoritative
+   `global` scope), so the model stays honestly stale until a real global refresh.
+2. **Engine-aware signature (D3).** `topics_effective_signature(config) = "pgmcp-topics-v3+{method}"`.
+   An engine switch yields a different string ⇒ correctly stale until recompute. The two
+   consumers (`tool_orient.rs`, `tool_architecture_quality.rs`) compare against this effective
+   value. The const is **not** bumped v3→v4 (the label pipeline is unchanged; the engine-suffix
+   transition already forces exactly one free recompute on next cron).
+3. **Full config threading (D6).** The scheduler's `topic_cron_config` is now `config.clone()`
+   (mirroring `sem_cron_config`), threading every topic knob from TOML.
+4. **Doc fixes (D5).** `config.rs` comment corrected; `grading-reliability.md` §6 updated.
+
+### Success-path case matrix (graph engine)
+
+```
+run_global_topic_scan
+  ├─ 0 chunks ──────────────────► NoOp return                  [no stamp]  ✓ stale
+  └─ method ∈ {graph, embedding_hdbscan}
+        └─ run_graph_topic_scan
+              ├─ per project: gate? ──reject──► continue (keep prior)
+              │                   └─accept──► store_topics("project:NAME")  [no stamp]
+              └─ build_global_rollup
+                    ├─ <4 candidates ──────────► return         [no stamp]  ✓ stale
+                    ├─ labels degenerate ──────► return         [no stamp]  ✓ stale
+                    └─ store_global_rollup OK → persist_quality
+                          └─ ★ stamp_topics_signature(db, config)           ✓ fresh
+```
+
+Partial success (some per-project scans gate-rejected, ≥4 good candidates remain) **does**
+stamp — the consumer-visible `global` scope is genuinely fresh and non-degenerate; rejected
+projects keep their prior rows.
+
+### Validation (this host; the real-DB test suite is dormant here)
+
+After release rebuild + daemon restart: `trigger_cron{job:"topic-clustering"}` →
+`psql -tAc "SELECT value FROM pgmcp_metadata WHERE key='topics_algo_signature'"` must return
+`pgmcp-topics-v3+graph` → `orient{project:"pgmcp"}` must show `health.topics_stale:false`.
+Pure unit tests (signature format) run here; `require_test_db!` integration tests
+(`graph_scan_stamps`, `degenerate_rollup_unstamped`, `online_path_stamps`,
+`engine_switch_invalidates`, `emergency_fallback_no_global_stamp`) run in CI.

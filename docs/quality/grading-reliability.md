@@ -61,10 +61,15 @@ topic model is stale or absent, instead of a misleading 0.0. "Stale" is now a
 `orient`'s health envelope previously set `topics_stale` from `topics.is_empty()`
 — so ancient, degenerate topics read as "current." It now uses
 `db::queries::topics_global_stale` / `graph_stale`, which compare a stored
-**algorithm signature** (`pgmcp_metadata['topics_algo_signature']` vs
-`cron::topic_clustering::TOPICS_ALGO_SIGNATURE`) and `computed_at` against the
-newest indexed file. Topics computed by older tokenizer/label code carry no
-signature and are correctly flagged stale.
+**algorithm signature** (`pgmcp_metadata['topics_algo_signature']`) against the
+*effective* signature `cron::topic_clustering::topics_effective_signature(config)`
+— the static label-pipeline version `TOPICS_ALGO_SIGNATURE` folded with the active
+`topic_clustering_method` — plus `computed_at` against the newest indexed file.
+Topics computed by an older label pipeline, **or by a different engine**, are
+correctly flagged stale. The signature is stamped by the cron orchestration layer
+(`stamp_topics_signature`) on the success path of *every* global-refresh engine
+(graph roll-up + FCM in-memory/mmap/online), not by the DB-layer `store_topics`
+(see ADR-017 Addendum A).
 
 ### 7. Process/team metrics: honest, kept, not curved
 `team_distribution`, `code_stability` (churn), `bug_fix_ratio`, and the ORR
@@ -85,9 +90,11 @@ stopword tiers. The fixes (`src/cron/topic_clustering.rs`):
   compound tokens.
 - **df cutoff**: drop words appearing in >40% of topics (≥5 topics) — strengthens
   separation, applied on both the in-memory and streaming (global) paths.
-- **Degeneracy guard**: `store_topics` stamps the algorithm signature only for a
-  healthy global topic set; collapsed/repeated labels are logged and left
-  unstamped so the model is treated as stale and recomputed.
+- **Degeneracy guard**: the canonical pre-overwrite gate (`topic_gate_rejects`)
+  refuses to store a collapsed model, preserving the prior topics; the engine-aware
+  signature is then stamped (`stamp_topics_signature`) only on a successful, gated
+  global refresh, so a degenerate result is treated as stale and recomputed
+  (see ADR-017 Addendum A).
 
 c-TF-IDF with this preprocessing is a BERTopic-class representation. An optional
 further refinement — embedding-based keyword selection (KeyBERT) with MMR
@@ -102,7 +109,8 @@ requires threading an embedder handle into the clustering cron.
   `job="function-metrics"` (these bypass the cooldown). Until then, `complexity`
   honestly reports `N/A`.
 - **Recomputing topics**: `trigger_cron job="topic-clustering"` after a rebuild;
-  the new signature is stamped only if the result is non-degenerate.
+  the effective signature (`pgmcp-topics-v3+<engine>`) is stamped only on a
+  successful, non-degenerate global refresh.
 
 ## Regenerating the report card
 
