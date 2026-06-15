@@ -503,6 +503,22 @@ pub struct TriggerCronParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CronHistoryParams {
+    /// Optional cron-job-name filter for the `recent` list.
+    #[serde(default)]
+    #[schemars(
+        description = "Optional cron job name to filter the recent-runs list (e.g. \"topic-clustering\", \"symbol-extraction\"). Omit to see recent runs across all jobs. The per-job rollup always covers every job."
+    )]
+    pub job: Option<String>,
+    /// Cap on the number of recent rows returned (1..=500, default 50).
+    #[serde(default)]
+    #[schemars(
+        description = "Max recent run rows to return (clamped to 1..=500; default 50). The per-job rollup is unaffected."
+    )]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WorkItemLinkCommitParams {
     #[schemars(description = "The item's public_id to link to a commit / PR / branch")]
     pub public_id: String,

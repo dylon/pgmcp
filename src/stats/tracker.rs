@@ -738,6 +738,11 @@ pub struct StatsTracker {
     pub telemetry_writes_failed: AtomicU64,
     /// Rows purged by the daily `telemetry-retention` cron job.
     pub telemetry_rows_purged: AtomicU64,
+    /// `cron_run_history` rows dropped because the writer channel was full
+    /// (back-pressure). Mirrors `telemetry_writes_dropped`; surfaced in
+    /// `index_stats` so silent drops stay observable. See
+    /// `src/cron/history/mod.rs`.
+    pub cron_history_writes_dropped: AtomicU64,
     /// Number of `memory-graph-refresh` cron passes that refreshed the unified
     /// knowledge-graph matviews (`memory_unified_nodes` + `memory_unified_edges`).
     pub memory_graph_refreshes: AtomicU64,
@@ -1051,6 +1056,7 @@ impl StatsTracker {
             telemetry_writes_dropped: AtomicU64::new(0),
             telemetry_writes_failed: AtomicU64::new(0),
             telemetry_rows_purged: AtomicU64::new(0),
+            cron_history_writes_dropped: AtomicU64::new(0),
             memory_graph_refreshes: AtomicU64::new(0),
             memory_concept_runs: AtomicU64::new(0),
             memory_concepts_emitted: AtomicU64::new(0),
@@ -1500,6 +1506,7 @@ impl StatsTracker {
             "telemetry_writes_dropped": self.telemetry_writes_dropped.load(Ordering::Acquire),
             "telemetry_writes_failed": self.telemetry_writes_failed.load(Ordering::Acquire),
             "telemetry_rows_purged": self.telemetry_rows_purged.load(Ordering::Acquire),
+            "cron_history_writes_dropped": self.cron_history_writes_dropped.load(Ordering::Acquire),
             "memory_graph_refreshes": self.memory_graph_refreshes.load(Ordering::Acquire),
             "memory_concept_runs": self.memory_concept_runs.load(Ordering::Acquire),
             "memory_concepts_emitted": self.memory_concepts_emitted.load(Ordering::Acquire),

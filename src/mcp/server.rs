@@ -1106,6 +1106,7 @@ impl McpServer {
             "fix_circular_dependency"        => fix_circular_dependency(FixCircularDependencyParams),
             "reindex"                        => reindex(ReindexParams),
             "active_clients"                 => active_clients(ActiveClientsParams),
+            "cron_history"                   => cron_history(CronHistoryParams),
             "client_project_matrix"          => client_project_matrix(ClientProjectMatrixParams),
             "project_dependents"             => project_dependents(ProjectDependentsParams),
             "project_dependencies"           => project_dependencies(ProjectDependenciesParams),

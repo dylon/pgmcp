@@ -59,6 +59,7 @@ pub mod tool_conversation_search;
 pub mod tool_coordinate_dependency_block;
 pub mod tool_coordination_respond;
 pub mod tool_coupling_cohesion_report;
+pub mod tool_cron_history;
 pub mod tool_cross_language_api_equivalents;
 pub mod tool_dependency_graph;
 pub mod tool_dependency_health;

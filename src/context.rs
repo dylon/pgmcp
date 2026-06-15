@@ -28,6 +28,7 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 
 use crate::config::Config;
+use crate::cron::history::CronHistoryWriter;
 use crate::daemon_state::DaemonLifecycle;
 use crate::db::DbClient;
 use crate::embed::EmbedSource;
@@ -113,6 +114,12 @@ pub struct SystemContext {
     /// loaded from `client_tool_policy` at daemon startup, then refreshed on the
     /// cron. See `docs/design/tool-policy-recency-decay.md`.
     tool_policy: Arc<ArcSwap<crate::mcp::tool_policy::ToolPolicySnapshot>>,
+    /// Durable cron-run ledger writer (`cron_run_history`, v40). In daemon mode
+    /// this is the live channel-backed writer spawned in `cli/daemon.rs`; in CLI
+    /// / test mode it is `CronHistoryWriter::null` (records silently dropped).
+    /// Cron bodies and the manual `trigger_cron` path build a `CronRunGuard`
+    /// from this handle. See `src/cron/history/` and ADR-018.
+    cron_history: CronHistoryWriter,
 }
 
 impl SystemContext {
@@ -130,6 +137,8 @@ impl SystemContext {
         task_store: Arc<TaskStore>,
         lifecycle: DaemonLifecycle,
     ) -> Self {
+        // CLI / test mode: a no-op writer (no channel; records are dropped).
+        let cron_history = CronHistoryWriter::null(Arc::clone(&stats));
         Self {
             db,
             embed,
@@ -149,6 +158,7 @@ impl SystemContext {
             tool_policy: Arc::new(ArcSwap::from_pointee(
                 crate::mcp::tool_policy::ToolPolicySnapshot::default(),
             )),
+            cron_history,
         }
     }
 
@@ -165,6 +175,7 @@ impl SystemContext {
         task_store: Arc<TaskStore>,
         lifecycle: DaemonLifecycle,
         llm_extractor: Arc<parking_lot::RwLock<Option<Arc<dyn LlmExtractor>>>>,
+        cron_history: CronHistoryWriter,
     ) -> Self {
         Self {
             db,
@@ -185,6 +196,7 @@ impl SystemContext {
             tool_policy: Arc::new(ArcSwap::from_pointee(
                 crate::mcp::tool_policy::ToolPolicySnapshot::default(),
             )),
+            cron_history,
         }
     }
 
@@ -193,6 +205,14 @@ impl SystemContext {
     /// reuse trie handles across calls rather than reopening one per query.
     pub fn fuzzy_cache(&self) -> &crate::fuzzy::cache::FuzzyCache {
         &self.fuzzy_cache
+    }
+
+    /// The durable cron-run-history writer (`cron_run_history`, v40). Cron
+    /// bodies and the manual `trigger_cron` path build a `CronRunGuard` from a
+    /// clone of this handle; the scheduler's gate path uses `record_skip`. In
+    /// CLI / test mode this is the no-op `null` writer. See `src/cron/history/`.
+    pub fn cron_history(&self) -> &CronHistoryWriter {
+        &self.cron_history
     }
 
     /// P14.4 — clone the per-project phonetics registry Arc. The

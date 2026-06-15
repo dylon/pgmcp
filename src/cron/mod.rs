@@ -24,6 +24,7 @@ pub mod gpu_fcm;
 pub mod graph_analysis;
 #[allow(dead_code)]
 pub mod hdbscan;
+pub mod history;
 #[allow(dead_code)]
 pub mod job;
 #[allow(dead_code)]

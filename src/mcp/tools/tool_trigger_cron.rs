@@ -70,11 +70,11 @@ pub async fn tool_trigger_cron(
         ));
     }
 
-    let db = ctx.db();
-    let stats = ctx.stats();
     let _heavy_guard = match ctx.heavy_cron_lock().try_lock() {
         Ok(guard) => guard,
         Err(_) => {
+            // Busy = lock held by another heavy run; nothing executed here, so
+            // there is no run to record (the busy response is not a cron run).
             return json_result(&json!({
                 "job": job,
                 "project": project,
@@ -84,8 +84,36 @@ pub async fn tool_trigger_cron(
             }));
         }
     };
-    let _cron_flag = crate::cron::scheduler::HeavyCronFlag::new(Arc::clone(stats));
+    let _cron_flag = crate::cron::scheduler::HeavyCronFlag::new(Arc::clone(ctx.stats()));
 
+    // Record this manual run in cron_run_history (ADR-018). The guard drops at
+    // function exit and writes one row: Ok on a returned result, Failed on an
+    // Err (a `?`-propagated arm error), Panicked on an unwind.
+    let mut run = crate::cron::history::CronRunGuard::new(
+        ctx.cron_history().clone(),
+        job,
+        crate::cron::history::CronTriggerSource::Manual,
+        project.clone(),
+    );
+    let result = trigger_cron_dispatch(ctx, job, project).await;
+    match &result {
+        Ok(_) => run.ok(),
+        Err(e) => run.fail(format!("{e:?}")),
+    }
+    result
+}
+
+/// Dispatch a validated `trigger_cron` job to its cron body. Split out from
+/// [`tool_trigger_cron`] so the latter can wrap the whole dispatch in a single
+/// [`crate::cron::history::CronRunGuard`] (recording the manual run) without
+/// threading the run outcome through all 14 arms.
+async fn trigger_cron_dispatch(
+    ctx: &SystemContext,
+    job: &str,
+    project: Option<String>,
+) -> Result<CallToolResult, McpError> {
+    let db = ctx.db();
+    let stats = ctx.stats();
     match job {
         "target-cleanup" => {
             // Disk reclamation: tiered `target/` removal + provenance-first

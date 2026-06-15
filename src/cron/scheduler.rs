@@ -4,8 +4,8 @@
 
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
-use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -52,6 +52,37 @@ fn staggered_initial_delay_ms(job_name: &str, interval_ms: u64) -> u64 {
     BASE_MS + (h % cap)
 }
 
+/// Restart-survival initial delay (ADR-018 §5). Computes a recurring cron's
+/// first-tick delay from its last persisted successful completion instead of a
+/// fresh stagger, so a daemon restart no longer slips the schedule. Pure and
+/// unit-testable (`now_ms` injected). Overdue / unknown-job / clock-skew all
+/// fall back to the anti-herd [`staggered_initial_delay_ms`]; for short-interval
+/// jobs the result naturally collapses to ~stagger (since `next_due ≈ now`),
+/// which is correct, not a special case.
+pub(crate) fn restart_initial_delay_ms(
+    job: &str,
+    interval_ms: u64,
+    last_ok_ms: Option<u64>,
+    now_ms: u64,
+) -> u64 {
+    if interval_ms == 0 {
+        return 0; // disabled: caller won't schedule
+    }
+    let stagger = staggered_initial_delay_ms(job, interval_ms);
+    match last_ok_ms {
+        None => stagger,                        // first boot / unknown job
+        Some(last) if last > now_ms => stagger, // clock skew / future timestamp
+        Some(last) => {
+            let next_due = last.saturating_add(interval_ms);
+            if next_due <= now_ms {
+                stagger // overdue → fire soon, but staggered (anti-herd)
+            } else {
+                (next_due - now_ms).max(stagger) // wait remaining, floor at stagger
+            }
+        }
+    }
+}
+
 /// RAII guard that flips `stats.heavy_cron_running` → true on construction
 /// and back to false on drop. Used by the four heavy cron bodies so the
 /// Prometheus `pgmcp_heavy_cron_running` gauge reflects live state regardless
@@ -77,78 +108,252 @@ impl Drop for HeavyCronFlag {
     }
 }
 
-/// Heavy-cron skip-gate macro. Returns either a held `MutexGuard` (work
-/// can proceed) or causes the enclosing closure to `return;` after
-/// recording the exact `SkipReason` into `stats.last_cron_outcomes` so
-/// an operator can tell which gate is silencing each cron.
+/// Heavy-cron skip-gate (ADR-018 §6). Returns the held `heavy_cron_lock`
+/// `MutexGuard` when the body may proceed, or `None` after recording the exact
+/// `SkipReason` into both `stats.last_cron_outcomes` (the in-memory
+/// `index_stats` snapshot) and the durable `cron_run_history` ledger (via
+/// `hist.record_skip`) so an operator can tell which gate is silencing each cron
+/// — live and historically.
 ///
-/// Without this, the seven heavy-cron closures silently `return;` at
-/// each gate and the scheduler records `CronJobOutcome::Ok` (because
-/// the *closure* returned cleanly). Bug C in the 2026-05-21 staleness
-/// investigation: 363 cron_executions with zero work-counters because
-/// every tick hit one of these three gates.
-macro_rules! heavy_gate_or_skip {
-    (
-        job = $job:literal,
-        lc = $lc:expr,
-        ready = $ready:expr,
-        cooldown = $cooldown:expr,
-        lock = $lock:expr,
-        stats = $stats:expr,
-    ) => {{
-        use crate::stats::tracker::{CronJobOutcome, SkipReason};
-        if !$lc.is_at_least(crate::daemon_state::DaemonPhase::Ready) {
-            $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::PhaseGate), 0);
-            return;
+/// Without recording, the heavy-cron closures silently `return;` at each gate
+/// and the scheduler records `CronJobOutcome::Ok` (because the *closure*
+/// returned cleanly). Bug C in the 2026-05-21 staleness investigation: 363
+/// cron_executions with zero work-counters because every tick hit a gate.
+///
+/// The **Cooldown** (ready-relative settle) branch deliberately lives *outside*
+/// this gate now — it moved up into the recurring closure (`heavy_cron_tick`)
+/// so a settle-skip can schedule a one-shot retry at cooldown-expiry instead of
+/// slipping the run by a full interval. This gate keeps the checks that must be
+/// evaluated *inside* the pool task: PhaseGate, Shutdown, DbDown, DiskPressure,
+/// LockBusy.
+fn try_heavy_gate<'a>(
+    job: &'static str,
+    lc: &DaemonLifecycle,
+    lock: &'a tokio::sync::Mutex<()>,
+    stats: &StatsTracker,
+    hist: &crate::cron::history::CronHistoryWriter,
+) -> Option<tokio::sync::MutexGuard<'a, ()>> {
+    use crate::cron::history::CronTriggerSource;
+    use crate::stats::tracker::{CronJobOutcome, SkipReason};
+    if !lc.is_at_least(crate::daemon_state::DaemonPhase::Ready) {
+        stats.record_cron_outcome(job, CronJobOutcome::Skipped(SkipReason::PhaseGate), 0);
+        hist.record_skip(job, CronTriggerSource::Scheduled, SkipReason::PhaseGate);
+        return None;
+    }
+    // The PhaseGate check passes through `Terminating` because `DaemonPhase` is
+    // ordered Initializing < Scanning < Ready < Terminating < Defunct. Without
+    // this second gate, closures already enqueued at SIGTERM race the closing PG
+    // pool / channels and the next pool-acquire logs "attempted to acquire a
+    // connection on a closed pool" (plan glittery-graham F3).
+    if lc.is_stopping() {
+        stats.record_cron_outcome(job, CronJobOutcome::Skipped(SkipReason::Shutdown), 0);
+        hist.record_skip(job, CronTriggerSource::Scheduled, SkipReason::Shutdown);
+        return None;
+    }
+    // DB-availability breaker (src/health): if the database is unreachable, skip
+    // quietly rather than stall on a 10 s `acquire_timeout` and log every tick.
+    if !stats.db_health().is_up() {
+        stats.record_cron_outcome(job, CronJobOutcome::Skipped(SkipReason::DbDown), 0);
+        hist.record_skip(job, CronTriggerSource::Scheduled, SkipReason::DbDown);
+        return None;
+    }
+    // Disk-pressure gate (src/health): heavy crons write/grow data, so pause them
+    // while the watchdog reports a watched filesystem under pressure.
+    if stats.disk_pressure().is_paused() {
+        stats.record_cron_outcome(job, CronJobOutcome::Skipped(SkipReason::DiskPressure), 0);
+        hist.record_skip(job, CronTriggerSource::Scheduled, SkipReason::DiskPressure);
+        return None;
+    }
+    match lock.try_lock() {
+        Ok(g) => Some(g),
+        Err(_) => {
+            tracing::info!(job, "heavy cron busy, deferring");
+            stats.record_cron_outcome(job, CronJobOutcome::Skipped(SkipReason::LockBusy), 0);
+            hist.record_skip(job, CronTriggerSource::Scheduled, SkipReason::LockBusy);
+            None
         }
-        // The PhaseGate check passes through `Terminating` because
-        // `DaemonPhase` is ordered Initializing < Scanning < Ready <
-        // Terminating < Defunct (`src/daemon_state.rs:35-46`). Without
-        // this second gate, closures already enqueued at SIGTERM race
-        // the closing PG pool / channels and the next pool-acquire
-        // logs "attempted to acquire a connection on a closed pool"
-        // (47× across one shutdown in the 2026-05-25 log triage). See
-        // plan ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
-        // F3.
-        if $lc.is_stopping() {
-            $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::Shutdown), 0);
-            return;
+    }
+}
+
+/// Slack added to a cooldown-retry one-shot so it fires just *past* the settle
+/// window rather than on its exact edge (`heavy_cron_tick` / ADR-018 §6).
+const COOLDOWN_SLACK_MS: u64 = 1_000;
+
+/// The ready-relative settle decision for a heavy cron, evaluated on the
+/// scheduler thread (not in the pool task) so a skip can be retried at
+/// cooldown-expiry instead of slipping a full interval.
+enum CooldownDecision {
+    /// Submit the body now (the in-pool gates still apply).
+    RunNow,
+    /// Still inside the post-Ready settle window; retry after this many ms.
+    DeferMs(u64),
+}
+
+/// Decide whether a heavy cron may submit now or must wait out the post-boot
+/// settle. Measures **time in the Ready phase** (`ms_in_current_phase`) — a true
+/// "N seconds after Ready" gate that survives across the body's own timing and
+/// resets correctly if the daemon phase regresses (e.g. a mid-run reindex).
+fn cooldown_decision(lc: &DaemonLifecycle, cooldown_ms: u64) -> CooldownDecision {
+    if cooldown_ms == 0 {
+        return CooldownDecision::RunNow;
+    }
+    // Not yet Ready (or already stopping): defer to the in-pool PhaseGate /
+    // Shutdown gates, which record the precise skip reason. Submitting now is
+    // exactly today's behavior (the outer closure never gated on Ready).
+    if !lc.is_at_least(crate::daemon_state::DaemonPhase::Ready) || lc.is_stopping() {
+        return CooldownDecision::RunNow;
+    }
+    let since_ready = lc.ms_in_current_phase().max(0) as u64;
+    if since_ready < cooldown_ms {
+        CooldownDecision::DeferMs(cooldown_ms - since_ready + COOLDOWN_SLACK_MS)
+    } else {
+        CooldownDecision::RunNow
+    }
+}
+
+/// Schedule a one-shot retry of a cooldown-deferred heavy cron at
+/// `delay_ms`. The one-shot re-evaluates the settle on fire: if the window has
+/// elapsed it runs the body; otherwise it re-arms itself. Bounded —
+/// `ms_in_current_phase` grows monotonically while Ready, and a phase
+/// regression simply re-waits Ready (ADR-018 §6).
+fn schedule_heavy_retry(
+    handle: CronHandle,
+    lc: DaemonLifecycle,
+    run_once: Arc<dyn Fn() + Send + Sync>,
+    cooldown_ms: u64,
+    job: &'static str,
+    delay_ms: u64,
+) {
+    // Clone for the closure capture so `handle` itself stays free to be the
+    // `schedule_once` receiver (the closure re-arms via `handle_inner`).
+    let handle_inner = handle.clone();
+    handle.schedule_once(delay_ms, job, move || {
+        match cooldown_decision(&lc, cooldown_ms) {
+            CooldownDecision::RunNow => run_once(),
+            CooldownDecision::DeferMs(d) => schedule_heavy_retry(
+                handle_inner.clone(),
+                lc.clone(),
+                Arc::clone(&run_once),
+                cooldown_ms,
+                job,
+                d,
+            ),
         }
-        // DB-availability breaker (src/health): if the database is unreachable,
-        // skip quietly rather than stall this heavy cron on a 10 s
-        // `acquire_timeout` and log an error every tick. The prober owns the
-        // single "database unreachable" line.
-        if !$stats.db_health().is_up() {
-            $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::DbDown), 0);
-            return;
-        }
-        // Disk-pressure gate (src/health): heavy crons write/grow data, so pause
-        // them while the watchdog reports a watched filesystem under pressure.
-        if $stats.disk_pressure().is_paused() {
-            $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::DiskPressure), 0);
-            return;
-        }
-        let first_seen = $ready.get_or_init(Instant::now);
-        if first_seen.elapsed() < $cooldown {
-            tracing::debug!(
-                job = $job,
-                elapsed_ms = first_seen.elapsed().as_millis() as u64,
-                cooldown_ms = $cooldown.as_millis() as u64,
-                phase_ms = $lc.ms_in_current_phase(),
-                "heavy cron in ready-relative cooldown"
+        false // one-shot
+    });
+}
+
+/// The recurring-closure body shared by every heavy cron (ADR-018 §6). On each
+/// tick it either submits the body now (`run_once`) or, if still inside the
+/// post-boot settle, records a `Cooldown` skip and schedules a one-shot retry at
+/// expiry — instead of letting the skip slip the run a full interval. Returns
+/// `true` to keep the recurring schedule (the retry is additive).
+fn heavy_cron_tick(
+    lc: &DaemonLifecycle,
+    handle: &CronHandle,
+    hist: &crate::cron::history::CronHistoryWriter,
+    stats: &StatsTracker,
+    job: &'static str,
+    cooldown_ms: u64,
+    run_once: &Arc<dyn Fn() + Send + Sync>,
+) -> bool {
+    use crate::cron::history::CronTriggerSource;
+    use crate::stats::tracker::{CronJobOutcome, SkipReason};
+    if lc.is_stopping() {
+        return false;
+    }
+    match cooldown_decision(lc, cooldown_ms) {
+        CooldownDecision::RunNow => run_once(),
+        CooldownDecision::DeferMs(d) => {
+            stats.record_cron_outcome(job, CronJobOutcome::Skipped(SkipReason::Cooldown), 0);
+            hist.record_skip(job, CronTriggerSource::Scheduled, SkipReason::Cooldown);
+            schedule_heavy_retry(
+                handle.clone(),
+                lc.clone(),
+                Arc::clone(run_once),
+                cooldown_ms,
+                job,
+                d,
             );
-            $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::Cooldown), 0);
-            return;
         }
-        match $lock.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                tracing::info!(concat!("heavy cron busy, deferring ", $job));
-                $stats.record_cron_outcome($job, CronJobOutcome::Skipped(SkipReason::LockBusy), 0);
-                return;
-            }
-        }
-    }};
+    }
+    true
+}
+
+/// Register one heavy cron with restart-survival scheduling (ADR-018 §5) and the
+/// honor-settle cooldown (§6). `body` is the cron-specific work; it runs inside
+/// the pool task behind [`try_heavy_gate`] + [`HeavyCronFlag`], receiving a
+/// `&mut CronRunGuard` so it can record the run's outcome and counters. The
+/// guard captures duration / RSS / thread deltas and persists exactly one
+/// `cron_run_history` row on drop (`Panicked` if the body unwinds). `body` is
+/// `Fn` because the recurring tick and each cooldown retry submit it afresh.
+#[allow(clippy::too_many_arguments)]
+fn register_heavy_cron<F>(
+    handle: &CronHandle,
+    lifecycle: &DaemonLifecycle,
+    cron_pool: &Arc<crate::work_pool::pool::WorkPool>,
+    heavy_cron_lock: &Arc<tokio::sync::Mutex<()>>,
+    stats: &Arc<StatsTracker>,
+    hist: &crate::cron::history::CronHistoryWriter,
+    job: &'static str,
+    initial_delay_ms: u64,
+    interval_ms: u64,
+    cooldown_ms: u64,
+    body: F,
+) where
+    F: Fn(&mut crate::cron::history::CronRunGuard) + Send + Sync + 'static,
+{
+    let body = Arc::new(body);
+    // Re-callable submit closure: the recurring tick calls it when the settle has
+    // elapsed; the cooldown trampoline calls it again at expiry. Each call clones
+    // the shared state and enqueues one fresh pool task.
+    let run_once: Arc<dyn Fn() + Send + Sync> = {
+        let cron_pool = Arc::clone(cron_pool);
+        let lc = lifecycle.clone();
+        let lock = Arc::clone(heavy_cron_lock);
+        let stats = Arc::clone(stats);
+        let hist = hist.clone();
+        Arc::new(move || {
+            let lc = lc.clone();
+            let lock = Arc::clone(&lock);
+            let stats = Arc::clone(&stats);
+            let hist = hist.clone();
+            let body = Arc::clone(&body);
+            cron_pool.submit(
+                move || {
+                    let Some(_lock) = try_heavy_gate(job, &lc, &lock, &stats, &hist) else {
+                        return;
+                    };
+                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
+                    let mut guard = crate::cron::history::CronRunGuard::new(
+                        hist.clone(),
+                        job,
+                        crate::cron::history::CronTriggerSource::Scheduled,
+                        None,
+                    );
+                    body(&mut guard);
+                    // `guard` drops here → records one row (Ok/NoOp/Failed set by
+                    // `body`, or Panicked if `body` unwound).
+                },
+                crate::work_pool::pool::Priority::Low,
+            );
+        })
+    };
+    let lc = lifecycle.clone();
+    let handle_for_tick = handle.clone();
+    let hist_for_tick = hist.clone();
+    let stats_for_tick = Arc::clone(stats);
+    handle.schedule_recurring(initial_delay_ms, interval_ms, job, move || {
+        heavy_cron_tick(
+            &lc,
+            &handle_for_tick,
+            &hist_for_tick,
+            &stats_for_tick,
+            job,
+            cooldown_ms,
+            &run_once,
+        )
+    });
 }
 
 #[inline]
@@ -640,12 +845,29 @@ pub fn schedule_maintenance_jobs(
     cron_pool: Arc<crate::work_pool::pool::WorkPool>,
     general_pool: Option<Arc<crate::work_pool::pool::WorkPool>>,
     system_ctx: crate::context::SystemContext,
+    last_runs: &std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
 ) {
-    // Stats aggregation (light — runs unconditionally)
+    // Restart-survival initial-delay helper (ADR-018 §5): every recurring cron's
+    // first-tick delay is computed from its last persisted successful completion
+    // (`last_runs`, read at startup in `daemon.rs`) rather than a fresh stagger,
+    // so a daemon restart no longer slips the schedule. Collapses to ~stagger for
+    // first-boot / overdue / short-interval jobs. Keeps call sites one-liners.
+    let initial_delay = |job: &str, interval_ms: u64| -> u64 {
+        restart_initial_delay_ms(
+            job,
+            interval_ms,
+            last_runs.get(job).map(|t| t.timestamp_millis() as u64),
+            now_ms(),
+        )
+    };
+
+    // Stats aggregation (light — runs unconditionally). Fixed 1s startup delay
+    // kept (restart-survival is irrelevant at this cadence); runs recorded.
     let stats_clone = Arc::clone(&stats);
     let db_clone = Arc::clone(&db);
     let rt_clone = rt.clone();
     let lc = lifecycle.clone();
+    let hist_stats_agg = system_ctx.cron_history().clone();
     handle.schedule_recurring(
         1000, // 1s initial delay
         config.stats_aggregation_interval_secs * 1000,
@@ -656,13 +878,19 @@ pub fn schedule_maintenance_jobs(
             }
             let db = db_clone.clone();
             let stats = Arc::clone(&stats_clone);
-            rt_clone.spawn(async move {
-                if let Ok(count) = db.count_indexed_files().await {
-                    stats
-                        .files_indexed
-                        .store(count, std::sync::atomic::Ordering::Relaxed);
-                }
-            });
+            let hist = hist_stats_agg.clone();
+            crate::cron::history::spawn_recorded(
+                &rt_clone,
+                hist,
+                "stats-aggregation",
+                async move {
+                    if let Ok(count) = db.count_indexed_files().await {
+                        stats
+                            .files_indexed
+                            .store(count, std::sync::atomic::Ordering::Relaxed);
+                    }
+                },
+            );
             true
         },
     );
@@ -671,6 +899,7 @@ pub fn schedule_maintenance_jobs(
     let db_clone = Arc::clone(&db);
     let rt_clone = rt.clone();
     let lc = lifecycle.clone();
+    let hist_stale = system_ctx.cron_history().clone();
     handle.schedule_recurring(
         5000,
         config.stale_cleanup_interval_secs * 1000,
@@ -680,7 +909,8 @@ pub fn schedule_maintenance_jobs(
                 return false;
             }
             let db = db_clone.clone();
-            rt_clone.spawn(async move {
+            let hist = hist_stale.clone();
+            crate::cron::history::spawn_recorded(&rt_clone, hist, "stale-cleanup", async move {
                 match db.cleanup_stale_files().await {
                     Ok(count) => {
                         if count > 0 {
@@ -713,8 +943,9 @@ pub fn schedule_maintenance_jobs(
     let presence_interval = config.work_item_presence_interval_secs;
     let presence_idle = config.work_item_presence_idle_secs as i64;
     let presence_offline = config.work_item_presence_offline_secs as i64;
+    let hist_wip = system_ctx.cron_history().clone();
     handle.schedule_recurring(
-        staggered_initial_delay_ms("work-item-presence", presence_interval * 1000),
+        initial_delay("work-item-presence", presence_interval * 1000),
         presence_interval * 1000,
         "work-item-presence",
         move || {
@@ -722,6 +953,7 @@ pub fn schedule_maintenance_jobs(
                 return false;
             }
             let stats = Arc::clone(&stats_clone);
+            let hist = hist_wip.clone();
             if !stats.db_health().is_up() {
                 stats.record_cron_outcome(
                     "work-item-presence",
@@ -730,18 +962,28 @@ pub fn schedule_maintenance_jobs(
                     ),
                     0,
                 );
+                hist.record_skip(
+                    "work-item-presence",
+                    crate::cron::history::CronTriggerSource::Scheduled,
+                    crate::stats::tracker::SkipReason::DbDown,
+                );
                 return true;
             }
             if let Some(pool) = db_clone.pool().cloned() {
-                rt_clone.spawn(async move {
-                    crate::cron::work_item_presence::run_or_log(
-                        pool,
-                        stats,
-                        presence_idle,
-                        presence_offline,
-                    )
-                    .await;
-                });
+                crate::cron::history::spawn_recorded(
+                    &rt_clone,
+                    hist,
+                    "work-item-presence",
+                    async move {
+                        crate::cron::work_item_presence::run_or_log(
+                            pool,
+                            stats,
+                            presence_idle,
+                            presence_offline,
+                        )
+                        .await;
+                    },
+                );
             }
             true
         },
@@ -757,8 +999,9 @@ pub fn schedule_maintenance_jobs(
     let lc_lv = lifecycle.clone();
     let liveness_interval = config.mcp_client_liveness_interval_secs.max(1);
     let liveness_proc_fd = clients_config.proc_fd_supplement;
+    let hist_liveness = system_ctx.cron_history().clone();
     handle.schedule_recurring(
-        staggered_initial_delay_ms("mcp-client-liveness", liveness_interval * 1000),
+        initial_delay("mcp-client-liveness", liveness_interval * 1000),
         liveness_interval * 1000,
         "mcp-client-liveness",
         move || {
@@ -766,6 +1009,7 @@ pub fn schedule_maintenance_jobs(
                 return false;
             }
             let stats = Arc::clone(&stats_lv);
+            let hist = hist_liveness.clone();
             if !stats.db_health().is_up() {
                 stats.record_cron_outcome(
                     "mcp-client-liveness",
@@ -774,13 +1018,23 @@ pub fn schedule_maintenance_jobs(
                     ),
                     0,
                 );
+                hist.record_skip(
+                    "mcp-client-liveness",
+                    crate::cron::history::CronTriggerSource::Scheduled,
+                    crate::stats::tracker::SkipReason::DbDown,
+                );
                 return true;
             }
             if let Some(pool) = db_lv.pool().cloned() {
-                rt_lv.spawn(async move {
-                    crate::cron::mcp_client_liveness::run_or_log(pool, stats, liveness_proc_fd)
-                        .await;
-                });
+                crate::cron::history::spawn_recorded(
+                    &rt_lv,
+                    hist,
+                    "mcp-client-liveness",
+                    async move {
+                        crate::cron::mcp_client_liveness::run_or_log(pool, stats, liveness_proc_fd)
+                            .await;
+                    },
+                );
             }
             true
         },
@@ -793,8 +1047,9 @@ pub fn schedule_maintenance_jobs(
     let stats_pd = Arc::clone(&stats);
     let lc_pd = lifecycle.clone();
     let deps_interval = config.project_deps_index_interval_secs.max(60);
+    let hist_pd = system_ctx.cron_history().clone();
     handle.schedule_recurring(
-        staggered_initial_delay_ms("project-deps-index", deps_interval * 1000),
+        initial_delay("project-deps-index", deps_interval * 1000),
         deps_interval * 1000,
         "project-deps-index",
         move || {
@@ -802,10 +1057,16 @@ pub fn schedule_maintenance_jobs(
                 return false;
             }
             let stats = Arc::clone(&stats_pd);
+            let hist = hist_pd.clone();
             if let Some(pool) = db_pd.pool().cloned() {
-                rt_pd.spawn(async move {
-                    crate::cron::project_deps_index::run_or_log(pool, stats).await;
-                });
+                crate::cron::history::spawn_recorded(
+                    &rt_pd,
+                    hist,
+                    "project-deps-index",
+                    async move {
+                        crate::cron::project_deps_index::run_or_log(pool, stats).await;
+                    },
+                );
             }
             true
         },
@@ -819,8 +1080,9 @@ pub fn schedule_maintenance_jobs(
     let stats_gs = Arc::clone(&stats);
     let lc_gs = lifecycle.clone();
     let gitscan_interval = config.git_state_scan_interval_secs.max(15);
+    let hist_gs = system_ctx.cron_history().clone();
     handle.schedule_recurring(
-        staggered_initial_delay_ms("git-state-scan", gitscan_interval * 1000),
+        initial_delay("git-state-scan", gitscan_interval * 1000),
         gitscan_interval * 1000,
         "git-state-scan",
         move || {
@@ -828,6 +1090,7 @@ pub fn schedule_maintenance_jobs(
                 return false;
             }
             let stats = Arc::clone(&stats_gs);
+            let hist = hist_gs.clone();
             if !stats.db_health().is_up() {
                 stats.record_cron_outcome(
                     "git-state-scan",
@@ -836,10 +1099,15 @@ pub fn schedule_maintenance_jobs(
                     ),
                     0,
                 );
+                hist.record_skip(
+                    "git-state-scan",
+                    crate::cron::history::CronTriggerSource::Scheduled,
+                    crate::stats::tracker::SkipReason::DbDown,
+                );
                 return true;
             }
             if let Some(pool) = db_gs.pool().cloned() {
-                rt_gs.spawn(async move {
+                crate::cron::history::spawn_recorded(&rt_gs, hist, "git-state-scan", async move {
                     crate::cron::git_state_scan::run_or_log(pool, stats).await;
                 });
             }
@@ -859,8 +1127,9 @@ pub fn schedule_maintenance_jobs(
         let stats_clone_fp = Arc::clone(&stats);
         let lc_fp = lifecycle.clone();
         let fp_interval = config.findings_promotion_interval_secs;
+        let hist_fp = system_ctx.cron_history().clone();
         handle.schedule_recurring(
-            staggered_initial_delay_ms("findings-promotion", fp_interval * 1000),
+            initial_delay("findings-promotion", fp_interval * 1000),
             fp_interval * 1000,
             "findings-promotion",
             move || {
@@ -868,10 +1137,16 @@ pub fn schedule_maintenance_jobs(
                     return false;
                 }
                 let stats = Arc::clone(&stats_clone_fp);
+                let hist = hist_fp.clone();
                 if let Some(pool) = db_clone_fp.pool().cloned() {
-                    rt_clone_fp.spawn(async move {
-                        crate::cron::findings_promotion::run_or_log(pool, stats).await;
-                    });
+                    crate::cron::history::spawn_recorded(
+                        &rt_clone_fp,
+                        hist,
+                        "findings-promotion",
+                        async move {
+                            crate::cron::findings_promotion::run_or_log(pool, stats).await;
+                        },
+                    );
                 }
                 true
             },
@@ -888,8 +1163,9 @@ pub fn schedule_maintenance_jobs(
         let lc_cs = lifecycle.clone();
         let cs_interval = config.concurrency_scan_interval_secs;
         let cs_promote = config.concurrency_auto_promote;
+        let hist_cs = system_ctx.cron_history().clone();
         handle.schedule_recurring(
-            staggered_initial_delay_ms("concurrency-scan", cs_interval * 1000),
+            initial_delay("concurrency-scan", cs_interval * 1000),
             cs_interval * 1000,
             "concurrency-scan",
             move || {
@@ -897,10 +1173,17 @@ pub fn schedule_maintenance_jobs(
                     return false;
                 }
                 let stats = Arc::clone(&stats_clone_cs);
+                let hist = hist_cs.clone();
                 if let Some(pool) = db_clone_cs.pool().cloned() {
-                    rt_clone_cs.spawn(async move {
-                        crate::cron::concurrency_scan::run_or_log(pool, stats, cs_promote).await;
-                    });
+                    crate::cron::history::spawn_recorded(
+                        &rt_clone_cs,
+                        hist,
+                        "concurrency-scan",
+                        async move {
+                            crate::cron::concurrency_scan::run_or_log(pool, stats, cs_promote)
+                                .await;
+                        },
+                    );
                 }
                 true
             },
@@ -922,8 +1205,13 @@ pub fn schedule_maintenance_jobs(
         let lc_tc = lifecycle.clone();
         let tc_interval = config.target_cleanup.interval_secs;
         let tc_cfg = config.target_cleanup.clone();
+        let hist_tc = system_ctx.cron_history().clone();
         handle.schedule_recurring(
-            600_000, // 10-minute ready-independent initial delay
+            // Fixed 10-minute delay kept intentionally: target-cleanup must
+            // surface its first dry-run manifest soon after every restart, so it
+            // deliberately does NOT use restart-survival (which would defer it to
+            // the next weekly due-time).
+            600_000,
             tc_interval * 1000,
             "target-cleanup",
             move || {
@@ -931,10 +1219,16 @@ pub fn schedule_maintenance_jobs(
                     return false;
                 }
                 let cfg = tc_cfg.clone();
+                let hist = hist_tc.clone();
                 if let Some(pool) = db_clone_tc.pool().cloned() {
-                    rt_clone_tc.spawn(async move {
-                        crate::cron::target_cleanup::run_or_log(pool, cfg).await;
-                    });
+                    crate::cron::history::spawn_recorded(
+                        &rt_clone_tc,
+                        hist,
+                        "target-cleanup",
+                        async move {
+                            crate::cron::target_cleanup::run_or_log(pool, cfg).await;
+                        },
+                    );
                 }
                 true
             },
@@ -947,6 +1241,7 @@ pub fn schedule_maintenance_jobs(
     let db_clone = Arc::clone(&db);
     let rt_clone = rt.clone();
     let lc = lifecycle.clone();
+    let hist_integrity = system_ctx.cron_history().clone();
     handle.schedule_recurring(
         config.integrity_check_interval_secs * 1000,
         config.integrity_check_interval_secs * 1000,
@@ -956,7 +1251,8 @@ pub fn schedule_maintenance_jobs(
                 return false;
             }
             let db = db_clone.clone();
-            rt_clone.spawn(async move {
+            let hist = hist_integrity.clone();
+            crate::cron::history::spawn_recorded(&rt_clone, hist, "integrity-check", async move {
                 match sqlx::query("DELETE FROM indexed_files WHERE content_hash IS NULL")
                     .execute(db.pool().expect("inline SQL needs PgPool"))
                     .await
@@ -974,10 +1270,13 @@ pub fn schedule_maintenance_jobs(
         },
     );
 
-    // DB maintenance (VACUUM ANALYZE) (light — runs unconditionally)
+    // DB maintenance (VACUUM ANALYZE) (light — runs unconditionally). Also sweeps
+    // `cron_run_history` past its retention window (ADR-018 §9).
     let db_clone = Arc::clone(&db);
     let rt_clone = rt.clone();
     let lc = lifecycle.clone();
+    let hist_dbm = system_ctx.cron_history().clone();
+    let cron_history_retention_days = config.cron_history_retention_days;
     handle.schedule_recurring(
         config.db_maintenance_interval_secs * 1000,
         config.db_maintenance_interval_secs * 1000,
@@ -987,18 +1286,33 @@ pub fn schedule_maintenance_jobs(
                 return false;
             }
             let db = db_clone.clone();
-            rt_clone.spawn(async move {
+            let hist = hist_dbm.clone();
+            crate::cron::history::spawn_recorded(&rt_clone, hist, "db-maintenance", async move {
+                let pool = db.pool().expect("inline SQL needs PgPool");
                 if let Err(e) = sqlx::query("VACUUM ANALYZE indexed_files")
-                    .execute(db.pool().expect("inline SQL needs PgPool"))
+                    .execute(pool)
                     .await
                 {
                     tracing::error!("DB maintenance failed: {}", e);
                 }
                 if let Err(e) = sqlx::query("VACUUM ANALYZE file_chunks")
-                    .execute(db.pool().expect("inline SQL needs PgPool"))
+                    .execute(pool)
                     .await
                 {
                     tracing::error!("DB maintenance (chunks) failed: {}", e);
+                }
+                // Retention sweep for the cron-run-history ledger (0 = keep forever).
+                match crate::db::queries::delete_cron_runs_older_than(
+                    pool,
+                    cron_history_retention_days,
+                )
+                .await
+                {
+                    Ok(deleted) if deleted > 0 => {
+                        tracing::info!(deleted, "Swept aged cron_run_history rows")
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::error!("cron_run_history retention sweep failed: {}", e),
                 }
             });
             true
@@ -1039,144 +1353,114 @@ pub fn schedule_maintenance_jobs(
     // needs to exclude only itself — its own lock decouples it from the GPU herd.
     let quality_history_lock: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
 
+    // Git history indexing (heavy). Restart-survival initial delay + §6
+    // honor-settle cooldown + durable run recording are all provided by
+    // `register_heavy_cron`; the closure below is just the per-cron work, which
+    // records its outcome on the `CronRunGuard` (`run`). RSS / duration / thread
+    // deltas are captured by the guard, replacing the old manual rss logging.
+    let git_interval_ms = config.git_history_index_interval_secs * 1000;
+    let git_cooldown_ms = config.ready_delay_git_secs * 1000;
     let stats_for_git = Arc::clone(&stats);
-    let lc = lifecycle.clone();
-    let lock = Arc::clone(&heavy_cron_lock);
-    let ready_git: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-    let git_ready_delay = Duration::from_secs(config.ready_delay_git_secs);
-    let cron_pool_git = Arc::clone(&cron_pool);
     let db_for_git = db_clone.clone();
     let commit_tx_for_git = commit_tx.clone();
     let rt_for_git = rt_clone.clone();
-    handle.schedule_recurring(
-        // 1s base delay + per-job hash jitter so this heavy cron doesn't
-        // collide with the others at startup. The real wait still
-        // happens on Ready-relative check below.
-        staggered_initial_delay_ms(
-            "git-history-index",
-            config.git_history_index_interval_secs * 1000,
-        ),
-        config.git_history_index_interval_secs * 1000,
+    register_heavy_cron(
+        handle,
+        &lifecycle,
+        &cron_pool,
+        &heavy_cron_lock,
+        &stats,
+        system_ctx.cron_history(),
         "git-history-index",
-        move || {
-            if lc.is_stopping() {
-                return false;
-            }
-            // Dispatch the body to CronPool so the scheduler thread is
-            // never blocked by a heavy `block_on`. The shared
-            // `heavy_cron_lock` continues to serialize the heavy quartet.
-            let lc = lc.clone();
-            let lock = Arc::clone(&lock);
-            let ready_git = Arc::clone(&ready_git);
-            let stats_for_git = Arc::clone(&stats_for_git);
+        initial_delay("git-history-index", git_interval_ms),
+        git_interval_ms,
+        git_cooldown_ms,
+        move |run| {
+            let stats = Arc::clone(&stats_for_git);
             let db = db_for_git.clone();
             let tx = commit_tx_for_git.clone();
             let rt = rt_for_git.clone();
-            cron_pool_git.submit(
-                move || {
-                    let _guard = heavy_gate_or_skip!(
-                        job = "git-history-index",
-                        lc = lc,
-                        ready = ready_git,
-                        cooldown = git_ready_delay,
-                        lock = lock,
-                        stats = stats_for_git,
-                    );
-                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_git));
-                    let stats = Arc::clone(&stats_for_git);
 
-                    // Counter is at top-of-body: a reliable "this cron's
-                    // body ran" signal regardless of whether any project
-                    // had new commits. Pairs with
-                    // `git_history_noop_returns` to distinguish the
-                    // empty-data case from "never ran".
-                    stats.git_history_runs.fetch_add(1, AtomicOrdering::Relaxed);
+            // Top-of-body counter: a reliable "this cron's body ran" signal.
+            // Pairs with `git_history_noop_returns` for the empty-data case.
+            stats.git_history_runs.fetch_add(1, AtomicOrdering::Relaxed);
 
-                    // Once-per-tick `git` binary preflight. A missing `git`
-                    // is a permanent fault for this cron — keep retrying
-                    // would just log-spam at every interval until daemon
-                    // restart. `classify_io_error` maps `NotFound` to
-                    // `Disable`; we record the reason on the stats tracker
-                    // so the scheduler skip-check elides future runs.
-                    if let Err(io_err) = std::process::Command::new("git").arg("--version").output()
-                        && crate::cron::shutdown::classify_io_error(&io_err)
-                            == crate::cron::shutdown::CronAction::Disable
-                    {
-                        let reason = format!("git binary unavailable: {io_err}");
-                        tracing::error!(
-                            job = "git-history-index",
-                            error = %io_err,
-                            "permanent fault — disabling cron job until daemon restart"
-                        );
-                        stats.disable_cron_job("git-history-index", reason);
-                        return;
+            // Once-per-tick `git` binary preflight. A missing `git` is a
+            // permanent fault — `classify_io_error` maps `NotFound` to `Disable`;
+            // record the reason so the scheduler skip-check elides future runs.
+            if let Err(io_err) = std::process::Command::new("git").arg("--version").output()
+                && crate::cron::shutdown::classify_io_error(&io_err)
+                    == crate::cron::shutdown::CronAction::Disable
+            {
+                let reason = format!("git binary unavailable: {io_err}");
+                tracing::error!(
+                    job = "git-history-index",
+                    error = %io_err,
+                    "permanent fault — disabling cron job until daemon restart"
+                );
+                stats.disable_cron_job("git-history-index", reason.clone());
+                run.fail(reason);
+                return;
+            }
+
+            // Ok(true)=noop (no git projects) | Ok(false)=ran | Err=list failed.
+            let mut body_result: Result<bool, String> = Ok(false);
+            rt.block_on(async {
+                match db.get_git_enabled_projects().await {
+                    Ok(projects) if projects.is_empty() => {
+                        stats
+                            .git_history_noop_returns
+                            .fetch_add(1, AtomicOrdering::Relaxed);
+                        tracing::info!("git-history-index: no git-enabled projects, nothing to do");
+                        body_result = Ok(true);
                     }
-
-                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    let t0 = Instant::now();
-                    rt.block_on(async {
-                        match db.get_git_enabled_projects().await {
-                            Ok(projects) if projects.is_empty() => {
-                                stats
-                                    .git_history_noop_returns
-                                    .fetch_add(1, AtomicOrdering::Relaxed);
-                                tracing::info!(
-                                    "git-history-index: no git-enabled projects, nothing to do"
+                    Ok(projects) => {
+                        for (project_id, project_path) in &projects {
+                            let project_root = std::path::Path::new(project_path);
+                            if !crate::indexer::git_indexer::is_git_history_enabled(project_root) {
+                                continue;
+                            }
+                            if let Err(e) = crate::indexer::git_indexer::index_git_history(
+                                project_root,
+                                *project_id,
+                                &db,
+                                &tx,
+                                &stats,
+                            )
+                            .await
+                            {
+                                tracing::error!(
+                                    project = %project_path,
+                                    error = %e,
+                                    "Git history indexing failed"
                                 );
                             }
-                            Ok(projects) => {
-                                for (project_id, project_path) in &projects {
-                                    let project_root = std::path::Path::new(project_path);
-                                    if !crate::indexer::git_indexer::is_git_history_enabled(
-                                        project_root,
-                                    ) {
-                                        continue;
-                                    }
-                                    if let Err(e) = crate::indexer::git_indexer::index_git_history(
-                                        project_root,
-                                        *project_id,
-                                        &db,
-                                        &tx,
-                                        &stats,
-                                    )
-                                    .await
-                                    {
-                                        tracing::error!(
-                                            project = %project_path,
-                                            error = %e,
-                                            "Git history indexing failed"
-                                        );
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("Failed to list projects for git indexing: {}", e);
-                            }
                         }
-                    });
-                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    tracing::info!(
-                        job = "git-history-index",
-                        rss_mb_start = rss_start >> 20,
-                        rss_mb_end = rss_end >> 20,
-                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
-                        elapsed_s = t0.elapsed().as_secs_f64(),
-                        "heavy cron complete"
-                    );
-                },
-                crate::work_pool::pool::Priority::Low,
-            );
-            true
+                    }
+                    Err(e) => {
+                        tracing::error!("Failed to list projects for git indexing: {}", e);
+                        body_result = Err(format!("list git-enabled projects: {e}"));
+                    }
+                }
+            });
+            match body_result {
+                Ok(true) => run.noop(),
+                Ok(false) => run.ok(),
+                Err(msg) => run.fail(msg),
+            }
         },
     );
 
-    // Cross-project similarity scan (heavy — gates on Ready + heavy_cron_lock)
+    // Cross-project similarity scan (heavy). Intrinsics + §6 honor-settle +
+    // restart-survival via register_heavy_cron; the closure is the per-cron work.
+    let sim_interval_ms = config.similarity_scan_interval_secs * 1000;
+    let sim_cooldown_ms = config.ready_delay_similarity_secs * 1000;
     let db_clone_sim = Arc::clone(&db);
     let rt_clone_sim = rt.clone();
     let stats_for_sim = Arc::clone(&stats);
-    let sim_interval = config.similarity_scan_interval_secs;
+    let lc_for_sim = lifecycle.clone();
     let sim_cron_config = CronConfig {
-        similarity_scan_interval_secs: sim_interval,
+        similarity_scan_interval_secs: config.similarity_scan_interval_secs,
         similarity_threshold: config.similarity_threshold,
         similarity_top_k: config.similarity_top_k,
         topic_scan_interval_secs: config.topic_scan_interval_secs,
@@ -1190,312 +1474,163 @@ pub fn schedule_maintenance_jobs(
         ..CronConfig::default()
     };
     let sim_ef_search = 100; // default ef_search
-    let lc = lifecycle.clone();
-    let lock = Arc::clone(&heavy_cron_lock);
-    let ready_sim: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-    let sim_ready_delay = Duration::from_secs(config.ready_delay_similarity_secs);
-    let cron_pool_sim = Arc::clone(&cron_pool);
-    handle.schedule_recurring(
-        staggered_initial_delay_ms("similarity-scan", sim_interval * 1000),
-        sim_interval * 1000,
+    register_heavy_cron(
+        handle,
+        &lifecycle,
+        &cron_pool,
+        &heavy_cron_lock,
+        &stats,
+        system_ctx.cron_history(),
         "similarity-scan",
-        move || {
-            if lc.is_stopping() {
-                return false;
-            }
-            let lc = lc.clone();
-            let lock = Arc::clone(&lock);
-            let ready_sim = Arc::clone(&ready_sim);
-            let stats_for_sim = Arc::clone(&stats_for_sim);
+        initial_delay("similarity-scan", sim_interval_ms),
+        sim_interval_ms,
+        sim_cooldown_ms,
+        move |run| {
+            let stats = Arc::clone(&stats_for_sim);
             let db = db_clone_sim.clone();
             let cfg = sim_cron_config.clone();
             let rt = rt_clone_sim.clone();
-            cron_pool_sim.submit(
-                move || {
-                    let _guard = heavy_gate_or_skip!(
-                        job = "similarity-scan",
-                        lc = lc,
-                        ready = ready_sim,
-                        cooldown = sim_ready_delay,
-                        lock = lock,
-                        stats = stats_for_sim,
-                    );
-                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_sim));
-                    let stats = Arc::clone(&stats_for_sim);
-                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    let t0 = Instant::now();
-                    let lc_inner = lc.clone();
-                    rt.block_on(async {
-                        crate::cron::similarity::run_similarity_scan(
-                            db.as_ref(),
-                            &cfg,
-                            sim_ef_search,
-                            &stats,
-                            &lc_inner,
-                        )
-                        .await;
-                    });
-                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    tracing::info!(
-                        job = "similarity-scan",
-                        rss_mb_start = rss_start >> 20,
-                        rss_mb_end = rss_end >> 20,
-                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
-                        elapsed_s = t0.elapsed().as_secs_f64(),
-                        "heavy cron complete"
-                    );
-                },
-                crate::work_pool::pool::Priority::Low,
-            );
-            true
+            let lc_inner = lc_for_sim.clone();
+            rt.block_on(async {
+                crate::cron::similarity::run_similarity_scan(
+                    db.as_ref(),
+                    &cfg,
+                    sim_ef_search,
+                    &stats,
+                    &lc_inner,
+                )
+                .await;
+            });
+            run.ok();
         },
     );
 
     // Semantic-edges materialization (heavy — gates on Ready + heavy_cron_lock).
     // Sequenced (via its ready-delay) before graph-analysis so its edges are
     // present for the blended PageRank / betweenness / community pass.
+    let sem_interval_ms = config.semantic_edge_interval_secs * 1000;
+    let sem_cooldown_ms = config.ready_delay_semantic_secs * 1000;
     let db_clone_sem = Arc::clone(&db);
     let rt_clone_sem = rt.clone();
     let stats_for_sem = Arc::clone(&stats);
-    let sem_interval = config.semantic_edge_interval_secs;
+    let lc_for_sem = lifecycle.clone();
     let sem_cron_config = config.clone();
     let sem_ef_search = 100; // default ef_search (mirrors similarity-scan)
-    let lc = lifecycle.clone();
-    let lock = Arc::clone(&heavy_cron_lock);
-    let ready_sem: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-    let sem_ready_delay = Duration::from_secs(config.ready_delay_semantic_secs);
-    let cron_pool_sem = Arc::clone(&cron_pool);
-    handle.schedule_recurring(
-        staggered_initial_delay_ms("semantic-edges", sem_interval * 1000),
-        sem_interval * 1000,
+    register_heavy_cron(
+        handle,
+        &lifecycle,
+        &cron_pool,
+        &heavy_cron_lock,
+        &stats,
+        system_ctx.cron_history(),
         "semantic-edges",
-        move || {
-            if lc.is_stopping() {
-                return false;
-            }
-            let lc = lc.clone();
-            let lock = Arc::clone(&lock);
-            let ready_sem = Arc::clone(&ready_sem);
-            let stats_for_sem = Arc::clone(&stats_for_sem);
+        initial_delay("semantic-edges", sem_interval_ms),
+        sem_interval_ms,
+        sem_cooldown_ms,
+        move |run| {
+            let stats = Arc::clone(&stats_for_sem);
             let db = db_clone_sem.clone();
             let cfg = sem_cron_config.clone();
             let rt = rt_clone_sem.clone();
-            cron_pool_sem.submit(
-                move || {
-                    let _guard = heavy_gate_or_skip!(
-                        job = "semantic-edges",
-                        lc = lc,
-                        ready = ready_sem,
-                        cooldown = sem_ready_delay,
-                        lock = lock,
-                        stats = stats_for_sem,
-                    );
-                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_sem));
-                    let stats = Arc::clone(&stats_for_sem);
-                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    let t0 = Instant::now();
-                    let lc_inner = lc.clone();
-                    rt.block_on(async {
-                        crate::cron::semantic_edges::run_semantic_edges(
-                            db.as_ref(),
-                            &cfg,
-                            sem_ef_search,
-                            &stats,
-                            &lc_inner,
-                        )
-                        .await;
-                    });
-                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    tracing::info!(
-                        job = "semantic-edges",
-                        rss_mb_start = rss_start >> 20,
-                        rss_mb_end = rss_end >> 20,
-                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
-                        elapsed_s = t0.elapsed().as_secs_f64(),
-                        "heavy cron complete"
-                    );
-                },
-                crate::work_pool::pool::Priority::Low,
-            );
-            true
+            let lc_inner = lc_for_sem.clone();
+            rt.block_on(async {
+                crate::cron::semantic_edges::run_semantic_edges(
+                    db.as_ref(),
+                    &cfg,
+                    sem_ef_search,
+                    &stats,
+                    &lc_inner,
+                )
+                .await;
+            });
+            run.ok();
         },
     );
 
     // Graph analysis (import extraction, PageRank, betweenness, coupling)
+    let graph_interval_ms = config.graph_analysis_interval_secs * 1000;
+    let graph_cooldown_ms = config.ready_delay_graph_secs * 1000;
     let db_clone_graph = Arc::clone(&db);
     let rt_clone_graph = rt.clone();
     let stats_for_graph = Arc::clone(&stats);
-    let graph_interval = config.graph_analysis_interval_secs;
-    let lc = lifecycle.clone();
-    let lock = Arc::clone(&heavy_cron_lock);
-    let ready_graph: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-    let graph_ready_delay = Duration::from_secs(config.ready_delay_graph_secs);
     let graph_general_pool = general_pool.clone();
-    let cron_pool_graph = Arc::clone(&cron_pool);
-    handle.schedule_recurring(
-        staggered_initial_delay_ms("graph-analysis", graph_interval * 1000),
-        graph_interval * 1000,
+    register_heavy_cron(
+        handle,
+        &lifecycle,
+        &cron_pool,
+        &heavy_cron_lock,
+        &stats,
+        system_ctx.cron_history(),
         "graph-analysis",
-        move || {
-            if lc.is_stopping() {
-                return false;
-            }
-            let lc = lc.clone();
-            let lock = Arc::clone(&lock);
-            let ready_graph = Arc::clone(&ready_graph);
-            let stats_for_graph = Arc::clone(&stats_for_graph);
+        initial_delay("graph-analysis", graph_interval_ms),
+        graph_interval_ms,
+        graph_cooldown_ms,
+        move |run| {
+            let stats = Arc::clone(&stats_for_graph);
             let db = db_clone_graph.clone();
             let wp = graph_general_pool.clone();
             let rt = rt_clone_graph.clone();
-            cron_pool_graph.submit(
-                move || {
-                    let _guard = heavy_gate_or_skip!(
-                        job = "graph-analysis",
-                        lc = lc,
-                        ready = ready_graph,
-                        cooldown = graph_ready_delay,
-                        lock = lock,
-                        stats = stats_for_graph,
-                    );
-                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_graph));
-                    let stats = Arc::clone(&stats_for_graph);
-                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    let t0 = Instant::now();
-                    rt.block_on(async {
-                        crate::cron::graph_analysis::run_graph_analysis(db.as_ref(), &stats, wp)
-                            .await;
-                    });
-                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    tracing::info!(
-                        job = "graph-analysis",
-                        rss_mb_start = rss_start >> 20,
-                        rss_mb_end = rss_end >> 20,
-                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
-                        elapsed_s = t0.elapsed().as_secs_f64(),
-                        "heavy cron complete"
-                    );
-                },
-                crate::work_pool::pool::Priority::Low,
-            );
-            true
+            rt.block_on(async {
+                crate::cron::graph_analysis::run_graph_analysis(db.as_ref(), &stats, wp).await;
+            });
+            run.ok();
         },
     );
 
     // Symbol extraction (Tier-0e tree-sitter pass — populates file_symbols + symbol_references)
+    let symbol_extraction_interval_ms = config.symbol_extraction_interval_secs * 1000;
+    let symbol_extraction_cooldown_ms = config.ready_delay_symbol_extraction_secs * 1000;
     let db_clone_symbol = Arc::clone(&db);
     let rt_clone_symbol = rt.clone();
     let stats_for_symbol = Arc::clone(&stats);
-    let symbol_extraction_interval = config.symbol_extraction_interval_secs;
-    let lc = lifecycle.clone();
-    let lock = Arc::clone(&heavy_cron_lock);
-    let ready_symbol_extraction: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-    let symbol_extraction_ready_delay =
-        Duration::from_secs(config.ready_delay_symbol_extraction_secs);
-    let cron_pool_symbol = Arc::clone(&cron_pool);
-    handle.schedule_recurring(
-        staggered_initial_delay_ms("symbol-extraction", symbol_extraction_interval * 1000),
-        symbol_extraction_interval * 1000,
+    register_heavy_cron(
+        handle,
+        &lifecycle,
+        &cron_pool,
+        &heavy_cron_lock,
+        &stats,
+        system_ctx.cron_history(),
         "symbol-extraction",
-        move || {
-            if lc.is_stopping() {
-                return false;
-            }
-            let lc = lc.clone();
-            let lock = Arc::clone(&lock);
-            let ready_symbol_extraction = Arc::clone(&ready_symbol_extraction);
-            let stats_for_symbol = Arc::clone(&stats_for_symbol);
+        initial_delay("symbol-extraction", symbol_extraction_interval_ms),
+        symbol_extraction_interval_ms,
+        symbol_extraction_cooldown_ms,
+        move |run| {
+            let stats = Arc::clone(&stats_for_symbol);
             let db = db_clone_symbol.clone();
             let rt = rt_clone_symbol.clone();
-            cron_pool_symbol.submit(
-                move || {
-                    let _guard = heavy_gate_or_skip!(
-                        job = "symbol-extraction",
-                        lc = lc,
-                        ready = ready_symbol_extraction,
-                        cooldown = symbol_extraction_ready_delay,
-                        lock = lock,
-                        stats = stats_for_symbol,
-                    );
-                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_symbol));
-                    let stats = Arc::clone(&stats_for_symbol);
-                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    let t0 = Instant::now();
-                    rt.block_on(async {
-                        crate::cron::symbol_extraction::run_symbol_extraction(db.as_ref(), &stats)
-                            .await;
-                    });
-                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    tracing::info!(
-                        job = "symbol-extraction",
-                        rss_mb_start = rss_start >> 20,
-                        rss_mb_end = rss_end >> 20,
-                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
-                        elapsed_s = t0.elapsed().as_secs_f64(),
-                        "heavy cron complete"
-                    );
-                },
-                crate::work_pool::pool::Priority::Low,
-            );
-            true
+            rt.block_on(async {
+                crate::cron::symbol_extraction::run_symbol_extraction(db.as_ref(), &stats).await;
+            });
+            run.ok();
         },
     );
 
     // SOTA Phase 1 — Function metrics cron (CC / Cognitive / Halstead / NPath / MI per function).
     // Sequenced after symbol-extraction (depends on file_symbols rows).
+    let function_metrics_interval_ms = config.function_metrics_interval_secs * 1000;
+    let fnmet_cooldown_ms = config.ready_delay_function_metrics_secs * 1000;
     let db_clone_fnmet = Arc::clone(&db);
     let rt_clone_fnmet = rt.clone();
     let stats_for_fnmet = Arc::clone(&stats);
-    let function_metrics_interval = config.function_metrics_interval_secs;
-    let lc = lifecycle.clone();
-    let lock = Arc::clone(&heavy_cron_lock);
-    let ready_fnmet: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-    let fnmet_ready_delay = Duration::from_secs(config.ready_delay_function_metrics_secs);
-    let cron_pool_fnmet = Arc::clone(&cron_pool);
-    handle.schedule_recurring(
-        staggered_initial_delay_ms("function-metrics", function_metrics_interval * 1000),
-        function_metrics_interval * 1000,
+    register_heavy_cron(
+        handle,
+        &lifecycle,
+        &cron_pool,
+        &heavy_cron_lock,
+        &stats,
+        system_ctx.cron_history(),
         "function-metrics",
-        move || {
-            if lc.is_stopping() {
-                return false;
-            }
-            let lc = lc.clone();
-            let lock = Arc::clone(&lock);
-            let ready_fnmet = Arc::clone(&ready_fnmet);
-            let stats_for_fnmet = Arc::clone(&stats_for_fnmet);
+        initial_delay("function-metrics", function_metrics_interval_ms),
+        function_metrics_interval_ms,
+        fnmet_cooldown_ms,
+        move |run| {
+            let stats = Arc::clone(&stats_for_fnmet);
             let db = db_clone_fnmet.clone();
             let rt = rt_clone_fnmet.clone();
-            cron_pool_fnmet.submit(
-                move || {
-                    let _guard = heavy_gate_or_skip!(
-                        job = "function-metrics",
-                        lc = lc,
-                        ready = ready_fnmet,
-                        cooldown = fnmet_ready_delay,
-                        lock = lock,
-                        stats = stats_for_fnmet,
-                    );
-                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_fnmet));
-                    let stats = Arc::clone(&stats_for_fnmet);
-                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    let t0 = Instant::now();
-                    rt.block_on(async {
-                        crate::cron::function_metrics::run_function_metrics(db.as_ref(), &stats)
-                            .await;
-                    });
-                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    tracing::info!(
-                        job = "function-metrics",
-                        rss_mb_start = rss_start >> 20,
-                        rss_mb_end = rss_end >> 20,
-                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
-                        elapsed_s = t0.elapsed().as_secs_f64(),
-                        "heavy cron complete"
-                    );
-                },
-                crate::work_pool::pool::Priority::Low,
-            );
-            true
+            rt.block_on(async {
+                crate::cron::function_metrics::run_function_metrics(db.as_ref(), &stats).await;
+            });
+            run.ok();
         },
     );
 
@@ -1504,220 +1639,137 @@ pub fn schedule_maintenance_jobs(
     // file_symbols rows and seeds function_metrics rows for the fan_in/fan_out
     // UPDATE this cron issues).
     let db_clone_cg = Arc::clone(&db);
+    let call_graph_interval_ms = config.call_graph_interval_secs * 1000;
+    let cg_cooldown_ms = config.ready_delay_call_graph_secs * 1000;
     let rt_clone_cg = rt.clone();
     let stats_for_cg = Arc::clone(&stats);
-    let call_graph_interval = config.call_graph_interval_secs;
-    let lc = lifecycle.clone();
-    let lock = Arc::clone(&heavy_cron_lock);
-    let ready_cg: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-    let cg_ready_delay = Duration::from_secs(config.ready_delay_call_graph_secs);
-    let cron_pool_cg = Arc::clone(&cron_pool);
     // Same WorkPool the file-graph cron uses for parallel Brandes betweenness;
     // the call-graph cron now runs betweenness over the function call graph too.
     let cg_general_pool = general_pool.clone();
-    handle.schedule_recurring(
-        staggered_initial_delay_ms("call-graph", call_graph_interval * 1000),
-        call_graph_interval * 1000,
+    register_heavy_cron(
+        handle,
+        &lifecycle,
+        &cron_pool,
+        &heavy_cron_lock,
+        &stats,
+        system_ctx.cron_history(),
         "call-graph",
-        move || {
-            if lc.is_stopping() {
-                return false;
-            }
-            let lc = lc.clone();
-            let lock = Arc::clone(&lock);
-            let ready_cg = Arc::clone(&ready_cg);
-            let stats_for_cg = Arc::clone(&stats_for_cg);
+        initial_delay("call-graph", call_graph_interval_ms),
+        call_graph_interval_ms,
+        cg_cooldown_ms,
+        move |run| {
+            let stats = Arc::clone(&stats_for_cg);
             let db = db_clone_cg.clone();
             let rt = rt_clone_cg.clone();
             let wp = cg_general_pool.clone();
-            cron_pool_cg.submit(
-                move || {
-                    let _guard = heavy_gate_or_skip!(
-                        job = "call-graph",
-                        lc = lc,
-                        ready = ready_cg,
-                        cooldown = cg_ready_delay,
-                        lock = lock,
-                        stats = stats_for_cg,
-                    );
-                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_cg));
-                    let stats = Arc::clone(&stats_for_cg);
-                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    let t0 = Instant::now();
-                    rt.block_on(async {
-                        crate::cron::call_graph::run_call_graph(db.as_ref(), &stats, wp).await;
-                    });
-                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    tracing::info!(
-                        job = "call-graph",
-                        rss_mb_start = rss_start >> 20,
-                        rss_mb_end = rss_end >> 20,
-                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
-                        elapsed_s = t0.elapsed().as_secs_f64(),
-                        "heavy cron complete"
-                    );
-                },
-                crate::work_pool::pool::Priority::Low,
-            );
-            true
+            rt.block_on(async {
+                crate::cron::call_graph::run_call_graph(db.as_ref(), &stats, wp).await;
+            });
+            run.ok();
         },
     );
 
     // RAPTOR-over-code summary tree (heavy — CUDA FCM per project; gates on
     // Ready + heavy_cron_lock). Sequenced (via ready-delay) after topic-
     // clustering so embeddings are settled before the conceptual tree is built.
+    let raptor_interval_ms = config.code_raptor_interval_secs * 1000;
+    let raptor_cooldown_ms = config.ready_delay_code_raptor_secs * 1000;
     let db_clone_raptor = Arc::clone(&db);
     let rt_clone_raptor = rt.clone();
     let stats_for_raptor = Arc::clone(&stats);
-    let raptor_interval = config.code_raptor_interval_secs;
-    let lc = lifecycle.clone();
-    let lock = Arc::clone(&heavy_cron_lock);
-    let ready_raptor: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-    let raptor_ready_delay = Duration::from_secs(config.ready_delay_code_raptor_secs);
-    let cron_pool_raptor = Arc::clone(&cron_pool);
-    handle.schedule_recurring(
-        staggered_initial_delay_ms("code-raptor", raptor_interval * 1000),
-        raptor_interval * 1000,
+    let lc_for_raptor = lifecycle.clone();
+    register_heavy_cron(
+        handle,
+        &lifecycle,
+        &cron_pool,
+        &heavy_cron_lock,
+        &stats,
+        system_ctx.cron_history(),
         "code-raptor",
-        move || {
-            if lc.is_stopping() {
-                return false;
-            }
-            let lc = lc.clone();
-            let lock = Arc::clone(&lock);
-            let ready_raptor = Arc::clone(&ready_raptor);
-            let stats_for_raptor = Arc::clone(&stats_for_raptor);
+        initial_delay("code-raptor", raptor_interval_ms),
+        raptor_interval_ms,
+        raptor_cooldown_ms,
+        move |run| {
+            let stats = Arc::clone(&stats_for_raptor);
             let db = db_clone_raptor.clone();
             let rt = rt_clone_raptor.clone();
-            cron_pool_raptor.submit(
-                move || {
-                    let _guard = heavy_gate_or_skip!(
-                        job = "code-raptor",
-                        lc = lc,
-                        ready = ready_raptor,
-                        cooldown = raptor_ready_delay,
-                        lock = lock,
-                        stats = stats_for_raptor,
-                    );
-                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_raptor));
-                    let stats = Arc::clone(&stats_for_raptor);
-                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    let t0 = Instant::now();
-                    let lc_inner = lc.clone();
-                    rt.block_on(async {
-                        crate::cron::code_raptor::run_code_raptor(db.as_ref(), &stats, &lc_inner)
-                            .await;
-                    });
-                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    tracing::info!(
-                        job = "code-raptor",
-                        rss_mb_start = rss_start >> 20,
-                        rss_mb_end = rss_end >> 20,
-                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
-                        elapsed_s = t0.elapsed().as_secs_f64(),
-                        "heavy cron complete"
-                    );
-                },
-                crate::work_pool::pool::Priority::Low,
-            );
-            true
+            let lc_inner = lc_for_raptor.clone();
+            rt.block_on(async {
+                crate::cron::code_raptor::run_code_raptor(db.as_ref(), &stats, &lc_inner).await;
+            });
+            run.ok();
         },
     );
 
-    // Fuzzy-index sync — clone db / rt / stats BEFORE topic-clustering
-    // claims the final-move ownership of each.
+    // Fuzzy-index sync (heavy). The `CronRunGuard` now captures the rss/thread
+    // deltas that were the persistent-trie daemon-thread leak signal (a healthy
+    // run returns threads_delta to ~0; a steadily-climbing delta means handles
+    // aren't being reclaimed); the per-run report counts become `counters`.
+    let fuzzy_interval_ms = config.fuzzy_sync_interval_secs * 1000;
+    let fuzzy_cooldown_ms = config.ready_delay_topic_secs * 1000;
     let db_clone_fuzzy = Arc::clone(&db);
     let rt_clone_fuzzy = rt.clone();
     let stats_for_fuzzy = Arc::clone(&stats);
     let fuzzy_data_dir = fuzzy_config.data_dir.clone();
     let fuzzy_max_disk_bytes = fuzzy_config.max_disk_bytes;
     let fuzzy_eviction_cfg = fuzzy_config.eviction_config();
-    let fuzzy_interval = config.fuzzy_sync_interval_secs;
-    let cron_pool_fuzzy = Arc::clone(&cron_pool);
-    let lc_fuzzy = lifecycle.clone();
-    let lock_fuzzy = Arc::clone(&heavy_cron_lock);
-    let ready_fuzzy: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-    let fuzzy_ready_delay = Duration::from_secs(config.ready_delay_topic_secs);
-    handle.schedule_recurring(
-        staggered_initial_delay_ms("fuzzy-sync", fuzzy_interval * 1000),
-        fuzzy_interval * 1000,
+    register_heavy_cron(
+        handle,
+        &lifecycle,
+        &cron_pool,
+        &heavy_cron_lock,
+        &stats,
+        system_ctx.cron_history(),
         "fuzzy-sync",
-        move || {
-            if lc_fuzzy.is_stopping() {
-                return false;
-            }
-            let lc = lc_fuzzy.clone();
-            let lock = Arc::clone(&lock_fuzzy);
-            let ready = Arc::clone(&ready_fuzzy);
+        initial_delay("fuzzy-sync", fuzzy_interval_ms),
+        fuzzy_interval_ms,
+        fuzzy_cooldown_ms,
+        move |run| {
             let stats = Arc::clone(&stats_for_fuzzy);
             let db = db_clone_fuzzy.clone();
             let rt = rt_clone_fuzzy.clone();
             let data_dir = fuzzy_data_dir.clone();
             let max_disk_bytes = fuzzy_max_disk_bytes;
             let eviction_cfg = fuzzy_eviction_cfg.clone();
-            cron_pool_fuzzy.submit(
-                move || {
-                    let _guard = heavy_gate_or_skip!(
+            let Some(pool) = db.pool().cloned() else {
+                tracing::warn!(job = "fuzzy-sync", "skipping run: DbClient has no pool");
+                run.noop();
+                return;
+            };
+            let result = rt.block_on(async move {
+                crate::cron::fuzzy_sync::run_fuzzy_sync(
+                    &pool,
+                    &data_dir,
+                    max_disk_bytes,
+                    eviction_cfg,
+                    stats,
+                )
+                .await
+            });
+            match result {
+                Ok(report) => {
+                    tracing::info!(
                         job = "fuzzy-sync",
-                        lc = lc,
-                        ready = ready,
-                        cooldown = fuzzy_ready_delay,
-                        lock = lock,
-                        stats = stats,
+                        symbols = report.symbols_synced,
+                        paths = report.paths_synced,
+                        commits = report.commits_synced,
+                        durable_mandates = report.durable_mandates_synced,
+                        concepts = report.concepts_synced,
+                        "fuzzy-sync run complete"
                     );
-                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
-                    // Capture RSS + thread count around the run. `threads_delta`
-                    // is the regression signal for the persistent-trie
-                    // daemon-thread leak: a healthy run returns to ~0; a
-                    // steadily-climbing delta means handles aren't being
-                    // reclaimed.
-                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    let threads_start = crate::stats::rss::current_thread_count().unwrap_or(0);
-                    let t0 = Instant::now();
-                    if let Some(pool) = db.pool().cloned() {
-                        let stats_ref = Arc::clone(&stats);
-                        let result = rt.block_on(async move {
-                            crate::cron::fuzzy_sync::run_fuzzy_sync(
-                                &pool,
-                                &data_dir,
-                                max_disk_bytes,
-                                eviction_cfg,
-                                stats_ref,
-                            )
-                            .await
-                        });
-                        let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                        let threads_end = crate::stats::rss::current_thread_count().unwrap_or(0);
-                        match result {
-                            Ok(report) => tracing::info!(
-                                job = "fuzzy-sync",
-                                symbols = report.symbols_synced,
-                                paths = report.paths_synced,
-                                commits = report.commits_synced,
-                                durable_mandates = report.durable_mandates_synced,
-                                concepts = report.concepts_synced,
-                                rss_mb_start = rss_start >> 20,
-                                rss_mb_end = rss_end >> 20,
-                                rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
-                                threads_start,
-                                threads_end,
-                                threads_delta = threads_end as i64 - threads_start as i64,
-                                elapsed_s = t0.elapsed().as_secs_f64(),
-                                "fuzzy-sync run complete"
-                            ),
-                            Err(e) => tracing::error!(
-                                job = "fuzzy-sync",
-                                error = %e,
-                                "fuzzy-sync run failed"
-                            ),
-                        }
-                    } else {
-                        tracing::warn!(job = "fuzzy-sync", "skipping run: DbClient has no pool");
-                    }
-                },
-                crate::work_pool::pool::Priority::Low,
-            );
-            true
+                    run.ok_with(serde_json::json!({
+                        "symbols": report.symbols_synced,
+                        "paths": report.paths_synced,
+                        "commits": report.commits_synced,
+                        "durable_mandates": report.durable_mandates_synced,
+                        "concepts": report.concepts_synced,
+                    }));
+                }
+                Err(e) => {
+                    tracing::error!(job = "fuzzy-sync", error = %e, "fuzzy-sync run failed");
+                    run.fail(e.to_string());
+                }
+            }
         },
     );
 
@@ -1734,172 +1786,111 @@ pub fn schedule_maintenance_jobs(
     // trajectory, not a single point; it fans out the quality collectors via
     // `quality::aggregate`). Interval-gated like embedding-migration.
     if config.quality_history_interval_secs > 0 {
+        // Own lock (`quality_history_lock`, not heavy_cron_lock) so the cheap
+        // snapshot stops starving behind multi-minute GPU crons; 120 s settle.
+        let qh_interval_ms = config.quality_history_interval_secs * 1000;
         let rt_clone_qh = rt.clone();
         let stats_for_qh = Arc::clone(&stats);
-        let qh_interval = config.quality_history_interval_secs;
-        let cron_pool_qh = Arc::clone(&cron_pool);
-        let lc_qh = lifecycle.clone();
-        // Own lock (not heavy_cron_lock) so the cheap snapshot stops starving
-        // behind multi-minute GPU crons. See `quality_history_lock` above.
-        let lock_qh = Arc::clone(&quality_history_lock);
-        let ready_qh: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-        let qh_ready_delay = Duration::from_secs(120);
         let ctx_qh = system_ctx.clone();
-        handle.schedule_recurring(
-            staggered_initial_delay_ms("quality-history", qh_interval * 1000),
-            qh_interval * 1000,
+        register_heavy_cron(
+            handle,
+            &lifecycle,
+            &cron_pool,
+            &quality_history_lock,
+            &stats,
+            system_ctx.cron_history(),
             "quality-history",
-            move || {
-                if lc_qh.is_stopping() {
-                    return false;
-                }
-                let lc = lc_qh.clone();
-                let lock = Arc::clone(&lock_qh);
-                let ready = Arc::clone(&ready_qh);
-                let stats = Arc::clone(&stats_for_qh);
+            initial_delay("quality-history", qh_interval_ms),
+            qh_interval_ms,
+            120_000,
+            move |run| {
+                let stats_run = Arc::clone(&stats_for_qh);
                 let rt = rt_clone_qh.clone();
                 let ctx = ctx_qh.clone();
-                cron_pool_qh.submit(
-                    move || {
-                        let _guard = heavy_gate_or_skip!(
-                            job = "quality-history",
-                            lc = lc,
-                            ready = ready,
-                            cooldown = qh_ready_delay,
-                            lock = lock,
-                            stats = stats,
-                        );
-                        let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
-                        let stats_run = Arc::clone(&stats);
-                        rt.block_on(async move {
-                            crate::cron::quality_history::run_or_log(ctx, stats_run).await;
-                        });
-                    },
-                    crate::work_pool::pool::Priority::Low,
-                );
-                true
+                rt.block_on(async move {
+                    crate::cron::quality_history::run_or_log(ctx, stats_run).await;
+                });
+                run.ok();
             },
         );
     }
 
     if config.tool_policy_interval_secs > 0 {
-        let rt_clone_tp = rt.clone();
-        let stats_for_tp = Arc::clone(&stats);
-        let tp_interval = config.tool_policy_interval_secs;
-        let cron_pool_tp = Arc::clone(&cron_pool);
-        let lc_tp = lifecycle.clone();
         // Cheap learner pass (a few SQL statements) — its own lock so it never
         // starves behind the GPU herd; it only reads `mcp_tool_calls` and rewrites
-        // the small `client_tool_policy` table.
+        // the small `client_tool_policy` table. 120 s settle.
+        let tp_interval_ms = config.tool_policy_interval_secs * 1000;
         let lock_tp: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
-        let ready_tp: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-        let tp_ready_delay = Duration::from_secs(120);
+        let rt_clone_tp = rt.clone();
+        let stats_for_tp = Arc::clone(&stats);
         let ctx_tp = system_ctx.clone();
-        handle.schedule_recurring(
-            staggered_initial_delay_ms("tool-policy-refresh", tp_interval * 1000),
-            tp_interval * 1000,
+        register_heavy_cron(
+            handle,
+            &lifecycle,
+            &cron_pool,
+            &lock_tp,
+            &stats,
+            system_ctx.cron_history(),
             "tool-policy-refresh",
-            move || {
-                if lc_tp.is_stopping() {
-                    return false;
-                }
-                let lc = lc_tp.clone();
-                let lock = Arc::clone(&lock_tp);
-                let ready = Arc::clone(&ready_tp);
-                let stats = Arc::clone(&stats_for_tp);
+            initial_delay("tool-policy-refresh", tp_interval_ms),
+            tp_interval_ms,
+            120_000,
+            move |run| {
+                let stats_run = Arc::clone(&stats_for_tp);
                 let rt = rt_clone_tp.clone();
                 let ctx = ctx_tp.clone();
-                cron_pool_tp.submit(
-                    move || {
-                        let _guard = heavy_gate_or_skip!(
-                            job = "tool-policy-refresh",
-                            lc = lc,
-                            ready = ready,
-                            cooldown = tp_ready_delay,
-                            lock = lock,
-                            stats = stats,
-                        );
-                        let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
-                        let stats_run = Arc::clone(&stats);
-                        rt.block_on(async move {
-                            crate::cron::tool_policy_refresh::run_or_log(ctx, stats_run).await;
-                        });
-                    },
-                    crate::work_pool::pool::Priority::Low,
-                );
-                true
+                rt.block_on(async move {
+                    crate::cron::tool_policy_refresh::run_or_log(ctx, stats_run).await;
+                });
+                run.ok();
             },
         );
     }
 
     if config.embedding_migration_interval_secs > 0 {
+        // F6 (boy-scout 2026-05-25): use the migration-specific ready-delay
+        // (default 60s) instead of reusing `ready_delay_topic_secs` (default
+        // 3600s). Migration has nothing to wait for post-Ready — it just drains
+        // rows whose `embedding_v2` column is NULL.
+        let mig_interval_ms = config.embedding_migration_interval_secs * 1000;
+        let mig_cooldown_ms = config.ready_delay_embedding_migration_secs * 1000;
         let db_clone_mig = Arc::clone(&db);
         let rt_clone_mig = rt.clone();
         let stats_for_mig = Arc::clone(&stats);
-        let mig_interval = config.embedding_migration_interval_secs;
         let mig_cfg = crate::cron::embedding_migration::EmbeddingMigrationConfig::new(
             embeddings_config.clone(),
             config.embedding_migration_batch_size,
             config.embedding_migration_max_batches,
         );
-        let cron_pool_mig = Arc::clone(&cron_pool);
-        let lc_mig = lifecycle.clone();
-        let lock_mig = Arc::clone(&heavy_cron_lock);
-        let ready_mig: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-        // F6 (boy-scout 2026-05-25): use the migration-specific
-        // ready-delay (default 60s) instead of reusing
-        // `ready_delay_topic_secs` (default 3600s). Migration has
-        // nothing to wait for post-Ready — it just drains rows
-        // whose `embedding_v2` column is NULL. The prior 1-hour
-        // delay blocked the BGE-M3 cutover drain for an hour after
-        // every daemon restart.
-        let mig_ready_delay = Duration::from_secs(config.ready_delay_embedding_migration_secs);
-        handle.schedule_recurring(
-            staggered_initial_delay_ms("embedding-migration", mig_interval * 1000),
-            mig_interval * 1000,
+        register_heavy_cron(
+            handle,
+            &lifecycle,
+            &cron_pool,
+            &heavy_cron_lock,
+            &stats,
+            system_ctx.cron_history(),
             "embedding-migration",
-            move || {
-                if lc_mig.is_stopping() {
-                    return false;
-                }
-                let lc = lc_mig.clone();
-                let lock = Arc::clone(&lock_mig);
-                let ready = Arc::clone(&ready_mig);
+            initial_delay("embedding-migration", mig_interval_ms),
+            mig_interval_ms,
+            mig_cooldown_ms,
+            move |run| {
                 let stats = Arc::clone(&stats_for_mig);
                 let db = db_clone_mig.clone();
                 let rt = rt_clone_mig.clone();
                 let mig_cfg = mig_cfg.clone();
-                cron_pool_mig.submit(
-                    move || {
-                        let _guard = heavy_gate_or_skip!(
-                            job = "embedding-migration",
-                            lc = lc,
-                            ready = ready,
-                            cooldown = mig_ready_delay,
-                            lock = lock,
-                            stats = stats,
-                        );
-                        let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
-                        if let Some(pool) = db.pool().cloned() {
-                            let stats_ref = Arc::clone(&stats);
-                            rt.block_on(async move {
-                                crate::cron::embedding_migration::run_or_log(
-                                    Arc::new(pool),
-                                    stats_ref,
-                                    mig_cfg,
-                                )
-                                .await;
-                            });
-                        } else {
-                            tracing::warn!(
-                                job = "embedding-migration",
-                                "skipping run: DbClient has no pool"
-                            );
-                        }
-                    },
-                    crate::work_pool::pool::Priority::Low,
-                );
-                true
+                let Some(pool) = db.pool().cloned() else {
+                    tracing::warn!(
+                        job = "embedding-migration",
+                        "skipping run: DbClient has no pool"
+                    );
+                    run.noop();
+                    return;
+                };
+                rt.block_on(async move {
+                    crate::cron::embedding_migration::run_or_log(Arc::new(pool), stats, mig_cfg)
+                        .await;
+                });
+                run.ok();
             },
         );
     }
@@ -1909,68 +1900,37 @@ pub fn schedule_maintenance_jobs(
     // `tool_hybrid_search` and by `tool_correct_query`. Off when
     // interval = 0.
     if config.ngram_lm_train_interval_secs > 0 {
+        let lm_interval_ms = config.ngram_lm_train_interval_secs * 1000;
+        let lm_cooldown_ms = config.ready_delay_topic_secs * 1000;
         let db_clone_lm = Arc::clone(&db);
         let rt_clone_lm = rt.clone();
         let stats_for_lm = Arc::clone(&stats);
-        let lm_interval = config.ngram_lm_train_interval_secs;
         let lm_data_dir = fuzzy_config.data_dir.clone();
-        let cron_pool_lm = Arc::clone(&cron_pool);
-        let lc_lm = lifecycle.clone();
-        let lock_lm = Arc::clone(&heavy_cron_lock);
-        let ready_lm: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-        let lm_ready_delay = Duration::from_secs(config.ready_delay_topic_secs);
-        handle.schedule_recurring(
-            staggered_initial_delay_ms("ngram-lm-train", lm_interval * 1000),
-            lm_interval * 1000,
+        register_heavy_cron(
+            handle,
+            &lifecycle,
+            &cron_pool,
+            &heavy_cron_lock,
+            &stats,
+            system_ctx.cron_history(),
             "ngram-lm-train",
-            move || {
-                if lc_lm.is_stopping() {
-                    return false;
-                }
-                let lc = lc_lm.clone();
-                let lock = Arc::clone(&lock_lm);
-                let ready = Arc::clone(&ready_lm);
+            initial_delay("ngram-lm-train", lm_interval_ms),
+            lm_interval_ms,
+            lm_cooldown_ms,
+            move |run| {
                 let stats = Arc::clone(&stats_for_lm);
                 let db = db_clone_lm.clone();
                 let rt = rt_clone_lm.clone();
                 let data_dir = lm_data_dir.clone();
-                cron_pool_lm.submit(
-                    move || {
-                        let _guard = heavy_gate_or_skip!(
-                            job = "ngram-lm-train",
-                            lc = lc,
-                            ready = ready,
-                            cooldown = lm_ready_delay,
-                            lock = lock,
-                            stats = stats,
-                        );
-                        let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
-                        let t0 = Instant::now();
-                        if let Some(pool) = db.pool().cloned() {
-                            let stats_ref = Arc::clone(&stats);
-                            rt.block_on(async move {
-                                crate::cron::ngram_lm_train::run_or_log(
-                                    Arc::new(pool),
-                                    stats_ref,
-                                    data_dir,
-                                )
-                                .await;
-                            });
-                            tracing::info!(
-                                job = "ngram-lm-train",
-                                elapsed_s = t0.elapsed().as_secs_f64(),
-                                "ngram-lm-train run complete"
-                            );
-                        } else {
-                            tracing::warn!(
-                                job = "ngram-lm-train",
-                                "skipping run: DbClient has no pool"
-                            );
-                        }
-                    },
-                    crate::work_pool::pool::Priority::Low,
-                );
-                true
+                let Some(pool) = db.pool().cloned() else {
+                    tracing::warn!(job = "ngram-lm-train", "skipping run: DbClient has no pool");
+                    run.noop();
+                    return;
+                };
+                rt.block_on(async move {
+                    crate::cron::ngram_lm_train::run_or_log(Arc::new(pool), stats, data_dir).await;
+                });
+                run.ok();
             },
         );
     }
@@ -1980,80 +1940,54 @@ pub fn schedule_maintenance_jobs(
     // to `topic_dendrograms`; the `dendrogram_topic_hierarchy` MCP
     // tool reads from there. Off when interval = 0.
     if config.topic_dendrogram_interval_secs > 0 {
+        let td_interval_ms = config.topic_dendrogram_interval_secs * 1000;
+        let td_cooldown_ms = config.ready_delay_topic_secs * 1000;
         let db_clone_td = Arc::clone(&db);
         let rt_clone_td = rt.clone();
         let stats_for_td = Arc::clone(&stats);
-        let td_interval = config.topic_dendrogram_interval_secs;
-        let cron_pool_td = Arc::clone(&cron_pool);
-        let lc_td = lifecycle.clone();
-        let lock_td = Arc::clone(&heavy_cron_lock);
-        let ready_td: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-        let td_ready_delay = Duration::from_secs(config.ready_delay_topic_secs);
-        handle.schedule_recurring(
-            staggered_initial_delay_ms("topic-dendrogram", td_interval * 1000),
-            td_interval * 1000,
+        register_heavy_cron(
+            handle,
+            &lifecycle,
+            &cron_pool,
+            &heavy_cron_lock,
+            &stats,
+            system_ctx.cron_history(),
             "topic-dendrogram",
-            move || {
-                if lc_td.is_stopping() {
-                    return false;
-                }
-                let lc = lc_td.clone();
-                let lock = Arc::clone(&lock_td);
-                let ready = Arc::clone(&ready_td);
+            initial_delay("topic-dendrogram", td_interval_ms),
+            td_interval_ms,
+            td_cooldown_ms,
+            move |run| {
                 let stats = Arc::clone(&stats_for_td);
                 let db = db_clone_td.clone();
                 let rt = rt_clone_td.clone();
-                cron_pool_td.submit(
-                    move || {
-                        let _guard = heavy_gate_or_skip!(
-                            job = "topic-dendrogram",
-                            lc = lc,
-                            ready = ready,
-                            cooldown = td_ready_delay,
-                            lock = lock,
-                            stats = stats,
-                        );
-                        let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats));
-                        let t0 = Instant::now();
-                        if let Some(pool) = db.pool().cloned() {
-                            let stats_ref = Arc::clone(&stats);
-                            rt.block_on(async move {
-                                crate::cron::topic_dendrogram::run_or_log(
-                                    Arc::new(pool),
-                                    stats_ref,
-                                )
-                                .await;
-                            });
-                            tracing::info!(
-                                job = "topic-dendrogram",
-                                elapsed_s = t0.elapsed().as_secs_f64(),
-                                "topic-dendrogram run complete"
-                            );
-                        } else {
-                            tracing::warn!(
-                                job = "topic-dendrogram",
-                                "skipping run: DbClient has no pool"
-                            );
-                        }
-                    },
-                    crate::work_pool::pool::Priority::Low,
-                );
-                true
+                let Some(pool) = db.pool().cloned() else {
+                    tracing::warn!(
+                        job = "topic-dendrogram",
+                        "skipping run: DbClient has no pool"
+                    );
+                    run.noop();
+                    return;
+                };
+                rt.block_on(async move {
+                    crate::cron::topic_dendrogram::run_or_log(Arc::new(pool), stats).await;
+                });
+                run.ok();
             },
         );
     }
 
-    // Topic clustering (global full-chunk — always produces scope = "global")
-    let db_clone_topic = db; // final move // final move
-    let rt_clone_topic = rt; // final move
-    let stats_for_topic = stats; // final move
-    let topic_interval = config.topic_scan_interval_secs;
-    let lc = lifecycle; // final move
-    let lock = Arc::clone(&heavy_cron_lock);
-    let ready_topic: Arc<OnceLock<Instant>> = Arc::new(OnceLock::new());
-    let topic_ready_delay = Duration::from_secs(config.ready_delay_topic_secs);
+    // Topic clustering (global full-chunk — always produces scope = "global").
+    // This is the motivating cron for ADR-018: an overdue topic-clustering after
+    // restart used to slip ~12h because its stagger tick was cooldown-gated; the
+    // §6 honor-settle retry now runs it ~1h after Ready instead.
+    let topic_interval_ms = config.topic_scan_interval_secs * 1000;
+    let topic_cooldown_ms = config.ready_delay_topic_secs * 1000;
+    let db_clone_topic = Arc::clone(&db);
+    let rt_clone_topic = rt.clone();
+    let stats_for_topic = Arc::clone(&stats);
+    let lc_for_topic = lifecycle.clone();
     let topic_cron_config = CronConfig {
-        topic_scan_interval_secs: topic_interval,
+        topic_scan_interval_secs: config.topic_scan_interval_secs,
         topic_min_cluster_size: config.topic_min_cluster_size,
         topic_num_clusters: config.topic_num_clusters,
         topic_fuzziness: config.topic_fuzziness,
@@ -2065,59 +1999,33 @@ pub fn schedule_maintenance_jobs(
         topic_scratch_dir: config.topic_scratch_dir.clone(),
         ..CronConfig::default()
     };
-    let cron_pool_topic = Arc::clone(&cron_pool);
-    handle.schedule_recurring(
-        staggered_initial_delay_ms("topic-clustering", topic_interval * 1000),
-        topic_interval * 1000,
+    register_heavy_cron(
+        handle,
+        &lifecycle,
+        &cron_pool,
+        &heavy_cron_lock,
+        &stats,
+        system_ctx.cron_history(),
         "topic-clustering",
-        move || {
-            if lc.is_stopping() {
-                return false;
-            }
-            let lc = lc.clone();
-            let lock = Arc::clone(&lock);
-            let ready_topic = Arc::clone(&ready_topic);
-            let stats_for_topic = Arc::clone(&stats_for_topic);
+        initial_delay("topic-clustering", topic_interval_ms),
+        topic_interval_ms,
+        topic_cooldown_ms,
+        move |run| {
+            let stats = Arc::clone(&stats_for_topic);
             let db = db_clone_topic.clone();
             let cfg = topic_cron_config.clone();
             let rt = rt_clone_topic.clone();
-            cron_pool_topic.submit(
-                move || {
-                    let _guard = heavy_gate_or_skip!(
-                        job = "topic-clustering",
-                        lc = lc,
-                        ready = ready_topic,
-                        cooldown = topic_ready_delay,
-                        lock = lock,
-                        stats = stats_for_topic,
-                    );
-                    let _cron_flag = HeavyCronFlag::new(Arc::clone(&stats_for_topic));
-                    let stats = Arc::clone(&stats_for_topic);
-                    let rss_start = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    let t0 = Instant::now();
-                    let lc_inner = lc.clone();
-                    rt.block_on(async {
-                        crate::cron::topic_clustering::run_global_topic_scan(
-                            db.as_ref(),
-                            &cfg,
-                            &stats,
-                            &lc_inner,
-                        )
-                        .await;
-                    });
-                    let rss_end = crate::stats::rss::current_rss_bytes().unwrap_or(0);
-                    tracing::info!(
-                        job = "topic-clustering",
-                        rss_mb_start = rss_start >> 20,
-                        rss_mb_end = rss_end >> 20,
-                        rss_mb_delta = (rss_end as i64 - rss_start as i64) >> 20,
-                        elapsed_s = t0.elapsed().as_secs_f64(),
-                        "heavy cron complete"
-                    );
-                },
-                crate::work_pool::pool::Priority::Low,
-            );
-            true
+            let lc_inner = lc_for_topic.clone();
+            rt.block_on(async {
+                crate::cron::topic_clustering::run_global_topic_scan(
+                    db.as_ref(),
+                    &cfg,
+                    &stats,
+                    &lc_inner,
+                )
+                .await;
+            });
+            run.ok();
         },
     );
 }
@@ -2139,6 +2047,115 @@ mod tests {
         let one = staggered_initial_delay_ms("similarity-scan", 21_600_000);
         let two = staggered_initial_delay_ms("similarity-scan", 21_600_000);
         assert_eq!(one, two);
+    }
+
+    // ---- ADR-018 §5: restart-survival initial delay ----
+
+    #[test]
+    fn restart_delay_no_history_is_stagger() {
+        // First boot / unknown job → fall back to the anti-herd stagger.
+        let ivl = 43_200_000; // 12h
+        assert_eq!(
+            restart_initial_delay_ms("topic-clustering", ivl, None, 1_000_000_000),
+            staggered_initial_delay_ms("topic-clustering", ivl)
+        );
+    }
+
+    #[test]
+    fn restart_delay_overdue_is_stagger() {
+        // last_ok + interval already in the past → fire soon, but staggered.
+        let ivl = 43_200_000;
+        let now = 1_000_000_000;
+        let last_ok = now - ivl - 5_000; // overdue by 5s
+        assert_eq!(
+            restart_initial_delay_ms("topic-clustering", ivl, Some(last_ok), now),
+            staggered_initial_delay_ms("topic-clustering", ivl)
+        );
+    }
+
+    #[test]
+    fn restart_delay_future_due_waits_remaining_floored_at_stagger() {
+        // Recent success → wait out the remaining interval (restart-survival),
+        // never shorter than the stagger.
+        let ivl = 43_200_000;
+        let now = 1_000_000_000;
+        let last_ok = now - 1_000_000; // ran 1000s ago → ~11.7h remaining
+        let got = restart_initial_delay_ms("topic-clustering", ivl, Some(last_ok), now);
+        let remaining = (last_ok + ivl) - now;
+        let stagger = staggered_initial_delay_ms("topic-clustering", ivl);
+        assert_eq!(got, remaining.max(stagger));
+        assert!(got >= stagger, "must never fire earlier than the stagger");
+    }
+
+    #[test]
+    fn restart_delay_clock_backwards_is_stagger() {
+        // last_ok in the future (clock skew) → stagger fallback, no underflow.
+        let ivl = 3_600_000;
+        let now = 1_000_000_000;
+        assert_eq!(
+            restart_initial_delay_ms("git-history-index", ivl, Some(now + 10_000), now),
+            staggered_initial_delay_ms("git-history-index", ivl)
+        );
+    }
+
+    #[test]
+    fn restart_delay_zero_interval_is_zero() {
+        // Disabled cron → caller won't schedule; the pure fn returns 0.
+        assert_eq!(restart_initial_delay_ms("x", 0, Some(1), 2), 0);
+        assert_eq!(restart_initial_delay_ms("x", 0, None, 2), 0);
+    }
+
+    #[test]
+    fn restart_delay_two_overdue_jobs_differ_anti_herd() {
+        // Two overdue jobs must not both collapse to the same instant.
+        let ivl = 7_200_000;
+        let now = 1_000_000_000;
+        let last = now - ivl - 1; // both overdue
+        let a = restart_initial_delay_ms("symbol-extraction", ivl, Some(last), now);
+        let b = restart_initial_delay_ms("function-metrics", ivl, Some(last), now);
+        assert_ne!(a, b, "overdue jobs must stagger, not herd");
+    }
+
+    // ---- ADR-018 §6: honor-settle cooldown decision ----
+
+    #[test]
+    fn cooldown_zero_is_run_now() {
+        let lc = crate::daemon_state::DaemonLifecycle::new();
+        lc.transition(crate::daemon_state::DaemonPhase::Scanning);
+        lc.transition(crate::daemon_state::DaemonPhase::Ready);
+        assert!(matches!(
+            cooldown_decision(&lc, 0),
+            CooldownDecision::RunNow
+        ));
+    }
+
+    #[test]
+    fn cooldown_not_ready_is_run_now() {
+        // Pre-Ready ticks defer to the in-pool PhaseGate, not the settle.
+        let lc = crate::daemon_state::DaemonLifecycle::new();
+        assert!(matches!(
+            cooldown_decision(&lc, 3_600_000),
+            CooldownDecision::RunNow
+        ));
+    }
+
+    #[test]
+    fn cooldown_ready_within_window_defers() {
+        // Just reached Ready with a 1h settle → defer with a positive delay
+        // bounded by cooldown + slack.
+        let lc = crate::daemon_state::DaemonLifecycle::new();
+        lc.transition(crate::daemon_state::DaemonPhase::Scanning);
+        lc.transition(crate::daemon_state::DaemonPhase::Ready);
+        let cooldown = 3_600_000u64;
+        match cooldown_decision(&lc, cooldown) {
+            CooldownDecision::DeferMs(d) => {
+                assert!(
+                    d > 0 && d <= cooldown + COOLDOWN_SLACK_MS,
+                    "defer {d} out of range"
+                );
+            }
+            CooldownDecision::RunNow => panic!("expected a defer just after Ready"),
+        }
     }
 
     #[test]
@@ -2431,40 +2448,15 @@ mod tests {
     use crate::stats::tracker::{
         CronJobOutcome as TestCronJobOutcome, SkipReason as TestSkipReason, StatsTracker,
     };
-    use std::sync::OnceLock as TestOnceLock;
 
-    /// Helper: invoke the body of `heavy_gate_or_skip!` inside a
-    /// `()`-returning closure (the macro early-returns with bare
-    /// `return;`, so the closure cannot return a value). The shared
-    /// `Arc<AtomicBool>` is flipped to `true` only if the macro
-    /// passes through every gate. Caller reads the flag to determine
-    /// "would the work body have run?".
+    /// Helper: run `try_heavy_gate` and report whether the body would have run
+    /// (`Some` lock returned). The cooldown settle is no longer part of the gate
+    /// (it moved to `heavy_cron_tick`), so these tests isolate the in-pool gates:
+    /// PhaseGate / Shutdown / DbDown / DiskPressure / LockBusy.
     fn try_gate(lc: &DaemonLifecycle, stats: &Arc<StatsTracker>) -> bool {
-        // Pre-warm cooldown deadline so cooldown can't be the
-        // returning reason; we want to isolate the shutdown gate.
-        let ready: Arc<TestOnceLock<Instant>> = Arc::new(TestOnceLock::new());
-        let _ = ready.set(Instant::now() - Duration::from_secs(3600));
-        let lock = Arc::new(tokio::sync::Mutex::new(()));
-        let proceeded = Arc::new(AtomicBool::new(false));
-
-        let proceeded_for_closure = Arc::clone(&proceeded);
-        let inner = || {
-            // The macro requires a string-literal job name (matched
-            // by `$job:literal`). Tests each construct their own
-            // `StatsTracker`, so re-using one literal across the
-            // three tests does not race on the DashMap.
-            let _guard = heavy_gate_or_skip!(
-                job = "heavy-gate-shutdown-test",
-                lc = lc,
-                ready = ready,
-                cooldown = Duration::from_secs(0),
-                lock = lock,
-                stats = stats,
-            );
-            proceeded_for_closure.store(true, AtomicOrdering::Relaxed);
-        };
-        inner();
-        proceeded.load(AtomicOrdering::Relaxed)
+        let lock = tokio::sync::Mutex::new(());
+        let hist = crate::cron::history::CronHistoryWriter::null(Arc::clone(stats));
+        try_heavy_gate("heavy-gate-shutdown-test", lc, &lock, stats, &hist).is_some()
     }
 
     #[test]

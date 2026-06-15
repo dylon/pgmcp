@@ -103,6 +103,28 @@ Optional `project` filters to one project by name; `include_exited` also lists r
     }
 
     #[tool(
+        description = "Durable cron-run history from the `cron_run_history` ledger: a per-job rollup (last outcome, last success, computed next-due, and run/ok/fail/skip counts) plus recent runs with intrinsics (duration, RSS / thread deltas, job counters). Survives daemon restarts. \
+USE WHEN: you want to see when each maintenance cron last ran or succeeded, whether any are failing or being skipped (and why), or how long/how much memory they take. \
+DO NOT USE WHEN: you want the live in-memory latest-outcome snapshot (use `index_stats`) or to trigger a run now (use `trigger_cron`). \
+Optional `job` filters the recent list to one cron; `limit` (1..=500, default 50) caps the recent rows. The per-job rollup always covers every job."
+    )]
+    async fn cron_history(
+        &self,
+        Parameters(params): Parameters<CronHistoryParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "cron_history",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_cron_history::tool_cron_history(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "The m:n matrix of which clients are EDITING which projects, from observed file events — edit/read counts, recently-edited files, and recency, grouped by project. \
 USE WHEN: you want a weighted 'who is working on what' view based on actual file touches, not just cwd. \
 DO NOT USE WHEN: you only need the live connection/PID view (use `active_clients`) or historical tool telemetry (use `mcp_tool_telemetry`). \

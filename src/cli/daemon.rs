@@ -394,6 +394,17 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         );
     }
 
+    // 8b. Durable cron-run-history writer (ADR-018). Spawned before the
+    // SystemContext build because the context carries the writer handle; cron
+    // bodies + the manual `trigger_cron` path build a `CronRunGuard` from it. Its
+    // cancel branch flushes pending rows at shutdown (joined below).
+    let (cron_history_writer, cron_history_writer_handle) =
+        cron::history::spawn_cron_history_writer(
+            db_pool.clone(),
+            Arc::clone(&stats_tracker),
+            shutdown.cancellation_token(),
+        );
+
     // 9. Build the SystemContext bundle. One context, shared by the
     // indexer, MCP server, and REST API — Arc-clone per field, no deep copy.
     let system_ctx = SystemContext::production_with_extractor(
@@ -405,7 +416,19 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         Arc::clone(&task_store),
         lifecycle.clone(),
         llm_extractor.clone(),
+        cron_history_writer,
     );
+
+    // Restart-survival (ADR-018 §5): each recurring cron's first-tick delay is
+    // computed from its last persisted successful completion instead of a fresh
+    // stagger, so a daemon restart no longer slips the schedule. Empty on a fresh
+    // DB (every cron falls back to its anti-herd stagger).
+    let last_cron_runs: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
+        db::queries::last_successful_completions(&db_pool)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
     // Schedule cron jobs (heavy jobs gate on lifecycle.is_at_least(Ready)).
     // Invoked after the SystemContext build so the quality-history cron can
@@ -424,6 +447,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         Arc::clone(&cron_pool),
         Some(Arc::clone(&general_pool)),
         system_ctx.clone(),
+        &last_cron_runs,
     );
 
     // 10. Start file watcher + scanner
@@ -593,6 +617,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let stats_for_retention = Arc::clone(&stats_tracker);
         let retention_days = config_snapshot.metrics.telemetry_retention_days;
         let rt_for_retention = tokio::runtime::Handle::current();
+        let hist_retention = system_ctx.cron_history().clone();
         // 24h interval. Initial delay 30s so we don't run during the
         // startup window when other heavy initialization is in flight.
         cron_handle.schedule_recurring(
@@ -602,10 +627,20 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             move || {
                 let pool = pool.clone();
                 let stats = Arc::clone(&stats_for_retention);
-                rt_for_retention.spawn(async move {
-                    cron::telemetry_retention::run_or_log(Arc::new(pool), stats, retention_days)
+                let hist = hist_retention.clone();
+                crate::cron::history::spawn_recorded(
+                    &rt_for_retention,
+                    hist,
+                    "telemetry-retention",
+                    async move {
+                        cron::telemetry_retention::run_or_log(
+                            Arc::new(pool),
+                            stats,
+                            retention_days,
+                        )
                         .await;
-                });
+                    },
+                );
                 true
             },
         );
@@ -623,13 +658,15 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let a2a_cfg = config_snapshot.a2a.reflection.clone();
         let interval_ms = a2a_cfg.cron_interval_secs.saturating_mul(1000);
         let rt_for_a2a = tokio::runtime::Handle::current();
+        let hist_a2a = system_ctx.cron_history().clone();
         // 60s initial delay so we don't run during the startup window.
         cron_handle.schedule_recurring(60_000, interval_ms, "a2a-reflect", move || {
             let pool = pool.clone();
             let stats = Arc::clone(&stats_for_a2a);
             let extractor = extractor_for_a2a.read().clone();
             let cfg = a2a_cfg.clone();
-            rt_for_a2a.spawn(async move {
+            let hist = hist_a2a.clone();
+            crate::cron::history::spawn_recorded(&rt_for_a2a, hist, "a2a-reflect", async move {
                 cron::a2a_reflect::run_or_log(Arc::new(pool), stats, extractor, cfg).await;
             });
             true
@@ -647,12 +684,14 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let csm_cfg = config_snapshot.a2a.csm_validate.clone();
         let interval_ms = csm_cfg.cron_interval_secs.saturating_mul(1000);
         let rt_for_csm = tokio::runtime::Handle::current();
+        let hist_csm = system_ctx.cron_history().clone();
         // 75s initial delay so we don't run during the startup window.
         cron_handle.schedule_recurring(75_000, interval_ms, "csm-validate", move || {
             let pool = pool.clone();
             let stats = Arc::clone(&stats_for_csm);
             let cfg = csm_cfg.clone();
-            rt_for_csm.spawn(async move {
+            let hist = hist_csm.clone();
+            crate::cron::history::spawn_recorded(&rt_for_csm, hist, "csm-validate", async move {
                 cron::csm_validate::run_or_log(Arc::new(pool), stats, cfg).await;
             });
             true
@@ -671,11 +710,13 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let sec_cfg = config_snapshot.security_scan.clone();
         let interval_ms = sec_cfg.cron_interval_secs.saturating_mul(1000);
         let rt_for_sec = tokio::runtime::Handle::current();
+        let hist_sec = system_ctx.cron_history().clone();
         // 105s initial delay so we don't run during the startup window.
         cron_handle.schedule_recurring(105_000, interval_ms, "security-scan", move || {
             let pool = pool.clone();
             let cfg = sec_cfg.clone();
-            rt_for_sec.spawn(async move {
+            let hist = hist_sec.clone();
+            crate::cron::history::spawn_recorded(&rt_for_sec, hist, "security-scan", async move {
                 cron::security_scan::run_or_log(pool, cfg).await;
             });
             true
@@ -696,13 +737,20 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             .memory_graph_refresh_interval_secs
             .saturating_mul(1000);
         let rt_for_graph = tokio::runtime::Handle::current();
+        let hist_graph = system_ctx.cron_history().clone();
         // 90s initial delay: after the boot-time hash-gated rebuild + warmup.
         cron_handle.schedule_recurring(90_000, interval_ms, "memory-graph-refresh", move || {
             let pool = pool.clone();
             let stats = Arc::clone(&stats_for_graph);
-            rt_for_graph.spawn(async move {
-                cron::memory_graph_refresh::run_or_log(Arc::new(pool), stats).await;
-            });
+            let hist = hist_graph.clone();
+            crate::cron::history::spawn_recorded(
+                &rt_for_graph,
+                hist,
+                "memory-graph-refresh",
+                async move {
+                    cron::memory_graph_refresh::run_or_log(Arc::new(pool), stats).await;
+                },
+            );
             true
         });
     }
@@ -719,15 +767,22 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let extractor_for_concepts = llm_extractor.clone();
         let interval_ms = concepts_cfg.cron_interval_secs.saturating_mul(1000);
         let rt_for_concepts = tokio::runtime::Handle::current();
+        let hist_concepts = system_ctx.cron_history().clone();
         // 120s initial delay so it runs after the boot-time graph rebuild.
         cron_handle.schedule_recurring(120_000, interval_ms, "memory-concept-extract", move || {
             let pool = pool.clone();
             let stats = Arc::clone(&stats_for_concepts);
             let cfg = concepts_cfg.clone();
             let extractor = extractor_for_concepts.read().clone();
-            rt_for_concepts.spawn(async move {
-                cron::memory_concepts::run_or_log(Arc::new(pool), stats, cfg, extractor).await;
-            });
+            let hist = hist_concepts.clone();
+            crate::cron::history::spawn_recorded(
+                &rt_for_concepts,
+                hist,
+                "memory-concept-extract",
+                async move {
+                    cron::memory_concepts::run_or_log(Arc::new(pool), stats, cfg, extractor).await;
+                },
+            );
             true
         });
     }
@@ -741,13 +796,20 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let ontology_cfg = config_snapshot.ontology.clone();
         let interval_ms = ontology_cfg.cron_interval_secs.saturating_mul(1000);
         let rt_for_ontology = tokio::runtime::Handle::current();
+        let hist_ontology_inv = system_ctx.cron_history().clone();
         // 180s initial delay so it runs after the boot-time graph rebuild.
         cron_handle.schedule_recurring(180_000, interval_ms, "ontology-invariants", move || {
             let pool = pool.clone();
             let cfg = ontology_cfg.clone();
-            rt_for_ontology.spawn(async move {
-                cron::ontology_invariants::run_or_log(Arc::new(pool), cfg).await;
-            });
+            let hist = hist_ontology_inv.clone();
+            crate::cron::history::spawn_recorded(
+                &rt_for_ontology,
+                hist,
+                "ontology-invariants",
+                async move {
+                    cron::ontology_invariants::run_or_log(Arc::new(pool), cfg).await;
+                },
+            );
             true
         });
     }
@@ -761,13 +823,20 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let ontology_cfg = config_snapshot.ontology.clone();
         let interval_ms = ontology_cfg.cron_interval_secs.saturating_mul(1000);
         let rt_for_ontology_build = tokio::runtime::Handle::current();
+        let hist_ontology_build = system_ctx.cron_history().clone();
         // 240s initial delay so it runs after invariant mining (180s).
         cron_handle.schedule_recurring(240_000, interval_ms, "ontology-build", move || {
             let pool = pool.clone();
             let cfg = ontology_cfg.clone();
-            rt_for_ontology_build.spawn(async move {
-                cron::ontology_build::run_or_log(Arc::new(pool), cfg).await;
-            });
+            let hist = hist_ontology_build.clone();
+            crate::cron::history::spawn_recorded(
+                &rt_for_ontology_build,
+                hist,
+                "ontology-build",
+                async move {
+                    cron::ontology_build::run_or_log(Arc::new(pool), cfg).await;
+                },
+            );
             true
         });
     }
@@ -782,13 +851,20 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let ontology_cfg = config_snapshot.ontology.clone();
         let interval_ms = ontology_cfg.cron_interval_secs.saturating_mul(1000);
         let rt_for_ontology_lp = tokio::runtime::Handle::current();
+        let hist_ontology_lp = system_ctx.cron_history().clone();
         // 300s initial delay so it runs after the hierarchy build (240s).
         cron_handle.schedule_recurring(300_000, interval_ms, "ontology-link-predict", move || {
             let pool = pool.clone();
             let cfg = ontology_cfg.clone();
-            rt_for_ontology_lp.spawn(async move {
-                cron::ontology_link_predict::run_or_log(Arc::new(pool), cfg).await;
-            });
+            let hist = hist_ontology_lp.clone();
+            crate::cron::history::spawn_recorded(
+                &rt_for_ontology_lp,
+                hist,
+                "ontology-link-predict",
+                async move {
+                    cron::ontology_link_predict::run_or_log(Arc::new(pool), cfg).await;
+                },
+            );
             true
         });
     }
@@ -802,12 +878,19 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let ontology_cfg = config_snapshot.ontology.clone();
         let interval_ms = ontology_cfg.cron_interval_secs.saturating_mul(1000);
         let rt_for_ontology_reason = tokio::runtime::Handle::current();
+        let hist_ontology_reason = system_ctx.cron_history().clone();
         cron_handle.schedule_recurring(360_000, interval_ms, "ontology-reason", move || {
             let pool = pool.clone();
             let cfg = ontology_cfg.clone();
-            rt_for_ontology_reason.spawn(async move {
-                cron::ontology_reason::run_or_log(Arc::new(pool), cfg).await;
-            });
+            let hist = hist_ontology_reason.clone();
+            crate::cron::history::spawn_recorded(
+                &rt_for_ontology_reason,
+                hist,
+                "ontology-reason",
+                async move {
+                    cron::ontology_reason::run_or_log(Arc::new(pool), cfg).await;
+                },
+            );
             true
         });
     }
@@ -821,13 +904,20 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let ontology_cfg = config_snapshot.ontology.clone();
         let interval_ms = ontology_cfg.cron_interval_secs.saturating_mul(1000);
         let rt_for_ontology_mig = tokio::runtime::Handle::current();
+        let hist_ontology_mig = system_ctx.cron_history().clone();
         // 150s: run before the hierarchy build (240s) so pattern concepts exist.
         cron_handle.schedule_recurring(150_000, interval_ms, "ontology-migrate", move || {
             let pool = pool.clone();
             let cfg = ontology_cfg.clone();
-            rt_for_ontology_mig.spawn(async move {
-                cron::ontology_migrate::run_or_log(Arc::new(pool), cfg).await;
-            });
+            let hist = hist_ontology_mig.clone();
+            crate::cron::history::spawn_recorded(
+                &rt_for_ontology_mig,
+                hist,
+                "ontology-migrate",
+                async move {
+                    cron::ontology_migrate::run_or_log(Arc::new(pool), cfg).await;
+                },
+            );
             true
         });
     }
@@ -841,13 +931,20 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let ontology_cfg = config_snapshot.ontology.clone();
         let interval_ms = ontology_cfg.cron_interval_secs.saturating_mul(1000);
         let rt_for_ontology_int = tokio::runtime::Handle::current();
+        let hist_ontology_int = system_ctx.cron_history().clone();
         // 270s: run after the hierarchy build (240s) so concepts + anchors exist.
         cron_handle.schedule_recurring(270_000, interval_ms, "ontology-integrate", move || {
             let pool = pool.clone();
             let cfg = ontology_cfg.clone();
-            rt_for_ontology_int.spawn(async move {
-                cron::ontology_integrate::run_or_log(Arc::new(pool), cfg).await;
-            });
+            let hist = hist_ontology_int.clone();
+            crate::cron::history::spawn_recorded(
+                &rt_for_ontology_int,
+                hist,
+                "ontology-integrate",
+                async move {
+                    cron::ontology_integrate::run_or_log(Arc::new(pool), cfg).await;
+                },
+            );
             true
         });
     }
@@ -861,13 +958,20 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         let traj_cfg = config_snapshot.cron.trajectory_similarity.clone();
         let interval_ms = traj_cfg.cron_interval_secs.saturating_mul(1000);
         let rt_for_traj = tokio::runtime::Handle::current();
+        let hist_traj = system_ctx.cron_history().clone();
         cron_handle.schedule_recurring(150_000, interval_ms, "trajectory-similarity", move || {
             let pool = pool.clone();
             let stats = Arc::clone(&stats_for_traj);
             let cfg = traj_cfg.clone();
-            rt_for_traj.spawn(async move {
-                cron::trajectory_similarity::run_or_log(Arc::new(pool), stats, cfg).await;
-            });
+            let hist = hist_traj.clone();
+            crate::cron::history::spawn_recorded(
+                &rt_for_traj,
+                hist,
+                "trajectory-similarity",
+                async move {
+                    cron::trajectory_similarity::run_or_log(Arc::new(pool), stats, cfg).await;
+                },
+            );
             true
         });
     }
@@ -1294,6 +1398,14 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             Ok(Err(e)) => tracing::warn!(error = %e, "Telemetry writer task panicked"),
             Err(_) => tracing::warn!("Telemetry writer did not drain within 5s; aborting"),
         }
+    }
+
+    // Drain the cron-run-history writer (ADR-018). Its cancel branch flushes
+    // pending `cron_run_history` rows before exiting.
+    match tokio::time::timeout(component_timeout, cron_history_writer_handle).await {
+        Ok(Ok(())) => info!("Cron history writer drained and exited"),
+        Ok(Err(e)) => tracing::warn!(error = %e, "Cron history writer task panicked"),
+        Err(_) => tracing::warn!("Cron history writer did not drain within 5s; aborting"),
     }
 
     // Close database pool (5s timeout)

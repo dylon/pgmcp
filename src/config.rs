@@ -2877,6 +2877,12 @@ pub struct CronConfig {
     #[serde(default)]
     pub concurrency_auto_promote: bool,
 
+    /// Retention window (days) for `cron_run_history` rows, swept by the
+    /// `db-maintenance` light cron. Default 30; `0` keeps history forever.
+    /// See `src/cron/history/` and ADR-018.
+    #[serde(default = "default_cron_history_retention_days")]
+    pub cron_history_retention_days: i64,
+
     /// Batch size for the embedding-migration cron (default 64).
     #[serde(default = "default_embedding_migration_batch_size")]
     pub embedding_migration_batch_size: usize,
@@ -3125,6 +3131,7 @@ impl Default for CronConfig {
             findings_promotion_interval_secs: default_findings_promotion_interval(),
             concurrency_scan_interval_secs: default_concurrency_scan_interval(),
             concurrency_auto_promote: false,
+            cron_history_retention_days: default_cron_history_retention_days(),
             embedding_migration_batch_size: default_embedding_migration_batch_size(),
             embedding_migration_max_batches: default_embedding_migration_max_batches(),
             topic_max_mem_fraction: default_topic_max_mem_fraction(),
@@ -3501,6 +3508,10 @@ fn default_findings_promotion_interval() -> u64 {
 
 fn default_concurrency_scan_interval() -> u64 {
     0 // disabled by default; opt-in (heavier: betweenness + cycle detection)
+}
+
+fn default_cron_history_retention_days() -> i64 {
+    30
 }
 
 fn default_embedding_migration_interval() -> u64 {

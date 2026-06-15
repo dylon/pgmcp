@@ -102,6 +102,10 @@ pub use queries_ontology::*;
 mod queries_external_scanner;
 pub use queries_external_scanner::*;
 
+#[path = "queries/cron_history.rs"]
+mod queries_cron_history;
+pub use queries_cron_history::*;
+
 // The digest rate-limit ledger keeps its own namespace (`queries::digest::*`)
 // rather than being flattened with `pub use`, so the digest's sole write
 // surface stays obviously distinct from the read queries. See `src/digest/`.

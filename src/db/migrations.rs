@@ -54,6 +54,7 @@ mod v37_client_tool_policy;
 mod v38_mcp_tool_catalog;
 mod v39_mcp_tool_call_result_size;
 mod v3_cross_language_signatures;
+mod v40_cron_run_history;
 mod v4_work_items;
 mod v5_work_items_collab;
 mod v6_unified_graph;
@@ -2552,6 +2553,14 @@ pub async fn run_migrations(
         v39_mcp_tool_call_result_size::MCP_TOOL_CALL_RESULT_SIZE,
         v39_mcp_tool_call_result_size::MCP_TOOL_CALL_RESULT_SIZE_NAME,
         || v39_mcp_tool_call_result_size::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v40_cron_run_history::CRON_RUN_HISTORY,
+        v40_cron_run_history::CRON_RUN_HISTORY_NAME,
+        || v40_cron_run_history::apply(pool),
     )
     .await?;
 
