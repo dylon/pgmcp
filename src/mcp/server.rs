@@ -844,6 +844,14 @@ impl McpServer {
             "suggest_merges"         => suggest_merges(SuggestMergesParams),
             "suggest_splits"         => suggest_splits(SuggestSplitsParams),
             "doc_coverage_gaps"      => doc_coverage_gaps(DocCoverageGapsParams),
+            // Topic analysis (portfolio)
+            "project_topic_profile"    => project_topic_profile(ProjectTopicProfileParams),
+            "topic_project_map"        => topic_project_map(TopicProjectMapParams),
+            "project_topic_similarity" => project_topic_similarity(ProjectTopicSimilarityParams),
+            "topic_cooccurrence"       => topic_cooccurrence(TopicCooccurrenceParams),
+            "topic_coverage_gaps"      => topic_coverage_gaps(TopicCoverageGapsParams),
+            "topic_owners"             => topic_owners(TopicOwnersParams),
+            "topic_trends"             => topic_trends(TopicTrendsParams),
             // Graph
             "dependency_graph"       => dependency_graph(DependencyGraphParams),
             "centrality_analysis"    => centrality_analysis(CentralityAnalysisParams),

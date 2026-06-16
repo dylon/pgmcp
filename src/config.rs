@@ -2851,6 +2851,13 @@ pub struct CronConfig {
     #[serde(default = "default_quality_history_interval")]
     pub quality_history_interval_secs: u64,
 
+    /// Interval for the `topics-size-history` cron (seconds). 0 disables. Cheap:
+    /// snapshots each `code_topics` row's `chunk_count` into
+    /// `pgmcp_metadata['topics_size_history']` so `topic_trends` has a per-topic
+    /// trajectory rather than a single point.
+    #[serde(default = "default_topics_size_history_interval")]
+    pub topics_size_history_interval_secs: u64,
+
     /// Interval for the `tool-policy-refresh` cron (seconds). 0 disables (the
     /// adaptive per-client tool surface then stays on whatever snapshot was
     /// loaded at startup). Default 6h. Recomputes each client's default tool set
@@ -3130,6 +3137,7 @@ impl Default for CronConfig {
             topic_dendrogram_interval_secs: default_topic_dendrogram_interval(),
             embedding_migration_interval_secs: default_embedding_migration_interval(),
             quality_history_interval_secs: default_quality_history_interval(),
+            topics_size_history_interval_secs: default_topics_size_history_interval(),
             tool_policy_interval_secs: default_tool_policy_interval(),
             findings_promotion_interval_secs: default_findings_promotion_interval(),
             concurrency_scan_interval_secs: default_concurrency_scan_interval(),
@@ -3498,6 +3506,10 @@ fn default_topic_dendrogram_interval() -> u64 {
     43200
 } // 12 h
 fn default_quality_history_interval() -> u64 {
+    21_600 // 6h
+}
+
+fn default_topics_size_history_interval() -> u64 {
     21_600 // 6h
 }
 

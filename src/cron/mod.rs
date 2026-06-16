@@ -93,6 +93,7 @@ pub mod topic_hierarchy;
 pub mod topic_label_llm;
 #[allow(dead_code)]
 pub mod topic_reduce;
+pub mod topics_size_history;
 #[allow(dead_code)]
 pub mod trajectory_similarity;
 pub mod work_item_presence;

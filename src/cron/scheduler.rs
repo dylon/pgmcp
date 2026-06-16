@@ -1815,6 +1815,39 @@ pub fn schedule_maintenance_jobs(
         );
     }
 
+    // topics-size-history (cheap — snapshots every `code_topics` row's
+    // `chunk_count` into `pgmcp_metadata['topics_size_history']` so `topic_trends`
+    // reads a per-topic trajectory, not a single point). Own light lock, 120 s
+    // settle — same idiom as tool-policy-refresh.
+    if config.topics_size_history_interval_secs > 0 {
+        let tsh_interval_ms = config.topics_size_history_interval_secs * 1000;
+        let lock_tsh: Arc<tokio::sync::Mutex<()>> = Arc::new(tokio::sync::Mutex::new(()));
+        let rt_clone_tsh = rt.clone();
+        let ctx_tsh = system_ctx.clone();
+        register_heavy_cron(
+            handle,
+            &lifecycle,
+            &cron_pool,
+            &lock_tsh,
+            &stats,
+            system_ctx.cron_history(),
+            "topics-size-history",
+            initial_delay("topics-size-history", tsh_interval_ms),
+            tsh_interval_ms,
+            120_000,
+            move |run| {
+                let rt = rt_clone_tsh.clone();
+                let ctx = ctx_tsh.clone();
+                rt.block_on(async move {
+                    if let Some(pool) = ctx.db().pool() {
+                        crate::cron::topics_size_history::run_or_log(pool).await;
+                    }
+                });
+                run.ok();
+            },
+        );
+    }
+
     if config.tool_policy_interval_secs > 0 {
         // Cheap learner pass (a few SQL statements) — its own lock so it never
         // starves behind the GPU herd; it only reads `mcp_tool_calls` and rewrites
@@ -2281,7 +2314,10 @@ mod tests {
     #[test]
     fn test_one_shot_task() {
         let terminating = Arc::new(AtomicBool::new(false));
-        let (handle, thread, _ready) = spawn_cron_with_interval(Arc::clone(&terminating), 10, None);
+        let (handle, thread, ready) = spawn_cron_with_interval(Arc::clone(&terminating), 10, None);
+        // Wait for the cron thread to be running before scheduling, so the
+        // one-shot isn't dropped on the floor before the loop starts.
+        ready.recv().expect("Cron thread failed to start");
         let counter = Arc::new(AtomicU64::new(0));
         let c = Arc::clone(&counter);
 
@@ -2290,7 +2326,14 @@ mod tests {
             true
         });
 
-        thread::sleep(Duration::from_millis(100));
+        // Poll (bounded) until the one-shot has run, rather than a fixed sleep
+        // that flakes under heavy parallel-test CPU load.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while counter.load(std::sync::atomic::Ordering::Relaxed) == 0
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
         handle.request_shutdown();
         thread.join().expect("Cron thread panicked");
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);

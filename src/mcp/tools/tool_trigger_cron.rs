@@ -57,6 +57,7 @@ pub async fn tool_trigger_cron(
         "security-scan",
         "findings-promotion",
         "topic-clustering",
+        "topics-size-history",
         "code-raptor",
         "topic-dendrogram",
         "memory-raptor",
@@ -64,7 +65,7 @@ pub async fn tool_trigger_cron(
     if !VALID_JOBS.contains(&job) {
         return Err(McpError::invalid_params(
             format!(
-                "Unknown job {job:?}. Valid: symbol-extraction | call-graph | function-metrics | graph-analysis | a2a-reflect | msm-calibrate | fuzzy-sync | target-cleanup | security-scan | findings-promotion | topic-clustering | code-raptor | topic-dendrogram | memory-raptor"
+                "Unknown job {job:?}. Valid: symbol-extraction | call-graph | function-metrics | graph-analysis | a2a-reflect | msm-calibrate | fuzzy-sync | target-cleanup | security-scan | findings-promotion | topic-clustering | topics-size-history | code-raptor | topic-dendrogram | memory-raptor"
             ),
             None,
         ));
@@ -415,6 +416,18 @@ async fn trigger_cron_dispatch(
                 "topics_discovered": stats.topics_discovered.load(Ordering::Relaxed),
                 "degenerate_refusals": stats.topic_degenerate_refusals.load(Ordering::Relaxed),
                 "guidance": "Topics recomputed. discover_topics (per-project scope='project:NAME' + a 'global' roll-up) and topic quality (orient health / pgmcp_metadata['topics_quality']) are refreshed. The degeneracy gate preserves prior topics if the new model is degenerate.",
+            }))
+        }
+        "topics-size-history" => {
+            // Snapshot current per-topic sizes into the bounded
+            // pgmcp_metadata['topics_size_history'] series read by topic_trends.
+            if let Some(pool) = db.pool() {
+                crate::cron::topics_size_history::run_or_log(pool).await;
+            }
+            json_result(&json!({
+                "job": job,
+                "status": "completed",
+                "guidance": "Per-topic size snapshot appended to topics_size_history. topic_trends (mode=longitudinal) needs ≥2 snapshots over time to compute growth/decline.",
             }))
         }
         "code-raptor" => {

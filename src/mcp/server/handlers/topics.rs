@@ -290,4 +290,182 @@ Requires discover_topics first."
         )
         .await
     }
+
+    #[tool(
+        description = "Per-project topic fingerprint: dominant topics, a specialization index \
+(normalized entropy + Gini — focused vs sprawling), and stored coherence. \
+USE WHEN: you want to know what a project is about and how focused it is, or to compare all \
+projects' specialization at a glance. \
+DO NOT USE WHEN: you want which file is mislabeled (find_misplaced_code) or the raw topic list \
+(discover_topics). \
+With `project`: one fingerprint. Without: a comparison table over all projects. Requires \
+discover_topics (topic assignments) first."
+    )]
+    async fn project_topic_profile(
+        &self,
+        Parameters(params): Parameters<ProjectTopicProfileParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "project_topic_profile",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_project_topic_profile::tool_project_topic_profile(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Cross-project theme overlap from the global roll-up: which themes are \
+shared substrate (span many projects) vs project-specific, plus each project's shared/unique split. \
+USE WHEN: mapping which concerns are common infrastructure across the workspace vs siloed. \
+DO NOT USE WHEN: you want a single project's topics (discover_topics / project_topic_profile). \
+Requires a global discover_topics roll-up first."
+    )]
+    async fn topic_project_map(
+        &self,
+        Parameters(params): Parameters<TopicProjectMapParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "topic_project_map",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_topic_project_map::tool_topic_project_map(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Cluster projects by topic similarity and flag likely redundant forks / \
+backups (.bak copies, PR-branch clones, rewrite families). \
+USE WHEN: auditing a multi-project workspace for duplication / near-duplicate forks, or finding \
+which projects are most alike. \
+DO NOT USE WHEN: you want within-project duplicate code (find_duplicates / lsh_clone_detection). \
+method=centroid (default) compares aggregated topic centroids; global_jsd compares global-theme \
+distributions. Requires topic assignments (discover_topics) first."
+    )]
+    async fn project_topic_similarity(
+        &self,
+        Parameters(params): Parameters<ProjectTopicSimilarityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "project_topic_similarity",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_project_topic_similarity::tool_project_topic_similarity(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Topic-topic coupling graph for a project: communities of entangled topics \
+(Louvain over chunks co-assigned to multiple topics) + bridge topics that span communities \
+(cross-cutting concerns). \
+USE WHEN: finding which concerns are tangled together or which topics cut across the codebase. \
+DO NOT USE WHEN: you want file-level coupling (find_coupled_files) or import cycles \
+(circular_dependencies). Requires topic assignments (discover_topics) first."
+    )]
+    async fn topic_cooccurrence(
+        &self,
+        Parameters(params): Parameters<TopicCooccurrenceParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "topic_cooccurrence",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_topic_cooccurrence::tool_topic_cooccurrence(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Where the topic model is weak: orphan (uncategorized) chunks, thin topics \
+(too few chunks), and low-cohesion topics — per project. \
+USE WHEN: auditing topic-model quality / coverage, or finding code that escaped clustering. \
+DO NOT USE WHEN: you want docs-vs-code gaps (doc_coverage_gaps) or test gaps (test_coverage_gaps). \
+With `project`: one project. Without: all projects. Requires discover_topics first."
+    )]
+    async fn topic_coverage_gaps(
+        &self,
+        Parameters(params): Parameters<TopicCoverageGapsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "topic_coverage_gaps",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_topic_coverage_gaps::tool_topic_coverage_gaps(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Per-topic ownership map from git blame: for each topic, the top authors, \
+the bus factor (min authors owning ≥50% of the topic's code), and ownership concentration. \
+USE WHEN: finding who knows a domain (the consensus / parser / semiring code), onboarding, or \
+bus-factor risk by concern. \
+DO NOT USE WHEN: you want per-file ownership (bus_factor_map / knowledge_silos). Requires git \
+blame indexing + discover_topics."
+    )]
+    async fn topic_owners(
+        &self,
+        Parameters(params): Parameters<TopicOwnersParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "topic_owners",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_topic_owners::tool_topic_owners(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Emerging vs declining topics over time + the quality trajectory. \
+USE WHEN: you want to know which themes are rising or fading, or whether topic-model quality is \
+trending up/down. \
+DO NOT USE WHEN: you want the current snapshot (discover_topics / project_topic_profile). \
+mode=longitudinal (default) uses the topics-size-history series (needs ≥2 snapshots); mode=quality \
+forecasts the aggregate coherence/diversity metrics; mode=chunk_age is an immediate blame-date proxy."
+    )]
+    async fn topic_trends(
+        &self,
+        Parameters(params): Parameters<TopicTrendsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "topic_trends",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_topic_trends::tool_topic_trends(self.ctx(), params),
+        )
+        .await
+    }
 }

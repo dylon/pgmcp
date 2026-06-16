@@ -68,6 +68,7 @@ pub mod sessions;
 pub mod shutdown;
 pub mod stats;
 pub mod tools_catalog;
+pub mod topic_analysis;
 #[allow(dead_code)]
 pub mod topic_store;
 pub mod tracker;

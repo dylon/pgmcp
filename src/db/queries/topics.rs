@@ -112,6 +112,90 @@ pub async fn get_topic_quality(pool: &PgPool) -> Option<serde_json::Value> {
         .and_then(|s| serde_json::from_str(&s).ok())
 }
 
+/// Append a per-topic size snapshot to the bounded `topics_size_history` array
+/// in `pgmcp_metadata` (most-recent-last, cap 500) — the longitudinal series
+/// `topic_trends` reads to compute per-topic growth/decline. Each snapshot
+/// records every `code_topics` row's current `chunk_count` at `now`. No schema
+/// change: `pgmcp_metadata` is a `(key, value)` table. Returns the topic count.
+pub async fn set_topics_size_snapshot(pool: &PgPool) -> Result<usize, sqlx::Error> {
+    #[derive(sqlx::FromRow)]
+    struct SizeRow {
+        scope: String,
+        id: i32,
+        label: String,
+        chunk_count: i32,
+    }
+    let rows = sqlx::query_as::<_, SizeRow>(
+        "SELECT scope, id, label, chunk_count FROM code_topics ORDER BY scope, id",
+    )
+    .fetch_all(pool)
+    .await?;
+    let now = Utc::now().to_rfc3339();
+    let topics: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "scope": r.scope,
+                "topic_id": r.id,
+                "label": r.label,
+                "chunk_count": r.chunk_count,
+            })
+        })
+        .collect();
+    let n = topics.len();
+    let snapshot = serde_json::json!({ "at": now, "topics": topics });
+
+    let existing: Option<String> =
+        sqlx::query_scalar("SELECT value FROM pgmcp_metadata WHERE key = 'topics_size_history'")
+            .fetch_optional(pool)
+            .await?;
+    let mut hist = existing
+        .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
+        .unwrap_or_default();
+    hist.push(snapshot);
+    let len = hist.len();
+    if len > 500 {
+        hist.drain(0..len - 500);
+    }
+    sqlx::query(
+        "INSERT INTO pgmcp_metadata (key, value) VALUES ('topics_size_history', $1)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    )
+    .bind(serde_json::Value::Array(hist).to_string())
+    .execute(pool)
+    .await?;
+    Ok(n)
+}
+
+/// Read the bounded `topics_size_history` snapshots (oldest-first). Empty when
+/// the `topics-size-history` cron has not run yet.
+pub async fn get_topics_size_history(pool: &PgPool) -> Vec<serde_json::Value> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'topics_size_history'",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
+    .unwrap_or_default()
+}
+
+/// Read the bounded `topics_quality_history` snapshots (oldest-first; each entry
+/// carries `scope`, `computed_at`, and the 8 quality metrics). Empty when no
+/// topic scan has run. Used by `topic_trends` (mode=quality).
+pub async fn get_topics_quality_history(pool: &PgPool) -> Vec<serde_json::Value> {
+    sqlx::query_scalar::<_, String>(
+        "SELECT value FROM pgmcp_metadata WHERE key = 'topics_quality_history'",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(&s).ok())
+    .unwrap_or_default()
+}
+
 /// Whether the global code-topic model is stale relative to the current
 /// algorithm signature and the indexed corpus.
 ///
