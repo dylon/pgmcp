@@ -32,6 +32,19 @@ struct EnrichedFileInfo {
     truncated: bool,
     indexed_at: Option<DateTime<Utc>>,
     modified_at: DateTime<Utc>,
+    /// When the indexer last *confirmed this row matches disk* (Level-1/Level-2
+    /// skip or full re-index). Compare THIS — not `indexed_at` — to disk mtime
+    /// for freshness: it advances even when a `git checkout`/`rebase` bumps mtime
+    /// without changing content, so it never reports false staleness.
+    last_verified_at: Option<DateTime<Utc>>,
+    /// Current on-disk mtime (live `stat` at call time), or `None` if the file
+    /// no longer exists on disk.
+    disk_mtime: Option<DateTime<Utc>>,
+    /// `true` when `last_verified_at >= disk_mtime` — the index has verified the
+    /// file at or after its current mtime, so the indexed content is current
+    /// (defeats the `indexed_at`-vs-mtime false-staleness signal). `None` when
+    /// the file is gone or has never been verified.
+    verified_current: Option<bool>,
     chunk_count: i32,
     first_chunk_line: Option<i32>,
     last_chunk_line: Option<i32>,
@@ -72,6 +85,18 @@ pub async fn tool_file_info(
             McpError::internal_error(format!("Chunk summary query failed: {}", e), None)
         })?;
 
+    // Live disk mtime (one cheap stat) so the envelope can report freshness
+    // directly: `verified_current` lets a caller stop hand-rolling the
+    // `indexed_at`-vs-mtime comparison that yields false "stale" on git touches.
+    let disk_mtime: Option<DateTime<Utc>> = std::fs::metadata(&params.path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .map(DateTime::<Utc>::from);
+    let verified_current = match (info.last_verified_at, disk_mtime) {
+        (Some(v), Some(d)) => Some(v >= d),
+        _ => None,
+    };
+
     let enriched = EnrichedFileInfo {
         path: info.path,
         relative_path: info.relative_path,
@@ -83,6 +108,9 @@ pub async fn tool_file_info(
         truncated: info.truncated,
         indexed_at: info.indexed_at,
         modified_at: info.modified_at,
+        last_verified_at: info.last_verified_at,
+        disk_mtime,
+        verified_current,
         chunk_count: summary.chunk_count,
         first_chunk_line: summary.first_chunk_line,
         last_chunk_line: summary.last_chunk_line,

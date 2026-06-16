@@ -34,8 +34,9 @@ use pgmcp::db::queries::{
     ChunkEmbeddingRow, ChunkPairSimilarity, ChunkTopicDetailRow, CommitSearchResult,
     CoupledFilePair, DocCoverageRow, DuplicateFilePair, FileComplexityRow, FileContent, FileInfo,
     FileReference, FileSimilarityPair, FileTopicDistributionRow, FileTopicRow, GrepResult,
-    IndexedFileMeta, LanguageCount, OrphanChunkRow, OrphanFileSummary, ProjectInfo, SearchResult,
-    SimilarityNeighborRow, TextSearchResult, TopicCentroidRow, TopicCoverageRow,
+    IndexFailureMeta, IndexedFileMeta, LanguageCount, OrphanChunkRow, OrphanFileSummary,
+    ProjectInfo, SearchResult, SimilarityNeighborRow, TextSearchResult, TopicCentroidRow,
+    TopicCoverageRow,
 };
 
 // ============================================================================
@@ -264,6 +265,14 @@ impl DbClient for MockDbClient {
         Ok(self.indexed_file_metadata.clone())
     }
 
+    async fn mark_files_verified(&self, _paths: &[String]) -> Result<u64, sqlx::Error> {
+        Ok(0)
+    }
+
+    async fn mark_file_verified(&self, _path: &str) -> Result<(), sqlx::Error> {
+        Ok(())
+    }
+
     async fn upsert_file(
         &self,
         project_id: i32,
@@ -422,6 +431,30 @@ impl DbClient for MockDbClient {
 
     async fn cleanup_stale_files(&self) -> Result<u64, sqlx::Error> {
         Ok(0)
+    }
+
+    async fn record_index_failure(
+        &self,
+        _path: &str,
+        _kind: pgmcp::embed::failure_kind::FailureKind,
+        _last_error: &str,
+    ) -> Result<(), sqlx::Error> {
+        Ok(())
+    }
+
+    async fn clear_index_failure(&self, _path: &str) -> Result<(), sqlx::Error> {
+        Ok(())
+    }
+
+    async fn get_bounded_failure_paths(
+        &self,
+        _min_failures: i32,
+    ) -> Result<Vec<IndexFailureMeta>, sqlx::Error> {
+        Ok(Vec::new())
+    }
+
+    async fn failure_kind_counts(&self) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        Ok(Vec::new())
     }
 
     // -- search ------------------------------------------------------------

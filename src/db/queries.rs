@@ -106,6 +106,10 @@ pub use queries_external_scanner::*;
 mod queries_cron_history;
 pub use queries_cron_history::*;
 
+#[path = "queries/index_failures.rs"]
+mod queries_index_failures;
+pub use queries_index_failures::*;
+
 // The digest rate-limit ledger keeps its own namespace (`queries::digest::*`)
 // rather than being flattened with `pub use`, so the digest's sole write
 // surface stays obviously distinct from the read queries. See `src/digest/`.

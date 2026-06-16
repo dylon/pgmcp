@@ -465,6 +465,72 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         lifecycle.clone(),
     )?;
 
+    // 10a. Reconcile-backstop cron (index freshness). Registered here, inline,
+    // because it needs `watcher_cmd_tx` (created just above) — the same reason
+    // the a2a/csm/security crons are registered in daemon.rs rather than in
+    // `schedule_maintenance_jobs`. It sends `WatcherCommand::Rescan` per
+    // workspace so live-watcher events that were missed self-heal within one
+    // interval instead of waiting for a restart. `0` disables. See
+    // `src/cron/index_reconcile.rs` and ADR docs.
+    if config_snapshot.cron.index_reconcile_interval_secs > 0 {
+        let rec_interval = config_snapshot.cron.index_reconcile_interval_secs;
+        let reconcile_workspaces: Vec<PathBuf> = indexer::scanner::effective_workspace_paths(
+            &config_snapshot,
+            &indexer::scanner::SyntheticRoots::from_home(),
+        )
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        let rec_tx = watcher_cmd_tx.clone();
+        let rec_stats = Arc::clone(&stats_tracker);
+        let rec_lc = lifecycle.clone();
+        let rec_rt = tokio::runtime::Handle::current();
+        let rec_hist = system_ctx.cron_history().clone();
+        let rec_initial = cron::scheduler::restart_initial_delay_ms(
+            "index-reconcile",
+            rec_interval * 1000,
+            last_cron_runs
+                .get("index-reconcile")
+                .map(|t| t.timestamp_millis() as u64),
+            cron::scheduler::now_ms(),
+        );
+        cron_handle.schedule_recurring(
+            rec_initial,
+            rec_interval * 1000,
+            "index-reconcile",
+            move || {
+                if rec_lc.is_stopping() {
+                    return false;
+                }
+                // Wait for the initial scan to finish (Ready) — reconciling a
+                // half-built index would double-walk against the startup scan.
+                if !rec_lc.is_at_least(daemon_state::DaemonPhase::Ready) {
+                    rec_stats.record_cron_outcome(
+                        "index-reconcile",
+                        stats::tracker::CronJobOutcome::Skipped(
+                            stats::tracker::SkipReason::PhaseGate,
+                        ),
+                        0,
+                    );
+                    rec_hist.record_skip(
+                        "index-reconcile",
+                        cron::history::CronTriggerSource::Scheduled,
+                        stats::tracker::SkipReason::PhaseGate,
+                    );
+                    return true;
+                }
+                let tx = rec_tx.clone();
+                let workspaces = reconcile_workspaces.clone();
+                let stats = Arc::clone(&rec_stats);
+                let hist = rec_hist.clone();
+                cron::history::spawn_recorded(&rec_rt, hist, "index-reconcile", async move {
+                    cron::index_reconcile::run_or_log(&tx, &workspaces, &stats);
+                });
+                true
+            },
+        );
+    }
+
     // 10b. Start config file watcher for hot-reload
     let _config_watcher_handle = indexer::config_watcher::start_config_watcher(
         Arc::clone(&config),

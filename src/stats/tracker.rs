@@ -254,6 +254,15 @@ pub struct StatsTracker {
     /// rescan command). A reliable "did the scanner actually run" signal
     /// for external freshness comparators.
     pub last_scanned_writes: AtomicU64,
+    /// Rows bulk-stamped by `mark_files_verified` — the Level-1-skipped set a
+    /// scan/rescan/reconcile walk confirmed still matches disk. The signal that
+    /// kills false "stale" reports for git-touched, content-unchanged files.
+    pub last_verified_writes: AtomicU64,
+    /// Files the scanner declined to re-submit because they hit the
+    /// content-intrinsic retry cap (`index_failures`) and have not changed.
+    pub files_bounded_skipped: AtomicU64,
+    /// Reconcile-backstop cron runs that reached the work-eligible state.
+    pub index_reconcile_runs: AtomicU64,
 
     // Pool state
     pub active_work_pool_threads: AtomicU64,
@@ -863,6 +872,9 @@ impl StatsTracker {
             files_skipped: AtomicU64::new(0),
             files_stale_removed: AtomicU64::new(0),
             last_scanned_writes: AtomicU64::new(0),
+            last_verified_writes: AtomicU64::new(0),
+            files_bounded_skipped: AtomicU64::new(0),
+            index_reconcile_runs: AtomicU64::new(0),
             active_work_pool_threads: AtomicU64::new(0),
             work_pool_queue_depth: AtomicU64::new(0),
             cron_executions: AtomicU64::new(0),
@@ -1324,6 +1336,9 @@ impl StatsTracker {
             "files_skipped": self.files_skipped.load(Ordering::Acquire),
             "files_stale_removed": self.files_stale_removed.load(Ordering::Acquire),
             "last_scanned_writes": self.last_scanned_writes.load(Ordering::Acquire),
+            "last_verified_writes": self.last_verified_writes.load(Ordering::Acquire),
+            "files_bounded_skipped": self.files_bounded_skipped.load(Ordering::Acquire),
+            "index_reconcile_runs": self.index_reconcile_runs.load(Ordering::Acquire),
             "active_work_pool_threads": self.active_work_pool_threads.load(Ordering::Acquire),
             "work_pool_queue_depth": self.work_pool_queue_depth.load(Ordering::Acquire),
             "cron_executions": self.cron_executions.load(Ordering::Acquire),

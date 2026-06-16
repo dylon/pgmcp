@@ -1464,6 +1464,13 @@ pub struct IndexerConfig {
     pub debounce_ms: u64,
     #[serde(default = "default_max_file_size")]
     pub max_file_size_bytes: u64,
+    /// Maximum content-intrinsic indexing-failure attempts (non-UTF-8, document
+    /// extraction failure/timeout/OOM) before the scanner stops re-submitting an
+    /// *unchanged* file. Editing the file (mtime advances past the last failure)
+    /// lifts the bound. See `src/embed/failure_kind.rs` and the `index_failures`
+    /// ledger (v42).
+    #[serde(default = "default_max_index_retries")]
+    pub max_index_retries: u32,
     #[serde(default = "default_exclude_patterns")]
     pub exclude_patterns: Vec<String>,
     /// Source-form preference for the per-directory dedup pass. When a
@@ -1535,6 +1542,7 @@ impl Default for IndexerConfig {
             file_types: default_file_types(),
             debounce_ms: default_debounce_ms(),
             max_file_size_bytes: default_max_file_size(),
+            max_index_retries: default_max_index_retries(),
             exclude_patterns: default_exclude_patterns(),
             source_priority: default_source_priority(),
             max_document_source_bytes: default_max_document_source_bytes(),
@@ -1927,6 +1935,10 @@ fn default_debounce_ms() -> u64 {
 
 fn default_max_file_size() -> u64 {
     1_048_576 // 1 MB
+}
+
+fn default_max_index_retries() -> u32 {
+    5
 }
 
 fn default_exclude_patterns() -> Vec<String> {
@@ -2667,6 +2679,14 @@ pub struct CronConfig {
     pub stale_cleanup_interval_secs: u64,
     #[serde(default = "default_integrity_check")]
     pub integrity_check_interval_secs: u64,
+    /// Periodic reconcile-backstop: re-walk every workspace with the Level-1
+    /// stat-only skip and re-submit only changed/new files, so live-watcher
+    /// events that were missed (inotify overflow, editor atomic-save with
+    /// rename, daemon-down-during-edit) self-heal within one interval instead of
+    /// waiting for a daemon restart. Cheap (one `stat` per file; only genuinely
+    /// changed files are read). `0` disables. See `src/cron/index_reconcile.rs`.
+    #[serde(default = "default_index_reconcile")]
+    pub index_reconcile_interval_secs: u64,
     #[serde(default = "default_stats_aggregation")]
     pub stats_aggregation_interval_secs: u64,
     #[serde(default = "default_db_maintenance")]
@@ -3098,6 +3118,7 @@ impl Default for CronConfig {
         Self {
             stale_cleanup_interval_secs: default_stale_cleanup(),
             integrity_check_interval_secs: default_integrity_check(),
+            index_reconcile_interval_secs: default_index_reconcile(),
             stats_aggregation_interval_secs: default_stats_aggregation(),
             db_maintenance_interval_secs: default_db_maintenance(),
             git_history_index_interval_secs: default_git_history_index(),
@@ -3390,6 +3411,9 @@ fn default_stale_cleanup() -> u64 {
 }
 fn default_integrity_check() -> u64 {
     86400
+}
+fn default_index_reconcile() -> u64 {
+    1800 // 30 min: bounds worst-case staleness from a missed live event
 }
 fn default_stats_aggregation() -> u64 {
     60
@@ -3978,6 +4002,16 @@ mod tests {
         let map = config.extension_map();
         assert_eq!(map.get("rs"), Some(&"rust".to_string()));
         assert_eq!(map.get("py"), Some(&"python".to_string()));
+    }
+
+    #[test]
+    fn test_index_freshness_defaults() {
+        // Pin the bounded-retry cap and the reconcile-backstop cadence (the
+        // `Default` impls call the `default_*` fns) so a silent change is caught.
+        assert_eq!(IndexerConfig::default().max_index_retries, 5);
+        assert_eq!(CronConfig::default().index_reconcile_interval_secs, 1800);
+        assert_eq!(default_max_index_retries(), 5);
+        assert_eq!(default_index_reconcile(), 1800);
     }
 
     #[test]

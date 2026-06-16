@@ -242,6 +242,21 @@ pub async fn tool_orient(
         None => serde_json::json!({}),
     };
 
+    // Corpus freshness: the newest `last_verified_at` across the project, and
+    // whether the reconcile backstop has fallen behind (older than 2× its
+    // interval). This is the false-staleness-proof signal — `last_verified_at`
+    // advances on git-touched-but-unchanged files, unlike `indexed_at`. Read the
+    // interval as a Copy u64 first so no config guard is held across the await.
+    let reconcile_interval = ctx.config().load().cron.index_reconcile_interval_secs;
+    let max_verified = crate::db::queries::project_max_last_verified(pool, project.id)
+        .await
+        .ok()
+        .flatten();
+    let index_reconcile_stale = reconcile_interval > 0
+        && max_verified
+            .map(|v| (chrono::Utc::now() - v).num_seconds() > 2 * reconcile_interval as i64)
+            .unwrap_or(false);
+
     let body = json!({
         "effect_breakdown": effect_breakdown,
         "found": true,
@@ -279,6 +294,10 @@ pub async fn tool_orient(
             "graph_stale": graph_stale,
             "topics_stale": topics_stale,
             "topics_degenerate": topics_degenerate,
+            // Corpus freshness: compare THIS to disk mtimes (not `indexed_at`)
+            // to gauge index staleness without the git-touch false positive.
+            "last_verified_at": max_verified,
+            "index_reconcile_stale": index_reconcile_stale,
             "topic_quality_global": topic_quality
                 .as_ref()
                 .and_then(|q| q.get("global"))
@@ -287,6 +306,11 @@ pub async fn tool_orient(
                 "The global topic model is DEGENERATE (labels collapsed / clusters \
                 not separated); discover_topics/topic_hierarchy results are unreliable \
                 until the topic engine is re-run and passes the quality gate."
+            } else if index_reconcile_stale {
+                "The reconcile backstop has not verified this project's files recently \
+                (last_verified_at is older than 2× the reconcile interval); live \
+                indexing may have missed events — a daemon restart or index-reconcile \
+                run will re-verify the corpus."
             } else if graph_stale || topics_stale {
                 "Some derived data (graph metrics, topics) is missing or stale; \
                 results from centrality_analysis/discover_topics will be limited \

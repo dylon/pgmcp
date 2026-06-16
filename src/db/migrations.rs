@@ -55,6 +55,8 @@ mod v38_mcp_tool_catalog;
 mod v39_mcp_tool_call_result_size;
 mod v3_cross_language_signatures;
 mod v40_cron_run_history;
+mod v41_indexed_files_last_verified;
+mod v42_index_failures;
 mod v4_work_items;
 mod v5_work_items_collab;
 mod v6_unified_graph;
@@ -2597,6 +2599,22 @@ pub async fn run_migrations(
         v40_cron_run_history::CRON_RUN_HISTORY,
         v40_cron_run_history::CRON_RUN_HISTORY_NAME,
         || v40_cron_run_history::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v41_indexed_files_last_verified::INDEXED_FILES_LAST_VERIFIED,
+        v41_indexed_files_last_verified::INDEXED_FILES_LAST_VERIFIED_NAME,
+        || v41_indexed_files_last_verified::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v42_index_failures::INDEX_FAILURES,
+        v42_index_failures::INDEX_FAILURES_NAME,
+        || v42_index_failures::apply(pool),
     )
     .await?;
 

@@ -460,6 +460,7 @@ async fn file_info_returns_metadata_from_mock_db() {
         truncated: false,
         indexed_at: Some(Utc::now()),
         modified_at: Utc::now(),
+        last_verified_at: Some(Utc::now()),
     });
     let server = server_with_mock(mock);
     let result = server
@@ -1159,6 +1160,7 @@ async fn file_info_serializes_timestamp_fields() {
         truncated: false,
         indexed_at: Some(Utc::now()),
         modified_at: Utc::now(),
+        last_verified_at: Some(Utc::now()),
     });
     let server = server_with_mock(mock);
     let result = server

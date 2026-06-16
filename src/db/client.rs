@@ -94,6 +94,13 @@ pub trait DbClient: Send + Sync {
 
     // -- file metadata + chunks ----------------------------------------------
     async fn get_all_file_metadata(&self) -> Result<Vec<IndexedFileMeta>, sqlx::Error>;
+    /// Bulk-bump `last_verified_at = NOW()` for the Level-1-skipped path set a
+    /// scan/rescan/reconcile walk confirmed still matches disk. One UPDATE for
+    /// the whole set (honors the Level-1 no-per-file-write mandate).
+    async fn mark_files_verified(&self, paths: &[String]) -> Result<u64, sqlx::Error>;
+    /// Single-row `last_verified_at = NOW()` bump for the live-event Level-2
+    /// content-hash skip (a `git`-touched but content-unchanged file).
+    async fn mark_file_verified(&self, path: &str) -> Result<(), sqlx::Error>;
     #[allow(clippy::too_many_arguments)]
     async fn upsert_file(
         &self,
@@ -144,6 +151,27 @@ pub trait DbClient: Send + Sync {
     async fn get_file_id_by_path(&self, path: &str) -> Result<Option<i64>, sqlx::Error>;
     async fn get_file_line_count(&self, file_id: i64) -> Result<i32, sqlx::Error>;
     async fn cleanup_stale_files(&self) -> Result<u64, sqlx::Error>;
+
+    // -- index-failure ledger (content-intrinsic, bounded retry) -------------
+    /// Record (or bump) a content-intrinsic indexing failure (see
+    /// [`crate::embed::failure_kind::FailureKind`]); best-effort at call sites.
+    async fn record_index_failure(
+        &self,
+        path: &str,
+        kind: crate::embed::failure_kind::FailureKind,
+        last_error: &str,
+    ) -> Result<(), sqlx::Error>;
+    /// Standalone clear of a path's failure-ledger row (the success writers
+    /// clear in-transaction; this is for callers without one).
+    async fn clear_index_failure(&self, path: &str) -> Result<(), sqlx::Error>;
+    /// Paths past the retry cap — the bounded set the scanner skips while their
+    /// mtime has not advanced past `last_failed_at`. Loaded once per scan.
+    async fn get_bounded_failure_paths(
+        &self,
+        min_failures: i32,
+    ) -> Result<Vec<crate::db::queries::IndexFailureMeta>, sqlx::Error>;
+    /// `(failure_kind, count)` breakdown for `index_stats`.
+    async fn failure_kind_counts(&self) -> Result<Vec<(String, i64)>, sqlx::Error>;
 
     // -- search --------------------------------------------------------------
     async fn semantic_search(

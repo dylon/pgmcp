@@ -1,5 +1,6 @@
 pub mod admission;
 pub mod backend;
+pub mod failure_kind;
 pub mod model;
 pub mod pool;
 pub mod rerank_ext;

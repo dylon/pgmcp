@@ -112,8 +112,8 @@ pub async fn replace_indexed_file(
             "INSERT INTO indexed_files
                 (project_id, path, relative_path, language, size_bytes, content,
                  content_hash, line_count, truncated, content_recoverable_from_disk,
-                 modified_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 modified_at, last_verified_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
              ON CONFLICT (path) DO UPDATE SET
                 project_id = EXCLUDED.project_id,
                 relative_path = EXCLUDED.relative_path,
@@ -125,7 +125,8 @@ pub async fn replace_indexed_file(
                 truncated = EXCLUDED.truncated,
                 content_recoverable_from_disk = EXCLUDED.content_recoverable_from_disk,
                 modified_at = EXCLUDED.modified_at,
-                indexed_at = NOW()
+                indexed_at = NOW(),
+                last_verified_at = NOW()
              RETURNING id",
         )
         .bind(replacement.project_id)
@@ -174,6 +175,14 @@ pub async fn replace_indexed_file(
         sqlx::query("UPDATE indexed_files SET content_hash = $1 WHERE id = $2")
             .bind(replacement.content_hash)
             .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Clear any content-intrinsic failure ledger entry: this path was just
+        // (re)indexed successfully, so a prior `index_failures` row is stale and
+        // must not keep the scanner's bounded-retry gate from re-walking it.
+        sqlx::query("DELETE FROM index_failures WHERE path = $1")
+            .bind(replacement.path)
             .execute(&mut *tx)
             .await?;
 

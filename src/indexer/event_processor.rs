@@ -341,12 +341,41 @@ pub fn start_indexing(
                 })
                 .expect("Failed to spawn scan walk thread");
 
+            // Level-0 bounded-failure set: content-intrinsic failures past the
+            // retry cap (loaded once, like metadata_map). The scanner stops
+            // re-submitting these while their mtime has not advanced past the
+            // last failure, so a corrupt document doesn't re-run extraction on
+            // every reconcile tick. Disjoint from metadata_map (a ledgered
+            // failure has no content_hash, so it's absent from that set).
+            let bounded_failures: std::collections::HashMap<
+                String,
+                chrono::DateTime<chrono::Utc>,
+            > = match rt_for_scan.block_on(
+                db_for_scan.get_bounded_failure_paths(config_snapshot.indexer.max_index_retries as i32),
+            ) {
+                Ok(rows) => {
+                    let mut m = std::collections::HashMap::with_capacity(rows.len());
+                    for r in rows {
+                        m.insert(r.path, r.last_failed_at);
+                    }
+                    m
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "Failed to load bounded-failure set; not gating retries");
+                    std::collections::HashMap::new()
+                }
+            };
+
             // Process discovered files with metadata-based filtering
             let mut total_scanned: u64 = 0;
             let mut skipped: u64 = 0;
             let mut submitted: u64 = 0;
+            let mut bounded_skipped: u64 = 0;
             let mut seen_paths: std::collections::HashSet<String> =
                 std::collections::HashSet::with_capacity(metadata_map.len());
+            // The Level-1-skipped (unchanged) set — bulk-stamped `last_verified_at`
+            // after the walk so git-touched-but-unchanged files stop reading stale.
+            let mut skipped_paths: Vec<String> = Vec::with_capacity(metadata_map.len());
 
             for path in file_rx {
                 // Bail out early on SIGTERM so we don't enqueue more
@@ -372,6 +401,28 @@ pub fn start_indexing(
 
                     if fs_size == db_meta.size_bytes && fs_mtime <= db_meta.modified_at {
                         skipped += 1;
+                        // Confirmed unchanged on disk → bulk-stamped verified below.
+                        skipped_paths.push(path.to_string_lossy().into_owned());
+                        continue;
+                    }
+                }
+
+                // Level 0: bounded-failure gate. A content-intrinsic failure
+                // (corrupt doc, non-UTF-8) that has hit the retry cap and whose
+                // file has NOT changed since the last failure is not worth
+                // re-reading — re-submitting it would re-run extraction and
+                // re-fail on every reconcile tick. An edit (mtime past the last
+                // failure) lifts the bound. Disjoint from metadata_map, so this
+                // only stats the small bounded set.
+                if let Some(last_failed) = bounded_failures.get(&*path.to_string_lossy())
+                    && let Ok(fs_meta) = std::fs::metadata(&path)
+                {
+                    let fs_mtime: chrono::DateTime<chrono::Utc> = fs_meta
+                        .modified()
+                        .map(Into::into)
+                        .unwrap_or_else(|_| chrono::Utc::now());
+                    if fs_mtime <= *last_failed {
+                        bounded_skipped += 1;
                         continue;
                     }
                 }
@@ -448,6 +499,27 @@ pub fn start_indexing(
             stats_for_scan
                 .files_skipped
                 .fetch_add(skipped, Ordering::Relaxed);
+            stats_for_scan
+                .files_bounded_skipped
+                .fetch_add(bounded_skipped, Ordering::Relaxed);
+
+            // Bulk-stamp `last_verified_at` for the Level-1-skipped (unchanged)
+            // set in one UPDATE — this honors the per-file no-write mandate and
+            // is the signal that stops git-touched, content-unchanged files from
+            // reading as falsely "stale" via `file_info`/`orient`.
+            match rt_for_scan.block_on(db_for_scan.mark_files_verified(&skipped_paths)) {
+                Ok(rows) => {
+                    stats_for_scan
+                        .last_verified_writes
+                        .fetch_add(rows, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Failed to bulk-mark last_verified_at after initial scan"
+                    );
+                }
+            }
 
             // Mark every project under each scanned workspace as freshly
             // scanned. The per-file `upsert_project` path bumps
@@ -735,9 +807,33 @@ fn rescan_workspace(
             }
         };
 
+    // Bounded-failure set + verified-set accumulator, mirroring the initial
+    // scan. This is what makes the reconcile-backstop cron (which drives
+    // `rescan_workspace` via `WatcherCommand::Rescan`) self-heal missed events
+    // while bounding retries on permanently-bad files and stamping
+    // `last_verified_at` for the unchanged set.
+    let bounded_failures: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>> =
+        match rt_handle
+            .block_on(db.get_bounded_failure_paths(config.load().indexer.max_index_retries as i32))
+        {
+            Ok(rows) => {
+                let mut m = std::collections::HashMap::with_capacity(rows.len());
+                for r in rows {
+                    m.insert(r.path, r.last_failed_at);
+                }
+                m
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to load bounded-failure set for rescan");
+                std::collections::HashMap::new()
+            }
+        };
+
     let mut total_scanned: u64 = 0;
     let mut skipped: u64 = 0;
     let mut submitted: u64 = 0;
+    let mut bounded_skipped: u64 = 0;
+    let mut skipped_paths: Vec<String> = Vec::with_capacity(metadata_map.len());
     for path in file_rx {
         total_scanned += 1;
 
@@ -752,6 +848,21 @@ fn rescan_workspace(
 
             if fs_size == db_meta.size_bytes && fs_mtime <= db_meta.modified_at {
                 skipped += 1;
+                skipped_paths.push(path.to_string_lossy().into_owned());
+                continue;
+            }
+        }
+
+        // Level 0: bounded-failure gate (see initial scan for rationale).
+        if let Some(last_failed) = bounded_failures.get(&*path.to_string_lossy())
+            && let Ok(fs_meta) = std::fs::metadata(&path)
+        {
+            let fs_mtime: chrono::DateTime<chrono::Utc> = fs_meta
+                .modified()
+                .map(Into::into)
+                .unwrap_or_else(|_| chrono::Utc::now());
+            if fs_mtime <= *last_failed {
+                bounded_skipped += 1;
                 continue;
             }
         }
@@ -797,11 +908,33 @@ fn rescan_workspace(
         }
     }
 
+    stats
+        .files_bounded_skipped
+        .fetch_add(bounded_skipped, Ordering::Relaxed);
+
+    // Bulk-stamp `last_verified_at` for the unchanged set so the reconcile
+    // backstop refreshes the false-staleness signal on every pass.
+    match rt_handle.block_on(db.mark_files_verified(&skipped_paths)) {
+        Ok(rows) => {
+            stats
+                .last_verified_writes
+                .fetch_add(rows, Ordering::Relaxed);
+        }
+        Err(e) => {
+            tracing::warn!(
+                workspace = %workspace_path_str,
+                error = %e,
+                "Failed to bulk-mark last_verified_at after rescan"
+            );
+        }
+    }
+
     info!(
         path = %workspace_path_str,
         total = total_scanned,
         unchanged = skipped,
         submitted,
+        bounded_skipped,
         "Re-scan complete"
     );
 }

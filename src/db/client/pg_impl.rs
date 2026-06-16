@@ -84,6 +84,14 @@ impl DbClient for PgPool {
         queries::get_all_file_metadata(self).await
     }
 
+    async fn mark_files_verified(&self, paths: &[String]) -> Result<u64, sqlx::Error> {
+        queries::mark_files_verified(self, paths).await
+    }
+
+    async fn mark_file_verified(&self, path: &str) -> Result<(), sqlx::Error> {
+        queries::mark_file_verified(self, path).await
+    }
+
     async fn upsert_file(
         &self,
         project_id: i32,
@@ -185,6 +193,30 @@ impl DbClient for PgPool {
 
     async fn cleanup_stale_files(&self) -> Result<u64, sqlx::Error> {
         queries::cleanup_stale_files(self).await
+    }
+
+    async fn record_index_failure(
+        &self,
+        path: &str,
+        kind: crate::embed::failure_kind::FailureKind,
+        last_error: &str,
+    ) -> Result<(), sqlx::Error> {
+        queries::record_index_failure(self, path, kind, last_error).await
+    }
+
+    async fn clear_index_failure(&self, path: &str) -> Result<(), sqlx::Error> {
+        queries::clear_index_failure(self, path).await
+    }
+
+    async fn get_bounded_failure_paths(
+        &self,
+        min_failures: i32,
+    ) -> Result<Vec<crate::db::queries::IndexFailureMeta>, sqlx::Error> {
+        queries::get_bounded_failure_paths(self, min_failures).await
+    }
+
+    async fn failure_kind_counts(&self) -> Result<Vec<(String, i64)>, sqlx::Error> {
+        queries::failure_kind_counts(self).await
     }
 
     async fn semantic_search(

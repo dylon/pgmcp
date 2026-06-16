@@ -893,6 +893,7 @@ fn process_index_file_task(
     use chrono::{DateTime, Utc};
     use xxhash_rust::xxh3::xxh3_64;
 
+    use crate::embed::failure_kind::FailureKind;
     use crate::indexer::{chunker, claude_chunker, codex_chunker, document_chunker, extract};
 
     let path = task.path;
@@ -1110,7 +1111,11 @@ fn process_index_file_task(
             Ok(false)
         });
         match res {
-            Ok(true) => {} // Level-1 size+mtime skip
+            Ok(true) => {
+                // Oversize file unchanged (size+mtime hash matched) — confirm
+                // verified so it doesn't read as falsely stale.
+                let _ = rt.block_on(db.mark_file_verified(&path_str));
+            }
             Ok(false) => {
                 stats.files_indexed.fetch_add(1, Ordering::Relaxed);
             }
@@ -1178,6 +1183,11 @@ fn process_index_file_task(
                     "Document extractor returned None for known document language"
                 );
                 stats.files_failed.fetch_add(1, Ordering::Relaxed);
+                let _ = rt.block_on(db.record_index_failure(
+                    &path_str,
+                    FailureKind::DocExtractFailed,
+                    "document extractor returned None",
+                ));
                 return;
             }
             Err(extract::ExtractError::ToolMissing { tool }) => {
@@ -1210,6 +1220,14 @@ fn process_index_file_task(
                 stats
                     .documents_extraction_timeout
                     .fetch_add(1, Ordering::Relaxed);
+                // Ledger for bounded retry: a doc that times out will time out
+                // again on every reconcile until it changes. (Tracked by its own
+                // counter above, so `files_failed` is intentionally not bumped.)
+                let _ = rt.block_on(db.record_index_failure(
+                    &path_str,
+                    FailureKind::DocExtractTimeout,
+                    "document extraction timed out",
+                ));
                 return;
             }
             Err(extract::ExtractError::SubprocessKilled { tool, signal }) => {
@@ -1224,6 +1242,11 @@ fn process_index_file_task(
                 stats
                     .documents_extraction_oom
                     .fetch_add(1, Ordering::Relaxed);
+                let _ = rt.block_on(db.record_index_failure(
+                    &path_str,
+                    FailureKind::DocExtractOom,
+                    "document extraction subprocess killed (rlimit/OOM)",
+                ));
                 return;
             }
             Err(e) => {
@@ -1240,6 +1263,11 @@ fn process_index_file_task(
                     "Document extraction failed"
                 );
                 stats.files_failed.fetch_add(1, Ordering::Relaxed);
+                let _ = rt.block_on(db.record_index_failure(
+                    &path_str,
+                    FailureKind::DocExtractFailed,
+                    &e.to_string(),
+                ));
                 return;
             }
         }
@@ -1254,7 +1282,15 @@ fn process_index_file_task(
                 // failures in the log. The file is still skipped.
                 if e.kind() == std::io::ErrorKind::InvalidData {
                     warn!(path = %path_str, worker_id, error = %e, "fs::read_to_string: not valid UTF-8 (skipping)");
+                    // Content-intrinsic: ledger for bounded retry so the scanner
+                    // stops re-reading a mislabeled binary on every reconcile.
+                    let _ = rt.block_on(db.record_index_failure(
+                        &path_str,
+                        FailureKind::NotUtf8,
+                        &e.to_string(),
+                    ));
                 } else {
+                    // Transient I/O — not ledgered (self-heals on the next pass).
                     error!(path = %path_str, worker_id, error = %e, "fs::read_to_string failed");
                 }
                 stats.files_failed.fetch_add(1, Ordering::Relaxed);
@@ -1324,7 +1360,13 @@ fn process_index_file_task(
     });
 
     match dedup_action {
-        Ok(DedupAction::Level2Skip) => return,
+        Ok(DedupAction::Level2Skip) => {
+            // Content unchanged at this path (e.g. a git-touch that bumped mtime
+            // without changing bytes) — stamp verified so `file_info`/`orient`
+            // stop reporting it as stale even though `indexed_at` is unchanged.
+            let _ = rt.block_on(db.mark_file_verified(&path_str));
+            return;
+        }
         Ok(DedupAction::Rename {
             canonical_id,
             old_path,
@@ -1426,7 +1468,11 @@ fn process_index_file_task(
         Ok(false)
     });
     match skip_res {
-        Ok(true) => return,
+        Ok(true) => {
+            // Content unchanged — stamp verified (the false-staleness fix).
+            let _ = rt.block_on(db.mark_file_verified(&path_str));
+            return;
+        }
         Ok(false) => {}
         Err(e) => {
             error!(path = %path_str, worker_id, error = %e, "content-hash check failed");

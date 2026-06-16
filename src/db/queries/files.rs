@@ -28,6 +28,55 @@ pub async fn get_all_file_metadata(pool: &PgPool) -> Result<Vec<IndexedFileMeta>
     .await
 }
 
+/// Bulk-bump `last_verified_at = NOW()` for every indexed file whose `path` is
+/// in `paths`. Called by the scanner / rescan / reconcile paths after a full
+/// walk, for the Level-1-skipped set the walk confirmed still matches disk.
+///
+/// This is the **one UPDATE per scan** that keeps `last_verified_at` honest
+/// without violating the Level-1 no-per-file-DB-write mandate
+/// (`feedback_rescan_metadata_skip.md`): the skip branch itself stays stat-only,
+/// and the whole skipped set is marked verified in a single index-backed
+/// (`UNIQUE(path)`) statement here. Returns the number of rows updated.
+pub async fn mark_files_verified(pool: &PgPool, paths: &[String]) -> Result<u64, sqlx::Error> {
+    if paths.is_empty() {
+        return Ok(0);
+    }
+    let result =
+        sqlx::query("UPDATE indexed_files SET last_verified_at = NOW() WHERE path = ANY($1)")
+            .bind(paths)
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected())
+}
+
+/// Single-row `last_verified_at = NOW()` bump, for the live-event path's
+/// Level-2 content-hash skip (a `git`-touched but content-unchanged file). Kept
+/// separate from [`mark_files_verified`] to avoid the array bind on the hot
+/// per-file path. Best-effort at the call site.
+pub async fn mark_file_verified(pool: &PgPool, path: &str) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE indexed_files SET last_verified_at = NOW() WHERE path = $1")
+        .bind(path)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// The most recent `last_verified_at` across a project's indexed files — the
+/// corpus-level freshness signal surfaced by `orient`. `None` if the project has
+/// no verified files yet (e.g. immediately after the v41 column was added and
+/// before the first scan/reconcile pass).
+pub async fn project_max_last_verified(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
+    sqlx::query_scalar::<_, Option<DateTime<Utc>>>(
+        "SELECT MAX(last_verified_at) FROM indexed_files WHERE project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+}
+
 // ============================================================================
 // File queries
 // ============================================================================
@@ -58,8 +107,8 @@ pub async fn upsert_file(
     modified_at: DateTime<Utc>,
 ) -> Result<i64, sqlx::Error> {
     let row = sqlx::query_scalar::<_, i64>(
-        "INSERT INTO indexed_files (project_id, path, relative_path, language, size_bytes, content, content_hash, line_count, truncated, content_recoverable_from_disk, modified_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        "INSERT INTO indexed_files (project_id, path, relative_path, language, size_bytes, content, content_hash, line_count, truncated, content_recoverable_from_disk, modified_at, last_verified_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
          ON CONFLICT (path) DO UPDATE SET
             project_id = EXCLUDED.project_id,
             relative_path = EXCLUDED.relative_path,
@@ -71,7 +120,8 @@ pub async fn upsert_file(
             truncated = EXCLUDED.truncated,
             content_recoverable_from_disk = EXCLUDED.content_recoverable_from_disk,
             modified_at = EXCLUDED.modified_at,
-            indexed_at = NOW()
+            indexed_at = NOW(),
+            last_verified_at = NOW()
          RETURNING id"
     )
     .bind(project_id)
@@ -233,7 +283,8 @@ pub async fn read_file_by_relative_path(
 pub async fn file_info(pool: &PgPool, path: &str) -> Result<Option<FileInfo>, sqlx::Error> {
     let row = sqlx::query_as::<_, FileInfo>(
         "SELECT f.path, f.relative_path, f.language, f.size_bytes, f.line_count,
-                f.truncated, f.indexed_at, f.modified_at, p.name AS project_name
+                f.truncated, f.indexed_at, f.modified_at, f.last_verified_at,
+                p.name AS project_name
          FROM indexed_files f
          LEFT JOIN projects p ON p.id = f.project_id
          WHERE f.path = $1",
@@ -256,6 +307,13 @@ pub struct FileInfo {
     pub truncated: bool,
     pub indexed_at: Option<DateTime<Utc>>,
     pub modified_at: DateTime<Utc>,
+    /// Wall-clock time the indexer last *confirmed this row matches disk* —
+    /// advances on every Level-1 metadata skip, Level-2 content-hash skip, and
+    /// full re-index. Unlike `indexed_at` (which freezes at the last content
+    /// change) this does not report false staleness when a `git checkout`/
+    /// `rebase` bumps a file's mtime without changing its content. `None` only
+    /// until the first scan/reconcile pass after the v41 column was added.
+    pub last_verified_at: Option<DateTime<Utc>>,
 }
 
 /// Get file tree for a project.
@@ -437,7 +495,8 @@ pub async fn update_file_path_in_place(
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE indexed_files
-         SET path = $2, relative_path = $3, modified_at = $4, indexed_at = NOW()
+         SET path = $2, relative_path = $3, modified_at = $4, indexed_at = NOW(),
+             last_verified_at = NOW()
          WHERE id = $1",
     )
     .bind(file_id)
@@ -446,6 +505,11 @@ pub async fn update_file_path_in_place(
     .bind(modified_at)
     .execute(pool)
     .await?;
+    // Recovered-on-rename: drop any stale failure-ledger row for the new path.
+    sqlx::query("DELETE FROM index_failures WHERE path = $1")
+        .bind(new_path)
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -468,9 +532,9 @@ pub async fn insert_duplicate_file(
         "INSERT INTO indexed_files (
             project_id, path, relative_path, language, size_bytes,
             content, content_hash, line_count, truncated, modified_at,
-            duplicate_of_file_id
+            last_verified_at, duplicate_of_file_id
          )
-         VALUES ($1, $2, $3, $4, $5, NULL, $6, 0, false, $7, $8)
+         VALUES ($1, $2, $3, $4, $5, NULL, $6, 0, false, $7, NOW(), $8)
          ON CONFLICT (path) DO UPDATE SET
             project_id = EXCLUDED.project_id,
             relative_path = EXCLUDED.relative_path,
@@ -479,7 +543,8 @@ pub async fn insert_duplicate_file(
             content_hash = EXCLUDED.content_hash,
             modified_at = EXCLUDED.modified_at,
             duplicate_of_file_id = EXCLUDED.duplicate_of_file_id,
-            indexed_at = NOW()
+            indexed_at = NOW(),
+            last_verified_at = NOW()
          RETURNING id",
     )
     .bind(project_id)
@@ -492,6 +557,11 @@ pub async fn insert_duplicate_file(
     .bind(canonical_file_id)
     .fetch_one(pool)
     .await?;
+    // Recovered-as-duplicate: drop any stale failure-ledger row for this path.
+    sqlx::query("DELETE FROM index_failures WHERE path = $1")
+        .bind(path)
+        .execute(pool)
+        .await?;
     Ok(id.0)
 }
 

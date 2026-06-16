@@ -61,10 +61,24 @@ pub async fn tool_index_stats(ctx: &SystemContext) -> Result<CallToolResult, Mcp
     })
     .await;
 
+    // Content-intrinsic indexing-failure breakdown (v42 ledger): turns the
+    // opaque `files_failed` counter into an actionable per-kind list. These are
+    // files the scanner now bounds (stops re-reading once past the retry cap and
+    // unchanged) — non-UTF-8 fixtures, corrupt/oversized documents.
+    let index_failures: Vec<serde_json::Value> = ctx
+        .db()
+        .failure_kind_counts()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(kind, count)| serde_json::json!({ "failure_kind": kind, "count": count }))
+        .collect();
+
     let envelope = serde_json::json!({
         "snapshot": snapshot,
         "index": index_counts,
         "effect_breakdown": effect_breakdown,
+        "index_failures": index_failures,
     });
 
     let json = serde_json::to_string_pretty(&envelope)
