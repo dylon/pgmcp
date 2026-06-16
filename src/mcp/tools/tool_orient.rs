@@ -314,7 +314,9 @@ pub async fn tool_orient(
 /// count is best-effort: a query error yields 0 so `orient` never fails on it.
 async fn social_envelope(pool: &sqlx::PgPool) -> serde_json::Value {
     async fn count(pool: &sqlx::PgPool, sql: &str) -> i64 {
-        let n: Result<i64, _> = sqlx::query_scalar(sql).fetch_one(pool).await;
+        let n: Result<i64, _> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(pool)
+            .await;
         n.unwrap_or(0)
     }
 

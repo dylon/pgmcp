@@ -71,7 +71,9 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         )",
         domains = ToolDomain::sql_in_list(),
     );
-    sqlx::query(&create_tool_cards).execute(pool).await?;
+    sqlx::query(sqlx::AssertSqlSafe(create_tool_cards.as_str()))
+        .execute(pool)
+        .await?;
 
     for stmt in [
         "CREATE INDEX IF NOT EXISTS idx_tool_categories_slug ON tool_categories(slug)",

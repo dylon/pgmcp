@@ -185,9 +185,9 @@ pub async fn create_table(
 }
 
 pub async fn get_table(pool: &PgPool, id: i64) -> Result<Option<DataTableRow>, sqlx::Error> {
-    sqlx::query_as::<_, DataTableRow>(&format!(
+    sqlx::query_as::<_, DataTableRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {TABLE_COLS} FROM data_tables WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await
@@ -200,10 +200,10 @@ pub async fn get_table_by_name(
     project_id: Option<i32>,
     name: &str,
 ) -> Result<Option<DataTableRow>, sqlx::Error> {
-    sqlx::query_as::<_, DataTableRow>(&format!(
+    sqlx::query_as::<_, DataTableRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {TABLE_COLS} FROM data_tables
          WHERE name = $1 AND project_id IS NOT DISTINCT FROM $2"
-    ))
+    )))
     .bind(name)
     .bind(project_id)
     .fetch_optional(pool)
@@ -297,9 +297,9 @@ pub async fn delete_table(pool: &PgPool, id: i64) -> Result<u64, sqlx::Error> {
 // ── Column-definition CRUD ───────────────────────────────────────────────────
 
 pub async fn list_columns(pool: &PgPool, table_id: i64) -> Result<Vec<DataColumnRow>, sqlx::Error> {
-    sqlx::query_as::<_, DataColumnRow>(&format!(
+    sqlx::query_as::<_, DataColumnRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {COLUMN_COLS} FROM data_table_columns WHERE table_id = $1 ORDER BY position, id"
-    ))
+    )))
     .bind(table_id)
     .fetch_all(pool)
     .await
@@ -595,13 +595,13 @@ pub async fn search_tables(
             DateTime<Utc>,
             f64,
         ),
-    >(&format!(
+    >(sqlx::AssertSqlSafe(format!(
         "SELECT {TABLE_COLS}, 1.0 - (embedding <=> $1) AS similarity
          FROM data_tables
          WHERE embedding IS NOT NULL AND ($2::int IS NULL OR project_id = $2)
          ORDER BY embedding <=> $1
          LIMIT $3"
-    ))
+    )))
     .bind(v)
     .bind(project_id)
     .bind(limit)

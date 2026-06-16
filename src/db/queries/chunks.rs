@@ -571,7 +571,7 @@ pub async fn bulk_extract_embeddings(
           )
     )";
     if let Some(lang) = language {
-        let rows = sqlx::query_as::<_, BulkChunkRow>(&format!(
+        let rows = sqlx::query_as::<_, BulkChunkRow>(sqlx::AssertSqlSafe(format!(
             "SELECT c.id as chunk_id, c.file_id, f.project_id, p.name as project_name,
                     f.path, f.language, c.content, c.{col}::real[] as embedding
              FROM file_chunks c
@@ -581,13 +581,13 @@ pub async fn bulk_extract_embeddings(
                AND c.{col} IS NOT NULL
                AND {canonical_filter}
              ORDER BY c.id",
-        ))
+        )))
         .bind(lang)
         .fetch_all(pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     } else {
-        let rows = sqlx::query_as::<_, BulkChunkRow>(&format!(
+        let rows = sqlx::query_as::<_, BulkChunkRow>(sqlx::AssertSqlSafe(format!(
             "SELECT c.id as chunk_id, c.file_id, f.project_id, p.name as project_name,
                     f.path, f.language, c.content, c.{col}::real[] as embedding
              FROM file_chunks c
@@ -596,7 +596,7 @@ pub async fn bulk_extract_embeddings(
              WHERE c.{col} IS NOT NULL
                AND {canonical_filter}
              ORDER BY c.id",
-        ))
+        )))
         .fetch_all(pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
@@ -613,7 +613,7 @@ pub async fn bulk_extract_project_embeddings(
     let active = crate::embed::signature::read_active_signature(pool).await?;
     let col = active.read_column();
     if let Some(lang) = language {
-        let rows = sqlx::query_as::<_, BulkChunkRow>(&format!(
+        let rows = sqlx::query_as::<_, BulkChunkRow>(sqlx::AssertSqlSafe(format!(
             "SELECT c.id as chunk_id, c.file_id, f.project_id, p.name as project_name,
                     f.path, f.language, c.content, c.{col}::real[] as embedding
              FROM file_chunks c
@@ -622,14 +622,14 @@ pub async fn bulk_extract_project_embeddings(
              WHERE p.name = $1 AND f.language = $2
                AND c.{col} IS NOT NULL
              ORDER BY c.id"
-        ))
+        )))
         .bind(project_name)
         .bind(lang)
         .fetch_all(pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     } else {
-        let rows = sqlx::query_as::<_, BulkChunkRow>(&format!(
+        let rows = sqlx::query_as::<_, BulkChunkRow>(sqlx::AssertSqlSafe(format!(
             "SELECT c.id as chunk_id, c.file_id, f.project_id, p.name as project_name,
                     f.path, f.language, c.content, c.{col}::real[] as embedding
              FROM file_chunks c
@@ -638,7 +638,7 @@ pub async fn bulk_extract_project_embeddings(
              WHERE p.name = $1
                AND c.{col} IS NOT NULL
              ORDER BY c.id"
-        ))
+        )))
         .bind(project_name)
         .fetch_all(pool)
         .await?;
@@ -688,7 +688,7 @@ pub async fn best_chunk_per_file(
     }
     let col = embedding_column_for_dim(embedding.len())?;
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
-    sqlx::query_as::<_, PprFileChunk>(&format!(
+    sqlx::query_as::<_, PprFileChunk>(sqlx::AssertSqlSafe(format!(
         "SELECT DISTINCT ON (c.file_id)
                 c.file_id, f.relative_path, f.language, c.content,
                 c.start_line, c.end_line, (1.0 - (c.{col} <=> $1))::float8 AS similarity
@@ -696,7 +696,7 @@ pub async fn best_chunk_per_file(
          JOIN indexed_files f ON f.id = c.file_id
          WHERE c.file_id = ANY($2) AND c.{col} IS NOT NULL
          ORDER BY c.file_id, c.{col} <=> $1"
-    ))
+    )))
     .bind(embedding_vec)
     .bind(file_ids)
     .fetch_all(pool)
@@ -725,10 +725,10 @@ pub async fn chunk_rerank_features(
         return Ok(Vec::new());
     }
     let col = embedding_column_for_dim(query_dim)?;
-    sqlx::query_as::<_, ChunkRerankFeature>(&format!(
+    sqlx::query_as::<_, ChunkRerankFeature>(sqlx::AssertSqlSafe(format!(
         "SELECT id AS chunk_id, {col} AS embedding, blame_date
          FROM file_chunks WHERE id = ANY($1)"
-    ))
+    )))
     .bind(chunk_ids)
     .fetch_all(pool)
     .await

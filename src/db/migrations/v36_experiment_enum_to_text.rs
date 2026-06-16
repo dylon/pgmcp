@@ -94,26 +94,26 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         if data_type.as_deref() == Some("USER-DEFINED") {
             // 1. Drop the typed default (e.g. 'other'::experiment_kind), which
             //    blocks the type change.
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "ALTER TABLE {} ALTER COLUMN {} DROP DEFAULT",
                 c.table, c.column
-            ))
+            )))
             .execute(&mut *tx)
             .await?;
             // 2. Convert enum → text, preserving each row's label string.
-            sqlx::query(&format!(
+            sqlx::query(sqlx::AssertSqlSafe(format!(
                 "ALTER TABLE {t} ALTER COLUMN {col} TYPE text USING {col}::text",
                 t = c.table,
                 col = c.column
-            ))
+            )))
             .execute(&mut *tx)
             .await?;
             // 3. Re-add the TEXT default for the columns that had one.
             if let Some(def) = c.default {
-                sqlx::query(&format!(
+                sqlx::query(sqlx::AssertSqlSafe(format!(
                     "ALTER TABLE {} ALTER COLUMN {} SET DEFAULT '{}'",
                     c.table, c.column, def
-                ))
+                )))
                 .execute(&mut *tx)
                 .await?;
             }
@@ -151,14 +151,14 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
     ];
     for (table, column, in_list) in checks {
         let cname = format!("{table}_{column}_check");
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {cname}"
-        ))
+        )))
         .execute(&mut *tx)
         .await?;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {table} ADD CONSTRAINT {cname} CHECK ({column} IN ({in_list}))"
-        ))
+        )))
         .execute(&mut *tx)
         .await?;
     }
@@ -174,7 +174,7 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         "experiment_arm_kind",
         "effect_direction",
     ] {
-        sqlx::query(&format!("DROP TYPE IF EXISTS {ty}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TYPE IF EXISTS {ty}")))
             .execute(&mut *tx)
             .await?;
     }

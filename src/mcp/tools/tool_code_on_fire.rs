@@ -154,15 +154,18 @@ pub async fn tool_code_on_fire(
         LIMIT $2"
     );
 
-    let rows: Vec<CodeOnFireRow> = sqlx::query_as::<_, CodeOnFireRow>(&sql)
-        .bind(project_id)
-        .bind(limit)
-        .bind(churn_q)
-        .bind(complexity_q)
-        .bind(mi_q)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| McpError::internal_error(format!("code_on_fire query failed: {}", e), None))?;
+    let rows: Vec<CodeOnFireRow> =
+        sqlx::query_as::<_, CodeOnFireRow>(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(project_id)
+            .bind(limit)
+            .bind(churn_q)
+            .bind(complexity_q)
+            .bind(mi_q)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| {
+                McpError::internal_error(format!("code_on_fire query failed: {}", e), None)
+            })?;
 
     if rows.is_empty() {
         return json_result(&json!({

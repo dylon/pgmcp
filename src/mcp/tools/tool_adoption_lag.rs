@@ -78,7 +78,7 @@ pub async fn tool_adoption_lag(
          WHERE file_id = $1 AND {col} IS NOT NULL
          ORDER BY chunk_index ASC"
     );
-    let chunks: Vec<ChunkRow> = sqlx::query_as::<_, ChunkRow>(&sql)
+    let chunks: Vec<ChunkRow> = sqlx::query_as::<_, ChunkRow>(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(new_file.file_id)
         .fetch_all(pool)
         .await

@@ -1205,7 +1205,7 @@ async fn migrate_embedding_table_batch(
          WHERE embedding IS NULL
          ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED"
     );
-    let rows: Vec<(i64, String)> = sqlx::query_as(&select_sql)
+    let rows: Vec<(i64, String)> = sqlx::query_as(sqlx::AssertSqlSafe(select_sql.as_str()))
         .bind(batch_size as i64)
         .fetch_all(pool)
         .await?;
@@ -1223,7 +1223,7 @@ async fn migrate_embedding_table_batch(
     let mut count = 0_u64;
     for ((id, _), vec) in rows.into_iter().zip(vectors) {
         let v = Vector::from(vec);
-        sqlx::query(&update_sql)
+        sqlx::query(sqlx::AssertSqlSafe(update_sql.as_str()))
             .bind(&v)
             .bind(BGE_M3_SIGNATURE)
             .bind(id)

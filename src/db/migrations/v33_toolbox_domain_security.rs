@@ -28,7 +28,9 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         "ALTER TABLE tool_cards ADD CONSTRAINT tool_cards_domain_check CHECK (domain IN ({domains}))",
         domains = ToolDomain::sql_in_list(),
     );
-    sqlx::query(&add).execute(pool).await?;
+    sqlx::query(sqlx::AssertSqlSafe(add.as_str()))
+        .execute(pool)
+        .await?;
     Ok(())
 }
 

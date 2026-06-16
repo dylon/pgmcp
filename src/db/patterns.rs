@@ -441,11 +441,14 @@ pub async fn semantic_search_patterns(
     let col = "embedding_v2";
 
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
 
-    let rows = sqlx::query_as::<_, PatternSearchRow>(&format!(
+    let rows = sqlx::query_as::<_, PatternSearchRow>(sqlx::AssertSqlSafe(format!(
         "SELECT p.id AS pattern_id,
                 p.slug, p.name, p.kind, p.category, p.summary, p.intent, p.canonical_url,
                 s.id AS source_id, s.source_family, s.title AS source_title,
@@ -470,7 +473,7 @@ pub async fn semantic_search_patterns(
            AND c.{col} IS NOT NULL
          ORDER BY c.{col} <=> $1
          LIMIT $2"
-    ))
+    )))
     .bind(&embedding_vec)
     .bind(limit)
     .bind(options.kind)
@@ -614,9 +617,9 @@ pub async fn catalog_stats(pool: &PgPool) -> Result<PatternCatalogStats, sqlx::E
     let missing_col = crate::embed::signature::read_active_signature(pool)
         .await?
         .read_column();
-    let chunks_missing_embeddings = sqlx::query_scalar(&format!(
+    let chunks_missing_embeddings = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*) FROM software_pattern_chunks WHERE {missing_col} IS NULL"
-    ))
+    )))
     .fetch_one(pool)
     .await?;
     let source_families = sqlx::query_as::<_, SourceFamilyStats>(

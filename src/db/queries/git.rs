@@ -153,12 +153,15 @@ pub async fn semantic_search_commits(
     let col = "embedding_v2";
 
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
 
     let results = if let Some(proj) = project {
-        sqlx::query_as::<_, CommitSearchResult>(&format!(
+        sqlx::query_as::<_, CommitSearchResult>(sqlx::AssertSqlSafe(format!(
             "SELECT g.commit_hash, g.author, g.author_date, g.subject,
                     cc.content as chunk_content,
                     1 - (cc.{col} <=> $1) as score,
@@ -169,14 +172,14 @@ pub async fn semantic_search_commits(
              WHERE p.name = $3 AND cc.{col} IS NOT NULL
              ORDER BY cc.{col} <=> $1
              LIMIT $2"
-        ))
+        )))
         .bind(&embedding_vec)
         .bind(limit)
         .bind(proj)
         .fetch_all(&mut *tx)
         .await?
     } else {
-        sqlx::query_as::<_, CommitSearchResult>(&format!(
+        sqlx::query_as::<_, CommitSearchResult>(sqlx::AssertSqlSafe(format!(
             "SELECT g.commit_hash, g.author, g.author_date, g.subject,
                     cc.content as chunk_content,
                     1 - (cc.{col} <=> $1) as score,
@@ -187,7 +190,7 @@ pub async fn semantic_search_commits(
              WHERE cc.{col} IS NOT NULL
              ORDER BY cc.{col} <=> $1
              LIMIT $2"
-        ))
+        )))
         .bind(&embedding_vec)
         .bind(limit)
         .fetch_all(&mut *tx)

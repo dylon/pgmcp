@@ -70,14 +70,14 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         ),
         ("chk_sync_ops_paradigm", "paradigm", paradigm_sql_in_list()),
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE sync_ops DROP CONSTRAINT IF EXISTS {name}"
-        ))
+        )))
         .execute(&mut *tx)
         .await?;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE sync_ops ADD CONSTRAINT {name} CHECK ({col} IN ({list}))"
-        ))
+        )))
         .execute(&mut *tx)
         .await?;
     }

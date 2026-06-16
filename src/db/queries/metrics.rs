@@ -492,7 +492,7 @@ pub async fn find_unresolved_dependencies(
         "SELECT cge.target_raw,
                 COUNT(DISTINCT cge.source_file_id) AS importer_count,
                 COALESCE(SUM(COALESCE(fm.pagerank, 0.0)), 0.0) AS usage_centrality,
-                EXTRACT(EPOCH FROM (NOW() - MAX(f.indexed_at)))/86400.0 AS latest_change_days,
+                (EXTRACT(EPOCH FROM (NOW() - MAX(f.indexed_at)))/86400.0)::float8 AS latest_change_days,
                 (array_agg(DISTINCT f.relative_path))[1:5] AS sample_importers
          FROM code_graph_edges cge
          JOIN indexed_files f ON f.id = cge.source_file_id
@@ -583,7 +583,7 @@ pub async fn get_growth_buckets(
         // We can't bind interval keywords directly; concat-and-cast is the
         // typical workaround. interval_unit is hard-coded to one of three
         // strings by the caller, so injection isn't a concern.
-        &format!(
+        sqlx::AssertSqlSafe(format!(
             "WITH per_commit AS (
                 SELECT gc.author_date,
                        gc.author,
@@ -606,7 +606,7 @@ pub async fn get_growth_buckets(
              GROUP BY bucket
              ORDER BY bucket ASC",
             unit = interval_unit
-        ),
+        )),
     )
     .bind(project_name)
     .bind(file_path)

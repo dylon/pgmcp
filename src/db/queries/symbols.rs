@@ -697,7 +697,10 @@ async fn run_resolution_phase(
     sqlx::query("SET LOCAL application_name = 'pgmcp:heavy:symbol-extraction'")
         .execute(&mut *tx)
         .await?;
-    let res = sqlx::query(sql).bind(project_id).execute(&mut *tx).await?;
+    let res = sqlx::query(sqlx::AssertSqlSafe(sql))
+        .bind(project_id)
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(res.rows_affected())
 }

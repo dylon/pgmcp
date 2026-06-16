@@ -44,10 +44,11 @@ pub async fn scan_files_for_pattern(
     let mut hits: Vec<ScanHit> = Vec::new();
     if let Some(langs) = language_filter {
         let v: Vec<String> = langs.iter().map(|s| s.to_string()).collect();
-        let mut rows = sqlx::query_as::<_, (String, String, Option<String>)>(&q)
-            .bind(project_id)
-            .bind(v)
-            .fetch(pool);
+        let mut rows =
+            sqlx::query_as::<_, (String, String, Option<String>)>(sqlx::AssertSqlSafe(q.as_str()))
+                .bind(project_id)
+                .bind(v)
+                .fetch(pool);
         while let Some((path, lang, content)) = rows.try_next().await? {
             push_pattern_hits(&mut hits, path, lang, content, pattern, limit);
             if hits.len() >= limit {
@@ -55,9 +56,10 @@ pub async fn scan_files_for_pattern(
             }
         }
     } else {
-        let mut rows = sqlx::query_as::<_, (String, String, Option<String>)>(&q)
-            .bind(project_id)
-            .fetch(pool);
+        let mut rows =
+            sqlx::query_as::<_, (String, String, Option<String>)>(sqlx::AssertSqlSafe(q.as_str()))
+                .bind(project_id)
+                .fetch(pool);
         while let Some((path, lang, content)) = rows.try_next().await? {
             push_pattern_hits(&mut hits, path, lang, content, pattern, limit);
             if hits.len() >= limit {

@@ -140,7 +140,7 @@ pub async fn record_receipt(
             acked_at     = COALESCE(agent_message_receipts.acked_at, EXCLUDED.acked_at),
             channel      = COALESCE(agent_message_receipts.channel, EXCLUDED.channel)"
     );
-    sqlx::query(&sql)
+    sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(message_id)
         .bind(recipient_session)
         .bind(recipient_agent)

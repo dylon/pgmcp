@@ -140,7 +140,7 @@ fn build_query() -> String {
 pub async fn collect(pool: &PgPool, window_minutes: i64) -> Result<AdoptionReport, sqlx::Error> {
     let allowlist: Vec<String> = REAL_CLIENTS.iter().map(|s| s.to_string()).collect();
     let sql = build_query();
-    let rows = sqlx::query(&sql)
+    let rows = sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(window_minutes as i32)
         .bind(&allowlist)
         .fetch_all(pool)

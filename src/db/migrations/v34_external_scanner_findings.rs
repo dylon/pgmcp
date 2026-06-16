@@ -73,7 +73,9 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         )",
         severities = severity::sql_in_list(),
     );
-    sqlx::query(&create_findings).execute(pool).await?;
+    sqlx::query(sqlx::AssertSqlSafe(create_findings.as_str()))
+        .execute(pool)
+        .await?;
 
     // 3. SBOM artifacts (syft). One current SBOM per (project, scanner, format).
     sqlx::query(

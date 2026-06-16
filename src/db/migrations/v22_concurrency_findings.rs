@@ -63,14 +63,14 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
             severity_sql_in_list(),
         ),
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE concurrency_findings DROP CONSTRAINT IF EXISTS {name}"
-        ))
+        )))
         .execute(&mut *tx)
         .await?;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE concurrency_findings ADD CONSTRAINT {name} CHECK ({col} IN ({list}))"
-        ))
+        )))
         .execute(&mut *tx)
         .await?;
     }
@@ -134,12 +134,12 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
     )
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE work_item_finding_provenance
          ADD CONSTRAINT work_item_finding_provenance_source_check
          CHECK (finding_source IN ({}))",
         crate::tracker::git_link::finding_source_sql_in_list()
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
 

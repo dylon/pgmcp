@@ -36,7 +36,9 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         kind = dep_kind_sql_in_list(),
         source = dep_source_sql_in_list(),
     );
-    sqlx::query(&create).execute(pool).await?;
+    sqlx::query(sqlx::AssertSqlSafe(create.as_str()))
+        .execute(pool)
+        .await?;
 
     // One live edge per (dependent, dependency, source) — partial unique on the
     // open interval, so historical (closed) rows don't collide.
@@ -62,9 +64,9 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         "stable_branch TEXT",
         "git_scanned_at TIMESTAMPTZ",
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE projects ADD COLUMN IF NOT EXISTS {col}"
-        ))
+        )))
         .execute(pool)
         .await?;
     }

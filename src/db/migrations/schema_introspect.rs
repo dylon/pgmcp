@@ -105,22 +105,22 @@ pub(super) async fn ensure_named_constraint(
         return Ok(());
     }
 
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {name}"
-    ))
+    )))
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {table} ADD CONSTRAINT {name} {definition}"
-    ))
+    )))
     .execute(pool)
     .await?;
     // `COMMENT` is a utility statement and does not accept bind parameters, so
     // the (constant) definition is single-quote-escaped and inlined.
     let escaped = definition.replace('\'', "''");
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "COMMENT ON CONSTRAINT {name} ON {table} IS '{escaped}'"
-    ))
+    )))
     .execute(pool)
     .await?;
     Ok(())

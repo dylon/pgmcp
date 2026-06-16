@@ -46,7 +46,9 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         )",
         status = status_sql_in_list(),
     );
-    sqlx::query(&coord).execute(pool).await?;
+    sqlx::query(sqlx::AssertSqlSafe(coord.as_str()))
+        .execute(pool)
+        .await?;
 
     let events = format!(
         "CREATE TABLE IF NOT EXISTS project_events (
@@ -58,7 +60,9 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         )",
         kind = event_kind_sql_in_list(),
     );
-    sqlx::query(&events).execute(pool).await?;
+    sqlx::query(sqlx::AssertSqlSafe(events.as_str()))
+        .execute(pool)
+        .await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_coord_dependency_open

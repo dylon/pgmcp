@@ -63,14 +63,14 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         ("chk_ontology_meta_facet", "facet", facet_sql_in_list()),
         ("chk_ontology_meta_status", "status", status_sql_in_list()),
     ] {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE ontology_concept_meta DROP CONSTRAINT IF EXISTS {name}"
-        ))
+        )))
         .execute(&mut *tx)
         .await?;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE ontology_concept_meta ADD CONSTRAINT {name} CHECK ({col} IN ({list}))"
-        ))
+        )))
         .execute(&mut *tx)
         .await?;
     }
@@ -96,11 +96,11 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
     )
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE ontology_concept_evidence
          ADD CONSTRAINT chk_ontology_evidence_kind CHECK (evidence_kind IN ({}))",
         evidence_sql_in_list()
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
 

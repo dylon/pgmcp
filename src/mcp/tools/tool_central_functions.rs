@@ -71,7 +71,7 @@ pub async fn tool_central_functions(
         i32,
         i32,
         i32,
-    )> = sqlx::query_as(&sql)
+    )> = sqlx::query_as(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(project_id)
         .bind(limit as i64)
         .fetch_all(pool)

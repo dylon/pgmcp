@@ -1914,7 +1914,7 @@ async fn run_mmap_global_topic_scan(
         // don't re-index the same chunks across worktrees / sibling
         // clones. See `bulk_extract_embeddings` in src/db/queries.rs
         // for rationale; the SQL is the same shape.
-        let rows = sqlx::query_as::<_, EmbRow>(&format!(
+        let rows = sqlx::query_as::<_, EmbRow>(sqlx::AssertSqlSafe(format!(
             "SELECT c.id AS id, c.file_id AS file_id, p.name AS project_name,
                     f.path AS path, f.language AS language,
                     c.{col}::real[] AS embedding
@@ -1937,7 +1937,7 @@ async fn run_mmap_global_topic_scan(
                )
              ORDER BY c.id
              LIMIT $1 OFFSET $2",
-        ))
+        )))
         .bind(batch_size as i64)
         .bind(offset as i64)
         .fetch_all(&pool_for_meta)
@@ -2546,7 +2546,7 @@ async fn run_online_global_topic_scan(
                 }
                 // Worktree-aware: filter to canonical project per
                 // repo. See bulk_extract_embeddings rationale.
-                let rows = sqlx::query_as::<_, Row>(&format!(
+                let rows = sqlx::query_as::<_, Row>(sqlx::AssertSqlSafe(format!(
                     "SELECT c.id AS id, c.{col}::real[] AS embedding
                      FROM file_chunks c
                      JOIN indexed_files f ON c.file_id = f.id
@@ -2567,7 +2567,7 @@ async fn run_online_global_topic_scan(
                        )
                      ORDER BY c.id
                      LIMIT $1 OFFSET $2",
-                ))
+                )))
                 .bind(bs as i64)
                 .bind(off as i64)
                 .fetch_all(&pool_clone)
@@ -2743,7 +2743,7 @@ async fn count_chunks(db: &dyn DbClient) -> Option<usize> {
             return None;
         }
     };
-    match sqlx::query_scalar::<_, i64>(&format!(
+    match sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*)
          FROM file_chunks c
          JOIN indexed_files f ON c.file_id = f.id
@@ -2762,7 +2762,7 @@ async fn count_chunks(db: &dyn DbClient) -> Option<usize> {
                       AND p_dup.git_root_commits = p.git_root_commits)
                  )
            )",
-    ))
+    )))
     .fetch_one(pool)
     .await
     {

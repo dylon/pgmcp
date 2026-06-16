@@ -22,7 +22,7 @@ async fn missing_from_catalog(pool: &PgPool, table: &str, seed: &[String]) -> Ve
         "SELECT v.name FROM UNNEST($1::text[]) AS v(name)
          WHERE NOT EXISTS (SELECT 1 FROM {table} c WHERE c.name = v.name)"
     );
-    sqlx::query_scalar(&sql)
+    sqlx::query_scalar(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(seed.to_vec())
         .fetch_all(pool)
         .await

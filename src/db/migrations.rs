@@ -95,27 +95,29 @@ async fn build_hnsw_index(
     create_index_sql: &str,
 ) -> Result<(), sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SET LOCAL maintenance_work_mem = '{}'",
         config.hnsw_maintenance_work_mem.replace('\'', "''")
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SET LOCAL statement_timeout = {}",
         config
             .hnsw_build_statement_timeout_secs
             .saturating_mul(1000)
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SET LOCAL max_parallel_maintenance_workers = {}",
         config.hnsw_max_parallel_workers
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
-    sqlx::query(create_index_sql).execute(&mut *tx).await?;
+    sqlx::query(sqlx::AssertSqlSafe(create_index_sql))
+        .execute(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -237,9 +239,11 @@ async fn ensure_v31_embedding_hnsw_index(
             .fetch_optional(pool)
             .await?;
     if stored.as_deref() != Some(&current_params) {
-        sqlx::query(&format!("DROP INDEX IF EXISTS {index_name}"))
-            .execute(pool)
-            .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP INDEX IF EXISTS {index_name}"
+        )))
+        .execute(pool)
+        .await?;
         build_hnsw_index(
             pool,
             config,
@@ -602,9 +606,11 @@ async fn ensure_experiment_hnsw_index(
                 .fetch_optional(pool)
                 .await?;
         if stored.as_deref() != Some(&current_params) {
-            sqlx::query(&format!("DROP INDEX IF EXISTS {index_name}"))
-                .execute(pool)
-                .await?;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "DROP INDEX IF EXISTS {index_name}"
+            )))
+            .execute(pool)
+            .await?;
             let create_sql = format!(
                 "CREATE INDEX {index_name} ON {table} \
                  USING hnsw (embedding vector_cosine_ops) WITH (m = {}, ef_construction = {})",
@@ -934,7 +940,9 @@ pub async fn run_migrations(
     ];
 
     for idx_sql in &indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     // HNSW index for vector similarity.
@@ -991,7 +999,9 @@ pub async fn run_migrations(
     ];
 
     for idx_sql in &git_indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     // HNSW index for git commit chunk embeddings
@@ -1033,7 +1043,9 @@ pub async fn run_migrations(
     ];
 
     for idx_sql in &similarity_indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     // ================================================================
@@ -1101,7 +1113,9 @@ pub async fn run_migrations(
     ];
 
     for idx_sql in &topic_indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     // ================================================================
@@ -1126,7 +1140,9 @@ pub async fn run_migrations(
     ];
 
     for idx_sql in &gcf_indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     // ================================================================
@@ -1166,7 +1182,9 @@ pub async fn run_migrations(
     ];
 
     for idx_sql in &graph_edge_indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     // ================================================================
@@ -1267,7 +1285,9 @@ pub async fn run_migrations(
         ["CREATE INDEX IF NOT EXISTS idx_fm_project ON file_metrics(project_id)"];
 
     for idx_sql in &file_metrics_indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     // Tier 0e — Tree-sitter symbol tables.
@@ -1311,7 +1331,9 @@ pub async fn run_migrations(
         "CREATE INDEX IF NOT EXISTS idx_file_symbols_name_trgm ON file_symbols USING gin (name gin_trgm_ops)",
     ];
     for idx_sql in &file_symbols_indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     sqlx::query(
@@ -1345,7 +1367,9 @@ pub async fn run_migrations(
         "CREATE INDEX IF NOT EXISTS idx_symbol_refs_source_symbol ON symbol_references(source_symbol_id) WHERE source_symbol_id IS NOT NULL",
     ];
     for idx_sql in &symbol_refs_indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     // ================================================================
@@ -1400,7 +1424,9 @@ pub async fn run_migrations(
         "CREATE INDEX IF NOT EXISTS idx_function_metrics_mi_asc ON function_metrics(project_id, maintainability_index ASC)",
     ];
     for idx_sql in &function_metrics_indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     // Graph-roadmap Phase 1.1 — function-level centralities. Materialized by
@@ -1419,7 +1445,9 @@ pub async fn run_migrations(
         "ALTER TABLE function_metrics ADD COLUMN IF NOT EXISTS harmonic DOUBLE PRECISION NOT NULL DEFAULT 0.0",
     ];
     for col_sql in &function_metrics_centrality_columns {
-        sqlx::query(col_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*col_sql))
+            .execute(pool)
+            .await?;
     }
     let function_metrics_centrality_indexes = [
         "CREATE INDEX IF NOT EXISTS idx_function_metrics_pagerank_desc ON function_metrics(project_id, pagerank DESC)",
@@ -1427,7 +1455,9 @@ pub async fn run_migrations(
         "CREATE INDEX IF NOT EXISTS idx_function_metrics_coreness_desc ON function_metrics(project_id, coreness DESC)",
     ];
     for idx_sql in &function_metrics_centrality_indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     // ================================================================
@@ -1458,7 +1488,9 @@ pub async fn run_migrations(
         "CREATE INDEX IF NOT EXISTS idx_cge_target_symbol ON code_graph_edges(target_symbol_id) WHERE target_symbol_id IS NOT NULL",
     ];
     for idx_sql in &cge_symbol_indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     // Idempotent CHECK install. `ensure_named_constraint` skips the
@@ -1875,7 +1907,9 @@ pub async fn run_migrations(
     ];
 
     for idx_sql in &pattern_indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     // The original oneTBB registry entry pointed at an Intel-hosted page that
@@ -2008,7 +2042,9 @@ pub async fn run_migrations(
         "CREATE INDEX IF NOT EXISTS idx_durable_mandates_scope_project ON durable_mandates(scope, project_id)",
     ];
     for idx_sql in &session_indexes {
-        sqlx::query(idx_sql).execute(pool).await?;
+        sqlx::query(sqlx::AssertSqlSafe(*idx_sql))
+            .execute(pool)
+            .await?;
     }
 
     // Idempotent CHECK-constraint installs (see `ensure_named_constraint`): these
@@ -2716,7 +2752,7 @@ async fn seed_catalog(
             language_origin = EXCLUDED.language_origin"
     );
     for entry in seed {
-        sqlx::query(&sql)
+        sqlx::query(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(entry.name)
             .bind(entry.description)
             .bind(entry.origin.as_db_str())
@@ -3605,12 +3641,12 @@ async fn ensure_memory_phase2_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
     .fetch_one(pool)
     .await?;
     if !constraint_exists {
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE memory_scope
                 ADD CONSTRAINT memory_scope_tuple_uq
                 {} (user_id, agent_id, session_id, project_id)",
             unique_clause
-        ))
+        )))
         .execute(pool)
         .await?;
     }
@@ -4076,12 +4112,14 @@ async fn ensure_memory_v2_columns(pool: &PgPool) -> Result<(), sqlx::Error> {
             "idx_software_pattern_chunks_embedding",
         ),
     ] {
-        sqlx::query(&format!("DROP INDEX IF EXISTS {legacy_index}"))
-            .execute(pool)
-            .await?;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "DROP INDEX IF EXISTS {legacy_index}"
+        )))
+        .execute(pool)
+        .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "ALTER TABLE {table} DROP COLUMN IF EXISTS embedding"
-        ))
+        )))
         .execute(pool)
         .await?;
     }

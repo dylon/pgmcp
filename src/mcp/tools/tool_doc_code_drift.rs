@@ -92,13 +92,14 @@ pub async fn tool_doc_code_drift(
         ORDER BY dist DESC
         LIMIT $3"
     );
-    let rows: Vec<(String, f64, i32, i32)> = sqlx::query_as::<_, (String, f64, i32, i32)>(&sql)
-        .bind(project_id)
-        .bind(min_drift)
-        .bind(limit)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| McpError::internal_error(format!("Drift query failed: {}", e), None))?;
+    let rows: Vec<(String, f64, i32, i32)> =
+        sqlx::query_as::<_, (String, f64, i32, i32)>(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(project_id)
+            .bind(min_drift)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Drift query failed: {}", e), None))?;
 
     let out: Vec<_> = rows
         .into_iter()

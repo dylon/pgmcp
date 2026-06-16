@@ -57,7 +57,7 @@ pub async fn tool_embedding_outliers(
         ORDER BY a.id, dist"
     );
     let rows: Vec<(i64, String, i32, i32, i64, f64)> =
-        sqlx::query_as::<_, (i64, String, i32, i32, i64, f64)>(&sql)
+        sqlx::query_as::<_, (i64, String, i32, i32, i64, f64)>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(project_id)
             .bind(k)
             .fetch_all(pool)

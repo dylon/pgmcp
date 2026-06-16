@@ -21,13 +21,13 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 
 # MCP server
-rmcp = { version = "1.1", features = ["client", "server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client"] }
+rmcp = { version = "1.7", features = ["client", "server", "transport-io", "transport-streamable-http-server", "transport-streamable-http-client"] }
 schemars = "1.0"
 sse-stream = "0.2"
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid"] }
-pgvector = { version = "0.4", features = ["sqlx"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono", "uuid"] }
+pgvector = { version = "0.4.2", features = ["sqlx"] }
 
 # Embeddings — direct candle stack. Pure Rust BERT inference; uses cudarc
 # (already a direct dep) for CUDA. No ONNX Runtime, no fastembed, no

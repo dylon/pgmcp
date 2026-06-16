@@ -223,13 +223,13 @@ pub async fn concurrency_metric_series(
         | "max_lock_contention" => column,
         _ => return Ok(Vec::new()),
     };
-    sqlx::query_as::<_, (f64, f64)>(&format!(
-        "SELECT EXTRACT(EPOCH FROM (now() - computed_at)) / 86400.0 AS days_ago,
+    sqlx::query_as::<_, (f64, f64)>(sqlx::AssertSqlSafe(format!(
+        "SELECT (EXTRACT(EPOCH FROM (now() - computed_at)) / 86400.0)::float8 AS days_ago,
                 {col}::float8 AS value
          FROM concurrency_health_history
          WHERE project_id = $1 AND computed_at >= now() - ($2::int8 * INTERVAL '1 day')
          ORDER BY computed_at ASC",
-    ))
+    )))
     .bind(project_id)
     .bind(days)
     .fetch_all(pool)

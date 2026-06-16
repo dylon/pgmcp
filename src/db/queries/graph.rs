@@ -388,9 +388,12 @@ pub async fn compute_semantic_file_edges(
     ef_search: i32,
 ) -> Result<Vec<SemanticFileEdge>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
     // The per-project HNSW LATERAL can exceed the daemon-wide statement_timeout
     // on large indexes; raise the ceiling for this transaction only (mirrors
     // `batch_find_cross_project_neighbors`).
@@ -405,7 +408,7 @@ pub async fn compute_semantic_file_edges(
     let col = crate::embed::signature::read_active_signature(pool)
         .await?
         .read_column();
-    let rows = sqlx::query_as::<_, SemanticFileEdge>(&format!(
+    let rows = sqlx::query_as::<_, SemanticFileEdge>(sqlx::AssertSqlSafe(format!(
         "WITH chunk_nn AS (
             SELECT c.file_id AS source_file_id,
                    nn.file_id AS target_file_id,
@@ -442,7 +445,7 @@ pub async fn compute_semantic_file_edges(
         SELECT source_file_id, target_file_id, weight
         FROM ranked
         WHERE rn <= $4",
-    ))
+    )))
     .bind(project_id)
     .bind(threshold)
     .bind(per_chunk_k)
@@ -525,10 +528,13 @@ pub async fn ppr_seed_files(
     let col = embedding_column_for_dim(embedding.len())?;
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
-    let rows = sqlx::query_as::<_, (i64, f64)>(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
+    let rows = sqlx::query_as::<_, (i64, f64)>(sqlx::AssertSqlSafe(format!(
         "SELECT file_id, MAX(sim)::float8 AS sim FROM (
             SELECT c.file_id, (1.0 - (c.{col} <=> $1)) AS sim
             FROM file_chunks c
@@ -539,7 +545,7 @@ pub async fn ppr_seed_files(
          ) t
          GROUP BY file_id
          ORDER BY sim DESC"
-    ))
+    )))
     .bind(embedding_vec)
     .bind(project_id)
     .bind(limit)

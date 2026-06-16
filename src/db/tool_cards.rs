@@ -245,9 +245,12 @@ pub async fn semantic_search_tool_cards(
     let embedding_vec = Vector::from(embedding.to_vec());
 
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
 
     let rows = sqlx::query_as::<_, ToolCardSearchRow>(
         "SELECT id, slug, name, domain, category, summary, when_to_use, invocation,

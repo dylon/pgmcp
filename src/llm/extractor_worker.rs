@@ -186,10 +186,10 @@ async fn run_once(
             ContradictionKind::Observation => "memory_observations",
             ContradictionKind::Relation => "memory_relations",
         };
-        let upd = sqlx::query(&format!(
+        let upd = sqlx::query(sqlx::AssertSqlSafe(format!(
             "UPDATE {} SET valid_to = NOW() WHERE id = $1 AND valid_to IS NULL",
             table
-        ))
+        )))
         .bind(c.conflicting_with)
         .execute(pool)
         .await?;

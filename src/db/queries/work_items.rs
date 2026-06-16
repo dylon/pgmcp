@@ -238,9 +238,9 @@ pub async fn insert_work_item_in_tx(
 
 /// Fetch one item by numeric id.
 pub async fn get_work_item(pool: &PgPool, id: i64) -> Result<Option<WorkItemRow>, sqlx::Error> {
-    sqlx::query_as::<_, WorkItemRow>(&format!(
+    sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {WORK_ITEM_COLS} FROM work_items WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await
@@ -251,9 +251,9 @@ pub async fn get_work_item_by_public_id(
     pool: &PgPool,
     public_id: &str,
 ) -> Result<Option<WorkItemRow>, sqlx::Error> {
-    sqlx::query_as::<_, WorkItemRow>(&format!(
+    sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {WORK_ITEM_COLS} FROM work_items WHERE public_id = $1"
-    ))
+    )))
     .bind(public_id)
     .fetch_optional(pool)
     .await
@@ -288,7 +288,7 @@ pub async fn list_work_items(
     f: &WorkItemFilter<'_>,
 ) -> Result<Vec<WorkItemRow>, sqlx::Error> {
     let limit = f.limit.clamp(1, 1000);
-    sqlx::query_as::<_, WorkItemRow>(&format!(
+    sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {WORK_ITEM_COLS} FROM work_items w
          WHERE ($1::int IS NULL OR project_id = $1)
            AND ($2::text IS NULL OR kind = $2)
@@ -303,7 +303,7 @@ pub async fn list_work_items(
            AND ($10::bool IS NOT TRUE OR (status IN ('pending','confirmed','ready') AND {NOT_BLOCKED}))
          ORDER BY priority DESC, computed_score DESC NULLS LAST, created_at DESC
          LIMIT $5"
-    ))
+    )))
     .bind(f.project_id)
     .bind(f.kind)
     .bind(f.status)
@@ -380,7 +380,7 @@ pub async fn update_work_item_fields_in_tx(
     clear_snooze: bool,
     severity: Option<&str>,
 ) -> Result<WorkItemRow, WorkItemOpError> {
-    let row = sqlx::query_as::<_, WorkItemRow>(&format!(
+    let row = sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "UPDATE work_items SET
             title = COALESCE($2, title),
             body = COALESCE($3, body),
@@ -392,7 +392,7 @@ pub async fn update_work_item_fields_in_tx(
             updated_at = NOW()
          WHERE id = $1
          RETURNING {WORK_ITEM_COLS}"
-    ))
+    )))
     .bind(id)
     .bind(title)
     .bind(body)
@@ -536,9 +536,9 @@ pub async fn fetch_bug_details(
     pool: &PgPool,
     item_id: i64,
 ) -> Result<Option<BugDetailsRow>, sqlx::Error> {
-    sqlx::query_as::<_, BugDetailsRow>(&format!(
+    sqlx::query_as::<_, BugDetailsRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {BUG_DETAIL_COLS} FROM work_item_bug_details WHERE item_id = $1"
-    ))
+    )))
     .bind(item_id)
     .fetch_optional(pool)
     .await
@@ -600,9 +600,9 @@ pub async fn set_work_item_status_in_tx(
     evidence_id: Option<i64>,
     negotiation_id: Option<i64>,
 ) -> Result<WorkItemRow, WorkItemOpError> {
-    let current = sqlx::query_as::<_, WorkItemRow>(&format!(
+    let current = sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {WORK_ITEM_COLS} FROM work_items WHERE id = $1 FOR UPDATE"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&mut **tx)
     .await?
@@ -641,7 +641,7 @@ pub async fn set_work_item_status_in_tx(
     };
     check_transition(from, to, actor, ctx).map_err(WorkItemOpError::Transition)?;
 
-    let updated = sqlx::query_as::<_, WorkItemRow>(&format!(
+    let updated = sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "UPDATE work_items SET
             status = $2,
             updated_at = NOW(),
@@ -652,7 +652,7 @@ pub async fn set_work_item_status_in_tx(
                                 THEN NOW() ELSE completed_at END
          WHERE id = $1
          RETURNING {WORK_ITEM_COLS}"
-    ))
+    )))
     .bind(id)
     .bind(to.as_str())
     .fetch_one(&mut **tx)
@@ -749,7 +749,7 @@ pub async fn assign_work_item(
     assignee: Option<&str>,
     assigned_by: Option<&str>,
 ) -> Result<WorkItemRow, WorkItemOpError> {
-    let row = sqlx::query_as::<_, WorkItemRow>(&format!(
+    let row = sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "UPDATE work_items SET
             assignee = $2,
             assigned_at = CASE WHEN $2 IS NULL THEN NULL ELSE NOW() END,
@@ -757,7 +757,7 @@ pub async fn assign_work_item(
             updated_at = NOW()
          WHERE id = $1
          RETURNING {WORK_ITEM_COLS}"
-    ))
+    )))
     .bind(id)
     .bind(assignee)
     .bind(assigned_by)
@@ -777,7 +777,7 @@ pub async fn next_actionable_work_items(
     limit: i64,
 ) -> Result<Vec<WorkItemRow>, sqlx::Error> {
     let cap = limit.clamp(1, 1000);
-    sqlx::query_as::<_, WorkItemRow>(&format!(
+    sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "WITH RECURSIVE subtree AS (
             SELECT id FROM work_items WHERE id = $1
             UNION ALL
@@ -790,7 +790,7 @@ pub async fn next_actionable_work_items(
            AND {NOT_BLOCKED}
          ORDER BY w.priority DESC, w.computed_score DESC NULLS LAST, w.id
          LIMIT $2"
-    ))
+    )))
     .bind(plan_root_id)
     .bind(cap)
     .bind(assignee)
@@ -887,7 +887,7 @@ pub async fn get_work_item_subtree(
         .map(|c| format!("c.{c}"))
         .collect::<Vec<_>>()
         .join(", ");
-    sqlx::query_as::<_, WorkItemRow>(&format!(
+    sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "WITH RECURSIVE subtree AS (
             SELECT {cols}, 0 AS depth, ARRAY[id] AS path FROM work_items WHERE id = $1
             UNION ALL
@@ -900,7 +900,7 @@ pub async fn get_work_item_subtree(
          ORDER BY depth, priority DESC, id
          LIMIT $2",
         cols = WORK_ITEM_COLS,
-    ))
+    )))
     .bind(root_id)
     .bind(cap)
     .fetch_all(pool)
@@ -1048,7 +1048,7 @@ pub async fn reprioritize_work_items(
     } else {
         14.0
     };
-    sqlx::query_as::<_, WorkItemRow>(&format!(
+    sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "WITH rescored AS (
             UPDATE work_items w SET computed_score =
                   w.priority::float8
@@ -1064,7 +1064,7 @@ pub async fn reprioritize_work_items(
          ORDER BY computed_score DESC NULLS LAST, priority DESC, id
          LIMIT $3",
         cols = WORK_ITEM_COLS,
-    ))
+    )))
     .bind(project_id)
     .bind(half_life)
     .bind(cap)
@@ -1091,14 +1091,14 @@ pub async fn search_work_items(
     limit: i64,
 ) -> Result<Vec<WorkItemSearchHit>, sqlx::Error> {
     let cap = limit.clamp(1, 100);
-    sqlx::query_as::<_, WorkItemSearchHit>(&format!(
+    sqlx::query_as::<_, WorkItemSearchHit>(sqlx::AssertSqlSafe(format!(
         "SELECT {WORK_ITEM_COLS}, 1.0 - (embedding <=> $1) AS similarity
          FROM work_items
          WHERE embedding IS NOT NULL
            AND ($2::int IS NULL OR project_id = $2)
          ORDER BY embedding <=> $1
          LIMIT $3"
-    ))
+    )))
     .bind(query)
     .bind(project_id)
     .bind(cap)
@@ -1234,11 +1234,11 @@ pub async fn get_plan_definition(
     slug: &str,
     version: Option<i32>,
 ) -> Result<Option<PlanDefinitionRow>, sqlx::Error> {
-    sqlx::query_as::<_, PlanDefinitionRow>(&format!(
+    sqlx::query_as::<_, PlanDefinitionRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {PLAN_DEF_COLS} FROM plan_definitions
          WHERE slug = $1 AND ($2::int IS NULL OR version = $2)
          ORDER BY version DESC LIMIT 1"
-    ))
+    )))
     .bind(slug)
     .bind(version)
     .fetch_optional(pool)
@@ -1246,9 +1246,9 @@ pub async fn get_plan_definition(
 }
 
 pub async fn list_plan_definitions(pool: &PgPool) -> Result<Vec<PlanDefinitionRow>, sqlx::Error> {
-    sqlx::query_as::<_, PlanDefinitionRow>(&format!(
+    sqlx::query_as::<_, PlanDefinitionRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {PLAN_DEF_COLS} FROM plan_definitions ORDER BY slug, version DESC"
-    ))
+    )))
     .fetch_all(pool)
     .await
 }
@@ -1259,9 +1259,9 @@ pub async fn get_plan_definition_by_id(
     pool: &PgPool,
     id: i64,
 ) -> Result<Option<PlanDefinitionRow>, sqlx::Error> {
-    sqlx::query_as::<_, PlanDefinitionRow>(&format!(
+    sqlx::query_as::<_, PlanDefinitionRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {PLAN_DEF_COLS} FROM plan_definitions WHERE id = $1"
-    ))
+    )))
     .bind(id)
     .fetch_optional(pool)
     .await
@@ -1732,7 +1732,7 @@ pub async fn claim_work_item(
 ) -> Result<Option<WorkItemRow>, sqlx::Error> {
     let lease = lease_secs.clamp(10, 86_400) as f64;
     let mut tx = pool.begin().await?;
-    let row = sqlx::query_as::<_, WorkItemRow>(&format!(
+    let row = sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "UPDATE work_items w SET
             claimed_by = $2,
             status = CASE WHEN w.status IN ('pending','confirmed','ready','blocked') THEN 'in_progress' ELSE w.status END,
@@ -1746,7 +1746,7 @@ pub async fn claim_work_item(
            AND w.status IN ('pending','confirmed','ready','in_progress','blocked')
            AND {NOT_BLOCKED}
          RETURNING {WORK_ITEM_COLS}"
-    ))
+    )))
     .bind(id)
     .bind(agent_id)
     .bind(lease)
@@ -1779,7 +1779,7 @@ pub async fn claim_next_work_item(
 ) -> Result<Option<WorkItemRow>, sqlx::Error> {
     let lease = lease_secs.clamp(10, 86_400) as f64;
     let mut tx = pool.begin().await?;
-    let picked: Option<i64> = sqlx::query_scalar(&format!(
+    let picked: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
         "WITH RECURSIVE subtree AS (
             SELECT id FROM work_items WHERE id = $1
             UNION ALL
@@ -1793,7 +1793,7 @@ pub async fn claim_next_work_item(
          ORDER BY w.priority DESC, w.computed_score DESC NULLS LAST, w.id
          FOR UPDATE SKIP LOCKED
          LIMIT 1"
-    ))
+    )))
     .bind(plan_root_id)
     .fetch_optional(&mut *tx)
     .await?;
@@ -1801,7 +1801,7 @@ pub async fn claim_next_work_item(
         tx.commit().await?;
         return Ok(None);
     };
-    let row = sqlx::query_as::<_, WorkItemRow>(&format!(
+    let row = sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "UPDATE work_items SET
             claimed_by = $2, status = 'in_progress', claimed_at = NOW(),
             lease_expires_at = NOW() + make_interval(secs => $3),
@@ -1809,7 +1809,7 @@ pub async fn claim_next_work_item(
             updated_at = NOW()
          WHERE id = $1
          RETURNING {WORK_ITEM_COLS}"
-    ))
+    )))
     .bind(pid)
     .bind(agent_id)
     .bind(lease)
@@ -1835,11 +1835,11 @@ pub async fn release_work_item(
     agent_id: &str,
 ) -> Result<Option<WorkItemRow>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    let row = sqlx::query_as::<_, WorkItemRow>(&format!(
+    let row = sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "UPDATE work_items SET claimed_by = NULL, lease_expires_at = NULL, updated_at = NOW()
          WHERE id = $1 AND claimed_by = $2
          RETURNING {WORK_ITEM_COLS}"
-    ))
+    )))
     .bind(id)
     .bind(agent_id)
     .fetch_optional(&mut *tx)
@@ -1866,14 +1866,14 @@ pub async fn handoff_work_item(
 ) -> Result<Option<WorkItemRow>, sqlx::Error> {
     let lease = lease_secs.clamp(10, 86_400) as f64;
     let mut tx = pool.begin().await?;
-    let row = sqlx::query_as::<_, WorkItemRow>(&format!(
+    let row = sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "UPDATE work_items SET
             claimed_by = $3, claimed_at = NOW(),
             lease_expires_at = NOW() + make_interval(secs => $4),
             claim_count = claim_count + 1, updated_at = NOW()
          WHERE id = $1 AND claimed_by = $2
          RETURNING {WORK_ITEM_COLS}"
-    ))
+    )))
     .bind(id)
     .bind(from_agent)
     .bind(to_agent)
@@ -2079,9 +2079,9 @@ pub async fn agent_current_items(
     pool: &PgPool,
     agent_id: &str,
 ) -> Result<Vec<WorkItemRow>, sqlx::Error> {
-    sqlx::query_as::<_, WorkItemRow>(&format!(
+    sqlx::query_as::<_, WorkItemRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {WORK_ITEM_COLS} FROM work_items WHERE claimed_by = $1 ORDER BY updated_at DESC"
-    ))
+    )))
     .bind(agent_id)
     .fetch_all(pool)
     .await
@@ -2171,20 +2171,22 @@ pub async fn upsert_tag(
 
 /// Fetch one tag by its stable `slug` (active or merged).
 pub async fn get_tag_by_slug(pool: &PgPool, slug: &str) -> Result<Option<TagRow>, sqlx::Error> {
-    sqlx::query_as::<_, TagRow>(&format!("SELECT {TAG_COLS} FROM tags WHERE slug = $1"))
-        .bind(slug)
-        .fetch_optional(pool)
-        .await
+    sqlx::query_as::<_, TagRow>(sqlx::AssertSqlSafe(format!(
+        "SELECT {TAG_COLS} FROM tags WHERE slug = $1"
+    )))
+    .bind(slug)
+    .fetch_optional(pool)
+    .await
 }
 
 /// List tags ordered by name. Active-only (`merged_into IS NULL`) unless
 /// `include_merged` is set.
 pub async fn list_tags(pool: &PgPool, include_merged: bool) -> Result<Vec<TagRow>, sqlx::Error> {
-    sqlx::query_as::<_, TagRow>(&format!(
+    sqlx::query_as::<_, TagRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {TAG_COLS} FROM tags
          WHERE ($1::bool OR merged_into IS NULL)
          ORDER BY name"
-    ))
+    )))
     .bind(include_merged)
     .fetch_all(pool)
     .await
@@ -2225,7 +2227,7 @@ pub async fn untag_work_item(pool: &PgPool, item_id: i64, tag_id: i64) -> Result
 /// Merged tags are excluded (their assignments have been repointed to the
 /// destination by [`merge_tags`]).
 pub async fn list_item_tags(pool: &PgPool, item_id: i64) -> Result<Vec<TagRow>, sqlx::Error> {
-    sqlx::query_as::<_, TagRow>(&format!(
+    sqlx::query_as::<_, TagRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {cols} FROM tags t
          JOIN work_item_tags wt ON wt.tag_id = t.id
          WHERE wt.item_id = $1 AND t.merged_into IS NULL
@@ -2235,7 +2237,7 @@ pub async fn list_item_tags(pool: &PgPool, item_id: i64) -> Result<Vec<TagRow>, 
             .map(|c| format!("t.{c}"))
             .collect::<Vec<_>>()
             .join(", "),
-    ))
+    )))
     .bind(item_id)
     .fetch_all(pool)
     .await
@@ -2301,9 +2303,9 @@ pub async fn rename_tag(
     slug: &str,
     new_name: &str,
 ) -> Result<Option<TagRow>, sqlx::Error> {
-    sqlx::query_as::<_, TagRow>(&format!(
+    sqlx::query_as::<_, TagRow>(sqlx::AssertSqlSafe(format!(
         "UPDATE tags SET name = $2 WHERE slug = $1 RETURNING {TAG_COLS}"
-    ))
+    )))
     .bind(slug)
     .bind(new_name)
     .fetch_optional(pool)
@@ -2356,12 +2358,12 @@ pub async fn list_progress(
     limit: i64,
 ) -> Result<Vec<ProgressRow>, sqlx::Error> {
     let cap = limit.clamp(1, 500);
-    sqlx::query_as::<_, ProgressRow>(&format!(
+    sqlx::query_as::<_, ProgressRow>(sqlx::AssertSqlSafe(format!(
         "SELECT {PROGRESS_COLS} FROM work_item_progress
          WHERE item_id = $1
          ORDER BY created_at DESC, id DESC
          LIMIT $2"
-    ))
+    )))
     .bind(item_id)
     .bind(cap)
     .fetch_all(pool)

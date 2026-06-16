@@ -34,10 +34,12 @@ async fn make_post_cutover(pool: &PgPool) {
     .await
     .expect("stamp bge-m3-v1 signature");
     for t in LEGACY_TABLES {
-        sqlx::query(&format!("ALTER TABLE {t} DROP COLUMN IF EXISTS embedding"))
-            .execute(pool)
-            .await
-            .unwrap_or_else(|e| panic!("drop legacy embedding on {t}: {e}"));
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "ALTER TABLE {t} DROP COLUMN IF EXISTS embedding"
+        )))
+        .execute(pool)
+        .await
+        .unwrap_or_else(|e| panic!("drop legacy embedding on {t}: {e}"));
     }
 }
 

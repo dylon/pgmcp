@@ -85,14 +85,14 @@ pub async fn tool_lsh_clone_detection(
          WHERE f.project_id = $1 AND fc.{col} IS NOT NULL
          LIMIT 5000"
     );
-    let rows: Vec<(i64, String, i32, i32, Option<pgvector::Vector>)> = sqlx::query_as::<
-        _,
-        (i64, String, i32, i32, Option<pgvector::Vector>),
-    >(&sql)
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| McpError::internal_error(format!("Embedding query failed: {}", e), None))?;
+    let rows: Vec<(i64, String, i32, i32, Option<pgvector::Vector>)> =
+        sqlx::query_as::<_, (i64, String, i32, i32, Option<pgvector::Vector>)>(
+            sqlx::AssertSqlSafe(sql.as_str()),
+        )
+        .bind(project_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|e| McpError::internal_error(format!("Embedding query failed: {}", e), None))?;
 
     if rows.is_empty() {
         return json_result(&json!({

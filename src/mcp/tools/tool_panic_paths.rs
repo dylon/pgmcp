@@ -68,7 +68,7 @@ pub async fn tool_panic_paths(
     let rows: Vec<(String, String, i32, i32, i32, i32)> = sqlx::query_as::<
         _,
         (String, String, i32, i32, i32, i32),
-    >(&sql)
+    >(sqlx::AssertSqlSafe(sql.as_str()))
     .bind(project_id)
     .bind(i64::from(limit))
     .fetch_all(pool)

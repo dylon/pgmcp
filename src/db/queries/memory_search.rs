@@ -314,9 +314,12 @@ pub async fn memory_semantic_search(
     }
     let v = pgvector::Vector::from(embedding.to_vec());
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
 
     let rows = sqlx::query_as::<_, MemorySemanticHit>(
         "SELECT o.id AS observation_id,
@@ -375,9 +378,12 @@ pub async fn memory_hybrid_search(
     let k = limit.clamp(1, 200);
     let pool_size = (k * 3).clamp(20, 300);
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
 
     let rows = sqlx::query_as::<_, MemorySemanticHit>(
         "WITH dense AS (
@@ -811,9 +817,12 @@ pub async fn memory_unified_search(
     let limit = limit.clamp(1, 200);
     let ef_search = ef_search.clamp(1, 10_000);
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
     let rows = sqlx::query_as::<_, UnifiedNodeHit>(
         "SELECT node_id, node_type, label, importance,
                 1 - (embedding <=> $1) AS similarity
@@ -862,14 +871,16 @@ async fn refresh_matview_concurrently(
     sqlx::query("SET LOCAL statement_timeout = '600s'")
         .execute(&mut *tx)
         .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SET LOCAL application_name = 'pgmcp:heavy:{job_tag}'"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
-    sqlx::query(&format!("REFRESH MATERIALIZED VIEW CONCURRENTLY {view}"))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "REFRESH MATERIALIZED VIEW CONCURRENTLY {view}"
+    )))
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await
 }
 

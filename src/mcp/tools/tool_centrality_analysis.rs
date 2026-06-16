@@ -107,7 +107,7 @@ pub async fn tool_centrality_analysis(
         order_clause
     );
 
-    let rows: Vec<MetricRow> = sqlx::query_as::<_, MetricRow>(&query)
+    let rows: Vec<MetricRow> = sqlx::query_as::<_, MetricRow>(sqlx::AssertSqlSafe(query.as_str()))
         .bind(project_id)
         .bind(limit as i64)
         .fetch_all(pool)

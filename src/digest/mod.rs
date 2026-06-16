@@ -625,7 +625,7 @@ async fn collect_health(
 /// Whole days since a project was last scanned, or `None` when never scanned.
 async fn days_since_last_scan(pool: &PgPool, project_id: i32) -> Result<Option<i64>, sqlx::Error> {
     let days: Option<f64> = sqlx::query_scalar(
-        "SELECT EXTRACT(EPOCH FROM (now() - last_scanned_at)) / 86400.0
+        "SELECT (EXTRACT(EPOCH FROM (now() - last_scanned_at)) / 86400.0)::float8
            FROM projects WHERE id = $1 AND last_scanned_at IS NOT NULL",
     )
     .bind(project_id)

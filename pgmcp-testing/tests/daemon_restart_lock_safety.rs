@@ -138,10 +138,10 @@ async fn migrations_retry_through_lock_contention() {
 
     // Make new sessions to this DB fail a lock wait after 1s so the first
     // migration attempt raises 55P03 rather than blocking indefinitely.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER DATABASE \"{}\" SET lock_timeout = '1s'",
         db.db_name()
-    ))
+    )))
     .execute(&pool)
     .await
     .expect("set per-database lock_timeout");

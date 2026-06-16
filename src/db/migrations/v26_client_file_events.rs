@@ -34,7 +34,9 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         op = op_sql_in_list(),
         source = source_sql_in_list(),
     );
-    sqlx::query(&create).execute(pool).await?;
+    sqlx::query(sqlx::AssertSqlSafe(create.as_str()))
+        .execute(pool)
+        .await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_cfe_project_ts

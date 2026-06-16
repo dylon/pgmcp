@@ -66,7 +66,13 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<PgPool, sqlx::Error>
                      SET idle_in_transaction_session_timeout = {idle_in_tx_timeout_ms}; \
                      SET lock_timeout = {lock_timeout_ms};"
                 );
-                conn.execute(base.as_str()).await?;
+                // sqlx 0.9: `Executor::execute(&str)` no longer exists; the SQL
+                // must impl `SqlSafeStr`. `base` is multi-statement, so route it
+                // through `raw_sql` (simple query protocol). Passing the owned
+                // String (not `&str`) also avoids borrowing a local across the
+                // `'static` after-connect future.
+                conn.execute(sqlx::raw_sql(sqlx::AssertSqlSafe(base)))
+                    .await?;
 
                 // `client_connection_check_interval` was introduced in PostgreSQL
                 // 14; it is an unknown GUC before that, and a failed `SET` would
@@ -78,12 +84,9 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<PgPool, sqlx::Error>
                             .fetch_one(&mut *conn)
                             .await?;
                     if server_version_num >= 140_000 {
-                        conn.execute(
-                            format!(
-                                "SET client_connection_check_interval = {client_conn_check_ms}"
-                            )
-                            .as_str(),
-                        )
+                        conn.execute(sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                            "SET client_connection_check_interval = {client_conn_check_ms}"
+                        ))))
                         .await?;
                     }
                 }

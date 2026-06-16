@@ -102,9 +102,12 @@ pub async fn semantic_search(
     }
     let embedding_vec = Vector::from(embedding.to_vec());
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
     let rows = sqlx::query_as::<_, ToolCatalogSearchRow>(
         "SELECT name, domain, description, 1 - (embedding <=> $1) AS score
          FROM mcp_tool_catalog

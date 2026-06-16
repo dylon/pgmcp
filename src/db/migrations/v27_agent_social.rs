@@ -53,7 +53,9 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         )",
         kind = kind_sql_in_list(),
     );
-    sqlx::query(&messages).execute(pool).await?;
+    sqlx::query(sqlx::AssertSqlSafe(messages.as_str()))
+        .execute(pool)
+        .await?;
 
     // Delivery receipts (m:n message↔recipient; dedup via the UNIQUE key).
     let receipts = format!(
@@ -70,7 +72,9 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         )",
         channel = channel_sql_in_list(),
     );
-    sqlx::query(&receipts).execute(pool).await?;
+    sqlx::query(sqlx::AssertSqlSafe(receipts.as_str()))
+        .execute(pool)
+        .await?;
 
     // Addressing-dimension indexes (no time predicate — `now()` is not IMMUTABLE
     // and cannot appear in a partial-index WHERE; the inbox query filters live).

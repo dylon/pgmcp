@@ -33,8 +33,14 @@ pub async fn count_projects(pool: &PgPool) -> Result<u64, sqlx::Error> {
 
 /// Get total bytes indexed.
 pub async fn total_bytes_indexed(pool: &PgPool) -> Result<u64, sqlx::Error> {
-    let total = sqlx::query_scalar::<_, Option<i64>>("SELECT SUM(size_bytes) FROM indexed_files")
-        .fetch_one(pool)
-        .await?;
+    // `size_bytes` is `bigint`, and Postgres widens `SUM(bigint)` to `numeric`
+    // (overflow-safe). `numeric` does NOT decode into `i64` (sqlx 0.8 and 0.9
+    // alike reject it), so cast the aggregate back to `bigint` — the workspace
+    // total is far below the i64 ceiling. Without the cast this query errors at
+    // runtime and `index_stats` silently reports 0 bytes.
+    let total =
+        sqlx::query_scalar::<_, Option<i64>>("SELECT SUM(size_bytes)::bigint FROM indexed_files")
+            .fetch_one(pool)
+            .await?;
     Ok(total.unwrap_or(0) as u64)
 }

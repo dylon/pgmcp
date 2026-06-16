@@ -238,9 +238,9 @@ impl StreamableHttpClient for Reqwest12StreamableClient {
                     ))
                 })?
                 .to_string();
-            return Err(StreamableHttpError::AuthRequired(AuthRequiredError {
-                www_authenticate_header: header,
-            }));
+            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                header,
+            )));
         }
         if response.status() == reqwest::StatusCode::FORBIDDEN
             && let Some(header) = response.headers().get(WWW_AUTHENTICATE)
@@ -251,10 +251,10 @@ impl StreamableHttpClient for Reqwest12StreamableClient {
                 ))
             })?;
             return Err(StreamableHttpError::InsufficientScope(
-                InsufficientScopeError {
-                    www_authenticate_header: header_str.to_string(),
-                    required_scope: extract_scope_from_header(header_str),
-                },
+                InsufficientScopeError::new(
+                    header_str.to_string(),
+                    extract_scope_from_header(header_str),
+                ),
             ));
         }
 

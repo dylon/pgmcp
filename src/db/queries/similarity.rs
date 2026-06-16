@@ -30,16 +30,19 @@ pub async fn compare_two_files(
     ef_search: i32,
 ) -> Result<Vec<ChunkPairSimilarity>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
 
     // Post-cutover the legacy `embedding` column is gone; read the active
     // signature's column (embedding_v2 under BGE-M3).
     let col = crate::embed::signature::read_active_signature(pool)
         .await?
         .read_column();
-    let results = sqlx::query_as::<_, ChunkPairSimilarity>(&format!(
+    let results = sqlx::query_as::<_, ChunkPairSimilarity>(sqlx::AssertSqlSafe(format!(
         "SELECT ca.id as chunk_id_a, ca.content as content_a,
                 ca.start_line as start_line_a, ca.end_line as end_line_a,
                 cb.id as chunk_id_b, cb.content as content_b,
@@ -49,7 +52,7 @@ pub async fn compare_two_files(
          CROSS JOIN file_chunks cb
          WHERE ca.file_id = $1 AND cb.file_id = $2
          ORDER BY similarity DESC",
-    ))
+    )))
     .bind(file_id_a)
     .bind(file_id_b)
     .fetch_all(&mut *tx)
@@ -71,14 +74,17 @@ pub async fn compare_chunks_within_file(
     ef_search: i32,
 ) -> Result<Vec<ChunkPairSimilarity>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
 
     let col = crate::embed::signature::read_active_signature(pool)
         .await?
         .read_column();
-    let results = sqlx::query_as::<_, ChunkPairSimilarity>(&format!(
+    let results = sqlx::query_as::<_, ChunkPairSimilarity>(sqlx::AssertSqlSafe(format!(
         "SELECT ca.id AS chunk_id_a, ca.content AS content_a,
                 ca.start_line AS start_line_a, ca.end_line AS end_line_a,
                 cb.id AS chunk_id_b, cb.content AS content_b,
@@ -90,7 +96,7 @@ pub async fn compare_chunks_within_file(
          WHERE ca.file_id = $1
            AND 1 - (ca.{col} <=> cb.{col}) >= $2
          ORDER BY similarity DESC",
-    ))
+    )))
     .bind(file_id)
     .bind(min_similarity)
     .fetch_all(&mut *tx)
@@ -179,9 +185,12 @@ pub async fn batch_find_cross_project_neighbors(
     ef_search: i32,
 ) -> Result<Vec<SimilarityNeighborRow>, sqlx::Error> {
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
     // The cross-project nearest-neighbor batch can legitimately run
     // longer than the daemon-wide statement_timeout on large indexes
     // (HNSW scan × 500-row batches). Raise the ceiling for this
@@ -204,7 +213,7 @@ pub async fn batch_find_cross_project_neighbors(
     let col = crate::embed::signature::read_active_signature(pool)
         .await?
         .read_column();
-    let results = sqlx::query_as::<_, SimilarityNeighborRow>(&format!(
+    let results = sqlx::query_as::<_, SimilarityNeighborRow>(sqlx::AssertSqlSafe(format!(
         "WITH batch AS (
             SELECT c.id, c.file_id, c.{col} AS embedding, f.project_id, f.path, f.language,
                    p.name as project_name,
@@ -242,7 +251,7 @@ pub async fn batch_find_cross_project_neighbors(
             LIMIT $3
         ) nn
         WHERE nn.similarity >= $4",
-    ))
+    )))
     .bind(last_chunk_id)
     .bind(batch_size)
     .bind(top_k)
@@ -443,7 +452,7 @@ pub async fn find_similar_files(
         same_repo_filter_idx
     );
     if let Some(proj) = target_project {
-        sqlx::query_as::<_, FileSimilarityPair>(&format!(
+        sqlx::query_as::<_, FileSimilarityPair>(sqlx::AssertSqlSafe(format!(
             "SELECT
                 CASE WHEN s.file_id_a = $1 THEN s.file_id_a ELSE s.file_id_b END as file_id_a,
                 CASE WHEN s.file_id_a = $1 THEN s.path_a ELSE s.path_b END as path_a,
@@ -463,7 +472,7 @@ pub async fn find_similar_files(
              GROUP BY file_id_a, path_a, project_name_a, file_id_b, path_b, project_name_b, s.language
              ORDER BY avg_similarity DESC
              LIMIT $3"
-        ))
+        )))
         .bind(file_id)
         .bind(min_similarity)
         .bind(limit)
@@ -472,7 +481,7 @@ pub async fn find_similar_files(
         .fetch_all(pool)
         .await
     } else {
-        sqlx::query_as::<_, FileSimilarityPair>(&format!(
+        sqlx::query_as::<_, FileSimilarityPair>(sqlx::AssertSqlSafe(format!(
             "SELECT
                 CASE WHEN s.file_id_a = $1 THEN s.file_id_a ELSE s.file_id_b END as file_id_a,
                 CASE WHEN s.file_id_a = $1 THEN s.path_a ELSE s.path_b END as path_a,
@@ -491,7 +500,7 @@ pub async fn find_similar_files(
              GROUP BY file_id_a, path_a, project_name_a, file_id_b, path_b, project_name_b, s.language
              ORDER BY avg_similarity DESC
              LIMIT $3"
-        ))
+        )))
         .bind(file_id)
         .bind(min_similarity)
         .bind(limit)
@@ -565,7 +574,7 @@ pub async fn find_duplicate_file_pairs(
           )
     ))";
     if let Some(lang) = language {
-        sqlx::query_as::<_, DuplicateFilePair>(&format!(
+        sqlx::query_as::<_, DuplicateFilePair>(sqlx::AssertSqlSafe(format!(
             "SELECT s.file_id_a, s.path_a, s.project_name_a, s.project_id_a,
                     s.file_id_b, s.path_b, s.project_name_b, s.project_id_b,
                     s.language,
@@ -583,7 +592,7 @@ pub async fn find_duplicate_file_pairs(
              HAVING AVG(s.chunk_similarity) >= $1
              ORDER BY avg_similarity DESC
              LIMIT $2",
-        ))
+        )))
         .bind(min_similarity)
         .bind(limit)
         .bind(lang)
@@ -591,7 +600,7 @@ pub async fn find_duplicate_file_pairs(
         .fetch_all(pool)
         .await
     } else {
-        sqlx::query_as::<_, DuplicateFilePair>(&format!(
+        sqlx::query_as::<_, DuplicateFilePair>(sqlx::AssertSqlSafe(format!(
             "SELECT s.file_id_a, s.path_a, s.project_name_a, s.project_id_a,
                     s.file_id_b, s.path_b, s.project_name_b, s.project_id_b,
                     s.language,
@@ -608,7 +617,7 @@ pub async fn find_duplicate_file_pairs(
              HAVING AVG(s.chunk_similarity) >= $1
              ORDER BY avg_similarity DESC
              LIMIT $2",
-        ))
+        )))
         .bind(min_similarity)
         .bind(limit)
         .bind(include_same_repo)

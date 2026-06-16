@@ -101,7 +101,7 @@ pub async fn tool_anomaly_detection(
         ORDER BY avg_distance DESC"
     );
     let rows: Vec<AnomalyRow> =
-        sqlx::query_as::<_, AnomalyRow>(&sql)
+        sqlx::query_as::<_, AnomalyRow>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(project_id)
             .fetch_all(ctx.db().pool().expect(
                 "inline SQL needs a real PgPool — wrap a sqlx::PgPool as Arc<dyn DbClient>",

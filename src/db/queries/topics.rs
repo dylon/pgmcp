@@ -1185,15 +1185,16 @@ pub async fn load_topic_centroids(
 
     for topic in &topics {
         // Get all chunk embeddings for this topic
-        let embeddings: Vec<Vec<f32>> = sqlx::query_scalar::<_, Vec<f32>>(&format!(
-            "SELECT c.{col}::real[] as embedding
+        let embeddings: Vec<Vec<f32>> =
+            sqlx::query_scalar::<_, Vec<f32>>(sqlx::AssertSqlSafe(format!(
+                "SELECT c.{col}::real[] as embedding
              FROM chunk_topic_assignments cta
              JOIN file_chunks c ON c.id = cta.chunk_id
              WHERE cta.topic_id = $1",
-        ))
-        .bind(topic.topic_id)
-        .fetch_all(pool)
-        .await?;
+            )))
+            .bind(topic.topic_id)
+            .fetch_all(pool)
+            .await?;
 
         if embeddings.is_empty() {
             continue;

@@ -1070,14 +1070,21 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             inner: LocalSessionManager::default(),
             stats: Arc::clone(&stats_tracker),
         };
+        // rmcp 1.7's StreamableHttpServerConfig is #[non_exhaustive], so it must be
+        // built via Default + builder methods rather than a struct literal. rmcp 1.7
+        // also adds DNS-rebinding protection: `allowed_hosts` defaults to loopback
+        // only ("localhost"/"127.0.0.1"/"::1", matching any port). That is correct
+        // for the default loopback bind and for local MCP clients; a remote `/mcp`
+        // deployment (non-loopback [mcp].host) must extend allowed_hosts with its
+        // public authority via `.with_allowed_hosts([...])`. `stateful_mode: true` is
+        // already the Default but is set explicitly to preserve intent.
+        let http_config = StreamableHttpServerConfig::default()
+            .with_stateful_mode(true)
+            .with_cancellation_token(cancel_token.clone());
         let mcp_service = StreamableHttpService::new(
             move || Ok(mcp_server.clone()),
             Arc::new(counting_manager),
-            StreamableHttpServerConfig {
-                stateful_mode: true,
-                cancellation_token: cancel_token.clone(),
-                ..Default::default()
-            },
+            http_config,
         );
 
         // Memory-server Phase 4: reuse the LLM extractor built earlier

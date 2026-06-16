@@ -188,14 +188,14 @@ async fn install_check(
     constraint: &str,
     predicate: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {table} DROP CONSTRAINT IF EXISTS {constraint}"
-    ))
+    )))
     .execute(pool)
     .await?;
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "ALTER TABLE {table} ADD CONSTRAINT {constraint} CHECK ({predicate})"
-    ))
+    )))
     .execute(pool)
     .await?;
     Ok(())

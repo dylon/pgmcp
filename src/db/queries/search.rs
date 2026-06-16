@@ -76,9 +76,12 @@ pub async fn semantic_search(
     // Using SET LOCAL within a transaction keeps it scoped to this operation.
     let mut tx = pool.begin().await?;
 
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
 
     // Build the query dynamically based on which filters are present.
     // The dedup clause's `$N` index is determined by how many other
@@ -86,7 +89,7 @@ pub async fn semantic_search(
     let results = match (language, project) {
         (Some(lang), Some(proj)) => {
             // $1=embedding, $2=limit, $3=lang, $4=proj, $5=dedupe
-            sqlx::query_as::<_, SearchResult>(&format!(
+            sqlx::query_as::<_, SearchResult>(sqlx::AssertSqlSafe(format!(
                 "SELECT f.path, f.relative_path, f.language,
                         c.content as chunk_content, c.start_line, c.end_line,
                         1 - (c.{col} <=> $1) as score,
@@ -101,7 +104,7 @@ pub async fn semantic_search(
                  LIMIT $2",
                 col = col,
                 dedup = worktree_dedup_clause(5)
-            ))
+            )))
             .bind(&embedding_vec)
             .bind(limit)
             .bind(lang)
@@ -112,7 +115,7 @@ pub async fn semantic_search(
         }
         (Some(lang), None) => {
             // $1=embedding, $2=limit, $3=lang, $4=dedupe
-            sqlx::query_as::<_, SearchResult>(&format!(
+            sqlx::query_as::<_, SearchResult>(sqlx::AssertSqlSafe(format!(
                 "SELECT f.path, f.relative_path, f.language,
                         c.content as chunk_content, c.start_line, c.end_line,
                         1 - (c.{col} <=> $1) as score,
@@ -127,7 +130,7 @@ pub async fn semantic_search(
                  LIMIT $2",
                 col = col,
                 dedup = worktree_dedup_clause(4)
-            ))
+            )))
             .bind(&embedding_vec)
             .bind(limit)
             .bind(lang)
@@ -137,7 +140,7 @@ pub async fn semantic_search(
         }
         (None, Some(proj)) => {
             // $1=embedding, $2=limit, $3=proj, $4=dedupe
-            sqlx::query_as::<_, SearchResult>(&format!(
+            sqlx::query_as::<_, SearchResult>(sqlx::AssertSqlSafe(format!(
                 "SELECT f.path, f.relative_path, f.language,
                         c.content as chunk_content, c.start_line, c.end_line,
                         1 - (c.{col} <=> $1) as score,
@@ -152,7 +155,7 @@ pub async fn semantic_search(
                  LIMIT $2",
                 col = col,
                 dedup = worktree_dedup_clause(4)
-            ))
+            )))
             .bind(&embedding_vec)
             .bind(limit)
             .bind(proj)
@@ -162,7 +165,7 @@ pub async fn semantic_search(
         }
         (None, None) => {
             // $1=embedding, $2=limit, $3=dedupe
-            sqlx::query_as::<_, SearchResult>(&format!(
+            sqlx::query_as::<_, SearchResult>(sqlx::AssertSqlSafe(format!(
                 "SELECT f.path, f.relative_path, f.language,
                         c.content as chunk_content, c.start_line, c.end_line,
                         1 - (c.{col} <=> $1) as score,
@@ -176,7 +179,7 @@ pub async fn semantic_search(
                  LIMIT $2",
                 col = col,
                 dedup = worktree_dedup_clause(3)
-            ))
+            )))
             .bind(&embedding_vec)
             .bind(limit)
             .bind(dedupe_worktrees)
@@ -314,9 +317,12 @@ pub async fn hybrid_search_chunks(
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
 
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
 
     // Optional filters collapse into one query via `($n IS NULL OR …)`.
     // SQL is built by the pure `hybrid_search_sql` helper so a no-DB unit test
@@ -324,7 +330,7 @@ pub async fn hybrid_search_chunks(
     // $1=embedding, $2=query_text, $3=candidates, $4=language, $5=project, $6=limit, $7=sparse
     let results = if let Some(sparse) = query_sparse {
         let sql = hybrid_search_sql(col, true);
-        sqlx::query_as::<_, SearchResult>(&sql)
+        sqlx::query_as::<_, SearchResult>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&embedding_vec)
             .bind(query_text)
             .bind(candidates)
@@ -336,7 +342,7 @@ pub async fn hybrid_search_chunks(
             .await?
     } else {
         let sql = hybrid_search_sql(col, false);
-        sqlx::query_as::<_, SearchResult>(&sql)
+        sqlx::query_as::<_, SearchResult>(sqlx::AssertSqlSafe(sql.as_str()))
             .bind(&embedding_vec)
             .bind(query_text)
             .bind(candidates)
@@ -384,7 +390,7 @@ where
     // SELECT re-sorts by rank globally and applies the limit. Chunks
     // hang off `COALESCE(duplicate_of_file_id, id)` so duplicates point
     // at canonical chunks.
-    let results = sqlx::query_as::<_, TextSearchResult>(&format!(
+    let results = sqlx::query_as::<_, TextSearchResult>(sqlx::AssertSqlSafe(format!(
         "SELECT path, relative_path, language, content, rank FROM (
             SELECT DISTINCT ON (f.id)
                 f.path,
@@ -404,7 +410,7 @@ where
          ORDER BY rank DESC
          LIMIT $2",
         worktree_dedup_clause(5)
-    ))
+    )))
     .bind(query)
     .bind(limit)
     .bind(language)
@@ -444,9 +450,9 @@ pub async fn text_search_bounded(
 ) -> Result<Vec<TextSearchResult>, sqlx::Error> {
     let mut tx = pool.begin().await?;
     // `statement_timeout_ms` is a u32 → digits only, no injection surface.
-    sqlx::query(&format!(
+    sqlx::query(sqlx::AssertSqlSafe(format!(
         "SET LOCAL statement_timeout = {statement_timeout_ms}"
-    ))
+    )))
     .execute(&mut *tx)
     .await?;
     let results =
@@ -488,7 +494,7 @@ pub async fn grep_search(
         // Convert glob to SQL LIKE pattern.
         // $1=pattern, $2=limit, $3=like, $4=dedupe
         let like_pattern = glob_pattern.replace('*', "%").replace('?', "_");
-        sqlx::query_as::<_, GrepResult>(&format!(
+        sqlx::query_as::<_, GrepResult>(sqlx::AssertSqlSafe(format!(
             "SELECT DISTINCT ON (f.id)
                 f.path,
                 f.relative_path,
@@ -502,7 +508,7 @@ pub async fn grep_search(
              ORDER BY f.id, c.chunk_index
              LIMIT $2",
             worktree_dedup_clause(4)
-        ))
+        )))
         .bind(pattern)
         .bind(limit)
         .bind(&like_pattern)
@@ -511,7 +517,7 @@ pub async fn grep_search(
         .await?
     } else {
         // $1=pattern, $2=limit, $3=dedupe
-        sqlx::query_as::<_, GrepResult>(&format!(
+        sqlx::query_as::<_, GrepResult>(sqlx::AssertSqlSafe(format!(
             "SELECT DISTINCT ON (f.id)
                 f.path,
                 f.relative_path,
@@ -524,7 +530,7 @@ pub async fn grep_search(
              ORDER BY f.id, c.chunk_index
              LIMIT $2",
             worktree_dedup_clause(3)
-        ))
+        )))
         .bind(pattern)
         .bind(limit)
         .bind(dedupe_worktrees)
@@ -598,9 +604,12 @@ pub async fn recall_prompts_semantic(
     let column = "embedding_v2";
 
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
 
     // Column-name interpolation is safe — it's chosen from a closed
     // whitelist above, not from user input.
@@ -622,7 +631,7 @@ pub async fn recall_prompts_semantic(
         col = column,
     );
 
-    let rows = sqlx::query_as::<_, PromptRecallResult>(&sql)
+    let rows = sqlx::query_as::<_, PromptRecallResult>(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(&embedding_vec)
         .bind(project_name)
         .bind(session_id)
@@ -713,9 +722,12 @@ pub async fn search_mandates_semantic(
     }
     let embedding_vec = pgvector::Vector::from(embedding.to_vec());
     let mut tx = pool.begin().await?;
-    sqlx::query(&format!("SET LOCAL hnsw.ef_search = {}", ef_search))
-        .execute(&mut *tx)
-        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL hnsw.ef_search = {}",
+        ef_search
+    )))
+    .execute(&mut *tx)
+    .await?;
     let rows = sqlx::query_as::<_, MandateSearchResult>(
         "SELECT m.id, m.scope, m.project_id, p.name AS project_name,
                 m.polarity, m.imperative, m.target, m.promoted_at, m.file_path,
@@ -799,7 +811,7 @@ pub async fn grep_search_chunks(
         dedup = worktree_dedup_clause(5),
     );
 
-    let rows = sqlx::query_as::<_, GrepChunkResult>(&sql)
+    let rows = sqlx::query_as::<_, GrepChunkResult>(sqlx::AssertSqlSafe(sql.as_str()))
         .bind(pattern)
         .bind(project)
         .bind(language)

@@ -25,7 +25,7 @@ parking_lot = "0.12"
 ndarray = { version = "0.16", features = ["blas", "serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sqlx = { version = "0.8", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono"] }
+sqlx = { version = "0.9", features = ["runtime-tokio", "tls-rustls", "postgres", "chrono"] }
 chrono = { version = "0.4", features = ["serde"] }
 
 # Test harness deps. Promoted from dev-dependencies because they're used by
@@ -40,13 +40,13 @@ proptest = "1"
 tempfile = "3"
 anyhow = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-pgvector = { version = "0.4", features = ["sqlx"] }
+pgvector = { version = "0.4.2", features = ["sqlx"] }
 crossbeam-channel = "0.5"
 dashmap = "6"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 libc = "0.2"
 arc-swap = "1"
-rmcp = { version = "1.1", features = ["server"] }
+rmcp = { version = "1.7", features = ["server"] }
 postcard = { version = "1", features = ["use-std"] }
 petgraph = "0.7"
 tracing = "0.1"
@@ -54,7 +54,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
 
 [dev-dependencies]
 arc-swap = "1"
-rmcp = { version = "1.1", features = ["server"] }
+rmcp = { version = "1.7", features = ["server"] }
 assert_cmd = "2"
 predicates = "3"
 

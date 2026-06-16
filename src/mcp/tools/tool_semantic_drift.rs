@@ -66,12 +66,13 @@ pub async fn tool_semantic_drift(
         ORDER BY dist DESC
         LIMIT $2"
     );
-    let rows: Vec<(String, f64, i32)> = sqlx::query_as::<_, (String, f64, i32)>(&sql)
-        .bind(project_id)
-        .bind(limit as i64)
-        .fetch_all(pool)
-        .await
-        .map_err(|e| McpError::internal_error(format!("Drift query failed: {}", e), None))?;
+    let rows: Vec<(String, f64, i32)> =
+        sqlx::query_as::<_, (String, f64, i32)>(sqlx::AssertSqlSafe(sql.as_str()))
+            .bind(project_id)
+            .bind(limit as i64)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| McpError::internal_error(format!("Drift query failed: {}", e), None))?;
 
     let files: Vec<_> = rows
         .into_iter()

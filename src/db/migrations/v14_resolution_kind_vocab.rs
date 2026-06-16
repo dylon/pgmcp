@@ -56,7 +56,9 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
           WHERE resolution_kind IS NOT NULL
             AND resolution_kind NOT IN ({in_list})"
     );
-    sqlx::query(&normalize).execute(&mut *tx).await?;
+    sqlx::query(sqlx::AssertSqlSafe(normalize.as_str()))
+        .execute(&mut *tx)
+        .await?;
 
     sqlx::query(
         "ALTER TABLE symbol_references DROP CONSTRAINT IF EXISTS chk_symbol_refs_resolution_kind",
@@ -67,7 +69,9 @@ pub(super) async fn apply(pool: &PgPool) -> Result<(), sqlx::Error> {
         "ALTER TABLE symbol_references ADD CONSTRAINT chk_symbol_refs_resolution_kind
             CHECK (resolution_kind IS NULL OR resolution_kind IN ({in_list}))"
     );
-    sqlx::query(&add).execute(&mut *tx).await?;
+    sqlx::query(sqlx::AssertSqlSafe(add.as_str()))
+        .execute(&mut *tx)
+        .await?;
 
     tx.commit().await?;
     Ok(())

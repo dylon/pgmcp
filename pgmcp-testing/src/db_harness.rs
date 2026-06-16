@@ -218,16 +218,19 @@ async fn run_orphan_sweep() -> Result<(), TestDbUnavailable> {
 /// connection to the *maintenance* DB, not to `db_name` itself.
 async fn drop_database_force(conn: &mut PgConnection, db_name: &str) {
     let escaped = db_name.replace('\'', "''");
-    let _ = sqlx::query(&format!(
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
          WHERE datname = '{}' AND pid <> pg_backend_pid()",
         escaped,
-    ))
+    )))
     .execute(&mut *conn)
     .await;
-    let _ = sqlx::query(&format!("DROP DATABASE IF EXISTS \"{}\"", db_name))
-        .execute(&mut *conn)
-        .await;
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS \"{}\"",
+        db_name
+    )))
+    .execute(&mut *conn)
+    .await;
 }
 
 /// Get-or-create the per-process shared pool. First caller bootstraps:
@@ -246,15 +249,18 @@ async fn shared_pool() -> Result<&'static PgPool, TestDbUnavailable> {
                 .await
                 .map_err(|e| TestDbUnavailable::ConnectFailed(e.to_string()))?;
             drop_database_force(&mut maint, &cfg.template_db).await;
-            sqlx::query(&format!("CREATE DATABASE \"{}\"", cfg.template_db))
-                .execute(&mut maint)
-                .await
-                .map_err(|e| {
-                    TestDbUnavailable::SetupFailed(format!(
-                        "CREATE DATABASE {}: {}",
-                        cfg.template_db, e
-                    ))
-                })?;
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "CREATE DATABASE \"{}\"",
+                cfg.template_db
+            )))
+            .execute(&mut maint)
+            .await
+            .map_err(|e| {
+                TestDbUnavailable::SetupFailed(format!(
+                    "CREATE DATABASE {}: {}",
+                    cfg.template_db, e
+                ))
+            })?;
             drop(maint);
 
             // Connect to the new template DB and run migrations.
@@ -335,10 +341,10 @@ impl TestDatabase {
         let mut maint = PgConnection::connect(&cfg.maintenance_url())
             .await
             .map_err(|e| TestDbUnavailable::ConnectFailed(e.to_string()))?;
-        sqlx::query(&format!(
+        sqlx::query(sqlx::AssertSqlSafe(format!(
             "CREATE DATABASE \"{}\" WITH TEMPLATE \"{}\"",
             db_name, cfg.template_db,
-        ))
+        )))
         .execute(&mut maint)
         .await
         .map_err(|e| {
