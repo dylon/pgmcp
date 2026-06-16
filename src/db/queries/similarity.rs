@@ -750,7 +750,9 @@ pub async fn find_pattern_abstraction_pairs(
                 s.project_name_a, s.project_name_b,
                 s.language,
                 s.chunk_similarity AS similarity,
-                cta_a.topic_id,
+                -- topic_id sources are INT4 (chunk_topic_assignments/code_topics);
+                -- cast to BIGINT for the `topic_id: i64` field (sqlx rejects INT4->i64).
+                cta_a.topic_id::bigint AS topic_id,
                 ct.label AS topic_label,
                 ct.keywords AS topic_keywords,
                 cta_a.membership_score AS membership_a,

@@ -197,7 +197,9 @@ pub async fn get_god_file_chunks_with_topics(
          dominant_topic AS (
             SELECT DISTINCT ON (cta.chunk_id)
                    cta.chunk_id,
-                   cta.topic_id,
+                   -- chunk_topic_assignments.topic_id is INT4; cast to BIGINT for
+                   -- the `topic_id: Option<i64>` field (sqlx rejects INT4->i64).
+                   cta.topic_id::bigint AS topic_id,
                    cta.membership_score,
                    ct.label,
                    ct.keywords

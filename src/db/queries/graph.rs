@@ -269,7 +269,11 @@ pub async fn list_call_edges_for_project(
                 sr.target_file_id,
                 sr.target_symbol_id,
                 sr.target_raw,
-                sr.resolution_confidence
+                -- `symbol_references.resolution_confidence` is `real` (FLOAT4);
+                -- cast to FLOAT8 so it decodes into the `Option<f64>` field
+                -- (sqlx rejects FLOAT4->f64). Shared by recursive_clusters + the
+                -- call_graph cron.
+                sr.resolution_confidence::float8 AS resolution_confidence
          FROM symbol_references sr
          JOIN indexed_files f ON sr.source_file_id = f.id
          WHERE f.project_id = $1

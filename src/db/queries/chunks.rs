@@ -509,7 +509,9 @@ pub async fn get_chunk_topic_summaries(
         return Ok(Vec::new());
     }
     sqlx::query_as::<_, ChunkTopicSummaryRow>(
-        "SELECT cta.chunk_id, ct.id AS topic_id, ct.label, ct.keywords, cta.membership_score
+        // `code_topics.id` is `integer` (INT4); cast to BIGINT so it decodes into
+        // the `topic_id: i64` field (sqlx rejects INT4->i64).
+        "SELECT cta.chunk_id, ct.id::bigint AS topic_id, ct.label, ct.keywords, cta.membership_score
          FROM chunk_topic_assignments cta
          JOIN code_topics ct ON ct.id = cta.topic_id
          WHERE cta.chunk_id = ANY($1)
