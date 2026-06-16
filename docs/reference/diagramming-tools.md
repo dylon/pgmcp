@@ -13,7 +13,7 @@ probe-grounded (real binary, path, and version captured by `--version` /
 `command -v` / `kpsewhich`). GUI-only tools with no scriptable surface are
 documented here but not carded.
 
-> Domain summary: **42 cards across 8 categories** — `graph_layout`,
+> Domain summary: **43 cards across 8 categories** — `graph_layout`,
 > `uml_architecture`, `scientific_plotting`, `diagram_language`, `ascii_diagram`,
 > `diagram_conversion`, `circuit_diagram`, `protocol_data_diagram`.
 
@@ -24,7 +24,7 @@ Query them with the MCP tools, e.g.
 
 ──────────────────────────────────────────────────────────────────────────────
 
-## Installed & carded (42)
+## Installed & carded (43)
 
 ### graph_layout
 | slug | tool | version | invocation gist |
@@ -44,6 +44,7 @@ Query them with the MCP tools, e.g.
 | `umlet` | UMLet | 15.1 | `umlet -action=convert -format svg -filename d.uxf` |
 | `dbml-renderer` | dbml-renderer | 1.0.31 | `dbml-renderer -i schema.dbml -o schema.svg` |
 | `kroki` | Kroki (render gateway; ~22 engines via core + bpmn/excalidraw companions) | 0.31.0 | `curl :8000/plantuml/svg --data-binary @d.puml -o d.svg` |
+| `blockdiag` | blockdiag suite (block/seq/act/nw/packet/rackdiag) | 3.0.0 | `blockdiag -T svg -o d.svg d.diag` (pyenv 3.11 + Pillow<10) |
 
 > **Kroki setup.** Carded against a `docker compose` stack (the `yuzutech/kroki`
 > core + the `kroki-bpmn` and `kroki-excalidraw` companions) on `localhost:8000`.
@@ -136,7 +137,6 @@ qualify, so they're documented instead:
 
 | tool | status | reason / agent path |
 |··········|··········|··········|
-| **blockdiag suite** (blockdiag/seqdiag/actdiag/nwdiag/packetdiag/rackdiag) | broken — no working path | Runtime-broken under Python 3.14: imports the removed `pkg_resources` *and* Pillow-10's removed `ImageDraw.textsize`. Fix needs `pipx inject --force <pkg> 'setuptools<81' 'Pillow<10'` per venv (attempted; still fails — the codebase predates both removals). The **`kroki-blockdiag` companion image is also broken** — it returns HTTP 200 with an empty body for all six types (probe-verified 2026-06-16), so Kroki does not rescue it either. No headless path currently available. |
 | **erd** (Haskell) | won't build → use `kroki` | `cabal install erd` fails: `erd` pins `text >=1 && <2` but modern `hashable` needs `text >=2.0.2` — an unsatisfiable constraint set on GHC 9.12. **Agent path: the carded `kroki` server (`POST :8000/erd/svg`, erd 0.2.3 bundled).** |
 | **LabPlot** | GUI-only | KDE interactive plotting app with no headless export CLI. Use `gnuplot`/`matplotlib`/`veusz`/`r-graphics` for scripted scientific plots. |
 | **Xfig** | GUI-only | Interactive `.fig` editor. Its agent path **is carded** as `fig2dev`. |
