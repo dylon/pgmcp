@@ -47,9 +47,24 @@ if ! has_arg "-metadir" "$@"; then
     cleanup_metadir=1
 fi
 
+# Per-invocation private JVM temp dir. SANY (the TLA+ parser) materializes the
+# bundled standard modules (Naturals, FiniteSets, Sequences, …) into
+# `java.io.tmpdir` and deletes them on JVM exit. The default is the SHARED
+# `/tmp`, so back-to-back gates race: one gate's exit-cleanup removes
+# `/tmp/Naturals.tla` while the next gate is still parsing it, yielding the
+# intermittent "Cannot find source file for module Naturals" failure. Giving
+# each invocation a unique `java.io.tmpdir` (set in java_opts below) isolates
+# every gate's extraction so they can never collide. `$$` is this script's PID,
+# distinct per gate (verify.sh spawns one `tlc-capped.sh` per spec).
+run_tmpdir="${TMPDIR:-/tmp}/pgmcp-tlc-jvm-${spec_base}-$$"
+mkdir -p "${run_tmpdir}"
+
 cleanup() {
     if [[ "${cleanup_metadir}" == "1" && -n "${metadir}" ]]; then
         rm -rf "${metadir}"
+    fi
+    if [[ -n "${run_tmpdir}" ]]; then
+        rm -rf "${run_tmpdir}"
     fi
 }
 trap cleanup EXIT
@@ -71,6 +86,7 @@ java_opts=(
     "-XX:+UseSerialGC"
     "-XX:ActiveProcessorCount=1"
     "-Djava.awt.headless=true"
+    "-Djava.io.tmpdir=${run_tmpdir}"
 )
 export TLA_JAVA_OPTS="${TLA_JAVA_OPTS:-} ${java_opts[*]}"
 
