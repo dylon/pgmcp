@@ -43,7 +43,19 @@ Query them with the MCP tools, e.g.
 | `mscgenjs` | mscgenjs | 5.0.1 | `mscgenjs -T svg -i h.msc -o h.svg` |
 | `umlet` | UMLet | 15.1 | `umlet -action=convert -format svg -filename d.uxf` |
 | `dbml-renderer` | dbml-renderer | 1.0.31 | `dbml-renderer -i schema.dbml -o schema.svg` |
-| `kroki` | Kroki (render gateway, fronts ~30 engines) | 0.31.0 | `curl :8000/plantuml/svg --data-binary @d.puml -o d.svg` |
+| `kroki` | Kroki (render gateway; ~22 engines via core + bpmn/excalidraw companions) | 0.31.0 | `curl :8000/plantuml/svg --data-binary @d.puml -o d.svg` |
+
+> **Kroki setup.** Carded against a `docker compose` stack (the `yuzutech/kroki`
+> core + the `kroki-bpmn` and `kroki-excalidraw` companions) on `localhost:8000`.
+> It renders ~22 engines: the JVM-core set (graphviz, plantuml, c4plantuml, d2,
+> structurizr, erd, dbml, nomnoml, umlet, bytefield, wavedrom, tikz, pikchr,
+> svgbob, ditaa, goat, vega, vegalite, wireviz, symbolator) plus the bpmn +
+> excalidraw companions. **Mermaid and diagrams.net companions are deliberately
+> not run** — the local `mermaid-cli`/`drawio` cards cover those — and the
+> **`kroki-blockdiag` companion image is broken** (HTTP 200 + empty body), so the
+> blockdiag suite is unavailable via Kroki too. `/health` lists a version for
+> every engine even when its companion isn't running, so trust a real render, not
+> the manifest.
 
 ### scientific_plotting
 | slug | tool | version | invocation gist |
@@ -124,7 +136,7 @@ qualify, so they're documented instead:
 
 | tool | status | reason / agent path |
 |··········|··········|··········|
-| **blockdiag suite** (blockdiag/seqdiag/actdiag/nwdiag/packetdiag) | broken locally → use `kroki` | Runtime-broken under Python 3.14: imports the removed `pkg_resources` *and* Pillow-10's removed `ImageDraw.textsize`. Fix needs `pipx inject --force <pkg> 'setuptools<81' 'Pillow<10'` per venv (attempted; still fails — the codebase predates both removals). **Agent path: the carded `kroki` server serves a working blockdiag suite — `POST :8000/blockdiag/svg` (also seq/act/nw/packet/rackdiag).** |
+| **blockdiag suite** (blockdiag/seqdiag/actdiag/nwdiag/packetdiag/rackdiag) | broken — no working path | Runtime-broken under Python 3.14: imports the removed `pkg_resources` *and* Pillow-10's removed `ImageDraw.textsize`. Fix needs `pipx inject --force <pkg> 'setuptools<81' 'Pillow<10'` per venv (attempted; still fails — the codebase predates both removals). The **`kroki-blockdiag` companion image is also broken** — it returns HTTP 200 with an empty body for all six types (probe-verified 2026-06-16), so Kroki does not rescue it either. No headless path currently available. |
 | **erd** (Haskell) | won't build → use `kroki` | `cabal install erd` fails: `erd` pins `text >=1 && <2` but modern `hashable` needs `text >=2.0.2` — an unsatisfiable constraint set on GHC 9.12. **Agent path: the carded `kroki` server (`POST :8000/erd/svg`, erd 0.2.3 bundled).** |
 | **LabPlot** | GUI-only | KDE interactive plotting app with no headless export CLI. Use `gnuplot`/`matplotlib`/`veusz`/`r-graphics` for scripted scientific plots. |
 | **Xfig** | GUI-only | Interactive `.fig` editor. Its agent path **is carded** as `fig2dev`. |
