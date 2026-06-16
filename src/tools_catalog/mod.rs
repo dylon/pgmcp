@@ -491,7 +491,7 @@ pub fn tool_category_seeds() -> Vec<ToolCategorySeed> {
 }
 
 pub fn tool_seeds() -> Vec<ToolSeed> {
-    let mut v = Vec::with_capacity(208);
+    let mut v = Vec::with_capacity(209);
     v.extend(proof_assistants::seeds());
     v.extend(auto_active::seeds());
     v.extend(smt_sat_atp::seeds());

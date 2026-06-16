@@ -13,7 +13,7 @@ probe-grounded (real binary, path, and version captured by `--version` /
 `command -v` / `kpsewhich`). GUI-only tools with no scriptable surface are
 documented here but not carded.
 
-> Domain summary: **41 cards across 8 categories** — `graph_layout`,
+> Domain summary: **42 cards across 8 categories** — `graph_layout`,
 > `uml_architecture`, `scientific_plotting`, `diagram_language`, `ascii_diagram`,
 > `diagram_conversion`, `circuit_diagram`, `protocol_data_diagram`.
 
@@ -24,7 +24,7 @@ Query them with the MCP tools, e.g.
 
 ──────────────────────────────────────────────────────────────────────────────
 
-## Installed & carded (41)
+## Installed & carded (42)
 
 ### graph_layout
 | slug | tool | version | invocation gist |
@@ -43,6 +43,7 @@ Query them with the MCP tools, e.g.
 | `mscgenjs` | mscgenjs | 5.0.1 | `mscgenjs -T svg -i h.msc -o h.svg` |
 | `umlet` | UMLet | 15.1 | `umlet -action=convert -format svg -filename d.uxf` |
 | `dbml-renderer` | dbml-renderer | 1.0.31 | `dbml-renderer -i schema.dbml -o schema.svg` |
+| `kroki` | Kroki (render gateway, fronts ~30 engines) | 0.31.0 | `curl :8000/plantuml/svg --data-binary @d.puml -o d.svg` |
 
 ### scientific_plotting
 | slug | tool | version | invocation gist |
@@ -123,9 +124,8 @@ qualify, so they're documented instead:
 
 | tool | status | reason / agent path |
 |··········|··········|··········|
-| **blockdiag suite** (blockdiag/seqdiag/actdiag/nwdiag/packetdiag) | broken | Runtime-broken under Python 3.14: imports the removed `pkg_resources` *and* Pillow-10's removed `ImageDraw.textsize`. Fix needs `pipx inject --force <pkg> 'setuptools<81' 'Pillow<10'` per venv (attempted; still fails — the codebase predates both removals). |
-| **kroki** | not running | A rendering *server*, not a standalone binary. Needs a running backend: `docker run -d --name kroki -p 8000:8000 yuzutech/kroki`, then POST diagram source. Card it once the server is up. |
-| **erd** (Haskell) | won't build | `cabal install erd` fails: `erd` pins `text >=1 && <2` but modern `hashable` needs `text >=2.0.2` — an unsatisfiable constraint set on GHC 9.12. |
+| **blockdiag suite** (blockdiag/seqdiag/actdiag/nwdiag/packetdiag) | broken locally → use `kroki` | Runtime-broken under Python 3.14: imports the removed `pkg_resources` *and* Pillow-10's removed `ImageDraw.textsize`. Fix needs `pipx inject --force <pkg> 'setuptools<81' 'Pillow<10'` per venv (attempted; still fails — the codebase predates both removals). **Agent path: the carded `kroki` server serves a working blockdiag suite — `POST :8000/blockdiag/svg` (also seq/act/nw/packet/rackdiag).** |
+| **erd** (Haskell) | won't build → use `kroki` | `cabal install erd` fails: `erd` pins `text >=1 && <2` but modern `hashable` needs `text >=2.0.2` — an unsatisfiable constraint set on GHC 9.12. **Agent path: the carded `kroki` server (`POST :8000/erd/svg`, erd 0.2.3 bundled).** |
 | **LabPlot** | GUI-only | KDE interactive plotting app with no headless export CLI. Use `gnuplot`/`matplotlib`/`veusz`/`r-graphics` for scripted scientific plots. |
 | **Xfig** | GUI-only | Interactive `.fig` editor. Its agent path **is carded** as `fig2dev`. |
 | **Karbon** (Calligra) | GUI-only | Interactive vector editor. Its agent path **is carded** as `calligraconverter`. |
@@ -140,15 +140,16 @@ deliberately excluded. Install commands assume Arch (`pacman`/AUR), `npm`,
 `pipx`, `cabal`, or Docker as noted.
 
 ### Software architecture
-- **Kroki** — one render gateway fronting graphviz/plantuml/mermaid/d2/bytefield/
-  wavedrom/… `docker run -d --name kroki -p 8000:8000 yuzutech/kroki`
-- **nomnoml** — UML sketches from text. `npm install -g nomnoml`
+- **nomnoml** — UML sketches from text. `npm install -g nomnoml` for a standalone
+  CLI (also renderable now via the carded `kroki` server: `POST :8000/nomnoml/svg`).
 - **C4-PlantUML** — C4-model stdlib for the installed PlantUML (not a package):
-  `git clone https://github.com/plantuml-stdlib/C4-PlantUML` then `!include` it.
+  `git clone https://github.com/plantuml-stdlib/C4-PlantUML` then `!include` it
+  (Kroki also serves it directly as the `c4plantuml` engine).
 
 ### Database / data modeling
 - **erd** — entity-relationship from a tiny DSL. `cabal install erd` (currently
-  unbuildable — see above; try AUR `erd` or a pinned `text<2` if needed).
+  unbuildable — see above; try AUR `erd` or a pinned `text<2` if needed). Already
+  renderable via the carded `kroki` server (`POST :8000/erd/svg`).
 
 ### Scientific
 - **python-vl-convert** — altair's headless SVG/PNG renderer. `sudo pacman -S python-vl-convert`
