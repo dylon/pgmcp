@@ -1227,6 +1227,35 @@ async fn index_stats_zeroed_mock_returns_zero_counters() {
 }
 
 #[tokio::test]
+async fn documentation_guidelines_returns_the_full_static_list() {
+    // Nullary, DB-free tool: must return the canonical 23-guideline seed set
+    // regardless of database state (this also satisfies the dispatch-coverage
+    // gate, which scans for a string-literal `call_tool_cli("documentation_guidelines", …)`).
+    let server = server_with_mock(MockDbClient::new());
+    let result = server
+        .call_tool_cli("documentation_guidelines", serde_json::json!({}))
+        .await
+        .expect("tool call");
+    let payload = text_of(&result);
+    let v: serde_json::Value =
+        serde_json::from_str(&payload).expect("documentation_guidelines JSON");
+    assert_eq!(v["count"].as_u64(), Some(23));
+    assert_eq!(
+        v["documentation_guidelines"].as_array().map(Vec::len),
+        Some(23)
+    );
+    assert_eq!(v["categories"].as_array().map(Vec::len), Some(7));
+    // The list is the canonical seed set (verbatim slugs), not DB-derived.
+    let items = v["documentation_guidelines"].as_array().expect("array");
+    assert!(
+        items
+            .iter()
+            .any(|g| g["slug"] == "algorithms-literate-pseudocode")
+    );
+    assert!(items.iter().any(|g| g["slug"] == "math-backticks"));
+}
+
+#[tokio::test]
 async fn index_stats_with_nonzero_bytes_prints_total() {
     let mut mock = MockDbClient::new();
     mock.total_bytes_indexed_result = 1_000_000;

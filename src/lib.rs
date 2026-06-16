@@ -38,6 +38,7 @@ pub mod datatable;
 pub mod db;
 pub mod deps;
 pub mod digest;
+pub mod docguidelines;
 pub mod embed;
 pub mod error;
 pub mod experiment;

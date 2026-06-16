@@ -32,6 +32,7 @@ mod datatable;
 mod db;
 mod deps;
 mod digest;
+mod docguidelines;
 mod embed;
 mod error;
 mod experiment;

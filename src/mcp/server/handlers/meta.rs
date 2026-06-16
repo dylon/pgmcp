@@ -116,10 +116,35 @@ also teaches your learned defaults."
         self.dispatch_for_call_tool(&_ctx, &inner, params.args)
             .await
     }
+
+    #[tool(
+        description = "Enumerate the documentation-authoring guidelines pgmcp enforces across ALL \
+agents (Claude, Codex, and every MCP client). Returns the full structured checklist (slug + \
+category + text). These same guidelines are always-on in this server's MCP `instructions` and are \
+surfaced in `orient`. USE WHEN: you are about to write or revise any documentation — design / \
+architecture / theory docs, READMEs, ADRs, API & usage guides, papers — and want the canonical \
+list to follow. DO NOT USE WHEN: searching indexed docs for content — use semantic_search / grep."
+    )]
+    async fn documentation_guidelines(
+        &self,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "documentation_guidelines",
+            30,
+            &_ctx,
+            "",
+            crate::mcp::tools::tool_documentation_guidelines::tool_documentation_guidelines(
+                self.ctx(),
+            ),
+        )
+        .await
+    }
 }
 
 // Non-`#[tool]` helpers (kept out of the `#[tool_router]` block so the macro only
-// processes the four tool methods above).
+// processes the five tool methods above).
 impl McpServer {
     async fn do_enable_tools(
         &self,

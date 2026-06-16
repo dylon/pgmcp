@@ -272,6 +272,7 @@ pub async fn tool_orient(
             "member_count": t.member_count,
         })).collect::<Vec<_>>(),
         "mandates": crate::mandates::compact_sources(&mandates),
+        "documentation_guidelines": crate::docguidelines::compact_for_orient(),
         "social": social,
         "health": {
             "phase": phase_label,

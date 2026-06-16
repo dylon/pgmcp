@@ -1134,6 +1134,7 @@ impl McpServer {
             "index_stats"   => index_stats,
             "pattern_catalog_stats" => pattern_catalog_stats in tool_software_patterns,
             "toolbox_stats" => toolbox_stats in tool_toolbox,
+            "documentation_guidelines" => documentation_guidelines,
         })
     }
 }
@@ -1190,15 +1191,25 @@ pub(crate) fn social_banner_for(client_name: &str) -> &'static str {
     }
 }
 
-/// Compose per-client instructions: the base catalog (from `get_info`) followed
-/// by the social banner, if any. Kept pure so the composition (catalog
-/// preservation + per-client variance) is unit-testable without an rmcp peer.
+/// Documentation-authoring guidelines, rendered once from the canonical seed
+/// module `crate::docguidelines`. Injected into EVERY client's instructions by
+/// `compose_instructions` (claude, codex, generic/unknown alike) — the only
+/// always-on, cross-agent enforcement surface pgmcp controls (Codex et al. have
+/// no prompt hook; this `initialize`-time string reaches them all).
+static DOC_GUIDELINES_BANNER: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(crate::docguidelines::render_instructions_banner);
+
+/// Compose per-client instructions: the base catalog (from `get_info`), then the
+/// documentation guidelines (unconditional — every client), then the social
+/// banner if any. Kept pure so the composition (catalog preservation + universal
+/// guidelines + per-client variance) is unit-testable without an rmcp peer.
 pub(crate) fn compose_instructions(base: &str, client_name: &str) -> String {
+    let guidelines = DOC_GUIDELINES_BANNER.as_str();
     let social = social_banner_for(client_name);
     if social.is_empty() {
-        base.to_string()
+        format!("{base}\n\n{guidelines}")
     } else {
-        format!("{base}\n\n{social}")
+        format!("{base}\n\n{guidelines}\n\n{social}")
     }
 }
 
@@ -1442,6 +1453,11 @@ impl ServerHandler for McpServer {
                         "Effective workspace-level AGENTS.md/CLAUDE.md mandate sources (JSON)",
                     )
                     .no_annotation(),
+                RawResource::new("pgmcp://guidelines", "Documentation Guidelines")
+                    .with_description(
+                        "Documentation-authoring guidelines enforced across all agents (JSON)",
+                    )
+                    .no_annotation(),
             ],
             next_cursor: None,
             meta: None,
@@ -1508,6 +1524,14 @@ impl ServerHandler for McpServer {
                 let config = self.config().load();
                 let bundle = crate::mandates::resolve_effective_mandates(&config, None);
                 let json = serde_json::to_string_pretty(&bundle)
+                    .map_err(|e| McpError::internal_error(format!("{}", e), None))?;
+                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    json,
+                    request.uri.clone(),
+                )]));
+            }
+            "pgmcp://guidelines" => {
+                let json = serde_json::to_string_pretty(&crate::docguidelines::guidelines_json())
                     .map_err(|e| McpError::internal_error(format!("{}", e), None))?;
                 return Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     json,
@@ -1780,10 +1804,23 @@ mod social_banner_tests {
         assert!(claude.contains(base));
         assert!(codex.contains(base));
         assert!(generic.contains(base));
-        // (a) per-client variance; generic/unknown gets catalog only.
+        // (a) per-client variance; generic/unknown gets catalog + guidelines, no
+        // social banner.
         assert!(claude.contains("COLLABORATION (A2A)"));
         assert!(claude.len() > codex.len());
-        assert_eq!(generic, base);
+        assert!(!generic.contains("COLLABORATION (A2A)"));
+        assert!(!generic.contains("a2a_pattern_recursive"));
+        // (c) the documentation guidelines are injected for EVERY client — the
+        // cross-agent enforcement surface (claude, codex, generic/unknown alike).
+        assert!(claude.contains("Knuth's literate programming"));
+        assert!(codex.contains("Knuth's literate programming"));
+        assert!(generic.contains("Knuth's literate programming"));
+        assert!(generic.contains("MUST follow"));
+        // generic = base + guidelines (no social banner).
+        assert_eq!(
+            generic,
+            format!("{base}\n\n{}", super::DOC_GUIDELINES_BANNER.as_str())
+        );
     }
 }
 
