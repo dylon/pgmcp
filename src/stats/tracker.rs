@@ -420,6 +420,11 @@ pub struct StatsTracker {
     /// `/api/status` poll always sees the actual last run, not a
     /// race-window-old value.
     pub last_cron_outcomes: DashMap<String, CronJobStatus>,
+    /// Monotonic generation bumped on every `record_cron_outcome`. Lets the
+    /// scheduler's `execute_inline` detect whether a cron closure recorded its
+    /// own terminal outcome (an inline gate skip) during its run, so the default
+    /// `Ok` write does not clobber that `Skipped` in the in-memory snapshot.
+    pub cron_outcome_seq: AtomicU64,
     /// Cron jobs whose body classified a permanent fault
     /// (`CronAction::Disable`) and which the scheduler must skip on
     /// subsequent ticks. Cleared on daemon restart. The map value is a
@@ -927,6 +932,7 @@ impl StatsTracker {
             inotify_overflows_total: AtomicU64::new(0),
             rag_search_failures_total: AtomicU64::new(0),
             last_cron_outcomes: DashMap::new(),
+            cron_outcome_seq: AtomicU64::new(0),
             disabled_cron_jobs: DashMap::new(),
             pool_pressure_ms_total: AtomicU64::new(0),
             embed_chunk_batches_total: AtomicU64::new(0),
@@ -1183,14 +1189,31 @@ impl StatsTracker {
         if name == "one-shot" || name == "recurring" {
             return;
         }
+        // Strictly-increasing stamp so any write changes this job's stored seq to
+        // a value distinct from any prior snapshot (the scheduler's clobber guard).
+        let seq = self.cron_outcome_seq.fetch_add(1, Ordering::Relaxed) + 1;
         self.last_cron_outcomes.insert(
             name.to_string(),
             CronJobStatus {
                 outcome,
                 at: Utc::now(),
                 duration_ms,
+                seq,
             },
         );
+    }
+
+    /// The write generation of `name`'s last recorded outcome (`0` if it has
+    /// never been recorded). The scheduler captures this before running a cron
+    /// closure and again after: if it advanced, the closure recorded its own
+    /// terminal outcome (e.g. an inline gate skip) and the default `Ok` must not
+    /// overwrite it. Per-job, so a concurrent write to a *different* job (a heavy
+    /// cron's pool task) never changes this job's value.
+    pub fn cron_outcome_seq_for(&self, name: &str) -> u64 {
+        self.last_cron_outcomes
+            .get(name)
+            .map(|r| r.seq)
+            .unwrap_or(0)
     }
 
     /// Shared DB-availability breaker (the prober loop is its only writer).

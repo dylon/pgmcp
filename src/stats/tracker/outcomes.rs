@@ -102,4 +102,11 @@ pub struct CronJobStatus {
     pub outcome: CronJobOutcome,
     pub at: DateTime<Utc>,
     pub duration_ms: u64,
+    /// Monotonic write generation (from `StatsTracker::cron_outcome_seq`),
+    /// stamped on every `record_cron_outcome`. The scheduler's `execute_inline`
+    /// compares a job's seq before and after running its closure to tell whether
+    /// the closure recorded its *own* terminal outcome (e.g. an inline gate
+    /// skip) — if so, the scheduler must NOT clobber it with a default `Ok`.
+    /// Not serialized (the JSON snapshot is built by hand from the other fields).
+    pub seq: u64,
 }

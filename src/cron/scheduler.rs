@@ -644,6 +644,21 @@ impl CronStateMachine {
             return;
         }
 
+        // Snapshot this job's outcome generation BEFORE running its closure, so
+        // that after a clean return we can tell whether the closure recorded its
+        // OWN terminal outcome (an inline gate skip via `record_cron_outcome`,
+        // e.g. work-item-presence's DbDown or index-reconcile's PhaseGate). If
+        // it did, the default `Ok` below must NOT clobber that `Skipped` in the
+        // in-memory `last_cron_outcomes` snapshot (the durable `cron_run_history`
+        // ledger is written separately via `record_skip` and stays correct
+        // regardless). Heavy crons are unaffected: their gate runs in a pool task
+        // that records AFTER this returns, so the default `Ok` is written then
+        // overwritten — exactly as before. See the `try_heavy_gate` comment.
+        let outcome_seq_before = stats
+            .as_ref()
+            .map(|s| s.cron_outcome_seq_for(&task_name))
+            .unwrap_or(0);
+
         let started = Instant::now();
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (task.task)()));
         let elapsed_ms = started.elapsed().as_millis() as u64;
@@ -654,7 +669,11 @@ impl CronStateMachine {
 
         match result {
             Ok(should_requeue) => {
-                if let Some(s) = stats {
+                if let Some(s) = stats
+                    && s.cron_outcome_seq_for(&task_name) == outcome_seq_before
+                {
+                    // The closure recorded no outcome of its own this tick → the
+                    // body ran to completion, so default to Ok.
                     s.record_cron_outcome(
                         &task_name,
                         crate::stats::tracker::CronJobOutcome::Ok,
@@ -2337,6 +2356,64 @@ mod tests {
         handle.request_shutdown();
         thread.join().expect("Cron thread panicked");
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// Regression: a cron closure that records its OWN terminal outcome (an
+    /// inline gate skip) then returns true must keep that outcome in the
+    /// in-memory snapshot — the scheduler must NOT clobber it with the default
+    /// `Ok`. A closure that records nothing still defaults to `Ok`.
+    #[test]
+    fn execute_inline_preserves_a_self_recorded_skip() {
+        use crate::stats::tracker::{CronJobOutcome, SkipReason, StatsTracker};
+        let terminating = Arc::new(AtomicBool::new(false));
+        let stats = Arc::new(StatsTracker::new());
+        let (handle, thread, ready) =
+            spawn_cron_with_interval(Arc::clone(&terminating), 10, Some(Arc::clone(&stats)));
+        ready.recv().expect("Cron thread failed to start");
+
+        // Inline-gated light-cron pattern: record a PhaseGate skip, return true.
+        let s_skip = Arc::clone(&stats);
+        handle.schedule_recurring(0, 10_000, "skipper", move || {
+            s_skip.record_cron_outcome(
+                "skipper",
+                CronJobOutcome::Skipped(SkipReason::PhaseGate),
+                0,
+            );
+            true
+        });
+        // Plain body that records nothing → scheduler defaults it to Ok.
+        handle.schedule_recurring(0, 10_000, "runner", move || true);
+
+        // Bounded wait until both have fired at least once (seq advances on the
+        // skip write / the default-Ok write respectively).
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while (stats.cron_outcome_seq_for("skipper") == 0
+            || stats.cron_outcome_seq_for("runner") == 0)
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        handle.request_shutdown();
+        thread.join().expect("Cron thread panicked");
+
+        let skipper = stats
+            .last_cron_outcomes
+            .get("skipper")
+            .map(|r| r.outcome.as_str().to_string());
+        let runner = stats
+            .last_cron_outcomes
+            .get("runner")
+            .map(|r| r.outcome.as_str().to_string());
+        assert_eq!(
+            skipper.as_deref(),
+            Some("skipped:phase_gate"),
+            "the scheduler must preserve a closure's self-recorded skip, not clobber it with Ok"
+        );
+        assert_eq!(
+            runner.as_deref(),
+            Some("ok"),
+            "a closure that records nothing this tick still defaults to Ok"
+        );
     }
 
     #[test]
