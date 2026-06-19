@@ -54,15 +54,28 @@ use pgmcp::daemon_state::{DaemonLifecycle, DaemonPhase};
 use pgmcp::db::DbClient;
 use pgmcp::db::queries::{self};
 use pgmcp::embed::backend::CandleBackend;
+use pgmcp::embed::model::Embedder;
 use pgmcp::embed::{EmbedSource, EmbeddingBackend};
 use pgmcp::mcp::server::McpServer;
-use pgmcp::quality::retrieval_metrics::{MatchGranularity, QueryMetrics, compute_query_metrics};
+use pgmcp::quality::retrieval_metrics::{
+    GoldItem, MatchGranularity, QueryMetrics, compute_query_metrics,
+};
+use pgmcp::reranker::{Reranker, RerankerChoice, make_reranker};
 use pgmcp::stats::tracker::StatsTracker;
 
 use pgmcp_testing::eval::corpus;
-use pgmcp_testing::eval::query::{EvalQuery, GoldTarget, QueryStrategy, known_item_queries};
-use pgmcp_testing::eval::runner::{SearchMode, pattern_crowding_at_k, run_mode};
-use pgmcp_testing::eval::stats::{AlignedMetric, PairwiseComparison, compare_all_pairs, mean};
+use pgmcp_testing::eval::judge::JudgeClient;
+use pgmcp_testing::eval::query::{
+    ConceptualQuery, EvalQuery, GoldTarget, QueryStrategy, conceptual_queries, known_item_queries,
+};
+use pgmcp_testing::eval::rerank::{colbert_rerank, cross_encoder_rerank};
+use pgmcp_testing::eval::runner::{
+    GraphMode, SearchMode, fetch_candidates, fetch_semantic_candidates, pattern_crowding_at_k,
+    run_graph_mode, run_mode,
+};
+use pgmcp_testing::eval::stats::{
+    AlignedMetric, PairwiseComparison, cohens_kappa_quadratic, compare_all_pairs, mean,
+};
 
 const KS: [usize; 4] = [1, 5, 10, 20];
 const ALPHA: f64 = 0.05;
@@ -74,6 +87,10 @@ struct Args {
     run_m1: bool,
     m1_targets: usize,
     m1_distractors: usize,
+    rerank: bool,
+    rerank_fetch_n: i32,
+    graph: bool,
+    judge: bool,
     out: String,
 }
 
@@ -84,6 +101,10 @@ fn parse_args() -> Args {
         run_m1: false,
         m1_targets: 80,
         m1_distractors: 800,
+        rerank: false,
+        rerank_fetch_n: 30,
+        graph: false,
+        judge: false,
         out: "target/eval/retrieval_results.json".to_string(),
     };
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -92,6 +113,16 @@ fn parse_args() -> Args {
         match argv[i].as_str() {
             "--gpu" => a.gpu = true,
             "--m1" => a.run_m1 = true,
+            "--rerank" => a.rerank = true,
+            "--graph" => a.graph = true,
+            "--judge" => a.judge = true,
+            "--rerank-fetch-n" => {
+                i += 1;
+                a.rerank_fetch_n = argv
+                    .get(i)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(a.rerank_fetch_n);
+            }
             "--limit" => {
                 i += 1;
                 a.limit = argv.get(i).and_then(|s| s.parse().ok()).unwrap_or(a.limit);
@@ -165,6 +196,32 @@ struct EfPoint {
     mean_latency_ms: f64,
 }
 
+/// Provenance + inter-judge agreement summary for the LLM-as-judge stratum.
+#[derive(Serialize)]
+struct JudgeReport {
+    primary_model: String,
+    kappa_model: Option<String>,
+    n_queries_scored: usize,
+    n_candidates_graded: usize,
+    /// Count of each 0–3 grade the primary judge assigned (relevance distribution).
+    grade_histogram: BTreeMap<u8, usize>,
+    /// Pooled candidates judged relevant (grade ≥ 1), summed over queries.
+    n_relevant: usize,
+    /// Quadratic-weighted Cohen's κ between the two judges over the κ sample.
+    kappa_quadratic: Option<f64>,
+    kappa_n: usize,
+    pool_depth_per_mode: i32,
+    score_depth: i32,
+}
+
+/// The LLM-judge conceptual stratum: per-mode graded-relevance scores plus the
+/// judge provenance/agreement report.
+#[derive(Serialize)]
+struct JudgeStratum {
+    stratum: StratumResult,
+    report: JudgeReport,
+}
+
 #[derive(Serialize)]
 struct CampaignResults {
     note: String,
@@ -176,8 +233,20 @@ struct CampaignResults {
     ef_search_ablation: Vec<EfPoint>,
     truncation: serde_json::Value,
     m2_holdout: Option<StratumResult>,
+    /// The M2 holdout scored at CHUNK granularity — isolates the residual
+    /// per-chunk truncation cost (compare vs `m2_holdout`'s file granularity).
+    m2_holdout_chunk: Option<StratumResult>,
     m1: Option<StratumResult>,
     m1_redacted: Option<StratumResult>,
+    /// Reranker A/B strata (semantic vs cross-encoder vs ColBERT), one per query
+    /// set the rerank pass was run on. Empty unless `--rerank`.
+    rerank_strata: Vec<StratumResult>,
+    /// Graph-augmented A/B strata (semantic vs code_ppr/path/raptor). Empty
+    /// unless `--graph`.
+    graph_strata: Vec<StratumResult>,
+    /// LLM-as-judge conceptual stratum (graded relevance + κ). `None` unless
+    /// `--judge` and at least the primary judge was reachable.
+    judge: Option<JudgeStratum>,
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +330,7 @@ async fn run_m1_variant(
         EmbedSource::backend(Arc::clone(backend)),
         Arc::clone(config_arc),
     );
-    let result = run_stratum(&server, &queries, limit, label).await;
+    let result = run_stratum(&server, &queries, limit, MatchGranularity::File, label).await;
 
     // Teardown: close our pool, then terminate stragglers and drop the DB.
     pool.close().await;
@@ -291,25 +360,29 @@ async fn run_stratum(
     server: &McpServer,
     queries: &[EvalQuery],
     limit: i32,
+    gran: MatchGranularity,
     label: &str,
 ) -> StratumResult {
     let modes = SearchMode::all();
-    // per_query[qid][mode] = QueryMetrics
-    let mut per_query: HashMap<String, HashMap<SearchMode, QueryMetrics>> = HashMap::new();
-    let mut crowd: HashMap<SearchMode, Vec<f64>> = HashMap::new();
+    // per_query[qid][arm] = QueryMetrics (arm = mode tag here; rerank arms reuse
+    // the same shape via aggregate_stratum).
+    let mut per_query: HashMap<String, HashMap<String, QueryMetrics>> = HashMap::new();
+    let mut crowd: HashMap<String, Vec<f64>> = HashMap::new();
 
     for q in queries {
         for mode in modes {
             match run_mode(server, mode, &q.query, q.project.as_deref(), limit).await {
                 Ok(hits) => {
-                    let m =
-                        compute_query_metrics(&hits, &q.gold_items(), MatchGranularity::File, &KS);
-                    per_query.entry(q.id.clone()).or_default().insert(mode, m);
+                    let m = compute_query_metrics(&hits, &q.gold_items(), gran, &KS);
+                    per_query
+                        .entry(q.id.clone())
+                        .or_default()
+                        .insert(mode.tag().to_string(), m);
                     // Pattern-crowding only over queries whose gold is NOT itself a
                     // pattern file (else a pattern hit is correct, not crowding).
                     if !q.gold.iter().any(|g| g.path.starts_with("src/patterns/")) {
                         crowd
-                            .entry(mode)
+                            .entry(mode.tag().to_string())
                             .or_default()
                             .push(pattern_crowding_at_k(&hits, 5));
                     }
@@ -319,21 +392,37 @@ async fn run_stratum(
         }
     }
 
-    // Queries where ALL modes produced metrics — the paired-comparison set.
+    let arms: Vec<String> = modes.iter().map(|m| m.tag().to_string()).collect();
+    aggregate_stratum(label, queries.len(), &arms, &per_query, &crowd)
+}
+
+/// Aggregate per-query metrics (keyed by arm label) into a [`StratumResult`]:
+/// the paired-comparison set (queries where every arm produced metrics), aligned
+/// per-metric vectors, BH-corrected pairwise tests, per-arm means, and raw
+/// samples. Shared by [`run_stratum`] (search modes) and [`run_rerank_stratum`]
+/// (rerank arms).
+fn aggregate_stratum(
+    label: &str,
+    n_queries: usize,
+    arms: &[String],
+    per_query: &HashMap<String, HashMap<String, QueryMetrics>>,
+    crowd: &HashMap<String, Vec<f64>>,
+) -> StratumResult {
+    // Queries where ALL arms produced metrics — the paired-comparison set.
     let mut complete: Vec<String> = per_query
         .iter()
-        .filter(|(_, m)| modes.iter().all(|md| m.contains_key(md)))
+        .filter(|(_, m)| arms.iter().all(|a| m.contains_key(a)))
         .map(|(id, _)| id.clone())
         .collect();
     complete.sort();
 
-    // Aligned per-mode vectors for a metric, ordered by `complete`.
+    // Aligned per-arm vectors for a metric, ordered by `complete`.
     let aligned = |name: &str, f: &dyn Fn(&QueryMetrics) -> f64| -> AlignedMetric {
-        let by_mode = modes
+        let by_mode = arms
             .iter()
-            .map(|md| {
-                let v: Vec<f64> = complete.iter().map(|id| f(&per_query[id][md])).collect();
-                (md.tag().to_string(), v)
+            .map(|a| {
+                let v: Vec<f64> = complete.iter().map(|id| f(&per_query[id][a])).collect();
+                (a.clone(), v)
             })
             .collect();
         AlignedMetric {
@@ -351,26 +440,26 @@ async fn run_stratum(
     pairwise.extend(compare_all_pairs(&mrr, ALPHA));
     pairwise.extend(compare_all_pairs(&recall10, ALPHA));
 
-    // Per-mode means over the complete set.
-    let per_mode = modes
+    // Per-arm means over the complete set.
+    let per_mode = arms
         .iter()
-        .map(|md| {
+        .map(|a| {
             let rr: Vec<f64> = complete
                 .iter()
-                .map(|id| per_query[id][md].reciprocal_rank)
+                .map(|id| per_query[id][a].reciprocal_rank)
                 .collect();
             let nd: Vec<f64> = complete
                 .iter()
-                .map(|id| per_query[id][md].ndcg_at(10))
+                .map(|id| per_query[id][a].ndcg_at(10))
                 .collect();
             let s1: Vec<f64> = complete
                 .iter()
                 .map(|id| {
-                    per_query[id][md]
+                    per_query[id][a]
                         .at_k
                         .iter()
-                        .find(|a| a.k == 1)
-                        .map(|a| a.success)
+                        .find(|x| x.k == 1)
+                        .map(|x| x.success)
                         .unwrap_or(0.0)
                 })
                 .collect();
@@ -378,18 +467,18 @@ async fn run_stratum(
             for &k in &KS {
                 let rk: Vec<f64> = complete
                     .iter()
-                    .map(|id| per_query[id][md].recall_at(k))
+                    .map(|id| per_query[id][a].recall_at(k))
                     .collect();
                 recall_at.insert(k, mean(&rk));
             }
             ModeMeans {
-                mode: md.tag().to_string(),
+                mode: a.clone(),
                 n: complete.len(),
                 mrr: mean(&rr),
                 ndcg_at_10: mean(&nd),
                 success_at_1: mean(&s1),
                 recall_at,
-                pattern_crowding_at_5: mean(crowd.get(md).map(|v| v.as_slice()).unwrap_or(&[])),
+                pattern_crowding_at_5: mean(crowd.get(a).map(|v| v.as_slice()).unwrap_or(&[])),
             }
         })
         .collect();
@@ -403,12 +492,305 @@ async fn run_stratum(
 
     StratumResult {
         label: label.to_string(),
-        n_queries: queries.len(),
+        n_queries,
         n_complete: complete.len(),
         per_mode,
         pairwise,
         samples,
     }
+}
+
+/// Reranker A/B: for each query fetch the top-`fetch_n` semantic candidates
+/// (with passage content), then score three arms — `semantic` (the top-`limit`
+/// baseline), `rerank_xenc` (BGE cross-encoder), `rerank_colbert` (ColBERT
+/// MaxSim) — reusing [`aggregate_stratum`]. Arms whose model is absent are
+/// skipped. A wider `fetch_n` than `limit` lets a reranker promote a candidate
+/// from beyond the baseline top-`limit`, mirroring the `/api/search` pipeline.
+async fn run_rerank_stratum(
+    server: &McpServer,
+    queries: &[EvalQuery],
+    reranker: Option<&dyn Reranker>,
+    colbert: Option<&Embedder>,
+    fetch_n: i32,
+    limit: i32,
+    label: &str,
+) -> StratumResult {
+    let mut arms: Vec<String> = vec!["semantic".to_string()];
+    if reranker.is_some() {
+        arms.push("rerank_xenc".to_string());
+    }
+    if colbert.is_some() {
+        arms.push("rerank_colbert".to_string());
+    }
+    let mut per_query: HashMap<String, HashMap<String, QueryMetrics>> = HashMap::new();
+    let crowd: HashMap<String, Vec<f64>> = HashMap::new(); // crowding not meaningful here
+
+    for q in queries {
+        let cands = match fetch_semantic_candidates(server, &q.query, q.project.as_deref(), fetch_n)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("warn[{label}]: {} candidate fetch failed: {e}", q.id);
+                continue;
+            }
+        };
+        if cands.is_empty() {
+            continue;
+        }
+        let gold = q.gold_items();
+        let entry = per_query.entry(q.id.clone()).or_default();
+
+        // Baseline = semantic top-`limit` (the order semantic_search returns).
+        let base: Vec<_> = cands
+            .iter()
+            .take(limit as usize)
+            .map(|c| c.hit.clone())
+            .collect();
+        entry.insert(
+            "semantic".to_string(),
+            compute_query_metrics(&base, &gold, MatchGranularity::File, &KS),
+        );
+
+        if let Some(rr) = reranker {
+            match cross_encoder_rerank(rr, &q.query, &cands, limit as usize) {
+                Ok(reordered) => {
+                    entry.insert(
+                        "rerank_xenc".to_string(),
+                        compute_query_metrics(&reordered, &gold, MatchGranularity::File, &KS),
+                    );
+                }
+                Err(e) => eprintln!("warn[{label}]: {} xenc rerank failed: {e}", q.id),
+            }
+        }
+        if let Some(cb) = colbert {
+            match colbert_rerank(cb, &q.query, &cands, limit as usize) {
+                Ok(reordered) => {
+                    entry.insert(
+                        "rerank_colbert".to_string(),
+                        compute_query_metrics(&reordered, &gold, MatchGranularity::File, &KS),
+                    );
+                }
+                Err(e) => eprintln!("warn[{label}]: {} colbert rerank failed: {e}", q.id),
+            }
+        }
+    }
+
+    aggregate_stratum(label, queries.len(), &arms, &per_query, &crowd)
+}
+
+/// Graph-augmented A/B: for each query, score `semantic` (baseline top-`limit`)
+/// vs `code_ppr` / `code_path` / `code_raptor`, reusing [`aggregate_stratum`].
+/// All modes are scored at file granularity (paths/clusters flattened to files);
+/// a mode that errors or returns nothing for a query is simply absent for it
+/// (and that query drops from the paired-comparison set if any arm is missing).
+async fn run_graph_stratum(
+    server: &McpServer,
+    queries: &[EvalQuery],
+    limit: i32,
+    label: &str,
+) -> StratumResult {
+    let graph_modes = GraphMode::all();
+    let mut arms: Vec<String> = vec!["semantic".to_string()];
+    arms.extend(graph_modes.iter().map(|m| m.tag().to_string()));
+    let mut per_query: HashMap<String, HashMap<String, QueryMetrics>> = HashMap::new();
+    let crowd: HashMap<String, Vec<f64>> = HashMap::new();
+
+    for q in queries {
+        let gold = q.gold_items();
+        match run_mode(
+            server,
+            SearchMode::Semantic,
+            &q.query,
+            q.project.as_deref(),
+            limit,
+        )
+        .await
+        {
+            Ok(hits) => {
+                per_query.entry(q.id.clone()).or_default().insert(
+                    "semantic".to_string(),
+                    compute_query_metrics(&hits, &gold, MatchGranularity::File, &KS),
+                );
+            }
+            Err(e) => eprintln!("warn[{label}]: {} semantic failed: {e}", q.id),
+        }
+        for gm in graph_modes {
+            match run_graph_mode(server, gm, &q.query, q.project.as_deref(), limit).await {
+                Ok(hits) => {
+                    per_query.entry(q.id.clone()).or_default().insert(
+                        gm.tag().to_string(),
+                        compute_query_metrics(&hits, &gold, MatchGranularity::File, &KS),
+                    );
+                }
+                Err(e) => eprintln!("warn[{label}]: {} {} failed: {e}", q.id, gm.tag()),
+            }
+        }
+    }
+    aggregate_stratum(label, queries.len(), &arms, &per_query, &crowd)
+}
+
+/// Fetch a representative chunk's content for a path from the DB — the fallback
+/// passage for judge pooling when a mode returned a path without content (e.g.
+/// `text_search`). Returns the first chunk's content (file-granularity grading
+/// needs one representative passage, not every chunk).
+async fn fetch_chunk_content(pool: &PgPool, project: &str, path: &str) -> Option<String> {
+    sqlx::query_scalar(
+        "SELECT c.content FROM file_chunks c \
+         JOIN indexed_files f ON f.id = c.file_id \
+         JOIN projects p ON p.id = f.project_id \
+         WHERE p.name = $1 AND f.relative_path = $2 AND c.content IS NOT NULL \
+         ORDER BY c.start_line LIMIT 1",
+    )
+    .bind(project)
+    .bind(path)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+}
+
+/// LLM-as-judge conceptual stratum (Epic 2). For each conceptual query: pool the
+/// top-`pool_k` candidates across semantic/hybrid/text (TREC-style pooling),
+/// grade each pooled `(query, passage)` 0–3 with the PRIMARY judge to build the
+/// graded gold, then score each mode's top-`score_limit` ranking against that
+/// gold (reusing [`aggregate_stratum`]). A `kappa_sample` prefix of queries is
+/// re-graded by the SECOND judge to report cross-family quadratic Cohen's κ.
+/// Grading is point-wise (one candidate per call) so there is no list position
+/// bias, and the judge never sees which mode produced a candidate.
+#[allow(clippy::too_many_arguments)]
+async fn run_judge_stratum(
+    server: &McpServer,
+    pool: &PgPool,
+    conceptual: &[ConceptualQuery],
+    primary: &JudgeClient,
+    kappa_judge: Option<&JudgeClient>,
+    pool_k: i32,
+    score_limit: i32,
+    kappa_sample: usize,
+) -> JudgeStratum {
+    let modes = SearchMode::all();
+    let arms: Vec<String> = modes.iter().map(|m| m.tag().to_string()).collect();
+    let mut per_query: HashMap<String, HashMap<String, QueryMetrics>> = HashMap::new();
+    let crowd: HashMap<String, Vec<f64>> = HashMap::new();
+    let mut grade_histogram: BTreeMap<u8, usize> = BTreeMap::new();
+    let mut n_candidates_graded = 0usize;
+    let mut n_relevant = 0usize;
+    let mut kappa_a: Vec<u8> = Vec::new();
+    let mut kappa_b: Vec<u8> = Vec::new();
+
+    for (qi, cq) in conceptual.iter().enumerate() {
+        let project = cq.project.clone().unwrap_or_else(|| "pgmcp".to_string());
+
+        // 1. Pool candidates with content across all modes (union by path).
+        let mut order: Vec<String> = Vec::new();
+        let mut content_by_path: HashMap<String, String> = HashMap::new();
+        for mode in modes {
+            match fetch_candidates(server, mode, &cq.query, cq.project.as_deref(), pool_k).await {
+                Ok(cands) => {
+                    for c in cands {
+                        let p = c.hit.path.clone();
+                        if !content_by_path.contains_key(&p) {
+                            order.push(p.clone());
+                        }
+                        let slot = content_by_path.entry(p).or_default();
+                        if slot.is_empty() && !c.content.trim().is_empty() {
+                            *slot = c.content;
+                        }
+                    }
+                }
+                Err(e) => eprintln!("warn[judge]: {} {} pool failed: {e}", cq.id, mode.tag()),
+            }
+        }
+        // Fill missing content from the DB (e.g. text-only paths).
+        for p in &order {
+            let needs_content = content_by_path
+                .get(p)
+                .map(|s| s.trim().is_empty())
+                .unwrap_or(true);
+            if needs_content && let Some(content) = fetch_chunk_content(pool, &project, p).await {
+                content_by_path.insert(p.clone(), content);
+            }
+        }
+
+        // 2. Grade each pooled candidate → graded gold.
+        let do_kappa = kappa_judge.is_some() && qi < kappa_sample;
+        let mut gold: Vec<GoldItem> = Vec::new();
+        for p in &order {
+            let content = content_by_path.get(p).cloned().unwrap_or_default();
+            if content.trim().is_empty() {
+                continue; // no passage to grade
+            }
+            match primary.grade(&cq.query, p, &content).await {
+                Ok(g) => {
+                    *grade_histogram.entry(g).or_default() += 1;
+                    n_candidates_graded += 1;
+                    if g >= 1 {
+                        n_relevant += 1;
+                        gold.push(GoldItem {
+                            path: p.clone(),
+                            start_line: None,
+                            end_line: None,
+                            relevance: g as f64,
+                        });
+                    }
+                    if do_kappa && let Some(kj) = kappa_judge {
+                        match kj.grade(&cq.query, p, &content).await {
+                            Ok(g2) => {
+                                kappa_a.push(g);
+                                kappa_b.push(g2);
+                            }
+                            Err(e) => eprintln!("warn[judge]: {} κ grade failed: {e}", cq.id),
+                        }
+                    }
+                }
+                Err(e) => eprintln!("warn[judge]: {} grade `{p}` failed: {e}", cq.id),
+            }
+        }
+        if gold.is_empty() {
+            eprintln!(
+                "warn[judge]: {} — no relevant candidate (all graded 0), skipping",
+                cq.id
+            );
+            continue;
+        }
+
+        // 3. Score each mode's ranking against the judge-built graded gold.
+        for mode in modes {
+            match run_mode(server, mode, &cq.query, cq.project.as_deref(), score_limit).await {
+                Ok(hits) => {
+                    per_query.entry(cq.id.clone()).or_default().insert(
+                        mode.tag().to_string(),
+                        compute_query_metrics(&hits, &gold, MatchGranularity::File, &KS),
+                    );
+                }
+                Err(e) => eprintln!("warn[judge]: {} {} score failed: {e}", cq.id, mode.tag()),
+            }
+        }
+    }
+
+    let stratum = aggregate_stratum(
+        "judge_conceptual",
+        conceptual.len(),
+        &arms,
+        &per_query,
+        &crowd,
+    );
+    let kappa_quadratic =
+        (kappa_a.len() >= 2).then(|| cohens_kappa_quadratic(&kappa_a, &kappa_b, 3));
+    let report = JudgeReport {
+        primary_model: primary.signature().to_string(),
+        kappa_model: kappa_judge.map(|k| k.signature().to_string()),
+        n_queries_scored: stratum.n_complete,
+        n_candidates_graded,
+        grade_histogram,
+        n_relevant,
+        kappa_quadratic,
+        kappa_n: kappa_a.len(),
+        pool_depth_per_mode: pool_k,
+        score_depth: score_limit,
+    };
+    JudgeStratum { stratum, report }
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +896,14 @@ async fn main() -> Result<()> {
     eprintln!("[A] running known-item stratum…");
     let ki = known_item_queries();
     ki.validate();
-    let known_item = run_stratum(&live_server, &ki.queries, args.limit, "known_item").await;
+    let known_item = run_stratum(
+        &live_server,
+        &ki.queries,
+        args.limit,
+        MatchGranularity::File,
+        "known_item",
+    )
+    .await;
 
     // --- HNSW honesty + ef_search ablation (project-scoped to pgmcp) ---
     eprintln!("[hnsw] measuring HNSW-vs-exact recall + ef_search ablation…");
@@ -596,6 +985,7 @@ async fn main() -> Result<()> {
     // measurement (semantic lacks the tail; the FTS index has it). Runs on the
     // live corpus — no isolated DB, no re-embedding — so it is always enabled.
     eprintln!("[B/M2] building token-holdout corpus (live, leak-free)…");
+    let mut m2_queries_captured: Vec<EvalQuery> = Vec::new();
     let window = if emb_cfg.max_length == 0 {
         512
     } else {
@@ -641,7 +1031,17 @@ async fn main() -> Result<()> {
                             )),
                         })
                         .collect();
-                    Some(run_stratum(&live_server, &m2_queries, args.limit, "m2_holdout").await)
+                    m2_queries_captured = m2_queries.clone();
+                    Some(
+                        run_stratum(
+                            &live_server,
+                            &m2_queries,
+                            args.limit,
+                            MatchGranularity::File,
+                            "m2_holdout",
+                        )
+                        .await,
+                    )
                 }
             }
             Err(e) => {
@@ -653,6 +1053,30 @@ async fn main() -> Result<()> {
             eprintln!("[B/M2] SKIPPED: model dir unavailable: {e}");
             None
         }
+    };
+
+    // Chunk-granularity M2 (truncation isolation): the same beyond-window
+    // holdout queries scored at CHUNK granularity. Comparing semantic's
+    // file-granularity recall (`m2_holdout`) against its chunk-granularity recall
+    // here isolates the residual per-chunk truncation cost (threat T8) — the
+    // right *file* is retrieved, but the right *chunk* ranks lower because its
+    // >512-token embedding dropped the tail. (text_search returns no line spans,
+    // so its chunk-gran row is degenerate; the semantic/hybrid rows carry the
+    // signal.)
+    let m2_holdout_chunk = if m2_queries_captured.is_empty() {
+        None
+    } else {
+        eprintln!("[B/M2-chunk] scoring holdout at chunk granularity…");
+        Some(
+            run_stratum(
+                &live_server,
+                &m2_queries_captured,
+                args.limit,
+                MatchGranularity::Chunk,
+                "m2_holdout_chunk",
+            )
+            .await,
+        )
     };
 
     // --- Strategy B: M1 leakage-controlled docstring (optional) ---
@@ -721,6 +1145,188 @@ async fn main() -> Result<()> {
         }
     }
 
+    // --- Reranker A/B (--rerank): semantic vs cross-encoder vs ColBERT ---
+    // Second-stage rerank lift over plain dense retrieval, on the live strata
+    // (known-item + M2 holdout). Models are local; the cross-encoder is
+    // GPU-greedy with no use_gpu knob, so run with CUDA_VISIBLE_DEVICES="" to
+    // force CPU alongside the daemon.
+    let mut rerank_strata: Vec<StratumResult> = Vec::new();
+    if args.rerank {
+        eprintln!("[rerank] loading BGE cross-encoder + ColBERT embedder…");
+        let reranker: Option<Box<dyn Reranker>> =
+            match tokio::task::spawn_blocking(|| make_reranker(RerankerChoice::BgeV2M3)).await {
+                Ok(Ok(opt)) => opt,
+                Ok(Err(e)) => {
+                    eprintln!("[rerank] cross-encoder load failed: {e}");
+                    None
+                }
+                Err(e) => {
+                    eprintln!("[rerank] cross-encoder load panicked: {e}");
+                    None
+                }
+            };
+        let colbert: Option<Embedder> = {
+            let mut cfg = emb_cfg.clone();
+            cfg.use_gpu = args.gpu; // follow --gpu (free GPU → fast ColBERT; else CPU)
+            match tokio::task::spawn_blocking(move || Embedder::new(&cfg)).await {
+                Ok(Ok(e)) if e.has_colbert() => Some(e),
+                Ok(Ok(_)) => {
+                    eprintln!("[rerank] ColBERT head absent — skipping ColBERT arm");
+                    None
+                }
+                Ok(Err(e)) => {
+                    eprintln!("[rerank] ColBERT embedder load failed: {e}");
+                    None
+                }
+                Err(e) => {
+                    eprintln!("[rerank] ColBERT embedder panicked: {e}");
+                    None
+                }
+            }
+        };
+        if reranker.is_some() || colbert.is_some() {
+            eprintln!("[rerank] known-item A/B…");
+            rerank_strata.push(
+                run_rerank_stratum(
+                    &live_server,
+                    &ki.queries,
+                    reranker.as_deref(),
+                    colbert.as_ref(),
+                    args.rerank_fetch_n,
+                    args.limit,
+                    "rerank_known_item",
+                )
+                .await,
+            );
+            if !m2_queries_captured.is_empty() {
+                eprintln!("[rerank] M2 holdout A/B…");
+                rerank_strata.push(
+                    run_rerank_stratum(
+                        &live_server,
+                        &m2_queries_captured,
+                        reranker.as_deref(),
+                        colbert.as_ref(),
+                        args.rerank_fetch_n,
+                        args.limit,
+                        "rerank_m2_holdout",
+                    )
+                    .await,
+                );
+            }
+        } else {
+            eprintln!("[rerank] no reranker model available — skipping rerank A/B");
+        }
+    }
+
+    // --- Graph-augmented modes (--graph): semantic vs code_ppr/path/raptor ---
+    // Calls the graph-aware MCP tools in-process; their artifacts
+    // (code_graph_edges, code_summary_tree) must be populated.
+    let mut graph_strata: Vec<StratumResult> = Vec::new();
+    if args.graph {
+        eprintln!("[graph] known-item A/B (semantic vs code_ppr/path/raptor)…");
+        graph_strata.push(
+            run_graph_stratum(&live_server, &ki.queries, args.limit, "graph_known_item").await,
+        );
+        if !m2_queries_captured.is_empty() {
+            eprintln!("[graph] M2 holdout A/B…");
+            graph_strata.push(
+                run_graph_stratum(
+                    &live_server,
+                    &m2_queries_captured,
+                    args.limit,
+                    "graph_m2_holdout",
+                )
+                .await,
+            );
+        }
+    }
+
+    // --- LLM-as-judge conceptual stratum (--judge): grades run on sparky ---
+    // Pools candidates across modes, grades them 0–3 with a local LLM judge
+    // (qwen3-32B on sparky's ollama by default), scores each mode against the
+    // judge-built graded gold, and cross-checks a sample with a second judge
+    // (DeepSeek-V4) for Cohen's κ. Endpoints/models/sizes are overridable via
+    // PGMCP_JUDGE_* env vars. Both judges are probed first; the κ judge is
+    // best-effort (κ = None if it is unreachable).
+    let judge = if args.judge {
+        let primary_url = std::env::var("PGMCP_JUDGE_PRIMARY_URL")
+            .unwrap_or_else(|_| "http://sparky:11434/v1".to_string());
+        let primary_model =
+            std::env::var("PGMCP_JUDGE_PRIMARY_MODEL").unwrap_or_else(|_| "qwen3:32b".to_string());
+        let kappa_url = std::env::var("PGMCP_JUDGE_KAPPA_URL")
+            .unwrap_or_else(|_| "http://localhost:8001/v1".to_string());
+        let kappa_model = std::env::var("PGMCP_JUDGE_KAPPA_MODEL")
+            .unwrap_or_else(|_| "deepseek-v4-pro".to_string());
+        let api_key = std::env::var("PGMCP_JUDGE_API_KEY").ok();
+        let pool_k: i32 = std::env::var("PGMCP_JUDGE_POOL_K")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(12);
+        let kappa_sample: usize = std::env::var("PGMCP_JUDGE_KAPPA_SAMPLE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(10);
+        let conceptual = conceptual_queries();
+        let score_depth = args.limit.min(10); // ≤ pool_k so every scored hit was graded
+
+        match JudgeClient::new(&primary_url, &primary_model, api_key.clone()) {
+            Ok(primary) => {
+                eprintln!("[judge] primary {primary_model} @ {primary_url} — smoke test…");
+                match primary.smoke().await {
+                    Ok(g) => {
+                        eprintln!("[judge] primary OK (smoke grade={g}); building κ judge…");
+                        let kappa_judge = match JudgeClient::new(&kappa_url, &kappa_model, api_key)
+                        {
+                            Ok(kj) => match kj.smoke().await {
+                                Ok(_) => {
+                                    eprintln!("[judge] κ judge {kappa_model} @ {kappa_url} OK");
+                                    Some(kj)
+                                }
+                                Err(e) => {
+                                    eprintln!("[judge] κ judge unreachable ({e}); κ skipped");
+                                    None
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!("[judge] κ judge init failed ({e}); κ skipped");
+                                None
+                            }
+                        };
+                        eprintln!(
+                            "[judge] grading {} conceptual queries (pool_k={pool_k}, score_depth={score_depth}, κ-sample={kappa_sample})…",
+                            conceptual.len()
+                        );
+                        Some(
+                            run_judge_stratum(
+                                &live_server,
+                                &pool,
+                                &conceptual,
+                                &primary,
+                                kappa_judge.as_ref(),
+                                pool_k,
+                                score_depth,
+                                kappa_sample,
+                            )
+                            .await,
+                        )
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[judge] primary judge unreachable ({e}); skipping judge stratum"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[judge] primary judge init failed ({e}); skipping");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let results = CampaignResults {
         note: "pgmcp retrieval-quality campaign. All metrics rank-based. \
                 Cross-mode comparison at file granularity (uniform key)."
@@ -733,8 +1339,12 @@ async fn main() -> Result<()> {
         ef_search_ablation,
         truncation,
         m2_holdout,
+        m2_holdout_chunk,
         m1,
         m1_redacted,
+        rerank_strata,
+        graph_strata,
+        judge,
     };
 
     // Write JSON artifact.
@@ -758,11 +1368,37 @@ fn print_summary(r: &CampaignResults) {
     if let Some(m2) = &r.m2_holdout {
         print_stratum(m2);
     }
+    if let Some(m2c) = &r.m2_holdout_chunk {
+        print_stratum(m2c);
+    }
     if let Some(m1) = &r.m1 {
         print_stratum(m1);
     }
     if let Some(m3) = &r.m1_redacted {
         print_stratum(m3);
+    }
+    for rr in &r.rerank_strata {
+        print_stratum(rr);
+    }
+    for g in &r.graph_strata {
+        print_stratum(g);
+    }
+    if let Some(j) = &r.judge {
+        print_stratum(&j.stratum);
+        let rep = &j.report;
+        println!(
+            "   judge: primary={} graded={} relevant={} grades={:?}",
+            rep.primary_model, rep.n_candidates_graded, rep.n_relevant, rep.grade_histogram
+        );
+        match (rep.kappa_quadratic, &rep.kappa_model) {
+            (Some(k), Some(m)) => {
+                println!(
+                    "   κ (quadratic-weighted, vs {m}, n={}): {:.3}",
+                    rep.kappa_n, k
+                )
+            }
+            _ => println!("   κ: n/a (second judge unavailable)"),
+        }
     }
     println!(
         "\n── HNSW vs exact (ef=100): mean recall@10 = {:.3} ──",

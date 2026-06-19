@@ -64,6 +64,7 @@ pub mod ontology_migrate;
 pub mod ontology_reason;
 #[allow(dead_code)]
 pub mod quality_history;
+pub mod retrieval_eval;
 #[allow(dead_code)]
 pub mod scheduler;
 pub mod security_scan;

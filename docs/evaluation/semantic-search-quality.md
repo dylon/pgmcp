@@ -53,6 +53,25 @@ The headline gap is **conceptual-vs-lexical**, not semantic-vs-hybrid: pgmcp's
 dense retrieval is doing its job; the lexical and fused modes are the right tools
 for *different* (keyword-precise) queries, which this set deliberately excludes.
 
+**Follow-up campaigns (Epics 1–4, 2026-06-19) — all four implemented, local-model-first:**
+
+- **Reranking (§5.7, F7):** local **ColBERT** MaxSim is a small-but-consistent win
+  on lexical M2 (nDCG +0.07, paired `p` = 0.003) and neutral on conceptual → the
+  safe default; the BGE cross-encoder *hurts* lexical (nDCG δ = −0.24) → gated off.
+- **Graph modes (§5.8, F8):** `code_ppr` / `code_path` / `code_raptor` all trail
+  flat semantic for single-target retrieval — they *complement* (relational /
+  module queries), not replace, dense search.
+- **LLM-as-judge (§5.9, F9):** an independent local judge (**DeepSeek-V4**,
+  cross-family Cohen's **κ = 0.81** vs Qwen3-14B) over 40 conceptual queries
+  confirms the routing rule with a *large* effect — **semantic nDCG@10 0.87 ≫
+  hybrid 0.72** (fusion hurts conceptual).
+- **Truncation (§5.5, F4):** the chunk-granularity pass quantifies the 512-token
+  cost — semantic recall@10 0.90 (file) → **0.65 (chunk)**, a ≈ 25-point per-chunk
+  penalty.
+- A **CI regression gate** + opt-in **drift cron** now guard retrieval quality;
+  **ADR-020** records the best-model-per-purpose portfolio. (Experiments
+  #106 / #107 / #108.)
+
 ---
 
 ## 2. Why this evaluation exists
@@ -388,14 +407,19 @@ prose / transcript chunks routinely exceed it. **≈ 23 % of the corpus has cont
 beyond the embedding window** — that tail is silently dropped from the dense
 vector (it survives in `content_tsv`, creating a dense/lexical asymmetry), so a
 chunk whose answer lives past token 512 is dense-unreachable *at the chunk level*.
-**The M2 hold-out (§5.3) measures the retrieval impact directly and finds it
-softened**: at the file level semantic still reaches the right file 88 % of the
-time, because overlapping per-file chunks embed the tail in a neighbour. So this
-is a *latent* lever, not an acute failure. (The proxy is char-based at ~4
-chars/token; the M2 path now loads the real tokenizer, so a precise per-chunk
-truncation count is a cheap extension.) **Recommendation:** AST/heading-aware
-sub-chunking to keep semantic units under the window, or a larger `max_length`
-for long-form documents.
+**The M2 hold-out (§5.3) measures the retrieval impact directly.** At the **file**
+level semantic still reaches the right file ≈ 90 % of the time (recall@10),
+because overlapping per-file chunks embed the tail in a neighbour — file-level
+retrieval is *softened*. But the **chunk-granularity** M2 pass (`m2_holdout_chunk`,
+scoring the exact hold-out chunk by its line span; GPU run 2026-06-19) isolates
+the residual cost: semantic recall@10 falls to **0.65** and nDCG@10 to **0.565** —
+a **≈ 25-point** per-chunk penalty. The right *file* is found; the truncated
+*chunk* ranks below its untruncated neighbours. **Hybrid narrows the gap** (file
+0.975 → chunk 0.863) because the dropped tail survives in `content_tsv`, so BM25
+still matches it — direct confirmation of the dense/lexical asymmetry. So
+truncation is a *latent* lever at the file level but a *real* ≈ 25-point cost at
+the chunk level. **Recommendation:** AST/heading-aware sub-chunking to keep
+semantic units under the window, or a larger `max_length` for long-form documents.
 
 ### 5.6 Pattern-catalog crowding
 
@@ -403,6 +427,129 @@ Across known-item queries whose gold is *not* a pattern file, `src/patterns/*`
 catalog cards occupy only **3.7 %** of top-5 slots (semantic and hybrid alike).
 The ~810-entry catalog is **not** the dominant distractor that generic ad-hoc
 probing implied — well-specified intent queries are not crowded out by it.
+
+### 5.7 Reranker A/B — cross-encoder vs ColBERT (Epic 1)
+
+A flat dense top-k leaves top-rank headroom (known-item Success@1 ≈ 0.14). Two
+**local** second-stage rerankers re-score the top-30 `semantic_search`
+candidates (carrying chunk content) and reorder the top-20: the
+**BGE-reranker-v2-m3 cross-encoder** (`src/reranker/bge_v2_m3.rs`, a single-label
+relevance head) and **BGE-M3 ColBERT MaxSim** late-interaction (`embed_colbert` +
+`colbert_maxsim`). Both run on the local GPU; scored against the same gold as
+§5.1 / §5.3 (GPU/BF16 run, 2026-06-19).
+
+| stratum · mode | MRR | nDCG@10 | Success@1 | recall@10 |
+|---|---:|---:|---:|---:|
+| **known-item** (N=50) · semantic | 0.303 | 0.405 | 0.140 | 0.740 |
+| ·· + cross-encoder | 0.339 | 0.402 | **0.200** | 0.640 |
+| ·· + ColBERT | 0.287 | 0.363 | 0.140 | 0.640 |
+| **M2 holdout** (N=80) · semantic | 0.698 | 0.746 | 0.575 | 0.900 |
+| ·· + cross-encoder | 0.525 | 0.594 | 0.388 | 0.838 |
+| ·· + ColBERT | **0.787** | **0.821** | **0.713** | **0.925** |
+
+Significant pairs (BH-adjusted, α = 0.05). On **M2** ColBERT beats semantic
+(nDCG δ = +0.126, `p_adj = 0.003`; MRR δ = +0.125, `p_adj = 0.005`) and the
+cross-encoder *loses* to semantic (nDCG δ = −0.241 *small*, `p_adj = 0.0008`; MRR
+δ = −0.235, `p_adj = 0.001`); ColBERT beats the cross-encoder decisively
+(nDCG δ = +0.349 *medium*, `p_adj < 10⁻⁴`). On **known-item** no rerank pair is
+significant — the cross-encoder nudges Success@1 0.14 → 0.20 and MRR up, but
+trades recall@10 down (0.74 → 0.64) and leaves nDCG flat.
+
+The ColBERT lift is **small** (mean nDCG +0.074, 0.746 → 0.821; Cliff's δ = 0.126,
+*negligible*): it is significant under the **paired** Wilcoxon that exploits the
+within-query design (`p_adj = 0.003`), but *not* under an unpaired Welch's t
+(`p = 0.077`, Cohen's d = 0.23) — the pre-registered test in **experiment #106**
+(`docs/scientific-ledger/reranker-a-b-…-2026-06-19.md`), recorded as REJECTED to
+avoid p-hacking. So the honest reading is "a real, consistent, *modest* lexical
+gain," not a large one.
+
+**Reading.** Reranking is **query-distribution-dependent**, mirroring the hybrid
+finding (F6): late-interaction **ColBERT** is a small-but-consistent win on
+lexical / verbatim queries (M2) and neutral on conceptual ones (known-item) — its
+value is **no downside anywhere**, so it is the safe reranker. The
+**cross-encoder** *hurts* verbatim queries (trained on natural-language
+query↔passage relevance, it misjudges a text-tail-vs-code pair) while giving only
+a non-significant top-rank nudge on conceptual ones, so it must not be enabled
+blanket. → **F7**.
+
+### 5.8 Graph-augmented retrieval modes (Epic 3)
+
+pgmcp ships three graph-aware retrieval tools over the code graph
+(`code_graph_edges` 1.14 M edges, `file_symbols` 452 K, `code_summary_tree` 759):
+**`code_ppr_search`** (Personalized PageRank / HippoRAG → ranked files),
+**`code_path_search`** (PathRAG → flow-pruned dependency routes), and
+**`code_raptor_search`** (RAPTOR module-cluster summaries). Each is reduced to a
+file-granularity ranked list (a route / cluster "hits" if it contains the gold
+file) and scored against the §5.1 / §5.3 gold.
+
+| stratum · mode | MRR | nDCG@10 | Success@1 | recall@10 |
+|---|---:|---:|---:|---:|
+| **known-item** (N=50) · semantic | 0.302 | 0.405 | 0.140 | 0.740 |
+| ·· code_ppr | 0.279 | 0.333 | 0.140 | 0.520 |
+| ·· code_path | 0.183 | 0.195 | 0.160 | 0.240 |
+| ·· code_raptor | 0.004 | 0.000 | 0.000 | 0.000 |
+| **M2 holdout** (N=80) · semantic | 0.697 | 0.746 | 0.575 | 0.900 |
+| ·· code_ppr | 0.474 | 0.531 | 0.350 | 0.713 |
+| ·· code_path | 0.374 | 0.388 | 0.350 | 0.438 |
+| ·· code_raptor | 0.000 | 0.000 | 0.000 | 0.000 |
+
+Every graph mode is significantly *below* flat semantic for single-target
+retrieval (known-item recall@10: ppr δ = −0.220 `p_adj = 0.003`; path δ = −0.500
+*large*; raptor δ = −0.740 *large*; same ordering on M2) — **experiment #107**
+(`docs/scientific-ledger/graph-augmented-…-2026-06-19.md`) records the
+"graph-beats-flat" hypothesis as REJECTED. This is **expected and correct**: these tools answer *relational* ("how does A reach B") and
+*conceptual-module* ("which module owns X") questions, not "find the one file" —
+that is `semantic_search`'s job. Among them **`code_ppr` is the strongest** (it
+restarts PageRank on the dense hits, so it inherits semantic's recall then
+re-ranks by graph proximity) and ties Success@1 with semantic on known-item.
+**`code_raptor` scores ≈ 0 at file granularity**: the pgmcp RAPTOR clusters are
+very coarse (3 clusters spanning 193 / 105 / 561 files) and the tool returns only
+~12 `sample_files` per cluster, so single-file matching is near-impossible — a
+real signal that RAPTOR clustering for this corpus is **under-resolved** (its
+HDBSCAN / c-TF-IDF parameters want tuning) and that RAPTOR is a *navigation* aid,
+not a retrieval ranker. → **F8**.
+
+### 5.9 LLM-as-judge — graded relevance over conceptual queries (Epic 2)
+
+The known-item and M2 strata use objective single-target gold. *Conceptual*
+queries ("how does this project handle retries") have no single gold file, so
+relevance is **graded by a local LLM judge** over pooled candidates. 40 conceptual
+queries (`conceptual_queries()`); for each, the top-10 of semantic / hybrid / text
+are **pooled** (TREC-style — union ≈ 9 unique files/query, **361 graded**) and each
+`(query, passage)` is graded 0–3 by **DeepSeek-V4-pro** (on the `sparky` DGX Spark)
+with a fixed rubric. Grading is **point-wise** (one candidate per call → no list
+position bias) and **system-blind** (the judge never sees which mode produced a
+candidate); the grades become the graded gold the rank metrics score against.
+
+**Judge reliability.** A **cross-family** second judge (**Qwen3-14B**, also local
+on sparky) re-graded a 53-pair sample; quadratic-weighted Cohen's **κ = 0.812** —
+"almost perfect" (Landis–Koch). Two independent model *families* agreeing this
+strongly means the grades reflect relevance, not one model's idiosyncrasy. The
+grade distribution is non-degenerate — {irrelevant 118, marginal 111, relevant 25,
+highly-relevant 107} — so the judge discriminates. (qwen3-32B CPU-offloads on the
+GB10 ollama and was unusable as the κ partner; see ADR-020.)
+
+| mode | MRR | nDCG@10 | recall@1 | recall@10 |
+|---|---:|---:|---:|---:|
+| **semantic** | **0.954** | **0.874** | 0.164 | **0.986** |
+| hybrid | 0.770 | 0.718 | 0.109 | 0.885 |
+| text | 0.338 | 0.110 | 0.040 | 0.086 |
+
+All pairwise differences are significant (BH-adjusted, α = 0.05). **Semantic
+decisively beats hybrid** (nDCG δ = −0.598 *large*, `p_adj < 10⁻⁴`; MRR δ = −0.344
+*medium*; recall@10 δ = −0.456 *medium*), which in turn dominates text
+(nDCG δ = −0.994). (recall@1 is low for *all* modes because conceptual queries
+average ≈ 6 judged-relevant files each — 243 relevant / 40 — so one relevant file
+at rank 1 is only ≈ 0.16 recall; MRR 0.954 confirms the rank-1 file *is* relevant.)
+
+**Reading.** This is the **strong form of F2**: on *purely* conceptual queries
+**fusion hurts**, with a *large* effect (vs the *negligible* known-item gap in
+§5.1, whose set deliberately mixes lexical-friendly queries) — BM25's lexical leg
+pulls in keyword-matching non-answers that displace semantically-relevant ones,
+and an *independent* LLM judge (κ = 0.81) confirms it. Together with F6 (hybrid
+*wins* lexical/verbatim M2), the routing rule is now fully evidenced and
+consistent: **conceptual → `semantic_search`; keyword/verbatim → `hybrid_search`.**
+→ **F9**.
 
 ---
 
@@ -414,8 +561,11 @@ probing implied — well-specified intent queries are not crowded out by it.
 | F2 | Hybrid slightly hurts on purely-conceptual queries (ties on docstrings) | known-item δ = −0.114, `p_adj < 10⁻⁴`, equal recall@10; M1 δ = −0.003, `p_adj = 0.10` (n.s.) | prefer semantic, or raise `semantic_weight`, for known-conceptual use |
 | F6 | Hybrid **wins** on lexical / verbatim queries | M2 nDCG δ = +0.159 *small*, `p_adj = 0.01`; recall@10 hybrid 0.98 > sem 0.88 > text 0.72 | route keyword/exact queries to `hybrid_search` (raise `bm25_weight`); the fuse-vs-pure choice is **query-distribution-dependent** |
 | F3 | HNSW is lossless at this scale | recall-vs-exact = 1.000 ∀ ef | leave `ef_search = 100`; re-ablate if a project 10×'s in size |
-| F4 | ≈ 23 % of chunks exceed the 512-token window (impact softened) | 147 K / 644 K > 2048 chars; M2 file-level recall@10 0.88 despite hold-out | AST/heading-aware sub-chunking, or larger `max_length` for prose |
+| F4 | ≈ 23 % of chunks exceed the 512-token window — *file*-level softened, *chunk*-level real | 147 K / 644 K > 2048 chars; M2 **file** recall@10 0.90 but **chunk** recall@10 0.65 (≈ 25 pp per-chunk cost); hybrid chunk 0.86 (tail survives in `content_tsv`) | AST/heading-aware sub-chunking, or larger `max_length` for prose |
 | F5 | Pattern-catalog crowding is mild | 3.7 % of top-5 | no action needed |
+| F7 | Reranking is query-distribution-dependent | M2: ColBERT nDCG δ = +0.126 (`p_adj` = 0.003); cross-encoder nDCG δ = −0.241 (`p_adj` = 0.0008); known-item all n.s. | enable **ColBERT** rerank as a safe default; gate the **cross-encoder** to conceptual queries only (or leave off) |
+| F8 | Graph modes complement, not replace, dense retrieval | known-item + M2 all below semantic; `code_ppr` closest (ties Success@1), `code_raptor` ≈ 0 at file granularity | keep graph tools for relational / module queries; tune the (too-coarse) RAPTOR clustering |
+| F9 | On purely-conceptual queries pure semantic beats fusion (*large* effect, LLM-judged) | judge stratum nDCG δ = −0.598 (`p_adj` < 10⁻⁴), recall@10 δ = −0.456; cross-family judge κ = 0.81 | route conceptual → `semantic_search`, keyword/verbatim → `hybrid_search` — this query-distribution routing (with F6) is the load-bearing rule |
 
 ---
 
@@ -447,11 +597,20 @@ probing implied — well-specified intent queries are not crowded out by it.
   (2026-06-17); every qualitative conclusion (mode ordering, significance,
   effect-size class) held across all runs. For a frozen baseline, snapshot the
   corpus (or pin a non-self-modifying project) before the run.
-- **T8 — M2 granularity.** The token-hold-out is scored at file granularity, so a
-  file's overlapping chunks can satisfy a query drawn from one chunk's tail; this
-  measures *file-level* truncation robustness, not the residual *per-chunk* cost
-  (which a chunk-granularity pass would isolate). The real tokenizer is now wired
-  (`bge_m3_model_dir`), so that pass is a cheap extension.
+- **T8 — M2 granularity (resolved).** The headline token-hold-out is scored at
+  file granularity, so a file's overlapping chunks can satisfy a query drawn from
+  one chunk's tail — measuring *file-level* truncation robustness. The residual
+  *per-chunk* cost is **now measured directly** by the chunk-granularity M2 pass
+  (§5.5, `m2_holdout_chunk`): semantic recall@10 **0.65** at chunk granularity vs
+  **0.90** at file granularity — a ≈ 25-point per-chunk truncation penalty. (Text
+  has no line spans, so only the semantic/hybrid chunk-gran rows are meaningful.)
+- **T9 — LLM-judge validity (Epic 2).** Conceptual relevance (§5.9) is graded by
+  an LLM (DeepSeek-V4), which could encode that model's biases. Mitigated three
+  ways: a fixed 0–3 rubric; **point-wise, system-blind** grading (the judge never
+  sees which mode produced a candidate, so it cannot favour one); and a
+  **cross-family** agreement check — Qwen3-14B re-graded a 53-pair sample at
+  quadratic-weighted Cohen's **κ = 0.81** ("almost perfect"). Only the conceptual
+  stratum is LLM-graded; known-item / M1 / M2 use objective gold.
 
 ---
 
@@ -484,28 +643,37 @@ written into the results JSON for re-analysis and for the experiment ledger.
 
 ---
 
-## 9. Follow-ups (out of this campaign's scope)
+## 9. Follow-ups — status
 
-- **LLM-as-judge pooled relevance** for conceptual queries with no single gold
-  file — graded nDCG with dual-judge Cohen's κ, **local-model-first** (qwen3) with
-  a stronger judge only as a κ cross-check.
-- **Graph-augmented modes** (`code_ppr_search` / `code_path_search` /
-  `code_raptor_search`) — requires building the symbol / graph / RAPTOR cron
-  artifacts first, then file/module-granularity scoring.
-- **CI regression gate** — a small frozen subset as a `#[test]` with MRR/recall
-  floors + a drift cron, so quality regressions fail the build.
-- **Per-chunk truncation pass + AST-aware sub-chunking** (F4 / T8) — the real
-  BGE-M3 tokenizer is now wired (`bge_m3_model_dir`), so a chunk-granularity M2
-  variant can isolate the residual per-chunk truncation cost; then trial
-  AST/heading-aware sub-chunking against this harness.
-- **Reranker A/B** — `src/reranker/bge_v2_m3.rs` (cross-encoder) and the ColBERT
-  MaxSim path exist but are off (`rerank_hook=false` / `colbert_rerank=false`);
-  turning them on and measuring the nDCG@10 / Success@1 lift on this benchmark is
-  a high-ROI, fully-local experiment (Success@1 = 0.14 leaves headroom).
+The four follow-up epics designed after the original campaign are now
+**implemented** (2026-06-19); this section records where each landed.
 
-(The earlier `experiment_open` criterion limitation is **resolved** in this
-changeset — it now accepts a string-encoded `acceptance_criterion`, so the ledger
-can pre-register the paired Wilcoxon directly after a daemon restart.)
+- **✓ Reranker A/B (Epic 1)** → §5.7, finding **F7**, experiment **#106**
+  (`docs/scientific-ledger/reranker-a-b-…-2026-06-19.md`). ColBERT = safe default;
+  cross-encoder gated off. (`pgmcp-testing/src/eval/rerank.rs`, `--rerank`.)
+- **✓ Graph-augmented modes (Epic 3)** → §5.8, finding **F8**. PPR / PathRAG /
+  RAPTOR scored at file granularity; graph *complements*, not replaces, dense
+  retrieval. (`pgmcp-testing/src/eval/runner.rs::GraphMode`, `--graph`.)
+- **✓ LLM-as-judge pooled relevance (Epic 2)** → §5.9. Local-first: DeepSeek-V4
+  primary + a Qwen3 cross-family Cohen's κ, both on the `sparky` DGX Spark.
+  (`pgmcp-testing/src/eval/judge.rs`, `--judge`, `PGMCP_JUDGE_*` env.)
+- **✓ CI regression gate + drift cron (Epic 3)** → a frozen probe set
+  (`src/quality/retrieval_drift.rs`) drives **both** the `#[test]` gate
+  (`pgmcp-testing/tests/eval_semantic_quality.rs`, MRR/recall floors, validated
+  live at MRR 0.38 / recall@10 0.75) **and** the opt-in `retrieval-eval` cron
+  (`src/cron/retrieval_eval.rs`; `[cron] retrieval_eval_interval_secs`).
+- **✓ Per-chunk truncation pass (F4 / T8)** → §5.5, the chunk-granularity M2
+  variant (`m2_holdout_chunk`).
+- **✓ Best-model-per-purpose audit (Epic 4)** → **ADR-020**
+  (`docs/decisions/020-best-model-per-purpose.md`).
+
+Genuinely **future** (scoped, not done):
+- **AST / heading-aware sub-chunking** to keep semantic units under the 512-token
+  window (the F4 mitigation; this harness is ready to measure it).
+- **Alternative-dense-embedder bake-off** — a fair comparison requires
+  re-embedding the whole corpus with the candidate (a multi-hour GPU job + a new
+  `EmbeddingModel` variant); the `eval-retrieval` harness + the leak-controlled M1
+  stratum are ready to drive it on `sparky` (see ADR-020).
 
 ---
 

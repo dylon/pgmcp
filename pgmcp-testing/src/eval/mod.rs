@@ -21,11 +21,15 @@
 
 pub mod corpus;
 pub mod docstring;
+pub mod judge;
 pub mod query;
+pub mod rerank;
 pub mod runner;
 pub mod stats;
 
 pub use docstring::{DocExtraction, extract_leading_docstring, redact_identifiers};
-pub use query::{EvalQuery, GoldTarget, QuerySet, QueryStrategy};
+pub use judge::JudgeClient;
+pub use query::{ConceptualQuery, EvalQuery, GoldTarget, QuerySet, QueryStrategy};
+pub use rerank::Candidate;
 pub use runner::SearchMode;
 pub use stats::{AlignedMetric, PairwiseComparison, compare_all_pairs};

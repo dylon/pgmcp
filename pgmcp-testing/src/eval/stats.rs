@@ -163,6 +163,43 @@ pub fn compare_all_pairs(m: &AlignedMetric, alpha: f64) -> Vec<PairwiseCompariso
     raw
 }
 
+/// Quadratic-weighted Cohen's κ between two raters' integer ratings in
+/// `0..=max_rating` — the inter-judge agreement statistic for the LLM-as-judge
+/// relevance grading (Epic 2). Quadratic weights `w(i,j) = (i−j)²/max²` penalize
+/// large disagreements more than adjacent ones, the standard choice for ordinal
+/// relevance grades. Returns `1.0` for perfect agreement, `≈0` for chance-level,
+/// negative for systematic disagreement, and `NaN` for empty input. Landis &
+/// Koch (1977) bands: <0 poor, 0–.20 slight, .21–.40 fair, .41–.60 moderate,
+/// .61–.80 substantial, .81–1 almost perfect.
+pub fn cohens_kappa_quadratic(a: &[u8], b: &[u8], max_rating: u8) -> f64 {
+    let n = a.len().min(b.len());
+    if n == 0 || max_rating == 0 {
+        return f64::NAN;
+    }
+    let r = max_rating as usize + 1;
+    let mut observed = vec![vec![0.0f64; r]; r];
+    let mut row = vec![0.0f64; r];
+    let mut col = vec![0.0f64; r];
+    for i in 0..n {
+        let (x, y) = (a[i].min(max_rating) as usize, b[i].min(max_rating) as usize);
+        observed[x][y] += 1.0;
+        row[x] += 1.0;
+        col[y] += 1.0;
+    }
+    let nf = n as f64;
+    let denom_max = (max_rating as f64).powi(2);
+    let (mut num, mut den) = (0.0, 0.0);
+    for i in 0..r {
+        for j in 0..r {
+            let w = (i as f64 - j as f64).powi(2) / denom_max;
+            let expected = row[i] * col[j] / nf;
+            num += w * observed[i][j];
+            den += w * expected;
+        }
+    }
+    if den == 0.0 { 1.0 } else { 1.0 - num / den }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -250,5 +287,24 @@ mod tests {
         assert_eq!(cliff_magnitude(0.2), "small");
         assert_eq!(cliff_magnitude(0.4), "medium");
         assert_eq!(cliff_magnitude(0.8), "large");
+    }
+
+    #[test]
+    fn cohens_kappa_quadratic_basics() {
+        let a = [0u8, 1, 2, 3, 2, 1, 0, 3];
+        // Perfect agreement → 1.0.
+        assert!((cohens_kappa_quadratic(&a, &a, 3) - 1.0).abs() < 1e-9);
+        // Off-by-one disagreement → below perfect.
+        let b = [1u8, 2, 3, 3, 1, 0, 1, 2];
+        let k_adj = cohens_kappa_quadratic(&a, &b, 3);
+        assert!(k_adj < 1.0, "imperfect agreement → < 1, got {k_adj}");
+        // Fully inverted ratings (uniform marginals) → κ ≈ −1.
+        let inv: Vec<u8> = a.iter().map(|x| 3 - x).collect();
+        let k_inv = cohens_kappa_quadratic(&a, &inv, 3);
+        assert!(k_inv < 0.0, "inverted ratings → negative κ, got {k_inv}");
+        assert!(k_inv < k_adj, "inverted must be worse than off-by-one");
+        // Empty / degenerate → NaN.
+        assert!(cohens_kappa_quadratic(&[], &[], 3).is_nan());
+        assert!(cohens_kappa_quadratic(&a, &a, 0).is_nan());
     }
 }

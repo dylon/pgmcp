@@ -12,6 +12,8 @@
 use pgmcp::mcp::server::McpServer;
 use pgmcp::quality::retrieval_metrics::{RankedHit, path_dedup};
 
+use crate::eval::rerank::Candidate;
+
 /// The three chunk-granularity search modes under comparison.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SearchMode {
@@ -138,6 +140,280 @@ pub async fn run_mode(
     let text = text_payload(&result)
         .ok_or_else(|| format!("{} returned no text content", mode.tool_name()))?;
     Ok(path_dedup(&parse_results(&text)))
+}
+
+/// Fetch the top-`fetch_n` `semantic_search` candidates **with their chunk
+/// content** (the rerankers need the passage text, not just the path). Parses
+/// the content defensively from `chunk_content` / `snippet` / `content`, and
+/// path-dedupes (first occurrence) to match the scoring convention.
+pub async fn fetch_semantic_candidates(
+    server: &McpServer,
+    query: &str,
+    project: Option<&str>,
+    fetch_n: i32,
+) -> Result<Vec<Candidate>, String> {
+    let args = serde_json::json!({
+        "query": query,
+        "project": project,
+        "limit": fetch_n,
+        "fields": ["relative_path", "start_line", "end_line", "score", "chunk_content"],
+    });
+    let result = server
+        .call_tool_cli("semantic_search", args)
+        .await
+        .map_err(|e| format!("semantic_search call failed: {}", e.message))?;
+    if result.is_error == Some(true) {
+        return Err(format!(
+            "semantic_search returned error: {}",
+            text_payload(&result).unwrap_or_default()
+        ));
+    }
+    let text = text_payload(&result).ok_or("semantic_search returned no text content")?;
+    Ok(parse_candidates(&text))
+}
+
+/// Fetch the top-`k` candidates for ANY mode **with passage content**, for
+/// LLM-judge pooling (Epic 2). `semantic`/`text` request `chunk_content` via
+/// `fields`; `hybrid` returns its own `snippet`. (`text_search` currently
+/// returns paths only — the judge pooler fills those gaps from the DB.)
+/// Path-deduped, order preserved.
+pub async fn fetch_candidates(
+    server: &McpServer,
+    mode: SearchMode,
+    query: &str,
+    project: Option<&str>,
+    k: i32,
+) -> Result<Vec<Candidate>, String> {
+    let args = match mode {
+        SearchMode::Semantic | SearchMode::Text => serde_json::json!({
+            "query": query,
+            "project": project,
+            "limit": k,
+            "fields": ["relative_path", "start_line", "end_line", "score", "chunk_content"],
+        }),
+        SearchMode::Hybrid => serde_json::json!({
+            "query": query,
+            "project": project,
+            "limit": k,
+        }),
+    };
+    let result = server
+        .call_tool_cli(mode.tool_name(), args)
+        .await
+        .map_err(|e| format!("{} call failed: {}", mode.tool_name(), e.message))?;
+    if result.is_error == Some(true) {
+        return Err(format!(
+            "{} returned error: {}",
+            mode.tool_name(),
+            text_payload(&result).unwrap_or_default()
+        ));
+    }
+    let text = text_payload(&result)
+        .ok_or_else(|| format!("{} returned no text content", mode.tool_name()))?;
+    Ok(parse_candidates(&text))
+}
+
+/// Parse the semantic_search envelope into content-bearing candidates,
+/// path-deduped (first occurrence), order preserved.
+fn parse_candidates(json_text: &str) -> Vec<Candidate> {
+    let v: serde_json::Value = match serde_json::from_str(json_text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let arr = match v.get("results").and_then(|r| r.as_array()) {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(arr.len());
+    for row in arr {
+        let path = match row.get("relative_path").and_then(|p| p.as_str()) {
+            Some(p) => p.to_string(),
+            None => continue,
+        };
+        if !seen.insert(path.clone()) {
+            continue; // dedup by path, keep first
+        }
+        let content = row
+            .get("chunk_content")
+            .and_then(|c| c.as_str())
+            .or_else(|| row.get("snippet").and_then(|c| c.as_str()))
+            .or_else(|| row.get("content").and_then(|c| c.as_str()))
+            .unwrap_or("")
+            .to_string();
+        let hit = RankedHit {
+            path,
+            start_line: row.get("start_line").and_then(|n| n.as_i64()),
+            end_line: row.get("end_line").and_then(|n| n.as_i64()),
+            score: row.get("score").and_then(|s| s.as_f64()),
+        };
+        out.push(Candidate { hit, content });
+    }
+    out
+}
+
+/// The graph-augmented retrieval modes, each a distinct MCP tool with its own
+/// result shape (all reduced to a file-granularity ranked list for scoring).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GraphMode {
+    /// `code_ppr_search` — Personalized PageRank → ranked files.
+    Ppr,
+    /// `code_path_search` — PathRAG → ranked dependency routes (flattened to files).
+    Path,
+    /// `code_raptor_search` — RAPTOR module-cluster summaries (flattened to sample files; coarse).
+    Raptor,
+}
+
+impl GraphMode {
+    pub fn tool_name(self) -> &'static str {
+        match self {
+            GraphMode::Ppr => "code_ppr_search",
+            GraphMode::Path => "code_path_search",
+            GraphMode::Raptor => "code_raptor_search",
+        }
+    }
+
+    pub fn tag(self) -> &'static str {
+        match self {
+            GraphMode::Ppr => "code_ppr",
+            GraphMode::Path => "code_path",
+            GraphMode::Raptor => "code_raptor",
+        }
+    }
+
+    pub fn all() -> [GraphMode; 3] {
+        [GraphMode::Ppr, GraphMode::Path, GraphMode::Raptor]
+    }
+
+    fn args(self, query: &str, project: Option<&str>, k: i32) -> serde_json::Value {
+        // ppr/path require a project; raptor's is optional.
+        serde_json::json!({ "project": project, "query": query, "k": k })
+    }
+}
+
+/// Parse a numeric field that the graph tools serialize as a JSON **string**
+/// (e.g. `"score": "0.081635"`) or occasionally a number.
+fn parse_num(v: &serde_json::Value) -> Option<f64> {
+    v.as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+/// Parse `"<start>-<end>"` line ranges (ppr's `lines` field).
+fn parse_line_span(v: &serde_json::Value) -> (Option<i64>, Option<i64>) {
+    let Some(s) = v.as_str() else {
+        return (None, None);
+    };
+    let mut it = s.split('-');
+    let start = it.next().and_then(|x| x.trim().parse().ok());
+    let end = it.next().and_then(|x| x.trim().parse().ok());
+    (start, end)
+}
+
+/// Parse a graph-tool envelope into a file-granularity ranked list, deduped by
+/// path (first occurrence). PPR → `results[].file`; PathRAG → `paths[].files`
+/// flattened in path order; RAPTOR → `results[].sample_files` flattened in
+/// cluster order (coarse — clusters span many files, only samples are returned).
+pub fn parse_graph_results(mode: GraphMode, json_text: &str) -> Vec<RankedHit> {
+    let v: serde_json::Value = match serde_json::from_str(json_text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<RankedHit> = Vec::new();
+    let mut push = |path: String, start: Option<i64>, end: Option<i64>, score: Option<f64>| {
+        if seen.insert(path.clone()) {
+            out.push(RankedHit {
+                path,
+                start_line: start,
+                end_line: end,
+                score,
+            });
+        }
+    };
+    match mode {
+        GraphMode::Ppr => {
+            for row in v
+                .get("results")
+                .and_then(|r| r.as_array())
+                .into_iter()
+                .flatten()
+            {
+                if let Some(file) = row.get("file").and_then(|f| f.as_str()) {
+                    let (s, e) = row
+                        .get("lines")
+                        .map(parse_line_span)
+                        .unwrap_or((None, None));
+                    push(file.to_string(), s, e, row.get("score").and_then(parse_num));
+                }
+            }
+        }
+        GraphMode::Path => {
+            for p in v
+                .get("paths")
+                .and_then(|r| r.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let flow = p.get("flow").and_then(parse_num);
+                for f in p
+                    .get("files")
+                    .and_then(|x| x.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(path) = f.as_str() {
+                        push(path.to_string(), None, None, flow);
+                    }
+                }
+            }
+        }
+        GraphMode::Raptor => {
+            for c in v
+                .get("results")
+                .and_then(|r| r.as_array())
+                .into_iter()
+                .flatten()
+            {
+                let sim = c.get("similarity").and_then(parse_num);
+                for f in c
+                    .get("sample_files")
+                    .and_then(|x| x.as_array())
+                    .into_iter()
+                    .flatten()
+                {
+                    if let Some(path) = f.as_str() {
+                        push(path.to_string(), None, None, sim);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Run one query through one graph-augmented mode; returns the file-granularity
+/// ranked hits (already deduped by `parse_graph_results`).
+pub async fn run_graph_mode(
+    server: &McpServer,
+    mode: GraphMode,
+    query: &str,
+    project: Option<&str>,
+    k: i32,
+) -> Result<Vec<RankedHit>, String> {
+    let result = server
+        .call_tool_cli(mode.tool_name(), mode.args(query, project, k))
+        .await
+        .map_err(|e| format!("{} call failed: {}", mode.tool_name(), e.message))?;
+    if result.is_error == Some(true) {
+        return Err(format!(
+            "{} returned error: {}",
+            mode.tool_name(),
+            text_payload(&result).unwrap_or_default()
+        ));
+    }
+    let text = text_payload(&result)
+        .ok_or_else(|| format!("{} returned no text content", mode.tool_name()))?;
+    Ok(parse_graph_results(mode, &text))
 }
 
 /// Fraction of the top-`k` slots occupied by `src/patterns/*` catalog files —

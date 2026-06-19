@@ -2871,6 +2871,18 @@ pub struct CronConfig {
     #[serde(default = "default_quality_history_interval")]
     pub quality_history_interval_secs: u64,
 
+    /// Interval for the retrieval-quality drift cron (seconds). 0 disables
+    /// (default). When > 0, periodically scores the frozen probe set
+    /// (`src/quality/retrieval_drift.rs`) through `semantic_search` and records
+    /// `pgmcp_metadata['retrieval_eval_last_report']`, warning below the floor —
+    /// the runtime complement to the CI regression gate.
+    #[serde(default)]
+    pub retrieval_eval_interval_secs: u64,
+
+    /// Project the retrieval-eval cron scores (default `pgmcp`).
+    #[serde(default = "default_retrieval_eval_project")]
+    pub retrieval_eval_project: String,
+
     /// Interval for the `topics-size-history` cron (seconds). 0 disables. Cheap:
     /// snapshots each `code_topics` row's `chunk_count` into
     /// `pgmcp_metadata['topics_size_history']` so `topic_trends` has a per-topic
@@ -3158,6 +3170,8 @@ impl Default for CronConfig {
             topic_dendrogram_interval_secs: default_topic_dendrogram_interval(),
             embedding_migration_interval_secs: default_embedding_migration_interval(),
             quality_history_interval_secs: default_quality_history_interval(),
+            retrieval_eval_interval_secs: 0,
+            retrieval_eval_project: default_retrieval_eval_project(),
             topics_size_history_interval_secs: default_topics_size_history_interval(),
             tool_policy_interval_secs: default_tool_policy_interval(),
             findings_promotion_interval_secs: default_findings_promotion_interval(),
@@ -3531,6 +3545,9 @@ fn default_topic_dendrogram_interval() -> u64 {
 } // 12 h
 fn default_quality_history_interval() -> u64 {
     21_600 // 6h
+}
+fn default_retrieval_eval_project() -> String {
+    "pgmcp".to_string()
 }
 
 fn default_topics_size_history_interval() -> u64 {

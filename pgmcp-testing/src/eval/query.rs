@@ -472,6 +472,192 @@ pub fn known_item_queries() -> QuerySet {
     ])
 }
 
+/// A conceptual query for the LLM-as-judge evaluation (Epic 2): a developer
+/// *intent* that no single file uniquely answers, so relevance is graded by an
+/// LLM over the pooled candidates (0–3) rather than matched against a
+/// pre-authored gold path. Unlike [`EvalQuery`] there is no `gold` — the judge
+/// builds it at run time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConceptualQuery {
+    /// Stable unit key (aligns the query across modes for paired tests).
+    pub id: String,
+    pub query: String,
+    /// Project scope (e.g. `Some("pgmcp")`), or `None` for cross-project.
+    pub project: Option<String>,
+}
+
+/// ~40 conceptual queries over `pgmcp` — broad "how/where does this project …"
+/// intents spanning retrieval, indexing, resilience, the tracker, graph
+/// analysis, concurrency, security, embeddings, and tooling. Each is deliberately
+/// answerable by *several* files, so the LLM judge assigns graded relevance to
+/// each pooled candidate (the complement of the single-gold known-item set).
+pub fn conceptual_queries() -> Vec<ConceptualQuery> {
+    let q = |id: &str, query: &str| ConceptualQuery {
+        id: id.to_string(),
+        query: query.to_string(),
+        project: Some("pgmcp".to_string()),
+    };
+    vec![
+        q(
+            "c_retry",
+            "how does the system retry and back off when an operation fails",
+        ),
+        q(
+            "c_db_outage",
+            "how does pgmcp stay resilient when the database goes down",
+        ),
+        q(
+            "c_index_fresh",
+            "how does the index detect and repair stale or out-of-date entries",
+        ),
+        q(
+            "c_reembed",
+            "how are file embeddings kept up to date when content changes",
+        ),
+        q(
+            "c_gpu_budget",
+            "how is GPU memory budgeted across embedding workers",
+        ),
+        q(
+            "c_rank_fusion",
+            "how are keyword and vector search results combined and ranked",
+        ),
+        q(
+            "c_adaptive_tools",
+            "how does the per-client tool surface shrink based on usage",
+        ),
+        q(
+            "c_cron_gating",
+            "how are background jobs scheduled and prevented from running too early",
+        ),
+        q(
+            "c_trust_boundary",
+            "what stops an agent from marking its own work as verified",
+        ),
+        q(
+            "c_code_graph",
+            "how is source code parsed into a graph of imports and calls",
+        ),
+        q(
+            "c_topic_quality",
+            "how does topic clustering avoid collapsing into degenerate clusters",
+        ),
+        q(
+            "c_deadlock",
+            "how does pgmcp statically detect potential deadlocks and lock-order issues",
+        ),
+        q(
+            "c_secrets",
+            "how are hardcoded secrets and credentials detected in the corpus",
+        ),
+        q(
+            "c_memory_graph",
+            "how does the memory server store entities, relations, and observations",
+        ),
+        q(
+            "c_cross_project",
+            "how are dependencies between different projects tracked",
+        ),
+        q(
+            "c_chunking",
+            "how is file content split into overlapping windows for embedding",
+        ),
+        q(
+            "c_hnsw_tuning",
+            "how is the approximate nearest-neighbor index configured and tuned",
+        ),
+        q(
+            "c_a2a",
+            "how do multiple agents coordinate and pass tasks to each other",
+        ),
+        q(
+            "c_experiments",
+            "how are scientific experiments recorded and decided with statistics",
+        ),
+        q(
+            "c_doc_guidelines",
+            "how are documentation guidelines enforced across different agents",
+        ),
+        q(
+            "c_digest",
+            "how is a read-only proactive summary produced at session start",
+        ),
+        q(
+            "c_git_link",
+            "how are git commits linked to the work items they address",
+        ),
+        q(
+            "c_ontology",
+            "how is the concept ontology queried and traversed",
+        ),
+        q(
+            "c_patterns",
+            "how is the software design pattern catalog searched",
+        ),
+        q(
+            "c_forecast",
+            "how does pgmcp project when a code-quality metric will cross a threshold",
+        ),
+        q("c_disk", "how is free disk space monitored and reclaimed"),
+        q(
+            "c_mandates",
+            "how are imperative instructions extracted from user prompts and remembered",
+        ),
+        q(
+            "c_fts",
+            "how is Postgres full-text search implemented over code chunks",
+        ),
+        q(
+            "c_rerank",
+            "how are candidate passages re-scored by a cross-encoder reranker",
+        ),
+        q(
+            "c_data_tables",
+            "how is user-defined tabular data stored without dynamic schema changes",
+        ),
+        q(
+            "c_migrations",
+            "how are database schema migrations applied at startup",
+        ),
+        q(
+            "c_bus_factor",
+            "how is knowledge concentration and code ownership computed from git history",
+        ),
+        q(
+            "c_centrality",
+            "how are the most important files ranked in the dependency graph",
+        ),
+        q(
+            "c_llm_backend",
+            "how is the language-model backend made pluggable between local and cloud",
+        ),
+        q(
+            "c_render",
+            "how is an analysis report rendered into multiple output formats",
+        ),
+        q(
+            "c_cron_history",
+            "how is the run history of background jobs tracked and surfaced",
+        ),
+        q(
+            "c_communities",
+            "how is the import graph grouped into communities of related modules",
+        ),
+        q(
+            "c_taint",
+            "how is untrusted input traced to dangerous sinks across functions",
+        ),
+        q(
+            "c_circular_deps",
+            "how are circular dependencies detected and broken",
+        ),
+        q(
+            "c_token_economy",
+            "how does pgmcp keep tool result payloads small to save tokens",
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -485,6 +671,34 @@ mod tests {
             "want >= 50 known-item queries, got {}",
             qs.len()
         );
+    }
+
+    #[test]
+    fn conceptual_set_is_valid_and_sizeable() {
+        let qs = conceptual_queries();
+        assert!(
+            qs.len() >= 40,
+            "want >= 40 conceptual queries, got {}",
+            qs.len()
+        );
+        let mut seen = std::collections::HashSet::new();
+        for c in &qs {
+            assert!(
+                seen.insert(c.id.as_str()),
+                "duplicate conceptual id: {}",
+                c.id
+            );
+            assert!(
+                !c.query.trim().is_empty(),
+                "empty conceptual query {}",
+                c.id
+            );
+            assert!(
+                c.project.is_some(),
+                "conceptual query {} needs a project",
+                c.id
+            );
+        }
     }
 
     #[test]

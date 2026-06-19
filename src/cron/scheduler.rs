@@ -1134,6 +1134,63 @@ pub fn schedule_maintenance_jobs(
         },
     );
 
+    // retrieval-eval: periodically score the frozen retrieval-drift probe set
+    // through `semantic_search` and record
+    // `pgmcp_metadata['retrieval_eval_last_report']`, warning below the floor —
+    // the runtime complement to the CI regression gate. Interval-gated (0
+    // disables, the default). Pulls the query embedder from the SystemContext.
+    if config.retrieval_eval_interval_secs > 0 {
+        let db_re = Arc::clone(&db);
+        let rt_re = rt.clone();
+        let stats_re = Arc::clone(&stats);
+        let lc_re = lifecycle.clone();
+        let re_interval = config.retrieval_eval_interval_secs;
+        let re_embed = system_ctx.embed().clone();
+        let re_project = config.retrieval_eval_project.clone();
+        let hist_re = system_ctx.cron_history().clone();
+        handle.schedule_recurring(
+            initial_delay("retrieval-eval", re_interval * 1000),
+            re_interval * 1000,
+            "retrieval-eval",
+            move || {
+                if lc_re.is_stopping() {
+                    return false;
+                }
+                let stats = Arc::clone(&stats_re);
+                let hist = hist_re.clone();
+                if !stats.db_health().is_up() {
+                    stats.record_cron_outcome(
+                        "retrieval-eval",
+                        crate::stats::tracker::CronJobOutcome::Skipped(
+                            crate::stats::tracker::SkipReason::DbDown,
+                        ),
+                        0,
+                    );
+                    hist.record_skip(
+                        "retrieval-eval",
+                        crate::cron::history::CronTriggerSource::Scheduled,
+                        crate::stats::tracker::SkipReason::DbDown,
+                    );
+                    return true;
+                }
+                let embed = re_embed.clone();
+                let project = re_project.clone();
+                if let Some(pool) = db_re.pool().cloned() {
+                    crate::cron::history::spawn_recorded(
+                        &rt_re,
+                        hist,
+                        "retrieval-eval",
+                        async move {
+                            crate::cron::retrieval_eval::run_or_log(pool, embed, stats, &project)
+                                .await;
+                        },
+                    );
+                }
+                true
+            },
+        );
+    }
+
     // findings-promotion (Phase 3): idempotently materialize high-confidence
     // bug_prediction / high-severity documented_tech_debt findings into
     // `pending` work items, for projects that opt in via
