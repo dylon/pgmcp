@@ -911,9 +911,12 @@ impl McpServer {
             "a2a_inbox"              => a2a_inbox(A2aInboxParams),
             "a2a_reply_message"      => a2a_reply_message(A2aReplyMessageParams),
             "a2a_ack_message"        => a2a_ack_message(A2aAckMessageParams),
+            "a2a_fleet_view"         => a2a_fleet_view(A2aFleetViewParams),
             // A2A RecursiveMAS-inspired extensions
             "a2a_find_agents_by_specialty"
                 => a2a_find_agents_by_specialty(A2aFindAgentsBySpecialtyParams),
+            "orchestrator_recommend_next"
+                => orchestrator_recommend_next(OrchestratorRecommendNextParams),
             "a2a_pattern_sequential" => a2a_pattern_sequential(A2aPatternSequentialParams),
             "a2a_pattern_mixture"    => a2a_pattern_mixture(A2aPatternMixtureParams),
             "a2a_pattern_distillation"
@@ -926,6 +929,7 @@ impl McpServer {
             "csm_show_projection"     => csm_show_projection(CsmShowProjectionParams),
             "csm_validate_run"        => csm_validate_run(CsmValidateRunParams),
             "csm_protocol_plan"       => csm_protocol_plan(CsmProtocolPlanParams),
+            "csm_synthesize_protocol" => csm_synthesize_protocol(CsmSynthesizeProtocolParams),
             "csm_infer_peer_fsm"      => csm_infer_peer_fsm(CsmInferPeerFsmParams),
             "a2a_report_outcome"     => a2a_report_outcome(A2aReportOutcomeParams),
             // Scientific-experiment subsystem (share the tool_experiments module).
