@@ -1,0 +1,30 @@
+@startuml
+left to right direction
+
+skinparam backgroundColor #ffffff
+skinparam shadowing false
+skinparam defaultFontName "Inter"
+skinparam ArrowColor #334155
+skinparam rectangle {
+  BorderColor #334155
+  FontColor #0f172a
+  RoundCorner 8
+}
+
+title lock-order cycle as a deadlock candidate
+
+rectangle "function f\nlock(A); lock(B)" as F1 #dbeafe
+rectangle "function g\nlock(B); lock(A)" as F2 #dbeafe
+rectangle "Lock A" as A #fef3c7
+rectangle "Lock B" as B #fef3c7
+rectangle "SCC {A, B}\npotential circular wait" as SCC #fee2e2
+
+F1 --> A
+F1 --> B
+F2 --> B
+F2 --> A
+A --> B : observed order
+B --> A : observed order
+A --> SCC
+B --> SCC
+@enduml

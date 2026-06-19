@@ -1,0 +1,30 @@
+@startuml
+left to right direction
+
+skinparam backgroundColor #ffffff
+skinparam shadowing false
+skinparam defaultFontName "Inter"
+skinparam ArrowColor #334155
+skinparam rectangle {
+  BorderColor #334155
+  FontColor #0f172a
+  RoundCorner 8
+}
+
+title pgmcp concurrency and safety metrics
+
+rectangle "Source files\nfunctions + bodies" as Code #dbeafe
+rectangle "Effect tags\nasync, unsafe, may_panic, lock_acquire" as Effects #e0f2fe
+rectangle "Lock-order graph\nlock A -> lock B" as Locks #fae8ff
+rectangle "function_metrics\npanic_paths, unsafe_blocks" as FuncMetrics #dcfce7
+rectangle "Concurrency findings\ndeadlock, panic, unsafe, blocking" as Findings #fee2e2
+rectangle "Engineering pillar\nfinding_density" as Report #ede9fe
+
+Code --> Effects
+Code --> Locks
+Code --> FuncMetrics
+Effects --> Findings
+Locks --> Findings
+FuncMetrics --> Findings
+Findings --> Report
+@enduml

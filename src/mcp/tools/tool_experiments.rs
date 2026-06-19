@@ -253,9 +253,26 @@ pub async fn tool_experiment_open(
     // Resolve the acceptance criterion: supplied JSON, or a kind-appropriate
     // default (Welch p<0.05 ∧ |d|≥0.5 ∧ correct direction).
     let criterion: AcceptanceCriterion = match &params.acceptance_criterion {
-        Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
-            McpError::invalid_params(format!("invalid acceptance_criterion: {e}"), None)
-        })?,
+        Some(v) => {
+            // Tolerate a JSON-encoded STRING: some MCP argument encoders stringify
+            // a nested object passed to an untyped (schema-less) param, so a caller
+            // sending `{"type":"wilcoxon_signed_rank",...}` may arrive as a string.
+            // Parse the string to a Value first, then deserialize, so both the
+            // object and the string-encoded form are accepted.
+            let value = match v {
+                serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s)
+                    .map_err(|e| {
+                        McpError::invalid_params(
+                            format!("acceptance_criterion was a string but not valid JSON: {e}"),
+                            None,
+                        )
+                    })?,
+                other => other.clone(),
+            };
+            serde_json::from_value(value).map_err(|e| {
+                McpError::invalid_params(format!("invalid acceptance_criterion: {e}"), None)
+            })?
+        }
         None => AcceptanceCriterion::default_optimization(params.lower_is_better.unwrap_or(true)),
     };
     let criterion_json = serde_json::to_string(&criterion)

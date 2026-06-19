@@ -1,0 +1,42 @@
+@startuml
+top to bottom direction
+
+skinparam backgroundColor #ffffff
+skinparam shadowing false
+skinparam defaultFontName "Inter"
+skinparam ArrowColor #334155
+skinparam rectangle {
+  BorderColor #334155
+  FontColor #0f172a
+  RoundCorner 8
+}
+
+title pgmcp architecture quality metrics
+
+rectangle "Import graph\nfiles as vertices" as Imports #dbeafe
+rectangle "Topic model\nsemantic memberships" as Topics #fae8ff
+rectangle "Git history\nchurn + fix ratio" as History #e0f2fe
+
+rectangle "SCC / cycle analysis" as SCC #dcfce7
+rectangle "Martin package metrics\nCa, Ce, I, A, D*" as Martin #dcfce7
+rectangle "DSM visibility analysis\nVFI, VFO, propagation cost" as DSM #dcfce7
+rectangle "Separation of concerns" as TopicDims #dcfce7
+
+rectangle "architecture_quality" as ArchScore #fef3c7
+rectangle "architecture_violations" as Violations #fee2e2
+rectangle "quality_report\nArchitecture pillar" as Report #ede9fe
+
+Imports --> SCC
+Imports --> Martin
+Imports --> DSM
+Topics --> TopicDims
+History --> ArchScore
+SCC --> ArchScore
+Martin --> ArchScore
+DSM --> Report
+TopicDims --> ArchScore
+ArchScore --> Report
+SCC --> Violations
+Martin --> Violations
+Violations --> Report
+@enduml

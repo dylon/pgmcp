@@ -660,6 +660,17 @@ fn resolve_device(use_gpu: bool) -> Result<Device> {
 /// panic mid-download must not wedge every future construction.
 static MODEL_DOWNLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// The local directory holding the BGE-M3 model files (downloads on cold cache,
+/// then reads from the HF cache). Exposed so tooling and the retrieval-quality
+/// evaluation can load the tokenizer for truncation-window analysis (which text
+/// falls beyond the `max_length` embedding window) without constructing a full
+/// [`Embedder`]. Consumed by the `pgmcp-testing` eval harness, not the daemon —
+/// hence `allow(dead_code)` for the binary target (mirrors `CandleBackend`).
+#[allow(dead_code)]
+pub fn bge_m3_model_dir() -> Result<PathBuf> {
+    ensure_model_files(ModelKind::Bgem3)
+}
+
 fn ensure_model_files(kind: ModelKind) -> Result<PathBuf> {
     let _download_guard = MODEL_DOWNLOAD_LOCK
         .lock()

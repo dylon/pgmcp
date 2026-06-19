@@ -51,6 +51,10 @@ postcard = { version = "1", features = ["use-std"] }
 petgraph = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry"] }
+# Used by the retrieval-quality eval (M2 token-holdout): load the BGE-M3
+# tokenizer untruncated to find text beyond the embedding window. Mirror
+# pgmcp's version/features.
+tokenizers = { version = "0.22", default-features = false, features = ["onig"] }
 
 [dev-dependencies]
 arc-swap = "1"
@@ -63,3 +67,10 @@ predicates = "3"
 [[bin]]
 name = "regen-goldens"
 path = "src/bin/regen_goldens.rs"
+
+# Retrieval-quality evaluation campaign (semantic vs hybrid vs text). Manual:
+# needs a populated live pgmcp DB + a BGE-M3 embedder (CPU by default, --gpu for
+# CUDA). See docs/evaluation/semantic-search-quality.md.
+[[bin]]
+name = "eval-retrieval"
+path = "src/bin/eval_retrieval.rs"

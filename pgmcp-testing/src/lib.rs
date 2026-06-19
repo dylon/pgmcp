@@ -26,6 +26,7 @@
 
 pub mod cli_harness;
 pub mod db_harness;
+pub mod eval;
 pub mod fixtures;
 pub mod golden;
 pub mod mocks;

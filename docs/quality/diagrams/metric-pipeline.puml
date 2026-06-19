@@ -1,0 +1,50 @@
+@startuml
+left to right direction
+
+skinparam backgroundColor #ffffff
+skinparam shadowing false
+skinparam defaultFontName "Inter"
+skinparam ArrowColor #334155
+skinparam rectangle {
+  BorderColor #334155
+  FontColor #0f172a
+  RoundCorner 8
+}
+
+title pgmcp quality metric pipeline
+
+rectangle "Indexed files\npath, language, lines, content" as Files #dbeafe
+rectangle "file_symbols\ndefinitions, signatures, ranges" as Symbols #dbeafe
+rectangle "symbol_references\ncalls, imports, type uses" as Refs #dbeafe
+rectangle "file_chunks + topics\nFCM memberships" as Chunks #dbeafe
+rectangle "git history\ncommits, authors, fix ratio, churn" as Git #dbeafe
+
+rectangle "code_graph_edges\nimports, co-change, semantic edges" as Graph #dcfce7
+rectangle "file_metrics\nPageRank, coupling, instability, churn" as FileMetrics #dcfce7
+rectangle "function_metrics\nCC, cognitive, Halstead, NPath, MI" as FnMetrics #dcfce7
+
+rectangle "Scorecards\nengineering + architecture" as Scorecards #fef3c7
+rectangle "Design metrics\nper file/module/function" as Design #fef3c7
+rectangle "Finding collectors\ncode health, graph, tests, security" as Collectors #fee2e2
+rectangle "quality_report\n3 pillars + findings + trends" as Report #ede9fe
+
+Files --> Symbols
+Files --> Chunks
+Symbols --> Refs
+Refs --> Graph
+Git --> FileMetrics
+Graph --> FileMetrics
+Symbols --> FnMetrics
+Files --> FnMetrics
+Chunks --> Scorecards
+FileMetrics --> Scorecards
+FnMetrics --> Scorecards
+FileMetrics --> Design
+FnMetrics --> Design
+FileMetrics --> Collectors
+FnMetrics --> Collectors
+Chunks --> Collectors
+Graph --> Collectors
+Scorecards --> Report
+Collectors --> Report
+@enduml

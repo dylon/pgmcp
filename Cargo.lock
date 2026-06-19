@@ -4015,6 +4015,7 @@ dependencies = [
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",
+ "tokenizers 0.22.2",
  "tokio",
  "tokio-util",
  "toml",
