@@ -418,6 +418,70 @@ pub struct CsmProtocolPlanParams {
     pub pattern: String,
 }
 
+// ── Crucible E3 / E5 / E6 ──────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct A2aFleetViewParams {
+    #[serde(default)]
+    #[schemars(description = "Max fleet members to return (default 200, clamped 1..=10000).")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OrchestratorRecommendNextParams {
+    #[serde(default)]
+    #[schemars(
+        description = "Free-text task description (context for the recommendation; echoed back)."
+    )]
+    pub task: Option<String>,
+    #[schemars(description = "Target specialty tags to match (OR-logic). Required, non-empty.")]
+    pub specialty: Vec<String>,
+    #[serde(default)]
+    #[schemars(description = "Optional exact-match on a candidate's recommended_role.")]
+    pub recommended_role: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Max ranked candidates to return (default 5, clamped 1..=100).")]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CsmSynthesizeRoleBinding {
+    #[schemars(description = "public_id of an actionable work item in the subtree.")]
+    pub public_id: String,
+    #[schemars(description = "Registered fleet peer name to bind to that item's protocol state.")]
+    pub agent: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CsmSynthesizeProtocolParams {
+    #[schemars(
+        description = "public_id of the plan/epic whose work-item subtree to fold into a protocol."
+    )]
+    pub public_id: String,
+    #[serde(default)]
+    #[schemars(description = "Max subtree rows to fold (default 200, clamped 1..=100000).")]
+    pub max_rows: Option<i64>,
+    #[schemars(
+        description = "Fleet peer bound to each actionable item lacking an explicit binding/assignee."
+    )]
+    pub default_solver_agent: String,
+    #[serde(default)]
+    #[schemars(
+        description = "Per-item peer overrides: bind a work item (by public_id) to a specific peer."
+    )]
+    pub role_bindings: Option<Vec<CsmSynthesizeRoleBinding>>,
+    #[serde(default)]
+    #[schemars(
+        description = "If set, wrap the chain in a Critic-gated loop (cyclic, pi-driven) bound to this peer."
+    )]
+    pub critic_agent: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Peer/name that plays the orchestrator role 'O' (default 'pi', the driver itself)."
+    )]
+    pub orchestrator: Option<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CsmInferPeerFsmParams {
     #[schemars(description = "Pattern name or a2a skill_id whose recorded runs to infer from")]

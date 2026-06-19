@@ -41,9 +41,11 @@ pub async fn run(
     port: u16,
     name: Option<String>,
     register_with: Option<String>,
+    pi_provider: Option<String>,
+    pi_model: Option<String>,
 ) -> Result<()> {
     crate::logging::init_cli_with_config(None);
-    serve_adapter(kind, port, name, register_with).await
+    serve_adapter(kind, port, name, register_with, pi_provider, pi_model).await
 }
 
 /// Embedded entry point for daemon autostart (`[a2a] autostart_adapters`).
@@ -54,8 +56,10 @@ pub async fn run_embedded(
     port: u16,
     name: Option<String>,
     register_with: Option<String>,
+    pi_provider: Option<String>,
+    pi_model: Option<String>,
 ) -> Result<()> {
-    serve_adapter(kind, port, name, register_with).await
+    serve_adapter(kind, port, name, register_with, pi_provider, pi_model).await
 }
 
 async fn serve_adapter(
@@ -63,6 +67,8 @@ async fn serve_adapter(
     port: u16,
     name: Option<String>,
     register_with: Option<String>,
+    pi_provider: Option<String>,
+    pi_model: Option<String>,
 ) -> Result<()> {
     let (inner, default_name, description) = match kind.as_str() {
         "claude" => (
@@ -75,7 +81,14 @@ async fn serve_adapter(
             "codex-cli",
             "OpenAI Codex CLI exposed as an A2A peer (codex)",
         ),
-        other => bail!("unknown adapter kind '{other}'; expected 'claude' or 'codex'"),
+        "pi" => (
+            crate::a2a::adapters::PiAdapter::new(pi_provider, pi_model).inner,
+            "pi-agent",
+            "pi coding agent exposed as an A2A peer (pi -p, MCP-free leaf)",
+        ),
+        other => {
+            bail!("unknown adapter kind '{other}'; expected 'claude', 'codex', or 'pi'")
+        }
     };
     let agent_name = name.unwrap_or_else(|| default_name.to_string());
 

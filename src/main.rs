@@ -188,18 +188,24 @@ enum Commands {
     /// `tasks/send` into a `claude -p` / `codex` subprocess invocation, and
     /// optionally self-registers with a pgmcp daemon's agent registry.
     A2aAdapter {
-        /// Which CLI to wrap: "claude" or "codex".
+        /// Which CLI to wrap: "claude", "codex", or "pi".
         #[arg(long)]
         kind: String,
         /// TCP port to bind the adapter's A2A server on.
         #[arg(long)]
         port: u16,
-        /// Agent name to advertise (defaults: claude-code / codex-cli).
+        /// Agent name to advertise (defaults: claude-code / codex-cli / pi-agent).
         #[arg(long)]
         name: Option<String>,
         /// pgmcp daemon base URL to self-register with (e.g. http://localhost:3100).
         #[arg(long)]
         register_with: Option<String>,
+        /// For `--kind pi`: the models.json provider to pin the leaf to (e.g. sparky-deepseek).
+        #[arg(long)]
+        pi_provider: Option<String>,
+        /// For `--kind pi`: the model id to pin the leaf to (e.g. deepseek-v4-flash).
+        #[arg(long)]
+        pi_model: Option<String>,
     },
     /// Print daemon and model state. With no MODEL argument, every section
     /// renders. MODEL filters to one of: daemon, database, embeddings,
@@ -402,7 +408,9 @@ async fn async_main() -> anyhow::Result<()> {
             port,
             name,
             register_with,
-        } => cli::a2a_adapter::run(kind, port, name, register_with).await,
+            pi_provider,
+            pi_model,
+        } => cli::a2a_adapter::run(kind, port, name, register_with, pi_provider, pi_model).await,
         Commands::Status { model, json } => cli::status::run(cfg, model, json).await,
         Commands::TrainLink {
             pairs,

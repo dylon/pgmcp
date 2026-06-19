@@ -9,7 +9,9 @@
 pub mod claude_code;
 pub mod codex_cli;
 pub mod generic_subprocess;
+pub mod pi_agent;
 
 pub use claude_code::ClaudeCodeAdapter;
 pub use codex_cli::CodexCliAdapter;
 pub use generic_subprocess::GenericSubprocessAdapter;
+pub use pi_agent::PiAdapter;

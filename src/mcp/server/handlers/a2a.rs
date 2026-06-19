@@ -349,4 +349,51 @@ ordered stages `a2a_pattern_sequential`. (RecursiveMAS Table 1 Deliberation.)"
         )
         .await
     }
+
+    #[tool(
+        description = "One read-only view of the agent fleet: the A2A peer registry joined with each \
+agent's trust prior, outcome history (success rate + most recent outcome), and whether it is a live \
+MCP client. Answers 'who is in the fleet, who is trusted, how have they performed, who is live' for \
+orchestration. (Crucible E3.)"
+    )]
+    async fn a2a_fleet_view(
+        &self,
+        Parameters(params): Parameters<A2aFleetViewParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "a2a_fleet_view",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_a2a_fleet_view::tool_a2a_fleet_view(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Advisory policy: rank fleet specialists for a task by a transparent combination \
+of specialty match, shrinkage-adjusted outcome success rate, the agent_trust prior, and recency. \
+Returns the ranked list with a per-component breakdown plus the top pick. RECOMMENDS; the orchestrator \
+decides and acts. Read-only — the reward loop runs via a2a_report_outcome/experiment_decide. (Crucible E6.)"
+    )]
+    async fn orchestrator_recommend_next(
+        &self,
+        Parameters(params): Parameters<OrchestratorRecommendNextParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "orchestrator_recommend_next",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_orchestrator_recommend_next::tool_orchestrator_recommend_next(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
 }

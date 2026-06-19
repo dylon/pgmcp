@@ -275,6 +275,7 @@ pub mod tool_a2a_ack_message;
 pub mod tool_a2a_active_agents;
 pub mod tool_a2a_cancel_task;
 pub mod tool_a2a_find_agents_by_specialty;
+pub mod tool_a2a_fleet_view;
 pub mod tool_a2a_get_task;
 pub mod tool_a2a_inbox;
 pub mod tool_a2a_list_agents;
@@ -294,8 +295,10 @@ pub mod tool_csm_list_protocols;
 pub mod tool_csm_protocol_of_pattern;
 pub mod tool_csm_protocol_plan;
 pub mod tool_csm_show_projection;
+pub mod tool_csm_synthesize_protocol;
 pub mod tool_csm_validate_run;
 pub mod tool_experiments;
+pub mod tool_orchestrator_recommend_next;
 pub use tool_experiments::{
     tool_experiment_decide, tool_experiment_get, tool_experiment_list,
     tool_experiment_log_artifact, tool_experiment_open, tool_experiment_protocol,

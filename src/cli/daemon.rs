@@ -1275,6 +1275,8 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
                         adapter_port,
                         None,
                         Some(url),
+                        None,
+                        None,
                     )
                     .await
                     {

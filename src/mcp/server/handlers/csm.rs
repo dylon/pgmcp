@@ -144,4 +144,30 @@ novel symbols flag off-protocol behaviour. ADR-009 Phase 8."
         )
         .await
     }
+
+    #[tool(
+        description = "Synthesize a typed Multiparty-Session-Type protocol from a work-item subtree \
+(a plan): fold its actionable items into a GlobalType, optionally wrapped in a Critic-gated loop \
+(cyclic Rec/Var), validate well-formedness + the black-box media discipline + per-role projection, \
+and emit a client-drivable plan with role→peer bindings. The plan→state-machine→orchestrator \
+keystone (Crucible E5). Read-only: synthesizes and validates; never executes work."
+    )]
+    async fn csm_synthesize_protocol(
+        &self,
+        Parameters(params): Parameters<CsmSynthesizeProtocolParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "csm_synthesize_protocol",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_csm_synthesize_protocol::tool_csm_synthesize_protocol(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
 }
