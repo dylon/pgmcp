@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::config::OntologyConfig;
 use crate::db::queries;
@@ -50,6 +50,6 @@ pub async fn run_ontology_integrate(pool: &PgPool) -> Result<(), sqlx::Error> {
 /// Cron entry point: run the integration, logging (not panicking) on error.
 pub async fn run_or_log(pool: Arc<PgPool>, _config: OntologyConfig) {
     if let Err(e) = run_ontology_integrate(&pool).await {
-        warn!(error = %e, "ontology-integrate pass failed");
+        error!(error = %e, "ontology-integrate pass failed");
     }
 }

@@ -29,6 +29,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 
 use crate::parsing::backend::LanguageBackend;
+use crate::parsing::regex_fv_util::{CommentStyle, strip_comments_preserving_lines};
 use crate::parsing::symbols::{Import, Symbol, SymbolKind, SymbolRefKind, SymbolReference};
 
 pub static COQ_BACKEND: CoqBackend = CoqBackend;
@@ -149,7 +150,15 @@ impl LanguageBackend for CoqBackend {
         "coq"
     }
 
+    fn lex_config(&self) -> crate::parsing::occurrences::LexConfig {
+        crate::parsing::occurrences::LexConfig::ml_style()
+    }
+
     fn extract_symbols(&self, content: &str) -> Vec<Symbol> {
+        // Blank `(* … *)` comments first so a keyword inside a comment cannot
+        // produce a phantom symbol (offsets preserved → line numbers stay right).
+        let content = strip_comments_preserving_lines(content, CommentStyle::CoqBlock);
+        let content = content.as_str();
         let re = coq_regexes();
         let mut out: Vec<Symbol> = Vec::new();
         let push = |out: &mut Vec<Symbol>, name: String, kind: SymbolKind, start_byte: usize| {
@@ -294,6 +303,8 @@ impl LanguageBackend for CoqBackend {
     }
 
     fn extract_imports(&self, content: &str) -> Vec<Import> {
+        let content = strip_comments_preserving_lines(content, CommentStyle::CoqBlock);
+        let content = content.as_str();
         let re = coq_regexes();
         let mut out: Vec<Import> = Vec::new();
         // `From Lib Require Import M1 M2 …`
@@ -341,6 +352,8 @@ impl LanguageBackend for CoqBackend {
     }
 
     fn extract_references(&self, content: &str) -> Vec<SymbolReference> {
+        let content = strip_comments_preserving_lines(content, CommentStyle::CoqBlock);
+        let content = content.as_str();
         let re = coq_regexes();
         let mut out: Vec<SymbolReference> = Vec::new();
         for cap in re.tactic_ref_re.captures_iter(content) {
@@ -489,6 +502,31 @@ End MathExamples.
             names.contains(&"x"),
             "x should still be extracted: {:?}",
             names
+        );
+    }
+
+    #[test]
+    fn comment_keywords_are_not_extracted() {
+        // Regression (ADR-025): a declaration keyword inside a `(* … *)` comment
+        // must NOT produce a phantom symbol now that the backend strips comments.
+        let src =
+            "(* Theorem fake_thm : True. Definition fake_def := 0. *)\nTheorem real_thm : True.";
+        let names: Vec<String> = COQ_BACKEND
+            .extract_symbols(src)
+            .into_iter()
+            .map(|s| s.name)
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "real_thm"),
+            "real decl missing: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "fake_thm"),
+            "comment leak (fake_thm): {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n == "fake_def"),
+            "comment leak (fake_def): {names:?}"
         );
     }
 }

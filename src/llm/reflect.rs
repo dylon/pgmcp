@@ -14,7 +14,7 @@ use std::sync::atomic::Ordering;
 
 use anyhow::{Result, anyhow};
 use sqlx::PgPool;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::db::queries::{self, NewEntityInput};
 use crate::llm::LlmExtractor;
@@ -134,7 +134,7 @@ pub async fn run_reflection(
             stats
                 .memory_reflection_errors
                 .fetch_add(1, Ordering::Relaxed);
-            warn!(error = %e, run_id, "reflection: LLM call failed");
+            error!(error = %e, run_id, "reflection: LLM call failed");
             finalize_run(pool, run_id, observations_considered, 0).await?;
             return Err(anyhow!("reflection failed: {}", e));
         }
@@ -277,7 +277,7 @@ pub async fn run_reflection_cron(
             stats
                 .memory_reflection_errors
                 .fetch_add(1, Ordering::Relaxed);
-            warn!(error = %e, "reflection cron: scope query failed");
+            error!(error = %e, "reflection cron: scope query failed");
             return;
         }
     };
@@ -298,7 +298,7 @@ pub async fn run_reflection_cron(
             trigger: ReflectionTrigger::Cron,
         };
         if let Err(e) = run_reflection(&pool, &stats, extractor.as_ref(), request).await {
-            warn!(error = %e, scope_id, "reflection cron: per-scope failure");
+            error!(error = %e, scope_id, "reflection cron: per-scope failure");
         }
     }
 }

@@ -24,8 +24,8 @@ use serde_json::{Value, json};
 use crate::context::SystemContext;
 use crate::db::queries;
 use crate::mcp::server::{
-    WorkItemAddCriterionParams, WorkItemAttemptVerifyParams, WorkItemDeferParams,
-    WorkItemRecordEvidenceParams, WorkItemReinstateParams,
+    WorkItemAddCriterionParams, WorkItemAssertFixedParams, WorkItemAttemptVerifyParams,
+    WorkItemDeferParams, WorkItemRecordEvidenceParams, WorkItemReinstateParams,
 };
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err};
 use crate::mcp::tools::work_items::crud::{id_of_public, map_db_err, map_op_err};
@@ -299,6 +299,94 @@ pub async fn tool_work_item_attempt_verify(
         .work_item_verifications
         .fetch_add(1, Ordering::Relaxed);
     json_result(&updated)
+}
+
+/// `work_item_assert_fixed` — an agent asserts a bug is fixed against a frozen,
+/// machine-checkable reproduction criterion, and advances it as far as the
+/// trust boundary allows (`claimed_done`). It does NOT — and cannot — mark the
+/// bug `verified`: per ADR-004 an `Actor::Agent` has no arm into a judgment
+/// state. Closing to `verified` happens only via trusted evidence — CI posting
+/// the `verification_command`'s result (`POST /api/tracker/ci_evidence` with the
+/// tracker user_token) or a decided bug-fix experiment — at which point the
+/// gatekeeper flips it. This tool freezes the bar (anti-tamper) and walks the
+/// agent-legal part of the path, then reports exactly what trusted step remains.
+/// It is the self-service "I fixed it" affordance whose absence left agent-filed
+/// bugs stranded (ADR-023).
+pub async fn tool_work_item_assert_fixed(
+    ctx: &SystemContext,
+    params: WorkItemAssertFixedParams,
+) -> Result<CallToolResult, McpError> {
+    ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
+    let pool = pool_or_err(ctx)?;
+    if params.verification_command.trim().is_empty() {
+        return Err(McpError::invalid_params(
+            "verification_command must be non-empty (a check that fails before the fix and passes after)",
+            None,
+        ));
+    }
+    let item_id = id_of_public(pool, &params.public_id).await?;
+    let item = queries::get_work_item(pool, item_id)
+        .await
+        .map_err(map_db_err)?
+        .ok_or_else(|| {
+            McpError::invalid_params(format!("no work item '{}'", params.public_id), None)
+        })?;
+    if item.kind != "bug" {
+        return Err(McpError::invalid_params(
+            format!(
+                "work_item_assert_fixed applies only to kind='bug' (got '{}')",
+                item.kind
+            ),
+            None,
+        ));
+    }
+
+    // Freeze the verifiable criterion (anti-tamper; locked once).
+    queries::freeze_bug_criterion(
+        pool,
+        item_id,
+        &params.verification_command,
+        params.expected_signal.as_deref(),
+    )
+    .await
+    .map_err(map_db_err)?;
+
+    // Walk the agent-legal part of the path to `claimed_done`. NEVER touch a
+    // judgment state — that is the gatekeeper's, gated on trusted evidence.
+    // Best-effort: if the from-state is not agent-advanceable to claimed_done,
+    // report the current status + the transition note rather than failing (the
+    // frozen criterion is the load-bearing outcome).
+    let agent = params.agent_id.as_deref().unwrap_or("unknown-agent");
+    let (advanced, status, transition_note) = match queries::set_work_item_status(
+        pool,
+        item_id,
+        WorkItemStatus::ClaimedDone,
+        Actor::Agent,
+        Some(agent),
+        Some("assert_fixed"),
+        None,
+        None,
+    )
+    .await
+    {
+        Ok(row) => (true, row.status, None),
+        Err(e) => (false, item.status.clone(), Some(e.to_string())),
+    };
+
+    json_result(&json!({
+        "public_id": params.public_id,
+        "kind": "bug",
+        "status": status,
+        "advanced_to_claimed_done": advanced,
+        "transition_note": transition_note,
+        "criterion_frozen": true,
+        "verification_command": params.verification_command,
+        "verified": false,
+        "guidance": "Fix asserted with a frozen, machine-checkable criterion. This does NOT mark \
+    the bug verified — an agent cannot self-verify (ADR-004 trust boundary). To close it, post TRUSTED \
+    evidence: run verification_command in CI and POST /api/tracker/ci_evidence with the tracker \
+    user_token, or decide a linked bug-fix experiment; the gatekeeper then flips it to verified.",
+    }))
 }
 
 /// Check the configured tracker user-token. This is the user-authority gate for

@@ -44,6 +44,83 @@ Requires graph-analysis cron."
     }
 
     #[tool(
+        description = "Combined INTER + INTRA-project architectural quality over the hierarchical \
+rollup (ADR-027): the workspace summary, per-group summaries, and per-project Martin metrics \
+(instability / abstractness / distance-from-main-sequence + an architecture_quality_score), worst \
+first. USE WHEN you want the whole-workspace architecture picture across projects, not one project. \
+Backed by project_metrics / hier_group_metrics (graph-analysis rollup); rebuild=true re-aggregates \
+the group+workspace levels. Returns {workspace, groups[], projects[]}."
+    )]
+    async fn workspace_architecture_quality(
+        &self,
+        Parameters(params): Parameters<WorkspaceArchitectureQualityParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "workspace_architecture_quality",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_workspace_architecture_quality::tool_workspace_architecture_quality(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Verify the strict (extensive-sum) composition laws of the Containment functor \
+over the hierarchical rollup (ADR-028): the workspace total of each extensive metric (file counts) \
+must equal the sum over projects. USE WHEN you want to confirm the inter/intra rollup is internally \
+consistent — a violation is a data-integrity bug, not a metric choice. rebuild=true re-aggregates \
+first. Returns {laws_checked, ok, violations[]}."
+    )]
+    async fn categorical_lint(
+        &self,
+        Parameters(params): Parameters<CategoricalLintParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "categorical_lint",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_categorical_lint::tool_categorical_lint(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Inter-project dependency coupling over the multi-ecosystem \
+project_dependencies graph (ADR-027): per-project efferent (Ce) / afferent (Ca) coupling + \
+instability, the most-depended-upon \"god projects\" (highest Ca first), and cross-project \
+dependency CYCLES (SCCs). USE WHEN you want to identify dependency coupling and cycles ACROSS \
+projects. Run the project-deps cron first to populate edges. Returns {project_count, edge_count, \
+cross_project_cycles[], projects[]}."
+    )]
+    async fn cross_project_coupling(
+        &self,
+        Parameters(params): Parameters<CrossProjectCouplingParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "cross_project_coupling",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_cross_project_coupling::tool_cross_project_coupling(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Detect architecture violations: cycles, god modules, bidirectional deps, \
 SDP violations, Zone of Pain/Uselessness modules. \
 USE WHEN: producing an architecture review, gating a PR on architectural-debt regressions, \

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use bincode::Options;
 use libgrammstein::topic::{TopicConfig, TopicExtractor};
 use sqlx::PgPool;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::stats::tracker::StatsTracker;
 
@@ -40,7 +40,7 @@ pub struct DendrogramRunReport {
 /// at n < 2 anyway).
 pub async fn run_or_log(pool: Arc<PgPool>, stats: Arc<StatsTracker>) {
     if let Err(e) = run_pass(&pool, &stats).await {
-        warn!(error = %e, "topic-dendrogram pass failed");
+        error!(error = %e, "topic-dendrogram pass failed");
     }
 }
 
@@ -69,7 +69,7 @@ pub async fn run_pass(
                     .fetch_add(topic_count, std::sync::atomic::Ordering::Relaxed);
             }
             Err(e) => {
-                warn!(project = %project_name, error = %e, "topic-dendrogram project run failed");
+                error!(project = %project_name, error = %e, "topic-dendrogram project run failed");
                 report.errors += 1;
             }
         }

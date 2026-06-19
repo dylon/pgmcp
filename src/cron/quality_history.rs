@@ -11,7 +11,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::context::SystemContext;
 use crate::quality::aggregate::aggregate_for_project;
@@ -36,7 +36,7 @@ pub async fn run_or_log(ctx: SystemContext, stats: Arc<StatsTracker>) {
     let projects = match crate::db::queries::list_projects(&pool).await {
         Ok(p) => p,
         Err(e) => {
-            warn!(error = %e, "quality-history: list_projects failed");
+            error!(error = %e, "quality-history: list_projects failed");
             return;
         }
     };
@@ -66,7 +66,7 @@ pub async fn run_or_log(ctx: SystemContext, stats: Arc<StatsTracker>) {
                 snapshots += 1;
             }
             Err(e) => {
-                warn!(
+                error!(
                     error = %e,
                     project = %project.name,
                     "quality-history: aggregate failed (non-fatal)"

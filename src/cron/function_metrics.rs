@@ -212,7 +212,7 @@ async fn score_project_functions(
                     stats.functions_scored.fetch_add(scored, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    warn!(
+                    error!(
                         project = %project_name,
                         file = %file.relative_path,
                         error = %e,

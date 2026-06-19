@@ -39,6 +39,29 @@ entry points.")]
     }
 
     #[tool(
+        description = "Inter-project grouping (ADR-027): worktree families + singletons across \
+the workspace, with each group's member projects and roles (main/member). USE WHEN you need to \
+see which indexed projects are worktrees of one repository (cross-project tools default to the \
+main of each family). Re-derives from git metadata by default. Returns {count, \
+multi_member_groups, groups[]}."
+    )]
+    async fn project_groups(
+        &self,
+        Parameters(params): Parameters<ProjectGroupsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "project_groups",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_project_groups::tool_project_groups(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Indexed-file metadata envelope (size, language, line count, \
 last_indexed_at, project name, chunk count). \
 USE WHEN: you want a quick fingerprint of a file before deciding whether to read it, \

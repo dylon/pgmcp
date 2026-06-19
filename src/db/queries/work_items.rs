@@ -485,6 +485,35 @@ pub async fn upsert_bug_details(
     Ok(())
 }
 
+/// Freeze a bug's machine-checkable reproduction criterion (v44 columns) for
+/// `work_item_assert_fixed` (ADR-023). `criterion_locked_at` is set once
+/// (anti-tamper, like an experiment hypothesis's locked criterion), so an agent
+/// cannot quietly rewrite the bar after asserting a fix. Creates the sidecar row
+/// if absent. Idempotent on the lock timestamp.
+pub async fn freeze_bug_criterion(
+    pool: &PgPool,
+    item_id: i64,
+    verification_command: &str,
+    expected_signal: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO work_item_bug_details
+            (item_id, verification_command, expected_signal, criterion_locked_at)
+         VALUES ($1, $2, $3, NOW())
+         ON CONFLICT (item_id) DO UPDATE SET
+            verification_command = EXCLUDED.verification_command,
+            expected_signal = COALESCE(EXCLUDED.expected_signal, work_item_bug_details.expected_signal),
+            criterion_locked_at = COALESCE(work_item_bug_details.criterion_locked_at, NOW()),
+            updated_at = NOW()",
+    )
+    .bind(item_id)
+    .bind(verification_command)
+    .bind(expected_signal)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 /// Transactional variant of [`upsert_bug_details`].
 pub async fn upsert_bug_details_in_tx(
     tx: &mut Transaction<'_, Postgres>,
@@ -2555,6 +2584,57 @@ pub async fn resolve_file_id_by_path(
     Ok(row.map(|(id,)| id))
 }
 
+/// An open `kind='bug'` work-item anchored (via `work_item_code_anchor`) to one
+/// of the given paths. Backs the boyscout `pgmcp bug-gate` verify step (ADR-022):
+/// it flags bugs the author should fix before pushing changes that touch the same
+/// files. "Open" = not yet terminal (`verified`/`cancelled`/`deferred`).
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct OpenBugAnchor {
+    pub public_id: String,
+    pub title: String,
+    pub severity: Option<String>,
+    pub status: String,
+    pub relative_path: String,
+}
+
+/// Find open bugs anchored to any of `paths`. Path matching mirrors
+/// [`resolve_file_id_by_path`]'s suffix idiom so a project-relative diff path
+/// (`src/foo.rs`) matches an indexed `relative_path` even when the latter carries
+/// a longer prefix. Returns at most `limit` rows, ordered by severity then id.
+pub async fn open_bugs_anchored_to_paths(
+    pool: &PgPool,
+    paths: &[String],
+    limit: i64,
+) -> Result<Vec<OpenBugAnchor>, sqlx::Error> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, OpenBugAnchor>(
+        // `sev_rank` is selected (not just used in ORDER BY) because SELECT
+        // DISTINCT requires every ORDER BY expression to appear in the select
+        // list. It is functionally determined by `severity` (already selected),
+        // so it does not change the distinct grouping; `OpenBugAnchor`'s FromRow
+        // simply ignores the extra column.
+        "SELECT DISTINCT w.public_id, w.title, w.severity, w.status, f.relative_path,
+                CASE w.severity WHEN 'critical' THEN 0 WHEN 'high' THEN 1
+                                WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END AS sev_rank
+           FROM work_items w
+           JOIN work_item_code_anchor a ON a.item_id = w.id
+           JOIN indexed_files f ON f.id = a.file_id
+          WHERE w.kind = 'bug'
+            AND w.status NOT IN ('verified', 'cancelled', 'deferred')
+            AND (f.relative_path = ANY($1)
+                 OR EXISTS (SELECT 1 FROM unnest($1::text[]) p
+                             WHERE f.relative_path LIKE '%' || p))
+          ORDER BY sev_rank, w.public_id
+          LIMIT $2",
+    )
+    .bind(paths)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
 // ============================================================================
 // Burndown / velocity (Phase 9e) — read over work_item_status_history.
 // ============================================================================
@@ -2822,7 +2902,7 @@ async fn drive_work_item_to_verified(pool: &PgPool, work_item_id: i64) {
             }
         }
         Err(e) => {
-            tracing::warn!(work_item_id, error = %e, "experiment-sync: evidence lookup failed")
+            tracing::error!(work_item_id, error = %e, "experiment-sync: evidence lookup failed")
         }
     }
 }

@@ -53,6 +53,10 @@ const BACKEND_LANGUAGES: &[&str] = &[
     "tlaplus",
     "lean",
     "sage",
+    "isabelle",
+    "metamath",
+    "why3",
+    "tamarin",
 ];
 
 /// Run the full symbol-extraction pipeline across all projects.
@@ -326,14 +330,26 @@ async fn extract_project_symbols(
                         min_skipped = min_modified(min_skipped, file.modified_at);
                         continue;
                     }
-                    DiskReadOutcome::IoError | DiskReadOutcome::NotRecoverable => {
+                    DiskReadOutcome::IoError => {
                         stats
                             .symbol_extraction_disk_io_errors
                             .fetch_add(1, Ordering::Relaxed);
-                        warn!(
+                        error!(
                             project = %project_name,
                             file = %file.relative_path,
-                            "Symbol extraction: content NULL and not recoverable from disk; skipping"
+                            "Symbol extraction: disk read failed (IO error); skipping — symbols will be incomplete for this file"
+                        );
+                        min_skipped = min_modified(min_skipped, file.modified_at);
+                        continue;
+                    }
+                    DiskReadOutcome::NotRecoverable => {
+                        stats
+                            .symbol_extraction_disk_not_recoverable
+                            .fetch_add(1, Ordering::Relaxed);
+                        error!(
+                            project = %project_name,
+                            file = %file.relative_path,
+                            "Symbol extraction: content NULL and not recoverable from disk; skipping — symbols will be incomplete for this file"
                         );
                         min_skipped = min_modified(min_skipped, file.modified_at);
                         continue;
@@ -356,7 +372,7 @@ async fn extract_project_symbols(
                     // Per-file transaction failures are logged and skipped — the
                     // FK CASCADE handles the case where the file was deleted
                     // between Phase A and Phase B.
-                    warn!(
+                    error!(
                         project = %project_name,
                         file = %file.relative_path,
                         error = %e,
@@ -599,6 +615,9 @@ async fn extract_and_persist_file(
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        // Scrub stale occurrences too (the file_symbols FK is ON DELETE SET
+        // NULL, so it nulls enclosing/target but does not remove the rows).
+        queries::replace_file_occurrences(pool, file_id, &[]).await?;
         return Ok((0, 0));
     }
 
@@ -692,6 +711,72 @@ async fn extract_and_persist_file(
         }
     }
 
+    // Token-level occurrences (v45, ADR-024): every identifier, classified
+    // code/comment/string/doc with column offsets. Resolve the innermost
+    // enclosing `file_symbols` span + the same-file definition target, upgrade a
+    // code identifier at a defining line to `Definition`, then replace per file.
+    // Capped so a pathological file cannot blow the row budget.
+    {
+        use crate::parsing::occurrence_kind::OccurrenceKind;
+        const MAX_OCC_PER_FILE: usize = 200_000;
+        let occurrences = backend.extract_occurrences(content);
+        let mut spans: Vec<(i64, u32, u32)> = Vec::with_capacity(symbols.len());
+        let mut def_at: std::collections::HashMap<(&str, u32), i64> =
+            std::collections::HashMap::new();
+        let mut def_by_name: std::collections::HashMap<&str, i64> =
+            std::collections::HashMap::new();
+        for (sym, sid) in symbols.iter().zip(symbol_ids.iter()) {
+            if *sid == 0 {
+                continue;
+            }
+            spans.push((*sid, sym.start_line, sym.end_line));
+            def_at
+                .entry((sym.name.as_str(), sym.start_line))
+                .or_insert(*sid);
+            def_by_name.entry(sym.name.as_str()).or_insert(*sid);
+        }
+        let mut occ_rows: Vec<queries::ResolvedOccurrence> =
+            Vec::with_capacity(occurrences.len().min(MAX_OCC_PER_FILE));
+        for occ in occurrences.iter().take(MAX_OCC_PER_FILE) {
+            let mut enclosing: Option<i64> = None;
+            let mut best = u32::MAX;
+            for (sid, s, e) in &spans {
+                if *s <= occ.start_line && occ.start_line <= *e {
+                    let width = e.saturating_sub(*s);
+                    if width <= best {
+                        best = width;
+                        enclosing = Some(*sid);
+                    }
+                }
+            }
+            let is_def = matches!(occ.occurrence_kind, OccurrenceKind::CodeReference)
+                && def_at.contains_key(&(occ.name.as_str(), occ.start_line));
+            let kind = if is_def {
+                OccurrenceKind::Definition
+            } else {
+                occ.occurrence_kind
+            };
+            let resolved = if matches!(
+                kind,
+                OccurrenceKind::Definition | OccurrenceKind::CodeReference
+            ) {
+                def_by_name.get(occ.name.as_str()).copied()
+            } else {
+                None
+            };
+            occ_rows.push(queries::ResolvedOccurrence {
+                name: occ.name.clone(),
+                start_line: occ.start_line as i32,
+                start_col: occ.start_col as i32,
+                end_col: occ.end_col as i32,
+                occurrence_kind: kind.as_str().to_string(),
+                enclosing_symbol_id: enclosing,
+                resolved_target_id: resolved,
+            });
+        }
+        queries::replace_file_occurrences(pool, file_id, &occ_rows).await?;
+    }
+
     // Temporal effect-drift (v15): diff the freshly-extracted effect sets
     // against the pre-extraction snapshot and append gained/lost transitions.
     // Keyed by (kind, name) so a symbol that merely moved lines isn't reported
@@ -729,7 +814,7 @@ async fn extract_and_persist_file(
         if !drift.is_empty()
             && let Err(e) = queries::record_effect_drift(pool, file_id, &drift).await
         {
-            warn!(file_id, error = %e, "effect-drift recording failed (non-fatal)");
+            error!(file_id, error = %e, "effect-drift recording failed (non-fatal)");
         }
     }
 

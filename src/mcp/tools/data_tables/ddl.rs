@@ -309,10 +309,12 @@ pub async fn tool_data_table_describe(
     } else {
         Vec::new()
     };
+    let links = queries::links_for_table(pool, t.id).await.map_err(db_err)?;
     json_result(&json!({
         "table": t,
         "columns": columns,
         "row_count": row_count,
         "sample_rows": sample_rows,
+        "links": links,
     }))
 }

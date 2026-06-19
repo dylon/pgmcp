@@ -99,7 +99,7 @@ struct Qwen3Inner {
 impl Qwen3LocalExtractor {
     pub fn new(variant: Qwen3Variant) -> Result<Self> {
         let device = Device::new_cuda(0).or_else(|cuda_err| {
-            tracing::warn!(error = %cuda_err, "Qwen3LocalExtractor: CUDA init failed, falling back to CPU (very slow)");
+            tracing::error!(error = %cuda_err, "Qwen3LocalExtractor: CUDA init failed, falling back to CPU (very slow)");
             Ok::<Device, anyhow::Error>(Device::Cpu)
         })?;
 

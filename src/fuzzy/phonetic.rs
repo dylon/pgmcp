@@ -33,7 +33,7 @@ use liblevenshtein::phonetic::rules::english;
 use liblevenshtein::phonetic::types::RewriteRuleChar;
 use notify::{RecursiveMode, Watcher};
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// Articulatory edit distance — Levenshtein with per-character
 /// substitution costs from the IPA articulatory-feature table
@@ -231,7 +231,7 @@ impl PgmcpPhonetics {
                     match event.kind {
                         notify::EventKind::Modify(_) | notify::EventKind::Create(_) => {
                             if let Err(e) = phon_for_cb.reload_rules(&path_for_cb) {
-                                warn!(path = %path_for_cb.display(), error = %e, "PgmcpPhonetics: reload failed");
+                                error!(path = %path_for_cb.display(), error = %e, "PgmcpPhonetics: reload failed");
                             }
                         }
                         notify::EventKind::Remove(_) => {

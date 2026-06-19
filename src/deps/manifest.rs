@@ -90,7 +90,7 @@ async fn resolve_dep(
         .map(|id| ("registry", id, 0.7))
 }
 
-async fn project_by_path(pool: &PgPool, path: &Path) -> Option<i32> {
+pub(crate) async fn project_by_path(pool: &PgPool, path: &Path) -> Option<i32> {
     let p = path.to_string_lossy();
     let p_slash = format!("{}/", p.trim_end_matches('/'));
     sqlx::query_scalar("SELECT id FROM projects WHERE path = $1 OR path = $2 LIMIT 1")
@@ -102,7 +102,7 @@ async fn project_by_path(pool: &PgPool, path: &Path) -> Option<i32> {
         .flatten()
 }
 
-async fn project_by_name(pool: &PgPool, name: &str) -> Option<i32> {
+pub(crate) async fn project_by_name(pool: &PgPool, name: &str) -> Option<i32> {
     sqlx::query_scalar("SELECT id FROM projects WHERE name = $1 LIMIT 1")
         .bind(name)
         .fetch_optional(pool)

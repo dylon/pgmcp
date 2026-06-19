@@ -12,7 +12,7 @@ use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, LoggingLevel};
 use serde::Serialize;
 use serde_json::json;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error};
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;

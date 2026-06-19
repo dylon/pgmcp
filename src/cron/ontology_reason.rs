@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::config::OntologyConfig;
 use crate::ontology::reason;
@@ -31,6 +31,6 @@ pub async fn run_ontology_reason(pool: &PgPool) -> Result<(), sqlx::Error> {
 /// Cron entry point: run the check, logging (not panicking) on error.
 pub async fn run_or_log(pool: Arc<PgPool>, _config: OntologyConfig) {
     if let Err(e) = run_ontology_reason(&pool).await {
-        warn!(error = %e, "ontology-reason pass failed");
+        error!(error = %e, "ontology-reason pass failed");
     }
 }

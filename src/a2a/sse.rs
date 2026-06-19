@@ -16,7 +16,7 @@ use axum::response::sse::Event as SseEvent;
 use futures::stream::{self, Stream};
 use sqlx::PgPool;
 use tokio::time::sleep;
-use tracing::warn;
+use tracing::error;
 use uuid::Uuid;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -75,7 +75,7 @@ pub async fn task_event_stream(
             {
                 Ok(r) => r,
                 Err(e) => {
-                    warn!(error = %e, "a2a sse poll failed");
+                    error!(error = %e, "a2a sse poll failed");
                     return None;
                 }
             };

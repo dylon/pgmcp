@@ -120,6 +120,10 @@ impl LanguageBackend for LeanBackend {
         "lean"
     }
 
+    fn lex_config(&self) -> crate::parsing::occurrences::LexConfig {
+        crate::parsing::occurrences::LexConfig::lean_style()
+    }
+
     fn extract_symbols(&self, content: &str) -> Vec<Symbol> {
         let Some(tree) = parse(content) else {
             return Vec::new();

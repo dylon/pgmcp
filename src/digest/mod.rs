@@ -826,7 +826,7 @@ pub async fn maybe_emit(
     )
     .await
     {
-        tracing::warn!(error = %e, "insert_digest_emission failed; suppressing emission");
+        tracing::error!(error = %e, "insert_digest_emission failed; suppressing emission");
         return false;
     }
     true

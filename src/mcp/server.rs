@@ -45,6 +45,8 @@ mod handlers_data_eng;
 mod handlers_data_tables;
 #[path = "server/handlers/experiments.rs"]
 mod handlers_experiments;
+#[path = "server/handlers/feedback.rs"]
+mod handlers_feedback;
 #[path = "server/handlers/fuzzy.rs"]
 mod handlers_fuzzy;
 #[path = "server/handlers/graph_advanced.rs"]
@@ -99,7 +101,7 @@ use rmcp::tool;
 use rmcp::{ErrorData as McpError, RoleServer, ServerHandler};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
-use tracing::{Instrument, info, info_span, warn};
+use tracing::{Instrument, error, info, info_span};
 
 use crate::config::Config;
 use crate::context::SystemContext;
@@ -319,7 +321,7 @@ where
         ),
         Err(e) => {
             stats.mcp_errors.fetch_add(1, Ordering::Relaxed);
-            warn!(
+            error!(
                 target: "pgmcp::mcp::tool",
                 tool = name,
                 client = %caller.client_name,
@@ -513,6 +515,7 @@ impl McpServer {
             + Self::router_ontology()
             + Self::router_toolbox()
             + Self::router_meta()
+            + Self::router_feedback()
     }
 }
 
@@ -569,6 +572,7 @@ impl McpServer {
             ("work_items_a", names(Self::router_work_items_a())),
             ("work_items_b", names(Self::router_work_items_b())),
             ("data_tables", names(Self::router_data_tables())),
+            ("feedback", names(Self::router_feedback())),
             ("trajectory", names(Self::router_trajectory())),
             ("graph_advanced", names(Self::router_graph_advanced())),
             ("infotheory", names(Self::router_infotheory())),
@@ -826,6 +830,7 @@ impl McpServer {
             "read_file"              => read_file(ReadFileParams),
             "mandate_context"        => mandate_context(MandateContextParams),
             "project_tree"           => project_tree(ProjectTreeParams),
+            "project_groups"         => project_groups(ProjectGroupsParams) in tool_project_groups,
             "work_summary"           => work_summary(WorkSummaryParams),
             "file_info"              => file_info(FileInfoParams),
             // Similarity
@@ -835,6 +840,7 @@ impl McpServer {
             "refactoring_report"     => refactoring_report(RefactoringReportParams),
             // Topics
             "discover_topics"        => discover_topics(DiscoverTopicsParams),
+            "cross_project_topic_redundancy" => cross_project_topic_redundancy(CrossProjectTopicRedundancyParams) in tool_cross_project_topic_redundancy,
             "find_orphans"           => find_orphans(FindOrphansParams),
             "find_misplaced_code"    => find_misplaced_code(FindMisplacedCodeParams),
             "find_coupled_files"     => find_coupled_files(FindCoupledFilesParams),
@@ -878,6 +884,9 @@ impl McpServer {
             "code_raptor_search"     => code_raptor_search(CodeRaptorSearchParams),
             // Architecture
             "coupling_cohesion_report"  => coupling_cohesion_report(CouplingCohesionReportParams),
+            "workspace_architecture_quality" => workspace_architecture_quality(WorkspaceArchitectureQualityParams) in tool_workspace_architecture_quality,
+            "categorical_lint"          => categorical_lint(CategoricalLintParams) in tool_categorical_lint,
+            "cross_project_coupling"    => cross_project_coupling(CrossProjectCouplingParams) in tool_cross_project_coupling,
             "architecture_violations"   => architecture_violations(ArchitectureViolationsParams),
             "design_smell_detection"    => design_smell_detection(DesignSmellDetectionParams),
             "architecture_quality"      => architecture_quality(ArchitectureQualityParams),
@@ -931,11 +940,22 @@ impl McpServer {
             "experiment_log_artifact"       => experiment_log_artifact(ExperimentLogArtifactParams) in tool_experiments,
             "experiment_render_ledger"      => experiment_render_ledger(ExperimentRenderLedgerParams) in tool_experiments,
             // JSON data tables (share the data_tables module).
+            // Agent feedback + voting (ADR-023).
+            "submit_feedback"        => submit_feedback(SubmitFeedbackParams) in tool_feedback,
+            "list_feedback"          => list_feedback(ListFeedbackParams) in tool_feedback,
+            "search_feedback"        => search_feedback(SearchFeedbackParams) in tool_feedback,
+            "respond_feedback"       => respond_feedback(RespondFeedbackParams) in tool_feedback,
+            "promote_feedback_to_work_item" => promote_feedback_to_work_item(PromoteFeedbackParams) in tool_feedback,
+            "cast_vote"              => cast_vote(CastVoteParams) in tool_feedback,
+            "retract_vote"           => retract_vote(RetractVoteParams) in tool_feedback,
+            "tally_votes"            => tally_votes(TallyVotesParams) in tool_feedback,
             "data_table_create"      => data_table_create(DataTableCreateParams) in data_tables,
             "data_table_alter"       => data_table_alter(DataTableAlterParams) in data_tables,
             "data_table_drop"        => data_table_drop(DataTableDropParams) in data_tables,
             "data_table_list"        => data_table_list(DataTableListParams) in data_tables,
             "data_table_describe"    => data_table_describe(DataTableDescribeParams) in data_tables,
+            "data_table_link"        => data_table_link(DataTableLinkParams) in data_tables,
+            "data_table_unlink"      => data_table_unlink(DataTableUnlinkParams) in data_tables,
             "data_table_insert"      => data_table_insert(DataTableInsertParams) in data_tables,
             "data_table_select"      => data_table_select(DataTableSelectParams) in data_tables,
             "data_table_update"      => data_table_update(DataTableUpdateParams) in data_tables,
@@ -970,6 +990,7 @@ impl McpServer {
             "work_item_add_criterion" => work_item_add_criterion(WorkItemAddCriterionParams) in work_items,
             "work_item_record_evidence" => work_item_record_evidence(WorkItemRecordEvidenceParams) in work_items,
             "work_item_attempt_verify" => work_item_attempt_verify(WorkItemAttemptVerifyParams) in work_items,
+            "work_item_assert_fixed"   => work_item_assert_fixed(WorkItemAssertFixedParams) in work_items,
             "work_item_defer"        => work_item_defer(WorkItemDeferParams) in work_items,
             "work_item_reinstate"    => work_item_reinstate(WorkItemReinstateParams) in work_items,
             "work_item_triage"       => work_item_triage(WorkItemTriageParams) in work_items,
@@ -1089,6 +1110,7 @@ impl McpServer {
             // dispatch — added so `call_tool_cli` can drive every #[tool]
             // method from harness tests. See `query_smoke_mcp_tools.rs`.
             "orient"                         => orient(OrientParams),
+            "lsp_query"                      => lsp_query(LspQueryParams) in tool_lsp_query,
             "topic_hierarchy_fcm"            => topic_hierarchy_fcm(TopicHierarchyFcmParams),
             "dependency_health"              => dependency_health(DependencyHealthParams),
             "shotgun_surgery_fix"            => shotgun_surgery_fix(ShotgunSurgeryFixParams),
@@ -1135,6 +1157,7 @@ impl McpServer {
             "pattern_catalog_stats" => pattern_catalog_stats in tool_software_patterns,
             "toolbox_stats" => toolbox_stats in tool_toolbox,
             "documentation_guidelines" => documentation_guidelines,
+            "engineering_principles" => engineering_principles,
         })
     }
 }
@@ -1199,17 +1222,27 @@ pub(crate) fn social_banner_for(client_name: &str) -> &'static str {
 static DOC_GUIDELINES_BANNER: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(crate::docguidelines::render_instructions_banner);
 
+/// Engineering-principles banner, rendered once from the canonical seed module
+/// `crate::engprinciples`. Injected into EVERY client's instructions by
+/// `compose_instructions` (always-on, cross-agent) — the universal seam for the
+/// four behavioral mandates (Codex et al. have no prompt hook; this
+/// `initialize`-time string reaches them all). See ADR-022.
+static ENG_PRINCIPLES_BANNER: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(crate::engprinciples::render_instructions_banner);
+
 /// Compose per-client instructions: the base catalog (from `get_info`), then the
-/// documentation guidelines (unconditional — every client), then the social
-/// banner if any. Kept pure so the composition (catalog preservation + universal
-/// guidelines + per-client variance) is unit-testable without an rmcp peer.
+/// documentation guidelines and engineering principles (both unconditional —
+/// every client), then the social banner if any. Kept pure so the composition
+/// (catalog preservation + universal guidelines/principles + per-client variance)
+/// is unit-testable without an rmcp peer.
 pub(crate) fn compose_instructions(base: &str, client_name: &str) -> String {
     let guidelines = DOC_GUIDELINES_BANNER.as_str();
+    let principles = ENG_PRINCIPLES_BANNER.as_str();
     let social = social_banner_for(client_name);
     if social.is_empty() {
-        format!("{base}\n\n{guidelines}")
+        format!("{base}\n\n{guidelines}\n\n{principles}")
     } else {
-        format!("{base}\n\n{guidelines}\n\n{social}")
+        format!("{base}\n\n{guidelines}\n\n{principles}\n\n{social}")
     }
 }
 
@@ -1458,6 +1491,9 @@ impl ServerHandler for McpServer {
                         "Documentation-authoring guidelines enforced across all agents (JSON)",
                     )
                     .no_annotation(),
+                RawResource::new("pgmcp://engineering-principles", "Engineering Principles")
+                    .with_description("Engineering mandates enforced across all agents (JSON)")
+                    .no_annotation(),
             ],
             next_cursor: None,
             meta: None,
@@ -1532,6 +1568,14 @@ impl ServerHandler for McpServer {
             }
             "pgmcp://guidelines" => {
                 let json = serde_json::to_string_pretty(&crate::docguidelines::guidelines_json())
+                    .map_err(|e| McpError::internal_error(format!("{}", e), None))?;
+                return Ok(ReadResourceResult::new(vec![ResourceContents::text(
+                    json,
+                    request.uri.clone(),
+                )]));
+            }
+            "pgmcp://engineering-principles" => {
+                let json = serde_json::to_string_pretty(&crate::engprinciples::principles_json())
                     .map_err(|e| McpError::internal_error(format!("{}", e), None))?;
                 return Ok(ReadResourceResult::new(vec![ResourceContents::text(
                     json,
@@ -1810,16 +1854,25 @@ mod social_banner_tests {
         assert!(claude.len() > codex.len());
         assert!(!generic.contains("COLLABORATION (A2A)"));
         assert!(!generic.contains("a2a_pattern_recursive"));
-        // (c) the documentation guidelines are injected for EVERY client — the
-        // cross-agent enforcement surface (claude, codex, generic/unknown alike).
+        // (c) the documentation guidelines AND engineering principles are injected
+        // for EVERY client — the cross-agent enforcement surfaces (claude, codex,
+        // generic/unknown alike).
         assert!(claude.contains("Knuth's literate programming"));
         assert!(codex.contains("Knuth's literate programming"));
         assert!(generic.contains("Knuth's literate programming"));
         assert!(generic.contains("MUST follow"));
-        // generic = base + guidelines (no social banner).
+        assert!(claude.contains("all solutions must be fully generalized"));
+        assert!(codex.contains("all solutions must be fully generalized"));
+        assert!(generic.contains("all solutions must be fully generalized"));
+        assert!(generic.contains("MUST uphold"));
+        // generic = base + guidelines + principles (no social banner).
         assert_eq!(
             generic,
-            format!("{base}\n\n{}", super::DOC_GUIDELINES_BANNER.as_str())
+            format!(
+                "{base}\n\n{}\n\n{}",
+                super::DOC_GUIDELINES_BANNER.as_str(),
+                super::ENG_PRINCIPLES_BANNER.as_str()
+            )
         );
     }
 }

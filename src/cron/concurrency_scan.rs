@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 
 use serde_json::json;
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::concurrency::findings::ConcurrencyFindingKind;
 use crate::concurrency::{self, LockOrderOptions};
@@ -43,7 +43,7 @@ pub async fn run_or_log(pool: PgPool, stats: Arc<StatsTracker>, auto_promote: bo
         Ok(p) => p,
         Err(e) => {
             stats.cron_panics.fetch_add(1, Ordering::Relaxed);
-            warn!(error = %e, "concurrency-scan: list_projects failed");
+            error!(error = %e, "concurrency-scan: list_projects failed");
             return;
         }
     };
@@ -51,7 +51,7 @@ pub async fn run_or_log(pool: PgPool, stats: Arc<StatsTracker>, auto_promote: bo
     for project in &projects {
         match scan_project(&pool, project.id, auto_promote).await {
             Ok(n) => total += n,
-            Err(e) => warn!(
+            Err(e) => error!(
                 project = %project.name,
                 error = %e,
                 "concurrency-scan: project sweep failed (non-fatal)"
@@ -101,10 +101,10 @@ async fn promote(
             if created
                 && let Err(e) = queries::set_finding_promoted_item(pool, finding_id, item_id).await
             {
-                warn!(error = %e, "concurrency-scan: back-patch promoted_item_id failed");
+                error!(error = %e, "concurrency-scan: back-patch promoted_item_id failed");
             }
         }
-        Err(e) => warn!(error = ?e, "concurrency-scan: promote finding failed (non-fatal)"),
+        Err(e) => error!(error = ?e, "concurrency-scan: promote finding failed (non-fatal)"),
     }
 }
 

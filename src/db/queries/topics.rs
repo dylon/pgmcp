@@ -527,7 +527,7 @@ pub async fn store_topics(
         // Log per-topic failures via tracing; return Ok unless ALL topics
         // failed (in which case the most-recent error is propagated).
         for (cluster_index, err) in &errors {
-            tracing::warn!(
+            tracing::error!(
                 cluster_index,
                 error = %err,
                 "store_topics: per-topic transaction failed (continuing)"

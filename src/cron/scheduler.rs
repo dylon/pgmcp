@@ -10,7 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, unbounded};
-use tracing::{error, warn};
+use tracing::error;
 
 use crate::config::CronConfig;
 use crate::daemon_state::DaemonLifecycle;
@@ -605,7 +605,7 @@ impl CronStateMachine {
             (CronState::Terminated, _) => unreachable!("Cannot transition from Terminated"),
 
             (state, event) => {
-                warn!(?state, ?event, "Unexpected transition");
+                error!(?state, ?event, "Unexpected transition");
                 CronState::CheckEvents
             }
         };

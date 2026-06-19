@@ -9,6 +9,7 @@
 
 pub mod coord_store;
 pub mod coordination;
+pub mod ecosystems;
 pub mod gitstate;
 pub mod manifest;
 pub mod store;
@@ -69,11 +70,30 @@ pub enum DepSource {
     Manual,
     /// Asserted by an agent whose build failed naming the dependency.
     Asserted,
+    /// Parsed from a Node `package.json` manifest.
+    Npm,
+    /// Parsed from a Python manifest (`pyproject.toml` / `requirements.txt`).
+    Pypi,
+    /// Parsed from a Go `go.mod` manifest.
+    Go,
+    /// Parsed from a Maven `pom.xml` manifest.
+    Maven,
+    /// Parsed from a Lean `lakefile.lean` / `lake-manifest.json`.
+    Lake,
 }
 
 impl DepSource {
-    pub const ALL: &'static [DepSource] =
-        &[Self::Cargo, Self::Import, Self::Manual, Self::Asserted];
+    pub const ALL: &'static [DepSource] = &[
+        Self::Cargo,
+        Self::Import,
+        Self::Manual,
+        Self::Asserted,
+        Self::Npm,
+        Self::Pypi,
+        Self::Go,
+        Self::Maven,
+        Self::Lake,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -81,6 +101,11 @@ impl DepSource {
             Self::Import => "import",
             Self::Manual => "manual",
             Self::Asserted => "asserted",
+            Self::Npm => "npm",
+            Self::Pypi => "pypi",
+            Self::Go => "go",
+            Self::Maven => "maven",
+            Self::Lake => "lake",
         }
     }
 
@@ -114,12 +139,14 @@ mod tests {
     #[test]
     fn dep_source_vocabulary_is_pinned() {
         let got: HashSet<&str> = DepSource::ALL.iter().map(|s| s.as_str()).collect();
-        let expected: HashSet<&str> = ["cargo", "import", "manual", "asserted"]
-            .into_iter()
-            .collect();
+        let expected: HashSet<&str> = [
+            "cargo", "import", "manual", "asserted", "npm", "pypi", "go", "maven", "lake",
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(got, expected, "DepSource vocabulary drifted");
-        assert_eq!(DepSource::ALL.len(), 4);
-        assert_eq!(got.len(), 4, "duplicate as_str() in DepSource");
+        assert_eq!(DepSource::ALL.len(), 9);
+        assert_eq!(got.len(), 9, "duplicate as_str() in DepSource");
     }
 
     #[test]

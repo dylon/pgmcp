@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use ndarray::Array2;
 use pgvector::Vector;
 use sqlx::PgPool;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::fcm::{self, BackendChoice, FcmBackend, GpuPrecision};
 use crate::llm::LlmExtractor;
@@ -52,7 +52,7 @@ pub async fn run_or_log(
             );
         }
         Err(e) => {
-            warn!(error = %e, "memory-raptor cron: build failed");
+            error!(error = %e, "memory-raptor cron: build failed");
             stats
                 .memory_raptor_build_errors
                 .fetch_add(1, Ordering::Relaxed);
@@ -94,7 +94,7 @@ pub async fn run_raptor_build(
                 done += 1;
             }
             Err(e) => {
-                warn!(error = %e, scope_id, "raptor: per-scope build failed");
+                error!(error = %e, scope_id, "raptor: per-scope build failed");
                 stats
                     .memory_raptor_build_errors
                     .fetch_add(1, Ordering::Relaxed);
@@ -115,7 +115,7 @@ pub async fn run_raptor_build(
             }
         }
         Err(e) => {
-            warn!(error = %e, "raptor: unified-graph tree build failed");
+            error!(error = %e, "raptor: unified-graph tree build failed");
             stats
                 .memory_raptor_build_errors
                 .fetch_add(1, Ordering::Relaxed);
@@ -273,7 +273,7 @@ async fn write_cluster_summaries(
         let summary_entities = match tokio::task::block_in_place(|| extractor.reflect(&trimmed)) {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, scope_id, cluster = j, "raptor: cluster reflect failed");
+                error!(error = %e, scope_id, cluster = j, "raptor: cluster reflect failed");
                 continue;
             }
         };

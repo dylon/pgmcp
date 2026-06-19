@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::config::A2aReflectionConfig;
 use crate::llm::LlmExtractor;
@@ -38,6 +38,6 @@ pub async fn run_or_log(
             mandates_promoted = report.mandates_promoted,
             "a2a-reflect cron completed"
         ),
-        Err(e) => warn!(error = %e, "a2a-reflect cron failed"),
+        Err(e) => error!(error = %e, "a2a-reflect cron failed"),
     }
 }

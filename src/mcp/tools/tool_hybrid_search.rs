@@ -10,7 +10,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, LoggingLevel};
 use serde_json::json;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error};
 
 use crate::context::SystemContext;
 use crate::fuzzy::limits::{bounded_limit, bounded_max_distance};
@@ -193,11 +193,11 @@ pub async fn tool_hybrid_search(
         {
             Ok(Ok(r)) => (r, LegStatus::Ok),
             Ok(Err(e)) => {
-                warn!(leg = "text", error = %e, "hybrid_search text leg failed; degrading");
+                error!(leg = "text", error = %e, "hybrid_search text leg failed; degrading");
                 (Vec::new(), LegStatus::Error)
             }
             Err(_) => {
-                warn!(
+                error!(
                     leg = "text",
                     timeout_ms = text_leg_timeout_ms,
                     "hybrid_search text leg timed out; degrading"
@@ -214,7 +214,7 @@ pub async fn tool_hybrid_search(
         let embedding = match ctx.embed().embed_query(&params.query).await {
             Ok(e) => e,
             Err(e) => {
-                warn!(leg = "semantic", error = %e, "hybrid_search embedding failed; degrading");
+                error!(leg = "semantic", error = %e, "hybrid_search embedding failed; degrading");
                 return (Vec::new(), LegStatus::Error);
             }
         };
@@ -232,7 +232,7 @@ pub async fn tool_hybrid_search(
         {
             Ok(r) => (r, LegStatus::Ok),
             Err(e) => {
-                warn!(leg = "semantic", error = %e, "hybrid_search semantic leg failed; degrading");
+                error!(leg = "semantic", error = %e, "hybrid_search semantic leg failed; degrading");
                 (Vec::new(), LegStatus::Error)
             }
         }
@@ -477,7 +477,7 @@ async fn try_third_leg(
         match crate::mcp::tools::sota_helpers::project_id_or_err(ctx, project_name).await {
             Ok(project_id) => project_id,
             Err(e) => {
-                warn!(
+                error!(
                     project = %project_name,
                     error = ?e,
                     "third leg skipped: project id resolution failed"
@@ -500,7 +500,7 @@ async fn try_third_leg(
     let lm = match crate::wfst::hybrid_lm::PgmcpHybridLm::open(&model_path) {
         Ok(lm) => lm,
         Err(e) => {
-            warn!(error = %e, "third leg skipped: HybridLM load failed");
+            error!(error = %e, "third leg skipped: HybridLM load failed");
             return None;
         }
     };
@@ -513,7 +513,7 @@ async fn try_third_leg(
     let fuzzy_idx = match crate::fuzzy::sync::open_symbol_trie(ctx, project_name).await {
         Ok(idx) => idx,
         Err(e) => {
-            warn!(
+            error!(
                 project = %project_name,
                 error = ?e,
                 "third leg skipped: symbol trie open failed"

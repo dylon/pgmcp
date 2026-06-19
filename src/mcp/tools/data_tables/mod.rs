@@ -14,11 +14,13 @@
 mod analysis;
 mod ddl;
 mod dml;
+mod links;
 mod search;
 
 pub use analysis::*;
 pub use ddl::*;
 pub use dml::*;
+pub use links::*;
 pub use search::*;
 
 use std::collections::HashMap;
@@ -201,11 +203,11 @@ pub(crate) async fn embed_table(
         Ok(v) => {
             if let Err(e) = queries::set_table_embedding(pool, table_id, &v, EMBED_SIGNATURE).await
             {
-                tracing::warn!(error = %e, table = %name, "failed to store data-table embedding");
+                tracing::error!(error = %e, table = %name, "failed to store data-table embedding");
             }
         }
         Err(e) => {
-            tracing::warn!(error = %e, table = %name,
+            tracing::error!(error = %e, table = %name,
                 "data-table embed-on-write failed; leaving NULL for cron backfill");
         }
     }

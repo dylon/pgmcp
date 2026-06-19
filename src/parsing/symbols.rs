@@ -285,6 +285,26 @@ pub struct Symbol {
     pub scope_depth: Option<u32>,
 }
 
+/// One token-level identifier occurrence (ADR-024, v45 `symbol_occurrences`).
+/// Produced by [`crate::parsing::backend::LanguageBackend::extract_occurrences`];
+/// the extraction cron fills `enclosing_symbol_id` / `resolved_target_id` and
+/// upgrades a code occurrence coinciding with a definition to
+/// `OccurrenceKind::Definition`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Occurrence {
+    pub name: String,
+    /// 1-based line.
+    pub start_line: u32,
+    /// 0-based UTF-8 char column where the identifier starts.
+    pub start_col: u32,
+    /// 0-based UTF-8 char column just past the identifier's last char.
+    pub end_col: u32,
+    pub occurrence_kind: crate::parsing::occurrence_kind::OccurrenceKind,
+    /// Coarse type tags where a binder annotation is available (else empty).
+    #[serde(default)]
+    pub type_tags: Vec<String>,
+}
+
 /// One import statement extracted from a file. The `target_raw` form is the
 /// canonical resolvable identifier per the language: Rust path, Python module,
 /// JS specifier, etc.

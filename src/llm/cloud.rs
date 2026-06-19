@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
-use tracing::{debug, warn};
+use tracing::{debug, error};
 
 use crate::llm::prompt::{
     build_extraction_prompt, build_reflection_prompt, extract_first_json, strip_code_fences,
@@ -147,7 +147,7 @@ pub fn parse_extraction_response(raw: &str) -> Result<ExtractionResult> {
     {
         return Ok(r);
     }
-    warn!(
+    error!(
         len = raw.len(),
         head = %&raw.chars().take(200).collect::<String>(),
         "extractor response could not be parsed as ExtractionResult"

@@ -379,13 +379,13 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
                         *slot.write() = Some(e);
                     }
                     Ok(None) => {}
-                    Err(e) => tracing::warn!(
+                    Err(e) => tracing::error!(
                         error = %e,
                         backend = %backend_str,
                         "LLM extractor construction failed; Stage B + memory_reflect disabled"
                     ),
                 },
-                Err(e) => tracing::warn!(
+                Err(e) => tracing::error!(
                     error = %e,
                     backend = %backend_str,
                     "LLM extractor backend invalid; Stage B + memory_reflect disabled"
@@ -1053,7 +1053,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         tokio::spawn(async move {
             match mcp::tools::tool_software_patterns::warm_pattern_catalog(&warm_ctx).await {
                 Ok(()) => tracing::info!("Software pattern catalog warm-up complete"),
-                Err(e) => tracing::warn!(error = %e, "Software pattern catalog warm-up failed"),
+                Err(e) => tracing::error!(error = %e, "Software pattern catalog warm-up failed"),
             }
         });
     }
@@ -1066,7 +1066,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         tokio::spawn(async move {
             match mcp::tools::tool_toolbox::warm_toolbox_catalog(&warm_ctx).await {
                 Ok(()) => tracing::info!("Developer-tool catalog warm-up complete"),
-                Err(e) => tracing::warn!(error = %e, "Developer-tool catalog warm-up failed"),
+                Err(e) => tracing::error!(error = %e, "Developer-tool catalog warm-up failed"),
             }
         });
     }
@@ -1091,12 +1091,12 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
                         warm_ctx.set_tool_policy(snapshot);
                         tracing::info!(clients, "Tool-policy snapshot loaded");
                     }
-                    Err(e) => tracing::warn!(error = %e, "Tool-policy snapshot load failed"),
+                    Err(e) => tracing::error!(error = %e, "Tool-policy snapshot load failed"),
                 }
             }
             match mcp::tools::tool_meta::warm_mcp_tool_catalog(&warm_ctx).await {
                 Ok(()) => tracing::info!("MCP tool catalog warm-up complete"),
-                Err(e) => tracing::warn!(error = %e, "MCP tool catalog warm-up failed"),
+                Err(e) => tracing::error!(error = %e, "MCP tool catalog warm-up failed"),
             }
         });
     }
@@ -1183,7 +1183,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
                         *slot.write() = Some(r);
                     }
                     Ok(None) => {}
-                    Err(e) => tracing::warn!(
+                    Err(e) => tracing::error!(
                         error = %e,
                         "/api/search hook: reranker load failed; staying RRF-only"
                     ),
@@ -1278,7 +1278,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
                     )
                     .await
                     {
-                        tracing::warn!(
+                        tracing::error!(
                             kind, port = adapter_port, error = %e,
                             "autostart a2a-adapter exited"
                         );
@@ -1344,7 +1344,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         tokio::select! {
             result = mcp_service.waiting() => {
                 if let Err(e) = result {
-                    tracing::warn!("MCP service ended with error: {:?}", e);
+                    tracing::error!("MCP service ended with error: {:?}", e);
                 }
                 info!("MCP client disconnected");
             }
@@ -1468,8 +1468,8 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     if let Some(handle) = telemetry_writer_handle {
         match tokio::time::timeout(component_timeout, handle).await {
             Ok(Ok(())) => info!("Telemetry writer drained and exited"),
-            Ok(Err(e)) => tracing::warn!(error = %e, "Telemetry writer task panicked"),
-            Err(_) => tracing::warn!("Telemetry writer did not drain within 5s; aborting"),
+            Ok(Err(e)) => tracing::error!(error = %e, "Telemetry writer task panicked"),
+            Err(_) => tracing::error!("Telemetry writer did not drain within 5s; aborting"),
         }
     }
 
@@ -1477,8 +1477,8 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     // pending `cron_run_history` rows before exiting.
     match tokio::time::timeout(component_timeout, cron_history_writer_handle).await {
         Ok(Ok(())) => info!("Cron history writer drained and exited"),
-        Ok(Err(e)) => tracing::warn!(error = %e, "Cron history writer task panicked"),
-        Err(_) => tracing::warn!("Cron history writer did not drain within 5s; aborting"),
+        Ok(Err(e)) => tracing::error!(error = %e, "Cron history writer task panicked"),
+        Err(_) => tracing::error!("Cron history writer did not drain within 5s; aborting"),
     }
 
     // Close database pool (5s timeout)

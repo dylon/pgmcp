@@ -1258,6 +1258,28 @@ async fn documentation_guidelines_returns_the_full_static_list() {
 }
 
 #[tokio::test]
+async fn engineering_principles_returns_the_full_static_list() {
+    // Nullary, DB-free tool: returns the canonical four-mandate seed set
+    // regardless of database state (also satisfies the dispatch-coverage gate,
+    // which scans for a string-literal `call_tool_cli("engineering_principles", …)`).
+    let server = server_with_mock(MockDbClient::new());
+    let result = server
+        .call_tool_cli("engineering_principles", serde_json::json!({}))
+        .await
+        .expect("tool call");
+    let payload = text_of(&result);
+    let v: serde_json::Value = serde_json::from_str(&payload).expect("engineering_principles JSON");
+    assert_eq!(v["count"].as_u64(), Some(4));
+    let items = v["engineering_principles"].as_array().expect("array");
+    assert_eq!(items.len(), 4);
+    // The list is the canonical seed set (verbatim slugs), not DB-derived.
+    assert!(items.iter().any(|p| p["slug"] == "no-overfit-generalize"));
+    assert!(items.iter().any(|p| p["slug"] == "boyscout-fix-all-bugs"));
+    assert!(items.iter().any(|p| p["slug"] == "pipe-output-cleanup"));
+    assert!(items.iter().any(|p| p["slug"] == "occam-razor-simplicity"));
+}
+
+#[tokio::test]
 async fn index_stats_with_nonzero_bytes_prints_total() {
     let mut mock = MockDbClient::new();
     mock.total_bytes_indexed_result = 1_000_000;

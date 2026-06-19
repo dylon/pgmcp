@@ -17,7 +17,7 @@ use arc_swap::ArcSwap;
 use crossbeam_channel::Sender;
 use dashmap::DashMap;
 use notify::{RecursiveMode, Watcher};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::config::{self, Config};
 use crate::context::SystemContext;
@@ -137,7 +137,7 @@ pub fn start_indexing(
                                                 &phonetics_for_filter,
                                             )
                                         {
-                                            warn!(
+                                            error!(
                                                 path = %project_root.display(),
                                                 rules_path = %rules_path.display(),
                                                 error = %e,
@@ -314,7 +314,7 @@ pub fn start_indexing(
                     map
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         error = %e,
                         "Failed to load file metadata, falling back to full scan"
                     );
@@ -361,7 +361,7 @@ pub fn start_indexing(
                     m
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "Failed to load bounded-failure set; not gating retries");
+                    tracing::error!(error = %e, "Failed to load bounded-failure set; not gating retries");
                     std::collections::HashMap::new()
                 }
             };
@@ -514,7 +514,7 @@ pub fn start_indexing(
                         .fetch_add(rows, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         error = %e,
                         "Failed to bulk-mark last_verified_at after initial scan"
                     );
@@ -553,7 +553,7 @@ pub fn start_indexing(
                             .fetch_add(rows, Ordering::Relaxed);
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::error!(
                             workspace = %ws,
                             error = %e,
                             "Failed to update last_scanned_at after initial scan"
@@ -631,7 +631,7 @@ pub fn start_indexing(
                                     );
                                 }
                                 Err(e) => {
-                                    warn!(
+                                    error!(
                                         path = %path.display(),
                                         error = %e,
                                         "Failed to unwatch workspace"
@@ -705,7 +705,7 @@ pub fn start_indexing(
                                         // poison data is now obsolete.
                                         let mut w = poisoned.into_inner();
                                         *w = new_watcher;
-                                        warn!(
+                                        error!(
                                             workspaces = paths.len(),
                                             "watcher re-armed via poisoned mutex recovery"
                                         );
@@ -799,7 +799,7 @@ fn rescan_workspace(
                 map
             }
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     error = %e,
                     "Failed to load file metadata for rescan, falling back to full re-read"
                 );
@@ -824,7 +824,7 @@ fn rescan_workspace(
                 m
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to load bounded-failure set for rescan");
+                tracing::error!(error = %e, "Failed to load bounded-failure set for rescan");
                 std::collections::HashMap::new()
             }
         };
@@ -900,7 +900,7 @@ fn rescan_workspace(
             stats.last_scanned_writes.fetch_add(rows, Ordering::Relaxed);
         }
         Err(e) => {
-            tracing::warn!(
+            tracing::error!(
                 workspace = %workspace_path_str,
                 error = %e,
                 "Failed to update last_scanned_at after rescan"
@@ -921,7 +921,7 @@ fn rescan_workspace(
                 .fetch_add(rows, Ordering::Relaxed);
         }
         Err(e) => {
-            tracing::warn!(
+            tracing::error!(
                 workspace = %workspace_path_str,
                 error = %e,
                 "Failed to bulk-mark last_verified_at after rescan"

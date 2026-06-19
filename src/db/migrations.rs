@@ -57,6 +57,12 @@ mod v3_cross_language_signatures;
 mod v40_cron_run_history;
 mod v41_indexed_files_last_verified;
 mod v42_index_failures;
+mod v43_feedback_and_votes;
+mod v44_data_table_links_and_bug_criteria;
+mod v45_symbol_occurrences;
+mod v46_project_groups;
+mod v47_widen_dep_source;
+mod v48_hier_metrics;
 mod v4_work_items;
 mod v5_work_items_collab;
 mod v6_unified_graph;
@@ -2615,6 +2621,54 @@ pub async fn run_migrations(
         v42_index_failures::INDEX_FAILURES,
         v42_index_failures::INDEX_FAILURES_NAME,
         || v42_index_failures::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v43_feedback_and_votes::FEEDBACK_AND_VOTES,
+        v43_feedback_and_votes::FEEDBACK_AND_VOTES_NAME,
+        || v43_feedback_and_votes::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v44_data_table_links_and_bug_criteria::DATA_TABLE_LINKS_AND_BUG_CRITERIA,
+        v44_data_table_links_and_bug_criteria::DATA_TABLE_LINKS_AND_BUG_CRITERIA_NAME,
+        || v44_data_table_links_and_bug_criteria::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v45_symbol_occurrences::SYMBOL_OCCURRENCES,
+        v45_symbol_occurrences::SYMBOL_OCCURRENCES_NAME,
+        || v45_symbol_occurrences::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v46_project_groups::PROJECT_GROUPS,
+        v46_project_groups::PROJECT_GROUPS_NAME,
+        || v46_project_groups::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v47_widen_dep_source::WIDEN_DEP_SOURCE,
+        v47_widen_dep_source::WIDEN_DEP_SOURCE_NAME,
+        || v47_widen_dep_source::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v48_hier_metrics::HIER_METRICS,
+        v48_hier_metrics::HIER_METRICS_NAME,
+        || v48_hier_metrics::apply(pool),
     )
     .await?;
 

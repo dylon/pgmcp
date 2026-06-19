@@ -22,7 +22,7 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::config::MetricsConfig;
 use crate::stats::tracker::StatsTracker;
@@ -234,7 +234,7 @@ async fn flush_batch(pool: &PgPool, stats: &StatsTracker, rows: &[TelemetryRow])
             debug!(rows = r.rows_affected(), "telemetry batch flushed");
         }
         Err(e) => {
-            warn!(rows = n, error = %e, "telemetry batch flush failed");
+            error!(rows = n, error = %e, "telemetry batch flush failed");
             stats
                 .telemetry_writes_failed
                 .fetch_add(n as u64, Ordering::Relaxed);

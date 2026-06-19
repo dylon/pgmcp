@@ -37,7 +37,7 @@ struct Inner {
 impl BgeRerankerV2M3 {
     pub fn new() -> Result<Self> {
         let device = Device::new_cuda(0).or_else(|e| {
-            tracing::warn!(error = %e, "BgeRerankerV2M3: CUDA init failed; falling back to CPU");
+            tracing::error!(error = %e, "BgeRerankerV2M3: CUDA init failed; falling back to CPU");
             Ok::<Device, anyhow::Error>(Device::Cpu)
         })?;
         let api = Api::new().context("hf-hub init")?;

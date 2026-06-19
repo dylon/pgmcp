@@ -19,7 +19,7 @@ use anyhow::{Context, Result, anyhow};
 use candle_core::{DType, Device, Tensor};
 use candle_nn::Optimizer;
 use rand::seq::SliceRandom;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::llm::recursive_link::{RecursiveLink, cosine_alignment_loss};
 
@@ -188,7 +188,7 @@ pub fn train_recursive_link(
     }
 
     if !final_loss.is_finite() {
-        warn!(final_loss, "RecursiveLink trainer: non-finite final loss");
+        error!(final_loss, "RecursiveLink trainer: non-finite final loss");
     }
 
     link.save(&varmap, output_path)

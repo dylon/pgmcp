@@ -86,29 +86,37 @@ run_gate() {
     echo
 }
 
-run_gate "Gate 1/8: cargo fmt --check" \
+run_gate "Gate 1/9: cargo fmt --check" \
     cargo fmt --check
-run_gate "Gate 2/8: cargo build --all-targets" \
+run_gate "Gate 2/9: cargo build --all-targets" \
     cargo build --all-targets
-run_gate "Gate 3/8: cargo clippy --all-targets -- -D warnings" \
+run_gate "Gate 3/9: cargo clippy --all-targets -- -D warnings" \
     cargo clippy --all-targets -- -D warnings
 # Build the release CLI binary BEFORE the pgmcp-testing gates: the CLI smoke
 # tests (cli_harness) exec `target/release/pgmcp`, so without this build they
 # would run a stale artifact. Then run the bin's unit tests.
-run_gate "Gate 4/8: cargo build + test --release --bin pgmcp" \
+run_gate "Gate 4/9: cargo build + test --release --bin pgmcp" \
     bash -c "cargo build --release --bin pgmcp && cargo test --release --bin pgmcp"
-run_gate "Gate 5/8: cargo test --release -p pgmcp-testing" \
+run_gate "Gate 5/9: cargo test --release -p pgmcp-testing" \
     cargo test --release -p pgmcp-testing
-run_gate "Gate 6/8: cargo test --release --test gpu_fallback_smoke -- --ignored" \
+run_gate "Gate 6/9: cargo test --release --test gpu_fallback_smoke -- --ignored" \
     cargo test --release --test gpu_fallback_smoke -- --ignored
-run_gate "Gate 7/8: cargo smoke (GPU smoke scenarios)" \
+run_gate "Gate 7/9: cargo smoke (GPU smoke scenarios)" \
     cargo smoke
 # Gate 8: run every `tests/*.rs` across the workspace. Tier-C real-DB tests
 # self-skip via `require_test_*!()` when `PGMCP_TEST_DATABASE_URL` is unset,
 # so this stays green for contributors without a local Postgres+pgvector
 # install; with the env var set, it becomes a full integration check.
-run_gate "Gate 8/8: cargo test --release --tests" \
+run_gate "Gate 8/9: cargo test --release --tests" \
     cargo test --release --tests
+# Gate 9: boyscout enforcement (ADR-022) — fail if an open kind='bug' work-item
+# is anchored (work_item_code_anchor) to a file touched by the current diff.
+# Self-skips LOUDLY (exit 0, logged) outside a git work tree or when the DB is
+# unavailable, so it stays green for contributors without the workspace indexed;
+# with the daemon's Postgres reachable it is a real gate. The release bin is
+# already built by Gate 4, so this reuses it.
+run_gate "Gate 9/9: boyscout — no open bugs anchored to changed files" \
+    cargo run --release --bin pgmcp -- bug-gate
 
 # P13.5 advisory gates: re-run the formal-verification artefacts so
 # that drift between the spec text and the proof / model state is

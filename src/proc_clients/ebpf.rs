@@ -37,7 +37,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::proc_clients::file_events::FileOp;
 
@@ -352,7 +352,7 @@ pub fn start_ebpf_consumer(
             let (pids, pid_session) = match fetch_live_pids(&pool).await {
                 Ok(v) => v,
                 Err(e) => {
-                    warn!(error = %e, "ebpf: live-pid fetch failed");
+                    error!(error = %e, "ebpf: live-pid fetch failed");
                     if sleep_or_cancel(refresh_secs, &shutdown).await {
                         return;
                     }
@@ -385,7 +385,7 @@ pub fn start_ebpf_consumer(
                     // Most often a permission/attach failure (no CAP_BPF). Back
                     // off generously so a cap-less host does not log-spam; the
                     // loop self-heals if caps are later granted.
-                    warn!(reason = %reason, "ebpf: probe stopped; backing off 60s");
+                    error!(reason = %reason, "ebpf: probe stopped; backing off 60s");
                     if sleep_or_cancel(refresh_secs.max(60), &shutdown).await {
                         return;
                     }

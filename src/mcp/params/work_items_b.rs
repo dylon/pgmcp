@@ -34,6 +34,23 @@ pub struct WorkItemAttemptVerifyParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WorkItemAssertFixedParams {
+    #[schemars(description = "The bug's public_id")]
+    pub public_id: String,
+    #[schemars(
+        description = "A runnable check that FAILS before the fix and PASSES after — the frozen, \
+machine-checkable reproduction criterion. Required."
+    )]
+    pub verification_command: String,
+    #[schemars(
+        description = "Optional success signal (e.g. 'exit 0', a passing test name) recorded with the criterion."
+    )]
+    pub expected_signal: Option<String>,
+    #[schemars(description = "Asserting agent (auto-filled from the MCP caller if omitted)")]
+    pub agent_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct WorkItemDeferParams {
     #[schemars(description = "The item's public_id to defer (skip)")]
     pub public_id: String,

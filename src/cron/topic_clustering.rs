@@ -253,7 +253,7 @@ fn run_through_backend(
     let mut backend = match fcm::make_backend(data.to_owned(), k, choice) {
         Ok(b) => b,
         Err(e) => {
-            warn!(error = %e, "FCM backend construction failed");
+            error!(error = %e, "FCM backend construction failed");
             return degenerate_result(data.nrows(), data.ncols(), k);
         }
     };
@@ -346,7 +346,7 @@ async fn stamp_topics_signature(db: &dyn DbClient, config: &CronConfig) {
     let Some(pool) = db.pool() else { return };
     let sig = topics_effective_signature(config);
     if let Err(e) = crate::db::queries::set_topics_algo_signature(pool, &sig).await {
-        warn!(error = %e, sig = %sig, "failed to stamp topics_algo_signature");
+        error!(error = %e, sig = %sig, "failed to stamp topics_algo_signature");
     }
 }
 
@@ -1513,7 +1513,7 @@ async fn persist_topic_quality(db: &dyn DbClient, scope: &str, summary: &Cluster
     if let (Some(pool), Some(metrics)) = (db.pool(), summary.metrics.as_ref())
         && let Err(e) = crate::db::queries::set_topic_quality(pool, scope, &metrics.to_json()).await
     {
-        warn!(scope, error = %e, "failed to persist topic quality metrics");
+        error!(scope, error = %e, "failed to persist topic quality metrics");
     }
 }
 
@@ -1758,7 +1758,7 @@ async fn run_hierarchy_pass(db: &dyn DbClient, config: &CronConfig, stats: &Arc<
     {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, "hierarchy: failed to load global centroids");
+            error!(error = %e, "hierarchy: failed to load global centroids");
             return;
         }
     };
@@ -1824,11 +1824,11 @@ async fn run_hierarchy_pass(db: &dyn DbClient, config: &CronConfig, stats: &Arc<
         return;
     }
     if let Err(e) = db.clear_topics_for_scope("hierarchy").await {
-        warn!(error = %e, "hierarchy: clear failed");
+        error!(error = %e, "hierarchy: clear failed");
         return;
     }
     if let Err(e) = db.store_topics("hierarchy", &meta_topics).await {
-        warn!(error = %e, "hierarchy: store failed");
+        error!(error = %e, "hierarchy: store failed");
         return;
     }
 
@@ -2257,7 +2257,7 @@ async fn compute_ctf_idf_streaming(
                     );
                     break;
                 }
-                warn!(error = %e, "streaming c-TF-IDF: content batch fetch failed");
+                error!(error = %e, "streaming c-TF-IDF: content batch fetch failed");
                 continue;
             }
         };
@@ -2642,7 +2642,7 @@ async fn run_online_global_topic_scan(
         let memberships = match store.collect_memberships_dense() {
             Ok(v) => v,
             Err(e) => {
-                warn!(error = %e, "online FCM: collect_memberships_dense failed; falling back to empty shells");
+                error!(error = %e, "online FCM: collect_memberships_dense failed; falling back to empty shells");
                 Vec::new()
             }
         };
@@ -2694,7 +2694,7 @@ async fn run_online_global_topic_scan(
         })
         .collect();
     if let Err(e) = db.clear_topics_for_scope("global").await {
-        warn!(error = %e, "online FCM: clear global failed");
+        error!(error = %e, "online FCM: clear global failed");
     }
     // The online mini-batch path persists per-chunk membership to LMDB rather
     // than RAM (to bound memory on huge corpora) and so does not compute the
@@ -2704,7 +2704,7 @@ async fn run_online_global_topic_scan(
     // `topics_quality`/`topics_degenerate` channel), so a successful store is the
     // correct stamp condition here.
     match db.store_topics("global", &topics_built).await {
-        Err(e) => warn!(error = %e, "online FCM: store global topics failed"),
+        Err(e) => error!(error = %e, "online FCM: store global topics failed"),
         Ok(()) => stamp_topics_signature(db, config).await,
     }
 
@@ -2739,7 +2739,7 @@ async fn count_chunks(db: &dyn DbClient) -> Option<usize> {
     let col = match crate::embed::signature::read_active_signature(pool).await {
         Ok(sig) => sig.read_column(),
         Err(e) => {
-            warn!(error = %e, "count_chunks: read active signature failed");
+            error!(error = %e, "count_chunks: read active signature failed");
             return None;
         }
     };
@@ -2768,7 +2768,7 @@ async fn count_chunks(db: &dyn DbClient) -> Option<usize> {
     {
         Ok(n) => Some(n as usize),
         Err(e) => {
-            warn!(error = %e, "count_chunks pre-flight query failed");
+            error!(error = %e, "count_chunks pre-flight query failed");
             None
         }
     }
@@ -2816,7 +2816,7 @@ async fn run_graph_topic_scan(db: &dyn DbClient, config: &CronConfig, stats: &Ar
         let rows = match db.bulk_extract_project_embeddings(name, None).await {
             Ok(r) => r,
             Err(e) => {
-                warn!(project = %name, error = %e, "graph topic scan: extract failed; skipping");
+                error!(project = %name, error = %e, "graph topic scan: extract failed; skipping");
                 continue;
             }
         };
@@ -2856,7 +2856,7 @@ async fn run_graph_topic_scan(db: &dyn DbClient, config: &CronConfig, stats: &Ar
         )
         .await;
         if let Err(e) = db.clear_topics_for_scope(&scope).await {
-            warn!(project = %name, error = %e, "graph topic scan: clear failed; preserving prior");
+            error!(project = %name, error = %e, "graph topic scan: clear failed; preserving prior");
             continue;
         }
         if let Err(e) = db.store_topics(&scope, &summary.topics).await {
@@ -2933,7 +2933,7 @@ async fn build_global_rollup(db: &dyn DbClient, config: &CronConfig, stats: &Arc
     {
         Ok(r) => r,
         Err(e) => {
-            warn!(error = %e, "global rollup: failed to load per-project topics");
+            error!(error = %e, "global rollup: failed to load per-project topics");
             return;
         }
     };
@@ -3132,7 +3132,7 @@ async fn build_global_rollup(db: &dyn DbClient, config: &CronConfig, stats: &Arc
     }
 
     if let Err(e) = db.clear_topics_for_scope("global").await {
-        warn!(error = %e, "global rollup: clear failed; preserving prior");
+        error!(error = %e, "global rollup: clear failed; preserving prior");
         return;
     }
     if let Err(e) = crate::db::queries::store_global_rollup(pool, &rollup).await {
@@ -3146,7 +3146,7 @@ async fn build_global_rollup(db: &dyn DbClient, config: &CronConfig, stats: &Arc
         "source": "global_rollup_over_per_project_centroids",
     });
     if let Err(e) = crate::db::queries::set_topic_quality(pool, "global", &q).await {
-        warn!(error = %e, "global rollup: persist quality failed");
+        error!(error = %e, "global rollup: persist quality failed");
     }
 
     // Mark the global model fresh: the roll-up cleared the per-project degeneracy
@@ -3218,7 +3218,7 @@ async fn run_per_project_emergency_fallback(
                     continue;
                 }
                 if let Err(e) = db.clear_topics_for_scope(&scope).await {
-                    warn!(
+                    error!(
                         project = %project_name,
                         error = %e,
                         "emergency fallback: clear_topics failed; skipping store to preserve prior topics"

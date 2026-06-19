@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use dashmap::DashMap;
 use sqlx::PgPool;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::db::queries::{self, AddObservationInput, NewEntityInput, NewRelationInput, ScopeSpec};
 use crate::llm::{
@@ -120,7 +120,7 @@ pub async fn run_extraction_for_prompt(
             stats
                 .memory_extractor_errors
                 .fetch_add(1, Ordering::Relaxed);
-            warn!(error = %e, session = %job.session_id, "extractor_worker: failed");
+            error!(error = %e, session = %job.session_id, "extractor_worker: failed");
         }
     }
 }

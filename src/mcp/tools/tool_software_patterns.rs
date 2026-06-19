@@ -10,7 +10,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, Content};
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::context::SystemContext;
 use crate::db::patterns::{

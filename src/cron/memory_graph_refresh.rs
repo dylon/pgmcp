@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::db::queries;
 use crate::stats::tracker::StatsTracker;
@@ -32,10 +32,10 @@ pub async fn run_memory_graph_refresh(
     let edges = queries::refresh_memory_unified_edges(pool).await;
 
     if let Err(e) = &nodes {
-        warn!(view = "memory_unified_nodes", error = %e, "matview refresh failed");
+        error!(view = "memory_unified_nodes", error = %e, "matview refresh failed");
     }
     if let Err(e) = &edges {
-        warn!(view = "memory_unified_edges", error = %e, "matview refresh failed");
+        error!(view = "memory_unified_edges", error = %e, "matview refresh failed");
     }
 
     if nodes.is_ok() && edges.is_ok() {
@@ -52,6 +52,6 @@ pub async fn run_memory_graph_refresh(
 /// Run the refresh, logging any error rather than panicking the cron thread.
 pub async fn run_or_log(pool: Arc<PgPool>, stats: Arc<StatsTracker>) {
     if let Err(e) = run_memory_graph_refresh(&pool, &stats).await {
-        warn!(error = %e, "memory-graph-refresh pass failed");
+        error!(error = %e, "memory-graph-refresh pass failed");
     }
 }

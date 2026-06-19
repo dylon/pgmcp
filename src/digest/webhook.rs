@@ -63,10 +63,10 @@ pub fn post_webhook(cfg: &DigestConfig, channel: super::DigestChannel, digest: &
                 tracing::debug!(%url, "digest webhook delivered");
             }
             Ok(resp) => {
-                tracing::warn!(%url, status = %resp.status(), "digest webhook non-2xx");
+                tracing::error!(%url, status = %resp.status(), "digest webhook non-2xx");
             }
             Err(e) => {
-                tracing::warn!(%url, error = %e, "digest webhook POST failed");
+                tracing::error!(%url, error = %e, "digest webhook POST failed");
             }
         }
     });

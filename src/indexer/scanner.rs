@@ -300,7 +300,7 @@ pub(crate) fn scan_single_workspace(
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    tracing::warn!(error = %e, "Error walking directory");
+                    tracing::error!(error = %e, "Error walking directory");
                     return ignore::WalkState::Continue;
                 }
             };
@@ -393,7 +393,7 @@ fn scan_claude_dir(
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                tracing::warn!(error = %e, "Error walking ~/.claude/");
+                tracing::error!(error = %e, "Error walking ~/.claude/");
                 continue;
             }
         };
@@ -475,7 +475,7 @@ fn scan_codex_dir(
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                tracing::warn!(error = %e, "Error walking ~/.codex/");
+                tracing::error!(error = %e, "Error walking ~/.codex/");
                 continue;
             }
         };
@@ -585,7 +585,7 @@ fn scan_synthetic_doc_dir(
         let entry = match entry {
             Ok(e) => e,
             Err(e) => {
-                tracing::warn!(error = %e, "Error walking {}", log_label);
+                tracing::error!(error = %e, "Error walking {}", log_label);
                 continue;
             }
         };

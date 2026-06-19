@@ -26,7 +26,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
-use tracing::{debug, warn};
+use tracing::{debug, error};
 
 use super::subprocess::run_bounded;
 use super::{ExtractError, OcrOptions, resolve_tool};
@@ -81,7 +81,7 @@ pub fn run_ocr(
         }
         let image = locate_page_image(tmp.path(), page, pad);
         let Some(image_path) = image else {
-            warn!(
+            error!(
                 pdf = %pdf_path.display(),
                 page,
                 "expected PNG missing after pdftoppm; skipping page"
@@ -164,7 +164,7 @@ fn rasterize(
     if png_count == 0 {
         let stderr_tail = String::from_utf8_lossy(&captured.stderr);
         let stderr_tail = stderr_tail.trim();
-        warn!(
+        error!(
             pdf = %pdf.display(),
             stderr = %stderr_tail,
             "pdftoppm produced no PNGs; marking PDF as un-OCR-able",

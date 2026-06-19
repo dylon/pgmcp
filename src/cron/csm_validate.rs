@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 use uuid::Uuid;
 
 use crate::config::A2aCsmValidateConfig;
@@ -26,7 +26,7 @@ pub async fn run_or_log(pool: Arc<PgPool>, stats: Arc<StatsTracker>, cfg: A2aCsm
     stats.cron_executions.fetch_add(1, Ordering::Relaxed);
     match run(&pool, cfg.batch_limit).await {
         Ok(validated) => info!(validated, "csm-validate cron completed"),
-        Err(e) => warn!(error = %e, "csm-validate cron failed"),
+        Err(e) => error!(error = %e, "csm-validate cron failed"),
     }
 }
 
@@ -68,14 +68,14 @@ async fn run(pool: &PgPool, limit: i64) -> Result<usize, String> {
                     Ok(Some(_)) => validated += 1,
                     // Raced with a manual csm_validate_run / another tick — fine.
                     Ok(None) => {}
-                    Err(e) => warn!(%task_id, error = %e, "csm-validate insert failed"),
+                    Err(e) => error!(%task_id, error = %e, "csm-validate insert failed"),
                 }
             }
             Ok(Prepared::Skip { reason, .. }) => {
                 debug!(%task_id, reason, "csm-validate skipped (not validatable)")
             }
             Ok(Prepared::NotFound) => {}
-            Err(e) => warn!(%task_id, error = %e, "csm-validate prepare failed"),
+            Err(e) => error!(%task_id, error = %e, "csm-validate prepare failed"),
         }
     }
     Ok(validated)

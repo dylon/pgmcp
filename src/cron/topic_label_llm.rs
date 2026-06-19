@@ -182,7 +182,7 @@ where
                 }
             }
             Err(e) => {
-                tracing::warn!(error = %e, "LLM relabel failed; keeping deterministic label");
+                tracing::error!(error = %e, "LLM relabel failed; keeping deterministic label");
                 // Negative-cache nothing (transient errors should retry next run).
             }
         }
@@ -220,7 +220,7 @@ pub fn relabel_topics_blocking(
     let model = match Qwen3LocalExtractor::new(variant) {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!(error = %e, backend, "topic LLM labeling: qwen3 load failed; deterministic labels");
+            tracing::error!(error = %e, backend, "topic LLM labeling: qwen3 load failed; deterministic labels");
             return topics;
         }
     };
@@ -253,7 +253,7 @@ pub async fn maybe_relabel(
     {
         Ok(t) => t,
         Err(e) => {
-            tracing::warn!(error = %e, "topic LLM labeling task join failed; deterministic labels");
+            tracing::error!(error = %e, "topic LLM labeling task join failed; deterministic labels");
             fallback
         }
     }

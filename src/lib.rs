@@ -24,6 +24,7 @@
 pub mod a2a;
 pub mod adoption;
 pub mod api;
+pub mod category;
 pub mod cli;
 #[allow(dead_code)]
 pub mod code_analysis;
@@ -40,13 +41,16 @@ pub mod deps;
 pub mod digest;
 pub mod docguidelines;
 pub mod embed;
+pub mod engprinciples;
 pub mod error;
 pub mod experiment;
 pub mod fcm;
+pub mod feedback;
 #[allow(dead_code)]
 pub mod fuzzy;
 pub mod graph;
 pub mod health;
+pub mod hierarchy;
 pub mod indexer;
 pub mod llm;
 pub mod logging;
@@ -73,6 +77,7 @@ pub mod topic_analysis;
 #[allow(dead_code)]
 pub mod topic_store;
 pub mod tracker;
+pub mod voting;
 #[allow(dead_code)]
 pub mod wfst;
 pub mod work_pool;

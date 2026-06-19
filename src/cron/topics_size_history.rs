@@ -6,7 +6,7 @@
 //! (default 6h), the same idiom as `tool_policy_refresh` / `quality_history`.
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 /// Append the current per-topic sizes to the bounded history. Best-effort: a
 /// failure is logged, never fatal (the next run retries).
@@ -17,6 +17,6 @@ pub async fn run_or_log(pool: &PgPool) {
             topics = n,
             "size snapshot stored"
         ),
-        Err(e) => warn!(job = "topics-size-history", error = %e, "size snapshot failed"),
+        Err(e) => error!(job = "topics-size-history", error = %e, "size snapshot failed"),
     }
 }

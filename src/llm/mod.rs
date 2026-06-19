@@ -30,6 +30,7 @@ pub mod qwen3;
 pub mod qwen3_latent_model;
 pub mod recursive_link;
 pub mod reflect;
+pub mod remote;
 
 /// Reference to an existing entity passed to the extractor as grounding
 /// context. Keeping payload small here keeps the prompt cheap: we send
@@ -148,6 +149,12 @@ pub enum LlmBackendChoice {
     Qwen38b,
     Qwen34b,
     Cloud(CloudProvider),
+    /// Remote OpenAI-compatible endpoint (Crucible E1). Lets the daemon offload
+    /// extraction/reflection to a network-reachable server (e.g. sparky's ollama
+    /// or DeepSeek-V4), freeing the contended local GPU. Endpoint/model come from
+    /// `PGMCP_LLM_BASE_URL` / `PGMCP_LLM_MODEL` (see `remote::RemoteOpenAiExtractor`).
+    /// Unit variant so this enum stays `Copy`.
+    Remote,
     /// Disable LLM extraction entirely. The salience worker falls back
     /// to the existing regex pipeline (Stage A); Stage B is a no-op.
     Disabled,
@@ -167,9 +174,10 @@ pub fn parse_backend_choice(s: &str) -> Result<LlmBackendChoice> {
         "cloud" | "anthropic" | "cloud-anthropic" => {
             Ok(LlmBackendChoice::Cloud(CloudProvider::Anthropic))
         }
+        "remote-openai" | "remote" | "openai-remote" => Ok(LlmBackendChoice::Remote),
         "disabled" | "off" | "none" => Ok(LlmBackendChoice::Disabled),
         other => Err(anyhow::anyhow!(
-            "unknown LLM extractor backend '{}'; choices: qwen3-8b, qwen3-4b, cloud, disabled",
+            "unknown LLM extractor backend '{}'; choices: qwen3-8b, qwen3-4b, cloud, remote-openai, disabled",
             other
         )),
     }
@@ -190,6 +198,7 @@ pub fn make_extractor(choice: LlmBackendChoice) -> Result<Option<Box<dyn LlmExtr
         LlmBackendChoice::Qwen34b => Ok(Some(Box::new(qwen3::Qwen3LocalExtractor::new(
             qwen3::Qwen3Variant::Four,
         )?))),
+        LlmBackendChoice::Remote => Ok(Some(Box::new(remote::RemoteOpenAiExtractor::from_env()?))),
     }
 }
 
@@ -214,6 +223,14 @@ mod tests {
         assert!(matches!(
             parse_backend_choice("disabled").unwrap(),
             LlmBackendChoice::Disabled
+        ));
+        assert!(matches!(
+            parse_backend_choice("remote-openai").unwrap(),
+            LlmBackendChoice::Remote
+        ));
+        assert!(matches!(
+            parse_backend_choice("remote").unwrap(),
+            LlmBackendChoice::Remote
         ));
         assert!(parse_backend_choice("bogus").is_err());
     }

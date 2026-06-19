@@ -315,6 +315,10 @@ impl LanguageBackend for MettaBackend {
         "metta"
     }
 
+    fn lex_config(&self) -> crate::parsing::occurrences::LexConfig {
+        crate::parsing::occurrences::LexConfig::lisp_style()
+    }
+
     fn extract_symbols(&self, content: &str) -> Vec<Symbol> {
         let Some(tree) = parse(content) else {
             return Vec::new();

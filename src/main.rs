@@ -18,6 +18,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod a2a;
 mod adoption;
 mod api;
+mod category;
 mod cli;
 #[allow(dead_code)]
 mod code_analysis;
@@ -34,13 +35,16 @@ mod deps;
 mod digest;
 mod docguidelines;
 mod embed;
+mod engprinciples;
 mod error;
 mod experiment;
 mod fcm;
+mod feedback;
 #[allow(dead_code)]
 mod fuzzy;
 mod graph;
 mod health;
+mod hierarchy;
 mod indexer;
 mod llm;
 mod logging;
@@ -67,6 +71,7 @@ mod topic_analysis;
 #[allow(dead_code)]
 mod topic_store;
 mod tracker;
+mod voting;
 #[allow(dead_code)]
 mod wfst;
 mod work_pool;
@@ -141,6 +146,23 @@ enum Commands {
         /// Maximum depth for file tree (default: 3)
         #[arg(long, default_value = "3")]
         depth: i32,
+    },
+    /// Boyscout gate: fail if an open `kind='bug'` work-item is anchored to a
+    /// file touched by the current diff (ADR-022). Self-skips outside git / no DB.
+    BugGate {
+        /// Repository directory (defaults to $PWD).
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Also check committed changes since this git ref (e.g. `origin/main`);
+        /// without it only uncommitted working-tree changes (vs HEAD) are checked.
+        #[arg(long)]
+        base: Option<String>,
+        /// Report anchored bugs but exit 0 (advisory mode).
+        #[arg(long)]
+        warn_only: bool,
+        /// Maximum number of anchored bugs to report.
+        #[arg(long, default_value = "50")]
+        limit: i64,
     },
     /// Run analysis jobs on demand (similarity scan, topic clustering, or both)
     Analyze {
@@ -368,6 +390,12 @@ async fn async_main() -> anyhow::Result<()> {
         Commands::Statistics => cli::statistics::run(cfg).await,
         Commands::Reindex { force } => cli::reindex::run(cfg, force).await,
         Commands::Context { cwd, depth } => cli::context::run(cfg, cwd, depth).await,
+        Commands::BugGate {
+            cwd,
+            base,
+            warn_only,
+            limit,
+        } => cli::bug_gate::run(cfg, cwd, base, warn_only, limit).await,
         Commands::Analyze {
             job,
             similarity_threshold,

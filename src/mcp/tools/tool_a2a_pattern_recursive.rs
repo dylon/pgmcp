@@ -98,7 +98,7 @@ pub async fn tool_a2a_pattern_recursive(
     {
         Ok(id) => Some(id),
         Err(e) => {
-            tracing::warn!(error = %e, "RLM trajectory persistence failed (non-fatal)");
+            tracing::error!(error = %e, "RLM trajectory persistence failed (non-fatal)");
             None
         }
     };

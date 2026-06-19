@@ -178,6 +178,51 @@ construction-time choices (precision, backend kind) are enums. See
 - Enums where the choice is closed and construction-time
   (`GpuPrecision`, `BackendChoice`, `FcmError`).
 
+## Engineering principles (ADR-022, `src/engprinciples/`)
+
+Four behavioral mandates are enforced uniformly across EVERY MCP client via the
+cross-agent seed `src/engprinciples/` (mirrors `src/docguidelines/`): injected
+into the MCP `instructions` banner, surfaced in `orient`, the
+`engineering_principles` tool, and the `pgmcp://engineering-principles` resource.
+
+1. **Full generality (no overfitting).** Never overfit a solution to one problem
+   such that it regresses elsewhere; all solutions must be fully generalized.
+2. **Boy Scout rule (fix every bug).** Leave the system better than you found it;
+   fix all issues you discover, pre-existing or not; no bug, however rare, is
+   acceptable. Mechanically gated by `pgmcp bug-gate` (verify.sh Gate 9).
+3. **Capture command output, then clean up.** Pipe validation/compilation/
+   evaluation output to files for follow-up analysis, then delete the temp files.
+   Mechanically steered by the user-scope `pgmcp-output-capture-enforce.sh`
+   PreToolUse hook + the `pgmcp-temp-sweep.sh` Stop hook.
+4. **Occam's Razor (simplest, not simpler).** Keep changes as simple as possible
+   to accomplish their goal but no simpler; full generality is a requirement, so
+   it aligns with Occam — make no extraneous changes.
+
+Two are judgment properties (1, 4) with no mechanical oracle — durable
+re-injection is the enforcement; two (2, 3) additionally carry a real gate. See
+ADR-022 for the enforcement matrix and the repo-vs-user-scope split.
+
+## Logging level convention (ADR-021)
+
+A caught/swallowed runtime error, or a degraded fallback taken *because* an
+operation failed (DB/IO, network/LLM, GPU/model load → CPU, parse/extract
+failure, a panicked/aborted task, a cron pass/batch that failed), logs at
+`error!`. Only an *expected, benign, by-design* condition logs at `warn!`:
+config advisory, "not configured / CLI-mode, skipping" no-op, expected-empty
+("produced no topics; preserving prior"), "restart required", a documented
+demotion, a **findings/quality report** ("violations detected", "quality below
+floor"), a designed budget/latency cap, a graceful documented degradation (LMDB
+cold-start, worktree-grouping fallback), or a **trust-boundary "refused"**.
+
+Rationale: at `[logging] level = "error"` (a common production posture) every
+`warn!` is silently dropped, so a runtime error mis-logged at `warn!` is
+invisible — the failure mode behind the algo-signature-staleness and
+index-freshness incidents. Enforced by
+`pgmcp-testing/tests/no_swallowed_error_warn.rs` (fails the build on a
+swallowed-error `warn!` outside its documented allow-list). If a discovered
+swallow is *also* control-flow-wrong, fix the handling and file a `kind='bug'` —
+do not just bump the level.
+
 ## Why this file exists
 
 On 2026-04-22 an agent added ~1000 lines under `#[cfg(feature = "cuda")]` and

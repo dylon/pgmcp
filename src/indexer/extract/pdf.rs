@@ -3,7 +3,7 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use tracing::{debug, warn};
+use tracing::{debug, error};
 
 use super::{
     ExtractError, ExtractOptions, Extracted, normalize::normalize_extracted_text, ocr,
@@ -108,7 +108,7 @@ pub fn extract_with_cache(
     let ocr_result = match ocr::run_ocr(path, page_count, &opts.ocr) {
         Ok(r) => r,
         Err(e) => {
-            warn!(
+            error!(
                 path = %path.display(),
                 error = %e,
                 "OCR failed; falling back to sparse pdftotext output",

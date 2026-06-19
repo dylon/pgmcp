@@ -15,7 +15,7 @@ use rmcp::model::CallToolResult;
 use serde_json::json;
 use sqlx::PgPool;
 use std::sync::atomic::Ordering;
-use tracing::{debug, error, warn};
+use tracing::{debug, error};
 
 use crate::context::SystemContext;
 use crate::db::mcp_tool_catalog::{self, ToolCatalogSearchRow};
@@ -244,7 +244,7 @@ pub async fn warm_mcp_tool_catalog(ctx: &SystemContext) -> Result<(), McpError> 
         ),
         Ok(_) => {}
         Err(e) => {
-            warn!(error = ?e, "mcp_tool_catalog warm-up embed failed; keyword fallback active until next pass")
+            error!(error = ?e, "mcp_tool_catalog warm-up embed failed; keyword fallback active until next pass")
         }
     }
     Ok(())

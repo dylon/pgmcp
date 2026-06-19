@@ -21,7 +21,7 @@ use std::sync::Mutex;
 
 use sqlx::PgPool;
 use tokio::runtime::Handle;
-use tracing::warn;
+use tracing::error;
 
 /// Read/write surface over the `ocr_extractions` table. Implementations
 /// MUST be safe to call from multiple embed-pool worker threads
@@ -70,7 +70,7 @@ impl OcrCache for PgOcrCache {
                 .await
             })
             .unwrap_or_else(|e| {
-                warn!(error = %e, content_hash, "ocr cache lookup failed");
+                error!(error = %e, content_hash, "ocr cache lookup failed");
                 None
             })
     }
@@ -107,7 +107,7 @@ impl OcrCache for PgOcrCache {
             .await
         });
         if let Err(e) = result {
-            warn!(error = %e, content_hash, "ocr cache store failed");
+            error!(error = %e, content_hash, "ocr cache store failed");
         }
     }
 }

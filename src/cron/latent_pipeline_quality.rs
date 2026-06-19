@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::stats::tracker::StatsTracker;
 
@@ -120,7 +120,7 @@ pub async fn run_or_log(
         }
         Err(e) => {
             stats.cron_panics.fetch_add(1, Ordering::Relaxed);
-            warn!(error = %e, "latent_pipeline_quality cron: aggregation failed");
+            error!(error = %e, "latent_pipeline_quality cron: aggregation failed");
         }
     }
 }

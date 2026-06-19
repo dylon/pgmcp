@@ -219,7 +219,7 @@ async fn try_dispatch_rlm(
     let frame: RlmFrame = match serde_json::from_value(frame_json.clone()) {
         Ok(f) => f,
         Err(e) => {
-            tracing::warn!(error = %e, "malformed RLM frame; answering as leaf");
+            tracing::error!(error = %e, "malformed RLM frame; answering as leaf");
             return Ok(None);
         }
     };
@@ -233,7 +233,7 @@ async fn try_dispatch_rlm(
     let env = match RlmEnvironment::from_json(&frame.environment) {
         Ok(e) => e,
         Err(e) => {
-            tracing::warn!(error = %e, "RLM frame environment unparseable; answering as leaf");
+            tracing::error!(error = %e, "RLM frame environment unparseable; answering as leaf");
             return Ok(None);
         }
     };
@@ -264,7 +264,7 @@ async fn try_dispatch_rlm(
         )
         .await
     {
-        tracing::warn!(error = %e, "RLM child trajectory persistence failed (non-fatal)");
+        tracing::error!(error = %e, "RLM child trajectory persistence failed (non-fatal)");
     }
 
     let parts = vec![Part::Text {

@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::config::MemoryConceptsConfig;
 use crate::db::queries::{self, NewRelationInput};
@@ -68,7 +68,7 @@ pub async fn run_memory_concepts(
             .await
             {
                 Ok(_) => emitted += 1,
-                Err(e) => warn!(error = %e, topic_id = *topic_id, "concept_topic anchor failed"),
+                Err(e) => error!(error = %e, topic_id = *topic_id, "concept_topic anchor failed"),
             }
         }
 
@@ -79,7 +79,7 @@ pub async fn run_memory_concepts(
         if let Err(e) =
             queries::upsert_concept_meta(pool, entity_id, facet, "topic_seed", None).await
         {
-            warn!(error = %e, entity_id, "ontology concept meta upsert failed");
+            error!(error = %e, entity_id, "ontology concept meta upsert failed");
         }
         concept_obs.push(queries::AddObservationInput {
             entity_name: label.clone(),
@@ -89,7 +89,7 @@ pub async fn run_memory_concepts(
     if !concept_obs.is_empty()
         && let Err(e) = queries::memory_add_observations(pool, &concept_obs, "auto_index").await
     {
-        warn!(error = %e, "concept observation batch insert failed");
+        error!(error = %e, "concept observation batch insert failed");
     }
     stats
         .memory_concepts_emitted
@@ -100,7 +100,7 @@ pub async fn run_memory_concepts(
         && let Some(extractor) = extractor
         && let Err(e) = run_llm_concepts(pool, stats, config, extractor.as_ref(), &topics).await
     {
-        warn!(error = %e, "LLM concept extraction failed");
+        error!(error = %e, "LLM concept extraction failed");
         stats.memory_concept_errors.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -232,6 +232,6 @@ pub async fn run_or_log(
     extractor: Option<Arc<dyn LlmExtractor>>,
 ) {
     if let Err(e) = run_memory_concepts(&pool, &stats, &config, extractor.as_ref()).await {
-        warn!(error = %e, "memory-concept-extract pass failed");
+        error!(error = %e, "memory-concept-extract pass failed");
     }
 }

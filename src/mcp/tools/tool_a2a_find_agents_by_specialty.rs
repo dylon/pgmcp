@@ -99,7 +99,7 @@ pub async fn tool_a2a_find_agents_by_specialty(
                     })
                     .collect(),
                 Err(e) => {
-                    tracing::warn!(error = %e, "typed-capability lookup failed (non-fatal)");
+                    tracing::error!(error = %e, "typed-capability lookup failed (non-fatal)");
                     Vec::new()
                 }
             }

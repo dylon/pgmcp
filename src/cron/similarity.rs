@@ -8,7 +8,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::config::CronConfig;
 use crate::cron::shutdown::{CronAction, classify_db_error};
@@ -134,7 +134,7 @@ pub async fn run_similarity_scan(
                 total_pairs += inserted;
             }
             Err(e) => {
-                warn!(error = %e, "Failed to insert similarity batch");
+                error!(error = %e, "Failed to insert similarity batch");
             }
         }
 

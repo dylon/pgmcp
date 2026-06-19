@@ -78,12 +78,27 @@ pub async fn fetch_file_content_batch(
     project_id: i32,
     file_ids: &[i64],
 ) -> Result<Vec<SymbolExtractionFileContent>, sqlx::Error> {
+    // Follow `duplicate_of_file_id` to the canonical row for the content-bearing
+    // columns (content / recoverable-flag / path / hash) via COALESCE, exactly as
+    // `insert_duplicate_file`'s contract promises. A duplicate-pointer row carries
+    // `content = NULL` and (historically) `content_recoverable_from_disk = FALSE`,
+    // so without this join every duplicate file resolved to `NotRecoverable` and
+    // was skipped — the general bug behind Lean's symbol-coverage collapse (3204
+    // files → 289 symbols). `relative_path` / `language` / `extracted_content_hash`
+    // / `modified_at` stay the duplicate's own. For non-duplicates `canon.*` is NULL
+    // and COALESCE is a no-op, so behavior is unchanged.
     sqlx::query_as::<_, SymbolExtractionFileContent>(
-        "SELECT id as file_id, path, relative_path, language, content,
-                content_recoverable_from_disk, content_hash,
-                extracted_content_hash, modified_at
-         FROM indexed_files
-         WHERE project_id = $1 AND id = ANY($2::bigint[])",
+        "SELECT f.id as file_id,
+                COALESCE(canon.path, f.path) as path,
+                f.relative_path, f.language,
+                COALESCE(canon.content, f.content) as content,
+                COALESCE(canon.content_recoverable_from_disk, f.content_recoverable_from_disk)
+                    as content_recoverable_from_disk,
+                COALESCE(canon.content_hash, f.content_hash) as content_hash,
+                f.extracted_content_hash, f.modified_at
+         FROM indexed_files f
+         LEFT JOIN indexed_files canon ON canon.id = f.duplicate_of_file_id
+         WHERE f.project_id = $1 AND f.id = ANY($2::bigint[])",
     )
     .bind(project_id)
     .bind(file_ids)
@@ -1172,6 +1187,147 @@ pub async fn lookup_function_symbol_ids(
          WHERE file_id = $1 AND kind = 'function'",
     )
     .bind(file_id)
+    .fetch_all(pool)
+    .await
+}
+
+// ============================================================================
+// Token-level occurrences (symbol_occurrences, v45 / ADR-024)
+// ============================================================================
+
+/// A cron-resolved occurrence row ready for insert. `occurrence_kind` is the
+/// `OccurrenceKind::as_str()` form; `enclosing_symbol_id` / `resolved_target_id`
+/// are resolved `file_symbols.id` values (or `None`).
+#[derive(Debug, Clone)]
+pub struct ResolvedOccurrence {
+    pub name: String,
+    pub start_line: i32,
+    pub start_col: i32,
+    pub end_col: i32,
+    pub occurrence_kind: String,
+    pub enclosing_symbol_id: Option<i64>,
+    pub resolved_target_id: Option<i64>,
+}
+
+/// Replace ALL occurrences for `file_id` with `rows` (delete-then-bulk-insert in
+/// one transaction). `type_tags` defaults to `'{}'` (occurrence type info is
+/// reached via `resolved_target_id` → the target symbol's shadow-ASR types).
+pub async fn replace_file_occurrences(
+    pool: &PgPool,
+    file_id: i64,
+    rows: &[ResolvedOccurrence],
+) -> Result<u64, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SET LOCAL statement_timeout = '15s'")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM symbol_occurrences WHERE file_id = $1")
+        .bind(file_id)
+        .execute(&mut *tx)
+        .await?;
+    if rows.is_empty() {
+        tx.commit().await?;
+        return Ok(0);
+    }
+    let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    let slines: Vec<i32> = rows.iter().map(|r| r.start_line).collect();
+    let scols: Vec<i32> = rows.iter().map(|r| r.start_col).collect();
+    let ecols: Vec<i32> = rows.iter().map(|r| r.end_col).collect();
+    let kinds: Vec<&str> = rows.iter().map(|r| r.occurrence_kind.as_str()).collect();
+    let encl: Vec<Option<i64>> = rows.iter().map(|r| r.enclosing_symbol_id).collect();
+    let resv: Vec<Option<i64>> = rows.iter().map(|r| r.resolved_target_id).collect();
+    sqlx::query(
+        "INSERT INTO symbol_occurrences
+            (file_id, name, start_line, start_col, end_col, occurrence_kind,
+             enclosing_symbol_id, resolved_target_id)
+         SELECT $1, * FROM UNNEST(
+             $2::text[], $3::int[], $4::int[], $5::int[], $6::text[], $7::int8[], $8::int8[]
+         )",
+    )
+    .bind(file_id)
+    .bind(&names)
+    .bind(&slines)
+    .bind(&scols)
+    .bind(&ecols)
+    .bind(&kinds)
+    .bind(&encl)
+    .bind(&resv)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(rows.len() as u64)
+}
+
+/// One occurrence row for read-back (LSP references / document_highlight).
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct OccurrenceRow {
+    pub file_id: i64,
+    pub name: String,
+    pub start_line: i32,
+    pub start_col: i32,
+    pub end_col: i32,
+    pub occurrence_kind: String,
+    pub enclosing_symbol_id: Option<i64>,
+    pub resolved_target_id: Option<i64>,
+}
+
+/// All occurrences of `name` in a project (optionally only a single file), for
+/// LSP `references` / `document_highlight`. Capped by `limit`.
+pub async fn occurrences_of_name(
+    pool: &PgPool,
+    project_id: i32,
+    name: &str,
+    file_id: Option<i64>,
+    limit: i64,
+) -> Result<Vec<OccurrenceRow>, sqlx::Error> {
+    sqlx::query_as::<_, OccurrenceRow>(
+        "SELECT o.file_id, o.name, o.start_line, o.start_col, o.end_col,
+                o.occurrence_kind, o.enclosing_symbol_id, o.resolved_target_id
+           FROM symbol_occurrences o
+           JOIN indexed_files f ON f.id = o.file_id
+          WHERE f.project_id = $1
+            AND o.name = $2
+            AND ($3::int8 IS NULL OR o.file_id = $3)
+          ORDER BY o.file_id, o.start_line, o.start_col
+          LIMIT $4",
+    )
+    .bind(project_id)
+    .bind(name)
+    .bind(file_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// Occurrences lexically scoped to a symbol: those whose `enclosing_symbol_id`
+/// is `symbol_id` OR a descendant of it (via `file_symbols.scope_path` prefix).
+/// Answers "uses of `name` within scope S" without shadowing resolution
+/// (documented limitation — same-name binders in nested scopes are not split).
+pub async fn occurrences_in_scope(
+    pool: &PgPool,
+    enclosing_symbol_id: i64,
+    name: Option<&str>,
+    limit: i64,
+) -> Result<Vec<OccurrenceRow>, sqlx::Error> {
+    sqlx::query_as::<_, OccurrenceRow>(
+        "WITH root AS (SELECT id, scope_path FROM file_symbols WHERE id = $1),
+              scoped AS (
+                  SELECT s.id FROM file_symbols s, root r
+                   WHERE s.id = r.id
+                      OR (r.scope_path IS NOT NULL AND s.scope_path IS NOT NULL
+                          AND s.scope_path LIKE r.scope_path || '%')
+              )
+         SELECT o.file_id, o.name, o.start_line, o.start_col, o.end_col,
+                o.occurrence_kind, o.enclosing_symbol_id, o.resolved_target_id
+           FROM symbol_occurrences o
+          WHERE o.enclosing_symbol_id IN (SELECT id FROM scoped)
+            AND ($2::text IS NULL OR o.name = $2)
+          ORDER BY o.file_id, o.start_line, o.start_col
+          LIMIT $3",
+    )
+    .bind(enclosing_symbol_id)
+    .bind(name)
+    .bind(limit)
     .fetch_all(pool)
     .await
 }

@@ -64,4 +64,21 @@ pub trait LanguageBackend: Send + Sync {
     fn extract_sync_ops(&self, _content: &str) -> Vec<super::sync_ops::FunctionSyncOps> {
         Vec::new()
     }
+
+    /// Per-language lexical config for textual occurrence extraction (ADR-024).
+    /// Defaults to C-style (`//`, `/* */`, `"…"`); languages with other comment
+    /// or string syntax override this (Python `#`, Lisp `;`, ML `(* *)`, …).
+    fn lex_config(&self) -> super::occurrences::LexConfig {
+        super::occurrences::LexConfig::c_style()
+    }
+
+    /// Extract every identifier occurrence (token-level) for `symbol_occurrences`
+    /// (v45) — code references plus identifiers in comments / strings / doc
+    /// comments, each with line + column offsets. The default drives the uniform
+    /// lexical scanner with `lex_config()`, so EVERY backend produces occurrences
+    /// (the extraction cron marks definitions and attaches binder `type_tags`).
+    /// A backend may override for grammar-precise extraction.
+    fn extract_occurrences(&self, content: &str) -> Vec<super::symbols::Occurrence> {
+        super::occurrences::extract_occurrences_textual(content, &self.lex_config())
+    }
 }

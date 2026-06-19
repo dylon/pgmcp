@@ -337,7 +337,7 @@ pub async fn writeback_peer_artifact(
                 .fetch_add(1, Ordering::Relaxed);
         }
         Err(e) => {
-            tracing::warn!(
+            tracing::error!(
                 error = %e,
                 agent = agent_name,
                 task_kind,

@@ -30,7 +30,7 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::stats::tracker::{SkipReason, StatsTracker};
 
@@ -417,7 +417,7 @@ async fn flush_batch(pool: &PgPool, stats: &StatsTracker, rows: &[CronRunRecord]
     match result {
         Ok(r) => debug!(rows = r.rows_affected(), "cron history batch flushed"),
         Err(e) => {
-            warn!(rows = n, error = %e, "cron history batch flush failed");
+            error!(rows = n, error = %e, "cron history batch flush failed");
             stats
                 .cron_history_writes_dropped
                 .fetch_add(n as u64, Ordering::Relaxed);

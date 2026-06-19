@@ -21,7 +21,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content, LoggingLevel};
 use serde_json::json;
-use tracing::{debug, error, info, warn};
+use tracing::debug;
 
 use crate::context::SystemContext;
 use crate::db::queries::LanguageCount;
@@ -288,6 +288,7 @@ pub async fn tool_orient(
         })).collect::<Vec<_>>(),
         "mandates": crate::mandates::compact_sources(&mandates),
         "documentation_guidelines": crate::docguidelines::compact_for_orient(),
+        "engineering_principles": crate::engprinciples::compact_for_orient(),
         "social": social,
         "health": {
             "phase": phase_label,

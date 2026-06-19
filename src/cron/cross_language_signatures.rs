@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::mcp::tools::sema_helpers::signatures::signature_shape_hash;
 use crate::stats::tracker::StatsTracker;
@@ -126,7 +126,7 @@ pub async fn run_cross_language_signatures(
                 match res {
                     Ok(r) => inserted_pairs += r.rows_affected(),
                     Err(e) => {
-                        warn!(error = ?e, "failed to insert cross-language clone pair");
+                        error!(error = ?e, "failed to insert cross-language clone pair");
                     }
                 }
             }

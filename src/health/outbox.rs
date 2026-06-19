@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::health::db_health::DbHealth;
 use crate::health::fs::fs_avail;
@@ -97,7 +97,7 @@ impl Outbox {
         on_full: OnFull,
     ) -> Option<Self> {
         if let Err(e) = std::fs::create_dir_all(&dir) {
-            warn!(error = %e, dir = %dir.display(), "outbox: could not create spool dir; outbox disabled");
+            error!(error = %e, dir = %dir.display(), "outbox: could not create spool dir; outbox disabled");
             return None;
         }
         Some(Self {
@@ -194,7 +194,7 @@ impl Outbox {
             format!("{kept}\n")
         };
         if let Err(e) = std::fs::write(active, kept) {
-            warn!(error = %e, "outbox: trim rewrite failed");
+            error!(error = %e, "outbox: trim rewrite failed");
         }
     }
 
@@ -212,7 +212,7 @@ impl Outbox {
                 .dir
                 .join(format!("{REPLAY_PREFIX}{stamp:020}.{n:06}.jsonl"));
             if let Err(e) = std::fs::rename(&active, &seg) {
-                warn!(error = %e, "outbox: rotate failed; replay deferred");
+                error!(error = %e, "outbox: rotate failed; replay deferred");
             }
         }
         let mut segs: Vec<PathBuf> = Vec::new();
@@ -264,7 +264,7 @@ impl Outbox {
             .join("\n");
         let body = format!("{body}\n");
         if let Err(e) = std::fs::write(seg, body) {
-            warn!(error = %e, "outbox: remainder rewrite failed");
+            error!(error = %e, "outbox: remainder rewrite failed");
         }
     }
 }

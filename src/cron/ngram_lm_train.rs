@@ -23,7 +23,7 @@ use libgrammstein::embedding::EmbeddingTrainerBuilder;
 use libgrammstein::hybrid::HybridLanguageModel;
 use libgrammstein::ngram::TrainerBuilder;
 use sqlx::PgPool;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::cron::fuzzy_sync::{project_artifact_key, slugify};
 use crate::stats::tracker::StatsTracker;
@@ -36,7 +36,7 @@ use crate::wfst::hybrid_lm::{
 pub async fn run_or_log(pool: Arc<PgPool>, stats: Arc<StatsTracker>, data_dir: PathBuf) {
     stats.ngram_lm_train_runs.fetch_add(1, Ordering::Relaxed);
     if let Err(e) = run_pass(&pool, &stats, &data_dir).await {
-        warn!(error = %e, "ngram-lm-train pass failed");
+        error!(error = %e, "ngram-lm-train pass failed");
     }
 }
 
@@ -64,7 +64,7 @@ pub async fn run_pass(
                 );
             }
             Err(e) => {
-                warn!(project = %project_name, error = %e, "ngram-lm-train: per-project failure");
+                error!(project = %project_name, error = %e, "ngram-lm-train: per-project failure");
             }
         }
     }

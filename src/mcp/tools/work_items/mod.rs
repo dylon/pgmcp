@@ -113,7 +113,7 @@ pub(crate) async fn embed_title_body(
     match ctx.embed().embed_query(&text).await {
         Ok(v) => Some(pgvector::Vector::from(v)),
         Err(e) => {
-            tracing::warn!(error = %e, "work_item embed-on-write failed; leaving embedding NULL");
+            tracing::error!(error = %e, "work_item embed-on-write failed; leaving embedding NULL");
             None
         }
     }

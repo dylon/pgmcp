@@ -20,7 +20,7 @@ use sqlx::PgPool;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::stats::tracker::StatsTracker;
 
@@ -73,7 +73,7 @@ async fn run_client_writer(
                 match maybe {
                     Some(obs) => {
                         if let Err(e) = resolve_and_upsert(&pool, &obs).await {
-                            warn!(
+                            error!(
                                 session = %obs.mcp_session_id,
                                 error = %e,
                                 "mcp-client capture upsert failed"

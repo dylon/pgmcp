@@ -42,6 +42,31 @@ topic clusters with keyword labels, membership scores, and representative chunks
     }
 
     #[tool(
+        description = "Cross-project topic redundancy (ADR-029): GLOBAL topics whose chunks span \
+multiple projects — shared concerns / fork-redundancy / consolidation candidates, ranked by spread \
+then size. USE WHEN you want to find duplicated functionality or shared themes across projects. \
+Reads the global topic model (run topic-clustering cron if empty). Returns {count, shared_topics[]}."
+    )]
+    async fn cross_project_topic_redundancy(
+        &self,
+        Parameters(params): Parameters<CrossProjectTopicRedundancyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "cross_project_topic_redundancy",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_cross_project_topic_redundancy::tool_cross_project_topic_redundancy(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Meta-clustering hierarchy over global topic centroids (Phase 9). Returns FCM-based meta-groups where each meta-group's parent_topic_ids point to the global topics it contains. Complementary view to discover_topics — chunk-to-global-topic assignments remain authoritative for cross-document comparability."
     )]
     async fn topic_hierarchy_fcm(

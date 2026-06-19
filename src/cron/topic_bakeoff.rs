@@ -18,7 +18,7 @@
 
 use std::sync::Arc;
 
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::config::CronConfig;
 use crate::cron::topic_clustering::{
@@ -85,7 +85,7 @@ pub async fn run_bakeoff(
         let rows = match db.bulk_extract_project_embeddings(project, None).await {
             Ok(r) => r,
             Err(e) => {
-                warn!(project, error = %e, "bake-off: failed to extract embeddings; skipping");
+                error!(project, error = %e, "bake-off: failed to extract embeddings; skipping");
                 md.push_str(&format!("## {project}\n\n_skipped: {e}_\n\n"));
                 continue;
             }

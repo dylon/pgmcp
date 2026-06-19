@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::warn;
+use tracing::error;
 
 use crate::llm::LlmExtractor;
 use crate::stats::tracker::StatsTracker;
@@ -40,6 +40,6 @@ pub async fn run_or_log(
         .load(Ordering::Acquire)
         > 0
     {
-        warn!("memory_reflect cron: at least one scope reflection errored — see warnings above");
+        error!("memory_reflect cron: at least one scope reflection errored — see errors above");
     }
 }

@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 
 use crate::context::SystemContext;
 use crate::mcp::server::SearchMandatesParams;

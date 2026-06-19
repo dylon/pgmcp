@@ -14,9 +14,14 @@
 #![allow(unused_imports)]
 
 pub mod a2a_csm;
+pub mod category;
 pub mod core_memory_a;
+pub mod data_table_links;
 pub mod data_tables;
+pub mod feedback;
 pub mod graph_arch;
+pub mod hierarchy;
+pub mod lsp;
 pub mod memory_sema;
 pub mod meta;
 pub mod ontology;
@@ -26,14 +31,20 @@ pub mod security_scan;
 pub mod sota_a;
 pub mod toolbox;
 pub mod topic_analysis;
+pub mod topic_apps;
 pub mod work_items_a;
 pub mod work_items_b;
 pub mod worklog;
 
 pub use a2a_csm::*;
+pub use category::*;
 pub use core_memory_a::*;
+pub use data_table_links::*;
 pub use data_tables::*;
+pub use feedback::*;
 pub use graph_arch::*;
+pub use hierarchy::*;
+pub use lsp::*;
 pub use memory_sema::*;
 pub use meta::*;
 pub use ontology::*;
@@ -43,6 +54,7 @@ pub use security_scan::*;
 pub use sota_a::*;
 pub use toolbox::*;
 pub use topic_analysis::*;
+pub use topic_apps::*;
 pub use work_items_a::*;
 pub use work_items_b::*;
 pub use worklog::*;

@@ -18,6 +18,7 @@ pub mod aggregate;
 pub mod column_type;
 pub mod filter;
 pub mod identifier;
+pub mod link_target;
 pub mod report;
 pub mod validate;
 

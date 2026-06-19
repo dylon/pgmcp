@@ -128,7 +128,7 @@ pub async fn run_target_cleanup(
     match tokio::task::spawn_blocking(move || cleanup_pass(inputs)).await {
         Ok(report) => report,
         Err(e) => {
-            warn!(error = %e, "target-cleanup: blocking pass panicked");
+            error!(error = %e, "target-cleanup: blocking pass panicked");
             CleanupReport::default()
         }
     }
@@ -212,7 +212,7 @@ async fn load_live_sessions(pool: &PgPool, now: DateTime<Utc>, grace_secs: u64) 
     {
         Ok(ids) => ids.into_iter().collect(),
         Err(e) => {
-            warn!(error = %e, "target-cleanup: live-sessions query failed");
+            error!(error = %e, "target-cleanup: live-sessions query failed");
             HashSet::new()
         }
     }
@@ -227,7 +227,7 @@ async fn load_alive_mcp(pool: &PgPool) -> HashSet<String> {
     {
         Ok(ids) => ids.into_iter().collect(),
         Err(e) => {
-            warn!(error = %e, "target-cleanup: alive-mcp query failed");
+            error!(error = %e, "target-cleanup: alive-mcp query failed");
             HashSet::new()
         }
     }
@@ -743,7 +743,7 @@ fn safe_remove(
             bytes
         }
         Err(e) => {
-            warn!(error = %e, project, tier, path = %real.display(), "target-cleanup: removal failed");
+            error!(error = %e, project, tier, path = %real.display(), "target-cleanup: removal failed");
             report.errors += 1;
             0
         }
@@ -1004,7 +1004,7 @@ fn safe_remove_tmp(
     match fs::remove_file(&real) {
         Ok(()) => bytes,
         Err(e) => {
-            warn!(error = %e, tier, path = %real.display(), "target-cleanup: tmp removal failed");
+            error!(error = %e, tier, path = %real.display(), "target-cleanup: tmp removal failed");
             report.errors += 1;
             0
         }
@@ -1257,14 +1257,14 @@ struct Manifest {
 impl Manifest {
     fn create(now: DateTime<Utc>, dry_run: bool) -> Self {
         let Some(dir) = manifest_dir() else {
-            warn!("target-cleanup: could not resolve state dir; manifest disabled");
+            error!("target-cleanup: could not resolve state dir; manifest disabled");
             return Self {
                 writer: None,
                 path: None,
             };
         };
         if let Err(e) = fs::create_dir_all(&dir) {
-            warn!(error = %e, dir = %dir.display(), "target-cleanup: manifest dir create failed");
+            error!(error = %e, dir = %dir.display(), "target-cleanup: manifest dir create failed");
             return Self {
                 writer: None,
                 path: None,
@@ -1287,7 +1287,7 @@ impl Manifest {
                 }
             }
             Err(e) => {
-                warn!(error = %e, path = %path.display(), "target-cleanup: manifest open failed");
+                error!(error = %e, path = %path.display(), "target-cleanup: manifest open failed");
                 Self {
                     writer: None,
                     path: None,

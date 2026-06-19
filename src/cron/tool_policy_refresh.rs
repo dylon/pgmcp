@@ -19,7 +19,7 @@ use crate::stats::tracker::StatsTracker;
 pub async fn run_or_log(ctx: SystemContext, _stats: Arc<StatsTracker>) {
     match run(&ctx).await {
         Ok(clients) => tracing::info!(clients, "tool-policy-refresh complete"),
-        Err(e) => tracing::warn!(error = %e, "tool-policy-refresh failed"),
+        Err(e) => tracing::error!(error = %e, "tool-policy-refresh failed"),
     }
 }
 

@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::stats::tracker::StatsTracker;
 
@@ -30,7 +30,7 @@ pub async fn run_or_log(pool: PgPool, stats: Arc<StatsTracker>) {
         Ok(_) => {}
         Err(e) => {
             stats.cron_panics.fetch_add(1, Ordering::Relaxed);
-            warn!(error = %e, "git-state-scan cron: failed");
+            error!(error = %e, "git-state-scan cron: failed");
         }
     }
 }

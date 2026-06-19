@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use crossbeam_channel::Sender;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::config::ProjectOverride;
 use crate::db::DbClient;
@@ -149,7 +149,7 @@ pub async fn index_git_history(
         // makes git refuse to operate on it), mark the cron job as
         // disabled so the scheduler stops retrying every hour.
         let action = crate::cron::shutdown::classify_git_error(&stderr);
-        warn!(
+        error!(
             project = %project_root.display(),
             stderr = %stderr,
             action = ?action,

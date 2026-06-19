@@ -15,7 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::embed::EmbedSource;
 use crate::quality::retrieval_drift::run_retrieval_drift;
@@ -53,7 +53,7 @@ pub async fn run_or_log(pool: PgPool, embed: EmbedSource, stats: Arc<StatsTracke
     .await
     {
         stats.cron_panics.fetch_add(1, Ordering::Relaxed);
-        warn!(error = %e, "retrieval-eval cron: failed to persist report");
+        error!(error = %e, "retrieval-eval cron: failed to persist report");
         return;
     }
     if !passed {

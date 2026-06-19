@@ -200,6 +200,44 @@ all=true). Returns {deleted}."
     }
 
     #[tool(
+        description = "Link a data table to the experiment or work-item it backs (target_type ∈ \
+experiment|work_item; optional `role`). Idempotent — re-linking updates the role. Returns \
+{link_id, table_id, target_type, target_id}."
+    )]
+    async fn data_table_link(
+        &self,
+        Parameters(params): Parameters<DataTableLinkParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "data_table_link",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::data_tables::tool_data_table_link(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(description = "Remove a data-table ⇄ experiment/work-item link. Returns {removed}.")]
+    async fn data_table_unlink(
+        &self,
+        Parameters(params): Parameters<DataTableUnlinkParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "data_table_unlink",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::data_tables::tool_data_table_unlink(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Aggregate a data table's rows: group by zero or more fields and compute metrics \
 (count | sum | avg | min | max | stddev | median | count_distinct) per group. Non-numeric values are skipped \
 and counted (n_ignored). USE WHEN summarizing observations. Returns {table, group_by, total_rows, groups}."

@@ -268,16 +268,16 @@ async fn self_register(daemon_url: &str, name: &str, port: u16, description: &st
                 tracing::info!(agent = name, endpoint = %endpoint, "self-registered with daemon");
                 return;
             }
-            Ok(r) => tracing::warn!(
+            Ok(r) => tracing::error!(
                 status = %r.status(), attempt, endpoint = %endpoint, "self-register non-success"
             ),
-            Err(e) => tracing::warn!(
+            Err(e) => tracing::error!(
                 error = %e, attempt, endpoint = %endpoint, "self-register failed"
             ),
         }
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    tracing::warn!(
+    tracing::error!(
         agent = name, endpoint = %endpoint,
         "self-register gave up after retries; register manually via a2a_register_agent"
     );

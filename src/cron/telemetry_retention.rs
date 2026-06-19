@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info};
 
 use crate::stats::tracker::StatsTracker;
 
@@ -49,6 +49,6 @@ pub async fn run_telemetry_retention(
 /// cron thread.
 pub async fn run_or_log(pool: Arc<PgPool>, stats: Arc<StatsTracker>, retention_days: u32) {
     if let Err(e) = run_telemetry_retention(&pool, &stats, retention_days).await {
-        warn!(error = %e, "telemetry-retention pass failed");
+        error!(error = %e, "telemetry-retention pass failed");
     }
 }

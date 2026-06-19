@@ -591,7 +591,7 @@ fn embedding_worker(
             );
             return;
         }
-        warn!(
+        error!(
             worker_id = id,
             reentries, "embedding event loop exited without shutdown; rebuilding model"
         );
@@ -1255,7 +1255,7 @@ fn process_index_file_task(
                 // problem, not a service-health failure. The
                 // `files_failed` counter still increments. Demote to
                 // warn! to match the timeout case above.
-                warn!(
+                error!(
                     path = %path_str,
                     worker_id,
                     lang = %language,
@@ -1625,7 +1625,7 @@ fn process_index_file_task(
             Ok(_file_id) => InsertOutcome::AllOk,
             Err(e) => {
                 if is_fk_violation(&e) {
-                    tracing::warn!(
+                    tracing::error!(
                         path = %path_str,
                         chunks_total = total_chunks,
                         worker_id,

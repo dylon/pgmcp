@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::config::OntologyConfig;
 use crate::db::queries;
@@ -66,7 +66,9 @@ pub async fn run_ontology_link_predict(pool: &PgPool) -> Result<(), sqlx::Error>
             {
                 Ok(true) => total += 1,
                 Ok(false) => {}
-                Err(e) => warn!(error = %e, facet = facet.as_str(), "predicted edge insert failed"),
+                Err(e) => {
+                    error!(error = %e, facet = facet.as_str(), "predicted edge insert failed")
+                }
             }
         }
     }
@@ -81,6 +83,6 @@ pub async fn run_ontology_link_predict(pool: &PgPool) -> Result<(), sqlx::Error>
 /// Cron entry point: run the prediction pass, logging (not panicking) on error.
 pub async fn run_or_log(pool: Arc<PgPool>, _config: OntologyConfig) {
     if let Err(e) = run_ontology_link_predict(&pool).await {
-        warn!(error = %e, "ontology-link-predict pass failed");
+        error!(error = %e, "ontology-link-predict pass failed");
     }
 }

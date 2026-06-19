@@ -528,13 +528,20 @@ pub async fn insert_duplicate_file(
     canonical_file_id: i64,
     modified_at: DateTime<Utc>,
 ) -> Result<i64, sqlx::Error> {
+    // Plain-text duplicates exist verbatim on disk at their own `path`, so their
+    // text is recoverable from a hash-verified disk read; document-language
+    // duplicates are not (their canonical stores normalized text inline, reached
+    // via the `duplicate_of_file_id` COALESCE in content-reading queries). Mirror
+    // the asymmetric-storage policy in `embed/pool.rs` so a direct read of this
+    // duplicate row (without the canonical join) can still recover plain text.
+    let recoverable = !crate::indexer::extract::is_document_language(language);
     let id: (i64,) = sqlx::query_as(
         "INSERT INTO indexed_files (
             project_id, path, relative_path, language, size_bytes,
             content, content_hash, line_count, truncated, modified_at,
-            last_verified_at, duplicate_of_file_id
+            last_verified_at, duplicate_of_file_id, content_recoverable_from_disk
          )
-         VALUES ($1, $2, $3, $4, $5, NULL, $6, 0, false, $7, NOW(), $8)
+         VALUES ($1, $2, $3, $4, $5, NULL, $6, 0, false, $7, NOW(), $8, $9)
          ON CONFLICT (path) DO UPDATE SET
             project_id = EXCLUDED.project_id,
             relative_path = EXCLUDED.relative_path,
@@ -543,6 +550,7 @@ pub async fn insert_duplicate_file(
             content_hash = EXCLUDED.content_hash,
             modified_at = EXCLUDED.modified_at,
             duplicate_of_file_id = EXCLUDED.duplicate_of_file_id,
+            content_recoverable_from_disk = EXCLUDED.content_recoverable_from_disk,
             indexed_at = NOW(),
             last_verified_at = NOW()
          RETURNING id",
@@ -555,6 +563,7 @@ pub async fn insert_duplicate_file(
     .bind(content_hash)
     .bind(modified_at)
     .bind(canonical_file_id)
+    .bind(recoverable)
     .fetch_one(pool)
     .await?;
     // Recovered-as-duplicate: drop any stale failure-ledger row for this path.

@@ -3,7 +3,7 @@
 
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
-use tracing::warn;
+use tracing::error;
 
 use crate::quality::findings::Pillar;
 use crate::quality::report::{PillarTrend, QualityReport};
@@ -37,7 +37,7 @@ pub async fn insert_history(pool: &PgPool, project_id: i32, report: &QualityRepo
     .execute(pool)
     .await;
     if let Err(e) = res {
-        warn!(error = %e, "quality_report_history insert failed (non-fatal)");
+        error!(error = %e, "quality_report_history insert failed (non-fatal)");
     }
 }
 

@@ -133,7 +133,7 @@ impl Embedder {
                 let load_head = |file: &str, in_dim: usize, out_dim: usize| -> Option<Linear> {
                     let path = model_dir.join(file);
                     if !path.exists() {
-                        tracing::warn!(
+                        tracing::error!(
                             file,
                             "BGE-M3 head file absent; that retrieval leg degrades to dense-only"
                         );
@@ -142,7 +142,7 @@ impl Embedder {
                     let head_vb = match VarBuilder::from_pth(&path, head_dtype, &device) {
                         Ok(v) => v,
                         Err(e) => {
-                            tracing::warn!(file, error = %e, "BGE-M3 head load failed; dense-only");
+                            tracing::error!(file, error = %e, "BGE-M3 head load failed; dense-only");
                             return None;
                         }
                     };
@@ -695,7 +695,7 @@ fn ensure_model_files(kind: ModelKind) -> Result<PathBuf> {
     if matches!(kind, ModelKind::Bgem3) {
         for aux in ["sparse_linear.pt", "colbert_linear.pt"] {
             if let Err(e) = api.get(aux) {
-                tracing::warn!(file = aux, error = %e, "BGE-M3 aux head not fetched; that leg degrades to dense-only");
+                tracing::error!(file = aux, error = %e, "BGE-M3 aux head not fetched; that leg degrades to dense-only");
             }
         }
     }

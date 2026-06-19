@@ -136,7 +136,7 @@ pub async fn run(
             );
         }
         None => {
-            tracing::warn!(kind, "rmas-loop: latent engine unavailable — degraded");
+            tracing::error!(kind, "rmas-loop: latent engine unavailable — degraded");
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({

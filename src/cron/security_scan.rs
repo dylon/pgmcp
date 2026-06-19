@@ -36,7 +36,7 @@ use sqlx::PgPool;
 use tokio::process::Command as TokioCommand;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::config::SecurityScanConfig;
 use crate::db::queries;
@@ -514,7 +514,7 @@ pub async fn run_security_scan(
     let projects = match queries::list_projects(pool).await {
         Ok(p) => p,
         Err(e) => {
-            warn!(error = %e, "security-scan: list_projects failed");
+            error!(error = %e, "security-scan: list_projects failed");
             return report;
         }
     };
@@ -573,7 +573,7 @@ pub async fn run_security_scan(
     while let Some(joined) = set.join_next().await {
         match joined {
             Ok(r) => report.merge(&r),
-            Err(e) => warn!(error = %e, "security-scan: scanner task panicked"),
+            Err(e) => error!(error = %e, "security-scan: scanner task panicked"),
         }
     }
     report
@@ -752,7 +752,7 @@ async fn run_and_persist(
                 match res {
                     Ok(()) => upserted += 1,
                     Err(e) => {
-                        warn!(scanner = spec.slug, error = %e, "security-scan: upsert finding failed")
+                        error!(scanner = spec.slug, error = %e, "security-scan: upsert finding failed")
                     }
                 }
                 seen.push(fp);
@@ -796,7 +796,7 @@ async fn record_run(
     {
         Ok(id) => Some(id),
         Err(e) => {
-            warn!(scanner, error = %e, "security-scan: insert run row failed");
+            error!(scanner, error = %e, "security-scan: insert run row failed");
             None
         }
     }

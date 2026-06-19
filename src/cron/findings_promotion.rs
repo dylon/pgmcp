@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::code_analysis::findings::{self, BugFeatures};
 use crate::config::ProjectOverride;
@@ -51,7 +51,7 @@ pub async fn run_or_log(pool: PgPool, stats: Arc<StatsTracker>) {
         Ok(p) => p,
         Err(e) => {
             stats.cron_panics.fetch_add(1, Ordering::Relaxed);
-            warn!(error = %e, "findings-promotion: list_projects failed");
+            error!(error = %e, "findings-promotion: list_projects failed");
             return;
         }
     };
@@ -71,7 +71,7 @@ pub async fn run_or_log(pool: PgPool, stats: Arc<StatsTracker>) {
         match promote_for_project(&pool, project.id, &project.name, threshold).await {
             Ok(n) => promoted_total += n,
             Err(e) => {
-                warn!(
+                error!(
                     error = %e,
                     project = %project.name,
                     "findings-promotion: project sweep failed (non-fatal)"
@@ -223,7 +223,7 @@ async fn promote_bug_prediction(
                     created += 1;
                 }
             }
-            Err(e) => warn!(
+            Err(e) => error!(
                 error = ?e,
                 path = %s.relative_path,
                 "findings-promotion: promote bug_prediction finding failed"
@@ -310,7 +310,7 @@ async fn promote_documented_tech_debt(
                         created += 1;
                     }
                 }
-                Err(e) => warn!(
+                Err(e) => error!(
                     error = ?e,
                     path = %path,
                     line = hit.line,
@@ -410,7 +410,7 @@ async fn promote_security_scan(pool: &PgPool, project_id: i32) -> Result<u64, sq
                         ..Default::default()
                     };
                     if let Err(e) = queries::upsert_bug_details(pool, item_id, &details).await {
-                        warn!(
+                        error!(
                             error = ?e,
                             scanner = %f.scanner,
                             "findings-promotion: security bug_details upsert failed"
@@ -418,7 +418,7 @@ async fn promote_security_scan(pool: &PgPool, project_id: i32) -> Result<u64, sq
                     }
                 }
             }
-            Err(e) => warn!(
+            Err(e) => error!(
                 error = ?e,
                 scanner = %f.scanner,
                 "findings-promotion: promote security_scan finding failed"

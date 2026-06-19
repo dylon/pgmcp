@@ -20,7 +20,7 @@ use anyhow::{Context, Result, anyhow};
 use candle_core::{DType, Device, Tensor};
 use hf_hub::api::sync::Api;
 use tokenizers::Tokenizer;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::llm::prompt::{build_extraction_prompt, build_reflection_prompt};
 use crate::llm::qwen3::Qwen3Variant;
@@ -134,7 +134,7 @@ impl Qwen3LatentPipeline {
         link_signature: String,
     ) -> Result<Self> {
         let device = Device::new_cuda(0).or_else(|err| {
-            warn!(error = %err, "Qwen3LatentPipeline: CUDA init failed, falling back to CPU (very slow)");
+            error!(error = %err, "Qwen3LatentPipeline: CUDA init failed, falling back to CPU (very slow)");
             Ok::<Device, anyhow::Error>(Device::Cpu)
         })?;
 

@@ -58,6 +58,32 @@ be in claimed_done or verifying."
     }
 
     #[tool(
+        description = "Assert a bug (kind='bug') is fixed against a runnable `verification_command` \
+(the frozen, machine-checkable reproduction criterion), advancing it to claimed_done. Does NOT mark \
+it verified — an agent cannot self-verify (ADR-004 trust boundary); closing requires trusted CI or a \
+decided bug-fix experiment. USE WHEN you have fixed a bug you filed. Returns the status + the \
+remaining trusted step."
+    )]
+    async fn work_item_assert_fixed(
+        &self,
+        Parameters(mut params): Parameters<WorkItemAssertFixedParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        if params.agent_id.is_none() {
+            params.agent_id = Some(extract_caller(&_ctx).client_name);
+        }
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_assert_fixed",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::work_items::tool_work_item_assert_fixed(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "USER-only: defer (explicitly skip) an item so it is excluded from completion \
 roll-up. Requires the tracker user_token — an agent CANNOT self-defer (no token; →deferred has no agent arm \
 in the transition matrix). Records an append-only scope-negotiation."

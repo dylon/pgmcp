@@ -23,7 +23,7 @@ use std::sync::atomic::Ordering;
 
 use liblevenshtein::time_series::MsmConfig;
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::config::TrajectorySimilarityConfig;
 use crate::stats::tracker::StatsTracker;
@@ -440,6 +440,6 @@ pub async fn run_or_log(
     config: TrajectorySimilarityConfig,
 ) {
     if let Err(e) = run_trajectory_similarity(&pool, &stats, &config).await {
-        warn!(error = %e, "trajectory-similarity pass failed");
+        error!(error = %e, "trajectory-similarity pass failed");
     }
 }

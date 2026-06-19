@@ -1,6 +1,7 @@
 use super::backend::LanguageBackend;
 use super::{
-    c_cpp, clojure, coq, java, javascript, lean, metta, python, rholang, rust, scala, tlaplus,
+    c_cpp, clojure, coq, isabelle, java, javascript, lean, metamath, metta, python, rholang, rust,
+    scala, tamarin, tlaplus, why3,
 };
 
 /// Registry: dispatches a language string to the matching backend, or `None`
@@ -31,6 +32,10 @@ impl LanguageRegistry {
             "coq" => Some(&coq::COQ_BACKEND),
             "tlaplus" => Some(&tlaplus::TLAPLUS_BACKEND),
             "lean" => Some(&lean::LEAN_BACKEND),
+            "isabelle" => Some(&isabelle::ISABELLE_BACKEND),
+            "metamath" => Some(&metamath::METAMATH_BACKEND),
+            "why3" => Some(&why3::WHY3_BACKEND),
+            "tamarin" => Some(&tamarin::TAMARIN_BACKEND),
             // Sage Math is a Python superset — reuse the Python backend.
             "sage" => Some(&python::PYTHON_BACKEND),
             _ => None,

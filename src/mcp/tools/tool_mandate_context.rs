@@ -7,7 +7,7 @@ use std::time::Instant;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, Content};
 use serde_json::json;
-use tracing::{debug, error, info};
+use tracing::{debug, error};
 use uuid::Uuid;
 
 use crate::context::SystemContext;

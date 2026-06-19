@@ -27,7 +27,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::{CallToolResult, Content};
 use serde::Serialize;
 use serde_json::json;
-use tracing::{debug, info};
+use tracing::debug;
 
 use crate::context::SystemContext;
 use crate::mcp::server::*;

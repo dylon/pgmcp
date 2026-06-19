@@ -38,6 +38,18 @@ pub use queries_clients::*;
 mod queries_files;
 pub use queries_files::*;
 
+#[path = "queries/feedback.rs"]
+mod queries_feedback;
+pub use queries_feedback::*;
+
+#[path = "queries/votes.rs"]
+mod queries_votes;
+pub use queries_votes::*;
+
+#[path = "queries/data_table_links.rs"]
+mod queries_data_table_links;
+pub use queries_data_table_links::*;
+
 #[path = "queries/chunks.rs"]
 mod queries_chunks;
 pub use queries_chunks::*;

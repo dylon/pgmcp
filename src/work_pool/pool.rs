@@ -130,7 +130,7 @@ impl WorkPool {
         };
 
         if let Err(e) = sender.send(Box::new(task)) {
-            tracing::warn!("Failed to submit task: channel disconnected: {}", e);
+            tracing::error!("Failed to submit task: channel disconnected: {}", e);
             return;
         }
 

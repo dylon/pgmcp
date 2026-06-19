@@ -49,7 +49,7 @@ pub fn run_or_log(
         match watcher_cmd_tx.try_send(WatcherCommand::Rescan(ws.clone())) {
             Ok(()) => enqueued += 1,
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     workspace = %ws.display(),
                     error = %e,
                     "index-reconcile: failed to enqueue rescan (command channel full?)"

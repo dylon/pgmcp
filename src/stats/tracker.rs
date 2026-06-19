@@ -535,8 +535,14 @@ pub struct StatsTracker {
     pub symbol_extraction_disk_hash_mismatches: AtomicU64,
     /// Symbol-extraction disk read found the file gone from disk; skipped.
     pub symbol_extraction_disk_missing: AtomicU64,
-    /// Symbol-extraction disk read failed (not recoverable / IO error); skipped.
+    /// Symbol-extraction disk read failed with a genuine IO error (permission /
+    /// transient fs error); skipped and the watermark is held.
     pub symbol_extraction_disk_io_errors: AtomicU64,
+    /// Symbol-extraction skipped a content-NULL file whose text was not recoverable
+    /// from disk. Split out from `disk_io_errors` so it is diagnosable on its own —
+    /// conflating the two is what hid the duplicate-pointer bug (canonical-follow
+    /// missing in `fetch_file_content_batch`) that collapsed Lean symbol coverage.
+    pub symbol_extraction_disk_not_recoverable: AtomicU64,
     /// Symbol-extraction skipped a file whose `content_hash` matched the hash at
     /// its last successful extraction (RC2 incremental-skip — no re-parse).
     pub symbol_extraction_unchanged_skips: AtomicU64,
@@ -971,6 +977,7 @@ impl StatsTracker {
             symbol_extraction_disk_hash_mismatches: AtomicU64::new(0),
             symbol_extraction_disk_missing: AtomicU64::new(0),
             symbol_extraction_disk_io_errors: AtomicU64::new(0),
+            symbol_extraction_disk_not_recoverable: AtomicU64::new(0),
             symbol_extraction_unchanged_skips: AtomicU64::new(0),
             read_file_chunk_stitches: AtomicU64::new(0),
             graph_build_runs: AtomicU64::new(0),
@@ -1441,6 +1448,7 @@ impl StatsTracker {
             "symbol_extraction_disk_hash_mismatches": self.symbol_extraction_disk_hash_mismatches.load(Ordering::Acquire),
             "symbol_extraction_disk_missing": self.symbol_extraction_disk_missing.load(Ordering::Acquire),
             "symbol_extraction_disk_io_errors": self.symbol_extraction_disk_io_errors.load(Ordering::Acquire),
+            "symbol_extraction_disk_not_recoverable": self.symbol_extraction_disk_not_recoverable.load(Ordering::Acquire),
             "symbol_extraction_unchanged_skips": self.symbol_extraction_unchanged_skips.load(Ordering::Acquire),
             "read_file_chunk_stitches": self.read_file_chunk_stitches.load(Ordering::Acquire),
             "graph_build_runs": self.graph_build_runs.load(Ordering::Acquire),

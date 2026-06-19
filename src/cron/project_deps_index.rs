@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::stats::tracker::StatsTracker;
 
@@ -22,7 +22,7 @@ pub async fn run_or_log(pool: PgPool, stats: Arc<StatsTracker>) {
         Ok(p) => p,
         Err(e) => {
             stats.cron_panics.fetch_add(1, Ordering::Relaxed);
-            warn!(error = %e, "project-deps-index cron: project list failed");
+            error!(error = %e, "project-deps-index cron: project list failed");
             return;
         }
     };
@@ -30,7 +30,7 @@ pub async fn run_or_log(pool: PgPool, stats: Arc<StatsTracker>) {
     let mut total_up = 0usize;
     let mut total_closed = 0u64;
     for (id, path) in projects {
-        let (up, closed) = crate::deps::manifest::index_project_manifests(&pool, id, &path).await;
+        let (up, closed) = crate::deps::ecosystems::index_all_manifests(&pool, id, &path).await;
         total_up += up;
         total_closed += closed;
     }

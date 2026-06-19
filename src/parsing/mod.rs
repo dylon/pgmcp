@@ -26,11 +26,16 @@ pub mod complexity;
 pub mod coq;
 pub mod dataflow;
 pub mod function_metrics;
+pub mod isabelle;
 pub mod java;
 pub mod javascript;
 pub mod lean;
+pub mod metamath;
 pub mod metta;
+pub mod occurrence_kind;
+pub mod occurrences;
 pub mod python;
+pub mod regex_fv_util;
 pub mod registry;
 pub mod resolution_kind;
 pub mod rholang;
@@ -38,8 +43,10 @@ pub mod rust;
 pub mod scala;
 pub mod symbols;
 pub mod sync_ops;
+pub mod tamarin;
 pub mod tlaplus;
 pub mod type_tags;
+pub mod why3;
 
 // Public surface for the trait + future backends. The `unused_imports`
 // allow is needed because backends land incrementally — until the first
@@ -80,6 +87,10 @@ mod tests {
         assert!(LanguageRegistry::for_language("coq").is_some());
         assert!(LanguageRegistry::for_language("tlaplus").is_some());
         assert!(LanguageRegistry::for_language("lean").is_some());
+        assert!(LanguageRegistry::for_language("isabelle").is_some());
+        assert!(LanguageRegistry::for_language("metamath").is_some());
+        assert!(LanguageRegistry::for_language("why3").is_some());
+        assert!(LanguageRegistry::for_language("tamarin").is_some());
         // Sage Math dispatches to the Python backend.
         assert!(LanguageRegistry::for_language("sage").is_some());
         // Backends not yet landed:

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::db::queries;
 use crate::stats::tracker::StatsTracker;
@@ -35,7 +35,7 @@ pub async fn run_or_log(pool: PgPool, stats: Arc<StatsTracker>, idle_secs: i64, 
         }
         Err(e) => {
             stats.cron_panics.fetch_add(1, Ordering::Relaxed);
-            warn!(error = %e, "work-item-presence cron: sweep failed");
+            error!(error = %e, "work-item-presence cron: sweep failed");
         }
     }
 }

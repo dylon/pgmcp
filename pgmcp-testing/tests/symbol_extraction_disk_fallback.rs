@@ -190,3 +190,156 @@ async fn content_null_hash_mismatch_is_skipped_and_not_watermarked() {
         "F1: watermark must stay before the skipped file's modified_at; got {watermark:?} vs {modified_at}"
     );
 }
+
+/// Insert a duplicate-pointer row in the PRE-FIX broken state: `content = NULL`
+/// AND `content_recoverable_from_disk = FALSE`. This is exactly the shape that
+/// stranded Lean's many generated/duplicate files (3204 files → 289 symbols).
+/// Fix 1 (canonical-follow COALESCE in `fetch_file_content_batch`) must repair it
+/// WITHOUT a re-index. The duplicate's own `path` need not exist on disk — the
+/// fix reads the canonical's path.
+async fn seed_duplicate_pointer_legacy(
+    pool: &PgPool,
+    project_id: i32,
+    abs_path: &str,
+    relative_path: &str,
+    content_hash: i64,
+    canonical_file_id: i64,
+) -> i64 {
+    sqlx::query_scalar(
+        "INSERT INTO indexed_files
+            (project_id, path, relative_path, language, size_bytes, content,
+             content_recoverable_from_disk, content_hash, line_count, modified_at,
+             duplicate_of_file_id)
+         VALUES ($1, $2, $3, 'rust', 1, NULL, FALSE, $4, 1, NOW(), $5)
+         ON CONFLICT (path) DO UPDATE SET
+            content = NULL, content_recoverable_from_disk = FALSE,
+            content_hash = $4, duplicate_of_file_id = $5, modified_at = NOW()
+         RETURNING id",
+    )
+    .bind(project_id)
+    .bind(abs_path)
+    .bind(relative_path)
+    .bind(content_hash)
+    .bind(canonical_file_id)
+    .fetch_one(pool)
+    .await
+    .expect("duplicate file")
+}
+
+/// Fix 1 — a duplicate-pointer row (even in the pre-fix `recoverable = FALSE`
+/// state) extracts its symbols by following `duplicate_of_file_id` to the
+/// canonical, repairing already-indexed duplicates without a re-index, and is
+/// NOT counted as `disk_not_recoverable`.
+#[tokio::test(flavor = "multi_thread")]
+async fn duplicate_pointer_extracts_via_canonical_without_reindex() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let project_id = seed_project(&pool, "rc2-dup", "/ws/rc2-dup").await;
+
+    let body = "pub fn zeta_eta_theta() {}\n";
+    let path = scratch_file("dupcanon", body);
+    let abs = path.to_str().expect("utf8 path").to_string();
+    let hash = content_hash_i64(body.as_bytes());
+    // Canonical: content-NULL, recoverable, real bytes on disk.
+    let canon_id = seed_disk_backed_file(&pool, project_id, &abs, "src/canon.rs", hash).await;
+    // Duplicate pointer in the broken state, at a path that need not exist.
+    let dup_id = seed_duplicate_pointer_legacy(
+        &pool,
+        project_id,
+        "/ws/rc2-dup/src/dup.rs",
+        "src/dup.rs",
+        hash,
+        canon_id,
+    )
+    .await;
+
+    let db_client: Arc<dyn DbClient> = Arc::new(pool.clone());
+    let stats = Arc::new(StatsTracker::new());
+    symbol_extraction::run_symbol_extraction_for_project(db_client.as_ref(), &stats, "rc2-dup")
+        .await;
+    let _ = std::fs::remove_file(&path);
+
+    let dup_has_symbol: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM file_symbols WHERE file_id = $1 AND name = 'zeta_eta_theta')",
+    )
+    .bind(dup_id)
+    .fetch_one(&pool)
+    .await
+    .expect("dup symbol lookup");
+    assert!(
+        dup_has_symbol,
+        "a duplicate-pointer row (even recoverable=FALSE) must extract via the canonical-follow COALESCE — repairing already-indexed duplicates without a re-index"
+    );
+    assert_eq!(
+        stats
+            .symbol_extraction_disk_not_recoverable
+            .load(Ordering::Acquire),
+        0,
+        "the duplicate must NOT be counted as not-recoverable (that conflation hid the Lean coverage bug)"
+    );
+}
+
+/// Fix 2 — `insert_duplicate_file` marks a plain-text duplicate as
+/// recoverable-from-disk (defense-in-depth so a direct, un-joined read still
+/// recovers its text); a document-language duplicate stays non-recoverable.
+#[tokio::test(flavor = "multi_thread")]
+async fn insert_duplicate_file_marks_plaintext_recoverable() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let project_id = seed_project(&pool, "rc2-dupins", "/ws/rc2-dupins").await;
+
+    let body = "pub fn iota_kappa() {}\n";
+    let path = scratch_file("dupins", body);
+    let abs = path.to_str().expect("utf8 path").to_string();
+    let hash = content_hash_i64(body.as_bytes());
+    let canon_id = seed_disk_backed_file(&pool, project_id, &abs, "src/c2.rs", hash).await;
+    let _ = std::fs::remove_file(&path);
+
+    let plain_dup = pgmcp::db::queries::insert_duplicate_file(
+        &pool,
+        project_id,
+        "/ws/rc2-dupins/src/d2.rs",
+        "src/d2.rs",
+        "rust",
+        body.len() as i64,
+        hash,
+        canon_id,
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("insert plain-text duplicate");
+    let plain_recoverable: bool =
+        sqlx::query_scalar("SELECT content_recoverable_from_disk FROM indexed_files WHERE id = $1")
+            .bind(plain_dup)
+            .fetch_one(&pool)
+            .await
+            .expect("plain recoverable flag");
+    assert!(
+        plain_recoverable,
+        "a plain-text duplicate must be marked recoverable-from-disk"
+    );
+
+    let doc_dup = pgmcp::db::queries::insert_duplicate_file(
+        &pool,
+        project_id,
+        "/ws/rc2-dupins/docs/d2.pdf",
+        "docs/d2.pdf",
+        "pdf",
+        body.len() as i64,
+        hash,
+        canon_id,
+        chrono::Utc::now(),
+    )
+    .await
+    .expect("insert document duplicate");
+    let doc_recoverable: bool =
+        sqlx::query_scalar("SELECT content_recoverable_from_disk FROM indexed_files WHERE id = $1")
+            .bind(doc_dup)
+            .fetch_one(&pool)
+            .await
+            .expect("doc recoverable flag");
+    assert!(
+        !doc_recoverable,
+        "a document-language duplicate must stay non-recoverable (its canonical stores inline text)"
+    );
+}

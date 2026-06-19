@@ -26,7 +26,7 @@ use std::sync::atomic::Ordering;
 
 use pgvector::Vector;
 use sqlx::PgPool;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 use crate::config::EmbeddingsConfig;
 use crate::db::queries;
@@ -194,7 +194,7 @@ pub async fn run_embedding_migration_pass(
             }
             Ok(_) => break, // backlog drained for file_chunks; move on
             Err(e) => {
-                warn!(error = %e, "file_chunks migration batch failed");
+                error!(error = %e, "file_chunks migration batch failed");
                 report.errors += 1;
                 stats
                     .embeddings_migration_errors
@@ -217,7 +217,7 @@ pub async fn run_embedding_migration_pass(
                 }
                 Ok(_) => break,
                 Err(e) => {
-                    warn!(error = %e, "file_chunks sparse backfill batch failed");
+                    error!(error = %e, "file_chunks sparse backfill batch failed");
                     report.errors += 1;
                     stats
                         .embeddings_migration_errors
@@ -242,7 +242,7 @@ pub async fn run_embedding_migration_pass(
             }
             Ok(_) => break,
             Err(e) => {
-                warn!(error = %e, "file_chunks contextual re-embed batch failed");
+                error!(error = %e, "file_chunks contextual re-embed batch failed");
                 report.errors += 1;
                 stats
                     .embeddings_migration_errors
@@ -264,7 +264,7 @@ pub async fn run_embedding_migration_pass(
             }
             Ok(_) => break,
             Err(e) => {
-                warn!(error = %e, "session_prompts migration batch failed");
+                error!(error = %e, "session_prompts migration batch failed");
                 report.errors += 1;
                 stats
                     .embeddings_migration_errors
@@ -287,7 +287,7 @@ pub async fn run_embedding_migration_pass(
             }
             Ok(_) => break,
             Err(e) => {
-                warn!(error = %e, "git_commit_chunks migration batch failed");
+                error!(error = %e, "git_commit_chunks migration batch failed");
                 report.errors += 1;
                 stats
                     .embeddings_migration_errors
@@ -304,7 +304,7 @@ pub async fn run_embedding_migration_pass(
             }
             Ok(_) => break,
             Err(e) => {
-                warn!(error = %e, "software_pattern_chunks migration batch failed");
+                error!(error = %e, "software_pattern_chunks migration batch failed");
                 report.errors += 1;
                 stats
                     .embeddings_migration_errors
@@ -321,7 +321,7 @@ pub async fn run_embedding_migration_pass(
             }
             Ok(_) => break,
             Err(e) => {
-                warn!(error = %e, "durable_mandates migration batch failed");
+                error!(error = %e, "durable_mandates migration batch failed");
                 report.errors += 1;
                 stats
                     .embeddings_migration_errors
@@ -338,7 +338,7 @@ pub async fn run_embedding_migration_pass(
             }
             Ok(_) => break,
             Err(e) => {
-                warn!(error = %e, "session_mandates migration batch failed");
+                error!(error = %e, "session_mandates migration batch failed");
                 report.errors += 1;
                 stats
                     .embeddings_migration_errors
@@ -366,7 +366,7 @@ pub async fn run_embedding_migration_pass(
             }
             Ok(_) => break,
             Err(e) => {
-                warn!(error = %e, "memory_observations migration batch failed");
+                error!(error = %e, "memory_observations migration batch failed");
                 report.errors += 1;
                 stats
                     .embeddings_migration_errors
@@ -415,7 +415,7 @@ pub async fn run_embedding_migration_pass(
                 }
                 Ok(_) => break,
                 Err(e) => {
-                    warn!(error = %e, table, "experiment embedding backfill batch failed");
+                    error!(error = %e, table, "experiment embedding backfill batch failed");
                     report.errors += 1;
                     stats
                         .embeddings_migration_errors
@@ -451,7 +451,7 @@ pub async fn run_embedding_migration_pass(
             }
             Ok(_) => break,
             Err(e) => {
-                warn!(error = %e, "work_items embedding backfill batch failed");
+                error!(error = %e, "work_items embedding backfill batch failed");
                 report.errors += 1;
                 stats
                     .embeddings_migration_errors
@@ -472,7 +472,7 @@ pub async fn run_embedding_migration_pass(
             }
             Ok(_) => break,
             Err(e) => {
-                warn!(error = %e, "data_tables embedding backfill batch failed");
+                error!(error = %e, "data_tables embedding backfill batch failed");
                 report.errors += 1;
                 stats
                     .embeddings_migration_errors
@@ -496,7 +496,7 @@ pub async fn run_embedding_migration_pass(
             }
             Ok(_) => break,
             Err(e) => {
-                warn!(error = %e, "memory_entities embedding backfill batch failed");
+                error!(error = %e, "memory_entities embedding backfill batch failed");
                 report.errors += 1;
                 stats
                     .embeddings_migration_errors
@@ -542,7 +542,7 @@ pub async fn run_embedding_migration_pass(
                 }
                 Ok(_) => break,
                 Err(e) => {
-                    warn!(error = %e, table, "v31 graph-RAG embedding backfill batch failed");
+                    error!(error = %e, table, "v31 graph-RAG embedding backfill batch failed");
                     report.errors += 1;
                     stats
                         .embeddings_migration_errors
@@ -573,7 +573,7 @@ pub async fn run_embedding_migration_pass(
             }
             Ok(_) => break,
             Err(e) => {
-                warn!(error = %e, "tool_cards embedding backfill batch failed");
+                error!(error = %e, "tool_cards embedding backfill batch failed");
                 report.errors += 1;
                 stats
                     .embeddings_migration_errors
@@ -602,7 +602,7 @@ pub async fn run_embedding_migration_pass(
             }
             Ok(_) => break,
             Err(e) => {
-                warn!(error = %e, "mcp_tool_catalog embedding backfill batch failed");
+                error!(error = %e, "mcp_tool_catalog embedding backfill batch failed");
                 report.errors += 1;
                 stats
                     .embeddings_migration_errors
@@ -1290,7 +1290,7 @@ pub async fn run_or_log(
     config: EmbeddingMigrationConfig,
 ) {
     if let Err(e) = run_embedding_migration_pass(&pool, &stats, &config).await {
-        warn!(error = %e, "embedding-migration pass failed");
+        error!(error = %e, "embedding-migration pass failed");
     }
 }
 

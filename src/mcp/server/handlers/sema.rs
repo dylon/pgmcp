@@ -42,6 +42,31 @@ with `cross_language_signatures` to refresh."
     }
 
     #[tool(
+        description = "Read-only LSP-shaped query over the indexed symbol graph (ADR-026). One \
+`op` selects the operation: document_symbol | workspace_symbol | definition | references | hover | \
+type_definition | implementation | call_hierarchy_incoming | call_hierarchy_outgoing | \
+type_hierarchy_super | type_hierarchy_sub | folding_range | signature_help | document_highlight | \
+capabilities. Params {project, op, file_path?, symbol?, scope?, limit}. USE WHEN you want \
+go-to-definition / find-references / call-hierarchy / hover without opening files. No mutation. Call \
+op=capabilities to list ops + their backing data."
+    )]
+    async fn lsp_query(
+        &self,
+        Parameters(params): Parameters<LspQueryParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "lsp_query",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_lsp_query::tool_lsp_query(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Search for functions by structural type shape: return type tags, \
 parameter type tags, effects. USE WHEN: 'find async functions returning Result<T,_>', \
 'all handlers taking Request<_>', 'database-touching functions in module foo'. \

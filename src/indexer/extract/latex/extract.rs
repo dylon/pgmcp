@@ -45,7 +45,7 @@ fn extract_bytes(bytes: &[u8], opts: &ExtractOptions, path_for_log: Option<&Path
     let text_raw = match rendered {
         Ok(text) => text,
         Err(_) => {
-            tracing::warn!(
+            tracing::error!(
                 path = ?path_for_log,
                 "latex render panicked; falling back to raw source"
             );

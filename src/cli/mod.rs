@@ -12,6 +12,7 @@
 pub mod a2a_adapter;
 pub mod admin;
 pub mod analyze;
+pub mod bug_gate;
 pub mod context;
 pub mod daemon;
 pub mod experiment;

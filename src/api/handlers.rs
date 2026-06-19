@@ -336,7 +336,7 @@ pub async fn search(
                     _ => tracing::debug!("ColBERT rerank skipped: backbone has no ColBERT head"),
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "ColBERT rerank failed; using RRF order"),
+            Err(e) => tracing::error!(error = %e, "ColBERT rerank failed; using RRF order"),
         }
     }
 
@@ -364,9 +364,9 @@ pub async fn search(
                 rerank_hits = hits;
                 rerank_used = true;
             }
-            Ok(Err(e)) => tracing::warn!(error = %e, "hook rerank failed; using RRF order"),
+            Ok(Err(e)) => tracing::error!(error = %e, "hook rerank failed; using RRF order"),
             Err(e) => {
-                tracing::warn!(error = %e, "hook rerank task join failed; using RRF order")
+                tracing::error!(error = %e, "hook rerank task join failed; using RRF order")
             }
         }
     }
@@ -882,11 +882,11 @@ pub async fn session_observe(
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        tracing::warn!(error = %e, "mark_near_duplicate_superseded failed")
+                        tracing::error!(error = %e, "mark_near_duplicate_superseded failed")
                     }
                 }
             }
-            Err(e) => tracing::warn!(error = %e, "upsert_mandate failed"),
+            Err(e) => tracing::error!(error = %e, "upsert_mandate failed"),
         }
     }
 

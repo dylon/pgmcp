@@ -28,7 +28,7 @@ use candle_core::{DType, Device, Tensor};
 use candle_nn::Optimizer;
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::llm::latent_train::LatentTrainConfig;
 use crate::llm::recursive_link::cosine_alignment_loss;
@@ -165,7 +165,7 @@ pub fn train_outer_link(
     }
 
     if !final_loss.is_finite() {
-        warn!(final_loss, "OuterLink trainer: non-finite final loss");
+        error!(final_loss, "OuterLink trainer: non-finite final loss");
     }
 
     link.save(&varmap, output_path)

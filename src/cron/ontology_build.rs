@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::config::OntologyConfig;
 use crate::db::queries;
@@ -31,11 +31,11 @@ pub async fn run_ontology_build(pool: &PgPool) -> Result<(), sqlx::Error> {
     for facet in Facet::ALL {
         match hierarchy::build_facet_isa(pool, *facet, MIN_EFFECT_SUPPORT).await {
             Ok(n) => isa_total += n,
-            Err(e) => warn!(error = %e, facet = facet.as_str(), "facet is_a build failed"),
+            Err(e) => error!(error = %e, facet = facet.as_str(), "facet is_a build failed"),
         }
         match hierarchy::build_broader_edges(pool, *facet, BROADER_TAU).await {
             Ok(n) => broader_total += n,
-            Err(e) => warn!(error = %e, facet = facet.as_str(), "facet broader build failed"),
+            Err(e) => error!(error = %e, facet = facet.as_str(), "facet broader build failed"),
         }
     }
     queries::refresh_memory_unified_edges(pool).await?;
@@ -50,6 +50,6 @@ pub async fn run_ontology_build(pool: &PgPool) -> Result<(), sqlx::Error> {
 /// Cron entry point: run the build, logging (not panicking) on error.
 pub async fn run_or_log(pool: Arc<PgPool>, _config: OntologyConfig) {
     if let Err(e) = run_ontology_build(&pool).await {
-        warn!(error = %e, "ontology-build pass failed");
+        error!(error = %e, "ontology-build pass failed");
     }
 }

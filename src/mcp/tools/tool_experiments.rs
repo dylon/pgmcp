@@ -101,7 +101,7 @@ async fn embed_opt(ctx: &SystemContext, on: bool, text: &str) -> Option<Vector> 
     match ctx.embed().embed_query(text).await {
         Ok(v) => Some(Vector::from(v)),
         Err(e) => {
-            tracing::warn!(error = %e, "experiment embed-on-write failed; leaving NULL for cron backfill");
+            tracing::error!(error = %e, "experiment embed-on-write failed; leaving NULL for cron backfill");
             None
         }
     }
@@ -386,7 +386,7 @@ pub async fn tool_experiment_open(
     )
     .await
     {
-        tracing::warn!(error = %e, "experiment mirror_open failed (non-fatal)");
+        tracing::error!(error = %e, "experiment mirror_open failed (non-fatal)");
     }
 
     ctx.stats()
@@ -965,7 +965,7 @@ pub async fn tool_experiment_decide(
                 "experiment_decide: synced verdict to linked work_items")
         }
         Ok(_) => {}
-        Err(e) => tracing::warn!(error = %e, "experiment_decide: work_item verdict sync failed"),
+        Err(e) => tracing::error!(error = %e, "experiment_decide: work_item verdict sync failed"),
     }
 
     // Optional: graduate a confirmed/rejected verdict into the cross-agent
@@ -994,7 +994,7 @@ pub async fn tool_experiment_decide(
         };
         match record_outcome(pool, &report).await {
             Ok(r) => linked_outcome_id = Some(r.outcome_id),
-            Err(e) => tracing::warn!(error = %e, "experiment_decide: agent_outcomes link failed"),
+            Err(e) => tracing::error!(error = %e, "experiment_decide: agent_outcomes link failed"),
         }
     }
 

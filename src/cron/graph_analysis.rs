@@ -99,6 +99,12 @@ pub async fn run_graph_analysis(
         }
     }
 
+    // Hierarchical rollup (ADR-027): now that every project's project_metrics row
+    // exists, aggregate up to groups + the workspace. Non-fatal.
+    if let Err(e) = crate::hierarchy::rollup::persist_group_workspace_rollup(pool).await {
+        error!(error = %e, "group/workspace rollup failed");
+    }
+
     info!(
         elapsed_ms = start.elapsed().as_millis() as u64,
         projects = projects.len(),
@@ -305,6 +311,15 @@ async fn analyze_project(
                 );
             }
         }
+    }
+
+    // Hierarchical rollup (ADR-027): persist module_metrics + project_metrics now
+    // that module_metrics are computed (cheap add at the point the data exists).
+    // Non-fatal — a rollup failure must not abort the graph-analysis pass.
+    if let Err(e) =
+        crate::hierarchy::rollup::persist_project_rollup(pool, project_id, &module_metrics).await
+    {
+        tracing::error!(project_id, error = %e, "hierarchical rollup persist failed");
     }
 
     // Compute churn metrics from git history

@@ -118,7 +118,7 @@ pub fn make_engine(cfg: RmasEngineConfig) -> Result<Option<Box<dyn RmasEngine>>>
         } => match HomogeneousQwen3Engine::load(backbone, topology, &link_dir) {
             Ok(engine) => Ok(Some(Box::new(engine) as Box<dyn RmasEngine>)),
             Err(e) => {
-                tracing::warn!(
+                tracing::error!(
                     error = %e,
                     "rmas: HomogeneousQwen3 engine unavailable (no GPU / missing backbone / load error) — degrading to text path"
                 );
@@ -129,7 +129,7 @@ pub fn make_engine(cfg: RmasEngineConfig) -> Result<Option<Box<dyn RmasEngine>>>
             match HeterogeneousQwen3Engine::load(topology, &link_dir) {
                 Ok(engine) => Ok(Some(Box::new(engine) as Box<dyn RmasEngine>)),
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         error = %e,
                         "rmas: HeterogeneousQwen3 engine unavailable (no GPU / insufficient VRAM / missing backbone) — degrading to text path"
                     );

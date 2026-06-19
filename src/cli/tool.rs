@@ -290,7 +290,7 @@ impl StreamableHttpClient for Reqwest12StreamableClient {
                 match response.json::<ServerJsonRpcMessage>().await {
                     Ok(message) => Ok(StreamableHttpPostResponse::Json(message, session_id)),
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::error!(
                             "could not parse daemon JSON response as ServerJsonRpcMessage; treating as accepted: {e}"
                         );
                         Ok(StreamableHttpPostResponse::Accepted)

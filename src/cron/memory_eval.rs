@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::db::queries;
 use crate::stats::tracker::StatsTracker;
@@ -41,7 +41,7 @@ pub async fn run_or_log(pool: Arc<PgPool>, stats: Arc<StatsTracker>, row_cap: i6
                 .fetch_add(total_violations as u64, Ordering::Relaxed);
             if let Err(e) = queries::record_memory_eval_report(&pool, &report).await {
                 stats.cron_panics.fetch_add(1, Ordering::Relaxed);
-                warn!(error = %e, "memory-eval cron: failed to persist report");
+                error!(error = %e, "memory-eval cron: failed to persist report");
             } else if total_violations > 0 {
                 warn!(
                     violations = total_violations,
@@ -63,7 +63,7 @@ pub async fn run_or_log(pool: Arc<PgPool>, stats: Arc<StatsTracker>, row_cap: i6
         }
         Err(e) => {
             stats.cron_panics.fetch_add(1, Ordering::Relaxed);
-            warn!(error = %e, "memory-eval cron: scan failed");
+            error!(error = %e, "memory-eval cron: scan failed");
         }
     }
 }

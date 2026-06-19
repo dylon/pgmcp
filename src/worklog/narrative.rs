@@ -87,7 +87,7 @@ fn generate_all(
     let model = match Qwen3LocalExtractor::new(variant) {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!(error = %e, backend, "work_summary narrative: qwen3 load failed; deterministic fallback");
+            tracing::error!(error = %e, backend, "work_summary narrative: qwen3 load failed; deterministic fallback");
             return (
                 None,
                 format!("deterministic-fallback (qwen3 unavailable: {e})"),
@@ -99,7 +99,7 @@ fn generate_all(
         match model.complete(&prompt, max_tokens) {
             Ok(raw) => out.push((i, parse_bullets(&raw))),
             Err(e) => {
-                tracing::warn!(error = %e, "work_summary narrative: generation failed for one project; deterministic fallback");
+                tracing::error!(error = %e, "work_summary narrative: generation failed for one project; deterministic fallback");
                 out.push((i, Vec::new()));
             }
         }

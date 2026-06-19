@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use sqlx::PgPool;
-use tracing::{info, warn};
+use tracing::{error, info};
 
 use crate::config::OntologyConfig;
 use crate::db::queries;
@@ -210,7 +210,7 @@ async fn persist(
             )
             .await
         {
-            warn!(error = %e, entity_id, "invariant file anchor failed");
+            error!(error = %e, entity_id, "invariant file anchor failed");
         }
     }
     Ok(())
@@ -219,6 +219,6 @@ async fn persist(
 /// Cron entry point: run the mining pass, logging (not panicking) on error.
 pub async fn run_or_log(pool: Arc<PgPool>, config: OntologyConfig) {
     if let Err(e) = run_ontology_invariants(&pool, &config).await {
-        warn!(error = %e, "ontology-invariants pass failed");
+        error!(error = %e, "ontology-invariants pass failed");
     }
 }
