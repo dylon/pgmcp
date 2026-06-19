@@ -13,12 +13,12 @@ curves.
 
 Use this document in three ways:
 
-| Reader goal | Start here | Then run |
-|---|---|---|
-| Understand a project's current health | [Quality report aggregation](#quality-report-aggregation) | `pgmcp tool quality_report project=<name> format=markdown` |
-| Investigate architecture risk | [Architecture metrics](#architecture-metrics) | `architecture_quality`, `architecture_violations`, `architecture_dsm` |
-| Investigate design or maintainability risk | [Design and maintainability metrics](#design-and-maintainability-metrics) | `design_metrics`, `complexity_hotspots`, `code_on_fire` |
-| Investigate concurrency risk | [Concurrency and safety metrics](#concurrency-and-safety-metrics) | `deadlock_candidates`, `panic_paths`, `unsafe_clusters` |
+| Reader goal                                | Start here                                                                | Then run                                                              |
+|--------------------------------------------|---------------------------------------------------------------------------|-----------------------------------------------------------------------|
+| Understand a project's current health      | [Quality report aggregation](#quality-report-aggregation)                 | `pgmcp tool quality_report project=<name> format=markdown`            |
+| Investigate architecture risk              | [Architecture metrics](#architecture-metrics)                             | `architecture_quality`, `architecture_violations`, `architecture_dsm` |
+| Investigate design or maintainability risk | [Design and maintainability metrics](#design-and-maintainability-metrics) | `design_metrics`, `complexity_hotspots`, `code_on_fire`               |
+| Investigate concurrency risk               | [Concurrency and safety metrics](#concurrency-and-safety-metrics)         | `deadlock_candidates`, `panic_paths`, `unsafe_clusters`               |
 
 ## Core vocabulary
 
@@ -26,19 +26,19 @@ The quality system is built from indexed files, extracted symbols, dependency
 edges, graph metrics, function metrics, and finding collectors. The following
 symbols are used throughout:
 
-| Symbol | Meaning |
-|---|---|
-| `G = (V, E)` | A directed graph with vertices `V` and edges `E`. In pgmcp, vertices may be files, functions, locks, or modules depending on the tool. |
-| `n = |V|` | Number of vertices. |
-| `m = |E|` | Number of edges. |
-| `u → v` | A directed edge from `u` to `v`, such as "file `u` imports file `v`". |
-| `deg⁺(v)` | Out-degree: number of outgoing edges from `v`. |
-| `deg⁻(v)` | In-degree: number of incoming edges to `v`. |
-| `reachable(u)` | Vertices transitively reachable from `u`. |
-| `SCC` | Strongly connected component: a maximal set of vertices where each vertex can reach every other vertex. |
-| `CFG` | Control-flow graph for one function or method. |
-| `score ∈ [0, 100]` | A positive quality score, where higher is better. |
-| `N/A` | Backing data was absent or stale; excluded from averages rather than counted as zero. |
+| Symbol             | Meaning                                                                                                                                |
+|--------------------|----------------------------------------------------------------------------------------------------------------------------------------|
+| `G = (V, E)`       | A directed graph with vertices `V` and edges `E`. In pgmcp, vertices may be files, functions, locks, or modules depending on the tool. |
+| `n = |V|`          | Number of vertices.                                                                                                                    |
+| `m = |E|`          | Number of edges.                                                                                                                       |
+| `u → v`            | A directed edge from `u` to `v`, such as "file `u` imports file `v`".                                                                  |
+| `deg⁺(v)`          | Out-degree: number of outgoing edges from `v`.                                                                                         |
+| `deg⁻(v)`          | In-degree: number of incoming edges to `v`.                                                                                            |
+| `reachable(u)`     | Vertices transitively reachable from `u`.                                                                                              |
+| `SCC`              | Strongly connected component: a maximal set of vertices where each vertex can reach every other vertex.                                |
+| `CFG`              | Control-flow graph for one function or method.                                                                                         |
+| `score ∈ [0, 100]` | A positive quality score, where higher is better.                                                                                      |
+| `N/A`              | Backing data was absent or stale; excluded from averages rather than counted as zero.                                                  |
 
 ## Metric pipeline
 
@@ -52,13 +52,13 @@ Diagram source: [metric-pipeline.puml](diagrams/metric-pipeline.puml).
 
 The persistent substrates are:
 
-| Table | Quality role | Representative fields |
-|---|---|---|
-| `file_metrics` | Per-file graph/process metrics | `pagerank`, `betweenness`, `in_degree`, `out_degree`, `afferent_coupling`, `efferent_coupling`, `instability`, `commit_count`, `author_count`, `fix_commit_ratio`, `churn_rate`, `days_since_last_change` |
-| `function_metrics` | Per-function static metrics | `cyclomatic`, `cognitive`, `halstead_volume`, `halstead_difficulty`, `halstead_effort`, `halstead_bugs`, `npath`, `maintainability_index`, `fan_in`, `fan_out`, `panic_paths`, `unsafe_blocks` |
-| `code_graph_edges` | File dependency graph | `source_file_id`, `target_file_id`, `edge_type`, `weight` |
-| `symbol_references` | Function/type/reference graph | `source_symbol_id`, `target_symbol_id`, `target_raw`, `ref_kind`, `source_line` |
-| `chunk_topic_assignments` | Semantic topic memberships | `topic_id`, `membership_score` |
+| Table                     | Quality role                   | Representative fields                                                                                                                                                                                     |
+|---------------------------|--------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `file_metrics`            | Per-file graph/process metrics | `pagerank`, `betweenness`, `in_degree`, `out_degree`, `afferent_coupling`, `efferent_coupling`, `instability`, `commit_count`, `author_count`, `fix_commit_ratio`, `churn_rate`, `days_since_last_change` |
+| `function_metrics`        | Per-function static metrics    | `cyclomatic`, `cognitive`, `halstead_volume`, `halstead_difficulty`, `halstead_effort`, `halstead_bugs`, `npath`, `maintainability_index`, `fan_in`, `fan_out`, `panic_paths`, `unsafe_blocks`            |
+| `code_graph_edges`        | File dependency graph          | `source_file_id`, `target_file_id`, `edge_type`, `weight`                                                                                                                                                 |
+| `symbol_references`       | Function/type/reference graph  | `source_symbol_id`, `target_symbol_id`, `target_raw`, `ref_kind`, `source_line`                                                                                                                           |
+| `chunk_topic_assignments` | Semantic topic memberships     | `topic_id`, `membership_score`                                                                                                                                                                            |
 
 ## Grading theory
 
@@ -69,13 +69,13 @@ project. A weak project should not look healthy merely because every file is wea
 
 The mapping is:
 
-| Score range | Grade |
-|---|---|
-| `score ≥ 90` | `A` |
-| `80 ≤ score < 90` | `B` |
-| `70 ≤ score < 80` | `C` |
-| `60 ≤ score < 70` | `D` |
-| `score < 60` | `F` |
+| Score range       | Grade |
+|-------------------|-------|
+| `score ≥ 90`      | `A`   |
+| `80 ≤ score < 90` | `B`   |
+| `70 ≤ score < 80` | `C`   |
+| `60 ≤ score < 70` | `D`   |
+| `score < 60`      | `F`   |
 
 The continuous GPA map is:
 
@@ -93,22 +93,22 @@ topic, graph, or function metrics from silently becoming an `F`.
 `quality_report` adds a finding-density dimension to each pillar. The finding
 categories map to pillars as follows:
 
-| Finding category | Pillar |
-|---|---|
-| `code_health`, `tests_docs`, `duplication`, `concurrency`, `hygiene` | Engineering |
-| `architecture`, `dependency` | Architecture |
-| `security` | Security |
+| Finding category                                                     | Pillar       |
+|----------------------------------------------------------------------|--------------|
+| `code_health`, `tests_docs`, `duplication`, `concurrency`, `hygiene` | Engineering  |
+| `architecture`, `dependency`                                         | Architecture |
+| `security`                                                           | Security     |
 
 Each file contributes at most once per pillar, at its worst severity. Unlocated
 project-level findings contribute directly. Severity weights are:
 
-| Severity | Weight |
-|---|---:|
+| Severity   | Weight |
+|------------|-------:|
 | `critical` | `10.0` |
-| `high` | `4.0` |
-| `medium` | `1.0` |
-| `low` | `0.25` |
-| `info` | `0.0` |
+| `high`     |  `4.0` |
+| `medium`   |  `1.0` |
+| `low`      | `0.25` |
+| `info`     |  `0.0` |
 
 The score is:
 
@@ -137,31 +137,31 @@ Given a project P:
 `engineering_scorecard` is an operational readiness scorecard. It asks whether a
 project is maintainable by a team, testable, stable, and current.
 
-| Dimension | Formula or rule | Backing data | Interpretation |
-|---|---|---|---|
-| `code_structure` | `100 · max(0, 1 − |avg_file_lines − 200| / 800)` | `indexed_files.line_count` | Rewards files near a moderate size; penalizes very small fragmentation and very large modules. |
-| `dependency_health` | `100 · (1 − files_in_import_cycles / file_count)` | import graph SCCs | Cycles make change order and ownership harder. |
-| `test_quality` | `100 · min(5 · test_file_count / file_count, 1)` | path heuristics | A test-file ratio proxy, not line coverage. |
-| `documentation` | `100 · min(10 · markdown_file_count / file_count, 1)` | `indexed_files.language` | A documentation presence proxy. |
-| `code_stability` | `100 · (1 − min(avg_churn, 5) / 5)` | `file_metrics.churn_rate` | High churn lowers stability. |
-| `bug_fix_ratio` | `100 · max(0, 1 − 3 · avg_fix_commit_ratio)` | `file_metrics.fix_commit_ratio` | High bug-fix commit share indicates defect pressure. |
-| `coupling` | `100 · (1 − min(avg(Ca + Ce), 20) / 20)` | `file_metrics.afferent_coupling`, `efferent_coupling` | Lower inter-file coupling is better. |
-| `complexity` | `100 · (1 − complex_files / files_with_functions)` where complex means worst function `CC > 15` | `function_metrics.cyclomatic` | `N/A` if function metrics are absent. |
-| `team_distribution` | `100 · min(avg_author_count, 4) / 4` | `file_metrics.author_count` | A bus-factor proxy; solo repos score low honestly. |
-| `freshness` | `100 · (1 − min(avg_days_since_change, 365) / 365)` | `file_metrics.days_since_last_change` | Penalizes stale files. |
+| Dimension           | Formula or rule                                                                                 | Backing data                                          | Interpretation                                                                                 |
+|---------------------|-------------------------------------------------------------------------------------------------|-------------------------------------------------------|------------------------------------------------------------------------------------------------|
+| `code_structure`    | `100 · max(0, 1 − \|avg_file_lines − 200\| / 800)`                                              | `indexed_files.line_count`                            | Rewards files near a moderate size; penalizes very small fragmentation and very large modules. |
+| `dependency_health` | `100 · (1 − files_in_import_cycles / file_count)`                                               | import graph SCCs                                     | Cycles make change order and ownership harder.                                                 |
+| `test_quality`      | `100 · min(5 · test_file_count / file_count, 1)`                                                | path heuristics                                       | A test-file ratio proxy, not line coverage.                                                    |
+| `documentation`     | `100 · min(10 · markdown_file_count / file_count, 1)`                                           | `indexed_files.language`                              | A documentation presence proxy.                                                                |
+| `code_stability`    | `100 · (1 − min(avg_churn, 5) / 5)`                                                             | `file_metrics.churn_rate`                             | High churn lowers stability.                                                                   |
+| `bug_fix_ratio`     | `100 · max(0, 1 − 3 · avg_fix_commit_ratio)`                                                    | `file_metrics.fix_commit_ratio`                       | High bug-fix commit share indicates defect pressure.                                           |
+| `coupling`          | `100 · (1 − min(avg(Ca + Ce), 20) / 20)`                                                        | `file_metrics.afferent_coupling`, `efferent_coupling` | Lower inter-file coupling is better.                                                           |
+| `complexity`        | `100 · (1 − complex_files / files_with_functions)` where complex means worst function `CC > 15` | `function_metrics.cyclomatic`                         | `N/A` if function metrics are absent.                                                          |
+| `team_distribution` | `100 · min(avg_author_count, 4) / 4`                                                            | `file_metrics.author_count`                           | A bus-factor proxy; solo repos score low honestly.                                             |
+| `freshness`         | `100 · (1 − min(avg_days_since_change, 365) / 365)`                                             | `file_metrics.days_since_last_change`                 | Penalizes stale files.                                                                         |
 
 The Operational Readiness Review gates are stricter Boolean checks:
 
-| Gate | Pass condition |
-|---|---|
-| `no_circular_deps` | no files in import cycles |
-| `test_coverage` | `test_file_count / file_count ≥ 0.1` |
-| `has_documentation` | at least one markdown document |
-| `low_churn` | average churn `< 3.0` |
-| `low_fix_ratio` | average fix ratio `< 0.3` |
-| `no_god_files` | no file has more than `2000` lines |
-| `bus_factor_ok` | average authors `≥ 1.5` |
-| `recently_maintained` | average stale days `< 180` |
+| Gate                  | Pass condition                       |
+|-----------------------|--------------------------------------|
+| `no_circular_deps`    | no files in import cycles            |
+| `test_coverage`       | `test_file_count / file_count ≥ 0.1` |
+| `has_documentation`   | at least one markdown document       |
+| `low_churn`           | average churn `< 3.0`                |
+| `low_fix_ratio`       | average fix ratio `< 0.3`            |
+| `no_god_files`        | no file has more than `2000` lines   |
+| `bus_factor_ok`       | average authors `≥ 1.5`              |
+| `recently_maintained` | average stale days `< 180`           |
 
 ## Architecture metrics
 
@@ -173,44 +173,44 @@ Diagram source: [architecture-metrics.puml](diagrams/architecture-metrics.puml).
 
 ### Positive architecture dimensions
 
-| Dimension | Formula or rule | Interpretation |
-|---|---|---|
+| Dimension                | Formula or rule                                          | Interpretation                                                                                  |
+|--------------------------|----------------------------------------------------------|-------------------------------------------------------------------------------------------------|
 | `separation_of_concerns` | `100 · max(0, 1 − max(avg_topics_per_file − 1, 0) / 10)` | Lower topic diversity per file means less concern mixing. Stale or absent topics produce `N/A`. |
-| `loose_coupling` | `100 · (1 − min(avg(Ca + Ce), 20) / 20)` | Lower average coupling is better. |
-| `sdp_compliance` | `100 · (1 − sdp_violations / import_edges)` | Stable files/modules should not depend on unstable targets. |
-| `acyclicity` | `100 · (1 − files_in_cycles / total_files)` | Cyclic imports lower architecture clarity. |
-| `test_coverage` | `100 · min(3 · test_file_count / total_files, 1)` | Coarser than the engineering scorecard's test proxy. |
-| `doc_coverage` | `100 · min(10 · markdown_file_count / total_files, 1)` | Documentation presence. |
-| `module_balance` | PageRank evenness against expected `1 / total_files` | Detects centrality concentration. |
-| `api_stability` | `100 · (1 − min(avg_churn, 5) / 5)` | Public architecture should not churn excessively. |
-| `dependency_health` | `100 · (1 − avg_fix_commit_ratio)` | Fix-heavy dependency surfaces are less healthy. |
-| `code_organization` | `100 · (1 − clamp(avg(Ca + Ce) / 30, 0, 1))` | Card & Glass-style module complexity surrogate. |
+| `loose_coupling`         | `100 · (1 − min(avg(Ca + Ce), 20) / 20)`                 | Lower average coupling is better.                                                               |
+| `sdp_compliance`         | `100 · (1 − sdp_violations / import_edges)`              | Stable files/modules should not depend on unstable targets.                                     |
+| `acyclicity`             | `100 · (1 − files_in_cycles / total_files)`              | Cyclic imports lower architecture clarity.                                                      |
+| `test_coverage`          | `100 · min(3 · test_file_count / total_files, 1)`        | Coarser than the engineering scorecard's test proxy.                                            |
+| `doc_coverage`           | `100 · min(10 · markdown_file_count / total_files, 1)`   | Documentation presence.                                                                         |
+| `module_balance`         | PageRank evenness against expected `1 / total_files`     | Detects centrality concentration.                                                               |
+| `api_stability`          | `100 · (1 − min(avg_churn, 5) / 5)`                      | Public architecture should not churn excessively.                                               |
+| `dependency_health`      | `100 · (1 − avg_fix_commit_ratio)`                       | Fix-heavy dependency surfaces are less healthy.                                                 |
+| `code_organization`      | `100 · (1 − clamp(avg(Ca + Ce) / 30, 0, 1))`             | Card & Glass-style module complexity surrogate.                                                 |
 
 `quality_report` extends the Architecture pillar with:
 
-| Dimension | Formula | Interpretation |
-|---|---|---|
-| `oo_coupling` | `100 · (1 − clamp(avg(CBO) / 20, 0, 1))` | Coupling-between-objects proxy from distinct referenced files. |
-| `propagation_cost` | `100 · (1 − propagation_cost)` | Inverse DSM visibility density. Lower propagation cost is better. |
+| Dimension          | Formula                                  | Interpretation                                                    |
+|--------------------|------------------------------------------|-------------------------------------------------------------------|
+| `oo_coupling`      | `100 · (1 − clamp(avg(CBO) / 20, 0, 1))` | Coupling-between-objects proxy from distinct referenced files.    |
+| `propagation_cost` | `100 · (1 − propagation_cost)`           | Inverse DSM visibility density. Lower propagation cost is better. |
 
 ### Martin package metrics
 
 For a module:
 
-| Metric | Formula | Meaning |
-|---|---|---|
-| `Ca` | count of external files importing this module | Afferent coupling; responsibility borne by the module. |
-| `Ce` | count of external files this module imports | Efferent coupling; dependencies needed by the module. |
-| `I` | `Ce / (Ca + Ce)` | Instability. `I = 0` is maximally stable; `I = 1` is maximally unstable. |
-| `A` | `abstract_files / total_files` | Abstractness. pgmcp detects traits/interfaces/abstract classes heuristically. |
-| `D*` | `|A + I − 1|` | Distance from the main sequence. Lower is better. |
+| Metric | Formula                                       | Meaning                                                                       |
+|--------|-----------------------------------------------|-------------------------------------------------------------------------------|
+| `Ca`   | count of external files importing this module | Afferent coupling; responsibility borne by the module.                        |
+| `Ce`   | count of external files this module imports   | Efferent coupling; dependencies needed by the module.                         |
+| `I`    | `Ce / (Ca + Ce)`                              | Instability. `I = 0` is maximally stable; `I = 1` is maximally unstable.      |
+| `A`    | `abstract_files / total_files`                | Abstractness. pgmcp detects traits/interfaces/abstract classes heuristically. |
+| `D*`   | `\|A + I − 1\|`                               | Distance from the main sequence. Lower is better.                             |
 
 The zones are:
 
-| Zone | Condition | Risk |
-|---|---|---|
-| Main sequence | low `D*` | Balanced abstraction and instability. |
-| Zone of pain | low `A`, low `I` | Concrete and stable; hard to change. |
+| Zone                | Condition          | Risk                                          |
+|---------------------|--------------------|-----------------------------------------------|
+| Main sequence       | low `D*`           | Balanced abstraction and instability.         |
+| Zone of pain        | low `A`, low `I`   | Concrete and stable; hard to change.          |
 | Zone of uselessness | high `A`, high `I` | Abstract and unstable; often over-engineered. |
 
 ### Design Structure Matrix
@@ -231,38 +231,38 @@ The propagation cost is:
 `PC` is the average fraction of the system affected by a change to a random
 element. pgmcp classifies vertices by median splits over `VFI` and `VFO`:
 
-| Class | Condition | Architectural role |
-|---|---|---|
-| `core` | high `VFI`, high `VFO` | Central load-bearing code. |
-| `shared` | high `VFI`, low `VFO` | Utility/foundation code. |
-| `control` | low `VFI`, high `VFO` | Orchestrator/entry-point code. |
-| `peripheral` | low `VFI`, low `VFO` | Leaf or isolated code. |
+| Class        | Condition              | Architectural role             |
+|--------------|------------------------|--------------------------------|
+| `core`       | high `VFI`, high `VFO` | Central load-bearing code.     |
+| `shared`     | high `VFI`, low `VFO`  | Utility/foundation code.       |
+| `control`    | low `VFI`, high `VFO`  | Orchestrator/entry-point code. |
+| `peripheral` | low `VFI`, low `VFO`   | Leaf or isolated code.         |
 
 ### Architecture violations
 
 `architecture_violations` reports:
 
-| Violation | Rule | Severity in tool |
-|---|---|---|
-| `dependency_cycle` | SCC with at least two files | critical |
-| `god_module` | depth-2 module with more than `15` files, excluding deliberate catalog/test patterns | high |
-| `bidirectional_dependency` | both `u → v` and `v → u` exist | high |
-| `sdp_violation` | stable source (`I < 0.3`) depends on unstable target (`I > 0.7`) | medium |
-| `zone_of_pain` | `I < 0.3`, `A < 0.3`, and module has more than `3` files | medium |
-| `zone_of_uselessness` | `I > 0.7`, `A > 0.7`, and module has more than `2` files | low |
-| `layer_violation` | declared architecture layer imports a forbidden layer | high |
+| Violation                  | Rule                                                                                 | Severity in tool |
+|----------------------------|--------------------------------------------------------------------------------------|------------------|
+| `dependency_cycle`         | SCC with at least two files                                                          | critical         |
+| `god_module`               | depth-2 module with more than `15` files, excluding deliberate catalog/test patterns | high             |
+| `bidirectional_dependency` | both `u → v` and `v → u` exist                                                       | high             |
+| `sdp_violation`            | stable source (`I < 0.3`) depends on unstable target (`I > 0.7`)                     | medium           |
+| `zone_of_pain`             | `I < 0.3`, `A < 0.3`, and module has more than `3` files                             | medium           |
+| `zone_of_uselessness`      | `I > 0.7`, `A > 0.7`, and module has more than `2` files                             | low              |
+| `layer_violation`          | declared architecture layer imports a forbidden layer                                | high             |
 
 ## Graph theory metrics
 
 Most architecture tools operate on directed graphs. Edges have different meanings
 depending on the graph:
 
-| Graph | Vertex | Edge |
-|---|---|---|
-| File import graph | file | file imports another file/module |
-| Function call graph | function symbol | function calls another function |
-| Co-change graph | file | files changed together in git history |
-| Lock-order graph | lock name | one lock is acquired before another |
+| Graph               | Vertex          | Edge                                  |
+|---------------------|-----------------|---------------------------------------|
+| File import graph   | file            | file imports another file/module      |
+| Function call graph | function symbol | function calls another function       |
+| Co-change graph     | file            | files changed together in git history |
+| Lock-order graph    | lock name       | one lock is acquired before another   |
 
 ### PageRank
 
@@ -361,12 +361,12 @@ If multiplication overflows, pgmcp stores `i64::MAX` and marks the overflow.
 
 Halstead metrics treat a function as operators and operands:
 
-| Symbol | Meaning |
-|---|---|
-| `η₁` | distinct operators |
-| `η₂` | distinct operands |
-| `N₁` | total operator occurrences |
-| `N₂` | total operand occurrences |
+| Symbol | Meaning                    |
+|--------|----------------------------|
+| `η₁`   | distinct operators         |
+| `η₂`   | distinct operands          |
+| `N₁`   | total operator occurrences |
+| `N₂`   | total operand occurrences  |
 
 pgmcp computes:
 
@@ -394,12 +394,12 @@ pgmcp uses the SEI-style Maintainability Index, clamped to `[0, 100]`:
 
 Where:
 
-| Term | Meaning |
-|---|---|
-| `V` | Halstead volume |
-| `CC` | cyclomatic complexity |
-| `LOC` | source lines of code |
-| `CR` | `comment_lines / max(1, LOC)` |
+| Term  | Meaning                       |
+|-------|-------------------------------|
+| `V`   | Halstead volume               |
+| `CC`  | cyclomatic complexity         |
+| `LOC` | source lines of code          |
+| `CR`  | `comment_lines / max(1, LOC)` |
 
 In tool guidance, `MI < 50` is hard to maintain.
 
@@ -432,13 +432,13 @@ complex methods, or both.
 
 `ck_metrics` reports the CK suite for OO-like containers:
 
-| Metric | Formula or rule | Interpretation |
-|---|---|---|
-| `WMC` | `Σ method CC` | Class complexity. |
-| `DIT` | longest inheritance/implementation chain to a root | Deep inheritance is fragile and harder to reason about. |
-| `NOC` | direct subclasses/implementors | High values mean a base type is widely extended and change-risky. |
-| `CBO` | distinct target files touched by the class | Coupling Between Objects. |
-| `RFC` | `method_count + distinct_call_targets` | Response surface; high values are harder to test. |
+| Metric | Formula or rule                                    | Interpretation                                                    |
+|--------|----------------------------------------------------|-------------------------------------------------------------------|
+| `WMC`  | `Σ method CC`                                      | Class complexity.                                                 |
+| `DIT`  | longest inheritance/implementation chain to a root | Deep inheritance is fragile and harder to reason about.           |
+| `NOC`  | direct subclasses/implementors                     | High values mean a base type is widely extended and change-risky. |
+| `CBO`  | distinct target files touched by the class         | Coupling Between Objects.                                         |
+| `RFC`  | `method_count + distinct_call_targets`             | Response surface; high values are harder to test.                 |
 
 ### LCOM4 cohesion
 
@@ -454,13 +454,13 @@ container. `LCOM4 ≥ 2` indicates multiple unrelated responsibilities.
 
 `design_smell_detection` converts metrics into refactoring signals:
 
-| Smell | Detection rule | Rationale |
-|---|---|---|
-| `god_class` | file has more than `500` lines and more than `5` topics | Large file with many concerns. |
-| `srp_violation` | more than `4` topics and more than `200` lines | Single Responsibility Principle risk. |
-| `shotgun_surgery` | more than `8` co-change partners | Changes ripple across files. |
-| `stale_module` | older than `365` days and more than `100` lines | Possibly abandoned code. |
-| `unstable_dependency` | more than `5` dependents and churn greater than `2.0` | Core dependency changes too often. |
+| Smell                 | Detection rule                                          | Rationale                             |
+|-----------------------|---------------------------------------------------------|---------------------------------------|
+| `god_class`           | file has more than `500` lines and more than `5` topics | Large file with many concerns.        |
+| `srp_violation`       | more than `4` topics and more than `200` lines          | Single Responsibility Principle risk. |
+| `shotgun_surgery`     | more than `8` co-change partners                        | Changes ripple across files.          |
+| `stale_module`        | older than `365` days and more than `100` lines         | Possibly abandoned code.              |
+| `unstable_dependency` | more than `5` dependents and churn greater than `2.0`   | Core dependency changes too often.    |
 
 ## Code-health and prediction metrics
 
@@ -479,10 +479,10 @@ Without AST data:
 
 The quality-report collector only emits findings at absolute thresholds:
 
-| Signal | Medium | High |
-|---|---:|---:|
-| worst function cyclomatic | `≥ 10` | `≥ 20` |
-| file size | `≥ 500` lines | `≥ 1000` lines |
+| Signal                    |        Medium |           High |
+|---------------------------|--------------:|---------------:|
+| worst function cyclomatic |        `≥ 10` |         `≥ 20` |
+| file size                 | `≥ 500` lines | `≥ 1000` lines |
 
 ### Bug prediction
 
@@ -522,11 +522,11 @@ Where:
 Documented technical debt separately scans comment markers, stubs, and
 deprecation annotations. Marker tiers are:
 
-| Tier | Markers |
-|---|---|
-| High | `FIXME`, `BUG`, `HACK`, `KLUDGE`, `WTF`, `XXX` |
+| Tier   | Markers                                                                  |
+|--------|--------------------------------------------------------------------------|
+| High   | `FIXME`, `BUG`, `HACK`, `KLUDGE`, `WTF`, `XXX`                           |
 | Medium | `TODO`, `TBD`, `WORKAROUND`, `REVIEW`, `SMELL`, `REFACTOR`, `DEPRECATED` |
-| Low | `NOTE`, `OPTIMIZE`, `TEMP`, `DEBUG` |
+| Low    | `NOTE`, `OPTIMIZE`, `TEMP`, `DEBUG`                                      |
 
 ### Code on fire
 
@@ -547,23 +547,23 @@ Rows are ranked by:
 
 These collectors feed `quality_report` and are also useful drill-down surfaces.
 
-| Area | Metric/tool | Rule or signal |
-|---|---|---|
-| Test coverage gaps | `test_coverage_gaps` | Directory has at least `5` implementation files and no test files. |
-| Doc coverage gaps | `doc_coverage_gaps` | Directory has at least `8` files and no markdown docs. |
-| Test smells | `test_smells` | Test/spec file has more than `400` lines. |
-| Flaky candidates | `flaky_test_candidates` | Test contains time, randomness, network, or sleep signals. |
-| Doc drift | `doc_code_drift` | Markdown older than `180` days or embedding drift from code vocabulary. |
-| Mutation surrogate | `mutation_score_surrogate` | Non-test function has `CC > 10`; needs stronger tests. |
-| Duplication | `find_duplicates`, `clone_density` | Similar chunk pairs or many clone-like calls. |
-| Dependency health | `dependency_health` | External import used by exactly one file; prune/consolidate candidate. |
-| Deprecated definitions | `deprecated_but_used` | Deprecated annotations remain in indexed code. |
-| Orphans | `find_orphans` | maximum topic membership `< 0.15`. |
-| Dead code | `dead_code_reachability` | private function/method has no incoming references. |
-| Stale zombie | `stale_zombie` | file older than `365` days with zero in-degree. |
-| Anomaly detection | `anomaly_detection` | file size z-score `≥ 2.5`; Medium at `≥ 4.0`. |
-| Naming consistency | `naming_consistency` | function name deviates from file-local dominant case style. |
-| Import hygiene | `import_hygiene` | import appears inside callable bodies; duplicated nested imports raise severity. |
+| Area                   | Metric/tool                        | Rule or signal                                                                   |
+|------------------------|------------------------------------|----------------------------------------------------------------------------------|
+| Test coverage gaps     | `test_coverage_gaps`               | Directory has at least `5` implementation files and no test files.               |
+| Doc coverage gaps      | `doc_coverage_gaps`                | Directory has at least `8` files and no markdown docs.                           |
+| Test smells            | `test_smells`                      | Test/spec file has more than `400` lines.                                        |
+| Flaky candidates       | `flaky_test_candidates`            | Test contains time, randomness, network, or sleep signals.                       |
+| Doc drift              | `doc_code_drift`                   | Markdown older than `180` days or embedding drift from code vocabulary.          |
+| Mutation surrogate     | `mutation_score_surrogate`         | Non-test function has `CC > 10`; needs stronger tests.                           |
+| Duplication            | `find_duplicates`, `clone_density` | Similar chunk pairs or many clone-like calls.                                    |
+| Dependency health      | `dependency_health`                | External import used by exactly one file; prune/consolidate candidate.           |
+| Deprecated definitions | `deprecated_but_used`              | Deprecated annotations remain in indexed code.                                   |
+| Orphans                | `find_orphans`                     | maximum topic membership `< 0.15`.                                               |
+| Dead code              | `dead_code_reachability`           | private function/method has no incoming references.                              |
+| Stale zombie           | `stale_zombie`                     | file older than `365` days with zero in-degree.                                  |
+| Anomaly detection      | `anomaly_detection`                | file size z-score `≥ 2.5`; Medium at `≥ 4.0`.                                    |
+| Naming consistency     | `naming_consistency`               | function name deviates from file-local dominant case style.                      |
+| Import hygiene         | `import_hygiene`                   | import appears inside callable bodies; duplicated nested imports raise severity. |
 
 ## Concurrency and safety metrics
 
@@ -604,14 +604,14 @@ Lock-order deadlock candidate, literate form:
 
 ### Concurrency collector rules
 
-| Tool or collector | Rule | Severity |
-|---|---|---|
-| `blocking_in_async` | async file contains blocking calls such as `std::thread::sleep`, blocking file IO, `reqwest::blocking`, `.lock().unwrap()`, or `block_on` | medium |
-| `lockset_races` | file contains `static mut` | high |
-| `send_sync_violations` | file contains `unsafe impl Send` or `unsafe impl Sync` | medium |
-| `deadlock_candidates` | repeated lock acquisition or lock-order SCCs | low in quality collector; explicit tool reports cycles |
-| `panic_paths` | `function_metrics.panic_paths > 0` | medium; high when panic paths `≥ 3` |
-| `unsafe_clusters` | `function_metrics.unsafe_blocks > 0` | low; medium when unsafe blocks `≥ 3` |
+| Tool or collector      | Rule                                                                                                                                      | Severity                                               |
+|------------------------|-------------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------------------|
+| `blocking_in_async`    | async file contains blocking calls such as `std::thread::sleep`, blocking file IO, `reqwest::blocking`, `.lock().unwrap()`, or `block_on` | medium                                                 |
+| `lockset_races`        | file contains `static mut`                                                                                                                | high                                                   |
+| `send_sync_violations` | file contains `unsafe impl Send` or `unsafe impl Sync`                                                                                    | medium                                                 |
+| `deadlock_candidates`  | repeated lock acquisition or lock-order SCCs                                                                                              | low in quality collector; explicit tool reports cycles |
+| `panic_paths`          | `function_metrics.panic_paths > 0`                                                                                                        | medium; high when panic paths `≥ 3`                    |
+| `unsafe_clusters`      | `function_metrics.unsafe_blocks > 0`                                                                                                      | low; medium when unsafe blocks `≥ 3`                   |
 
 The `effect_breakdown` channel is also included in many quality tools. Effects
 such as `unsafe`, `may_panic`, `async`, `await_point`, `lock_acquire`, and
@@ -622,12 +622,12 @@ such as `unsafe`, `may_panic`, `async`, `await_point`, `lock_acquire`, and
 The Security pillar is part of `quality_report`, and its findings affect the
 overall GPA. Its dimensions are:
 
-| Dimension | Formula or rule |
-|---|---|
-| `secret_hygiene` | `100 · (1 − clamp(secret_weighted / file_count, 0, 1))`; critical secrets count heavier. |
-| `injection_risk` | `100 · (1 − clamp((injection_candidates + taint_analysis) / file_count · 10, 0, 1))`. |
-| `crypto_hygiene` | `100 · (1 − clamp((crypto_misuse + unsafe_deserialization) / file_count · 10, 0, 1))`. |
-| `supply_chain` | `N/A` unless advisories are imported; otherwise `100 · (1 − clamp(weighted_advisories / 20, 0, 1))`. |
+| Dimension        | Formula or rule                                                                                      |
+|------------------|------------------------------------------------------------------------------------------------------|
+| `secret_hygiene` | `100 · (1 − clamp(secret_weighted / file_count, 0, 1))`; critical secrets count heavier.             |
+| `injection_risk` | `100 · (1 − clamp((injection_candidates + taint_analysis) / file_count · 10, 0, 1))`.                |
+| `crypto_hygiene` | `100 · (1 − clamp((crypto_misuse + unsafe_deserialization) / file_count · 10, 0, 1))`.               |
+| `supply_chain`   | `N/A` unless advisories are imported; otherwise `100 · (1 − clamp(weighted_advisories / 20, 0, 1))`. |
 
 Related collectors scan for hardcoded secrets, high-entropy tokens, injection
 sinks, weak crypto, unsafe deserialization, PII logging/spread, unprotected
@@ -635,17 +635,17 @@ routes, reachable attack sinks, and vulnerable dependencies.
 
 ## Tool map
 
-| Need | Primary tool | Drill-down tools |
-|---|---|---|
-| Overall graded audit | `quality_report` | `quality_trend`, `quality_forecast` |
-| Engineering maturity | `engineering_scorecard` | `complexity_hotspots`, `bug_prediction`, `technical_debt_analysis` |
-| Architecture maturity | `architecture_quality` | `coupling_cohesion_report`, `architecture_violations`, `architecture_dsm` |
-| Formal design metrics | `design_metrics` | `ck_metrics`, `lcom4`, `central_functions` |
-| Graph centrality | `centrality_analysis` | `dependency_graph`, `community_detection`, `change_impact_analysis` |
-| Function hotspots | `code_on_fire` | `central_functions`, `panic_paths`, `unsafe_clusters` |
-| Concurrency review | `deadlock_candidates` | `panic_paths`, `unsafe_clusters`, `send_sync_violations` |
-| Tests/docs debt | `test_coverage_gaps` | `doc_coverage_gaps`, `test_smells`, `mutation_score_surrogate` |
-| Hygiene | `find_orphans` | `dead_code_reachability`, `stale_zombie`, `naming_consistency`, `import_hygiene` |
+| Need                  | Primary tool            | Drill-down tools                                                                 |
+|-----------------------|-------------------------|----------------------------------------------------------------------------------|
+| Overall graded audit  | `quality_report`        | `quality_trend`, `quality_forecast`                                              |
+| Engineering maturity  | `engineering_scorecard` | `complexity_hotspots`, `bug_prediction`, `technical_debt_analysis`               |
+| Architecture maturity | `architecture_quality`  | `coupling_cohesion_report`, `architecture_violations`, `architecture_dsm`        |
+| Formal design metrics | `design_metrics`        | `ck_metrics`, `lcom4`, `central_functions`                                       |
+| Graph centrality      | `centrality_analysis`   | `dependency_graph`, `community_detection`, `change_impact_analysis`              |
+| Function hotspots     | `code_on_fire`          | `central_functions`, `panic_paths`, `unsafe_clusters`                            |
+| Concurrency review    | `deadlock_candidates`   | `panic_paths`, `unsafe_clusters`, `send_sync_violations`                         |
+| Tests/docs debt       | `test_coverage_gaps`    | `doc_coverage_gaps`, `test_smells`, `mutation_score_surrogate`                   |
+| Hygiene               | `find_orphans`          | `dead_code_reachability`, `stale_zombie`, `naming_consistency`, `import_hygiene` |
 
 Example commands:
 
@@ -664,15 +664,15 @@ pgmcp tool deadlock_candidates project=pgmcp
 
 pgmcp's metrics are intentionally explicit about what they do and do not prove:
 
-| Boundary | Consequence |
-|---|---|
-| Topic-derived metrics depend on fresh, non-degenerate topic clustering. | `separation_of_concerns` becomes `N/A` when topics are stale or absent. |
-| Function metrics require symbol extraction and function-metrics crons. | Complexity dimensions become `N/A` or tools fall back to labeled heuristics. |
-| Test coverage proxies use path heuristics. | They do not replace line/branch coverage from tools such as `llvm-cov` or `tarpaulin`. |
-| Security scanners are static heuristics. | They prioritize review; they are not exploit proofs. |
-| Bug prediction is historical/statistical. | It is a prioritization signal, not a deterministic defect oracle. |
-| Concurrency regex scans are conservative. | They identify candidates for review; formal deadlock proofs require stronger models. |
-| No curves are used for grades. | A project is measured against absolute bars, not against itself. |
+| Boundary                                                                | Consequence                                                                            |
+|-------------------------------------------------------------------------|----------------------------------------------------------------------------------------|
+| Topic-derived metrics depend on fresh, non-degenerate topic clustering. | `separation_of_concerns` becomes `N/A` when topics are stale or absent.                |
+| Function metrics require symbol extraction and function-metrics crons.  | Complexity dimensions become `N/A` or tools fall back to labeled heuristics.           |
+| Test coverage proxies use path heuristics.                              | They do not replace line/branch coverage from tools such as `llvm-cov` or `tarpaulin`. |
+| Security scanners are static heuristics.                                | They prioritize review; they are not exploit proofs.                                   |
+| Bug prediction is historical/statistical.                               | It is a prioritization signal, not a deterministic defect oracle.                      |
+| Concurrency regex scans are conservative.                               | They identify candidates for review; formal deadlock proofs require stronger models.   |
+| No curves are used for grades.                                          | A project is measured against absolute bars, not against itself.                       |
 
 ## References
 
