@@ -29,8 +29,8 @@ symbols are used throughout:
 | Symbol             | Meaning                                                                                                                                |
 |--------------------|----------------------------------------------------------------------------------------------------------------------------------------|
 | `G = (V, E)`       | A directed graph with vertices `V` and edges `E`. In pgmcp, vertices may be files, functions, locks, or modules depending on the tool. |
-| `n = |V|`          | Number of vertices.                                                                                                                    |
-| `m = |E|`          | Number of edges.                                                                                                                       |
+| `n = \|V\|`        | Number of vertices.                                                                                                                    |
+| `m = \|E\|`        | Number of edges.                                                                                                                       |
 | `u → v`            | A directed edge from `u` to `v`, such as "file `u` imports file `v`".                                                                  |
 | `deg⁺(v)`          | Out-degree: number of outgoing edges from `v`.                                                                                         |
 | `deg⁻(v)`          | In-degree: number of incoming edges to `v`.                                                                                            |
