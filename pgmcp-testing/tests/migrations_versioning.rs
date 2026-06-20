@@ -36,7 +36,7 @@ async fn run_migrations_records_initial_schema_version_once() {
         .await
         .expect("count query");
 
-    pgmcp::db::migrations::run_migrations(&pool, &vector_cfg)
+    pgmcp::db::migrations::run_migrations(&pool, &vector_cfg, false)
         .await
         .expect("second migration run must succeed (idempotent)");
 

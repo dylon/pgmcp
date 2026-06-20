@@ -92,7 +92,7 @@ async fn reconcile_heals_effect_catalog_drift() {
 
     // Re-running migrations must re-seed them via reconcile_vocabulary_catalogs
     // (idempotent + unconditional), healing the drift on an existing DB.
-    pgmcp::db::migrations::run_migrations(&pool, &VectorConfig::default())
+    pgmcp::db::migrations::run_migrations(&pool, &VectorConfig::default(), false)
         .await
         .expect("run_migrations must heal catalog drift");
 

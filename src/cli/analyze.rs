@@ -40,7 +40,7 @@ pub async fn run(
     let config = Config::load(config_override)?;
     crate::logging::init_cli_with_config(Some(&config));
     let pool = db::pool::create_pool(&config.database).await?;
-    db::migrations::run_migrations(&pool, &config.vector).await?;
+    db::migrations::run_migrations(&pool, &config.vector, false).await?;
 
     // Apply CLI overrides to cron config
     let mut cron_config = config.cron.clone();

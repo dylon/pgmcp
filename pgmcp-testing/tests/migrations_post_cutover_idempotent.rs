@@ -51,11 +51,11 @@ async fn run_migrations_tolerates_dropped_legacy_embedding() {
 
     // The regression assertion: re-running migrations must NOT error on the
     // post-cutover schema (this threw before the column-existence guards).
-    pgmcp::db::migrations::run_migrations(&pool, &VectorConfig::default())
+    pgmcp::db::migrations::run_migrations(&pool, &VectorConfig::default(), false)
         .await
         .expect("run_migrations must tolerate a post-cutover schema (first re-run)");
     // Idempotent: a second boot stays green too.
-    pgmcp::db::migrations::run_migrations(&pool, &VectorConfig::default())
+    pgmcp::db::migrations::run_migrations(&pool, &VectorConfig::default(), false)
         .await
         .expect("run_migrations must stay a no-op on repeated post-cutover boots");
 }
@@ -65,7 +65,7 @@ async fn run_migrations_hnsw_rebuild_skips_dropped_legacy_index() {
     let db = require_test_db!();
     let pool = db.pool().clone();
     make_post_cutover(&pool).await;
-    pgmcp::db::migrations::run_migrations(&pool, &VectorConfig::default())
+    pgmcp::db::migrations::run_migrations(&pool, &VectorConfig::default(), false)
         .await
         .expect("baseline post-cutover migration");
 
@@ -75,7 +75,7 @@ async fn run_migrations_hnsw_rebuild_skips_dropped_legacy_index() {
     // alone would not cover this path.)
     let mut cfg = VectorConfig::default();
     cfg.hnsw_m += 4;
-    pgmcp::db::migrations::run_migrations(&pool, &cfg)
+    pgmcp::db::migrations::run_migrations(&pool, &cfg, false)
         .await
         .expect("HNSW rebuild must skip the dropped legacy index, not error");
 }
@@ -85,7 +85,7 @@ async fn post_cutover_runtime_paths_avoid_dropped_column() {
     let db = require_test_db!();
     let pool = db.pool().clone();
     make_post_cutover(&pool).await;
-    pgmcp::db::migrations::run_migrations(&pool, &VectorConfig::default())
+    pgmcp::db::migrations::run_migrations(&pool, &VectorConfig::default(), false)
         .await
         .expect("post-cutover migration");
 

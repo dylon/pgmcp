@@ -318,7 +318,7 @@ async fn run_m1_variant(
     }
     let url = format!("{base}/{dbname}");
     let pool = PgPool::connect(&url).await.context("connect isolated db")?;
-    pgmcp::db::migrations::run_migrations(&pool, &pgmcp::config::VectorConfig::default())
+    pgmcp::db::migrations::run_migrations(&pool, &pgmcp::config::VectorConfig::default(), false)
         .await
         .context("migrate isolated db")?;
 

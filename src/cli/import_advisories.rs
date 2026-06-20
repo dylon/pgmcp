@@ -19,7 +19,7 @@ pub async fn run(config_override: Option<&Path>, path: std::path::PathBuf) -> an
     let config = Config::load(config_override)?;
     crate::logging::init_cli_with_config(Some(&config));
     let pool = db::pool::create_pool(&config.database).await?;
-    db::migrations::run_migrations(&pool, &config.vector).await?;
+    db::migrations::run_migrations(&pool, &config.vector, false).await?;
 
     if !path.exists() {
         anyhow::bail!("advisory dump path does not exist: {}", path.display());

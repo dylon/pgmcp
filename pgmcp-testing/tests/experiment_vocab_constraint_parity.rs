@@ -196,7 +196,7 @@ async fn v36_converts_an_existing_native_enum_column_in_place() {
         .execute(&pool)
         .await
         .expect("un-record v36");
-    pgmcp::db::migrations::run_migrations(&pool, &VectorConfig::default())
+    pgmcp::db::migrations::run_migrations(&pool, &VectorConfig::default(), false)
         .await
         .expect("re-run migrations must convert the enum column");
 

@@ -55,7 +55,7 @@ pub enum ExperimentCmd {
 /// Build the same CLI-mode `McpServer` that `pgmcp tool` uses (lazy embedder).
 pub(crate) async fn build_cli_server(config: Config) -> anyhow::Result<mcp::server::McpServer> {
     let pool = db::pool::create_pool(&config.database).await?;
-    db::migrations::run_migrations(&pool, &config.vector).await?;
+    db::migrations::run_migrations(&pool, &config.vector, false).await?;
     let stats = Arc::new(stats::tracker::StatsTracker::new());
     let config_arc = Arc::new(ArcSwap::from_pointee(config));
     let log_broadcaster = Arc::new(mcp::logging::LogBroadcaster::new());

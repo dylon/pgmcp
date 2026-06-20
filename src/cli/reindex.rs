@@ -32,7 +32,7 @@ pub async fn run(config_override: Option<&Path>, force: bool) -> anyhow::Result<
 
     println!("Triggering full re-index of all workspaces...");
     let pool = db::pool::create_pool(&config.database).await?;
-    db::migrations::run_migrations(&pool, &config.vector).await?;
+    db::migrations::run_migrations(&pool, &config.vector, false).await?;
     sqlx::query("DELETE FROM git_commit_chunks")
         .execute(&pool)
         .await?;

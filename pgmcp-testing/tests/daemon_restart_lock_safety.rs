@@ -37,7 +37,7 @@ async fn migrations_guard_content_hash_drop_not_null() {
         .await
         .expect("force content_hash NOT NULL");
 
-    run_migrations(&pool, &VectorConfig::default())
+    run_migrations(&pool, &VectorConfig::default(), false)
         .await
         .expect("migrations must succeed after content_hash was forced NOT NULL");
 
@@ -56,7 +56,7 @@ async fn migrations_guard_content_hash_drop_not_null() {
     );
 
     // Idempotent: the guard now sees a nullable column and skips the ALTER.
-    run_migrations(&pool, &VectorConfig::default())
+    run_migrations(&pool, &VectorConfig::default(), false)
         .await
         .expect("re-running migrations on an already-nullable column must stay Ok");
 }
@@ -164,7 +164,7 @@ async fn migrations_retry_through_lock_contention() {
 
     // Run migrations concurrently; they must retry, not abort.
     let migrations = tokio::spawn(async move {
-        run_migrations_with_lock_retry(&migration_pool, &VectorConfig::default()).await
+        run_migrations_with_lock_retry(&migration_pool, &VectorConfig::default(), false).await
     });
 
     // Release the lock after the first attempt times out (~1s) but before the

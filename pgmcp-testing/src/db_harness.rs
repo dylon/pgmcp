@@ -269,7 +269,7 @@ async fn shared_pool() -> Result<&'static PgPool, TestDbUnavailable> {
                 .await
                 .map_err(|e| TestDbUnavailable::ConnectFailed(e.to_string()))?;
             let vector_config = VectorConfig::default();
-            pgmcp::db::migrations::run_migrations(&pool, &vector_config)
+            pgmcp::db::migrations::run_migrations(&pool, &vector_config, false)
                 .await
                 .map_err(|e| TestDbUnavailable::MigrationsFailed(e.to_string()))?;
             Ok(pool)

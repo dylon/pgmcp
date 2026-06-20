@@ -79,7 +79,7 @@ pub async fn run(
 
             // Tier 2+3: tool execution — DB required, embed model lazy
             let pool = db::pool::create_pool(&config.database).await?;
-            db::migrations::run_migrations(&pool, &config.vector).await?;
+            db::migrations::run_migrations(&pool, &config.vector, false).await?;
             let stats = Arc::new(stats::tracker::StatsTracker::new());
             let config_arc = Arc::new(ArcSwap::from_pointee(config));
             let log_broadcaster = Arc::new(mcp::logging::LogBroadcaster::new());
