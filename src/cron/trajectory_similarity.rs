@@ -13,20 +13,25 @@
 //!   ISO week, from `git_commit_files` ⋈ `git_commits`).
 //!
 //! For each node type, the top-`max_per_type` most-sampled trajectories are
-//! compared k-NN (bounded O(n²) on small n) and the nearest `k` (within
-//! `max_distance`) become `evolves_like` edges in `trajectory_similarities`,
-//! which `memory_unified_edges` surfaces. The split/merge cost `c` is the
-//! Stefan-recommended default. Scheduled from `src/cli/daemon.rs`.
+//! queried k-NN with liblevenshtein's admissible lower-bound-pruned MSM range
+//! search, and the nearest `k` (within `max_distance`) become `evolves_like`
+//! edges in `trajectory_similarities`, which `memory_unified_edges` surfaces.
+//! The split/merge cost `c` is the Stefan-recommended default. Scheduled from
+//! `src/cli/daemon.rs`.
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use liblevenshtein::time_series::MsmConfig;
+use liblevenshtein::time_series::{MsmConfig, search_with_lb_parallel};
 use sqlx::PgPool;
 use tracing::{info, warn};
 
 use crate::config::TrajectorySimilarityConfig;
 use crate::stats::tracker::StatsTracker;
+
+/// Upper bound for expanding-threshold k-NN. Prevents unbounded loops when the
+/// cohort contains fewer than the requested number of neighbors.
+const MAX_MSM_THRESHOLD: f64 = 1.0e9;
 
 /// One record's numeric trajectory.
 struct Traj {
@@ -162,21 +167,16 @@ fn msm_knn(
     max_distance: f64,
     k: usize,
 ) -> Vec<(String, String, String, String, f64, f64)> {
+    if trajs.is_empty() || k == 0 || max_distance.is_nan() || max_distance < 0.0 {
+        return Vec::new();
+    }
+
     let msm = MsmConfig::new(c);
+    let db = trajectory_db(trajs);
     let mut out = Vec::new();
     for (i, a) in trajs.iter().enumerate() {
-        let mut dists: Vec<(usize, f64)> = Vec::new();
-        for (j, b) in trajs.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            let d = msm.distance(&a.series, &b.series);
-            if d <= max_distance {
-                dists.push((j, d));
-            }
-        }
-        dists.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
-        for (j, d) in dists.into_iter().take(k) {
+        let hits = search_with_lb_parallel(&a.series, &db, max_distance, &msm);
+        for (j, d) in hits.into_iter().filter(|(j, _)| *j != i).take(k) {
             let b = &trajs[j];
             // weight ∈ (0,1]: identical trajectories → 1, distant → →0.
             let weight = 1.0 / (1.0 + d);
@@ -191,6 +191,45 @@ fn msm_knn(
         }
     }
     out
+}
+
+fn trajectory_db(trajs: &[Traj]) -> Vec<(usize, Vec<f64>)> {
+    trajs
+        .iter()
+        .enumerate()
+        .map(|(idx, traj)| (idx, traj.series.clone()))
+        .collect()
+}
+
+fn nearest_by_msm_lb(
+    probe: &[f64],
+    db: &[(usize, Vec<f64>)],
+    msm: &MsmConfig,
+    k: usize,
+    exclude_idx: Option<usize>,
+) -> Vec<(usize, f64)> {
+    if db.is_empty() || k == 0 {
+        return Vec::new();
+    }
+
+    let mut threshold = seed_threshold(probe);
+    loop {
+        let hits = search_with_lb_parallel(probe, db, threshold, msm);
+        let mut filtered: Vec<(usize, f64)> = hits
+            .into_iter()
+            .filter(|(idx, _)| Some(*idx) != exclude_idx)
+            .collect();
+        if filtered.len() >= k || threshold >= MAX_MSM_THRESHOLD {
+            filtered.truncate(k);
+            return filtered;
+        }
+        threshold *= 2.0;
+    }
+}
+
+fn seed_threshold(probe: &[f64]) -> f64 {
+    let scale = probe.iter().fold(0.0_f64, |m, x| m.max(x.abs())).max(1.0);
+    scale * (probe.len().max(1) as f64) * 0.1 + 1.0
 }
 
 /// One record's categorical event-sequence (Stage 5e).
@@ -424,13 +463,11 @@ pub async fn recognize_partial_trajectory(
         _ => return Ok(Vec::new()),
     };
     let msm = MsmConfig::new(if msm_c > 0.0 { msm_c } else { 0.1 });
-    let mut scored: Vec<(String, f64)> = cohort
-        .iter()
-        .map(|t| (t.node_id.clone(), msm.distance(partial, &t.series)))
-        .collect();
-    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
-    scored.truncate(k.max(1));
-    Ok(scored)
+    let db = trajectory_db(&cohort);
+    Ok(nearest_by_msm_lb(partial, &db, &msm, k.max(1), None)
+        .into_iter()
+        .map(|(idx, distance)| (cohort[idx].node_id.clone(), distance))
+        .collect())
 }
 
 /// Run the pass, logging any error rather than panicking the cron thread.
@@ -441,5 +478,74 @@ pub async fn run_or_log(
 ) {
     if let Err(e) = run_trajectory_similarity(&pool, &stats, &config).await {
         warn!(error = %e, "trajectory-similarity pass failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_trajs() -> Vec<Traj> {
+        vec![
+            Traj {
+                node_id: "a".to_string(),
+                node_type: "test".to_string(),
+                series: vec![1.0, 2.0, 3.0],
+            },
+            Traj {
+                node_id: "b".to_string(),
+                node_type: "test".to_string(),
+                series: vec![1.0, 2.0, 3.1],
+            },
+            Traj {
+                node_id: "c".to_string(),
+                node_type: "test".to_string(),
+                series: vec![10.0, 10.0, 10.0],
+            },
+        ]
+    }
+
+    fn brute_knn(trajs: &[Traj], c: f64, max_distance: f64, k: usize) -> Vec<(String, String)> {
+        let msm = MsmConfig::new(c);
+        let mut out = Vec::new();
+        for (i, a) in trajs.iter().enumerate() {
+            let mut dists: Vec<(usize, f64)> = trajs
+                .iter()
+                .enumerate()
+                .filter(|(j, _)| *j != i)
+                .filter_map(|(j, b)| {
+                    let d = msm.distance(&a.series, &b.series);
+                    (d <= max_distance).then_some((j, d))
+                })
+                .collect();
+            dists.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(std::cmp::Ordering::Equal));
+            out.extend(
+                dists
+                    .into_iter()
+                    .take(k)
+                    .map(|(j, _)| (a.node_id.clone(), trajs[j].node_id.clone())),
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn msm_knn_matches_brute_force_ids() {
+        let trajs = sample_trajs();
+        let got: Vec<(String, String)> = msm_knn(&trajs, 0.1, 100.0, 2)
+            .into_iter()
+            .map(|(from_id, _, to_id, _, _, _)| (from_id, to_id))
+            .collect();
+        assert_eq!(got, brute_knn(&trajs, 0.1, 100.0, 2));
+    }
+
+    #[test]
+    fn nearest_by_msm_lb_excludes_and_limits() {
+        let trajs = sample_trajs();
+        let db = trajectory_db(&trajs);
+        let msm = MsmConfig::new(0.1);
+        let hits = nearest_by_msm_lb(&trajs[0].series, &db, &msm, 1, Some(0));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, 1);
     }
 }
