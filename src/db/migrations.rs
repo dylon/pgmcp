@@ -65,6 +65,7 @@ mod v47_widen_dep_source;
 mod v48_hier_metrics;
 mod v49_toolbox_debug_tools;
 mod v4_work_items;
+mod v50_orchestration_sessions;
 mod v5_work_items_collab;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
@@ -675,10 +676,11 @@ fn is_lock_timeout(e: &sqlx::Error) -> bool {
 pub async fn run_migrations_with_lock_retry(
     pool: &PgPool,
     vector_config: &VectorConfig,
+    defer_unified_rebuild: bool,
 ) -> Result<(), sqlx::Error> {
     let mut attempt = 0u32;
     loop {
-        match run_migrations(pool, vector_config).await {
+        match run_migrations(pool, vector_config, defer_unified_rebuild).await {
             Ok(()) => return Ok(()),
             Err(e) if is_lock_timeout(&e) && attempt < MIGRATION_LOCK_RETRIES => {
                 attempt += 1;
@@ -740,6 +742,7 @@ where
 pub async fn run_migrations(
     pool: &PgPool,
     vector_config: &VectorConfig,
+    defer_unified_rebuild: bool,
 ) -> Result<(), sqlx::Error> {
     // Bootstrap the version table first. Subsequent migration code can
     // call `version_applied` / `record_version` to short-circuit work
@@ -2681,6 +2684,14 @@ pub async fn run_migrations(
     )
     .await?;
 
+    apply_step(
+        pool,
+        v50_orchestration_sessions::ORCHESTRATION_SESSIONS,
+        v50_orchestration_sessions::ORCHESTRATION_SESSIONS_NAME,
+        || v50_orchestration_sessions::apply(pool),
+    )
+    .await?;
+
     // Every-boot vocabulary-catalog reconcile (RC1 durable fix). Unconditional
     // and idempotent; closes the post-v2 catalog-drift gap that silently
     // FK-skipped symbol extraction for files carrying a newly-added effect.
@@ -2744,8 +2755,20 @@ pub async fn run_migrations(
     // collaboration tables (work_item_claims, agent_presence, agent_identity).
     // Hash-gated (MEMORY_UNIFIED_VIEWS_HASH_KEY): rebuilds only when the SQL
     // consts change. See `docs/memory-server/05-schema.md` §12.3.
+    //
+    // `defer_unified_rebuild` (daemon only): a matview-definition change forces a
+    // DROP + rebuild whose HNSW index build over a large corpus can take minutes
+    // — far past systemd `TimeoutStartSec`, which crash-looped the service on the
+    // 2026-06-19 #5 incident. The daemon therefore only ENSURES the matviews
+    // exist on the critical path here and runs the hash-gated rebuild in a
+    // post-READY background task (`src/cli/daemon.rs`). CLI callers rebuild inline
+    // (no start-timeout to exceed).
     // ================================================================
-    ensure_memory_unified_views(pool, vector_config).await?;
+    if defer_unified_rebuild {
+        ensure_memory_unified_views_present(pool, vector_config).await?;
+    } else {
+        ensure_memory_unified_views(pool, vector_config).await?;
+    }
 
     Ok(())
 }
@@ -3528,7 +3551,14 @@ async fn ensure_trajectory_similarities(pool: &PgPool) -> Result<(), sqlx::Error
     Ok(())
 }
 
-async fn ensure_memory_unified_views(
+/// Daemon-background / CLI-inline path: hash-gated rebuild of the memory_unified
+/// matviews. Skips when the combined CREATE SQL is unchanged; otherwise drops &
+/// rebuilds both matviews + their indexes (incl. the HNSW vector index). On a
+/// large corpus the HNSW build can take minutes, so the DAEMON runs this OFF the
+/// startup critical path as a post-READY background task (see
+/// `ensure_memory_unified_views_present` and `src/cli/daemon.rs`). CLI callers
+/// run it inline — they have no systemd start-timeout to exceed.
+pub(crate) async fn ensure_memory_unified_views(
     pool: &PgPool,
     config: &VectorConfig,
 ) -> Result<(), sqlx::Error> {
@@ -3556,7 +3586,48 @@ async fn ensure_memory_unified_views(
         "memory_unified_views definition changed (was {:?}, now {}); rebuilding",
         stored, current_hash
     );
+    build_memory_unified_views(pool, config, &current_hash).await
+}
 
+/// Startup-critical-path guard: ensure the memory_unified matviews EXIST (so the
+/// daemon can serve queries against them) but DEFER any definition-change rebuild
+/// to the post-READY background task `ensure_memory_unified_views`. On a fresh DB
+/// the matviews are absent, so they are built here — but over an empty corpus
+/// that is near-instant. On an existing DB they are present, so this is a no-op
+/// and the (potentially multi-minute) HNSW rebuild never blocks systemd
+/// readiness. Introduced after the 2026-06-19 incident where a matview SQL change
+/// triggered a 765k-vector HNSW rebuild that exceeded `TimeoutStartSec` and
+/// crash-looped the service.
+pub(crate) async fn ensure_memory_unified_views_present(
+    pool: &PgPool,
+    config: &VectorConfig,
+) -> Result<(), sqlx::Error> {
+    let present: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = 'memory_unified_nodes' AND relkind = 'm')",
+    )
+    .fetch_one(pool)
+    .await?;
+    if present {
+        return Ok(());
+    }
+    let combined = format!(
+        "{}\n---\n{}",
+        MEMORY_UNIFIED_NODES_SQL, MEMORY_UNIFIED_EDGES_SQL
+    );
+    let current_hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(combined.as_bytes()));
+    info!("memory_unified_views absent; building on the startup path (empty/new corpus)");
+    build_memory_unified_views(pool, config, &current_hash).await
+}
+
+/// Drop (if present) and rebuild both memory_unified matviews + their indexes
+/// (unique, type, HNSW-on-embedding, edge-traversal) and record `current_hash`.
+/// Shared by the hash-gate (`ensure_memory_unified_views`) and the fresh-build
+/// guard (`ensure_memory_unified_views_present`).
+async fn build_memory_unified_views(
+    pool: &PgPool,
+    config: &VectorConfig,
+    current_hash: &str,
+) -> Result<(), sqlx::Error> {
     // Drop the existing graph views so we can rebuild against the latest
     // column shapes. `memory_unified_edges` was a plain VIEW before Stage 2 and
     // is a MATERIALIZED VIEW after; a DO-block drops whichever form exists — a
@@ -3643,7 +3714,7 @@ async fn ensure_memory_unified_views(
          ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
     )
     .bind(MEMORY_UNIFIED_VIEWS_HASH_KEY)
-    .bind(&current_hash)
+    .bind(current_hash)
     .execute(pool)
     .await?;
 

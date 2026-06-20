@@ -398,6 +398,22 @@ pub struct CsmShowProjectionParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CsmProtocolStringDiagramParams {
+    #[serde(default)]
+    #[schemars(
+        description = "The csm_protocols.id (public id) of a stored protocol to decompose. \
+                       Supply this OR protocol_name (one is required)."
+    )]
+    pub protocol_public_id: Option<i64>,
+    #[serde(default)]
+    #[schemars(
+        description = "The csm_protocols.name of a stored protocol to decompose (e.g. a \
+                       synthesized:PLAN-1 name or a pattern name). Supply this OR protocol_public_id."
+    )]
+    pub protocol_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CsmValidateRunParams {
     #[serde(default)]
     #[schemars(
@@ -480,6 +496,128 @@ pub struct CsmSynthesizeProtocolParams {
         description = "Peer/name that plays the orchestrator role 'O' (default 'pi', the driver itself)."
     )]
     pub orchestrator: Option<String>,
+}
+
+// ── Crucible session PAUSE / RESUME (ADR-009) ───────────────────────────────
+//
+// These three tools persist/replay/validate orchestration checkpoints in pgmcp's
+// OWN `orchestration_sessions` table. The agent (the orchestrator, pi) supplies
+// every value; pgmcp stores it, replays the recorded trace to recover the
+// protocol position, and returns JSON. pgmcp NEVER runs a shell or writes the
+// user's files — this is pure coordination/MEMORY state.
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionCheckpointSaveParams {
+    #[schemars(
+        description = "Stable key identifying this orchestration session (UPSERT key — \
+                              re-saving the same key overwrites the prior snapshot)."
+    )]
+    pub session_key: String,
+    #[schemars(
+        description = "Protocol label (the synthesized protocol name, e.g. \"synthesized:PLAN-1\"); \
+                       a free string used only for display + the csm_run_traces row."
+    )]
+    pub protocol_name: String,
+    #[schemars(
+        description = "The serialized GlobalType (the MPST AST) this session drives, as emitted by \
+                       csm_synthesize_protocol's `global_type`. Stored so resume can rebuild the \
+                       projected network without re-synthesizing."
+    )]
+    pub global_type: serde_json::Value,
+    #[serde(default)]
+    #[schemars(description = "Role that plays the orchestrator (default \"O\").")]
+    pub orchestrator_role: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional a2a_tasks UUID this run is recorded under; the pause guard checks \
+                       its child tasks are terminal and the trace is flushed under this id."
+    )]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Linear step cursor (how many PlannedSteps have completed). Default 0."
+    )]
+    pub cursor: Option<i32>,
+    #[serde(default)]
+    #[schemars(description = "Critic-loop iteration count (cyclic protocols). Default 0.")]
+    pub critic_iteration: Option<i32>,
+    #[serde(default)]
+    #[schemars(description = "Optional critic phase marker (e.g. \"awaiting_verdict\").")]
+    pub critic_phase: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "role → fleet-peer map (JSON object), as emitted by csm_synthesize_protocol. \
+                       MUST include the orchestrator role's binding."
+    )]
+    pub role_peer: Option<serde_json::Value>,
+    #[serde(default)]
+    #[schemars(
+        description = "public_id of the work item whose lease this session holds; dropped on pause, \
+                       re-claimed on resume."
+    )]
+    pub work_item_root: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Experiment ids associated with this run (carried across resume).")]
+    pub experiment_ids: Option<Vec<i64>>,
+    #[serde(default)]
+    #[schemars(description = "Opaque memory-scope token carried across resume.")]
+    pub memory_scope: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "pi's own session id (orchestrator-side correlation).")]
+    pub pi_session_id: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "pi's parent session id (nested orchestration).")]
+    pub pi_parent_session_id: Option<String>,
+    #[serde(default)]
+    #[schemars(description = "Parent orchestration_sessions id (a forked sub-run).")]
+    pub parent_session_id: Option<i64>,
+    #[serde(default)]
+    #[schemars(
+        description = "The orchestrator-side trace executed so far: a JSON array of CSM Events \
+                       (`{from,to,label}`). At pause this is flushed to csm_run_traces.events. \
+                       Default []."
+    )]
+    pub transcript: Option<serde_json::Value>,
+    #[serde(default)]
+    #[schemars(
+        description = "If true, PAUSE the session: GUARD that every child a2a_task of task_id is \
+                       terminal (refuse otherwise), flush the transcript to csm_run_traces, cache \
+                       the cursor/critic position, and drop the work-item lease."
+    )]
+    pub pause: bool,
+    #[serde(default)]
+    #[schemars(
+        description = "Lease seconds to (re)set on the work_item_root while running (no-op on pause). \
+                       Clamped 10..=86400; default 900."
+    )]
+    pub lease_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionCheckpointResumeParams {
+    #[schemars(description = "session_key of a paused (or running) session to resume.")]
+    pub session_key: String,
+    #[serde(default)]
+    #[schemars(
+        description = "If true, FORK: copy the checkpoint into a fresh child session (parent_session_id \
+                       set) under `new_session_key`, and resume the fork instead of the original."
+    )]
+    pub fork: bool,
+    #[serde(default)]
+    #[schemars(description = "Required when fork=true: the new child session_key.")]
+    pub new_session_key: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Lease seconds to re-claim on the work_item_root. Clamped 10..=86400; default 900."
+    )]
+    pub lease_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionCheckpointListParams {
+    #[serde(default)]
+    #[schemars(description = "Max resumable sessions to return (default 50, clamped 1..=10000).")]
+    pub limit: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

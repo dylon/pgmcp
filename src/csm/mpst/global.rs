@@ -112,6 +112,54 @@ impl GlobalType {
             GlobalType::Var { .. } | GlobalType::End => {}
         }
     }
+
+    /// Sequential composition `self ; cont` — the protocol-composition algebra's
+    /// product (Crucible CT-2). Grafts `cont` onto every `End` leaf of `self`, so
+    /// the composite runs `self` to completion and then continues as `cont`.
+    ///
+    /// `End` is the unit (`g.then(End) == g`, `End.then(g) == g`), the operation
+    /// is associative, and it is CLOSED — composing two well-formed protocols
+    /// yields a well-formed protocol. These laws are mechanically proved in
+    /// `docs/formal/rocq/CsmMpst.v` (`gseq`, `gseq_unit_l`/`gseq_unit_r`,
+    /// `gseq_assoc`, `wf_gseq`), and projection is a monoid homomorphism over it
+    /// (`project_gseq_hom`: `project(p;q) = project(p) ; project(q)`) — which is
+    /// exactly what lets `csm_synthesize_protocol` fold a plan subtree into one
+    /// drivable GlobalType and still project sound per-role machines. A loop's
+    /// `End` exit arms continue as `cont`; `Var` back-edges keep looping, so
+    /// `cont` must be closed (no free `Var`) — the Orchestrator only composes
+    /// closed sub-protocols.
+    pub fn then(self, cont: GlobalType) -> GlobalType {
+        match self {
+            GlobalType::End => cont,
+            GlobalType::Interaction {
+                from,
+                to,
+                label,
+                cont: k,
+            } => GlobalType::Interaction {
+                from,
+                to,
+                label,
+                cont: Box::new(k.then(cont)),
+            },
+            GlobalType::Choice { from, to, branches } => GlobalType::Choice {
+                from,
+                to,
+                branches: branches
+                    .into_iter()
+                    .map(|b| GlobalBranch {
+                        label: b.label,
+                        cont: b.cont.then(cont.clone()),
+                    })
+                    .collect(),
+            },
+            GlobalType::Rec { var, body } => GlobalType::Rec {
+                var,
+                body: Box::new(body.then(cont)),
+            },
+            GlobalType::Var { var } => GlobalType::Var { var },
+        }
+    }
 }
 
 // ── Ergonomic constructors (keep protocol literals readable) ──────────────────
@@ -171,6 +219,43 @@ pub fn end() -> GlobalType {
 mod tests {
     use super::*;
     use crate::csm::role::Label;
+
+    #[test]
+    fn then_is_sequential_composition_and_preserves_well_formedness() {
+        use crate::csm::mpst::wellformed::well_formed;
+        // p = O → A : x . end     q = A → O : y . end   (both well-formed)
+        let p = interaction("O", "A", Label::text("x"), end());
+        let q = interaction("A", "O", Label::text("y"), end());
+        assert!(well_formed(&p).is_ok());
+        assert!(well_formed(&q).is_ok());
+
+        // End is the two-sided unit (gseq_unit_l / gseq_unit_r).
+        assert_eq!(p.clone().then(end()), p);
+        assert_eq!(end().then(q.clone()), q);
+
+        // p ; q grafts q onto p's End leaf: O→A:x . A→O:y . end.
+        let pq = p.clone().then(q.clone());
+        assert_eq!(
+            pq,
+            interaction(
+                "O",
+                "A",
+                Label::text("x"),
+                interaction("A", "O", Label::text("y"), end()),
+            )
+        );
+
+        // CLOSURE (wf_gseq): the composite of two well-formed protocols is
+        // well-formed.
+        assert!(well_formed(&pq).is_ok());
+
+        // Associativity (gseq_assoc): (p;q);r == p;(q;r).
+        let r = interaction("O", "A", Label::text("z"), end());
+        assert_eq!(
+            p.clone().then(q.clone()).then(r.clone()),
+            p.clone().then(q.clone().then(r.clone())),
+        );
+    }
 
     #[test]
     fn participants_are_collected() {

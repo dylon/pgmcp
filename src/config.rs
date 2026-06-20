@@ -3101,6 +3101,15 @@ pub struct CronConfig {
     #[serde(default = "default_work_item_presence_offline")]
     pub work_item_presence_offline_secs: u64,
 
+    /// Interval (seconds) of the `orchestration-session-reaper` crash-resume cron
+    /// (ADR-009 PAUSE/RESUME). A single bounded UPDATE that auto-pauses every live
+    /// (`running`/`resuming`) `orchestration_sessions` row whose work-item lease
+    /// has lapsed — i.e. the orchestrator (pi) crashed mid-protocol — so the
+    /// session surfaces in `session_checkpoint_list` for another agent to resume.
+    /// **OFF by default (0 disables)**, like the presence / csm-validate crons.
+    #[serde(default = "default_orchestration_session_reaper_interval")]
+    pub orchestration_session_reaper_interval_secs: u64,
+
     /// Interval (seconds) of the `mcp-client-liveness` sweep: re-checks each
     /// `alive` `mcp_clients` PID via `/proc` (existence + start-time
     /// fingerprint, so a recycled PID counts as exited), refreshes cwd/project
@@ -3215,6 +3224,8 @@ impl Default for CronConfig {
             work_item_presence_interval_secs: default_work_item_presence_interval(),
             work_item_presence_idle_secs: default_work_item_presence_idle(),
             work_item_presence_offline_secs: default_work_item_presence_offline(),
+            orchestration_session_reaper_interval_secs:
+                default_orchestration_session_reaper_interval(),
             mcp_client_liveness_interval_secs: default_mcp_client_liveness_interval(),
             project_deps_index_interval_secs: default_project_deps_index_interval(),
             git_state_scan_interval_secs: default_git_state_scan_interval(),
@@ -3365,6 +3376,10 @@ fn default_work_item_presence_idle() -> u64 {
 }
 fn default_work_item_presence_offline() -> u64 {
     900
+}
+fn default_orchestration_session_reaper_interval() -> u64 {
+    // OFF by default — opt-in, like the presence / csm-validate crons.
+    0
 }
 
 fn default_topic_max_mem_fraction() -> f64 {

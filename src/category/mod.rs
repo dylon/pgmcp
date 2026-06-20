@@ -19,6 +19,8 @@
 
 #![allow(dead_code)]
 
+pub mod fca;
+
 use serde::{Deserialize, Serialize};
 
 /// Whether a rolled-up metric is composition-preserving under the Containment

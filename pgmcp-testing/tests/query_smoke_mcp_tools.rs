@@ -812,3 +812,89 @@ async fn tool_adoption_report_executes_against_real_schema() {
     assert_eq!(family_calls("Work-item tracker"), 1);
     assert_eq!(family_calls("CSM coordination-conformance"), 0);
 }
+
+// =============================================================================
+// CT-4 — fca_concept_lattice (ADR-028 / Crucible ADR-010). The Galois
+// derivation operators + NextClosure concept enumeration over a real
+// (objects × attributes) context. With no effect incidence on the synthetic
+// corpus the lattice is the trivial top/bottom, but the SQL + closure must
+// execute against the real schema.
+// =============================================================================
+#[tokio::test]
+async fn tool_fca_concept_lattice_against_populated_corpus() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let _h = SyntheticCorpus::seed_with_assignments(&pool).await;
+    let server = server_with_pool(pool);
+
+    let result = server
+        .call_tool_cli(
+            "fca_concept_lattice",
+            json!({"project": "proj-auth", "object_kind": "symbol", "attribute_kind": "effect"}),
+        )
+        .await
+        .expect("fca_concept_lattice must not error against the real schema");
+    let v: serde_json::Value =
+        serde_json::from_str(&text_of(&result)).expect("fca body must be JSON");
+    assert!(v["concepts"].is_array(), "concepts must be an array");
+    assert_eq!(
+        v["context"]["object_kind"].as_str(),
+        Some("symbol"),
+        "context echoes the requested object_kind"
+    );
+}
+
+// =============================================================================
+// CT-3 — csm_protocol_string_diagram (ADR-028 / Crucible ADR-010). The
+// monoidal tensor decomposition of a real protocol's GlobalType. Seed one
+// well-formed linear protocol (built with the csm constructors so the stored
+// adjacent-tagged JSON is exactly what the tool decodes) and assert the
+// decomposition: a linear protocol over the single pair {O,W} is one tensor
+// factor.
+// =============================================================================
+#[tokio::test]
+async fn tool_csm_protocol_string_diagram_against_seeded_protocol() {
+    use pgmcp::csm::mpst::global::{end, interaction};
+    use pgmcp::csm::role::Label;
+
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let server = server_with_pool(pool.clone());
+
+    // O → W : t1_req . W → O : t1_done . end
+    let g = interaction(
+        "O",
+        "W",
+        Label::text("t1_req"),
+        interaction("W", "O", Label::text("t1_done"), end()),
+    );
+    let gt = serde_json::to_value(&g).expect("serialize global_type");
+    sqlx::query(
+        "INSERT INTO csm_protocols (name, pattern_skill_id, global_type, participants, wellformed)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind("smoke_string_diagram")
+    .bind("sequential")
+    .bind(gt)
+    .bind(vec!["O".to_string(), "W".to_string()])
+    .bind(true)
+    .execute(&pool)
+    .await
+    .expect("seed csm_protocols row");
+
+    let result = server
+        .call_tool_cli(
+            "csm_protocol_string_diagram",
+            json!({"protocol_name": "smoke_string_diagram"}),
+        )
+        .await
+        .expect("csm_protocol_string_diagram must not error");
+    let v: serde_json::Value =
+        serde_json::from_str(&text_of(&result)).expect("string-diagram body must be JSON");
+    assert_eq!(v["protocol"].as_str(), Some("smoke_string_diagram"));
+    assert_eq!(
+        v["n_tensor_factors"].as_i64(),
+        Some(1),
+        "O and W interact, so the linear protocol is a single tensor factor"
+    );
+}

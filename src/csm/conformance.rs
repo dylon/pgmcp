@@ -73,10 +73,26 @@ impl ConformanceError {
     }
 }
 
-/// Replay `trace` against `net`. Each event advances the sender on a `Send` and
-/// the receiver on a `Recv`; the run conforms iff every step is legal and every
-/// machine ends terminal.
-pub fn check_conformance(net: &Network, trace: &[Event]) -> Result<(), ConformanceError> {
+/// Replay `trace` against `net`, returning the per-role [`LocalState`] each
+/// machine is left in. Each event advances the sender on a `Send` and the
+/// receiver on a `Recv` through the single legality oracle [`check_step`]; a step
+/// that the network refuses is a [`ConformanceError::Step`] (the trace is not a
+/// legal protocol path).
+///
+/// Unlike [`check_conformance`], this **does not** assert that every machine is
+/// terminal: a mid-protocol *prefix* (e.g. a paused session that has executed
+/// some — but not all — of its turns) replays cleanly to a set of non-terminal
+/// states, which is exactly the PAUSE/RESUME recovery input. The returned map is
+/// "the position": replaying the recorded trace recovers where every role sits,
+/// from which the orchestrator's next step can be planned
+/// (`crate::csm::driver::next_step_from`).
+///
+/// `check_conformance` is re-expressed as `replay_to_states(...).and_then(<all
+/// machines terminal>)`, so the two share one replay implementation.
+pub fn replay_to_states(
+    net: &Network,
+    trace: &[Event],
+) -> Result<BTreeMap<Role, LocalState>, ConformanceError> {
     let mut states: BTreeMap<Role, LocalState> = net
         .machines
         .iter()
@@ -135,6 +151,15 @@ pub fn check_conformance(net: &Network, trace: &[Event]) -> Result<(), Conforman
         states.insert(ev.to.clone(), nr);
     }
 
+    Ok(states)
+}
+
+/// Assert every machine in `states` is in a terminal state; the terminal check
+/// `check_conformance` adds on top of [`replay_to_states`].
+fn assert_all_terminal(
+    net: &Network,
+    states: BTreeMap<Role, LocalState>,
+) -> Result<(), ConformanceError> {
     for (role, st) in &states {
         let m = net.machine(role).expect("machine for tracked role");
         if !m.is_terminal(*st) {
@@ -145,6 +170,13 @@ pub fn check_conformance(net: &Network, trace: &[Event]) -> Result<(), Conforman
         }
     }
     Ok(())
+}
+
+/// Replay `trace` against `net`. Each event advances the sender on a `Send` and
+/// the receiver on a `Recv`; the run conforms iff every step is legal and every
+/// machine ends terminal.
+pub fn check_conformance(net: &Network, trace: &[Event]) -> Result<(), ConformanceError> {
+    replay_to_states(net, trace).and_then(|states| assert_all_terminal(net, states))
 }
 
 /// One recorded turn of an `a2a_pattern_*` run, as persisted to
@@ -391,6 +423,96 @@ mod tests {
         let turns = [turn("Sub"), turn("Sub")];
         let trace = lift_transcript(ProtocolId::Recursive, &turns);
         check_conformance(&n, &trace).expect("recursive depth-2 run conforms");
+    }
+
+    #[test]
+    fn replay_prefix_leaves_orchestrator_mid_protocol() {
+        // A one-turn prefix of Sequential (the Planner round) is NOT terminal, but
+        // it replays cleanly via `replay_to_states` — exactly the PAUSE input. The
+        // orchestrator is left having received `plan`, awaiting the Critic round, so
+        // its state is non-terminal (a `check_conformance` on the same prefix would
+        // report `Incomplete`).
+        let p = ProtocolParams::default();
+        let n = net(ProtocolId::Sequential, &p);
+        let prefix = lift_transcript(ProtocolId::Sequential, &[turn("Planner")]);
+        let states = replay_to_states(&n, &prefix).expect("prefix replays cleanly");
+        let o = Role::new("O");
+        let m = n.machine(&o).expect("orchestrator machine");
+        let st = *states.get(&o).expect("orchestrator state tracked");
+        assert!(
+            !m.is_terminal(st),
+            "a one-round prefix must leave the orchestrator mid-protocol, was terminal at {st}"
+        );
+        // And the same prefix under the full terminal check is Incomplete.
+        assert!(matches!(
+            check_conformance(&n, &prefix),
+            Err(ConformanceError::Incomplete { .. })
+        ));
+    }
+
+    #[test]
+    fn replay_prefix_of_every_registry_protocol_is_clean_but_non_terminal() {
+        // For every choice-free registry protocol, the first orchestrator
+        // request/response pair replays cleanly to a non-terminal orchestrator
+        // state (the mid-protocol "position" PAUSE captures). Deliberation is
+        // excluded: its first lifted turn already exercises the sender-driven
+        // choice and is covered separately.
+        let p = ProtocolParams::default();
+        let cases = [
+            (ProtocolId::Sequential, "Planner"),
+            (ProtocolId::Distillation, "Expert"),
+            (ProtocolId::Mixture, "Math"),
+        ];
+        let o = Role::new("O");
+        for (id, role) in cases {
+            let n = net(id, &p);
+            let prefix = lift_transcript(id, &[turn(role)]);
+            let states = replay_to_states(&n, &prefix)
+                .unwrap_or_else(|e| panic!("{} prefix should replay: {}", id.name(), e.message()));
+            let m = n.machine(&o).expect("orchestrator machine");
+            let st = *states.get(&o).expect("orchestrator tracked");
+            assert!(
+                !m.is_terminal(st),
+                "{} one-round prefix must be non-terminal for O",
+                id.name()
+            );
+        }
+    }
+
+    #[test]
+    fn replay_to_states_completes_terminal_for_a_full_run() {
+        // A complete conforming run replays to all-terminal states, so the
+        // terminal check `check_conformance` layers on still passes.
+        let p = ProtocolParams::default();
+        let n = net(ProtocolId::Sequential, &p);
+        let turns = [turn("Planner"), turn("Critic"), turn("Solver")];
+        let trace = lift_transcript(ProtocolId::Sequential, &turns);
+        let states = replay_to_states(&n, &trace).expect("full run replays");
+        for (role, st) in &states {
+            let m = n.machine(role).expect("machine");
+            assert!(
+                m.is_terminal(*st),
+                "role {role} must be terminal after a full run, was at {st}"
+            );
+        }
+        // The terminal-asserting wrapper agrees.
+        check_conformance(&n, &trace).expect("full run conforms");
+    }
+
+    #[test]
+    fn replay_to_states_rejects_a_corrupt_prefix_with_step() {
+        // A Solver turn with no preceding Planner is not a legal protocol path:
+        // `replay_to_states` must refuse it loudly with a `Step` error (a corrupt
+        // trace the resume path must NOT silently accept), not return a bogus
+        // state map.
+        let p = ProtocolParams::default();
+        let n = net(ProtocolId::Sequential, &p);
+        let corrupt = lift_transcript(ProtocolId::Sequential, &[turn("Solver")]);
+        let err = replay_to_states(&n, &corrupt).expect_err("solver-first is illegal");
+        assert!(
+            matches!(err, ConformanceError::Step { .. }),
+            "a corrupt prefix must return Step, got {err:?}"
+        );
     }
 
     #[test]

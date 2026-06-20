@@ -311,11 +311,16 @@ pub mod tool_csm_infer_peer_fsm;
 pub mod tool_csm_list_protocols;
 pub mod tool_csm_protocol_of_pattern;
 pub mod tool_csm_protocol_plan;
+pub mod tool_csm_protocol_string_diagram;
 pub mod tool_csm_show_projection;
 pub mod tool_csm_synthesize_protocol;
 pub mod tool_csm_validate_run;
 pub mod tool_experiments;
+pub mod tool_fca_concept_lattice;
 pub mod tool_orchestrator_recommend_next;
+pub mod tool_session_checkpoint_list;
+pub mod tool_session_checkpoint_resume;
+pub mod tool_session_checkpoint_save;
 pub use tool_experiments::{
     tool_experiment_decide, tool_experiment_get, tool_experiment_list,
     tool_experiment_log_artifact, tool_experiment_open, tool_experiment_protocol,

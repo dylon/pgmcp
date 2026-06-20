@@ -184,8 +184,31 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
     let db_pool = db::pool::create_pool(&config_snapshot.database).await?;
     // Retry on transient lock contention (e.g. an orphaned backend from a killed
     // prior instance still holding ACCESS SHARE) instead of aborting startup.
-    db::migrations::run_migrations_with_lock_retry(&db_pool, &config_snapshot.vector).await?;
+    db::migrations::run_migrations_with_lock_retry(&db_pool, &config_snapshot.vector, true).await?;
     info!("Database initialized");
+
+    // Defer the memory_unified matview + HNSW rebuild OFF the startup critical
+    // path. `run_migrations` above (defer_unified_rebuild = true) only GUARANTEED
+    // the matviews EXIST; this hash-gated rebuild applies any definition change in
+    // a background task, so a large-corpus HNSW build (e.g. the 765k-vector index
+    // that triggered the 2026-06-19 #5 crash loop) can never exceed systemd's
+    // `TimeoutStartSec` and crash-loop the service. It is a fast no-op when the
+    // matview SQL is unchanged (the common restart case). On a definition change,
+    // unified-graph vector search is briefly degraded (the HNSW index is rebuilt)
+    // while the daemon otherwise serves normally.
+    {
+        let pool = db_pool.clone();
+        let vector_cfg = config_snapshot.vector.clone();
+        tokio::spawn(async move {
+            if let Err(e) = db::migrations::ensure_memory_unified_views(&pool, &vector_cfg).await {
+                tracing::error!(
+                    error = %e,
+                    "background memory_unified matview rebuild failed; unified-graph \
+                     search may be degraded until the next successful rebuild/refresh"
+                );
+            }
+        });
+    }
 
     // 1a′. On-disk fuzzy ARTrie format guard. The libdictenstein lock-free overlay
     // refactor changed the trie's on-disk format incompatibly, so any `.artrie`
@@ -762,6 +785,46 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             });
             true
         });
+    }
+
+    // 11d-quater. Schedule the orchestration-session crash-resume reaper (ADR-009
+    // PAUSE/RESUME). Off by default (interval 0). A single bounded UPDATE that
+    // auto-pauses live orchestration_sessions whose work-item lease lapsed (pi
+    // crashed mid-protocol), so the run surfaces in session_checkpoint_list for
+    // another agent to resume. Writes only pgmcp's own table.
+    if config_snapshot
+        .cron
+        .orchestration_session_reaper_interval_secs
+        > 0
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let stats_for_reaper = Arc::clone(&stats_tracker);
+        let interval_ms = config_snapshot
+            .cron
+            .orchestration_session_reaper_interval_secs
+            .saturating_mul(1000);
+        let rt_for_reaper = tokio::runtime::Handle::current();
+        let hist_reaper = system_ctx.cron_history().clone();
+        // 75s initial delay so we don't run during the startup window.
+        cron_handle.schedule_recurring(
+            75_000,
+            interval_ms,
+            "orchestration-session-reaper",
+            move || {
+                let pool = pool.clone();
+                let stats = Arc::clone(&stats_for_reaper);
+                let hist = hist_reaper.clone();
+                crate::cron::history::spawn_recorded(
+                    &rt_for_reaper,
+                    hist,
+                    "orchestration-session-reaper",
+                    async move {
+                        cron::orchestration_session_reaper::run_or_log(pool, stats).await;
+                    },
+                );
+                true
+            },
+        );
     }
 
     // 11d-ter. Schedule the security-scan cron: run installed external security

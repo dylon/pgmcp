@@ -3003,7 +3003,7 @@ dependencies = [
 
 [[package]]
 name = "libgrammstein"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "bincode 1.3.3",

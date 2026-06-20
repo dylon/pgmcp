@@ -17,7 +17,7 @@
 //! TLC + the conformance observer.
 
 use crate::csm::conformance::{Event, check_conformance, lift_transcript, transcript_to_turns};
-use crate::csm::machine::Network;
+use crate::csm::machine::{LocalState, Network};
 use crate::csm::registry::{ProtocolId, ProtocolParams, global_of};
 use crate::csm::role::{Action, Label, Role};
 
@@ -97,6 +97,58 @@ impl ProtocolDriver {
         None // exceeded the bound — not a finite linear chain
     }
 
+    /// The single orchestrator-prescribed step *from an arbitrary state* of the
+    /// orchestrator's machine — the resume primitive. Generalises [`plan`]'s
+    /// edge-walk (which always starts at `m.initial`) to begin at `state`, the
+    /// position recovered by `crate::csm::conformance::replay_to_states` for a
+    /// paused session.
+    ///
+    /// Returns the next `(peer, request, response)` [`PlannedStep`] the
+    /// orchestrator must drive, or `None` when:
+    /// - `state` is terminal (nothing left to do), or
+    /// - the orchestrator faces a `Choice`/`Branch` at `state` — i.e. it has more
+    ///   than one outgoing edge, the **Critic loop** (`verify_req` → `pass`/`revise`)
+    ///   whose branch is resolved at runtime, not statically. The caller (the
+    ///   resume tool) renders that as a `critic_verdict` await instead of a step.
+    ///
+    /// `None` is deliberately *coarse* (terminal vs. choice vs. malformed all
+    /// collapse to "no single next step"); the caller disambiguates terminal from
+    /// choice by re-checking `m.is_terminal(state)` / the edge count, which it
+    /// already holds the network for.
+    pub fn next_step_from(
+        net: &Network,
+        orchestrator: &Role,
+        state: LocalState,
+    ) -> Option<PlannedStep> {
+        let m = net.machine(orchestrator)?;
+        if m.is_terminal(state) {
+            return None;
+        }
+        let outs: Vec<_> = m.edges_from(state).collect();
+        if outs.len() != 1 {
+            return None; // a choice/branch (the Critic loop) — resolved at runtime
+        }
+        let send = outs[0];
+        let (peer, request) = match &send.action {
+            Action::Send { to, label } => (to.clone(), label.clone()),
+            Action::Recv { .. } => return None, // orchestrator must lead with a send
+        };
+        let mids: Vec<_> = m.edges_from(send.to).collect();
+        if mids.len() != 1 {
+            return None;
+        }
+        let recv = mids[0];
+        let response = match &recv.action {
+            Action::Recv { from, label } if *from == peer => label.clone(),
+            _ => return None,
+        };
+        Some(PlannedStep {
+            peer,
+            request,
+            response,
+        })
+    }
+
     /// The orchestrator-side trace a plan induces (for conformance confirmation):
     /// each step is `O→peer:request` then `peer→O:response`.
     pub fn plan_trace(orchestrator: &Role, plan: &[PlannedStep]) -> Vec<Event> {
@@ -169,6 +221,134 @@ mod tests {
         assert_eq!(peers, vec!["P", "C", "S"]);
         assert_eq!(plan[0].request.name, "plan_req");
         assert_eq!(plan[0].response.name, "plan");
+    }
+
+    #[test]
+    fn next_step_from_initial_reproduces_plan_first_step() {
+        // Seeding `next_step_from` at the orchestrator's initial state must
+        // reproduce `plan()[0]` — the resume primitive is consistent with the
+        // from-scratch planner.
+        let p = ProtocolParams::default();
+        let n = net(ProtocolId::Sequential, &p);
+        let o = Role::new("O");
+        let m = n.machine(&o).expect("orchestrator machine");
+        let plan = ProtocolDriver::plan(&n, &o).expect("sequential is drivable");
+        let from_initial =
+            ProtocolDriver::next_step_from(&n, &o, m.initial).expect("a first step exists");
+        assert_eq!(
+            from_initial, plan[0],
+            "seeding at m.initial must reproduce plan()[0]"
+        );
+    }
+
+    #[test]
+    fn next_step_from_mid_chain_yields_the_subsequent_step() {
+        // Walk the orchestrator's machine one full request/response pair forward
+        // (Planner round), then `next_step_from` at that mid-state must yield the
+        // SECOND plan step (the Critic round) — generalising the edge-walk to an
+        // arbitrary seed.
+        let p = ProtocolParams::default();
+        let n = net(ProtocolId::Sequential, &p);
+        let o = Role::new("O");
+        let m = n.machine(&o).expect("orchestrator machine");
+        let plan = ProtocolDriver::plan(&n, &o).expect("sequential is drivable");
+        assert!(
+            plan.len() >= 2,
+            "sequential has at least planner+critic steps"
+        );
+
+        // Advance: O sends plan_req (state→send.to), then receives plan
+        // (send.to→recv.to). That recv.to is the mid-chain state.
+        let send = m.edges_from(m.initial).next().expect("a send edge");
+        let recv = m.edges_from(send.to).next().expect("a recv edge");
+        let mid = recv.to;
+
+        let next = ProtocolDriver::next_step_from(&n, &o, mid).expect("a subsequent step exists");
+        assert_eq!(
+            next, plan[1],
+            "seeding mid-chain must yield the correct subsequent step (plan[1])"
+        );
+    }
+
+    #[test]
+    fn next_step_from_terminal_is_none() {
+        // At a terminal state there is no next step.
+        let p = ProtocolParams::default();
+        let n = net(ProtocolId::Distillation, &p);
+        let o = Role::new("O");
+        let m = n.machine(&o).expect("orchestrator machine");
+        let terminal = *m.terminals.iter().next().expect("a terminal state exists");
+        assert!(ProtocolDriver::next_step_from(&n, &o, terminal).is_none());
+    }
+
+    #[test]
+    fn next_step_from_returns_none_at_a_choice() {
+        // The Critic-gated synthesized loop puts the orchestrator at a Choice
+        // (verify_req → pass/revise). `next_step_from` returns None there (the
+        // caller renders a critic_verdict await). Built via the same fold the
+        // synthesize tool uses: a single worker + a critic.
+        use crate::csm::mpst::global::{self, GlobalType};
+        use crate::csm::role::Label;
+
+        fn worker_chain(o: &Role, w: &Role, tail: GlobalType) -> GlobalType {
+            global::interaction(
+                o.clone(),
+                w.clone(),
+                Label::text("t0_req"),
+                global::interaction(w.clone(), o.clone(), Label::text("t0_done"), tail),
+            )
+        }
+        let o = Role::new("O");
+        let w = Role::new("W0");
+        let c = Role::new("C");
+        let loop_node = global::rec(
+            "loop",
+            global::interaction(
+                o.clone(),
+                c.clone(),
+                Label::text("verify_req"),
+                global::choice(
+                    c.clone(),
+                    o.clone(),
+                    vec![
+                        global::gbranch(
+                            Label::text("pass"),
+                            global::interaction(
+                                o.clone(),
+                                w.clone(),
+                                Label::text("t0_release"),
+                                global::end(),
+                            ),
+                        ),
+                        global::gbranch(
+                            Label::text("revise"),
+                            worker_chain(&o, &w, global::var("loop")),
+                        ),
+                    ],
+                ),
+            ),
+        );
+        let g = worker_chain(&o, &w, loop_node);
+        let net = Network::build("test_critic", &g).expect("network builds");
+        let m = net.machine(&o).expect("orchestrator machine");
+
+        // Walk the initial worker round (O→W:t0_req, W→O:t0_done) to reach the
+        // verify_req send; one more send+recv pair reaches the Choice state.
+        let s1 = m.edges_from(m.initial).next().expect("t0_req send");
+        let r1 = m.edges_from(s1.to).next().expect("t0_done recv");
+        // r1.to is the verify_req send state; next_step_from here is still a single
+        // send (verify_req), so advance once more to land on the Choice.
+        let verify_send = m.edges_from(r1.to).next().expect("verify_req send");
+        let choice_state = verify_send.to;
+        // At the choice state the orchestrator faces pass/revise (>1 outgoing edge).
+        assert!(
+            m.edges_from(choice_state).count() > 1,
+            "the choice state must branch"
+        );
+        assert!(
+            ProtocolDriver::next_step_from(&net, &o, choice_state).is_none(),
+            "next_step_from must be None at the Critic choice"
+        );
     }
 
     #[test]

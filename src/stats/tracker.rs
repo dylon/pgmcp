@@ -702,6 +702,9 @@ pub struct StatsTracker {
     pub presence_sweeps: AtomicU64,
     /// Work-item leases expired by the presence cron.
     pub work_item_leases_expired: AtomicU64,
+    /// Orchestration sessions auto-paused by the crash-resume cron (ADR-009
+    /// PAUSE/RESUME): live sessions whose work-item lease lapsed (pi crashed).
+    pub orchestration_sessions_auto_paused: AtomicU64,
     /// quality-history cron: number of sweeps + GPA snapshots written.
     pub quality_history_runs: AtomicU64,
     pub quality_history_snapshots: AtomicU64,
@@ -1071,6 +1074,7 @@ impl StatsTracker {
             git_items_auto_linked: AtomicU64::new(0),
             findings_promoted: AtomicU64::new(0),
             work_item_leases_expired: AtomicU64::new(0),
+            orchestration_sessions_auto_paused: AtomicU64::new(0),
             http_mcp_sessions: AtomicU64::new(0),
             peak_rss_bytes: AtomicU64::new(0),
             current_rss_bytes: AtomicU64::new(0),
@@ -1547,6 +1551,9 @@ impl StatsTracker {
             "git_items_auto_linked": self.git_items_auto_linked.load(Ordering::Acquire),
             "findings_promoted": self.findings_promoted.load(Ordering::Acquire),
             "work_item_leases_expired": self.work_item_leases_expired.load(Ordering::Acquire),
+            "orchestration_sessions_auto_paused": self
+                .orchestration_sessions_auto_paused
+                .load(Ordering::Acquire),
             "http_mcp_sessions": self.http_mcp_sessions.load(Ordering::Acquire),
             "telemetry_rows_written": self.telemetry_rows_written.load(Ordering::Acquire),
             "telemetry_writes_dropped": self.telemetry_writes_dropped.load(Ordering::Acquire),

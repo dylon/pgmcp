@@ -946,6 +946,13 @@ impl McpServer {
             "csm_protocol_plan"       => csm_protocol_plan(CsmProtocolPlanParams),
             "csm_synthesize_protocol" => csm_synthesize_protocol(CsmSynthesizeProtocolParams),
             "csm_infer_peer_fsm"      => csm_infer_peer_fsm(CsmInferPeerFsmParams),
+            // Category-theoretic analytical tools (ADR-028 CT-3 / CT-4)
+            "csm_protocol_string_diagram" => csm_protocol_string_diagram(CsmProtocolStringDiagramParams),
+            "fca_concept_lattice"     => fca_concept_lattice(FcaConceptLatticeParams),
+            // Crucible session PAUSE/RESUME (ADR-009)
+            "session_checkpoint_save"   => session_checkpoint_save(SessionCheckpointSaveParams),
+            "session_checkpoint_resume" => session_checkpoint_resume(SessionCheckpointResumeParams),
+            "session_checkpoint_list"   => session_checkpoint_list(SessionCheckpointListParams),
             "a2a_report_outcome"     => a2a_report_outcome(A2aReportOutcomeParams),
             // Scientific-experiment subsystem (share the tool_experiments module).
             "experiment_open"               => experiment_open(ExperimentOpenParams) in tool_experiments,

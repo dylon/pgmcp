@@ -545,5 +545,482 @@ Section Csm.
     - simpl in Hcf. discriminate.
   Qed.
 
+  (* ===================================================================== *)
+  (* CT-1 (Crucible) — Projection NAMED as a FUNCTOR.                       *)
+  (*                                                                       *)
+  (* ADR-028 posture: a categorical claim earns its place only by being    *)
+  (* grounded + falsifiable. The grounded, falsifiable content here is the *)
+  (* soundness of csm_validate_run / replay_to_states (src/csm): they      *)
+  (* recover a role's endpoint state by REPLAYING the recorded global      *)
+  (* trace through `project`, which is correct precisely because           *)
+  (* projection is FUNCTORIAL. A counterexample to either law below would  *)
+  (* be a concrete protocol on which a paused session resumes desynced.    *)
+  (*                                                                       *)
+  (* Two complementary, fully-proven functorialities (no axioms/admits):   *)
+  (*   (A) the TRACE functor  local_of_trace(.,r) : (Trace, ++, []) ->     *)
+  (*       (Ltype, lappend, LEnd)  is a MONOID HOMOMORPHISM (a functor     *)
+  (*       between one-object categories): it sends the empty trace to the *)
+  (*       unit and a concatenation to a product. `project` factors        *)
+  (*       through it (protocol_fidelity), so projection literally IS this *)
+  (*       functor applied to the canonical global trace.                  *)
+  (*   (B) the REDUCTION functor  project(.,r)  carries the global         *)
+  (*       reduction category (objects gtype, morphisms = reachability     *)
+  (*       "gstar") into the local one (objects ltype, morphisms "lstar"), *)
+  (*       preserving identity (refl |-> refl) and composition             *)
+  (*       (concat |-> concat).                                            *)
+  (* ===================================================================== *)
+
+  (* ---- (A) the trace monoid functor ---------------------------------- *)
+
+  (* Sequential composition on the (choice-free) local image: graft `t`    *)
+  (* onto the LEnd tail of `s`. This is the product of the codomain        *)
+  (* monoid; LEnd is its unit. (Total on ltype; the LSelect/LBranch arms   *)
+  (* are absorbing — the choice-free image never contains them.)           *)
+  Fixpoint lappend (s t : ltype) : ltype :=
+    match s with
+    | LEnd => t
+    | LSend q l k => LSend q l (lappend k t)
+    | LRecv p l k => LRecv p l (lappend k t)
+    | LSelect q brs => LSelect q brs
+    | LBranch p brs => LBranch p brs
+    end.
+
+  (* (Ltype, lappend, LEnd) is a monoid: LEnd is a two-sided unit and      *)
+  (* lappend is associative — so "monoid homomorphism" below is justified. *)
+  Lemma lappend_unit_l : forall t, lappend LEnd t = t.
+  Proof. reflexivity. Qed.
+
+  Lemma lappend_unit_r : forall s, lappend s LEnd = s.
+  Proof.
+    induction s as [| q l k IH | p l k IH | q brs | p brs]; simpl.
+    - reflexivity.
+    - rewrite IH. reflexivity.
+    - rewrite IH. reflexivity.
+    - reflexivity.
+    - reflexivity.
+  Qed.
+
+  Lemma lappend_assoc : forall a b c,
+    lappend (lappend a b) c = lappend a (lappend b c).
+  Proof.
+    induction a as [| q l k IH | p l k IH | q brs | p brs]; intros b c; simpl.
+    - reflexivity.
+    - rewrite IH. reflexivity.
+    - rewrite IH. reflexivity.
+    - reflexivity.
+    - reflexivity.
+  Qed.
+
+  (* FUNCTOR LAW 1 (identity / unit preservation): the empty trace is sent *)
+  (* to the unit of the codomain monoid.                                   *)
+  Lemma trace_functor_identity : forall r, local_of_trace [] r = LEnd.
+  Proof. reflexivity. Qed.
+
+  (* FUNCTOR LAW 2 (composition preservation): local_of_trace(.,r) is a    *)
+  (* monoid homomorphism — the image of a concatenated trace is the        *)
+  (* lappend (product) of the images.                                      *)
+  Lemma trace_functor_composition : forall s t r,
+    local_of_trace (s ++ t) r
+    = lappend (local_of_trace s r) (local_of_trace t r).
+  Proof.
+    induction s as [| [[p q] l] rest IH]; intros t r.
+    - reflexivity.
+    - simpl. destruct (eq_role_dec r p) as [_ | _].
+      + simpl. rewrite IH. reflexivity.
+      + destruct (eq_role_dec r q) as [_ | _].
+        * simpl. rewrite IH. reflexivity.
+        * apply IH.
+  Qed.
+
+  (* FACTORISATION: on the choice-free fragment `project g r` equals this  *)
+  (* trace functor applied to the canonical global trace gtrace g — i.e.   *)
+  (* projection IS (local_of_trace . gtrace), the composite csm_validate_  *)
+  (* run replays. (protocol_fidelity, named as the functor factorisation.) *)
+  Corollary project_is_trace_functor :
+    forall g r, choice_free g = true ->
+      project g r = local_of_trace (gtrace g) r.
+  Proof. exact protocol_fidelity. Qed.
+
+  (* ---- (B) the reduction-LTS functor --------------------------------- *)
+
+  (* Morphisms of the global / local reduction categories: finite          *)
+  (* reduction paths. Identity is the empty path (refl); composition is    *)
+  (* path concatenation (the _app lemmas below — composition is closed).   *)
+  Inductive gstar : gtype -> gtype -> Prop :=
+  | gstar_refl : forall g, gstar g g
+  | gstar_step : forall g g' g'', gstep g g' -> gstar g' g'' -> gstar g g''.
+
+  Inductive lstar : ltype -> ltype -> Prop :=
+  | lstar_refl : forall l, lstar l l
+  | lstar_step : forall l l' l'', lstep l l' -> lstar l' l'' -> lstar l l''.
+
+  Lemma gstar_app : forall a b c, gstar a b -> gstar b c -> gstar a c.
+  Proof.
+    intros a b c Hab. induction Hab as [g | g g' g'' Hs Hrest IH]; intro Hbc.
+    - exact Hbc.
+    - apply gstar_step with (g' := g'); [exact Hs | apply IH; exact Hbc].
+  Qed.
+
+  Lemma lstar_app : forall a b c, lstar a b -> lstar b c -> lstar a c.
+  Proof.
+    intros a b c Hab. induction Hab as [l | l l' l'' Hs Hrest IH]; intro Hbc.
+    - exact Hbc.
+    - apply lstar_step with (l' := l'); [exact Hs | apply IH; exact Hbc].
+  Qed.
+
+  (* The plain-merge side-condition lifted to EVERY GChoice node REACHABLE  *)
+  (* from g — exactly csm_synthesize_protocol's projectability check.       *)
+  (* Phrased over reachability (gstar) rather than a structural fixpoint    *)
+  (* (the nested branch-list recursion is not guard-accepted, and would be  *)
+  (* needed only to re-derive this closure property anyway), so it is       *)
+  (* preserved along a reduction path by construction. On this class        *)
+  (* projection is functorial with no further hypothesis.                  *)
+  Definition globally_agreeing (g : gtype) : Prop :=
+    forall p q brs, gstar g (GChoice p q brs) -> bystanders_agree p q brs.
+
+  (* Preserved by a global step: every GChoice reachable from g' is also    *)
+  (* reachable from g (prepend the step), so it still agrees.               *)
+  Lemma globally_agreeing_step :
+    forall g g', globally_agreeing g -> gstep g g' -> globally_agreeing g'.
+  Proof.
+    intros g g' Hag Hstep p q brs Hreach.
+    apply Hag. apply gstar_step with (g' := g'); [exact Hstep | exact Hreach].
+  Qed.
+
+  (* choice_free is preserved by a step and by reachability — a linear      *)
+  (* protocol never reaches a GChoice, so it agrees vacuously.             *)
+  Lemma choice_free_step :
+    forall g g', choice_free g = true -> gstep g g' -> choice_free g' = true.
+  Proof.
+    intros g g' Hcf Hstep.
+    destruct Hstep as [p q l k | p q brs l k Hin].
+    - simpl in Hcf. exact Hcf.
+    - simpl in Hcf. discriminate.
+  Qed.
+
+  Lemma choice_free_star :
+    forall g g', choice_free g = true -> gstar g g' -> choice_free g' = true.
+  Proof.
+    intros g g' Hcf Hstar. revert Hcf.
+    induction Hstar as [g0 | g0 g1 g2 Hstep Hrest IH]; intro Hcf.
+    - exact Hcf.
+    - apply IH. apply choice_free_step with (g := g0); [exact Hcf | exact Hstep].
+  Qed.
+
+  Lemma choice_free_globally_agreeing :
+    forall g, choice_free g = true -> globally_agreeing g.
+  Proof.
+    intros g Hcf p q brs Hreach.
+    assert (Hcf' : choice_free (GChoice p q brs) = true)
+      by (apply choice_free_star with (g := g); [exact Hcf | exact Hreach]).
+    simpl in Hcf'. discriminate.
+  Qed.
+
+  (* PER-STEP functoriality: for ANY role r a single global step maps to a  *)
+  (* local reachability morphism. Sender/receiver advance one lstep; a      *)
+  (* bystander stays put (the step maps to the local identity).            *)
+  Lemma project_step_sim :
+    forall g g' r,
+      globally_agreeing g -> gstep g g' -> lstar (project g r) (project g' r).
+  Proof.
+    intros g g' r Hag Hstep.
+    destruct Hstep as [p q l k | p q brs l k Hin].
+    - (* GMsg p q l k -> k *)
+      destruct (eq_role_dec r p) as [Hp | Hp].
+      + subst r. rewrite project_send_sound.
+        apply lstar_step with (l' := project k p); [apply LStep_Send | apply lstar_refl].
+      + destruct (eq_role_dec r q) as [Hq | Hq].
+        * subst r. rewrite project_recv_sound by (intro He; apply Hp; symmetry; exact He).
+          apply lstar_step with (l' := project k q); [apply LStep_Recv | apply lstar_refl].
+        * rewrite project_bystander by assumption. apply lstar_refl.
+    - (* GChoice p q brs -> k, (l,k) in brs *)
+      destruct (eq_role_dec r p) as [Hp | Hp].
+      + subst r. rewrite project_choice_sender.
+        apply lstar_step with (l' := project k p);
+          [apply LStep_Sel with (l := l); apply in_proj_branches; exact Hin | apply lstar_refl].
+      + destruct (eq_role_dec r q) as [Hq | Hq].
+        * subst r. rewrite project_choice_receiver by (intro He; apply Hp; symmetry; exact He).
+          apply lstar_step with (l' := project k q);
+            [apply LStep_Bra with (l := l); apply in_proj_branches; exact Hin | apply lstar_refl].
+        * rewrite project_choice_bystander by assumption.
+          assert (Hba : bystanders_agree p q brs) by (apply Hag; apply gstar_refl).
+          destruct brs as [| [l0 g0] rest]; simpl.
+          { inversion Hin. }
+          assert (Heq : project g0 r = project k r)
+            by (apply (Hba r l0 g0 l k Hp Hq); [left; reflexivity | exact Hin]).
+          rewrite Heq. apply lstar_refl.
+  Qed.
+
+  (* THE FUNCTOR: project(.,r) preserves identity (refl |-> refl) and       *)
+  (* composition (path concatenation) — every global reachability morphism *)
+  (* g =>star g' over a globally-agreeing protocol maps to a local one      *)
+  (* project g r =>star project g' r.                                       *)
+  Theorem project_functor :
+    forall g g' r,
+      globally_agreeing g -> gstar g g' -> lstar (project g r) (project g' r).
+  Proof.
+    intros g g' r Hag Hstar. revert Hag.
+    induction Hstar as [g0 | g0 g1 g2 Hstep Hrest IH]; intro Hag.
+    - apply lstar_refl.
+    - apply lstar_app with (b := project g1 r).
+      + apply project_step_sim; [exact Hag | exact Hstep].
+      + apply IH. apply (globally_agreeing_step g0 g1 Hag Hstep).
+  Qed.
+
+  (* Functor law 1 (identity preservation): the identity global morphism    *)
+  (* maps to the identity local morphism.                                  *)
+  Corollary project_functor_preserves_id :
+    forall g r, lstar (project g r) (project g r).
+  Proof. intros. apply lstar_refl. Qed.
+
+  (* Functor law 2 (composition preservation): the image of a composite     *)
+  (* morphism is the composite of the images.                              *)
+  Corollary project_functor_preserves_comp :
+    forall g1 g2 g3 r,
+      lstar (project g1 r) (project g2 r) ->
+      lstar (project g2 r) (project g3 r) ->
+      lstar (project g1 r) (project g3 r).
+  Proof.
+    intros g1 g2 g3 r H12 H23. apply lstar_app with (b := project g2 r); assumption.
+  Qed.
+
+  (* Choice-free corollary: the four linear patterns (Sequential / Mixture  *)
+  (* / Distillation / Recursive) are functorial unconditionally.           *)
+  Corollary project_functor_choice_free :
+    forall g g' r,
+      choice_free g = true -> gstar g g' -> lstar (project g r) (project g' r).
+  Proof.
+    intros g g' r Hcf Hstar.
+    apply project_functor; [apply choice_free_globally_agreeing; exact Hcf | exact Hstar].
+  Qed.
+
+  (* ===================================================================== *)
+  (* CT-2 (Crucible) — Protocol-composition ALGEBRA with proven closure.    *)
+  (*                                                                       *)
+  (* The Orchestrator assembles a protocol by composing sub-protocols. The *)
+  (* algebra is a MONOID (gseq with unit GEnd) that is CLOSED — a composite *)
+  (* of well-formed protocols is well-formed (wf_gseq) — and the           *)
+  (* projection functor is MONOIDAL — projection of a sequential composite *)
+  (* is the lappend (CT-1's monoid product) of the projections             *)
+  (* (project_gseq_hom): project(p;q) = project(p) ; project(q). So         *)
+  (* per-role endpoint machines compose modularly, which is exactly what    *)
+  (* lets csm_synthesize_protocol fold a plan tree into one drivable        *)
+  (* GlobalType. The tensor (independence) law underwrites CT-3's           *)
+  (* tensor_factors decomposition.                                          *)
+  (* ===================================================================== *)
+
+  (* Strong induction for gtype with a per-branch IH on GChoice — the       *)
+  (* auto-generated gtype_ind omits it (branches sit inside a list). Proved *)
+  (* by a mutual structural fix over the type and its branch list.          *)
+  Lemma gtype_strong_ind :
+    forall P : gtype -> Prop,
+      P GEnd ->
+      (forall a b l k, P k -> P (GMsg a b l k)) ->
+      (forall a b brs, (forall l gk, In (l, gk) brs -> P gk) -> P (GChoice a b brs)) ->
+      forall g, P g.
+  Proof.
+    intros P Hend Hmsg Hchoice.
+    fix REC 1. intro g. destruct g as [| a b l k | a b brs].
+    - exact Hend.
+    - apply Hmsg. apply REC.
+    - apply Hchoice. revert brs.
+      fix RECbrs 1. intro brs. destruct brs as [| [l0 g0] rest].
+      + intros l gk H. inversion H.
+      + intros l gk H. destruct H as [Heq | Hrest].
+        * injection Heq as Hl Hg. subst gk. apply REC.
+        * exact (RECbrs rest l gk Hrest).
+  Qed.
+
+  (* SEQUENTIAL composition (;): substitute q for p's GEnd leaves. The      *)
+  (* inner fix over branches is guard-safe (same shape as `project`).       *)
+  Fixpoint gseq (p q : gtype) : gtype :=
+    match p with
+    | GEnd => q
+    | GMsg a b l k => GMsg a b l (gseq k q)
+    | GChoice a b brs =>
+        GChoice a b ((fix sbrs (bs : list (label * gtype)) : list (label * gtype) :=
+                        match bs with
+                        | [] => []
+                        | (l, gk) :: rest => (l, gseq gk q) :: sbrs rest
+                        end) brs)
+    end.
+
+  (* Standalone branch-sequencer; seq_branches_eq aligns it with gseq's     *)
+  (* inner fix (mirrors proj_branches / proj_branches_eq).                  *)
+  Fixpoint seq_branches (bs : list (label * gtype)) (q : gtype)
+    : list (label * gtype) :=
+    match bs with
+    | [] => []
+    | (l, gk) :: rest => (l, gseq gk q) :: seq_branches rest q
+    end.
+
+  Lemma seq_branches_eq :
+    forall brs q,
+      (fix sbrs (bs : list (label * gtype)) : list (label * gtype) :=
+         match bs with
+         | [] => []
+         | (l, gk) :: rest => (l, gseq gk q) :: sbrs rest
+         end) brs = seq_branches brs q.
+  Proof.
+    induction brs as [| [l gk] rest IH]; intro q.
+    - reflexivity.
+    - simpl. f_equal. apply IH.
+  Qed.
+
+  Lemma seq_branches_length :
+    forall brs q, length (seq_branches brs q) = length brs.
+  Proof.
+    induction brs as [| [l gk] rest IH]; intro q; simpl;
+      [reflexivity | rewrite IH; reflexivity].
+  Qed.
+
+  Lemma in_seq_branches_inv :
+    forall brs q pr,
+      In pr (seq_branches brs q) ->
+      exists l gk, In (l, gk) brs /\ pr = (l, gseq gk q).
+  Proof.
+    induction brs as [| [l0 g0] rest IH]; intros q pr Hin; [inversion Hin |].
+    simpl in Hin. destruct Hin as [Heq | Hin'].
+    - exists l0, g0. split; [left; reflexivity | symmetry; exact Heq].
+    - destruct (IH q pr Hin') as [l [gk [Hgk Heq]]].
+      exists l, gk. split; [right; exact Hgk | exact Heq].
+  Qed.
+
+  (* Clean rewrite for gseq on a choice (folds the inner fix to             *)
+  (* seq_branches), used by the GChoice arms of the laws below.            *)
+  Lemma gseq_choice :
+    forall a b brs q, gseq (GChoice a b brs) q = GChoice a b (seq_branches brs q).
+  Proof. intros a b brs q. simpl. rewrite seq_branches_eq. reflexivity. Qed.
+
+  (* CLOSURE: sequential composition preserves well-formedness — the algebra *)
+  (* is closed, so the Orchestrator may fold sub-protocols and keep a        *)
+  (* well-formed (hence projectable + drivable) GlobalType.                  *)
+  Theorem wf_gseq :
+    forall p q, wf p = true -> wf q = true -> wf (gseq p q) = true.
+  Proof.
+    intros p q Hp Hq. generalize dependent p.
+    apply (gtype_strong_ind (fun p => wf p = true -> wf (gseq p q) = true)).
+    - intros _. simpl. exact Hq.
+    - intros a b l k IHk Hwf. simpl in Hwf. simpl.
+      apply andb_true_iff in Hwf. destruct Hwf as [Hab Hk].
+      apply andb_true_iff. split; [exact Hab | apply IHk; exact Hk].
+    - intros a b brs IHbrs Hwf. simpl in Hwf.
+      apply andb_true_iff in Hwf. destruct Hwf as [Hwf2 Hall].
+      apply andb_true_iff in Hwf2. destruct Hwf2 as [Hab Hlen].
+      rewrite gseq_choice. simpl.
+      apply andb_true_iff. split.
+      + apply andb_true_iff. split;
+          [exact Hab | rewrite seq_branches_length; exact Hlen].
+      + rewrite forallb_forall in Hall. rewrite forallb_forall.
+        intros pr Hin.
+        destruct (in_seq_branches_inv brs q pr Hin) as [l [gk [Hgk Heq]]].
+        subst pr. simpl. apply (IHbrs l gk Hgk). exact (Hall (l, gk) Hgk).
+  Qed.
+
+  (* gseq is a MONOID with unit GEnd (unit laws + associativity). *)
+  Lemma gseq_unit_l : forall q, gseq GEnd q = q.
+  Proof. reflexivity. Qed.
+
+  Lemma seq_branches_id :
+    forall brs,
+      (forall l gk, In (l, gk) brs -> gseq gk GEnd = gk) ->
+      seq_branches brs GEnd = brs.
+  Proof.
+    induction brs as [| [l0 g0] rest IH]; intro H.
+    - reflexivity.
+    - simpl. rewrite (H l0 g0 (or_introl eq_refl)). f_equal.
+      apply IH. intros l gk Hin. apply (H l gk). right. exact Hin.
+  Qed.
+
+  Lemma gseq_unit_r : forall p, gseq p GEnd = p.
+  Proof.
+    apply (gtype_strong_ind (fun p => gseq p GEnd = p)).
+    - reflexivity.
+    - intros a b l k IH. simpl. rewrite IH. reflexivity.
+    - intros a b brs IHbrs. rewrite gseq_choice. f_equal.
+      apply seq_branches_id. exact IHbrs.
+  Qed.
+
+  Lemma seq_branches_assoc :
+    forall brs b c,
+      (forall l gk, In (l, gk) brs -> gseq (gseq gk b) c = gseq gk (gseq b c)) ->
+      seq_branches (seq_branches brs b) c = seq_branches brs (gseq b c).
+  Proof.
+    induction brs as [| [l0 g0] rest IH]; intros b c H.
+    - reflexivity.
+    - simpl. rewrite (H l0 g0 (or_introl eq_refl)). f_equal.
+      apply IH. intros l gk Hin. apply (H l gk). right. exact Hin.
+  Qed.
+
+  Lemma gseq_assoc :
+    forall a b c, gseq (gseq a b) c = gseq a (gseq b c).
+  Proof.
+    intros a b c. revert a.
+    apply (gtype_strong_ind (fun a => gseq (gseq a b) c = gseq a (gseq b c))).
+    - reflexivity.
+    - intros x y l k IH. simpl. rewrite IH. reflexivity.
+    - intros x y brs IHbrs. rewrite !gseq_choice. f_equal.
+      apply seq_branches_assoc. exact IHbrs.
+  Qed.
+
+  (* choice_free is preserved by sequential composition. *)
+  Lemma choice_free_gseq :
+    forall p q,
+      choice_free p = true -> choice_free q = true -> choice_free (gseq p q) = true.
+  Proof.
+    induction p as [| a b l k IH | a b brs]; intros q Hp Hq.
+    - simpl. exact Hq.
+    - simpl. simpl in Hp. apply (IH q Hp Hq).
+    - simpl in Hp. discriminate.
+  Qed.
+
+  (* gtrace is a homomorphism on the linear fragment: the trace of a         *)
+  (* sequential composite is the concatenation of the traces.               *)
+  Lemma gtrace_gseq :
+    forall p q, choice_free p = true -> gtrace (gseq p q) = gtrace p ++ gtrace q.
+  Proof.
+    induction p as [| a b l k IH | a b brs]; intros q Hp.
+    - reflexivity.
+    - simpl. simpl in Hp. rewrite (IH q Hp). reflexivity.
+    - simpl in Hp. discriminate.
+  Qed.
+
+  (* MONOIDAL FUNCTOR: on the linear fragment, projection sends sequential   *)
+  (* composition of protocols to the lappend (CT-1 monoid product) of the    *)
+  (* projections — project(p;q) = project(p) ; project(q). The projection    *)
+  (* functor is a monoid homomorphism on protocols, so per-role machines     *)
+  (* assemble exactly as the global protocols do.                            *)
+  Theorem project_gseq_hom :
+    forall p q r,
+      choice_free p = true -> choice_free q = true ->
+      project (gseq p q) r = lappend (project p r) (project q r).
+  Proof.
+    intros p q r Hp Hq.
+    rewrite (project_is_trace_functor (gseq p q) r (choice_free_gseq p q Hp Hq)).
+    rewrite (project_is_trace_functor p r Hp).
+    rewrite (project_is_trace_functor q r Hq).
+    rewrite (gtrace_gseq p q Hp).
+    apply trace_functor_composition.
+  Qed.
+
+  (* A role ABSENT from q has the empty local view of q (choice-free q). *)
+  Definition role_absent (r : role) (q : gtype) : Prop := project q r = LEnd.
+
+  (* TENSOR independence (the parallel / disjoint-roles law): when r is      *)
+  (* absent from q, the two protocols occupy different tensor factors, and   *)
+  (* the sequential composite projects for r to exactly p's view — q is      *)
+  (* invisible. This is the independence csm_protocol_string_diagram's       *)
+  (* tensor_factors decomposition asserts: roles in different factors never  *)
+  (* interfere, so the factors are schedule-independent.                     *)
+  Theorem project_gseq_tensor_independent :
+    forall p q r,
+      choice_free p = true -> choice_free q = true ->
+      role_absent r q ->
+      project (gseq p q) r = project p r.
+  Proof.
+    intros p q r Hp Hq Hab. unfold role_absent in Hab.
+    rewrite (project_gseq_hom p q r Hp Hq). rewrite Hab. apply lappend_unit_r.
+  Qed.
+
 End Csm.
 

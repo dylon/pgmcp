@@ -65,3 +65,28 @@ pub struct ColimitViewParams {
     #[serde(default)]
     pub limit: Option<i64>,
 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FcaConceptLatticeParams {
+    /// Optional project name (list_projects) to scope objects; omit for the
+    /// whole workspace.
+    #[serde(default)]
+    pub project: Option<String>,
+    /// Object kind: "symbol" (functions from file_symbols) or "file"
+    /// (indexed_files). Default "symbol".
+    #[serde(default)]
+    pub object_kind: Option<String>,
+    /// Attribute kind: "effect" (effect_catalog via the has_effect / symbol_effects
+    /// relation) or "type_tag" (type_tag_catalog via the has_type relation).
+    /// Default "effect".
+    #[serde(default)]
+    pub attribute_kind: Option<String>,
+    /// Hard cap on enumerated concepts (NextClosure). Default 200; a truncation is
+    /// logged (ADR-022: no silent caps) and `truncated:true` is returned.
+    #[serde(default)]
+    pub max_concepts: Option<i64>,
+    /// Max objects sampled per concept extent in the output (display only).
+    /// Default 8.
+    #[serde(default)]
+    pub extent_sample: Option<i64>,
+}

@@ -78,7 +78,11 @@ pub const NODE_TYPES: &[NodeTypeMeta] = &[
         key: "topic",
         display: "Topic",
         source_table: "code_topics",
-        has_embedding: false,
+        // ADR-029 (e4526ea): topics are vector-seeded by their representative
+        // chunk's embedding (`file_chunks.embedding_v2` via `representative_chunk_id`)
+        // in `MEMORY_UNIFIED_NODES_SQL`, so topic hubs participate in unified vector
+        // search, not graph-only. (The arm was NULL pre-ADR-029; the flag now matches.)
+        has_embedding: true,
     },
     NodeTypeMeta {
         key: "durable_mandate",

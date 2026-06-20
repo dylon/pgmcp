@@ -62,6 +62,7 @@ pub mod ontology_link_predict;
 pub mod ontology_migrate;
 
 pub mod ontology_reason;
+pub mod orchestration_session_reaper;
 #[allow(dead_code)]
 pub mod quality_history;
 pub mod retrieval_eval;
