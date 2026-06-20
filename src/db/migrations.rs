@@ -57,6 +57,7 @@ mod v3_cross_language_signatures;
 mod v40_cron_run_history;
 mod v41_indexed_files_last_verified;
 mod v42_index_failures;
+mod v43_toolbox_debug_tools;
 mod v4_work_items;
 mod v5_work_items_collab;
 mod v6_unified_graph;
@@ -2615,6 +2616,14 @@ pub async fn run_migrations(
         v42_index_failures::INDEX_FAILURES,
         v42_index_failures::INDEX_FAILURES_NAME,
         || v42_index_failures::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v43_toolbox_debug_tools::TOOLBOX_DEBUG_TOOLS,
+        v43_toolbox_debug_tools::TOOLBOX_DEBUG_TOOLS_NAME,
+        || v43_toolbox_debug_tools::apply(pool),
     )
     .await?;
 

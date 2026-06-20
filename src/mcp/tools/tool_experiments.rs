@@ -1376,12 +1376,13 @@ pub async fn tool_experiment_log_artifact(
     let content = params.content.as_deref();
     let sha = content.map(|c| format!("{:x}", Sha256::digest(c.as_bytes())));
 
-    // Parse recognized benchmark formats into a metrics summary.
+    // Parse recognized benchmark / profile formats into a metrics summary.
     let mut metrics = params.metrics.clone().unwrap_or_else(|| json!({}));
     let mut parsed_sample_count: Option<usize> = None;
     if params.parse.unwrap_or(false)
         && let Some(c) = content
     {
+        // Numeric-sample benchmark formats → distributional summary.
         let parsed = match kind {
             "hyperfine" => extract::parse_hyperfine_times(c).ok(),
             "criterion" => extract::parse_criterion_samples(c).ok(),
@@ -1394,6 +1395,75 @@ pub async fn tool_experiment_log_artifact(
                 "std_dev": s.std_dev, "min": s.min, "max": s.max,
             });
             parsed_sample_count = Some(samples.len());
+        } else {
+            // Profile artifacts → structured hot-symbol / heap summary. These
+            // are not numeric-sample vectors, so they carry their own shape.
+            match kind {
+                "perf" => {
+                    let mut entries = extract::parse_perf_report(c);
+                    let total = entries.len();
+                    entries.truncate(25);
+                    let hot: Vec<serde_json::Value> = entries
+                        .iter()
+                        .map(|e| {
+                            json!({
+                                "symbol": e.symbol,
+                                "self_pct": e.self_pct,
+                                "children_pct": e.children_pct,
+                                "module": e.module,
+                            })
+                        })
+                        .collect();
+                    metrics = json!({
+                        "profile_kind": "perf",
+                        "symbol_count": total,
+                        "hot_symbols": hot,
+                    });
+                    parsed_sample_count = Some(total);
+                }
+                "flamegraph" => {
+                    let folded = extract::parse_folded_stacks(c);
+                    let total_samples: u64 = folded.values().copied().sum();
+                    let mut leaves: Vec<(String, u64)> = folded.into_iter().collect();
+                    leaves.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+                    let distinct = leaves.len();
+                    leaves.truncate(25);
+                    let hot: Vec<serde_json::Value> = leaves
+                        .iter()
+                        .map(|(sym, count)| {
+                            let pct = if total_samples > 0 {
+                                (*count as f64) * 100.0 / (total_samples as f64)
+                            } else {
+                                0.0
+                            };
+                            json!({ "symbol": sym, "samples": count, "self_pct": pct })
+                        })
+                        .collect();
+                    metrics = json!({
+                        "profile_kind": "flamegraph",
+                        "total_samples": total_samples,
+                        "distinct_leaves": distinct,
+                        "hot_symbols": hot,
+                    });
+                    parsed_sample_count = Some(distinct);
+                }
+                "massif" => {
+                    let summary = extract::parse_massif(c);
+                    let frames: Vec<serde_json::Value> = summary
+                        .top_frames
+                        .iter()
+                        .map(|f| json!({ "function": f.function, "bytes": f.bytes }))
+                        .collect();
+                    let frame_count = frames.len();
+                    metrics = json!({
+                        "profile_kind": "massif",
+                        "peak_heap_bytes": summary.peak_heap_bytes,
+                        "top_frames": frames,
+                    });
+                    parsed_sample_count = Some(frame_count);
+                }
+                _ => {}
+            }
         }
     }
     let metrics_json = metrics.to_string();

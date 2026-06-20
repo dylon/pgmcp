@@ -17,7 +17,7 @@ use crate::tools_catalog::{ToolCategorySeed, ToolSeed, card_content};
 /// Content-staleness key folded into `content_hash`. Bump the version suffix
 /// whenever the embedded-prose composition (`tools_catalog::card_content`)
 /// changes in a way that should force a global re-embed.
-pub const DEV_TOOL_EMBEDDING_SIGNATURE: &str = "pgmcp-tool-embedding-v1";
+pub const DEV_TOOL_EMBEDDING_SIGNATURE: &str = "pgmcp-tool-embedding-v2";
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct ToolCardRow {

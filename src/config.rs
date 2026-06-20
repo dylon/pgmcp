@@ -1749,6 +1749,14 @@ fn default_file_types() -> Vec<FileTypeMapping> {
             extension: "cljs".into(),
             language: "clojurescript".into(),
         },
+        // `.cljc` (reader-conditional / cross-platform Clojure source) routes
+        // to the Clojure backend — it shares the `tree-sitter-clojure` grammar
+        // and the `clojure` symbol/import/metric passes handle it identically
+        // to `.clj`.
+        FileTypeMapping {
+            extension: "cljc".into(),
+            language: "clojure".into(),
+        },
         // Document indexing extensions — extraction is routed through
         // `src/indexer/extract/` to system tools (`pdftotext`,
         // `ps2ascii`, `pandoc`). The `language` strings here are
@@ -4098,6 +4106,7 @@ mod tests {
             ("hxx", "cpp"),
             ("clj", "clojure"),
             ("cljs", "clojurescript"),
+            ("cljc", "clojure"),
             ("tsx", "tsx"),
         ] {
             let path_str = format!("file.{}", ext);

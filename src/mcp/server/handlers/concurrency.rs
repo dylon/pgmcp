@@ -77,6 +77,55 @@ impl McpServer {
         .await
     }
     #[tool(
+        description = "Reconcile a RUNTIME trace (BCC off-CPU folded stacks, `perf script`, or a \
+            `gdb thread apply all bt`) against the STATIC interprocedural lock-order graph. Returns \
+            confirmed waits (static predicted them), static_missed (real runtime waits the static \
+            graph lacks — precision gaps), and static_only (static edges this trace didn't exercise), \
+            plus static cycles flagged when runtime-corroborated. Read-only — pgmcp parses the \
+            agent-provided trace text; it never attaches a debugger. format = offcpu_folded | \
+            perf_script | gdb_bt."
+    )]
+    async fn runtime_deadlock_reconcile(
+        &self,
+        Parameters(params): Parameters<RuntimeDeadlockReconcileParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "runtime_deadlock_reconcile",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_runtime_deadlock_reconcile::tool_runtime_deadlock_reconcile(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+    #[tool(
+        description = "Map an agent-provided backtrace (gdb `bt`, a BCC off-CPU folded stack, or a \
+            newline/`;`-separated frame list) to file:line + symbol per frame, with the memory-graph \
+            entities anchored to each resolved symbol. Turns an opaque trace into clickable code \
+            locations enriched with prior knowledge. Read-only (symbol resolution + memory anchors). \
+            format = gdb_bt | folded | auto."
+    )]
+    async fn trace_map_to_code(
+        &self,
+        Parameters(params): Parameters<TraceMapToCodeParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "trace_map_to_code",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_trace_map_to_code::tool_trace_map_to_code(self.ctx(), params),
+        )
+        .await
+    }
+    #[tool(
         description = "Inspect one symbol's ordered synchronization skeleton (sync_ops) with a \
             per-op held-set annotation (drill-down for a reported lock cycle)."
     )]

@@ -74,6 +74,20 @@ pub struct ExperimentLogArtifactParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProfileIngestParams {
+    #[schemars(description = "Project name to resolve hot symbols against")]
+    pub project: String,
+    #[schemars(
+        description = "The raw profile text (perf report stdio table, folded/collapsed stacks, or massif dump)"
+    )]
+    pub content: String,
+    #[schemars(description = "Profile format: perf | flamegraph | massif")]
+    pub kind: String,
+    #[schemars(description = "Max hot symbols to resolve (default 25, max 200)")]
+    pub limit: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ExperimentRenderLedgerParams {
     #[schemars(description = "Experiment id (or use slug)")]
     pub experiment_id: Option<i64>,

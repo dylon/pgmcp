@@ -442,6 +442,7 @@ fn abstraction_for_language(language: &str) -> (&'static str, FixAction) {
             ("interface", FixAction::ExtractInterface)
         }
         "python" => ("Protocol", FixAction::ExtractTrait),
+        "clojure" | "clojurescript" => ("defprotocol", FixAction::ExtractTrait),
         _ => ("interface", FixAction::ExtractInterface),
     }
 }
@@ -516,6 +517,8 @@ mod tests {
         assert_eq!(abstraction_for_language("java").0, "interface");
         assert_eq!(abstraction_for_language("python").0, "Protocol");
         assert_eq!(abstraction_for_language("typescript").0, "interface");
+        assert_eq!(abstraction_for_language("clojure").0, "defprotocol");
+        assert_eq!(abstraction_for_language("clojurescript").0, "defprotocol");
         assert_eq!(abstraction_for_language("c").0, "interface");
     }
 
