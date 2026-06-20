@@ -1331,3 +1331,74 @@ pub async fn occurrences_in_scope(
     .fetch_all(pool)
     .await
 }
+
+/// One resolved profile symbol: a `file_symbols` row matched by exact name,
+/// enriched with file path + function-level metrics (PageRank, cyclomatic,
+/// fan-in/out, panic-paths). Used by `profile_ingest` to bridge a profiler's
+/// hot symbols to the static code graph. `panic_paths` doubles as the
+/// missing-preallocation proxy surface — high panic-path + hot is a refactor
+/// signal (the `missing_preallocation` analyzer keys off the same functions).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct ResolvedProfileSymbolRow {
+    pub symbol_id: i64,
+    pub file_id: i64,
+    pub name: String,
+    pub relative_path: String,
+    pub language: String,
+    pub start_line: i32,
+    /// Function-level PageRank from the call-graph cron (0.0 when uncomputed).
+    pub pagerank: Option<f64>,
+    pub cyclomatic: Option<i32>,
+    pub cognitive: Option<i32>,
+    pub fan_in: Option<i32>,
+    pub fan_out: Option<i32>,
+    pub panic_paths: Option<i32>,
+    /// File-level PageRank (fallback centrality when the function-level value
+    /// is absent — e.g. a language without a call-graph backend).
+    pub file_pagerank: Option<f64>,
+}
+
+/// Resolve a batch of (bare) symbol names to their `file_symbols` rows within a
+/// project, joined with `function_metrics` (function-level PageRank / cyclomatic
+/// / fan-in/out / panic-paths) and `file_metrics` (file-level PageRank). A
+/// single symbol name may resolve to multiple rows (overloads / same-named
+/// methods across files); all are returned, ranked by function PageRank then
+/// cyclomatic descending so the caller can take the most-central match.
+///
+/// Pure read. `names` are matched case-sensitively against `file_symbols.name`.
+pub async fn resolve_profile_symbols(
+    pool: &PgPool,
+    project_id: i32,
+    names: &[String],
+) -> Result<Vec<ResolvedProfileSymbolRow>, sqlx::Error> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as::<_, ResolvedProfileSymbolRow>(
+        "SELECT fs.id          AS symbol_id,
+                fs.file_id     AS file_id,
+                fs.name        AS name,
+                f.relative_path AS relative_path,
+                f.language     AS language,
+                fs.start_line  AS start_line,
+                fm.pagerank    AS pagerank,
+                fm.cyclomatic  AS cyclomatic,
+                fm.cognitive   AS cognitive,
+                fm.fan_in      AS fan_in,
+                fm.fan_out     AS fan_out,
+                fm.panic_paths AS panic_paths,
+                flm.pagerank   AS file_pagerank
+         FROM file_symbols fs
+         JOIN indexed_files f       ON fs.file_id = f.id
+         LEFT JOIN function_metrics fm ON fm.function_id = fs.id
+         LEFT JOIN file_metrics flm    ON flm.file_id = fs.file_id
+         WHERE f.project_id = $1
+           AND fs.kind = 'function'
+           AND fs.name = ANY($2::text[])
+         ORDER BY COALESCE(fm.pagerank, 0.0) DESC, COALESCE(fm.cyclomatic, 0) DESC",
+    )
+    .bind(project_id)
+    .bind(names)
+    .fetch_all(pool)
+    .await
+}

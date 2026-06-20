@@ -233,6 +233,29 @@ JSON is summarized into metrics. Indexed + embedded so `experiment_search`/grep 
     }
 
     #[tool(
+        description = "Bridge a profiler's hot symbols to the static code graph: parse an agent-provided \
+profile artifact (perf report stdio table, folded/collapsed flamegraph stacks, or a massif dump) and resolve \
+each hot symbol to file:line joined with its function-level PageRank and complexity (cyclomatic / fan-in/out / \
+panic-paths). Ranks targets by runtime intensity × call-graph centrality × complexity. Read-only — pgmcp parses \
+the text and runs SELECTs; it never runs perf/valgrind. kind = perf | flamegraph | massif."
+    )]
+    async fn profile_ingest(
+        &self,
+        Parameters(params): Parameters<ProfileIngestParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "profile_ingest",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_profile_ingest::tool_profile_ingest(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Render an experiment's structured record to a committed markdown ledger under \
 docs/scientific-ledger/ (with YAML frontmatter carrying the slug join-key). dry_run=true returns the markdown \
 without writing. The structured record is the source of truth; the ledger is the human-readable, indexed view."

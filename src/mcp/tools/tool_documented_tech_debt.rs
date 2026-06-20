@@ -100,6 +100,20 @@ fn stub_patterns() -> &'static [StubPattern] {
             label: "cpp_unreachable_assert",
             severity: "high",
         },
+        // Clojure stub idiom: `(throw (ex-info "not implemented" ...))` or
+        // `(throw (UnsupportedOperationException. ...))`.
+        StubPattern {
+            language: "clojure",
+            pattern: r#"(?im)\(\s*throw\s+\(\s*(?:ex-info\s+["'](?:not\s*implemented|todo|unimplemented)|UnsupportedOperationException)"#,
+            label: "clojure_throw_not_implemented",
+            severity: "high",
+        },
+        StubPattern {
+            language: "clojurescript",
+            pattern: r#"(?im)\(\s*throw\s+\(\s*(?:ex-info\s+["'](?:not\s*implemented|todo|unimplemented)|js/Error\.\s*["'](?:not\s*implemented|todo|unimplemented))"#,
+            label: "cljs_throw_not_implemented",
+            severity: "high",
+        },
     ]
 }
 
@@ -130,6 +144,16 @@ fn deprecation_patterns() -> &'static [DeprecatedPattern] {
         DeprecatedPattern {
             language: "python",
             pattern: r"(?m)warnings\.warn\([^)]*DeprecationWarning|@deprecated\b",
+        },
+        // Clojure marks deprecation via `^:deprecated` metadata or a
+        // `{:deprecated "..."}` attr-map on a var.
+        DeprecatedPattern {
+            language: "clojure",
+            pattern: r#"(?m)\^:deprecated\b|:deprecated\s+(?:true|"[^"]*")"#,
+        },
+        DeprecatedPattern {
+            language: "clojurescript",
+            pattern: r#"(?m)\^:deprecated\b|:deprecated\s+(?:true|"[^"]*")"#,
         },
     ]
 }
@@ -754,5 +778,42 @@ mod tests {
         }];
         let (author, _) = blame_at(&blame, 5);
         assert!(author.is_none());
+    }
+
+    /// Every stub/deprecation pattern must compile; the inner loops use
+    /// `.expect()` so a malformed pattern would panic in production.
+    #[test]
+    fn all_stub_and_deprecation_patterns_compile() {
+        for sp in stub_patterns() {
+            Regex::new(sp.pattern).unwrap_or_else(|e| panic!("stub pattern {} bad: {e}", sp.label));
+        }
+        for dp in deprecation_patterns() {
+            Regex::new(dp.pattern)
+                .unwrap_or_else(|e| panic!("deprecation pattern for {} bad: {e}", dp.language));
+        }
+    }
+
+    #[test]
+    fn clojure_stub_pattern_matches_throw_not_implemented() {
+        let sp = stub_patterns()
+            .iter()
+            .find(|sp| sp.language == "clojure")
+            .expect("clojure stub pattern present");
+        let re = Regex::new(sp.pattern).expect("compile");
+        assert!(re.is_match("(defn foo [] (throw (ex-info \"not implemented\" {})))"));
+        assert!(re.is_match("(throw (UnsupportedOperationException. \"x\"))"));
+        assert!(!re.is_match("(defn foo [] (println \"ok\"))"));
+    }
+
+    #[test]
+    fn clojure_deprecation_pattern_matches_metadata() {
+        let dp = deprecation_patterns()
+            .iter()
+            .find(|dp| dp.language == "clojure")
+            .expect("clojure deprecation pattern present");
+        let re = Regex::new(dp.pattern).expect("compile");
+        assert!(re.is_match("(defn ^:deprecated old-api [] nil)"));
+        assert!(re.is_match("(def x {:deprecated \"use y\"})"));
+        assert!(!re.is_match("(defn current-api [] nil)"));
     }
 }

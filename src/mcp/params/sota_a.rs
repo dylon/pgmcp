@@ -279,6 +279,38 @@ pub struct LockOrderGraphParams {
     pub resource_key: Option<String>,
 }
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RuntimeDeadlockReconcileParams {
+    #[schemars(description = "Project name (required)")]
+    pub project: String,
+    #[schemars(
+        description = "The runtime trace text captured by the agent (off-CPU folded stack, perf script dump, or gdb backtrace)"
+    )]
+    pub trace_text: String,
+    #[schemars(description = "Trace format: offcpu_folded | perf_script | gdb_bt")]
+    pub format: String,
+    #[schemars(
+        description = "Max call hops for the static interprocedural lock graph (default 5)"
+    )]
+    pub max_call_depth: Option<u32>,
+    #[schemars(description = "Drop static edges below this resource-key confidence (default 0.3)")]
+    pub confidence_floor: Option<f32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TraceMapToCodeParams {
+    #[schemars(description = "Project name to resolve frames against")]
+    pub project: String,
+    #[schemars(
+        description = "The backtrace text (gdb `bt`, off-CPU folded stack, or a newline/`;`-separated frame list)"
+    )]
+    pub backtrace: String,
+    #[schemars(
+        description = "Backtrace format: gdb_bt | folded | auto (default auto — sniff gdb `#N` frames vs `;`-folded vs newline list)"
+    )]
+    pub format: Option<String>,
+    #[schemars(description = "Max frames to resolve (default 64, max 512)")]
+    pub limit: Option<i32>,
+}
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SyncSkeletonParams {
     #[schemars(description = "Project name (required)")]
     pub project: String,

@@ -10,6 +10,7 @@
 
 pub mod findings;
 pub mod severity;
+pub mod trace_reconcile;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 

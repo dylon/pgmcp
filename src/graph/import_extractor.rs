@@ -61,6 +61,28 @@ static C_INCLUDE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?m)^\s*#\s*include\s*[<"]([\w/._-]+)[>"]"#).expect("invalid regex")
 });
 
+/// Clojure namespace tokens. We don't parse the `ns` form structurally here
+/// (that's the tree-sitter backend's job in `src/parsing/clojure.rs`); the
+/// fallback simply harvests every bracketed/quoted namespace symbol inside a
+/// `:require` / `:use` / `:import` clause or a top-level `(require '…)`. A
+/// Clojure namespace symbol is dotted, may contain hyphens, and ends each
+/// segment in an identifier char. We match the leading symbol of a vector spec
+/// (`[a.b.c :as x]`), a bare symbol (`a.b.c`), or a quoted symbol (`'a.b.c`).
+static CLOJURE_NS_SYMBOL: LazyLock<Regex> = LazyLock::new(|| {
+    // A namespace symbol: starts with a letter, contains alnum / `.` / `-` /
+    // `_` / `*` / `?` / `!`, and has at least one `.` OR stands alone. We keep
+    // it permissive but anchor on the contexts via CLOJURE_REQUIRE_BLOCK.
+    Regex::new(r"[A-Za-z][A-Za-z0-9_.*?!+-]*").expect("invalid regex")
+});
+/// Matches a `(:require …)`, `(:use …)`, `(:import …)` clause body, or a
+/// top-level `(require …)` / `(use …)` / `(import …)` form, capturing the body
+/// up to the matching paren depth heuristically (a single non-nested level,
+/// which covers the common `ns` layout).
+static CLOJURE_REQUIRE_BLOCK: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?s)\(\s*:?(?:require|use|import)\b([^()]*(?:\([^()]*\)[^()]*)*)")
+        .expect("invalid regex")
+});
+
 /// Extract all imports from source content for a given language.
 pub fn extract_imports(content: &str, language: &str) -> Vec<RawImport> {
     match language {
@@ -70,6 +92,7 @@ pub fn extract_imports(content: &str, language: &str) -> Vec<RawImport> {
         "go" => extract_go_imports(content),
         "java" | "kotlin" => extract_java_imports(content),
         "c" | "cpp" | "c++" | "header" => extract_c_imports(content),
+        "clojure" | "clojurescript" => extract_clojure_imports(content),
         _ => Vec::new(),
     }
 }
@@ -198,6 +221,128 @@ fn extract_c_imports(content: &str) -> Vec<RawImport> {
     imports
 }
 
+/// Clojure / ClojureScript keywords that appear inside a `:require` / `:import`
+/// vector and must NOT be treated as namespace symbols.
+const CLOJURE_SPEC_KEYWORDS: &[&str] = &[
+    ":as",
+    ":as-alias",
+    ":refer",
+    ":refer-macros",
+    ":rename",
+    ":only",
+    ":exclude",
+    ":include-macros",
+    ":reload",
+    ":reload-all",
+    ":verbose",
+    "true",
+    "false",
+    "nil",
+];
+
+fn extract_clojure_imports(content: &str) -> Vec<RawImport> {
+    let mut imports = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for block in CLOJURE_REQUIRE_BLOCK.captures_iter(content) {
+        let body = match block.get(1) {
+            Some(m) => m.as_str(),
+            None => continue,
+        };
+        // The first symbol of each vector spec (or a bare/quoted symbol) is the
+        // namespace. We harvest every namespace-looking token, then filter out
+        // the spec keywords (`:as`, …) and the `:refer`'d names that follow a
+        // vector. A `:refer [a b]` list's `a`/`b` are var names, not namespaces;
+        // they live inside a nested `[...]` after `:refer`, which our token
+        // scanner would otherwise pick up. We drop tokens appearing after a
+        // `:refer` / `:only` / `:rename` keyword within the same spec by
+        // splitting on those markers.
+        for spec in split_clojure_specs(body) {
+            // Within one spec, take only the leading symbol (before any keyword).
+            let head = spec
+                .split_whitespace()
+                .find(|t| !t.is_empty())
+                .unwrap_or("");
+            // Strip a leading quote / vector bracket and a trailing bracket.
+            let cleaned = head
+                .trim_start_matches('\'')
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim_matches('"');
+            if cleaned.is_empty() {
+                continue;
+            }
+            // Validate it's a namespace symbol and not a keyword/number.
+            if CLOJURE_SPEC_KEYWORDS.contains(&cleaned)
+                || cleaned.starts_with(':')
+                || !CLOJURE_NS_SYMBOL.is_match(cleaned)
+            {
+                continue;
+            }
+            // A pure number or single punctuation is not a namespace.
+            if cleaned.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if seen.insert(cleaned.to_string()) {
+                imports.push(RawImport {
+                    raw_path: cleaned.to_string(),
+                    kind: "require".to_string(),
+                });
+            }
+        }
+    }
+
+    imports
+}
+
+/// Split a `:require`/`:import` clause body into individual specs. Each spec is
+/// either a bracketed vector `[ns …]`, a quoted symbol `'ns`, or a bare symbol
+/// `ns`. We tokenize by splitting on the vector brackets while keeping the
+/// leading symbol of each bracketed group, plus the bare symbols between them.
+fn split_clojure_specs(body: &str) -> Vec<String> {
+    let mut specs: Vec<String> = Vec::new();
+    let mut depth = 0i32;
+    let mut current = String::new();
+    for ch in body.chars() {
+        match ch {
+            '[' | '(' => {
+                if depth == 0 {
+                    // Flush any bare symbols accumulated at top level.
+                    flush_bare_specs(&current, &mut specs);
+                    current.clear();
+                }
+                depth += 1;
+            }
+            ']' | ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    // `current` holds the inside of a vector spec.
+                    specs.push(current.trim().to_string());
+                    current.clear();
+                }
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+    if depth == 0 && !current.trim().is_empty() {
+        flush_bare_specs(&current, &mut specs);
+    }
+    specs
+}
+
+/// Treat each whitespace-separated bare token (outside any bracket) as its own
+/// single-symbol spec, so `(:require a.b c.d)` yields two specs.
+fn flush_bare_specs(chunk: &str, specs: &mut Vec<String>) {
+    for tok in chunk.split_whitespace() {
+        let t = tok.trim_start_matches('\'');
+        if !t.is_empty() && !t.starts_with(':') {
+            specs.push(t.to_string());
+        }
+    }
+}
+
 // ============================================================================
 // Import resolution
 // ============================================================================
@@ -213,6 +358,7 @@ pub fn resolve_import_candidates(
         "rust" => resolve_rust_import(import, source_relative_path),
         "python" => resolve_python_import(import, source_relative_path),
         "javascript" | "typescript" => resolve_js_import(import, source_relative_path),
+        "clojure" | "clojurescript" => resolve_clojure_import(import, source_relative_path),
         _ => Vec::new(),
     }
 }
@@ -299,6 +445,64 @@ fn resolve_js_import(import: &RawImport, source_relative_path: &str) -> Vec<Stri
     } else {
         // External package
         Vec::new()
+    }
+}
+
+/// Resolve a Clojure namespace symbol (`a.b.c`) to candidate source files.
+///
+/// Clojure maps namespace dots to directory separators and munges hyphens in
+/// the namespace into underscores in the file path (`my-app.core` →
+/// `my_app/core.clj`). We derive the classpath source root from the source
+/// file's own path (the FIRST `src` component, mirroring `rust_crate_src_root`)
+/// so multi-module / Leiningen-profile layouts resolve, and emit `.clj`,
+/// `.cljs`, and `.cljc` candidates. Java-class `:import` targets (containing an
+/// uppercase class segment) are skipped — they resolve to the JDK / jars, not
+/// project files.
+fn resolve_clojure_import(import: &RawImport, source_relative_path: &str) -> Vec<String> {
+    let ns = import.raw_path.trim();
+    if ns.is_empty() {
+        return Vec::new();
+    }
+    // CLJS string-module requires (e.g. `"react"`) and Java packages are not
+    // project files; a Java import like `java.util.Date` has an uppercase final
+    // segment. Skip those — they're external.
+    if ns.contains('/') {
+        // Munged already or a JS module path with slashes — not our convention.
+        return Vec::new();
+    }
+    let segments: Vec<String> = ns.split('.').map(|seg| seg.replace('-', "_")).collect();
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    // Heuristic: a trailing PascalCase segment indicates a Java class import
+    // (`java.util.Date`), which is not a project namespace file.
+    if let Some(last) = ns.rsplit('.').next()
+        && last.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+    {
+        return Vec::new();
+    }
+    let src_root = clojure_src_root(source_relative_path);
+    let rel = segments.join("/");
+    let base = if src_root.is_empty() {
+        rel
+    } else {
+        format!("{}/{}", src_root, rel)
+    };
+    vec![
+        format!("{}.clj", base),
+        format!("{}.cljs", base),
+        format!("{}.cljc", base),
+    ]
+}
+
+/// Derive the classpath source root for a Clojure file. Uses the first `src`
+/// path component (so `modules/foo/src/bar/core.clj` → `modules/foo/src`);
+/// falls back to `"src"`.
+fn clojure_src_root(source_relative_path: &str) -> String {
+    let parts: Vec<&str> = source_relative_path.split('/').collect();
+    match parts.iter().position(|&p| p == "src") {
+        Some(idx) => parts[..=idx].join("/"),
+        None => "src".to_string(),
     }
 }
 
@@ -473,6 +677,62 @@ mod tests {
         let paths: Vec<&str> = imports.iter().map(|i| i.raw_path.as_str()).collect();
         assert!(paths.contains(&"stdio.h"));
         assert!(paths.contains(&"local.h"));
+    }
+
+    #[test]
+    fn clojure_ns_require_captures_namespaces() {
+        let src = r#"
+(ns my.app
+  (:require [clojure.string :as str :refer [join]]
+            [clojure.set]
+            ["react" :as react])
+  (:import java.util.Date))
+"#;
+        let imports = extract_imports(src, "clojure");
+        let paths: Vec<&str> = imports.iter().map(|i| i.raw_path.as_str()).collect();
+        assert!(paths.contains(&"clojure.string"), "imports: {:?}", paths);
+        assert!(paths.contains(&"clojure.set"), "imports: {:?}", paths);
+        // :refer'd var `join` must NOT be captured as a namespace.
+        assert!(!paths.contains(&"join"), "leaked :refer var: {:?}", paths);
+        // `:as` keyword must not appear.
+        assert!(!paths.iter().any(|p| p.starts_with(':')));
+    }
+
+    #[test]
+    fn clojure_top_level_require_captured() {
+        let src = "(require '[clojure.test :as t])\n(require 'clojure.pprint)\n";
+        let imports = extract_imports(src, "clojurescript");
+        let paths: Vec<&str> = imports.iter().map(|i| i.raw_path.as_str()).collect();
+        assert!(paths.contains(&"clojure.test"), "imports: {:?}", paths);
+        assert!(paths.contains(&"clojure.pprint"), "imports: {:?}", paths);
+    }
+
+    #[test]
+    fn clojure_resolve_munges_hyphens_and_emits_extensions() {
+        let imp = RawImport {
+            raw_path: "my-app.core-utils".to_string(),
+            kind: "require".to_string(),
+        };
+        let candidates = resolve_import_candidates(&imp, "src/my_app/main.clj", "clojure");
+        assert!(
+            candidates.contains(&"src/my_app/core_utils.clj".to_string()),
+            "candidates: {:?}",
+            candidates
+        );
+        assert!(candidates.contains(&"src/my_app/core_utils.cljc".to_string()));
+        assert!(candidates.contains(&"src/my_app/core_utils.cljs".to_string()));
+    }
+
+    #[test]
+    fn clojure_resolve_skips_java_classes() {
+        // A Java-class import (uppercase final segment) is external — no project
+        // file candidates.
+        let imp = RawImport {
+            raw_path: "java.util.Date".to_string(),
+            kind: "require".to_string(),
+        };
+        let candidates = resolve_import_candidates(&imp, "src/app/core.clj", "clojure");
+        assert!(candidates.is_empty(), "got: {:?}", candidates);
     }
 
     #[test]

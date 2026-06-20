@@ -957,6 +957,7 @@ impl McpServer {
             "experiment_list"               => experiment_list(ExperimentListParams) in tool_experiments,
             "experiment_timeline"           => experiment_timeline(ExperimentTimelineParams) in tool_experiments,
             "experiment_log_artifact"       => experiment_log_artifact(ExperimentLogArtifactParams) in tool_experiments,
+            "profile_ingest"                => profile_ingest(ProfileIngestParams),
             "experiment_render_ledger"      => experiment_render_ledger(ExperimentRenderLedgerParams) in tool_experiments,
             // JSON data tables (share the data_tables module).
             // Agent feedback + voting (ADR-023).
@@ -1074,6 +1075,8 @@ impl McpServer {
             "deadlock_cycles"        => deadlock_cycles(DeadlockCyclesParams),
             "channel_deadlock"       => channel_deadlock(ChannelDeadlockParams),
             "lock_order_graph"       => lock_order_graph(LockOrderGraphParams),
+            "runtime_deadlock_reconcile" => runtime_deadlock_reconcile(RuntimeDeadlockReconcileParams),
+            "trace_map_to_code"      => trace_map_to_code(TraceMapToCodeParams),
             "sync_skeleton"          => sync_skeleton(SyncSkeletonParams),
             "concurrency_bottlenecks" => concurrency_bottlenecks(ConcurrencyBottlenecksParams),
             "concurrency_forecast"   => concurrency_forecast(ConcurrencyForecastParams),

@@ -25,9 +25,14 @@ pub async fn tool_unprotected_routes(
     let pool = pool_or_err(ctx)?;
     let limit = params.limit.unwrap_or(50);
 
-    // Frameworks: axum (.route("/x", post(...))), Express (app.post), Flask (@app.route methods=POST), Spring (@PostMapping)
+    // Frameworks: axum (.route("/x", post(...))), Express (app.post), Flask
+    // (@app.route methods=POST), Spring (@PostMapping), and Clojure Ring /
+    // Compojure (`(POST "/x" ...)`, `(defroutes ...)`, `(context "/api" ...)`).
+    // The Compojure verbs are uppercase macros at the head of a list form, so
+    // they're anchored on `(VERB` + whitespace + a string/binding to avoid
+    // matching the same tokens used as plain words.
     let route_re = Regex::new(
-        r"(?m)(\.route\([^)]*post\(|\.route\([^)]*put\(|\.route\([^)]*delete\(|\.route\([^)]*patch\(|app\.(post|put|delete|patch)\(|@(?:Post|Put|Delete|Patch)Mapping|methods=\[?['\x22](POST|PUT|DELETE|PATCH))"
+        r#"(?m)(\.route\([^)]*post\(|\.route\([^)]*put\(|\.route\([^)]*delete\(|\.route\([^)]*patch\(|app\.(post|put|delete|patch)\(|@(?:Post|Put|Delete|Patch)Mapping|methods=\[?['\x22](POST|PUT|DELETE|PATCH)|\(\s*(?:GET|POST|PUT|DELETE|PATCH|ANY)\s+["]|\(\s*(?:defroutes|context)\s)"#
     ).expect("route regex");
     let auth_re = Regex::new(
         r"(?m)(require_auth|require_login|login_required|verify_jwt|require_role|@authenticated|@requires_auth|AuthGuard|RequireAuth|auth\.|@PreAuthorize)"
@@ -98,4 +103,44 @@ pub async fn tool_unprotected_routes(
         "http_handler_symbols": http_handler_symbols,
         "guidance": "Routes with mutating verbs (POST/PUT/DELETE/PATCH) in files lacking visible auth middleware are review candidates. A complete check requires per-route middleware-stack inspection beyond regex."
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use regex::Regex;
+
+    /// The route regex is built inline in the tool body; this mirror keeps the
+    /// pattern under test so a malformed alternation fails CI rather than
+    /// panicking a worker (the tool uses `.expect("route regex")`).
+    fn route_re() -> Regex {
+        Regex::new(
+            r#"(?m)(\.route\([^)]*post\(|\.route\([^)]*put\(|\.route\([^)]*delete\(|\.route\([^)]*patch\(|app\.(post|put|delete|patch)\(|@(?:Post|Put|Delete|Patch)Mapping|methods=\[?['\x22](POST|PUT|DELETE|PATCH)|\(\s*(?:GET|POST|PUT|DELETE|PATCH|ANY)\s+["]|\(\s*(?:defroutes|context)\s)"#,
+        )
+        .expect("route regex compiles")
+    }
+
+    #[test]
+    fn matches_compojure_verbs() {
+        let re = route_re();
+        assert!(re.is_match(r#"(POST "/users" req (create-user req))"#));
+        assert!(re.is_match(r#"(GET "/users/:id" [id] (get-user id))"#));
+        assert!(re.is_match(r#"(DELETE "/users/:id" [id] (delete-user id))"#));
+        assert!(re.is_match(r#"(defroutes app-routes (GET "/" [] "ok"))"#));
+        assert!(re.is_match(r#"(context "/api" [] routes)"#));
+    }
+
+    #[test]
+    fn does_not_match_plain_words() {
+        let re = route_re();
+        // A bare symbol named `post` or the word GET in prose must not match.
+        assert!(!re.is_match("(let [post 3] post)"));
+        assert!(!re.is_match(";; GET the value from the map"));
+    }
+
+    #[test]
+    fn still_matches_axum_and_spring() {
+        let re = route_re();
+        assert!(re.is_match(r#".route("/x", post(handler))"#));
+        assert!(re.is_match("@PostMapping(\"/x\")"));
+    }
 }

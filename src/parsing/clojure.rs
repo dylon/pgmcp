@@ -21,7 +21,13 @@ use std::sync::OnceLock;
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator, Tree};
 
 use crate::parsing::backend::LanguageBackend;
-use crate::parsing::symbols::{Import, Symbol, SymbolKind, SymbolRefKind, SymbolReference};
+use crate::parsing::complexity;
+use crate::parsing::function_metrics::{
+    CognitiveIncrement, CognitiveKind, FunctionMetrics, ScoringInput,
+};
+use crate::parsing::symbols::{
+    Import, Parameter, Symbol, SymbolKind, SymbolRefKind, SymbolReference,
+};
 
 #[derive(Clone, Copy)]
 enum Variant {
@@ -277,6 +283,17 @@ impl LanguageBackend for ClojureBackend {
                 }
             }
 
+            // Shadow-ASR: populate `parameters` from the arglist vector for
+            // `defn` / `defn-` / `defmethod`. Types stay empty (Clojure is
+            // dynamically typed); we capture the parameter NAMES in source
+            // order. Multi-arity `defn`s use the FIRST arity's arglist (the
+            // canonical signature surface).
+            let parameters = if matches!(head_text.as_str(), "defn" | "defn-" | "defmethod") {
+                extract_clojure_params(def.node, content)
+            } else {
+                Vec::new()
+            };
+
             out.push(Symbol {
                 file_id: 0,
                 kind,
@@ -286,6 +303,7 @@ impl LanguageBackend for ClojureBackend {
                 visibility,
                 signature: Some(first_line(content, def.node)),
                 name,
+                parameters,
                 ..Default::default()
             });
         }
@@ -355,6 +373,347 @@ impl LanguageBackend for ClojureBackend {
         }
         out
     }
+
+    fn extract_function_metrics(&self, content: &str) -> Vec<FunctionMetrics> {
+        let Some(tree) = parse(content) else {
+            return Vec::new();
+        };
+        let mut out: Vec<FunctionMetrics> = Vec::new();
+        collect_clojure_function_metrics(tree.root_node(), content, &mut out);
+        out
+    }
+}
+
+// ============================================================================
+// Shadow-ASR: parameter extraction (Group 1d)
+// ============================================================================
+
+/// Clojure branching / binding head symbols that contribute a decision point.
+/// `if`/`when`/`when-not`/`cond`/`condp`/`case`/`and`/`or`/`recur` per the plan.
+const CLOJURE_DECISION_HEADS: &[&str] = &[
+    "if",
+    "if-not",
+    "if-let",
+    "if-some",
+    "when",
+    "when-not",
+    "when-let",
+    "when-some",
+    "when-first",
+    "cond",
+    "cond->",
+    "cond->>",
+    "condp",
+    "case",
+    "and",
+    "or",
+    "recur",
+];
+
+/// Extract parameter NAMES from a `defn`/`defn-`/`defmethod`'s arglist vector.
+///
+/// Finds the first `vec_lit` among the def's named children (the first arity's
+/// arglist), then collects each `sym_lit` as a positional parameter. A `&`
+/// marks the following symbol as variadic (Clojure rest arg). Destructuring
+/// forms (`[{:keys [a b]} c]`) are summarized: a map/vector binding becomes one
+/// positional `Parameter` with `name=None` (anonymous destructure) so the arity
+/// count stays correct without inventing names.
+fn extract_clojure_params(def_node: Node<'_>, src: &str) -> Vec<Parameter> {
+    // Locate the arglist: for `defn name [..]` it's the first vec_lit after the
+    // name; for `defmethod name dispatch [..]` it's still the first vec_lit.
+    let mut walker = def_node.walk();
+    let arglist = def_node
+        .named_children(&mut walker)
+        .find(|c| c.kind() == "vec_lit");
+    let Some(arglist) = arglist else {
+        return Vec::new();
+    };
+
+    let mut params: Vec<Parameter> = Vec::new();
+    let mut next_is_variadic = false;
+    let mut position: u32 = 0;
+    let mut w = arglist.walk();
+    for child in arglist.named_children(&mut w) {
+        match child.kind() {
+            "sym_lit" => {
+                let text = node_text(child, src);
+                if text == "&" {
+                    // Clojure rest-arg marker; the next symbol is variadic.
+                    next_is_variadic = true;
+                    continue;
+                }
+                // `_` is the conventional ignored binding — keep it as a named
+                // positional so arity is preserved.
+                params.push(Parameter {
+                    position,
+                    name: Some(text.to_string()),
+                    is_variadic: next_is_variadic,
+                    ..Default::default()
+                });
+                next_is_variadic = false;
+                position += 1;
+            }
+            // Destructuring binding (`{:keys [...]}` or `[a b]`) — one
+            // anonymous positional parameter.
+            "map_lit" | "vec_lit" => {
+                params.push(Parameter {
+                    position,
+                    name: None,
+                    is_variadic: next_is_variadic,
+                    type_raw: Some(node_text(child, src).chars().take(60).collect()),
+                    ..Default::default()
+                });
+                next_is_variadic = false;
+                position += 1;
+            }
+            _ => {}
+        }
+    }
+    params
+}
+
+// ============================================================================
+// extract_function_metrics — recursive walker (Group 1d)
+// ============================================================================
+
+/// Walk every `defn`/`defn-`/`defmethod`/`defmacro` form and score it.
+fn collect_clojure_function_metrics(node: Node<'_>, src: &str, out: &mut Vec<FunctionMetrics>) {
+    if node.kind() == "list_lit"
+        && let Some(head) = node.named_child(0)
+        && head.kind() == "sym_lit"
+    {
+        let head_text = node_text(head, src);
+        if matches!(head_text, "defn" | "defn-" | "defmethod" | "defmacro")
+            && let Some(name_node) = node.named_child(1)
+            && name_node.kind() == "sym_lit"
+        {
+            let name = node_text(name_node, src).to_string();
+            if !name.is_empty() {
+                out.push(score_clojure_function(&name, node, src));
+            }
+        }
+    }
+    let mut walker = node.walk();
+    for child in node.named_children(&mut walker) {
+        collect_clojure_function_metrics(child, src, out);
+    }
+}
+
+/// Score one Clojure function form.
+fn score_clojure_function(name: &str, form: Node<'_>, src: &str) -> FunctionMetrics {
+    use std::collections::HashMap;
+    let mut decision_points: u32 = 0;
+    let mut cognitive_increments: Vec<CognitiveIncrement> = Vec::new();
+    let mut operators: HashMap<&'static str, u32> = HashMap::new();
+    let mut operands: HashMap<String, u32> = HashMap::new();
+    let mut npath_factors: Vec<u64> = Vec::new();
+    let mut panic_paths: u32 = 0;
+
+    walk_clojure_form(
+        form,
+        src,
+        0,
+        &mut decision_points,
+        &mut cognitive_increments,
+        &mut operators,
+        &mut operands,
+        &mut npath_factors,
+        &mut panic_paths,
+        name,
+        true, // is the def form root — don't recurse into nested defn rows
+    );
+
+    let start_line = line_of(form);
+    let end_line = end_line_of(form);
+    let source_lines = end_line.saturating_sub(start_line) + 1;
+    let input = ScoringInput {
+        name,
+        start_line,
+        end_line,
+        decision_points,
+        cognitive_increments,
+        operators,
+        operands,
+        npath_factors,
+        source_lines,
+        comment_lines: 0,
+        panic_paths,
+        unsafe_blocks: 0,
+    };
+    complexity::score(&input)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_clojure_form(
+    node: Node<'_>,
+    src: &str,
+    depth: u8,
+    decision_points: &mut u32,
+    cognitive_increments: &mut Vec<CognitiveIncrement>,
+    operators: &mut std::collections::HashMap<&'static str, u32>,
+    operands: &mut std::collections::HashMap<String, u32>,
+    npath_factors: &mut Vec<u64>,
+    panic_paths: &mut u32,
+    fn_name: &str,
+    is_root: bool,
+) {
+    let kind = node.kind();
+
+    // Halstead leaf classification. In Clojure the "operators" are the head
+    // symbols of list forms; everything else (other symbols, literals,
+    // keywords) is an operand. We approximate by treating recognized special
+    // forms / decision heads as operators and the rest as operands at the leaf.
+    if node.child_count() == 0 || matches!(kind, "sym_lit" | "kwd_lit" | "num_lit" | "str_lit") {
+        let text = node_text(node, src);
+        if !text.is_empty() {
+            if let Some(op) = match_clojure_operator(text) {
+                *operators.entry(op).or_insert(0) += 1;
+            } else {
+                *operands.entry(text.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    let mut new_depth = depth;
+    // Inspect list forms' head symbol for decisions / throw / recursion.
+    if kind == "list_lit"
+        && let Some(head) = node.named_child(0)
+        && head.kind() == "sym_lit"
+    {
+        let head_text = node_text(head, src);
+
+        // Stop at nested `defn`/`defmethod`/`defmacro` so they get their own
+        // metrics row (but always descend through the root form itself).
+        if !is_root && matches!(head_text, "defn" | "defn-" | "defmethod" | "defmacro") {
+            return;
+        }
+
+        if CLOJURE_DECISION_HEADS.contains(&head_text) {
+            *decision_points = decision_points.saturating_add(1);
+            // `cond`/`condp`/`case` fan out per clause-pair; approximate with
+            // the number of branch children. `and`/`or` are logical sequences.
+            match head_text {
+                "and" | "or" => {
+                    cognitive_increments.push(CognitiveIncrement {
+                        depth,
+                        kind: CognitiveKind::LogicalSequence,
+                    });
+                    npath_factors.push(2);
+                }
+                "recur" => {
+                    cognitive_increments.push(CognitiveIncrement {
+                        depth,
+                        kind: CognitiveKind::BreakInFlow,
+                    });
+                }
+                "cond" | "condp" | "case" => {
+                    // Each pair of children after the head is one branch; the
+                    // named-child count gives a reasonable branch estimate.
+                    let branches = (node.named_child_count().saturating_sub(1) / 2).max(1) as u64;
+                    cognitive_increments.push(CognitiveIncrement {
+                        depth,
+                        kind: CognitiveKind::NestedCondition,
+                    });
+                    npath_factors.push(branches.max(2));
+                    new_depth = depth.saturating_add(1);
+                }
+                _ => {
+                    cognitive_increments.push(CognitiveIncrement {
+                        depth,
+                        kind: CognitiveKind::NestedCondition,
+                    });
+                    npath_factors.push(2);
+                    new_depth = depth.saturating_add(1);
+                }
+            }
+        } else if matches!(head_text, "throw") {
+            *panic_paths = panic_paths.saturating_add(1);
+        } else if head_text == fn_name {
+            // Direct self-call recursion.
+            cognitive_increments.push(CognitiveIncrement {
+                depth,
+                kind: CognitiveKind::Recursion,
+            });
+        }
+    }
+
+    let mut walker = node.walk();
+    for child in node.named_children(&mut walker) {
+        walk_clojure_form(
+            child,
+            src,
+            new_depth,
+            decision_points,
+            cognitive_increments,
+            operators,
+            operands,
+            npath_factors,
+            panic_paths,
+            fn_name,
+            false,
+        );
+    }
+}
+
+/// Recognize Clojure head symbols / special forms classified as operators for
+/// the Halstead η1 universe.
+fn match_clojure_operator(s: &str) -> Option<&'static str> {
+    const CLOJURE_OPERATOR_HEADS: &[&str] = &[
+        "if",
+        "if-not",
+        "if-let",
+        "if-some",
+        "when",
+        "when-not",
+        "when-let",
+        "when-some",
+        "cond",
+        "cond->",
+        "cond->>",
+        "condp",
+        "case",
+        "and",
+        "or",
+        "not",
+        "recur",
+        "loop",
+        "let",
+        "letfn",
+        "fn",
+        "fn*",
+        "do",
+        "doseq",
+        "dotimes",
+        "for",
+        "defn",
+        "defn-",
+        "defmethod",
+        "defmacro",
+        "defmulti",
+        "def",
+        "ns",
+        "throw",
+        "try",
+        "catch",
+        "finally",
+        "->",
+        "->>",
+        "as->",
+        "some->",
+        "some->>",
+        "=",
+        "==",
+        "not=",
+        "<",
+        ">",
+        "<=",
+        ">=",
+        "+",
+        "-",
+        "*",
+        "/",
+    ];
+    CLOJURE_OPERATOR_HEADS.iter().copied().find(|t| *t == s)
 }
 
 /// Walk an `(ns name (:require ...) (:import ...))` form, emitting per-spec rows.
@@ -637,5 +996,118 @@ mod tests {
     fn language_names() {
         assert_eq!(CLOJURE_BACKEND.language_name(), "clojure");
         assert_eq!(CLOJURESCRIPT_BACKEND.language_name(), "clojurescript");
+    }
+
+    // ========================================================================
+    // Shadow-ASR parameter extraction + function metrics (Group 1d)
+    // ========================================================================
+
+    #[test]
+    fn defn_params_populate_names() {
+        let src = "(defn greet [greeting name] (str greeting \" \" name))\n";
+        let syms = CLOJURE_BACKEND.extract_symbols(src);
+        let greet = syms.iter().find(|s| s.name == "greet").expect("greet");
+        assert_eq!(greet.parameters.len(), 2, "params: {:?}", greet.parameters);
+        assert_eq!(greet.parameters[0].name.as_deref(), Some("greeting"));
+        assert_eq!(greet.parameters[1].name.as_deref(), Some("name"));
+        // Types stay empty (dynamic typing).
+        assert!(greet.parameters[0].type_raw.is_none());
+    }
+
+    #[test]
+    fn defn_variadic_rest_arg_flagged() {
+        let src = "(defn f [a & rest] rest)\n";
+        let syms = CLOJURE_BACKEND.extract_symbols(src);
+        let f = syms.iter().find(|s| s.name == "f").expect("f");
+        // `&` is not a parameter; `a` + `rest` are, and `rest` is variadic.
+        assert_eq!(f.parameters.len(), 2, "params: {:?}", f.parameters);
+        assert_eq!(f.parameters[0].name.as_deref(), Some("a"));
+        assert_eq!(f.parameters[1].name.as_deref(), Some("rest"));
+        assert!(f.parameters[1].is_variadic);
+    }
+
+    #[test]
+    fn defn_destructuring_is_anonymous_positional() {
+        let src = "(defn handle [{:keys [x y]} z] (+ x y z))\n";
+        let syms = CLOJURE_BACKEND.extract_symbols(src);
+        let h = syms.iter().find(|s| s.name == "handle").expect("handle");
+        // Two positional params: a destructure (anonymous) and `z`.
+        assert_eq!(h.parameters.len(), 2, "params: {:?}", h.parameters);
+        assert!(h.parameters[0].name.is_none(), "destructure is anonymous");
+        assert_eq!(h.parameters[1].name.as_deref(), Some("z"));
+    }
+
+    #[test]
+    fn defmethod_params_populate() {
+        let src = "(defmethod area :circle [shape] (* 3.14 (:r shape)))\n";
+        let syms = CLOJURESCRIPT_BACKEND.extract_symbols(src);
+        let area = syms.iter().find(|s| s.name == "area").expect("area");
+        assert_eq!(area.parameters.len(), 1, "params: {:?}", area.parameters);
+        assert_eq!(area.parameters[0].name.as_deref(), Some("shape"));
+    }
+
+    #[test]
+    fn cyclomatic_empty_defn_is_one() {
+        let src = "(defn noop [] nil)\n";
+        let m = CLOJURE_BACKEND.extract_function_metrics(src);
+        assert_eq!(m.len(), 1, "metrics: {:?}", m);
+        assert_eq!(m[0].name, "noop");
+        assert_eq!(m[0].cyclomatic, 1);
+    }
+
+    #[test]
+    fn cyclomatic_counts_if_when_cond() {
+        let src = r#"
+(defn classify [x]
+  (if (> x 0)
+    (when (even? x)
+      (cond
+        (= x 2) :two
+        (= x 4) :four
+        :else :other))
+    :negative))
+"#;
+        let m = CLOJURE_BACKEND.extract_function_metrics(src);
+        assert_eq!(m.len(), 1);
+        // if (+1), when (+1), cond (+1) → at least 3 decision points → CC >= 4.
+        assert!(m[0].cyclomatic >= 4, "got CC = {}", m[0].cyclomatic);
+    }
+
+    #[test]
+    fn cyclomatic_counts_and_or() {
+        let src = "(defn check [a b c] (and a (or b c)))\n";
+        let m = CLOJURE_BACKEND.extract_function_metrics(src);
+        assert_eq!(m.len(), 1);
+        // and (+1), or (+1) → CC >= 3.
+        assert!(m[0].cyclomatic >= 3, "got CC = {}", m[0].cyclomatic);
+    }
+
+    #[test]
+    fn throw_counts_as_panic_path() {
+        let src = "(defn guard [x] (if (neg? x) (throw (ex-info \"bad\" {})) x))\n";
+        let m = CLOJURE_BACKEND.extract_function_metrics(src);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].panic_paths, 1, "metrics: {:?}", m[0]);
+    }
+
+    #[test]
+    fn nested_defns_score_independently() {
+        let src = r#"
+(defn outer [x] (if x 1 0))
+(defn inner [y] (when y (or y 2)))
+"#;
+        let m = CLOJURE_BACKEND.extract_function_metrics(src);
+        let names: Vec<&str> = m.iter().map(|x| x.name.as_str()).collect();
+        assert!(names.contains(&"outer"), "names: {:?}", names);
+        assert!(names.contains(&"inner"));
+        let outer = m.iter().find(|x| x.name == "outer").expect("outer");
+        assert_eq!(outer.cyclomatic, 2); // one if
+    }
+
+    #[test]
+    fn metrics_on_garbage_no_panic() {
+        for s in ["", "(defn", "((", "   "] {
+            let _ = CLOJURE_BACKEND.extract_function_metrics(s);
+        }
     }
 }

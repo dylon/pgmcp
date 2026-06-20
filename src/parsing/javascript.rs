@@ -18,6 +18,10 @@ use tree_sitter::{Language, Node, Parser, Query, QueryCursor, StreamingIterator,
 mod type_mapper;
 
 use crate::parsing::backend::LanguageBackend;
+use crate::parsing::complexity;
+use crate::parsing::function_metrics::{
+    CognitiveIncrement, CognitiveKind, FunctionMetrics, ScoringInput,
+};
 use crate::parsing::symbols::{Import, Symbol, SymbolKind, SymbolRefKind, SymbolReference};
 
 #[derive(Clone, Copy)]
@@ -432,6 +436,378 @@ impl LanguageBackend for JsTsBackend {
         }
         out
     }
+
+    fn extract_function_metrics(&self, content: &str) -> Vec<FunctionMetrics> {
+        let Some(tree) = parse(content, self.variant) else {
+            return Vec::new();
+        };
+        let mut out: Vec<FunctionMetrics> = Vec::new();
+        collect_function_metrics(tree.root_node(), content, &mut out);
+        out
+    }
+}
+
+// ============================================================================
+// extract_function_metrics — recursive walker (CC / Cognitive / Halstead /
+// NPath / throw-paths). Mirrors `src/parsing/python.rs`'s tree-sitter pass.
+// ============================================================================
+
+/// Node kinds that are function bodies / definitions; each gets its own
+/// metrics row, and the walker stops at nested ones so they don't pollute the
+/// enclosing function's counts.
+const JS_FUNCTION_KINDS: &[&str] = &[
+    "function_declaration",
+    "function_expression",
+    "arrow_function",
+    "generator_function",
+    "generator_function_declaration",
+    "method_definition",
+];
+
+/// Resolve the display name of a function-shaped node. Anonymous functions /
+/// arrows fall back to a synthetic name keyed on their start position so they
+/// remain distinct rows; the function-metrics cron resolves `function_id` by
+/// `(name, start_line)` against `file_symbols`, so anonymous functions simply
+/// won't match a symbol row and are skipped at persist time — harmless.
+fn function_name(node: Node<'_>, src: &str) -> String {
+    if let Some(name_node) = node.child_by_field_name("name") {
+        let n = node_text(name_node, src);
+        if !n.is_empty() {
+            return n.to_string();
+        }
+    }
+    // `const greet = (x) => ...` / `const f = function () {}` — the name lives
+    // on the enclosing `variable_declarator`'s `name` field.
+    if let Some(parent) = node.parent()
+        && parent.kind() == "variable_declarator"
+        && let Some(name_node) = parent.child_by_field_name("name")
+    {
+        let n = node_text(name_node, src);
+        if !n.is_empty() {
+            return n.to_string();
+        }
+    }
+    // `{ method() {} }` shorthand on an object — the `pair`/property key.
+    format!("<anonymous@{}>", line_of(node))
+}
+
+/// Walk every function-shaped node in the tree and score it.
+fn collect_function_metrics(node: Node<'_>, src: &str, out: &mut Vec<FunctionMetrics>) {
+    if JS_FUNCTION_KINDS.contains(&node.kind()) {
+        // The function's executable region is its `body` field (a
+        // statement_block) or, for a single-expression arrow, its last child.
+        let body = node.child_by_field_name("body").unwrap_or_else(|| {
+            node.child(node.child_count().saturating_sub(1))
+                .unwrap_or(node)
+        });
+        let name = function_name(node, src);
+        out.push(score_js_function(
+            &name,
+            line_of(node),
+            end_line_of(body),
+            body,
+            src,
+            &name,
+        ));
+    }
+    let mut walker = node.walk();
+    for child in node.named_children(&mut walker) {
+        collect_function_metrics(child, src, out);
+    }
+}
+
+/// Score one JS/TS function body.
+fn score_js_function(
+    name: &str,
+    start_line: u32,
+    end_line: u32,
+    body: Node<'_>,
+    src: &str,
+    fn_name: &str,
+) -> FunctionMetrics {
+    use std::collections::HashMap;
+    let mut decision_points: u32 = 0;
+    let mut cognitive_increments: Vec<CognitiveIncrement> = Vec::new();
+    let mut operators: HashMap<&'static str, u32> = HashMap::new();
+    let mut operands: HashMap<String, u32> = HashMap::new();
+    let mut npath_factors: Vec<u64> = Vec::new();
+    let mut panic_paths: u32 = 0;
+
+    walk_js_body(
+        body,
+        src,
+        0,
+        &mut decision_points,
+        &mut cognitive_increments,
+        &mut operators,
+        &mut operands,
+        &mut npath_factors,
+        &mut panic_paths,
+        fn_name,
+    );
+
+    let source_lines = end_line.saturating_sub(start_line) + 1;
+    let input = ScoringInput {
+        name,
+        start_line,
+        end_line,
+        decision_points,
+        cognitive_increments,
+        operators,
+        operands,
+        npath_factors,
+        source_lines,
+        comment_lines: 0, // not counted in tree-sitter pass
+        panic_paths,
+        unsafe_blocks: 0, // not meaningful for JS/TS
+    };
+    complexity::score(&input)
+}
+
+/// Static set of JS/TS operator/keyword tokens (η1 universe). tree-sitter
+/// emits punctuation/operators as anonymous leaf nodes whose `kind()` is the
+/// literal text, and keywords likewise; we classify both by matching text.
+const JS_OPERATOR_KINDS: &[&str] = &[
+    // Arithmetic / comparison / logical / bitwise.
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "**",
+    "==",
+    "===",
+    "!=",
+    "!==",
+    "<",
+    ">",
+    "<=",
+    ">=",
+    "&&",
+    "||",
+    "??",
+    "!",
+    "&",
+    "|",
+    "^",
+    "<<",
+    ">>",
+    ">>>",
+    "~", // Assignment.
+    "=",
+    "+=",
+    "-=",
+    "*=",
+    "/=",
+    "%=",
+    "**=",
+    "&&=",
+    "||=",
+    "??=",
+    "&=",
+    "|=",
+    "^=",
+    "<<=",
+    ">>=",
+    ">>>=", // Member / arrow / spread / optional-chaining.
+    ".",
+    "?.",
+    "...",
+    "=>",
+    "?",
+    ":",
+    ",",
+    ";",
+    "(",
+    ")",
+    "[",
+    "]",
+    "{",
+    "}",
+    // Keywords classified as operators (control-flow + binding + declaration).
+    "if",
+    "else",
+    "for",
+    "while",
+    "do",
+    "switch",
+    "case",
+    "default",
+    "break",
+    "continue",
+    "return",
+    "throw",
+    "try",
+    "catch",
+    "finally",
+    "function",
+    "class",
+    "const",
+    "let",
+    "var",
+    "new",
+    "delete",
+    "typeof",
+    "instanceof",
+    "in",
+    "of",
+    "void",
+    "yield",
+    "await",
+    "async",
+    "extends",
+    "implements",
+    "interface",
+    "type",
+    "enum",
+    "import",
+    "export",
+    "from",
+    "as",
+];
+
+fn match_js_operator(s: &str) -> Option<&'static str> {
+    JS_OPERATOR_KINDS.iter().copied().find(|t| *t == s)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_js_body(
+    node: Node<'_>,
+    src: &str,
+    depth: u8,
+    decision_points: &mut u32,
+    cognitive_increments: &mut Vec<CognitiveIncrement>,
+    operators: &mut std::collections::HashMap<&'static str, u32>,
+    operands: &mut std::collections::HashMap<String, u32>,
+    npath_factors: &mut Vec<u64>,
+    panic_paths: &mut u32,
+    fn_name: &str,
+) {
+    let kind = node.kind();
+
+    // Classify leaf tokens for Halstead.
+    if node.child_count() == 0 {
+        let text = node_text(node, src);
+        if !text.is_empty() {
+            if let Some(op) = match_js_operator(text) {
+                *operators.entry(op).or_insert(0) += 1;
+            } else if matches!(
+                kind,
+                "identifier"
+                    | "property_identifier"
+                    | "shorthand_property_identifier"
+                    | "number"
+                    | "string_fragment"
+                    | "true"
+                    | "false"
+                    | "null"
+                    | "undefined"
+                    | "this"
+            ) {
+                *operands.entry(text.to_string()).or_insert(0) += 1;
+            }
+        }
+    }
+
+    // Decision points & cognitive increments.
+    let mut new_depth = depth;
+    match kind {
+        "if_statement" => {
+            *decision_points = decision_points.saturating_add(1);
+            cognitive_increments.push(CognitiveIncrement {
+                depth,
+                kind: CognitiveKind::NestedCondition,
+            });
+            // `else` branch (else_clause / alternative) doubles the paths.
+            let has_else = node.child_by_field_name("alternative").is_some();
+            npath_factors.push(if has_else { 2 } else { 1 });
+            new_depth = depth.saturating_add(1);
+        }
+        "while_statement" | "for_statement" | "for_in_statement" | "do_statement" => {
+            *decision_points = decision_points.saturating_add(1);
+            cognitive_increments.push(CognitiveIncrement {
+                depth,
+                kind: CognitiveKind::NestedCondition,
+            });
+            npath_factors.push(2);
+            new_depth = depth.saturating_add(1);
+        }
+        "catch_clause" => {
+            *decision_points = decision_points.saturating_add(1);
+            cognitive_increments.push(CognitiveIncrement {
+                depth,
+                kind: CognitiveKind::NestedCondition,
+            });
+            npath_factors.push(2);
+        }
+        // Each `case` (but not `default`) is a decision point.
+        "switch_case" => {
+            *decision_points = decision_points.saturating_add(1);
+            npath_factors.push(2);
+        }
+        "ternary_expression" => {
+            *decision_points = decision_points.saturating_add(1);
+            npath_factors.push(2);
+        }
+        // Short-circuit boolean / nullish-coalescing operators are decisions.
+        "binary_expression" => {
+            if let Some(op) = node.child_by_field_name("operator") {
+                let op_text = node_text(op, src);
+                if matches!(op_text, "&&" | "||" | "??") {
+                    *decision_points = decision_points.saturating_add(1);
+                    cognitive_increments.push(CognitiveIncrement {
+                        depth,
+                        kind: CognitiveKind::LogicalSequence,
+                    });
+                    npath_factors.push(2);
+                }
+            }
+        }
+        "throw_statement" => {
+            *panic_paths = panic_paths.saturating_add(1);
+        }
+        "break_statement" | "continue_statement" => {
+            cognitive_increments.push(CognitiveIncrement {
+                depth,
+                kind: CognitiveKind::BreakInFlow,
+            });
+        }
+        "call_expression" => {
+            // Recursion detection: a call whose callee is an identifier equal
+            // to the enclosing function name.
+            if let Some(func) = node.child_by_field_name("function") {
+                let name = node_text(func, src);
+                if name == fn_name {
+                    cognitive_increments.push(CognitiveIncrement {
+                        depth,
+                        kind: CognitiveKind::Recursion,
+                    });
+                }
+            }
+        }
+        // Don't recurse into nested function bodies — they get their own
+        // metrics row from `collect_function_metrics`.
+        _ if JS_FUNCTION_KINDS.contains(&kind) => {
+            return;
+        }
+        _ => {}
+    }
+
+    let mut walker = node.walk();
+    for child in node.children(&mut walker) {
+        walk_js_body(
+            child,
+            src,
+            new_depth,
+            decision_points,
+            cognitive_increments,
+            operators,
+            operands,
+            npath_factors,
+            panic_paths,
+            fn_name,
+        );
+    }
 }
 
 fn push_named(
@@ -718,5 +1094,142 @@ export class HelloGreeter implements Greeter {
         assert_eq!(JS_BACKEND.language_name(), "javascript");
         assert_eq!(TS_BACKEND.language_name(), "typescript");
         assert_eq!(TSX_BACKEND.language_name(), "tsx");
+    }
+
+    // ========================================================================
+    // extract_function_metrics tests (TS/JS, Group 1c)
+    // ========================================================================
+
+    #[test]
+    fn ts_cc_for_empty_fn_is_one() {
+        let src = "function empty(): void {}";
+        let m = TS_BACKEND.extract_function_metrics(src);
+        assert_eq!(m.len(), 1, "metrics: {:?}", m);
+        assert_eq!(m[0].name, "empty");
+        assert_eq!(m[0].cyclomatic, 1);
+    }
+
+    #[test]
+    fn js_cc_for_if_else_and_loop() {
+        let src = r#"
+function classify(x) {
+    if (x > 0) {
+        for (let i = 0; i < x; i++) {
+            doThing(i);
+        }
+    } else {
+        return -1;
+    }
+    return 0;
+}
+"#;
+        let m = JS_BACKEND.extract_function_metrics(src);
+        assert_eq!(m.len(), 1);
+        // 1 if + 1 for = 2 decision points → CC = 3
+        assert_eq!(m[0].cyclomatic, 3, "metrics: {:?}", m[0]);
+    }
+
+    #[test]
+    fn ts_switch_cases_count_as_decisions() {
+        let src = r#"
+function pick(x: number): string {
+    switch (x) {
+        case 1: return "a";
+        case 2: return "b";
+        default: return "z";
+    }
+}
+"#;
+        let m = TS_BACKEND.extract_function_metrics(src);
+        assert_eq!(m.len(), 1);
+        // 2 `case` (default excluded) → CC = 3
+        assert_eq!(m[0].cyclomatic, 3, "metrics: {:?}", m[0]);
+    }
+
+    #[test]
+    fn js_logical_and_ternary_count_as_decisions() {
+        let src = "function f(a, b, c) { return a && b ? c : (b || c); }";
+        let m = JS_BACKEND.extract_function_metrics(src);
+        assert_eq!(m.len(), 1);
+        // `a && b` (+1), ternary (+1), `b || c` (+1) → CC >= 4
+        assert!(m[0].cyclomatic >= 4, "got CC = {}", m[0].cyclomatic);
+    }
+
+    #[test]
+    fn ts_throw_counts_as_panic_path() {
+        let src = r#"
+function guard(x: number): number {
+    if (x < 0) {
+        throw new Error("negative");
+    }
+    return x;
+}
+"#;
+        let m = TS_BACKEND.extract_function_metrics(src);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].panic_paths, 1, "metrics: {:?}", m[0]);
+    }
+
+    #[test]
+    fn js_cognitive_increases_with_nesting() {
+        let src = r#"
+function deep(x) {
+    if (x > 0) {
+        if (x > 1) {
+            return 2;
+        }
+    }
+    return 0;
+}
+"#;
+        let m = JS_BACKEND.extract_function_metrics(src);
+        // outer if +1, inner if +2 → cognitive >= 3
+        assert!(m[0].cognitive >= 3, "got cognitive = {}", m[0].cognitive);
+    }
+
+    #[test]
+    fn ts_methods_score_independently() {
+        let src = r#"
+class S {
+    methodA(x: number): number {
+        if (x > 0) { return 1; } else { return 0; }
+    }
+    methodB(): void {}
+}
+"#;
+        let m = TS_BACKEND.extract_function_metrics(src);
+        let names: Vec<&str> = m.iter().map(|x| x.name.as_str()).collect();
+        assert!(names.contains(&"methodA"), "names: {:?}", names);
+        assert!(names.contains(&"methodB"));
+        let a = m.iter().find(|x| x.name == "methodA").expect("methodA");
+        let b = m.iter().find(|x| x.name == "methodB").expect("methodB");
+        assert_eq!(a.cyclomatic, 2); // one if
+        assert_eq!(b.cyclomatic, 1); // empty
+    }
+
+    #[test]
+    fn js_arrow_assigned_to_const_gets_name() {
+        let src = "const greet = (name) => { if (name) { return name; } return \"hi\"; };";
+        let m = JS_BACKEND.extract_function_metrics(src);
+        let greet = m.iter().find(|x| x.name == "greet");
+        assert!(greet.is_some(), "expected named arrow, got: {:?}", m);
+        assert_eq!(greet.expect("greet").cyclomatic, 2); // one if
+    }
+
+    #[test]
+    fn js_halstead_counts_operators() {
+        let src = "function add(a, b) { return a + b; }";
+        let m = JS_BACKEND.extract_function_metrics(src);
+        assert_eq!(m.len(), 1);
+        assert!(m[0].halstead.n1 > 0, "metrics: {:?}", m[0]);
+        assert!(m[0].halstead.n2 > 0);
+    }
+
+    #[test]
+    fn ts_parse_error_yields_empty_fn_metrics() {
+        let bogus = "function ( { this is not valid";
+        // Tree-sitter is error-tolerant, so we just assert no panic and a
+        // bounded result (it may extract 0 functions from the error tree).
+        let _ = TS_BACKEND.extract_function_metrics(bogus);
     }
 }

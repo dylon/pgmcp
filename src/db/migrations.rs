@@ -63,6 +63,7 @@ mod v45_symbol_occurrences;
 mod v46_project_groups;
 mod v47_widen_dep_source;
 mod v48_hier_metrics;
+mod v49_toolbox_debug_tools;
 mod v4_work_items;
 mod v5_work_items_collab;
 mod v6_unified_graph;
@@ -2669,6 +2670,14 @@ pub async fn run_migrations(
         v48_hier_metrics::HIER_METRICS,
         v48_hier_metrics::HIER_METRICS_NAME,
         || v48_hier_metrics::apply(pool),
+    )
+    .await?;
+
+    apply_step(
+        pool,
+        v49_toolbox_debug_tools::TOOLBOX_DEBUG_TOOLS,
+        v49_toolbox_debug_tools::TOOLBOX_DEBUG_TOOLS_NAME,
+        || v49_toolbox_debug_tools::apply(pool),
     )
     .await?;
 

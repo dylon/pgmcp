@@ -59,6 +59,13 @@ static ABSTRACT_PATTERNS: LazyLock<Vec<(&str, Regex)>> = LazyLock::new(|| {
             "go",
             Regex::new(r"(?m)^\s*type\s+\w+\s+interface\s*\{").expect("invalid regex"),
         ),
+        // Clojure / ClojureScript: `defprotocol` declares an abstract
+        // polymorphic surface (the closest analogue to a trait/interface) and
+        // `definterface` declares a host-interop interface.
+        (
+            "clojure",
+            Regex::new(r"(?m)\(\s*def(?:protocol|interface)\s+\w").expect("invalid regex"),
+        ),
     ]
 });
 
@@ -71,6 +78,7 @@ pub fn is_abstract_file(content: &str, language: &str) -> bool {
             "python" => *lang_prefix == "python",
             "typescript" | "javascript" => *lang_prefix == "typescript",
             "go" => *lang_prefix == "go",
+            "clojure" | "clojurescript" => *lang_prefix == "clojure",
             _ => false,
         };
         if matches_lang && re.is_match(content) {
@@ -235,6 +243,19 @@ mod tests {
         assert!(is_abstract_file("public interface Foo {}", "java"));
         assert!(is_abstract_file("abstract class Bar {}", "java"));
         assert!(!is_abstract_file("class Concrete {}", "java"));
+    }
+
+    #[test]
+    fn is_abstract_file_detects_clojure_defprotocol() {
+        assert!(is_abstract_file(
+            "(defprotocol Greeter\n  (greet [this name]))",
+            "clojure"
+        ));
+        assert!(is_abstract_file(
+            "(definterface Foo (bar []))",
+            "clojurescript"
+        ));
+        assert!(!is_abstract_file("(defn greet [name] name)", "clojure"));
     }
 
     #[test]
