@@ -153,7 +153,7 @@ fn render_per_tool_metrics(stats: &StatsTracker) -> String {
 async fn metrics_handler(State(state): State<MetricsState>) -> String {
     let s = &state.stats;
 
-    format!(
+    let mut body = format!(
         "# HELP pgmcp_files_indexed Total files indexed\n\
          # TYPE pgmcp_files_indexed counter\n\
          pgmcp_files_indexed {}\n\
@@ -395,7 +395,9 @@ async fn metrics_handler(State(state): State<MetricsState>) -> String {
         s.memory_read_graph_calls.load(Ordering::Relaxed),
         s.memory_search_nodes_calls.load(Ordering::Relaxed),
         s.memory_open_nodes_calls.load(Ordering::Relaxed),
-    ) + &render_per_tool_metrics(s)
+    );
+    body.push_str(&render_per_tool_metrics(s));
+    body
 }
 
 /// Start the Prometheus metrics HTTP server.

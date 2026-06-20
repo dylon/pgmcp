@@ -1204,6 +1204,90 @@ async fn work_item_link_experiment_smoke() {
 }
 
 #[tokio::test]
+async fn accepted_experiment_verdict_verifies_linked_triage_bug() {
+    let db = require_test_db!();
+    let server = server_1024(db.pool().clone());
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let experiment_slug = format!("triage-bug-exp-{suffix}");
+    let bug_id = format!("triage-bug-{suffix}");
+
+    let (experiment_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO experiments (slug, title, question) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(&experiment_slug)
+    .bind("Triage bug experiment")
+    .bind("Can trusted experiment evidence close an intake bug?")
+    .fetch_one(db.pool())
+    .await
+    .expect("seed experiment row");
+
+    server
+        .call_tool_cli(
+            "work_item_create",
+            json!({
+                "kind": "bug",
+                "public_id": bug_id,
+                "title": "experiment-backed triage bug",
+                "severity": "high",
+                "reproduction_steps": "run the frozen experiment gate"
+            }),
+        )
+        .await
+        .expect("create triage bug");
+
+    server
+        .call_tool_cli(
+            "work_item_link_experiment",
+            json!({
+                "experiment_slug": experiment_slug,
+                "work_item_public_id": bug_id
+            }),
+        )
+        .await
+        .expect("link experiment to triage bug");
+
+    let synced = pgmcp::db::queries::sync_experiment_verdict_to_work_items(
+        db.pool(),
+        experiment_id,
+        "accepted",
+        "{\"verdict\":\"accepted\"}",
+    )
+    .await
+    .expect("sync experiment verdict");
+    assert_eq!(synced, 1, "one linked bug receives experiment evidence");
+
+    let status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE public_id = $1")
+        .bind(&bug_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("bug status");
+    assert_eq!(
+        status, "verified",
+        "trusted accepted experiment evidence closes the triage bug through the gatekeeper"
+    );
+
+    let experiment_evidence_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM verification_evidence e
+           JOIN work_items w ON w.id = e.item_id
+          WHERE w.public_id = $1
+            AND e.source = 'experiment'
+            AND e.verdict = 'pass'",
+    )
+    .bind(&bug_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("experiment evidence count");
+    assert_eq!(
+        experiment_evidence_count, 1,
+        "the status change is backed by trusted experiment evidence"
+    );
+}
+
+#[tokio::test]
 async fn work_item_phase9_relations_reporting() {
     let db = require_test_db!();
     let server = server_1024(db.pool().clone());

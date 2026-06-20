@@ -185,7 +185,13 @@ fn split_into_words(name: &str) -> Vec<String> {
 fn capitalize(word: &str) -> String {
     let mut chars = word.chars();
     match chars.next() {
-        Some(first) => first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase(),
+        // RHS coerced to `&str` (not `&String`) so `String + _` binds
+        // unambiguously to `Add<&str>`. Required once `smartstring` (via the
+        // context-tape `rhai` REPL dependency) adds `Add<SmartString> for String`,
+        // which otherwise makes `String + &String` ambiguous. Behavior-identical.
+        Some(first) => {
+            first.to_uppercase().collect::<String>() + chars.as_str().to_lowercase().as_str()
+        }
         None => String::new(),
     }
 }

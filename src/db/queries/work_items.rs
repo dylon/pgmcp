@@ -2845,24 +2845,31 @@ pub async fn sync_experiment_verdict_to_work_items(
 
 /// Best-effort gatekeeper drive of an experiment-linked item to `verified` after
 /// passing evidence was posted. Walks the legal path for the item's current
-/// state (in_progress/claimed_done → verifying → verified); any refused step is
-/// logged and halts the walk — the evidence is recorded regardless.
+/// state. Ordinary work walks through `verifying`; experiment-backed bug intake
+/// rows can close directly through the evidence-bearing Gatekeeper transition.
+/// Any refused step is logged and halts the walk — the evidence is recorded
+/// regardless.
 async fn drive_work_item_to_verified(pool: &PgPool, work_item_id: i64) {
-    use WorkItemStatus::{Blocked, ClaimedDone, InProgress, Pending, Ready, Verified, Verifying};
+    use WorkItemStatus::{
+        Blocked, ClaimedDone, Confirmed, InProgress, Pending, Ready, Triage, Verified, Verifying,
+    };
     let Ok(Some(row)) = get_work_item(pool, work_item_id).await else {
         return;
     };
     let Some(status) = WorkItemStatus::parse(&row.status) else {
         return;
     };
-    // Pre-verify steps to reach `Verifying` for the item's current state. The
-    // lab-tech agent legitimately moves the work to "ready for verification";
-    // the trust gate is the final →Verified, which requires the passing
-    // trusted-source (experiment) evidence the agent cannot fabricate.
+    // Pre-verify steps to reach `Verifying` for ordinary work states. Bug
+    // intake states (`triage`/`confirmed`) can be closed directly by the final
+    // Gatekeeper transition below because the accepted experiment verdict is
+    // already the trusted, machine-checkable evidence. That preserves the
+    // human-only `triage -> confirmed` judgment while avoiding evidence-backed
+    // bugs getting stranded in the intake queue.
     let steps: &[(WorkItemStatus, Actor)] = match status {
         Pending | Ready | Blocked => &[(InProgress, Actor::Agent), (Verifying, Actor::Agent)],
         InProgress => &[(Verifying, Actor::Agent)],
         ClaimedDone => &[(Verifying, Actor::System)],
+        Triage | Confirmed => &[],
         Verifying => &[],
         Verified => return, // already verified — idempotent no-op
         _ => return,        // rejected/deferred/cancelled — leave for human judgment
