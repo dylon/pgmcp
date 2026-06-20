@@ -2864,9 +2864,12 @@ pub(crate) const MEMORY_UNIFIED_NODES_SQL: &str = "CREATE MATERIALIZED VIEW memo
       FROM file_chunks
       WHERE embedding_v2 IS NOT NULL
     UNION ALL
-    SELECT 'topic:' || id::TEXT, 'topic',
-           label, NULL::VECTOR(1024), 0.5
-      FROM code_topics
+    SELECT 'topic:' || ct.id::TEXT, 'topic',
+           ct.label,
+           (SELECT fc.embedding_v2 FROM file_chunks fc
+             WHERE fc.id = ct.representative_chunk_id) AS embedding,
+           0.5
+      FROM code_topics ct
     UNION ALL
     SELECT 'durable_mandate:' || id::TEXT, 'durable_mandate',
            imperative, embedding, 0.7

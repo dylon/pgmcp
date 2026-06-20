@@ -68,6 +68,7 @@ mod shutdown;
 mod stats;
 mod tools_catalog;
 mod topic_analysis;
+mod topic_apps;
 #[allow(dead_code)]
 mod topic_store;
 mod tracker;

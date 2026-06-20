@@ -148,4 +148,29 @@ Newsome-Song NDSS 2005 audit aid."
         )
         .await
     }
+
+    #[tool(
+        description = "Cross-project CVE exposure (ADR-027): propagate supply-chain vulnerabilities \
+across the project dependency graph — a vulnerable dependency in project D exposes its transitive \
+DEPENDENTS, with inherited severity decayed by min edge-confidence. USE WHEN assessing blast radius \
+of a vulnerable package across the workspace. Returns {exposed_project_count, projects[]}."
+    )]
+    async fn cross_project_cve_exposure(
+        &self,
+        Parameters(params): Parameters<CrossProjectCveExposureParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "cross_project_cve_exposure",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_cross_project_cve_exposure::tool_cross_project_cve_exposure(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
 }

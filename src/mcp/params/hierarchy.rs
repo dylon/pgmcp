@@ -31,3 +31,10 @@ pub struct CrossProjectCouplingParams {
     #[serde(default)]
     pub limit: Option<i64>,
 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CrossProjectCveExposureParams {
+    /// Max projects to return (default 100, max 1000).
+    #[serde(default)]
+    pub limit: Option<i64>,
+}

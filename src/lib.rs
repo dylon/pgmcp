@@ -74,6 +74,7 @@ pub mod shutdown;
 pub mod stats;
 pub mod tools_catalog;
 pub mod topic_analysis;
+pub mod topic_apps;
 #[allow(dead_code)]
 pub mod topic_store;
 pub mod tracker;

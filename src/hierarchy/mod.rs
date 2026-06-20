@@ -13,6 +13,7 @@
 
 pub mod grouping;
 pub mod rollup;
+pub mod security;
 
 use serde::{Deserialize, Serialize};
 

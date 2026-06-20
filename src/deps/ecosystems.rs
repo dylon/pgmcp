@@ -21,6 +21,39 @@ struct DepEntry {
     local_path: Option<String>,
 }
 
+/// All declared dependency package NAMES in a manifest file, by filename — for
+/// CVE matching (ADR-027 E6). Reuses the per-ecosystem parsers; Cargo.toml is
+/// handled here via a `[dependencies]` table scan (the project-graph path in
+/// `manifest.rs` resolves Cargo deps to projects, but CVE matching wants the raw
+/// names). Returns empty for unrecognized files.
+pub(crate) fn package_names(file_name: &str, content: &str) -> Vec<String> {
+    let dir = Path::new("");
+    let entries = match file_name {
+        "package.json" => parse_npm(dir, content),
+        "pyproject.toml" | "requirements.txt" => parse_pypi(dir, content),
+        "go.mod" => parse_go(dir, content),
+        "pom.xml" => parse_maven(dir, content),
+        "lake-manifest.json" | "lakefile.lean" => parse_lake(dir, content),
+        "Cargo.toml" => return cargo_dep_names(content),
+        _ => Vec::new(),
+    };
+    entries.into_iter().map(|e| e.name).collect()
+}
+
+/// `[dependencies]` / `[dev-dependencies]` / `[build-dependencies]` keys of a Cargo.toml.
+fn cargo_dep_names(content: &str) -> Vec<String> {
+    let Ok(val) = content.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for sec in ["dependencies", "dev-dependencies", "build-dependencies"] {
+        if let Some(tbl) = val.get(sec).and_then(|v| v.as_table()) {
+            out.extend(tbl.keys().cloned());
+        }
+    }
+    out
+}
+
 /// Index every ecosystem's manifests for a project. Returns (upserted, closed)
 /// summed across ecosystems (Cargo via `index_project_manifests`, then the rest).
 pub async fn index_all_manifests(

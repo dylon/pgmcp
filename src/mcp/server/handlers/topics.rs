@@ -67,6 +67,194 @@ Reads the global topic model (run topic-clustering cron if empty). Returns {coun
     }
 
     #[tool(
+        description = "Work-item / bug topic model (ADR-029): cluster work_items by embedding into \
+recurring themes (recurring defect/work themes). Optional `kind` filter (e.g. 'bug'). USE WHEN you \
+want the tracker's recurring concerns. Returns {items, topic_count, topics[]}."
+    )]
+    async fn work_item_topics(
+        &self,
+        Parameters(params): Parameters<WorkItemTopicsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "work_item_topics",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_corpus_topics::tool_work_item_topics(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Commit-message topic model (ADR-029): cluster git commit chunks by embedding \
+into development themes over time. Returns {items, topic_count, topics[]}."
+    )]
+    async fn commit_topics(
+        &self,
+        Parameters(params): Parameters<CommitTopicsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "commit_topics",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_corpus_topics::tool_commit_topics(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Prompt/conversation topic model (ADR-029): cluster session prompts by \
+embedding into recurring request themes. Returns {items, topic_count, topics[]}."
+    )]
+    async fn prompt_topics(
+        &self,
+        Parameters(params): Parameters<PromptTopicsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "prompt_topics",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_corpus_topics::tool_prompt_topics(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Topic-scoped semantic search (ADR-029): semantic search restricted to one \
+topic's chunks (by topic_id or topic_label). USE WHEN you want 'find X within the <topic> theme'. \
+Returns {topic_id, count, results[]}."
+    )]
+    async fn topic_scoped_search(
+        &self,
+        Parameters(params): Parameters<TopicScopedSearchParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "topic_scoped_search",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_topic_apps2::tool_topic_scoped_search(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Topic-quality / architecture-trajectory forecast (ADR-029): OLS trend + ETA \
+to a threshold over the architecture-quality history (the dimension topic cohesion feeds). Returns \
+{latest, slope_per_day, days_to_threshold, trend}."
+    )]
+    async fn topic_quality_forecast(
+        &self,
+        Parameters(params): Parameters<TopicQualityForecastParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "topic_quality_forecast",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_topic_apps2::tool_topic_quality_forecast(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Doc/code topic alignment (ADR-029): Jensen-Shannon divergence between the \
+documentation-chunk and code-chunk topic distributions, plus per-topic flags \
+(code_only_undocumented / doc_only). USE WHEN auditing documentation drift / undocumented areas. \
+Returns {jensen_shannon_divergence, topics[]}."
+    )]
+    async fn doc_code_topic_alignment(
+        &self,
+        Parameters(params): Parameters<DocCodeTopicAlignmentParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "doc_code_topic_alignment",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_topic_apps2::tool_doc_code_topic_alignment(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Topic ⊗ experiment map (ADR-029): which experiments are anchored to each \
+topic (experiment_code_anchor.topic_id) — the themes under active investigation. Returns \
+{count, topics[]}."
+    )]
+    async fn topic_experiment_map(
+        &self,
+        Parameters(params): Parameters<TopicExperimentMapParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "topic_experiment_map",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_topic_apps2::tool_topic_experiment_map(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Topic-drift early-warning (ADR-029): per-topic chunk-count change across the \
+topics-size-history snapshots — emerging (growing) or declining (shrinking) themes. Returns \
+{drifting_topic_count, drifting_topics[]}."
+    )]
+    async fn topic_drift_warning(
+        &self,
+        Parameters(params): Parameters<TopicDriftWarningParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "topic_drift_warning",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_topic_apps3::tool_topic_drift_warning(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Topic ownership forecasting (ADR-029): per-topic git-blame ownership \
+concentration (top-author share, bus_factor, Herfindahl) + a recency trend (concentrating / \
+diffusing) flagging single-owner / bus-factor risk. Returns {count, topics[]}."
+    )]
+    async fn topic_ownership_forecast(
+        &self,
+        Parameters(params): Parameters<TopicOwnershipForecastParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "topic_ownership_forecast",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_topic_apps3::tool_topic_ownership_forecast(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Meta-clustering hierarchy over global topic centroids (Phase 9). Returns FCM-based meta-groups where each meta-group's parent_topic_ids point to the global topics it contains. Complementary view to discover_topics — chunk-to-global-topic assignments remain authoritative for cross-document comparability."
     )]
     async fn topic_hierarchy_fcm(

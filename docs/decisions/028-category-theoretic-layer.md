@@ -1,9 +1,12 @@
 # ADR-028: Category-theoretic layer over the workspace graph
 
-- **Status:** Accepted (strict-law lint landed; the wider functor toolset is the roadmap below)
+- **Status:** Accepted — **full functor toolset + formal proofs delivered + validated.**
 - **Date:** 2026-06-19
 - **Relates to:** item 4 (category theory over the workspace), ADR-027 (hierarchical rollup).
-  Module: `src/category/`. Tool: `categorical_lint`.
+  Module: `src/category/`. Tools: `categorical_lint`, `functorial_impact`, `common_dependency`
+  (pullback), `integration_point` (pushout), `effect_functor`, `naturality_gap`, `colimit_view`.
+  Formal: `docs/formal/containment_functor.v` (Rocq, coqc-verified), `ContainmentFunctor.tla`
+  (TLC: no error). Experiment: `docs/experiments/item4-categorical-validation.md`.
 
 ## Context
 
@@ -40,18 +43,21 @@ total of each extensive column must equal the sum over `project_metrics`. A mism
 the rollup lost or double-counted — a real bug, caught categorically. This is the concrete,
 falsifiable payoff: the functor laws are not decoration, they are assertions about the data.
 
-## Roadmap (the wider functor toolset)
+## The wider functor toolset (delivered)
 
-- `functorial_impact` — where collapsing a level breaks a lax law badly enough to mislead.
-- `common_dependency` (pullback) / `integration_point` (pushout) over `ProjectDep`.
-- `naturality_gap` — divergence between the `import`, `co_change`, and `semantic` functors
-  on the same objects (hidden coupling / architectural erosion); reuses
-  `cochange_mutual_information`, now computable at project grain.
-- `effect_functor` — `Call → effect-set monoid` (reuses `effect_propagation`).
-- `colimit_view` — formalizes `memory_unified_edges` as a colimit.
-- Formal treatment in `docs/formal/` (Rocq/TLA⁺) proving the functor laws, validated with
-  coqc/tlapm/TLC, plus a labeled-sample validation experiment that the categorical invariants
-  surface real, otherwise-undetected issues.
+- `functorial_impact` — where the intensive (lax) rollup diverges from a size-weighted mean
+  (collapsing the level misleads). ✅
+- `common_dependency` (pullback) / `integration_point` (pushout) over `ProjectDep`. ✅
+- `naturality_gap` — divergence between the `import` and `semantic` functors on file pairs
+  (structurally coupled but conceptually distant = erosion). Co-change is the third functor,
+  addable when a co-change table is materialized. ✅
+- `effect_functor` — `Call → effect-set monoid` (the effect-monoid generators + most effectful
+  symbols). ✅
+- `colimit_view` — `memory_unified_edges`/`_nodes` as a colimit of its per-source diagrams. ✅
+- Formal treatment in `docs/formal/`: `containment_functor.v` (Rocq) proves the strict-sum
+  functor law for all finite hierarchies (coqc exit 0, no admits); `ContainmentFunctor.tla`
+  model-checks it with TLC (no error). Validation experiment:
+  `docs/experiments/item4-categorical-validation.md`.
 
 ## Consequences
 

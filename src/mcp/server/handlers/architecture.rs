@@ -121,6 +121,130 @@ cross_project_cycles[], projects[]}."
     }
 
     #[tool(
+        description = "Pullback over the project-dependency category (ADR-028): projects that BOTH \
+project_a and project_b depend on (shared upstream). Returns {count, common_dependencies}."
+    )]
+    async fn common_dependency(
+        &self,
+        Parameters(params): Parameters<CommonDependencyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "common_dependency",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_category2::tool_common_dependency(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Pushout over the project-dependency category (ADR-028): projects that depend \
+on BOTH project_a and project_b (shared integrators/consumers). Returns {count, integration_points}."
+    )]
+    async fn integration_point(
+        &self,
+        Parameters(params): Parameters<IntegrationPointParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "integration_point",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_category2::tool_integration_point(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Functorial impact (ADR-028): per group, the gap between the intensive (lax) \
+unweighted-mean rollup and a size-weighted mean — where collapsing the level loses information \
+(a few large projects dominate). Returns {count, impacts}."
+    )]
+    async fn functorial_impact(
+        &self,
+        Parameters(params): Parameters<FunctorialImpactParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "functorial_impact",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_category2::tool_functorial_impact(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Effect functor (ADR-028): the Call → effect-set monoid — the effect monoid \
+generators (distinct effects) and the most effectful symbols. Returns {monoid_generators, \
+most_effectful_symbols}."
+    )]
+    async fn effect_functor(
+        &self,
+        Parameters(params): Parameters<EffectFunctorParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "effect_functor",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_category3::tool_effect_functor(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Naturality gap (ADR-028): import edges whose endpoints are semantically \
+distant (the import and semantic functors disagree) — architectural erosion / leaky abstractions. \
+Returns {gap_count, gaps}."
+    )]
+    async fn naturality_gap(
+        &self,
+        Parameters(params): Parameters<NaturalityGapParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "naturality_gap",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_category3::tool_naturality_gap(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Colimit view (ADR-028): the unified memory/code graph as a colimit of its \
+per-source diagrams — node-type objects + (from_type, edge_type, to_type) component arms. Returns \
+{objects, diagram_components}."
+    )]
+    async fn colimit_view(
+        &self,
+        Parameters(params): Parameters<ColimitViewParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "colimit_view",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_category3::tool_colimit_view(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Detect architecture violations: cycles, god modules, bidirectional deps, \
 SDP violations, Zone of Pain/Uselessness modules. \
 USE WHEN: producing an architecture review, gating a PR on architectural-debt regressions, \

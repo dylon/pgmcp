@@ -1,7 +1,11 @@
 # ADR-027: Hierarchical inter+intra-project intelligence
 
-- **Status:** Accepted (grouping model landed; rollup/metrics/category layers are the staged
-  roadmap below)
+- **Status:** Accepted — **delivered**: grouping (E1), multi-ecosystem deps (E2, v47),
+  hierarchical rollup (E3, v48) + `workspace_architecture_quality`, inter-project coupling
+  (E4) `cross_project_coupling`, CVE propagation (E6) `cross_project_cve_exposure`, and the
+  category layer (item 4, ADR-028). The `cross_project_symbol_edges` opt-in overlay (v49) and
+  the optional categorical cache (v51) remain the one genuinely-optional overlay (off by
+  design); everything else below is built. (The "roadmap" tables below are the as-built map.)
 - **Date:** 2026-06-19
 - **Relates to:** item 15 (inter-project architecture) + item 4 (category theory). Module:
   `src/hierarchy/`. Migration: v46 (`project_groups`, `project_group_members`); v47–v51
