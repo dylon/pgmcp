@@ -101,6 +101,14 @@ pub struct Config {
     /// on-demand `security_scan` MCP tool works regardless.
     #[serde(default)]
     pub security_scan: SecurityScanConfig,
+    /// `[self_improvement]` — the governed self-improvement discovery cron
+    /// (`src/cron/self_improvement.rs`, ADR-015): mines recurring agent-outcome
+    /// failure clusters + persistently low-trust approaches into `pending` `idea`
+    /// proposals (provenance-keyed, capped). ON by default — it files only
+    /// `pending` proposals; nothing self-applies (the human plan-review signoff +
+    /// the structural trust boundary gate it).
+    #[serde(default)]
+    pub self_improvement: SelfImprovementConfig,
     /// `[tape]` — defaults for the Crucible context-tape paging control plane
     /// (`src/tape/`): the per-session token budget, eviction policy, and logical
     /// TTL used when a session does not specify its own `working_set_config`.
@@ -226,6 +234,72 @@ impl Default for SecurityScanConfig {
             max_concurrent: default_security_scan_concurrency(),
             exclude_projects: Vec::new(),
             offline_only: false,
+        }
+    }
+}
+
+fn default_self_improvement_enabled() -> bool {
+    true
+}
+fn default_self_improvement_interval() -> u64 {
+    21_600 // 6 hours
+}
+fn default_self_improvement_failure_threshold() -> i64 {
+    3
+}
+fn default_self_improvement_lookback_days() -> i64 {
+    30
+}
+fn default_self_improvement_low_trust_floor() -> f64 {
+    0.25
+}
+fn default_self_improvement_low_trust_min_reports() -> i64 {
+    5
+}
+fn default_self_improvement_max_promotions() -> usize {
+    25
+}
+
+/// `[self_improvement]` — the governed self-improvement discovery cron
+/// (`src/cron/self_improvement.rs`, ADR-015). ON by default; it files only
+/// `pending` `idea` proposals (the human plan-review signoff gates application).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SelfImprovementConfig {
+    /// Master switch for the discovery cron (default true).
+    #[serde(default = "default_self_improvement_enabled")]
+    pub enabled: bool,
+    /// Cron cadence in seconds (default 21600 = 6h). 0 disables the cron.
+    #[serde(default = "default_self_improvement_interval")]
+    pub cron_interval_secs: u64,
+    /// Minimum count of distinct `failed` outcomes for a (task_kind, approach)
+    /// cluster before it is proposed for improvement (default 3).
+    #[serde(default = "default_self_improvement_failure_threshold")]
+    pub failure_threshold: i64,
+    /// Lookback window in days for the outcome scan (default 30).
+    #[serde(default = "default_self_improvement_lookback_days")]
+    pub lookback_days: i64,
+    /// `agent_trust.importance_prior` at or below this (with enough reports) is
+    /// proposed as a persistently-underperforming approach (default 0.25).
+    #[serde(default = "default_self_improvement_low_trust_floor")]
+    pub low_trust_floor: f64,
+    /// Minimum `reports_total` before a low-trust agent is proposed (default 5).
+    #[serde(default = "default_self_improvement_low_trust_min_reports")]
+    pub low_trust_min_reports: i64,
+    /// Max proposals filed per signal per run — a flood guard (default 25).
+    #[serde(default = "default_self_improvement_max_promotions")]
+    pub max_promotions: usize,
+}
+
+impl Default for SelfImprovementConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_self_improvement_enabled(),
+            cron_interval_secs: default_self_improvement_interval(),
+            failure_threshold: default_self_improvement_failure_threshold(),
+            lookback_days: default_self_improvement_lookback_days(),
+            low_trust_floor: default_self_improvement_low_trust_floor(),
+            low_trust_min_reports: default_self_improvement_low_trust_min_reports(),
+            max_promotions: default_self_improvement_max_promotions(),
         }
     }
 }

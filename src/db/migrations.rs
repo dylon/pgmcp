@@ -72,6 +72,7 @@ mod v53_working_set_bytes;
 mod v54_csm_pushdown;
 mod v55_file_abstractness;
 mod v56_cross_project_edges;
+mod v57_self_improvement_findings;
 mod v5_work_items_collab;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
@@ -2798,6 +2799,21 @@ pub async fn run_migrations(
         v56_cross_project_edges::CROSS_PROJECT_EDGES,
         v56_cross_project_edges::CROSS_PROJECT_EDGES_NAME,
         || v56_cross_project_edges::apply(pool),
+    )
+    .await?;
+
+    // ================================================================
+    // Step 57 — self-improvement findings. Re-installs the
+    // `work_item_finding_provenance.finding_source` CHECK from the current
+    // FindingSource vocabulary (now including `self_improvement`), so the
+    // ADR-015 discovery cron can promote `idea` proposals through the shared
+    // promote_finding path. See `src/db/migrations/v57_self_improvement_findings.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v57_self_improvement_findings::SELF_IMPROVEMENT_FINDINGS_V1,
+        v57_self_improvement_findings::SELF_IMPROVEMENT_FINDINGS_V1_NAME,
+        || v57_self_improvement_findings::apply(pool),
     )
     .await?;
 

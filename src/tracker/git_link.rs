@@ -100,6 +100,12 @@ pub enum FindingSource {
     /// `provenance_key` and the `external_scanner_findings.scanner` column, so
     /// this one source value preserves full per-scanner provenance.
     SecurityScan,
+    /// A recurring agent-outcome failure cluster, or a persistently low-trust
+    /// approach, surfaced by the `self_improvement` discovery cron
+    /// (`src/cron/self_improvement.rs`, ADR-015) → a `pending` `idea` proposal
+    /// for the governed self-improvement loop. Born `pending`, never
+    /// self-applied — the human plan-review signoff gates it.
+    SelfImprovement,
 }
 
 impl FindingSource {
@@ -110,6 +116,7 @@ impl FindingSource {
         Self::DeadlockCycle,
         Self::ChannelDeadlock,
         Self::SecurityScan,
+        Self::SelfImprovement,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -119,6 +126,7 @@ impl FindingSource {
             Self::DeadlockCycle => "deadlock_cycle",
             Self::ChannelDeadlock => "channel_deadlock",
             Self::SecurityScan => "security_scan",
+            Self::SelfImprovement => "self_improvement",
         }
     }
 
@@ -146,6 +154,9 @@ impl FindingSource {
             Self::DeadlockCycle | Self::ChannelDeadlock => "bug",
             // External security-scanner findings are first-class `bug`s.
             Self::SecurityScan => "bug",
+            // A self-improvement proposal is an `idea` (a suggestion/possibility),
+            // born `pending` for the governed loop's human plan-review.
+            Self::SelfImprovement => "idea",
         }
     }
 }
@@ -183,6 +194,7 @@ mod tests {
             "deadlock_cycle",
             "channel_deadlock",
             "security_scan",
+            "self_improvement",
         ]
         .into_iter()
         .collect();
@@ -190,8 +202,8 @@ mod tests {
             got, expected,
             "FindingSource vocabulary drifted from pinned set"
         );
-        assert_eq!(FindingSource::ALL.len(), 5);
-        assert_eq!(got.len(), 5, "duplicate as_str() value in FindingSource");
+        assert_eq!(FindingSource::ALL.len(), 6);
+        assert_eq!(got.len(), 6, "duplicate as_str() value in FindingSource");
     }
 
     #[test]
@@ -246,5 +258,6 @@ mod tests {
     fn item_kind_maps_source_to_kind() {
         assert_eq!(FindingSource::BugPrediction.item_kind(), "bug");
         assert_eq!(FindingSource::DocumentedTechDebt.item_kind(), "fixme");
+        assert_eq!(FindingSource::SelfImprovement.item_kind(), "idea");
     }
 }

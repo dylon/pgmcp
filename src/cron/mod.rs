@@ -13,6 +13,8 @@ pub mod embedding_migration;
 #[allow(dead_code)]
 pub mod findings_promotion;
 #[allow(dead_code)]
+pub mod self_improvement;
+#[allow(dead_code)]
 pub mod function_metrics;
 #[allow(dead_code)]
 pub mod fuzzy_sync;

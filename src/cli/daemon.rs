@@ -762,6 +762,33 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         });
     }
 
+    // 11d-ter. Schedule the self-improvement discovery cron (ADR-015). ON by
+    // default ([self_improvement] enabled = true; cron_interval_secs = 0 also
+    // disables). Mines recurring outcome-failure clusters + low-trust approaches
+    // into `pending` `idea` proposals for the governed loop; files only `pending`
+    // items — nothing self-applies (the human plan-review signoff gates it).
+    if config_snapshot.self_improvement.enabled
+        && config_snapshot.self_improvement.cron_interval_secs > 0
+        && let Some(pool) = system_ctx.db().pool().cloned()
+    {
+        let stats_for_si = Arc::clone(&stats_tracker);
+        let si_cfg = config_snapshot.self_improvement.clone();
+        let interval_ms = si_cfg.cron_interval_secs.saturating_mul(1000);
+        let rt_for_si = tokio::runtime::Handle::current();
+        let hist_si = system_ctx.cron_history().clone();
+        // 135s initial delay so we don't run during the startup window.
+        cron_handle.schedule_recurring(135_000, interval_ms, "self-improvement", move || {
+            let pool = pool.clone();
+            let stats = Arc::clone(&stats_for_si);
+            let cfg = si_cfg.clone();
+            let hist = hist_si.clone();
+            crate::cron::history::spawn_recorded(&rt_for_si, hist, "self-improvement", async move {
+                cron::self_improvement::run_or_log(pool, stats, cfg).await;
+            });
+            true
+        });
+    }
+
     // 11d-bis. Schedule the CSM auto-conformance cron (ADR-009). Off by default
     // ([a2a.csm_validate] cron_enabled = false). Validates completed
     // a2a_pattern_* runs with no csm_run_traces row yet, feeding the MSM learner
