@@ -117,7 +117,10 @@ pub async fn tool_session_checkpoint_resume(
         error!(session_key = %resumed_key, error = %e, "resume: stored global_type is not a GlobalType");
         McpError::internal_error(format!("stored global_type is corrupt: {e}"), None)
     })?;
-    let net = Network::build(row.protocol_name.clone(), &g).map_err(|e| {
+    // Build against the protocol environment so a resumed call-bearing protocol (a named
+    // GlobalCall / RecursiveCf) resolves its callees; call-free protocols are unaffected.
+    let env = crate::csm::registry::protocol_env();
+    let net = Network::build_in(row.protocol_name.clone(), &g, &env).map_err(|e| {
         error!(session_key = %resumed_key, error = %e.message(), "resume: network rebuild failed");
         McpError::internal_error(format!("network rebuild failed: {}", e.message()), None)
     })?;

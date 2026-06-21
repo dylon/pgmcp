@@ -6,8 +6,8 @@ use rmcp::model::CallToolResult;
 use serde_json::{Value, json};
 
 use crate::context::SystemContext;
-use crate::csm::mpst::wellformed::well_formed;
-use crate::csm::registry::{ProtocolId, ProtocolParams, global_of};
+use crate::csm::mpst::wellformed::well_formed_in;
+use crate::csm::registry::{ProtocolId, ProtocolParams, global_of, protocol_env};
 use crate::mcp::server::CsmProtocolOfPatternParams;
 use crate::mcp::tools::sota_helpers::json_result;
 
@@ -28,7 +28,9 @@ pub async fn tool_csm_protocol_of_pattern(
             )
         })?;
     let g = global_of(id, &ProtocolParams::default());
-    let wf = well_formed(&g);
+    // Resolve callees through the registry so a call-bearing pattern (RecursiveCf) reports
+    // well-formed instead of UnknownCallee; call-free patterns are unaffected by the env.
+    let wf = well_formed_in(&g, &protocol_env());
     let participants: Vec<String> = g.participants().iter().map(|r| r.to_string()).collect();
     json_result(&json!({
         "name": id.name(),

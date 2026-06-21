@@ -200,6 +200,34 @@ unicode diagram. Loads from csm_protocols by public id or name. Read-only."
     }
 
     #[tool(
+        description = "Render a stored protocol's GlobalType as a faithful TLA+ module (the \
+global-cursor model: a state cursor `g`, a `fired` label map, and a return-address `stack` for \
+box/call protocols) for downstream TLC model-checking. Deterministic, pure analysis — no checker is \
+spawned and no file is written (the caller writes <module>.tla and runs TLC). Emits \
+WellNested/StackBounded for pushdown protocols; deadlock-freedom is TLC's built-in check; layer \
+data-dependency / liveness assertions over `fired`. Loads from csm_protocols by public id or name. \
+Read-only."
+    )]
+    async fn csm_protocol_to_tla(
+        &self,
+        Parameters(params): Parameters<CsmProtocolToTlaParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "csm_protocol_to_tla",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_csm_protocol_to_tla::tool_csm_protocol_to_tla(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
         description = "Compute the FORMAL CONCEPT LATTICE (Formal Concept Analysis, ADR-028 CT-4) of \
 a real formal context drawn from pgmcp's tables: objects × attributes × incidence. Two contexts: \
 (object_kind=symbol, attribute_kind=effect) over file_symbols × effect_catalog via symbol_effects, \

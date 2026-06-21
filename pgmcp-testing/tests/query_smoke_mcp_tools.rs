@@ -898,3 +898,61 @@ async fn tool_csm_protocol_string_diagram_against_seeded_protocol() {
         "O and W interact, so the linear protocol is a single tensor factor"
     );
 }
+
+// =============================================================================
+// csm_protocol_to_tla — the deterministic GlobalType -> TLA+ encoder (the
+// global-cursor model). Seed one well-formed linear protocol and assert the tool
+// renders a faithful TLA+ module (a `g` cursor, a `fired` label map, a Spec) over
+// the protocol's own labels. Also satisfies the Layer-D coverage net.
+// =============================================================================
+#[tokio::test]
+async fn tool_csm_protocol_to_tla_against_seeded_protocol() {
+    use pgmcp::csm::mpst::global::{end, interaction};
+    use pgmcp::csm::role::Label;
+
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let server = server_with_pool(pool.clone());
+
+    // O → W : t1_req . W → O : t1_done . end
+    let g = interaction(
+        "O",
+        "W",
+        Label::text("t1_req"),
+        interaction("W", "O", Label::text("t1_done"), end()),
+    );
+    let gt = serde_json::to_value(&g).expect("serialize global_type");
+    sqlx::query(
+        "INSERT INTO csm_protocols (name, pattern_skill_id, global_type, participants, wellformed)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind("smoke_to_tla")
+    .bind("sequential")
+    .bind(gt)
+    .bind(vec!["O".to_string(), "W".to_string()])
+    .bind(true)
+    .execute(&pool)
+    .await
+    .expect("seed csm_protocols row");
+
+    let result = server
+        .call_tool_cli(
+            "csm_protocol_to_tla",
+            json!({"protocol_name": "smoke_to_tla"}),
+        )
+        .await
+        .expect("csm_protocol_to_tla must not error");
+    let v: serde_json::Value =
+        serde_json::from_str(&text_of(&result)).expect("to_tla body must be JSON");
+    assert_eq!(v["protocol"].as_str(), Some("smoke_to_tla"));
+    let tla = v["tla"].as_str().expect("tla field is a string");
+    assert!(
+        tla.contains("MODULE smoke_to_tla"),
+        "emits a named module: {tla}"
+    );
+    assert!(tla.contains("Spec == Init"), "emits a Spec: {tla}");
+    assert!(
+        tla.contains("fired EXCEPT ![\"t1_req\"] = 1"),
+        "encodes the protocol's labels into the fired map: {tla}"
+    );
+}

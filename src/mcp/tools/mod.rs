@@ -315,6 +315,7 @@ pub mod tool_csm_list_protocols;
 pub mod tool_csm_protocol_of_pattern;
 pub mod tool_csm_protocol_plan;
 pub mod tool_csm_protocol_string_diagram;
+pub mod tool_csm_protocol_to_tla;
 pub mod tool_csm_show_projection;
 pub mod tool_csm_synthesize_protocol;
 pub mod tool_csm_validate_run;

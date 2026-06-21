@@ -7,8 +7,8 @@ use rmcp::model::CallToolResult;
 use serde_json::json;
 
 use crate::context::SystemContext;
-use crate::csm::mpst::wellformed::well_formed;
-use crate::csm::registry::{ProtocolId, ProtocolParams, global_of};
+use crate::csm::mpst::wellformed::well_formed_in;
+use crate::csm::registry::{ProtocolId, ProtocolParams, global_of, protocol_env};
 use crate::csm::store::upsert_protocol;
 use crate::mcp::server::CsmListProtocolsParams;
 use crate::mcp::tools::sota_helpers::json_result;
@@ -18,11 +18,14 @@ pub async fn tool_csm_list_protocols(
     _params: CsmListProtocolsParams,
 ) -> Result<CallToolResult, McpError> {
     let p = ProtocolParams::default();
+    // Resolve callees through the registry so a call-bearing protocol (RecursiveCf) reports
+    // well-formed; call-free protocols are unaffected by the populated env.
+    let env = protocol_env();
     let pool = ctx.db().pool();
     let mut out = Vec::with_capacity(ProtocolId::ALL.len());
     for id in ProtocolId::ALL {
         let g = global_of(id, &p);
-        let wf = well_formed(&g).is_ok();
+        let wf = well_formed_in(&g, &env).is_ok();
         let participants: Vec<String> = g.participants().iter().map(|r| r.to_string()).collect();
         if let Some(pool) = pool
             && let Ok(gjson) = serde_json::to_value(&g)

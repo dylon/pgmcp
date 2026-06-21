@@ -952,6 +952,7 @@ impl McpServer {
             "csm_infer_peer_fsm"      => csm_infer_peer_fsm(CsmInferPeerFsmParams),
             // Category-theoretic analytical tools (ADR-028 CT-3 / CT-4)
             "csm_protocol_string_diagram" => csm_protocol_string_diagram(CsmProtocolStringDiagramParams),
+            "csm_protocol_to_tla"         => csm_protocol_to_tla(CsmProtocolToTlaParams),
             "fca_concept_lattice"     => fca_concept_lattice(FcaConceptLatticeParams),
             // Crucible session PAUSE/RESUME (ADR-009)
             "session_checkpoint_save"   => session_checkpoint_save(SessionCheckpointSaveParams),

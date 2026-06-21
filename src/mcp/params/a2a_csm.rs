@@ -414,6 +414,28 @@ pub struct CsmProtocolStringDiagramParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CsmProtocolToTlaParams {
+    #[serde(default)]
+    #[schemars(
+        description = "The csm_protocols.id (public id) of a stored protocol to encode as TLA+. \
+                       Supply this OR protocol_name (one is required)."
+    )]
+    pub protocol_public_id: Option<i64>,
+    #[serde(default)]
+    #[schemars(
+        description = "The csm_protocols.name of a stored protocol to encode as TLA+ (e.g. a \
+                       synthesized:PLAN-1 name or a pattern name). Supply this OR protocol_public_id."
+    )]
+    pub protocol_name: Option<String>,
+    #[serde(default)]
+    #[schemars(
+        description = "Optional TLA+ module name for the output (sanitized to a valid identifier); \
+                       defaults to the protocol name."
+    )]
+    pub module: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CsmValidateRunParams {
     #[serde(default)]
     #[schemars(

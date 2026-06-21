@@ -11,7 +11,7 @@ use serde_json::json;
 use crate::context::SystemContext;
 use crate::csm::driver::ProtocolDriver;
 use crate::csm::machine::Network;
-use crate::csm::registry::{ProtocolId, ProtocolParams, global_of};
+use crate::csm::registry::{ProtocolId, ProtocolParams, global_of, protocol_env};
 use crate::csm::role::Role;
 use crate::mcp::server::CsmProtocolPlanParams;
 use crate::mcp::tools::sota_helpers::json_result;
@@ -26,7 +26,9 @@ pub async fn tool_csm_protocol_plan(
             McpError::invalid_params(format!("unknown pattern '{}'", params.pattern), None)
         })?;
     let g = global_of(id, &ProtocolParams::default());
-    let net = Network::build(id.name(), &g).map_err(|e| {
+    // Resolve callees through the registry so a call-bearing pattern (RecursiveCf) builds
+    // (and is then reported non-drivable); call-free patterns are unaffected by the env.
+    let net = Network::build_in(id.name(), &g, &protocol_env()).map_err(|e| {
         McpError::internal_error(format!("projection failed: {}", e.message()), None)
     })?;
     let orchestrator = Role::new("O");

@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::csm::conformance::{Event, TranscriptTurn, check_conformance, lift_transcript};
 use crate::csm::machine::Network;
-use crate::csm::registry::{ProtocolId, ProtocolParams, global_of};
+use crate::csm::registry::{ProtocolId, ProtocolParams, global_of, protocol_env};
 use crate::csm::store::{find_trajectory_for_task, read_run};
 use crate::csm::trajectory::encoded_series;
 
@@ -109,8 +109,12 @@ pub async fn prepare_validation(pool: &PgPool, task_id: Uuid) -> Result<Prepared
         (g, trace, encoded, None)
     };
 
-    let net =
-        Network::build(id.name(), &g).map_err(|e| format!("projection failed: {}", e.message()))?;
+    // Build against the protocol environment so call-bearing protocols (RecursiveCf, and any
+    // future named-GlobalCall plan) resolve their callees through the registry; call-free
+    // patterns are unaffected by the populated env.
+    let env = protocol_env();
+    let net = Network::build_in(id.name(), &g, &env)
+        .map_err(|e| format!("projection failed: {}", e.message()))?;
     let (conformant, conformance_error) = match check_conformance(&net, &trace) {
         Ok(()) => (true, None),
         Err(e) => (false, Some(e.message())),
@@ -190,7 +194,8 @@ pub async fn validate_coordination(
         .collect();
 
     let g = global_of(ProtocolId::WorktreeNegotiation, &ProtocolParams::default());
-    let net = Network::build(ProtocolId::WorktreeNegotiation.name(), &g)
+    let env = protocol_env();
+    let net = Network::build_in(ProtocolId::WorktreeNegotiation.name(), &g, &env)
         .map_err(|e| format!("projection failed: {}", e.message()))?;
     let trace = lift_transcript(ProtocolId::WorktreeNegotiation, &turns);
     let (conformant, conformance_error) = match check_conformance(&net, &trace) {
