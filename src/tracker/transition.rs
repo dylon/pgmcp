@@ -10,12 +10,13 @@
 //!
 //! The crux rules that make verification hard to game (see the plan §B/§G):
 //!
-//! 1. **`→ Verified` is `Gatekeeper`-only** and only with passing evidence.
-//!    Normal work reaches it from `ClaimedDone`/`Verifying`; trusted
-//!    experiment/CI evidence may also close bug intake states without granting
-//!    agents the human-only `triage → confirmed` judgment. There is **no
-//!    `Agent` arm into `Verified` anywhere in the matrix** — an agent cannot
-//!    self-verify.
+//! 1. **`→ Verified` is `Gatekeeper`-only**, only from `ClaimedDone`/`Verifying`,
+//!    and only with passing evidence. There is **no `Agent` arm into
+//!    `Verified` anywhere in the matrix** — an agent cannot self-verify.
+//!    (2026-06-20: the short-lived `Triage`/`Confirmed → Verified` arms were
+//!    REVERTED — they let an agent-controlled accepted experiment close a bug
+//!    via a synthesized Gatekeeper. See
+//!    `docs/reviews/uncommitted-cowboy-changes-2026-06-20.md`.)
 //! 2. **`→ Deferred` is `User`-only** and requires a `scope_negotiations`
 //!    record. No `Agent` arm — an agent cannot self-defer.
 //! 3. **`→ Rejected` is `Gatekeeper`-only** (driven by a failing evidence
@@ -174,7 +175,13 @@ pub fn legal_actors(from: WorkItemStatus, to: WorkItemStatus) -> &'static [Actor
         // `work_item_triage` tool checks the user token before acting as `User`,
         // exactly as `defer` does. There is no agent arm into `confirmed`.
         (Triage, Confirmed) => U,
-        (Triage, Verified) => G,
+        // DISABLED 2026-06-20 (full revert of the experiment self-verification
+        // loophole): `(Triage, Verified) => G`. It let an accepted experiment
+        // verdict — agent-controlled (open/record/decide are ungated; the agent
+        // supplies the measurements) — drive a bug Triage→Verified via a
+        // synthesized `Actor::Gatekeeper`, bypassing the CI-only trust boundary.
+        // A bug now leaves intake only through the normal lifecycle.
+        // (Triage, Verified) => G,
         (Triage, Blocked) => UA,
         (Triage, Deferred) => U,
         (Triage, Cancelled) => U,
@@ -182,7 +189,10 @@ pub fn legal_actors(from: WorkItemStatus, to: WorkItemStatus) -> &'static [Actor
         (Confirmed, InProgress) => UA,
         (Confirmed, Ready) => UAS,
         (Confirmed, Blocked) => UAS,
-        (Confirmed, Verified) => G,
+        // DISABLED 2026-06-20 (same revert as `(Triage, Verified)` above):
+        // `(Confirmed, Verified) => G` — experiments are agent-controlled and
+        // must not drive →verified. Only CI source='ci' closes a bug.
+        // (Confirmed, Verified) => G,
         (Confirmed, Deferred) => U,
         (Confirmed, Cancelled) => U,
         // ready
@@ -294,9 +304,7 @@ mod tests {
         for from in WorkItemStatus::ALL {
             for actor in ACTORS {
                 let r = check_transition(*from, Verified, actor, full_ctx());
-                if actor == Gatekeeper
-                    && matches!(*from, Triage | Confirmed | ClaimedDone | Verifying)
-                {
+                if actor == Gatekeeper && matches!(*from, ClaimedDone | Verifying) {
                     assert!(r.is_ok(), "gatekeeper {from:?}->verified should pass");
                 } else {
                     assert!(
@@ -330,14 +338,6 @@ mod tests {
         ));
         assert!(matches!(
             check_transition(Verifying, Verified, Gatekeeper, ctx),
-            Err(TransitionError::EvidenceRequired { .. })
-        ));
-        assert!(matches!(
-            check_transition(Triage, Verified, Gatekeeper, ctx),
-            Err(TransitionError::EvidenceRequired { .. })
-        ));
-        assert!(matches!(
-            check_transition(Confirmed, Verified, Gatekeeper, ctx),
             Err(TransitionError::EvidenceRequired { .. })
         ));
     }
@@ -461,13 +461,15 @@ mod tests {
         // its own bug fix.
         assert!(check_transition(Verifying, Verified, Agent, c).is_err());
         assert!(check_transition(Verifying, Verified, Gatekeeper, c).is_ok());
-        // A trusted experiment/CI verdict may close a bug row even before the
-        // user-token confirmation path runs. This is not human triage: only the
-        // evidence-bearing gatekeeper can do it, and only with passing evidence.
+        // Bug intake states are NOT a Gatekeeper→verified shortcut (full revert of
+        // the 2026-06-20 experiment self-verification loophole): a triaged/confirmed
+        // bug is worked through the normal lifecycle; NO actor — not even the
+        // Gatekeeper — closes it directly from intake, and experiments
+        // (agent-controlled) post no tracker verification evidence.
         assert!(check_transition(Triage, Verified, Agent, c).is_err());
-        assert!(check_transition(Triage, Verified, Gatekeeper, c).is_ok());
+        assert!(check_transition(Triage, Verified, Gatekeeper, c).is_err());
         assert!(check_transition(Confirmed, Verified, Agent, c).is_err());
-        assert!(check_transition(Confirmed, Verified, Gatekeeper, c).is_ok());
+        assert!(check_transition(Confirmed, Verified, Gatekeeper, c).is_err());
         // a verified bug can be re-reported as a regression.
         assert!(check_transition(Verified, Triage, Agent, c).is_ok());
     }

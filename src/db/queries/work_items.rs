@@ -2792,19 +2792,24 @@ pub async fn experiment_verdict_criterion_id_in_tx(
     Ok(row.map(|(id,)| id))
 }
 
-/// Sync a rendered experiment verdict to every linked tracker work_item: post
-/// trusted (`source='experiment'`) verification evidence to each item's
-/// `experiment_verdict` criterion and — for an accepted verdict — drive the item
-/// to `verified` through the gatekeeper path. Best-effort and idempotent;
-/// returns the number of work_items that received evidence. The agent cannot
-/// fabricate a statistical verdict over a frozen criterion, so this is a
-/// legitimate trusted-source flip (see the plan's experiment-integration §).
+/// DISABLED 2026-06-20 — full revert of the experiment→work-item self-verification
+/// loophole. `experiment_open`/`record_measurement`/`decide` are agent-callable with
+/// NO token and the agent supplies the measurements, so a "frozen" criterion is
+/// trivially gamed; this previously posted `source='experiment'` evidence and drove
+/// linked bugs →verified via a synthesized `Actor::Gatekeeper` — the success-inflation
+/// vector flagged in review. It is now an inert no-op (returns 0): experiments post NO
+/// tracker verification evidence — only CI `source='ci'` may flip →verified. (The old
+/// docstring claim "the agent cannot fabricate a statistical verdict over a frozen
+/// criterion" was false — the agent controls the inputs.) Re-enable ONLY behind a
+/// human/CI gate. See docs/reviews/uncommitted-cowboy-changes-2026-06-20.md.
 pub async fn sync_experiment_verdict_to_work_items(
-    pool: &PgPool,
-    experiment_id: i64,
-    verdict: &str,
-    detail_json: &str,
+    _pool: &PgPool,
+    _experiment_id: i64,
+    _verdict: &str,
+    _detail_json: &str,
 ) -> Result<u64, sqlx::Error> {
+    Ok(0)
+    /* ORIGINAL BODY (disabled, preserved per the no-silent-disable mandate):
     let evidence_verdict = match verdict {
         "accepted" => "pass",
         "rejected" => "fail",
@@ -2821,34 +2826,78 @@ pub async fn sync_experiment_verdict_to_work_items(
             continue;
         };
         record_verification_evidence(
-            pool,
-            cid,
-            evidence_verdict,
-            "experiment",
-            None,
-            None,
-            None,
-            Some("pgmcp-stats-engine"),
-            None,
-            None,
-            None,
-            detail_json,
-        )
-        .await?;
+            pool, cid, evidence_verdict, "experiment",
+            None, None, None, Some("pgmcp-stats-engine"), None, None, None, detail_json,
+        ).await?;
         synced += 1;
         if evidence_verdict == "pass" {
+            corroborate_manual_required_criteria_with_experiment(pool, wid, detail_json).await?;
             drive_work_item_to_verified(pool, wid).await;
         }
     }
     Ok(synced)
+    */
 }
 
-/// Best-effort gatekeeper drive of an experiment-linked item to `verified` after
-/// passing evidence was posted. Walks the legal path for the item's current
-/// state. Ordinary work walks through `verifying`; experiment-backed bug intake
-/// rows can close directly through the evidence-bearing Gatekeeper transition.
-/// Any refused step is logged and halts the walk — the evidence is recorded
-/// regardless.
+// DISABLED 2026-06-20 — full revert of the experiment self-verification loophole.
+// `corroborate_manual_required_criteria_with_experiment` laundered agent-assertable
+// `source='manual'` passes on UNRELATED required criteria into trusted
+// `source='experiment'` passes purely so they "no longer strand the item" — pure
+// success-inflation with no honest semantics (an experiment about hypothesis H does
+// NOT establish that an unrelated manual criterion C is satisfied). This function was
+// UNCOMMITTED, so it is preserved here (commented, not deleted) per the
+// no-silent-disable mandate. See docs/reviews/uncommitted-cowboy-changes-2026-06-20.md.
+/*
+async fn corroborate_manual_required_criteria_with_experiment(
+    pool: &PgPool,
+    work_item_id: i64,
+    detail_json: &str,
+) -> Result<u64, sqlx::Error> {
+    let criteria: Vec<(i64,)> = sqlx::query_as(
+        "SELECT ac.id
+           FROM acceptance_criteria ac
+          WHERE ac.item_id = $1
+            AND ac.required
+            AND ac.criterion_kind <> 'experiment_verdict'
+            AND EXISTS (
+                  SELECT 1
+                    FROM verification_evidence e
+                   WHERE e.criterion_id = ac.id
+                     AND e.verdict = 'pass'
+                     AND e.source = 'manual')
+            AND NOT EXISTS (
+                  SELECT 1
+                    FROM verification_evidence e
+                   WHERE e.criterion_id = ac.id
+                     AND e.verdict = 'pass'
+                     AND e.source IN ('ci','stop_hook','subagent_audit',
+                                      'external_auditor','user_signoff','experiment'))",
+    )
+    .bind(work_item_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut corroborated = 0u64;
+    for (criterion_id,) in criteria {
+        record_verification_evidence(
+            pool, criterion_id, "pass", "experiment",
+            None, None, None, Some("pgmcp-stats-engine"), None, None, None, detail_json,
+        )
+        .await?;
+        corroborated += 1;
+    }
+    Ok(corroborated)
+}
+*/
+
+// DISABLED 2026-06-20 — full revert (see `sync_experiment_verdict_to_work_items`).
+// This drove an experiment-linked item →verified via a synthesized
+// `Actor::Gatekeeper` (including DIRECTLY from `Triage`/`Confirmed`), bypassing the
+// CI-only trust boundary on agent-controlled experiment evidence. Preserved
+// (commented, not deleted) per the no-silent-disable mandate. The matching
+// `(Triage,Verified)`/`(Confirmed,Verified)` matrix arms were also reverted in
+// `src/tracker/transition.rs`. See docs/reviews/uncommitted-cowboy-changes-2026-06-20.md.
+/*
 async fn drive_work_item_to_verified(pool: &PgPool, work_item_id: i64) {
     use WorkItemStatus::{
         Blocked, ClaimedDone, Confirmed, InProgress, Pending, Ready, Triage, Verified, Verifying,
@@ -2859,31 +2908,19 @@ async fn drive_work_item_to_verified(pool: &PgPool, work_item_id: i64) {
     let Some(status) = WorkItemStatus::parse(&row.status) else {
         return;
     };
-    // Pre-verify steps to reach `Verifying` for ordinary work states. Bug
-    // intake states (`triage`/`confirmed`) can be closed directly by the final
-    // Gatekeeper transition below because the accepted experiment verdict is
-    // already the trusted, machine-checkable evidence. That preserves the
-    // human-only `triage -> confirmed` judgment while avoiding evidence-backed
-    // bugs getting stranded in the intake queue.
     let steps: &[(WorkItemStatus, Actor)] = match status {
         Pending | Ready | Blocked => &[(InProgress, Actor::Agent), (Verifying, Actor::Agent)],
         InProgress => &[(Verifying, Actor::Agent)],
         ClaimedDone => &[(Verifying, Actor::System)],
         Triage | Confirmed => &[],
         Verifying => &[],
-        Verified => return, // already verified — idempotent no-op
-        _ => return,        // rejected/deferred/cancelled — leave for human judgment
+        Verified => return,
+        _ => return,
     };
     for (to, actor) in steps {
         if let Err(e) = set_work_item_status(
-            pool,
-            work_item_id,
-            *to,
-            *actor,
-            Some("experiment-sync"),
-            Some("experiment verdict"),
-            None,
-            None,
+            pool, work_item_id, *to, *actor,
+            Some("experiment-sync"), Some("experiment verdict"), None, None,
         )
         .await
         {
@@ -2894,14 +2931,8 @@ async fn drive_work_item_to_verified(pool: &PgPool, work_item_id: i64) {
     match latest_passing_evidence_id(pool, work_item_id).await {
         Ok(eid) => {
             if let Err(e) = set_work_item_status(
-                pool,
-                work_item_id,
-                Verified,
-                Actor::Gatekeeper,
-                Some("pgmcp-stats-engine"),
-                Some("experiment verdict"),
-                eid,
-                None,
+                pool, work_item_id, Verified, Actor::Gatekeeper,
+                Some("pgmcp-stats-engine"), Some("experiment verdict"), eid, None,
             )
             .await
             {
@@ -2913,6 +2944,7 @@ async fn drive_work_item_to_verified(pool: &PgPool, work_item_id: i64) {
         }
     }
 }
+*/
 
 // ============================================================================
 // Git/PR close-the-loop (work_item_git_links + work_item_finding_provenance)

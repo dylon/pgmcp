@@ -1204,7 +1204,7 @@ async fn work_item_link_experiment_smoke() {
 }
 
 #[tokio::test]
-async fn accepted_experiment_verdict_verifies_linked_triage_bug() {
+async fn accepted_experiment_verdict_does_not_verify_linked_triage_bug() {
     let db = require_test_db!();
     let server = server_1024(db.pool().clone());
     let suffix = std::time::SystemTime::now()
@@ -1249,6 +1249,11 @@ async fn accepted_experiment_verdict_verifies_linked_triage_bug() {
         .await
         .expect("link experiment to triage bug");
 
+    // FULL REVERT (2026-06-20): an accepted experiment verdict must NOT verify a
+    // linked bug. `sync_experiment_verdict_to_work_items` is now an inert no-op —
+    // experiments are agent-controlled (open/record/decide ungated; measurements
+    // agent-supplied), so flipping a bug →verified on one was a self-verification
+    // loophole. Tracker verification stays CI-only (source='ci').
     let synced = pgmcp::db::queries::sync_experiment_verdict_to_work_items(
         db.pool(),
         experiment_id,
@@ -1256,8 +1261,11 @@ async fn accepted_experiment_verdict_verifies_linked_triage_bug() {
         "{\"verdict\":\"accepted\"}",
     )
     .await
-    .expect("sync experiment verdict");
-    assert_eq!(synced, 1, "one linked bug receives experiment evidence");
+    .expect("sync experiment verdict (now a no-op)");
+    assert_eq!(
+        synced, 0,
+        "the experiment→tracker sync is disabled (inert no-op)"
+    );
 
     let status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE public_id = $1")
         .bind(&bug_id)
@@ -1265,8 +1273,8 @@ async fn accepted_experiment_verdict_verifies_linked_triage_bug() {
         .await
         .expect("bug status");
     assert_eq!(
-        status, "verified",
-        "trusted accepted experiment evidence closes the triage bug through the gatekeeper"
+        status, "triage",
+        "an agent-controlled experiment must NOT close the triage bug — it stays in intake"
     );
 
     let experiment_evidence_count: i64 = sqlx::query_scalar(
@@ -1282,8 +1290,118 @@ async fn accepted_experiment_verdict_verifies_linked_triage_bug() {
     .await
     .expect("experiment evidence count");
     assert_eq!(
-        experiment_evidence_count, 1,
-        "the status change is backed by trusted experiment evidence"
+        experiment_evidence_count, 0,
+        "no trusted experiment verification evidence is posted to the tracker"
+    );
+}
+
+#[tokio::test]
+async fn accepted_experiment_verdict_does_not_corroborate_manual_required_criteria() {
+    let db = require_test_db!();
+    let server = server_1024(db.pool().clone());
+    let suffix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    let experiment_slug = format!("manual-criterion-exp-{suffix}");
+    let task_id = format!("manual-criterion-task-{suffix}");
+
+    let (experiment_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO experiments (slug, title, question) VALUES ($1, $2, $3) RETURNING id",
+    )
+    .bind(&experiment_slug)
+    .bind("Manual criterion corroboration experiment")
+    .bind("Can accepted experiment evidence corroborate existing manual criteria?")
+    .fetch_one(db.pool())
+    .await
+    .expect("seed experiment row");
+
+    server
+        .call_tool_cli(
+            "work_item_create",
+            json!({
+                "kind": "task",
+                "public_id": task_id,
+                "title": "task with manual criterion later covered by experiment",
+            }),
+        )
+        .await
+        .expect("create task");
+
+    let criterion = server
+        .call_tool_cli(
+            "work_item_add_criterion",
+            json!({
+                "public_id": task_id,
+                "criterion_kind": "test",
+                "description": "the focused regression test passes",
+            }),
+        )
+        .await
+        .expect("add manual criterion");
+    let cv: Value = serde_json::from_str(&text_of(&criterion)).expect("criterion JSON");
+    let criterion_id = cv["criterion_id"].as_i64().expect("criterion id");
+
+    server
+        .call_tool_cli(
+            "work_item_record_evidence",
+            json!({ "criterion_id": criterion_id, "verdict": "pass" }),
+        )
+        .await
+        .expect("record manual pass");
+
+    server
+        .call_tool_cli(
+            "work_item_link_experiment",
+            json!({
+                "experiment_slug": experiment_slug,
+                "work_item_public_id": task_id
+            }),
+        )
+        .await
+        .expect("link experiment to task");
+
+    // FULL REVERT (2026-06-20): an accepted experiment must NOT corroborate
+    // unrelated manual criteria. The sync is an inert no-op and the corroboration
+    // path is disabled — an experiment about hypothesis H does not establish that
+    // an unrelated manual criterion C is satisfied (that was pure success-inflation).
+    let synced = pgmcp::db::queries::sync_experiment_verdict_to_work_items(
+        db.pool(),
+        experiment_id,
+        "accepted",
+        "{\"verdict\":\"accepted\"}",
+    )
+    .await
+    .expect("sync accepted experiment verdict (now a no-op)");
+    assert_eq!(
+        synced, 0,
+        "the experiment→tracker sync is disabled (inert no-op)"
+    );
+
+    let status: String = sqlx::query_scalar("SELECT status FROM work_items WHERE public_id = $1")
+        .bind(&task_id)
+        .fetch_one(db.pool())
+        .await
+        .expect("task status");
+    assert_ne!(
+        status, "verified",
+        "an accepted experiment must NOT verify a task via its unrelated manual criteria"
+    );
+
+    let corroborating_evidence_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)
+           FROM verification_evidence
+          WHERE criterion_id = $1
+            AND source = 'experiment'
+            AND verdict = 'pass'",
+    )
+    .bind(criterion_id)
+    .fetch_one(db.pool())
+    .await
+    .expect("corroborating evidence count");
+    assert_eq!(
+        corroborating_evidence_count, 0,
+        "the manual criterion receives NO experiment corroboration (the inflation path is disabled)"
     );
 }
 
