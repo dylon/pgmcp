@@ -258,6 +258,34 @@ pub async fn graph_stale(pool: &PgPool, project_id: i32) -> bool {
     }
 }
 
+/// True when a project's module-level coupling metrics are **degenerate** — a
+/// non-trivial indexed project where NO file has any intra-project import
+/// coupling (`afferent_coupling = efferent_coupling = 0` everywhere). This is
+/// the signature of a resolution/edge-build failure (the Rust cross-crate /
+/// content-gate bugs), not a real architecture: no genuine 20+-file codebase has
+/// zero internal imports. Callers (orient health, architecture_quality) use it
+/// to discount `coupling_cohesion_report` / `loose_coupling` verdicts.
+///
+/// Only intra-project coupling counts — `file_metrics` Ca/Ce are built from
+/// `target_project_id IS NULL` edges, so a project whose only resolved imports
+/// are cross-project still reads as degenerate (its intra-project graph is).
+/// Floor of 20 files keeps tiny fixtures/leaf crates from tripping it.
+pub async fn coupling_degenerate(pool: &PgPool, project_id: i32) -> bool {
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT COUNT(*),
+                COUNT(*) FILTER (WHERE afferent_coupling > 0 OR efferent_coupling > 0)
+         FROM file_metrics WHERE project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or(None);
+    match row {
+        Some((n, coupled)) => n >= 20 && coupled == 0,
+        None => false,
+    }
+}
+
 /// Delete all topics and their assignments for a given scope.
 pub async fn clear_topics_for_scope(pool: &PgPool, scope: &str) -> Result<(), sqlx::Error> {
     // Delete assignments first (FK constraint)

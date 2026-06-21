@@ -194,3 +194,61 @@ async fn coupling_cohesion_report_ignores_cross_project_edges() {
         "foreign module leaked through stale cross-project edges: {v}"
     );
 }
+
+#[tokio::test]
+async fn abstractness_reads_persisted_is_abstract_content_independently() {
+    // The report sources module Abstractness from the persisted, symbol-derived
+    // `file_metrics.is_abstract` — never from file content. A core module whose
+    // file is marked abstract (content stays NULL) must report abstractness > 0.
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let project_id = insert_project(&pool, "cc-abs", "/ws/cc-abs").await;
+    let a = insert_file(&pool, project_id, "/ws/cc-abs/core/t.rs", "core/t.rs").await;
+    let b = insert_file(&pool, project_id, "/ws/cc-abs/util/u.rs", "util/u.rs").await;
+    insert_import_edge(&pool, project_id, a, b).await;
+    sqlx::query(
+        "INSERT INTO file_metrics
+         (file_id, project_id, pagerank, afferent_coupling, efferent_coupling, instability, is_abstract)
+         VALUES ($1, $2, 1.0, 0, 1, 1.0, TRUE)",
+    )
+    .bind(a)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .expect("persist abstract core file");
+    sqlx::query(
+        "INSERT INTO file_metrics
+         (file_id, project_id, pagerank, afferent_coupling, efferent_coupling, instability, is_abstract)
+         VALUES ($1, $2, 1.0, 1, 0, 0.0, FALSE)",
+    )
+    .bind(b)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .expect("persist concrete util file");
+
+    let server = server_with_pool(pool);
+    let result = server
+        .call_tool_cli(
+            "coupling_cohesion_report",
+            serde_json::json!({"project": "cc-abs", "module_depth": 1}),
+        )
+        .await
+        .expect("call");
+    let v: Value = serde_json::from_str(&text_of(&result)).expect("json");
+    let core = v["modules"]
+        .as_array()
+        .expect("modules")
+        .iter()
+        .find(|m| m["module"] == "core")
+        .unwrap_or_else(|| panic!("missing core module: {v}"));
+    let abstractness: f64 = core["abstractness"]
+        .as_str()
+        .expect("abstractness")
+        .parse()
+        .expect("numeric");
+    assert!(
+        abstractness > 0.0,
+        "core module abstractness must reflect persisted is_abstract: {v}"
+    );
+}

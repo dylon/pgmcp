@@ -77,14 +77,15 @@ pub async fn tool_fix_circular_dependency(
 
     // Compute module metrics once; needed for SDP-based strategy selection.
     let module_metrics = compute_module_metrics(&bundle.graph, 2);
-    let mut file_abstractions: HashMap<String, bool> = HashMap::new();
-    for fm in &bundle.file_metas {
-        let is_abs = fm.relative_path.contains("trait")
-            || fm.relative_path.contains("interface")
-            || fm.relative_path.contains("abstract")
-            || fm.relative_path.ends_with("mod.rs");
-        file_abstractions.insert(fm.relative_path.clone(), is_abs);
-    }
+    // Abstractness from the persisted, symbol-derived per-file metric (single
+    // source of truth) rather than a file-name heuristic.
+    let pool = crate::mcp::tools::sota_helpers::pool_or_err(ctx)?;
+    let file_abstractions: HashMap<String, bool> =
+        crate::db::queries::file_abstractions(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
     let mut mm = module_metrics;
     update_abstractness(&mut mm, &file_abstractions);
     let metric_by_module: HashMap<&str, &ModuleMetrics> =

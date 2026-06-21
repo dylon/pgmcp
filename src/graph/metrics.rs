@@ -2,11 +2,10 @@
 //!
 //! Computes Robert C. Martin's package metrics at a configurable directory depth.
 
-use regex::Regex;
 use std::collections::{HashMap, HashSet};
-use std::sync::LazyLock;
 
-use super::types::{CodeGraph, EdgeType};
+use super::cargo_layout::CrateLayout;
+use super::types::{CodeGraph, EdgeType, FileNode};
 use petgraph::Direction;
 
 /// Metrics for a single module (directory grouping).
@@ -30,74 +29,102 @@ pub struct ModuleMetrics {
     pub files: Vec<String>,
 }
 
-/// Abstractness detection patterns.
-static ABSTRACT_PATTERNS: LazyLock<Vec<(&str, Regex)>> = LazyLock::new(|| {
-    vec![
-        (
-            "rust",
-            Regex::new(r"(?m)^\s*(?:pub\s+)?trait\s+\w+").expect("invalid regex"),
-        ),
-        (
-            "java",
-            Regex::new(r"(?m)^\s*(?:public\s+)?(?:abstract\s+)?interface\s+\w+")
-                .expect("invalid regex"),
-        ),
-        (
-            "java_abstract",
-            Regex::new(r"(?m)^\s*(?:public\s+)?abstract\s+class\s+\w+").expect("invalid regex"),
-        ),
-        (
-            "python",
-            Regex::new(r"(?m)class\s+\w+\(.*ABC").expect("invalid regex"),
-        ),
-        (
-            "typescript",
-            Regex::new(r"(?m)^\s*(?:export\s+)?(?:abstract\s+)?interface\s+\w+")
-                .expect("invalid regex"),
-        ),
-        (
-            "go",
-            Regex::new(r"(?m)^\s*type\s+\w+\s+interface\s*\{").expect("invalid regex"),
-        ),
-        // Clojure / ClojureScript: `defprotocol` declares an abstract
-        // polymorphic surface (the closest analogue to a trait/interface) and
-        // `definterface` declares a host-interop interface.
-        (
-            "clojure",
-            Regex::new(r"(?m)\(\s*def(?:protocol|interface)\s+\w").expect("invalid regex"),
-        ),
-    ]
-});
-
-/// Check if file content contains abstract/interface declarations.
-pub fn is_abstract_file(content: &str, language: &str) -> bool {
-    for (lang_prefix, re) in ABSTRACT_PATTERNS.iter() {
-        let matches_lang = match language {
-            "rust" => *lang_prefix == "rust",
-            "java" | "kotlin" => lang_prefix.starts_with("java"),
-            "python" => *lang_prefix == "python",
-            "typescript" | "javascript" => *lang_prefix == "typescript",
-            "go" => *lang_prefix == "go",
-            "clojure" | "clojurescript" => *lang_prefix == "clojure",
-            _ => false,
-        };
-        if matches_lang && re.is_match(content) {
-            return true;
-        }
-    }
-    false
+/// How a file is assigned to a module bucket for Martin's package metrics.
+///
+/// Two modes:
+/// - [`ModuleBucketer::by_depth`] — the legacy directory-depth bucketing (first
+///   `depth` path segments of the file's directory). Correct for non-cargo
+///   languages and the internal heuristics that don't carry a crate layout.
+/// - [`ModuleBucketer::crate_aware`] — Rust files are bucketed by their **Cargo
+///   crate** (from [`CrateLayout`]), the true package unit of a workspace, so
+///   an edge counts toward Ca/Ce iff it crosses a crate boundary. Non-Rust /
+///   crate-less files fall back to directory depth. This is what lifts
+///   single-crate-per-directory Rust repos out of the `Ca=Ce=0` degeneracy that
+///   fixed depth-2 produced (everything collapsing to one `src` bucket).
+///
+/// Crate buckets are keyed `crate:<ident>[/<subdir>]`; the `crate:` namespace
+/// prefix never collides with a directory bucket (which contains no `:`), so
+/// crate-aware and fallback buckets coexist unambiguously in one result set.
+pub struct ModuleBucketer<'a> {
+    layout: Option<&'a CrateLayout>,
+    fallback_depth: usize,
+    intra_crate_depth: usize,
 }
 
-/// Compute module-level metrics from a CodeGraph.
+impl<'a> ModuleBucketer<'a> {
+    /// Legacy directory-depth bucketing (back-compat; the body of the old
+    /// `compute_module_metrics(graph, depth)`).
+    pub fn by_depth(depth: usize) -> Self {
+        Self {
+            layout: None,
+            fallback_depth: depth,
+            intra_crate_depth: 0,
+        }
+    }
+
+    /// Crate-aware bucketing: Rust files bucket by crate; everything else by
+    /// `fallback_depth`. `intra_crate_depth` > 0 splits a crate into
+    /// sub-modules that many directory levels deep (0 = whole crate is one
+    /// bucket — the canonical package unit).
+    pub fn crate_aware(
+        layout: &'a CrateLayout,
+        fallback_depth: usize,
+        intra_crate_depth: usize,
+    ) -> Self {
+        Self {
+            layout: Some(layout),
+            fallback_depth,
+            intra_crate_depth,
+        }
+    }
+
+    /// The bucket key for one file node.
+    fn bucket(&self, node: &FileNode) -> String {
+        if let Some(layout) = self.layout
+            && node.language == "rust"
+            && let Some((ident, src_dir)) = layout.crate_of_path(&node.relative_path)
+        {
+            if self.intra_crate_depth == 0 {
+                return format!("crate:{ident}");
+            }
+            // Directory of the file relative to the crate src root, truncated.
+            let within = node
+                .relative_path
+                .strip_prefix(src_dir)
+                .map(|s| s.trim_start_matches('/'))
+                .unwrap_or("");
+            let sub = truncate_module(directory_of(within), self.intra_crate_depth);
+            return if sub.is_empty() {
+                format!("crate:{ident}")
+            } else {
+                format!("crate:{ident}/{sub}")
+            };
+        }
+        truncate_module(&node.module, self.fallback_depth)
+    }
+}
+
+/// Compute module-level metrics from a CodeGraph using directory-depth buckets.
 /// `module_depth`: how many directory levels to use for module grouping.
+/// Back-compat shim over [`compute_module_metrics_with`]; existing callers are
+/// unchanged.
 pub fn compute_module_metrics(code_graph: &CodeGraph, module_depth: usize) -> Vec<ModuleMetrics> {
+    compute_module_metrics_with(code_graph, &ModuleBucketer::by_depth(module_depth))
+}
+
+/// Compute module-level metrics from a CodeGraph using an explicit bucketer
+/// (directory-depth or crate-aware). See [`ModuleBucketer`].
+pub fn compute_module_metrics_with(
+    code_graph: &CodeGraph,
+    bucketer: &ModuleBucketer,
+) -> Vec<ModuleMetrics> {
     let graph = &code_graph.graph;
 
-    // Group nodes by module (directory at given depth)
+    // Group nodes by module bucket.
     let mut module_nodes: HashMap<String, Vec<petgraph::graph::NodeIndex>> = HashMap::new();
     for node_idx in graph.node_indices() {
         let node = &graph[node_idx];
-        let module = truncate_module(&node.module, module_depth);
+        let module = bucketer.bucket(node);
         module_nodes.entry(module).or_default().push(node_idx);
     }
 
@@ -162,6 +189,15 @@ pub fn compute_module_metrics(code_graph: &CodeGraph, module_depth: usize) -> Ve
     }
 
     results
+}
+
+/// The directory portion of a relative path (everything before the last `/`),
+/// or `""` for a top-level file. Used to derive a file's intra-crate sub-module.
+fn directory_of(relative_path: &str) -> &str {
+    match relative_path.rfind('/') {
+        Some(pos) => &relative_path[..pos],
+        None => "",
+    }
 }
 
 /// Truncate a module path to the specified depth.
@@ -231,37 +267,98 @@ mod tests {
         cg
     }
 
-    #[test]
-    fn is_abstract_file_detects_rust_trait() {
-        assert!(is_abstract_file("pub trait Foo { fn bar(&self); }", "rust"));
-        assert!(is_abstract_file("trait Bar {}", "rust"));
-        assert!(!is_abstract_file("struct Foo;", "rust"));
+    fn node(path: &str, lang: &str) -> FileNode {
+        FileNode {
+            file_id: 0,
+            relative_path: path.to_string(),
+            language: lang.to_string(),
+            module: path
+                .rsplit_once('/')
+                .map(|(d, _)| d)
+                .unwrap_or("")
+                .to_string(),
+        }
     }
 
     #[test]
-    fn is_abstract_file_detects_java_interface_and_abstract_class() {
-        assert!(is_abstract_file("public interface Foo {}", "java"));
-        assert!(is_abstract_file("abstract class Bar {}", "java"));
-        assert!(!is_abstract_file("class Concrete {}", "java"));
+    fn crate_aware_bucketer_keys_by_crate() {
+        let layout = CrateLayout::from_map(
+            [
+                ("mettail_prattail".to_string(), "prattail/src".to_string()),
+                ("mettail_ast".to_string(), "ast/src".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let b0 = ModuleBucketer::crate_aware(&layout, 2, 0);
+        assert_eq!(
+            b0.bucket(&node("prattail/src/wpda/walker.rs", "rust")),
+            "crate:mettail_prattail"
+        );
+        assert_eq!(
+            b0.bucket(&node("ast/src/language.rs", "rust")),
+            "crate:mettail_ast"
+        );
+        // intra-crate sub-depth splits within a crate
+        let b1 = ModuleBucketer::crate_aware(&layout, 2, 1);
+        assert_eq!(
+            b1.bucket(&node("prattail/src/wpda/walker.rs", "rust")),
+            "crate:mettail_prattail/wpda"
+        );
+        // non-rust and outside-any-crate files fall back to directory depth
+        assert_eq!(b0.bucket(&node("docs/adr/001.md", "markdown")), "docs/adr");
+        assert_eq!(b0.bucket(&node("prattail/build.rs", "rust")), "prattail");
     }
 
     #[test]
-    fn is_abstract_file_detects_clojure_defprotocol() {
-        assert!(is_abstract_file(
-            "(defprotocol Greeter\n  (greet [this name]))",
-            "clojure"
-        ));
-        assert!(is_abstract_file(
-            "(definterface Foo (bar []))",
-            "clojurescript"
-        ));
-        assert!(!is_abstract_file("(defn greet [name] name)", "clojure"));
+    fn by_depth_bucketer_matches_truncate_module() {
+        let b = ModuleBucketer::by_depth(2);
+        let n = node("src/mcp/tools/foo.rs", "rust");
+        assert_eq!(b.bucket(&n), truncate_module(&n.module, 2));
     }
 
     #[test]
-    fn is_abstract_file_unknown_language_is_false() {
-        assert!(!is_abstract_file("trait Foo {}", "ruby"));
-        assert!(!is_abstract_file("", "rust"));
+    fn compute_module_metrics_with_by_depth_equals_legacy() {
+        // The back-compat shim must be a faithful refactor of the old fn.
+        let cg = make_graph(
+            vec![(1, "a/x.rs", "rust"), (2, "b/y.rs", "rust")],
+            vec![(1, 2)],
+        );
+        let legacy = compute_module_metrics(&cg, 2);
+        let viaw = compute_module_metrics_with(&cg, &ModuleBucketer::by_depth(2));
+        assert_eq!(legacy.len(), viaw.len());
+        // a→b is a cross-module edge ⇒ each module has exactly one Ca/Ce side.
+        let total_ce: usize = viaw.iter().map(|m| m.efferent_coupling).sum();
+        assert_eq!(total_ce, 1);
+    }
+
+    #[test]
+    fn crate_buckets_make_cross_crate_edges_inter_module() {
+        // Two crates, one inter-crate import: with crate buckets the edge counts
+        // toward Ca/Ce; with single-`src` depth-2 it would have collapsed.
+        let layout = CrateLayout::from_map(
+            [
+                ("foo".to_string(), "foo/src".to_string()),
+                ("bar".to_string(), "bar/src".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        let cg = make_graph(
+            vec![(1, "foo/src/a.rs", "rust"), (2, "bar/src/b.rs", "rust")],
+            vec![(1, 2)],
+        );
+        let mm = compute_module_metrics_with(&cg, &ModuleBucketer::crate_aware(&layout, 2, 0));
+        let foo = mm
+            .iter()
+            .find(|m| m.module_path == "crate:foo")
+            .expect("foo bucket");
+        let bar = mm
+            .iter()
+            .find(|m| m.module_path == "crate:bar")
+            .expect("bar bucket");
+        assert_eq!((foo.efferent_coupling, foo.afferent_coupling), (1, 0));
+        assert_eq!((bar.afferent_coupling, bar.efferent_coupling), (1, 0));
     }
 
     #[test]

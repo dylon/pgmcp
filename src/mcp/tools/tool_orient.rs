@@ -211,6 +211,10 @@ pub async fn tool_orient(
     // degenerate topics (computed by pre-stopword code) as "current"; the
     // signature leg of `topics_global_stale` now flags exactly that case.
     let graph_stale = crate::db::queries::graph_stale(pool, project.id).await;
+    // Degenerate coupling: a multi-file project whose import edges never resolved
+    // (all Ca=Ce=0), so coupling_cohesion_report / architecture_quality
+    // loose_coupling are unreliable until symbol-extraction + graph-analysis run.
+    let coupling_degenerate = crate::db::queries::coupling_degenerate(pool, project.id).await;
     // Effective signature folds the active engine so a graph-vs-FCM mismatch or an
     // engine switch is detected, not only a label-pipeline version bump. Compute
     // the owned string before the await so no config guard is held across it.
@@ -295,6 +299,7 @@ pub async fn tool_orient(
             "graph_stale": graph_stale,
             "topics_stale": topics_stale,
             "topics_degenerate": topics_degenerate,
+            "coupling_degenerate": coupling_degenerate,
             // Corpus freshness: compare THIS to disk mtimes (not `indexed_at`)
             // to gauge index staleness without the git-touch false positive.
             "last_verified_at": max_verified,
@@ -307,6 +312,12 @@ pub async fn tool_orient(
                 "The global topic model is DEGENERATE (labels collapsed / clusters \
                 not separated); discover_topics/topic_hierarchy results are unreliable \
                 until the topic engine is re-run and passes the quality gate."
+            } else if coupling_degenerate {
+                "Coupling/architecture metrics are DEGENERATE (every module reports \
+                zero coupling): graph-analysis has not rebuilt import edges from \
+                symbol references, so coupling_cohesion_report and \
+                architecture_quality.loose_coupling are unreliable until \
+                symbol-extraction + graph-analysis have run."
             } else if index_reconcile_stale {
                 "The reconcile backstop has not verified this project's files recently \
                 (last_verified_at is older than 2× the reconcile interval); live \

@@ -95,6 +95,7 @@ pub async fn tool_naturality_gap(
            JOIN indexed_files tf ON tf.id = e.target_file_id
           WHERE e.project_id = $1 AND e.edge_type = 'import'
             AND e.target_file_id IS NOT NULL
+            AND e.target_project_id IS NULL
             AND (1.0 - (a.v <=> b.v)) < $2
           ORDER BY sim ASC
           LIMIT $3",

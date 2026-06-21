@@ -93,7 +93,8 @@ pub async fn tool_circular_dependencies(
          FROM code_graph_edges e
          JOIN indexed_files sf ON e.source_file_id = sf.id
          LEFT JOIN indexed_files tf ON e.target_file_id = tf.id
-         WHERE e.project_id = $1 AND e.edge_type = 'import'",
+         WHERE e.project_id = $1 AND e.edge_type = 'import'
+           AND e.target_project_id IS NULL",
     )
     .bind(project_id)
     .fetch_all(pool)

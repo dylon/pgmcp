@@ -133,13 +133,22 @@ pub async fn tool_dependency_graph(
         weight: f64,
     }
 
+    // When `include_cross_project` is true the target-side project guard is
+    // dropped ($3 OR …), so a `use` resolved into another indexed project's
+    // crate surfaces; its node is labeled `<project>:<path>` to disambiguate
+    // identical relative paths across projects. Default false keeps the graph
+    // strictly intra-project (the cross-project target then fails the join and
+    // the row is dropped by the `tf.id IS NOT NULL` filter).
+    let include_cross_project = params.include_cross_project.unwrap_or(false);
     let edges: Vec<EdgeRow> = sqlx::query_as::<_, EdgeRow>(
         "SELECT
             e.source_file_id,
             sf.relative_path as source_path,
             sf.language as source_lang,
             e.target_file_id,
-            tf.relative_path as target_path,
+            CASE WHEN e.target_project_id IS NOT NULL AND tp.name IS NOT NULL
+                 THEN tp.name || ':' || tf.relative_path
+                 ELSE tf.relative_path END as target_path,
             tf.language as target_lang,
             e.edge_type,
             e.weight
@@ -147,13 +156,15 @@ pub async fn tool_dependency_graph(
          JOIN indexed_files sf ON e.source_file_id = sf.id
                             AND sf.project_id = e.project_id
          LEFT JOIN indexed_files tf ON e.target_file_id = tf.id
-                                  AND tf.project_id = e.project_id
+                                  AND ($3 OR tf.project_id = e.project_id)
+         LEFT JOIN projects tp ON tp.id = e.target_project_id
          WHERE e.project_id = $1
            AND e.edge_type = ANY($2::text[])
            AND (e.target_file_id IS NULL OR tf.id IS NOT NULL)",
     )
     .bind(project_id)
     .bind(&edge_type_strs)
+    .bind(include_cross_project)
     .fetch_all(pool)
     .await
     .map_err(|e| McpError::internal_error(format!("Edge query failed: {}", e), None))?;

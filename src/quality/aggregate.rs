@@ -233,7 +233,8 @@ async fn propagation_cost_dim(pool: &PgPool, project_id: i32) -> DimensionScore 
     }
     let edges: Vec<Edge> = sqlx::query_as::<_, Edge>(
         "SELECT source_file_id, target_file_id FROM code_graph_edges
-         WHERE project_id = $1 AND edge_type = 'import' AND target_file_id IS NOT NULL",
+         WHERE project_id = $1 AND edge_type = 'import' AND target_file_id IS NOT NULL
+           AND target_project_id IS NULL",
     )
     .bind(project_id)
     .fetch_all(pool)

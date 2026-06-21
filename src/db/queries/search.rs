@@ -483,6 +483,71 @@ pub struct TextSearchResult {
 /// `dedupe_worktrees=true` collapses cross-worktree duplicates of the
 /// same `(repo, relative_path)` to a single canonical hit. See
 /// `worktree_dedup_clause` for the filter shape.
+/// Translate the PCRE/`rg`/GNU word-boundary escapes that PostgreSQL's POSIX
+/// Advanced Regular Expression engine spells differently, leaving every other
+/// escape untouched.
+///
+/// PG ARE reads `\b` as a **literal backspace** (a character-entry escape), not
+/// a word boundary — so a `\bword\b` pattern matches nothing in source text,
+/// while `rg`/GNU grep treat `\b` as a zero-width boundary and match. PG's
+/// boundary escapes are `\y` (boundary), `\Y` (non-boundary), `\m` (start of
+/// word), `\M` (end of word). We map `\b`→`\y`, `\B`→`\Y`, and the GNU
+/// `\<`/`\>`→`\m`/`\M`. Class shorthands (`\d`/`\w`/`\s`/…) already work in PG
+/// ARE and are left alone. A `\b` **inside** a bracket expression (`[...]`)
+/// legitimately means backspace in both engines, so bracket interiors are
+/// skipped — only word-boundary escapes outside a character class are rewritten.
+fn translate_pcre_boundaries(pattern: &str) -> std::borrow::Cow<'_, str> {
+    if !pattern.contains('\\') {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let mut out = String::with_capacity(pattern.len() + 4);
+    let mut in_class = false; // inside a [...] character class
+    let mut changed = false;
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(&n) = chars.peek() {
+                let repl = if in_class {
+                    None
+                } else {
+                    match n {
+                        'b' => Some('y'),
+                        'B' => Some('Y'),
+                        '<' => Some('m'),
+                        '>' => Some('M'),
+                        _ => None,
+                    }
+                };
+                out.push('\\');
+                match repl {
+                    Some(r) => {
+                        out.push(r);
+                        changed = true;
+                    }
+                    // Copy the escaped char verbatim (incl. `\b` in a class,
+                    // `\d`, `\\`, `\[`) so it can never toggle `in_class`.
+                    None => out.push(n),
+                }
+                chars.next();
+            } else {
+                out.push('\\'); // trailing backslash
+            }
+            continue;
+        }
+        match c {
+            '[' => in_class = true,
+            ']' => in_class = false,
+            _ => {}
+        }
+        out.push(c);
+    }
+    if changed {
+        std::borrow::Cow::Owned(out)
+    } else {
+        std::borrow::Cow::Borrowed(pattern)
+    }
+}
+
 pub async fn grep_search(
     pool: &PgPool,
     pattern: &str,
@@ -490,6 +555,7 @@ pub async fn grep_search(
     limit: i32,
     dedupe_worktrees: bool,
 ) -> Result<Vec<GrepResult>, sqlx::Error> {
+    let pat = translate_pcre_boundaries(pattern);
     let results = if let Some(glob_pattern) = glob {
         // Convert glob to SQL LIKE pattern.
         // $1=pattern, $2=limit, $3=like, $4=dedupe
@@ -509,7 +575,7 @@ pub async fn grep_search(
              LIMIT $2",
             worktree_dedup_clause(4)
         )))
-        .bind(pattern)
+        .bind(pat.as_ref())
         .bind(limit)
         .bind(&like_pattern)
         .bind(dedupe_worktrees)
@@ -531,7 +597,7 @@ pub async fn grep_search(
              LIMIT $2",
             worktree_dedup_clause(3)
         )))
-        .bind(pattern)
+        .bind(pat.as_ref())
         .bind(limit)
         .bind(dedupe_worktrees)
         .fetch_all(pool)
@@ -811,8 +877,9 @@ pub async fn grep_search_chunks(
         dedup = worktree_dedup_clause(5),
     );
 
+    let pat = translate_pcre_boundaries(pattern);
     let rows = sqlx::query_as::<_, GrepChunkResult>(sqlx::AssertSqlSafe(sql.as_str()))
-        .bind(pattern)
+        .bind(pat.as_ref())
         .bind(project)
         .bind(language)
         .bind(like_pattern)
@@ -821,6 +888,46 @@ pub async fn grep_search_chunks(
         .fetch_all(pool)
         .await?;
     Ok(rows)
+}
+
+#[cfg(test)]
+mod boundary_translation_tests {
+    use super::translate_pcre_boundaries;
+
+    #[test]
+    fn maps_word_boundaries_outside_brackets() {
+        assert_eq!(translate_pcre_boundaries(r"\bword\b"), r"\yword\y");
+        assert_eq!(translate_pcre_boundaries(r"\Bword"), r"\Yword");
+        assert_eq!(translate_pcre_boundaries(r"\<id\>"), r"\mid\M");
+    }
+
+    #[test]
+    fn leaves_class_shorthands_and_bracket_backspace_untouched() {
+        // Class shorthands already work in PG ARE.
+        assert_eq!(translate_pcre_boundaries(r"\d+\s\w*"), r"\d+\s\w*");
+        // `\b` inside [...] is a legitimate backspace in both engines.
+        assert_eq!(translate_pcre_boundaries(r"[\b]"), r"[\b]");
+        assert_eq!(
+            translate_pcre_boundaries(r"foo[a\bc]\bbar"),
+            r"foo[a\bc]\ybar"
+        );
+    }
+
+    #[test]
+    fn no_backslash_is_borrowed_unchanged() {
+        let p = "plain_text_pattern";
+        assert!(matches!(
+            translate_pcre_boundaries(p),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        // A non-boundary escape leaves the string logically unchanged.
+        assert_eq!(translate_pcre_boundaries(r"a\.b"), r"a\.b");
+    }
+
+    #[test]
+    fn handles_trailing_backslash_without_panic() {
+        assert_eq!(translate_pcre_boundaries(r"abc\"), "abc\\");
+    }
 }
 
 #[cfg(test)]

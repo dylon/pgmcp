@@ -1,6 +1,6 @@
 //! `tool_architecture_quality` — MCP tool body.
 //!
-//! The 10-dimension scoring is factored into [`collect_architecture_dimensions`]
+//! The 11-dimension scoring is factored into [`collect_architecture_dimensions`]
 //! so both this tool and the `quality_report` aggregator share one
 //! implementation. The thin tool wrapper keeps the stats counter, the
 //! effect-breakdown channel, and the JSON envelope.
@@ -18,17 +18,28 @@ use crate::mcp::server::*;
 use crate::mcp::tools::sota_helpers::{import_cycle_file_count, pool_or_err, project_id_or_err};
 use crate::quality::report::{DimensionScore, letter_grade};
 
-/// Compute the 10 architecture-quality dimensions for a project. Shared by the
+/// Compute the 11 architecture-quality dimensions for a project. Shared by the
 /// `architecture_quality` tool and the `quality_report` Architecture pillar.
 ///
-/// Each dimension is always scorable here (the underlying queries degrade to
-/// neutral defaults), so all returned scores are `Some`. The `quality_report`
-/// aggregator layers its data-absent supplementary dimensions on top.
+/// Most dimensions are always scorable (the underlying queries degrade to
+/// neutral defaults). Four go N/A (`DimensionScore::absent`, excluded from the
+/// mean) when their inputs are untrustworthy: `separation_of_concerns` under a
+/// stale/absent topic model, and `loose_coupling` / `sdp_compliance` /
+/// `code_organization` / `main_sequence_distance` under degenerate coupling (so
+/// an unresolved import graph can't masquerade as excellent architecture). The
+/// `quality_report` aggregator layers its data-absent supplementary dimensions
+/// on top.
 pub(crate) async fn collect_architecture_dimensions(
     ctx: &SystemContext,
     project_id: i32,
 ) -> Result<Vec<DimensionScore>, McpError> {
     let pool = pool_or_err(ctx)?;
+
+    // Degenerate-coupling guard, shared by every coupling-derived dimension:
+    // when the import graph never resolved (the Rust cross-crate / content-gate
+    // failure), Ca/Ce/instability/SDP are all 0 and would score *falsely good*
+    // (avg_coupling≈0 ⇒ loose_coupling≈100). Those dims are reported N/A instead.
+    let coupling_degenerate = crate::db::queries::coupling_degenerate(pool, project_id).await;
 
     // 1. Separation of concerns: avg distinct topics per file (lower = better).
     let avg_topics: Option<f64> = sqlx::query_scalar(
@@ -210,18 +221,79 @@ pub(crate) async fn collect_architecture_dimensions(
     // `loose_coupling` so the two dims aren't identical.)
     let org_score = (1.0 - (avg_coupling.unwrap_or(0.0) / 30.0).clamp(0.0, 1.0)) * 100.0;
 
-    Ok(vec![
-        soc_dim,
+    // The three coupling-derived dims go N/A under degenerate coupling so a
+    // resolution failure can't masquerade as excellent architecture.
+    let coupling_dim = if coupling_degenerate {
+        DimensionScore::absent(
+            "loose_coupling",
+            "Avg afferent+efferent coupling — N/A (degenerate: import edges unresolved)",
+        )
+    } else {
         DimensionScore::present(
             "loose_coupling",
             "Avg afferent+efferent coupling",
             coupling_score,
-        ),
+        )
+    };
+    let sdp_dim = if coupling_degenerate {
+        DimensionScore::absent(
+            "sdp_compliance",
+            "Stable-dependencies-principle conformance — N/A (degenerate coupling)",
+        )
+    } else {
         DimensionScore::present(
             "sdp_compliance",
             "Stable-dependencies-principle conformance",
             sdp_score,
+        )
+    };
+    let org_dim = if coupling_degenerate {
+        DimensionScore::absent(
+            "code_organization",
+            "Card & Glass module-complexity surrogate — N/A (degenerate coupling)",
+        )
+    } else {
+        DimensionScore::present(
+            "code_organization",
+            "Card & Glass module-complexity surrogate",
+            org_score,
+        )
+    };
+
+    // 11. Main-sequence distance (Martin's normalized D' = |A + I − 1|, lower is
+    // better), scored off the persisted, rolled-up mean per-module distance.
+    // N/A when coupling is degenerate (I untrustworthy), the project declares no
+    // type symbols (A undefined), or the rollup hasn't run.
+    let type_symbols: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(abstract_type_count + concrete_type_count), 0)::int8
+         FROM file_metrics WHERE project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    let avg_distance: Option<f64> =
+        sqlx::query_scalar("SELECT avg_distance FROM project_metrics WHERE project_id = $1")
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+    let msd_dim = match avg_distance {
+        Some(d) if !coupling_degenerate && type_symbols > 0 => DimensionScore::present(
+            "main_sequence_distance",
+            "Closeness to Martin's main sequence (A+I=1); higher is better",
+            (1.0 - d.clamp(0.0, 1.0)) * 100.0,
         ),
+        _ => DimensionScore::absent(
+            "main_sequence_distance",
+            "Mean |A+I−1| across modules — N/A (no type symbols or degenerate coupling)",
+        ),
+    };
+
+    Ok(vec![
+        soc_dim,
+        coupling_dim,
+        sdp_dim,
         DimensionScore::present(
             "acyclicity",
             "Fraction of files free of import cycles",
@@ -244,11 +316,8 @@ pub(crate) async fn collect_architecture_dimensions(
             "Inverse of fix-commit ratio",
             health_score,
         ),
-        DimensionScore::present(
-            "code_organization",
-            "Card & Glass module-complexity surrogate",
-            org_score,
-        ),
+        org_dim,
+        msd_dim,
     ])
 }
 

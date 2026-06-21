@@ -174,6 +174,7 @@ pub async fn import_conditional_entropy(
         "SELECT source_file_id, target_file_id, COALESCE(SUM(weight), 0.0) AS w
          FROM code_graph_edges
          WHERE project_id = $1 AND edge_type = 'import' AND target_file_id IS NOT NULL
+           AND target_project_id IS NULL
          GROUP BY source_file_id, target_file_id
          ORDER BY source_file_id",
     )

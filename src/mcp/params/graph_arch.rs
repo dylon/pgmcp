@@ -78,6 +78,13 @@ pub struct DependencyGraphParams {
         description = "Output format: \"summary\" (node/edge counts), \"edges\" (edge list), \"dot\" (Graphviz DOT) (default: \"summary\")"
     )]
     pub format: Option<String>,
+    /// Include cross-project import edges (a `use` into a crate in another
+    /// indexed project). Default false = intra-project only. Cross-project
+    /// targets are labeled `<project>:<path>`.
+    #[schemars(
+        description = "Include cross-project import edges (use into another indexed project's crate); default false. Cross-project targets are labeled <project>:<path>"
+    )]
+    pub include_cross_project: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -153,6 +160,12 @@ pub struct CouplingCohesionReportParams {
         description = "Sort by: \"instability\", \"distance\", \"coupling\", \"cohesion\" (default: \"distance\")"
     )]
     pub sort_by: Option<String>,
+    /// Module bucketing: "depth" (directory levels, default) or "crate" (Cargo
+    /// crate boundaries — the true package unit of a Rust workspace).
+    #[schemars(
+        description = "Module bucketing: \"depth\" (directory levels, default) or \"crate\" (Cargo crate boundaries for Rust workspaces)"
+    )]
+    pub bucketing: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]

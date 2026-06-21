@@ -834,8 +834,15 @@ fn rescan_workspace(
     let mut submitted: u64 = 0;
     let mut bounded_skipped: u64 = 0;
     let mut skipped_paths: Vec<String> = Vec::with_capacity(metadata_map.len());
+    // Disk truth for THIS workspace: every path the walk yields. After a
+    // successful walk, an indexed path under this workspace NOT in this set is a
+    // phantom row (deleted / content-changing-renamed on disk while the live
+    // inotify path missed the event) and is pruned below.
+    let mut seen_paths: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(metadata_map.len());
     for path in file_rx {
         total_scanned += 1;
+        seen_paths.insert(path.to_string_lossy().into_owned());
 
         if let Some(db_meta) = metadata_map.get(&*path.to_string_lossy())
             && let Ok(fs_meta) = std::fs::metadata(&path)
@@ -889,7 +896,55 @@ fn rescan_workspace(
         }
     }
 
-    let _ = walk_handle.join();
+    let walk_ok = walk_handle.join().is_ok();
+
+    // Phantom-row prune (root-scoped, walk-success-gated). A path indexed under
+    // THIS workspace that the just-completed walk did not yield is gone from disk
+    // — a deletion or a content-changing rename that the live inotify path
+    // missed (e.g. a `rm -rf` while the daemon was down, or an atomic rename).
+    // Mirrors the initial-scan set-difference sweep but scoped to one workspace
+    // root so it can never touch another workspace's rows, and skipped on a walk
+    // failure or an empty walk so a transient error can't mass-delete. The FK
+    // cascade from `indexed_files` clears file_metrics / code_graph_edges /
+    // file_symbols / file_chunks, so deleting the parent row suffices.
+    if walk_ok && total_scanned > 0 {
+        let ws_prefix = format!("{}/", workspace_path_str.trim_end_matches('/'));
+        let stale_paths: Vec<String> = metadata_map
+            .keys()
+            .filter(|p| {
+                (p.as_str() == workspace_path_str || p.starts_with(&ws_prefix))
+                    && !seen_paths.contains(*p)
+            })
+            .cloned()
+            .collect();
+        if !stale_paths.is_empty() {
+            let detected = stale_paths.len() as u64;
+            match rt_handle.block_on(db.delete_files_batch(&stale_paths)) {
+                Ok(deleted) => {
+                    info!(
+                        workspace = %workspace_path_str,
+                        detected,
+                        deleted,
+                        "Pruned phantom index rows (deleted/renamed on disk)"
+                    );
+                    stats
+                        .files_stale_removed
+                        .fetch_add(detected, Ordering::Relaxed);
+                    if let Err(e) = rt_handle.block_on(db.cleanup_orphaned_projects()) {
+                        tracing::error!(error = %e, "Failed to clean up orphaned projects after phantom prune");
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        workspace = %workspace_path_str,
+                        count = detected,
+                        error = %e,
+                        "Failed to prune phantom index rows"
+                    );
+                }
+            }
+        }
+    }
 
     // Bump `last_scanned_at` for every project under this workspace —
     // catches the "rescan walked the tree, no files changed" case where

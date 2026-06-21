@@ -1,5 +1,5 @@
 //! Real-Postgres correctness oracle for `architecture_quality`.
-//! 10 dimensions, every scorable grade in {A,B,C,D,F}, N/A dimensions excluded
+//! 11 dimensions, every scorable grade in {A,B,C,D,F}, N/A dimensions excluded
 //! from the overall score, and project-id scoped metric rows.
 
 mod common;
@@ -81,7 +81,7 @@ fn score(payload: &Value, name: &str) -> f64 {
 }
 
 #[tokio::test]
-async fn architecture_quality_returns_ten_dimensions_each_with_letter_grade() {
+async fn architecture_quality_returns_eleven_dimensions_each_with_letter_grade() {
     let db = require_test_db!();
     let pool = db.pool().clone();
     let _h = seed_graph_corpus(&pool).await;
@@ -98,8 +98,8 @@ async fn architecture_quality_returns_ten_dimensions_each_with_letter_grade() {
     let dims = v["dimensions"].as_array().expect("dimensions");
     assert_eq!(
         dims.len(),
-        10,
-        "architecture_quality must report exactly 10 dimensions"
+        11,
+        "architecture_quality must report exactly 11 dimensions (incl. main_sequence_distance)"
     );
     let mut scores = Vec::new();
     for d in dims {
@@ -244,4 +244,112 @@ async fn architecture_quality_ignores_cross_project_metric_and_edge_rows() {
     assert_eq!(score(&v, "api_stability"), 100.0);
     assert_eq!(score(&v, "dependency_health"), 100.0);
     assert_eq!(score(&v, "sdp_compliance"), 100.0);
+}
+
+#[tokio::test]
+async fn degenerate_coupling_marks_coupling_dims_na_and_excludes_them() {
+    // A 25-file project where EVERY file has zero coupling (the import-edge
+    // resolution failure) is degenerate: the coupling-derived dims must go N/A
+    // rather than score a falsely-excellent ~100, and be excluded from overall.
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let project_id = insert_project(&pool, "arch-degen", "/ws/arch-degen").await;
+    for i in 0..25 {
+        let fid = insert_file(
+            &pool,
+            project_id,
+            &format!("/ws/arch-degen/src/f{i}.rs"),
+            &format!("src/f{i}.rs"),
+        )
+        .await;
+        insert_metric(&pool, project_id, fid, 0, 0.0, 0.0, 0.0).await;
+    }
+    let server = server_with_pool(pool);
+    let result = server
+        .call_tool_cli(
+            "architecture_quality",
+            serde_json::json!({"project": "arch-degen", "detail": "full"}),
+        )
+        .await
+        .expect("call");
+    let v: Value = serde_json::from_str(&text_of(&result)).expect("json");
+
+    for dim in [
+        "loose_coupling",
+        "sdp_compliance",
+        "code_organization",
+        "main_sequence_distance",
+    ] {
+        assert_eq!(
+            dimension(&v, dim)["score"].as_str(),
+            Some("N/A"),
+            "{dim} must be N/A under degenerate coupling: {v}"
+        );
+    }
+    // overall_score is the mean of ONLY the scorable (non-N/A) dimensions.
+    let scores: Vec<f64> = v["dimensions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["score"].as_str().and_then(|s| s.parse::<f64>().ok()))
+        .collect();
+    let mean = scores.iter().sum::<f64>() / scores.len() as f64;
+    let overall: f64 = v["overall_score"].as_str().unwrap().parse().unwrap();
+    assert!(
+        (mean - overall).abs() < 0.2,
+        "overall {overall} must exclude the N/A coupling dims (mean {mean})"
+    );
+}
+
+#[tokio::test]
+async fn main_sequence_distance_scored_from_rollup_when_types_present() {
+    // Non-degenerate project (few files, real coupling) with persisted type
+    // symbols and a project_metrics rollup ⇒ the main-sequence-distance dimension
+    // is scored as 100·(1 − avg_distance).
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let project_id = insert_project(&pool, "arch-msd", "/ws/arch-msd").await;
+    let fid = insert_file(&pool, project_id, "/ws/arch-msd/src/a.rs", "src/a.rs").await;
+    sqlx::query(
+        "INSERT INTO file_metrics
+         (file_id, project_id, pagerank, afferent_coupling, efferent_coupling, instability,
+          abstract_type_count, concrete_type_count)
+         VALUES ($1, $2, 1.0, 1, 1, 0.5, 1, 2)",
+    )
+    .bind(fid)
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .expect("insert metric with type counts");
+    // avg_distance = 0.25 (exact in f64, comfortably mid-grade) ⇒ score 75.0,
+    // grade C — chosen off any grade boundary so float formatting can't flip it.
+    sqlx::query(
+        "INSERT INTO project_metrics
+         (project_id, file_count, module_count, avg_instability, avg_abstractness, avg_distance,
+          architecture_quality_score)
+         VALUES ($1, 1, 1, 0.5, 0.33, 0.25, 0.75)",
+    )
+    .bind(project_id)
+    .execute(&pool)
+    .await
+    .expect("insert project_metrics rollup");
+
+    let server = server_with_pool(pool);
+    let result = server
+        .call_tool_cli(
+            "architecture_quality",
+            serde_json::json!({"project": "arch-msd", "detail": "full"}),
+        )
+        .await
+        .expect("call");
+    let v: Value = serde_json::from_str(&text_of(&result)).expect("json");
+    // (1 − 0.25)·100 = 75 ⇒ grade C.
+    assert!(
+        (score(&v, "main_sequence_distance") - 75.0).abs() < 0.5,
+        "expected ~75 main-sequence-distance score: {v}"
+    );
+    assert_eq!(
+        dimension(&v, "main_sequence_distance")["grade"].as_str(),
+        Some("C")
+    );
 }

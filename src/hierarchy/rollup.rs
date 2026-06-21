@@ -113,29 +113,32 @@ pub async fn persist_group_workspace_rollup(pool: &PgPool) -> Result<(), sqlx::E
             .fetch_all(&mut *tx)
             .await?;
     for (gid, label) in groups {
-        let (project_count, file_count, avg_i, avg_d): (i64, i64, f64, f64) = sqlx::query_as(
-            "SELECT COUNT(*)::int8,
+        let (project_count, file_count, avg_i, avg_a, avg_d): (i64, i64, f64, f64, f64) =
+            sqlx::query_as(
+                "SELECT COUNT(*)::int8,
                     COALESCE(SUM(pm.file_count), 0)::int8,
                     COALESCE(AVG(pm.avg_instability), 0)::float8,
+                    COALESCE(AVG(pm.avg_abstractness), 0)::float8,
                     COALESCE(AVG(pm.avg_distance), 0)::float8
                FROM project_group_members m
                JOIN project_metrics pm ON pm.project_id = m.project_id
               WHERE m.group_id = $1 AND m.valid_to IS NULL",
-        )
-        .bind(gid)
-        .fetch_one(&mut *tx)
-        .await?;
+            )
+            .bind(gid)
+            .fetch_one(&mut *tx)
+            .await?;
         sqlx::query(
             "INSERT INTO hier_group_metrics
                 (level, ref_id, label, project_count, file_count, avg_instability,
-                 avg_distance, architecture_quality_score)
-             VALUES ('group', $1, $2, $3, $4, $5, $6, $7)",
+                 avg_abstractness, avg_distance, architecture_quality_score)
+             VALUES ('group', $1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(gid)
         .bind(label)
         .bind(project_count as i32)
         .bind(file_count)
         .bind(avg_i)
+        .bind(avg_a)
         .bind(avg_d)
         .bind(quality_from_distance(avg_d))
         .execute(&mut *tx)
@@ -143,24 +146,27 @@ pub async fn persist_group_workspace_rollup(pool: &PgPool) -> Result<(), sqlx::E
     }
 
     // Workspace level: aggregate all projects (ref_id = 0).
-    let (project_count, file_count, avg_i, avg_d): (i64, i64, f64, f64) = sqlx::query_as(
-        "SELECT COUNT(*)::int8,
+    let (project_count, file_count, avg_i, avg_a, avg_d): (i64, i64, f64, f64, f64) =
+        sqlx::query_as(
+            "SELECT COUNT(*)::int8,
                 COALESCE(SUM(file_count), 0)::int8,
                 COALESCE(AVG(avg_instability), 0)::float8,
+                COALESCE(AVG(avg_abstractness), 0)::float8,
                 COALESCE(AVG(avg_distance), 0)::float8
            FROM project_metrics",
-    )
-    .fetch_one(&mut *tx)
-    .await?;
+        )
+        .fetch_one(&mut *tx)
+        .await?;
     sqlx::query(
         "INSERT INTO hier_group_metrics
             (level, ref_id, label, project_count, file_count, avg_instability,
-             avg_distance, architecture_quality_score)
-         VALUES ('workspace', 0, 'workspace', $1, $2, $3, $4, $5)",
+             avg_abstractness, avg_distance, architecture_quality_score)
+         VALUES ('workspace', 0, 'workspace', $1, $2, $3, $4, $5, $6)",
     )
     .bind(project_count as i32)
     .bind(file_count)
     .bind(avg_i)
+    .bind(avg_a)
     .bind(avg_d)
     .bind(quality_from_distance(avg_d))
     .execute(&mut *tx)

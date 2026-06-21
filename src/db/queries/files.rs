@@ -603,20 +603,56 @@ pub async fn find_files_by_path_pattern(
     .await
 }
 
-/// Clean up stale files (files that no longer exist on disk).
+/// Clean up stale files (files that no longer exist on disk). This is the
+/// cross-workspace backstop for paths under no active workspace root (the
+/// per-workspace `rescan_workspace` set-difference prune handles paths inside a
+/// walked workspace).
+///
+/// Hardened (Boy-Scout, ADR-019 follow-up): the previous implementation stat'd
+/// every ~60k path and issued one `DELETE … WHERE path = $1` per missing row on
+/// a single connection carrying the pool's 30 s `statement_timeout`, and
+/// `?`-aborted the WHOLE sweep on the first error — so a timeout/hiccup stranded
+/// every not-yet-processed phantom for another full cycle (the bug behind
+/// persistent phantom module rows). Now: collect the missing set, then delete it
+/// in timeout-lifted batches that log-and-continue, so one bad batch can't abort
+/// the rest. `Missing`-only (`!exists()`); an edited file still `exists()` and is
+/// re-indexed, never pruned.
 pub async fn cleanup_stale_files(pool: &PgPool) -> Result<u64, sqlx::Error> {
     let paths = sqlx::query_scalar::<_, String>("SELECT path FROM indexed_files")
         .fetch_all(pool)
         .await?;
 
+    let missing: Vec<String> = paths
+        .into_iter()
+        .filter(|p| !std::path::Path::new(p).exists())
+        .collect();
+    if missing.is_empty() {
+        return Ok(0);
+    }
+
     let mut removed = 0u64;
-    for path in &paths {
-        if !std::path::Path::new(path).exists() {
-            sqlx::query("DELETE FROM indexed_files WHERE path = $1")
-                .bind(path)
-                .execute(pool)
+    for chunk in missing.chunks(500) {
+        // Per-batch transaction with the statement timeout lifted: a large
+        // FK-cascade delete must not be cancelled mid-sweep by the pool's 30 s
+        // default. A failed batch is logged and skipped, not propagated.
+        let res: Result<u64, sqlx::Error> = async {
+            let mut tx = pool.begin().await?;
+            sqlx::query("SET LOCAL statement_timeout = 0")
+                .execute(&mut *tx)
                 .await?;
-            removed += 1;
+            let r = sqlx::query("DELETE FROM indexed_files WHERE path = ANY($1)")
+                .bind(chunk)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok(r.rows_affected())
+        }
+        .await;
+        match res {
+            Ok(n) => removed += n,
+            Err(e) => {
+                tracing::error!(error = %e, batch = chunk.len(), "stale-cleanup: batch delete failed; continuing")
+            }
         }
     }
 

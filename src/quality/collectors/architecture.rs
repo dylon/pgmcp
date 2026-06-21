@@ -31,6 +31,7 @@ pub async fn collect_circular_dependencies(
          JOIN indexed_files fa ON fa.id = e1.source_file_id
          JOIN indexed_files fb ON fb.id = e1.target_file_id
          WHERE e1.project_id = $1 AND e1.edge_type = 'import' AND e2.edge_type = 'import'
+           AND e1.target_project_id IS NULL AND e2.target_project_id IS NULL
            AND e1.source_file_id < e1.target_file_id",
     )
     .bind(project_id)

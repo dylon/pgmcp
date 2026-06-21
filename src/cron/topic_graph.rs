@@ -81,7 +81,8 @@ pub async fn load_project_graph_edges(
          FROM code_graph_edges
          WHERE project_id = $1
            AND source_file_id IS NOT NULL
-           AND target_file_id IS NOT NULL",
+           AND target_file_id IS NOT NULL
+           AND target_project_id IS NULL",
     )
     .bind(project_id)
     .fetch_all(pool)

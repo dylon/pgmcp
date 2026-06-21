@@ -70,6 +70,8 @@ mod v51_working_set;
 mod v52_experiment_hardening;
 mod v53_working_set_bytes;
 mod v54_csm_pushdown;
+mod v55_file_abstractness;
+mod v56_cross_project_edges;
 mod v5_work_items_collab;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
@@ -2763,6 +2765,39 @@ pub async fn run_migrations(
         v54_csm_pushdown::CSM_PUSHDOWN,
         v54_csm_pushdown::CSM_PUSHDOWN_NAME,
         || v54_csm_pushdown::apply(pool),
+    )
+    .await?;
+
+    // ================================================================
+    // Step 55 — first-class per-file Abstractness (Martin's `A`). Adds
+    // `file_metrics.is_abstract`/`abstract_type_count`/`concrete_type_count` so
+    // the graph-analysis cron can persist abstractness computed
+    // content-independently from `file_symbols`, fixing the always-zero
+    // `module_metrics.abstractness` and the inverted persisted
+    // `distance_from_main_sequence`. Also closes the v48 group/workspace-tier
+    // gap (`hier_group_metrics.avg_abstractness`). See
+    // `src/db/migrations/v55_file_abstractness.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v55_file_abstractness::FILE_ABSTRACTNESS,
+        v55_file_abstractness::FILE_ABSTRACTNESS_NAME,
+        || v55_file_abstractness::apply(pool),
+    )
+    .await?;
+
+    // ================================================================
+    // Step 56 — cross-project import edges. Adds
+    // `code_graph_edges.target_project_id` (NULL for intra-project/unresolved;
+    // the target's project for a cross-crate edge into another project) + a
+    // partial index, so cross-project file→file imports are self-identifying and
+    // uniformly filterable. See `src/db/migrations/v56_cross_project_edges.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v56_cross_project_edges::CROSS_PROJECT_EDGES,
+        v56_cross_project_edges::CROSS_PROJECT_EDGES_NAME,
+        || v56_cross_project_edges::apply(pool),
     )
     .await?;
 

@@ -39,12 +39,28 @@ pub async fn tool_coupling_cohesion_report(
             None,
         ));
     }
+    let bucketing = params
+        .bucketing
+        .as_deref()
+        .map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or("depth");
+    if !matches!(bucketing, "depth" | "crate") {
+        return Err(McpError::invalid_params(
+            format!(
+                "Unknown bucketing '{}': expected one of depth | crate",
+                bucketing
+            ),
+            None,
+        ));
+    }
 
     debug!(
         tool = "coupling_cohesion_report",
         project = %project,
         module_depth,
         sort_by,
+        bucketing,
         "MCP tool invoked",
     );
 
@@ -91,11 +107,10 @@ pub async fn tool_coupling_cohesion_report(
         file_id: i64,
         relative_path: String,
         language: String,
-        content: Option<String>,
     }
 
     let file_data: Vec<FileMetaDb> = sqlx::query_as::<_, FileMetaDb>(
-        "SELECT id as file_id, relative_path, language, content
+        "SELECT id as file_id, relative_path, language
          FROM indexed_files WHERE project_id = $1",
     )
     .bind(project_id)
@@ -104,7 +119,8 @@ pub async fn tool_coupling_cohesion_report(
     .map_err(|e| McpError::internal_error(format!("File query failed: {}", e), None))?;
 
     use crate::graph::builder::{FileMetaRow, GraphEdgeRow, build_graph};
-    use crate::graph::metrics::{compute_module_metrics, is_abstract_file, update_abstractness};
+    use crate::graph::cargo_layout::CrateLayout;
+    use crate::graph::metrics::{ModuleBucketer, compute_module_metrics_with, update_abstractness};
 
     let graph_edges: Vec<GraphEdgeRow> = db_edges
         .iter()
@@ -130,19 +146,40 @@ pub async fn tool_coupling_cohesion_report(
         .collect();
 
     let code_graph = build_graph(&graph_edges, &metas);
-    let mut module_metrics = compute_module_metrics(&code_graph, module_depth);
 
-    // Compute abstractness from content
-    let mut file_abstractions: std::collections::HashMap<String, bool> =
-        std::collections::HashMap::new();
-    for f in &file_data {
-        let is_abstract = f
-            .content
-            .as_ref()
-            .map(|c| is_abstract_file(c, &f.language))
-            .unwrap_or(false);
-        file_abstractions.insert(f.relative_path.clone(), is_abstract);
-    }
+    // Bucketing: directory depth (default) or Cargo crate boundaries. Crate mode
+    // needs the project's layout, built from its root path; it falls back to
+    // depth when the project has no Cargo crates.
+    let crate_layout: Option<CrateLayout> = if bucketing == "crate" {
+        let root: Option<String> = sqlx::query_scalar("SELECT path FROM projects WHERE id = $1")
+            .bind(project_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| {
+                McpError::internal_error(format!("Project path query failed: {}", e), None)
+            })?;
+        root.map(|r| CrateLayout::build_for_project(&r))
+    } else {
+        None
+    };
+    let bucketer = match crate_layout.as_ref() {
+        Some(l) if !l.is_empty() => ModuleBucketer::crate_aware(l, module_depth, 0),
+        _ => ModuleBucketer::by_depth(module_depth),
+    };
+    let mut module_metrics = compute_module_metrics_with(&code_graph, &bucketer);
+
+    // Per-file abstractness from the persisted, symbol-derived metric (computed
+    // content-independently by the graph-analysis cron). Bucket-independent, so
+    // it composes with this tool's request-time bucketing. Absent rows (cron
+    // not yet run) default to not-abstract, exactly the prior pre-cron behavior.
+    let file_abstractions: std::collections::HashMap<String, bool> =
+        crate::db::queries::file_abstractions(pool, project_id)
+            .await
+            .map_err(|e| {
+                McpError::internal_error(format!("Abstractness query failed: {}", e), None)
+            })?
+            .into_iter()
+            .collect();
     update_abstractness(&mut module_metrics, &file_abstractions);
 
     // Sort

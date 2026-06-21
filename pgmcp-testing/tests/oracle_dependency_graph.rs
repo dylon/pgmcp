@@ -172,3 +172,84 @@ async fn dependency_graph_rejects_duplicate_projects_and_stale_edges() {
         "unexpected duplicate-project error: {err}"
     );
 }
+
+#[tokio::test]
+async fn cross_project_edges_are_opt_in() {
+    // A self-identifying cross-project import edge (target_project_id set) is
+    // excluded by default and surfaced only with include_cross_project=true.
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+    let a_proj: i32 = sqlx::query_scalar(
+        "INSERT INTO projects (workspace_path, path, name)
+         VALUES ('/ws/dg-a', '/ws/dg-a/dg-a', 'dg-a') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("project a");
+    let b_proj: i32 = sqlx::query_scalar(
+        "INSERT INTO projects (workspace_path, path, name)
+         VALUES ('/ws/dg-b', '/ws/dg-b/dg-b', 'dg-b') RETURNING id",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("project b");
+    let a_file: i64 = sqlx::query_scalar(
+        "INSERT INTO indexed_files
+            (project_id, path, relative_path, language, size_bytes, line_count, modified_at)
+         VALUES ($1, '/ws/dg-a/src/a.rs', 'src/a.rs', 'rust', 10, 10, NOW()) RETURNING id",
+    )
+    .bind(a_proj)
+    .fetch_one(&pool)
+    .await
+    .expect("file a");
+    let b_file: i64 = sqlx::query_scalar(
+        "INSERT INTO indexed_files
+            (project_id, path, relative_path, language, size_bytes, line_count, modified_at)
+         VALUES ($1, '/ws/dg-b/src/b.rs', 'src/b.rs', 'rust', 10, 10, NOW()) RETURNING id",
+    )
+    .bind(b_proj)
+    .fetch_one(&pool)
+    .await
+    .expect("file b");
+    sqlx::query(
+        "INSERT INTO code_graph_edges
+            (project_id, source_file_id, target_file_id, target_project_id, edge_type, weight)
+         VALUES ($1, $2, $3, $4, 'import', 1.0)",
+    )
+    .bind(a_proj)
+    .bind(a_file)
+    .bind(b_file)
+    .bind(b_proj)
+    .execute(&pool)
+    .await
+    .expect("cross-project edge");
+
+    let server = server_with_pool(pool);
+
+    let default = server
+        .call_tool_cli("dependency_graph", serde_json::json!({"project": "dg-a"}))
+        .await
+        .expect("default call");
+    let dv: Value = serde_json::from_str(&text_of(&default)).expect("json");
+    assert_eq!(
+        dv["edge_count"], 0,
+        "cross-project edge must be excluded by default: {dv}"
+    );
+
+    let included = server
+        .call_tool_cli(
+            "dependency_graph",
+            serde_json::json!({"project": "dg-a", "include_cross_project": true}),
+        )
+        .await
+        .expect("opt-in call");
+    let iv: Value = serde_json::from_str(&text_of(&included)).expect("json");
+    assert_eq!(
+        iv["edge_count"], 1,
+        "include_cross_project must surface the cross-project edge: {iv}"
+    );
+    assert_eq!(
+        iv["node_count"], 2,
+        "opt-in graph spans the source and the foreign target: {iv}"
+    );
+}

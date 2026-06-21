@@ -12,10 +12,13 @@ use sqlx::PgPool;
 use tracing::{error, info};
 
 use crate::db::DbClient;
+use crate::db::disk_read::{DiskReadOutcome, read_disk_verified};
 use crate::graph::algorithms;
 use crate::graph::builder::{FileMetaRow, GraphEdgeRow};
-use crate::graph::import_extractor;
-use crate::graph::metrics;
+use crate::graph::cargo_layout::CrateLayout;
+use crate::graph::import_extractor::{self, RawImport};
+use crate::graph::metrics::{self, ModuleBucketer};
+use crate::graph::workspace_crate_map::WorkspaceCrateMap;
 use crate::stats::tracker::StatsTracker;
 
 /// Metadata-only row (no content) — cheap to fetch in bulk.
@@ -24,15 +27,6 @@ struct FileMetaLite {
     file_id: i64,
     relative_path: String,
     language: String,
-}
-
-/// Content-carrying row for streaming imports extraction.
-#[derive(Debug, sqlx::FromRow)]
-struct FileContentLite {
-    file_id: i64,
-    relative_path: String,
-    language: String,
-    content: Option<String>,
 }
 
 /// Size of each content-fetch batch. Peak content RAM per project ≈
@@ -68,18 +62,19 @@ pub async fn run_graph_analysis(
     // distinguish "ran, no work" from "never ran".
     stats.graph_build_runs.fetch_add(1, Ordering::Relaxed);
 
-    // Get all projects
-    let projects: Vec<(i32, String)> =
-        match sqlx::query_as::<_, (i32, String)>("SELECT id, name FROM projects ORDER BY id")
-            .fetch_all(pool)
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                error!("Failed to list projects for graph analysis: {}", e);
-                return;
-            }
-        };
+    // Get all projects (incl. root path for the Cargo crate layout).
+    let projects: Vec<(i32, String, String)> = match sqlx::query_as::<_, (i32, String, String)>(
+        "SELECT id, name, path FROM projects ORDER BY id",
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(p) => p,
+        Err(e) => {
+            error!("Failed to list projects for graph analysis: {}", e);
+            return;
+        }
+    };
 
     if projects.is_empty() {
         stats
@@ -89,8 +84,32 @@ pub async fn run_graph_analysis(
         return;
     }
 
-    for (project_id, project_name) in &projects {
-        if let Err(e) = analyze_project(pool, *project_id, project_name, work_pool.as_ref()).await {
+    // Build the workspace-global crate map ONCE for the whole pass: per-project
+    // Cargo crate layouts (intra-project cross-crate resolution + crate-aware
+    // module bucketing) plus the worktree-safe cross-project resolver. A build
+    // failure is non-fatal — resolution degrades to intra-project only.
+    let id_paths: Vec<(i32, String)> = projects
+        .iter()
+        .map(|(id, _, path)| (*id, path.clone()))
+        .collect();
+    let crate_map = match WorkspaceCrateMap::build(pool, &id_paths).await {
+        Ok(m) => m,
+        Err(e) => {
+            error!(error = %e, "Failed to build workspace crate map; cross-crate resolution disabled this pass");
+            WorkspaceCrateMap::default()
+        }
+    };
+
+    for (project_id, project_name, _path) in &projects {
+        if let Err(e) = analyze_project(
+            pool,
+            *project_id,
+            project_name,
+            &crate_map,
+            work_pool.as_ref(),
+        )
+        .await
+        {
             error!(
                 project = %project_name,
                 error = %e,
@@ -124,13 +143,24 @@ async fn analyze_project(
     pool: &PgPool,
     project_id: i32,
     project_name: &str,
+    crate_map: &WorkspaceCrateMap,
     work_pool: Option<&Arc<crate::work_pool::pool::WorkPool>>,
 ) -> Result<(), sqlx::Error> {
-    // Phase A: fetch metadata only (no content).
+    // This project's Cargo crate layout (intra-project cross-crate resolution +
+    // crate-aware module bucketing) and worktree group key (worktree-safe
+    // cross-project resolution).
+    let layout = crate_map.layout_of(project_id);
+    let group_key = crate_map.group_key_of(project_id).to_string();
+
+    // Phase A: fetch metadata for ALL files (NO content gate). Import edges are
+    // rebuilt from `symbol_references` (content-independent) and, for the regex
+    // fallback, from disk-recovered content; gating on `content IS NOT NULL`
+    // would discard the recoverable-from-disk majority and starve the edges,
+    // collapsing the module coupling metrics to Ca=Ce=0.
     let metas: Vec<FileMetaLite> = sqlx::query_as::<_, FileMetaLite>(
         "SELECT id as file_id, relative_path, language
          FROM indexed_files
-         WHERE project_id = $1 AND content IS NOT NULL",
+         WHERE project_id = $1",
     )
     .bind(project_id)
     .fetch_all(pool)
@@ -174,20 +204,32 @@ async fn analyze_project(
         let symbol_imports =
             crate::db::queries::get_imports_from_symbols(pool, project_id, &file_ids).await?;
         for imp in &symbol_imports {
-            let target_file_id = imp.target_file_id.or_else(|| {
-                let language = file_languages.get(&imp.source_file_id)?;
-                let source_path = file_paths_by_id.get(&imp.source_file_id)?;
-                let raw = synthesize_raw_import(&imp.target_raw, language);
-                let candidates =
-                    import_extractor::resolve_import_candidates(&raw, source_path, language);
-                candidates
-                    .iter()
-                    .find_map(|c| file_paths.get(c.as_str()))
-                    .copied()
-            });
+            let (target_file_id, target_project_id) = match (
+                file_languages.get(&imp.source_file_id),
+                file_paths_by_id.get(&imp.source_file_id),
+            ) {
+                (Some(language), Some(source_path)) => {
+                    let raw = synthesize_raw_import(&imp.target_raw, language);
+                    resolve_import_target(
+                        imp.target_file_id,
+                        &raw,
+                        source_path,
+                        language,
+                        &file_paths,
+                        layout,
+                        crate_map,
+                        project_id,
+                        &group_key,
+                    )
+                }
+                // Missing language/path (shouldn't happen) — keep any in-project
+                // resolution the symbol-extraction cron already made.
+                _ => (imp.target_file_id, None),
+            };
             all_edges.push(ImportEdge {
                 source_file_id: imp.source_file_id,
                 target_file_id,
+                target_project_id,
                 target_raw: imp.target_raw.clone(),
                 edge_type: "import".to_string(),
                 weight: 1.0,
@@ -205,39 +247,54 @@ async fn analyze_project(
         if regex_batch_ids.is_empty() {
             continue;
         }
-        let batch: Vec<FileContentLite> = sqlx::query_as::<_, FileContentLite>(
-            "SELECT id as file_id, relative_path, language, content
-             FROM indexed_files
-             WHERE project_id = $1 AND id = ANY($2::bigint[]) AND content IS NOT NULL",
-        )
-        .bind(project_id)
-        .bind(&regex_batch_ids)
-        .fetch_all(pool)
-        .await?;
+        // No `content IS NOT NULL` filter: content-NULL files stored under the
+        // asymmetric-storage policy are recovered from disk below (mirroring the
+        // symbol-extraction cron), so the regex fallback also resolves imports
+        // for the recoverable-from-disk majority.
+        let batch =
+            crate::db::queries::fetch_file_content_batch(pool, project_id, &regex_batch_ids)
+                .await?;
 
         for file in &batch {
-            let content = match &file.content {
+            // Resolve content: inline if present, else a hash-verified disk read.
+            let disk_owned;
+            let content: &str = match &file.content {
                 Some(c) => c,
-                None => continue,
+                None => match read_disk_verified(
+                    &file.path,
+                    file.content_recoverable_from_disk,
+                    file.content_hash,
+                ) {
+                    DiskReadOutcome::Hit(bytes) => {
+                        disk_owned = bytes;
+                        &disk_owned
+                    }
+                    // Missing / HashMismatch / IoError / NotRecoverable: no
+                    // trustworthy text to parse — skip (the file still becomes a
+                    // graph node via Phase A; it just contributes no out-edges).
+                    _ => continue,
+                },
             };
 
             let imports = import_extractor::extract_imports(content, &file.language);
 
             for import in &imports {
-                let candidates = import_extractor::resolve_import_candidates(
+                let (target_file_id, target_project_id) = resolve_import_target(
+                    None,
                     import,
                     &file.relative_path,
                     &file.language,
+                    &file_paths,
+                    layout,
+                    crate_map,
+                    project_id,
+                    &group_key,
                 );
-
-                let target_file_id = candidates
-                    .iter()
-                    .find_map(|candidate| file_paths.get(candidate.as_str()))
-                    .copied();
 
                 all_edges.push(ImportEdge {
                     source_file_id: file.file_id,
                     target_file_id,
+                    target_project_id,
                     target_raw: import.raw_path.clone(),
                     edge_type: "import".to_string(),
                     weight: 1.0,
@@ -297,8 +354,40 @@ async fn analyze_project(
     // Compute degrees
     let degrees = algorithms::compute_degrees(&code_graph.graph);
 
-    // Compute module metrics for coupling
-    let module_metrics = metrics::compute_module_metrics(&code_graph, 2);
+    // Compute module metrics for coupling. Rust files bucket by their Cargo
+    // crate (the true package unit of a workspace) so an edge counts toward
+    // Ca/Ce iff it crosses a crate boundary; non-Rust / crate-less projects fall
+    // back to directory depth-2 (byte-identical to the prior behavior).
+    let bucketer = match layout {
+        Some(l) if !l.is_empty() => ModuleBucketer::crate_aware(l, 2, 0),
+        _ => ModuleBucketer::by_depth(2),
+    };
+    let mut module_metrics = metrics::compute_module_metrics_with(&code_graph, &bucketer);
+
+    // Per-file abstractness from symbols (content-independent — survives the
+    // content=NULL disk policy). A file is abstract iff it declares ≥1
+    // trait/interface. Files with no type symbols default to concrete (0,0).
+    let abs_by_id: HashMap<i64, (i32, i32)> =
+        crate::db::queries::file_abstract_type_counts(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(fid, a, c)| (fid, (a as i32, c as i32)))
+            .collect();
+    let file_abstractions: HashMap<String, bool> = file_paths
+        .iter()
+        .map(|(path, fid)| {
+            (
+                path.clone(),
+                abs_by_id.get(fid).is_some_and(|(a, _)| *a > 0),
+            )
+        })
+        .collect();
+    // Fill real A + D* = |A + I − 1| so the rollup persists Martin's actual
+    // abstractness/distance instead of the placeholders (abstractness 0.0,
+    // distance = instability — which was inverted on Rust). This is the single
+    // fix for both the always-zero abstractness and the inverted distance.
+    metrics::update_abstractness(&mut module_metrics, &file_abstractions);
 
     // Build per-file Ca/Ce from module metrics
     let mut file_coupling: HashMap<i64, (i32, i32)> = HashMap::new();
@@ -345,6 +434,7 @@ async fn analyze_project(
         };
 
         let churn = churn_data.get(&file_id);
+        let (abs_cnt, conc_cnt) = abs_by_id.get(&file_id).copied().unwrap_or((0, 0));
 
         metrics_rows.push(FileMetricsRow {
             file_id,
@@ -356,6 +446,9 @@ async fn analyze_project(
             afferent_coupling: ca,
             efferent_coupling: ce,
             instability,
+            is_abstract: abs_cnt > 0,
+            abstract_type_count: abs_cnt,
+            concrete_type_count: conc_cnt,
             commit_count: churn.map(|c| c.commit_count).unwrap_or(0),
             author_count: churn.map(|c| c.author_count).unwrap_or(0),
             fix_commit_ratio: churn.map(|c| c.fix_commit_ratio).unwrap_or(0.0),
@@ -388,9 +481,58 @@ async fn analyze_project(
 struct ImportEdge {
     source_file_id: i64,
     target_file_id: Option<i64>,
+    /// The project owning `target_file_id` when it lives in a DIFFERENT project
+    /// than the source (cross-crate `use` into a sibling repo); `None` for an
+    /// intra-project or unresolved edge. Self-identifies cross-project edges so
+    /// intra-project readers filter them with `target_project_id IS NULL`.
+    target_project_id: Option<i32>,
     target_raw: String,
     edge_type: String,
     weight: f64,
+}
+
+/// Two-tier import resolution shared by the symbol-aware and regex paths.
+///
+/// - **Tier 0** — an in-project target the symbol-extraction cron already
+///   resolved by name (`pre_resolved`).
+/// - **Tier 1** — this project's path-convention resolution, including
+///   intra-project cargo workspace members via the crate `layout`.
+/// - **Tier 2** — cross-project resolution (Rust only): the target crate lives
+///   in another indexed project; worktree-safe via [`WorkspaceCrateMap`].
+///
+/// Returns `(target_file_id, target_project_id)` — the latter `Some` only for a
+/// Tier-2 cross-project hit.
+#[allow(clippy::too_many_arguments)]
+fn resolve_import_target(
+    pre_resolved: Option<i64>,
+    raw: &RawImport,
+    source_path: &str,
+    language: &str,
+    file_paths: &HashMap<String, i64>,
+    layout: Option<&CrateLayout>,
+    crate_map: &WorkspaceCrateMap,
+    source_project_id: i32,
+    source_group_key: &str,
+) -> (Option<i64>, Option<i32>) {
+    if let Some(tfid) = pre_resolved {
+        return (Some(tfid), None);
+    }
+    let candidates =
+        import_extractor::resolve_import_candidates(raw, source_path, language, layout);
+    if let Some(tfid) = candidates
+        .iter()
+        .find_map(|c| file_paths.get(c.as_str()))
+        .copied()
+    {
+        return (Some(tfid), None);
+    }
+    if language == "rust"
+        && let Some((tfid, tpid)) =
+            crate_map.resolve_external_use(raw, source_project_id, source_group_key)
+    {
+        return (Some(tfid), Some(tpid));
+    }
+    (None, None)
 }
 
 /// Synthesize a `RawImport` from a `symbol_references.target_raw` string so
@@ -425,6 +567,9 @@ struct FileMetricsRow {
     afferent_coupling: i32,
     efferent_coupling: i32,
     instability: f64,
+    is_abstract: bool,
+    abstract_type_count: i32,
+    concrete_type_count: i32,
     commit_count: i32,
     author_count: i32,
     fix_commit_ratio: f64,
@@ -479,21 +624,23 @@ async fn insert_edges_batch(
     let project_ids: Vec<i32> = vec![project_id; dedup.len()];
     let source_ids: Vec<i64> = dedup.iter().map(|e| e.source_file_id).collect();
     let target_ids: Vec<Option<i64>> = dedup.iter().map(|e| e.target_file_id).collect();
+    let target_pids: Vec<Option<i32>> = dedup.iter().map(|e| e.target_project_id).collect();
     let edge_types: Vec<String> = dedup.iter().map(|e| e.edge_type.clone()).collect();
     let target_raws: Vec<String> = dedup.iter().map(|e| e.target_raw.clone()).collect();
     let weights: Vec<f64> = dedup.iter().map(|e| e.weight).collect();
 
     sqlx::query(
-        "INSERT INTO code_graph_edges (project_id, source_file_id, target_file_id, edge_type, target_raw, weight)
+        "INSERT INTO code_graph_edges (project_id, source_file_id, target_file_id, target_project_id, edge_type, target_raw, weight)
          SELECT * FROM UNNEST(
-             $1::int4[], $2::int8[], $3::int8[], $4::text[], $5::text[], $6::float8[]
+             $1::int4[], $2::int8[], $3::int8[], $4::int4[], $5::text[], $6::text[], $7::float8[]
          )
          ON CONFLICT (source_file_id, COALESCE(target_file_id, -1::BIGINT), edge_type, COALESCE(target_raw, ''))
-         DO UPDATE SET weight = EXCLUDED.weight, computed_at = NOW()"
+         DO UPDATE SET weight = EXCLUDED.weight, target_project_id = EXCLUDED.target_project_id, computed_at = NOW()"
     )
     .bind(&project_ids)
     .bind(&source_ids)
     .bind(&target_ids)
+    .bind(&target_pids)
     .bind(&edge_types)
     .bind(&target_raws)
     .bind(&weights)
@@ -520,7 +667,8 @@ async fn load_graph_edges(
          FROM code_graph_edges e
          JOIN indexed_files sf ON e.source_file_id = sf.id
          LEFT JOIN indexed_files tf ON e.target_file_id = tf.id
-         WHERE e.project_id = $1",
+         WHERE e.project_id = $1
+           AND e.target_project_id IS NULL",
     )
     .bind(project_id)
     .fetch_all(pool)
@@ -774,18 +922,23 @@ async fn upsert_file_metrics_batch(
     let fix_ratios: Vec<f64> = rows.iter().map(|r| r.fix_commit_ratio).collect();
     let churn_rates: Vec<f64> = rows.iter().map(|r| r.churn_rate).collect();
     let days: Vec<Option<i32>> = rows.iter().map(|r| r.days_since_last_change).collect();
+    let is_abs: Vec<bool> = rows.iter().map(|r| r.is_abstract).collect();
+    let abs_cnt: Vec<i32> = rows.iter().map(|r| r.abstract_type_count).collect();
+    let conc_cnt: Vec<i32> = rows.iter().map(|r| r.concrete_type_count).collect();
 
     sqlx::query(
         "INSERT INTO file_metrics (
             file_id, project_id,
             pagerank, betweenness, in_degree, out_degree,
             afferent_coupling, efferent_coupling, instability,
+            is_abstract, abstract_type_count, concrete_type_count,
             commit_count, author_count, fix_commit_ratio, churn_rate,
             days_since_last_change, computed_at
         )
         SELECT file_id, project_id,
                pagerank, betweenness, in_degree, out_degree,
                aff, eff, inst,
+               is_abstract, abstract_type_count, concrete_type_count,
                commit_count, author_count, fix_ratio, churn_rate,
                days_since, NOW()
         FROM UNNEST(
@@ -793,10 +946,10 @@ async fn upsert_file_metrics_batch(
             $3::float8[], $4::float8[], $5::int4[], $6::int4[],
             $7::int4[], $8::int4[], $9::float8[],
             $10::int4[], $11::int4[], $12::float8[], $13::float8[],
-            $14::int4[]
+            $14::int4[], $15::bool[], $16::int4[], $17::int4[]
         ) AS u(file_id, project_id, pagerank, betweenness, in_degree, out_degree,
                aff, eff, inst, commit_count, author_count, fix_ratio, churn_rate,
-               days_since)
+               days_since, is_abstract, abstract_type_count, concrete_type_count)
         ON CONFLICT (file_id) DO UPDATE SET
             project_id = EXCLUDED.project_id,
             pagerank = EXCLUDED.pagerank,
@@ -806,6 +959,9 @@ async fn upsert_file_metrics_batch(
             afferent_coupling = EXCLUDED.afferent_coupling,
             efferent_coupling = EXCLUDED.efferent_coupling,
             instability = EXCLUDED.instability,
+            is_abstract = EXCLUDED.is_abstract,
+            abstract_type_count = EXCLUDED.abstract_type_count,
+            concrete_type_count = EXCLUDED.concrete_type_count,
             commit_count = EXCLUDED.commit_count,
             author_count = EXCLUDED.author_count,
             fix_commit_ratio = EXCLUDED.fix_commit_ratio,
@@ -827,6 +983,9 @@ async fn upsert_file_metrics_batch(
     .bind(&fix_ratios)
     .bind(&churn_rates)
     .bind(&days)
+    .bind(&is_abs)
+    .bind(&abs_cnt)
+    .bind(&conc_cnt)
     .execute(pool)
     .await?;
 

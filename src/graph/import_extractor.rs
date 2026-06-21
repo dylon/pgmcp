@@ -14,6 +14,8 @@
 use regex::Regex;
 use std::sync::LazyLock;
 
+use crate::graph::cargo_layout::CrateLayout;
+
 /// A raw import extracted from source code.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RawImport {
@@ -28,7 +30,14 @@ pub struct RawImport {
 // ============================================================================
 
 static RUST_USE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^\s*use\s+((?:crate|super|self)(?:::\w+)+)").expect("invalid regex")
+    // Capture any identifier-rooted `use` path, not just `crate`/`super`/`self`.
+    // The leading segment of a cross-crate `use` is the crate's library
+    // identifier (`mettail_prattail`), which the resolver maps to a workspace
+    // member's source dir via `CrateLayout`. External crates (`std`, `tokio`)
+    // are captured too but resolve to no candidate (left unresolved, as before).
+    // Grouped/`as`/glob tails self-heal: `(?:::\w+)+` stops at `{`/`*`/` as `,
+    // yielding the module-path prefix which `rust_path_candidates` resolves.
+    Regex::new(r"(?m)^\s*use\s+(\w+(?:::\w+)+)").expect("invalid regex")
 });
 static RUST_MOD: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^\s*(?:pub\s+)?mod\s+(\w+)\s*;").expect("invalid regex"));
@@ -349,13 +358,17 @@ fn flush_bare_specs(chunk: &str, specs: &mut Vec<String>) {
 
 /// Resolve raw imports to candidate relative file paths within a project.
 /// `source_relative_path`: the file containing the import (e.g., "src/mcp/server.rs").
+/// `layout`: the project's Cargo crate layout (`Some` for Rust workspaces), used
+/// to resolve cross-crate `use <ident>::…` to the owning member's source dir.
+/// `None` preserves the legacy `crate::`/`super::`-only behavior.
 pub fn resolve_import_candidates(
     import: &RawImport,
     source_relative_path: &str,
     language: &str,
+    layout: Option<&CrateLayout>,
 ) -> Vec<String> {
     match language {
-        "rust" => resolve_rust_import(import, source_relative_path),
+        "rust" => resolve_rust_import(import, source_relative_path, layout),
         "python" => resolve_python_import(import, source_relative_path),
         "javascript" | "typescript" => resolve_js_import(import, source_relative_path),
         "clojure" | "clojurescript" => resolve_clojure_import(import, source_relative_path),
@@ -363,7 +376,11 @@ pub fn resolve_import_candidates(
     }
 }
 
-fn resolve_rust_import(import: &RawImport, source_relative_path: &str) -> Vec<String> {
+fn resolve_rust_import(
+    import: &RawImport,
+    source_relative_path: &str,
+    layout: Option<&CrateLayout>,
+) -> Vec<String> {
     let path = &import.raw_path;
 
     match &*import.kind {
@@ -384,8 +401,27 @@ fn resolve_rust_import(import: &RawImport, source_relative_path: &str) -> Vec<St
                 let parent = parent_module(source_relative_path);
                 let segments: Vec<&str> = rest.split("::").collect();
                 rust_path_candidates(&parent, &segments)
+            } else if let Some(rest) = path.strip_prefix("self::") {
+                // self::foo -> a child module of the CURRENT module. For a file
+                // `a/b.rs` the current module's children live under `a/b/`; for
+                // `a/mod.rs` (or `a/b/mod.rs`) they live in the same directory.
+                let base = rust_self_module_root(source_relative_path);
+                let segments: Vec<&str> = rest.split("::").collect();
+                rust_path_candidates(&base, &segments)
+            } else if let Some((ident, rest)) = path.split_once("::") {
+                // Cross-crate `use <ident>::path::Item;`. Map the crate library
+                // identifier to its source dir via the workspace Cargo layout;
+                // an unknown ident (std/tokio/3rd-party, or no layout) stays
+                // unresolved — exactly the prior behavior for externals.
+                match layout.and_then(|l| l.src_dir_for(ident)) {
+                    Some(src_dir) => {
+                        let segments: Vec<&str> = rest.split("::").collect();
+                        rust_path_candidates(src_dir, &segments)
+                    }
+                    None => Vec::new(),
+                }
             } else {
-                // External crate reference
+                // Bare single-segment `use foo;` — no module path to resolve.
                 Vec::new()
             }
         }
@@ -533,7 +569,32 @@ fn rust_crate_src_root(source_relative_path: &str) -> String {
     }
 }
 
-fn rust_path_candidates(base: &str, segments: &[&str]) -> Vec<String> {
+/// Directory under which a file's `self::` child modules live. For `a/b.rs`
+/// the current module is `a::b`, whose children sit in `a/b/`; for a module
+/// root file (`a/mod.rs`, `lib.rs`, `main.rs`) the children sit in the same
+/// directory.
+fn rust_self_module_root(source_relative_path: &str) -> String {
+    let dir = parent_dir(source_relative_path);
+    let stem = source_relative_path
+        .rsplit('/')
+        .next()
+        .and_then(|f| f.strip_suffix(".rs"))
+        .unwrap_or("");
+    if matches!(stem, "mod" | "lib" | "main" | "") {
+        dir.to_string()
+    } else if dir.is_empty() {
+        stem.to_string()
+    } else {
+        format!("{dir}/{stem}")
+    }
+}
+
+/// Generate candidate relative file paths for a module path rooted at `base`.
+/// Tries progressively shorter module prefixes (the trailing segments may name
+/// an item within the module, not a submodule) and both `<mod>.rs` and
+/// `<mod>/mod.rs` layouts. `pub` so the cross-project resolver
+/// (`crate::graph::workspace_crate_map`) can reuse the exact same convention.
+pub fn rust_path_candidates(base: &str, segments: &[&str]) -> Vec<String> {
     if segments.is_empty() {
         return Vec::new();
     }
@@ -626,11 +687,99 @@ mod tests {
             raw_path: "crate::a::b".to_string(),
             kind: "use".to_string(),
         };
-        let candidates = resolve_rust_import(&imp, "crates/foo/src/lib.rs");
+        let candidates = resolve_rust_import(&imp, "crates/foo/src/lib.rs", None);
         assert!(
             candidates.contains(&"crates/foo/src/a/b.rs".to_string()),
             "expected member-rooted candidate, got {candidates:?}"
         );
+    }
+
+    #[test]
+    fn cross_crate_use_resolves_via_layout_when_ident_ne_directory() {
+        // Directory `prattail/` exposes lib ident `mettail_prattail`. A
+        // cross-crate `use mettail_prattail::wpda::Foo;` must resolve under the
+        // member's src dir even though ident != directory.
+        let layout = CrateLayout::from_map(
+            [("mettail_prattail".to_string(), "prattail/src".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let imp = RawImport {
+            raw_path: "mettail_prattail::wpda::Foo".to_string(),
+            kind: "use".to_string(),
+        };
+        let cands = resolve_rust_import(&imp, "runtime/src/lib.rs", Some(&layout));
+        assert!(
+            cands.contains(&"prattail/src/wpda.rs".to_string())
+                && cands.contains(&"prattail/src/wpda/mod.rs".to_string()),
+            "expected wpda module candidates under prattail/src, got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn cross_crate_glob_resolves_via_shorter_prefix_fallback() {
+        let layout = CrateLayout::from_map(
+            [("mettail_prattail".to_string(), "prattail/src".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let imp = RawImport {
+            raw_path: "mettail_prattail::wpda::*".to_string(),
+            kind: "use".to_string(),
+        };
+        let cands = resolve_rust_import(&imp, "runtime/src/lib.rs", Some(&layout));
+        assert!(
+            cands.contains(&"prattail/src/wpda.rs".to_string()),
+            "glob tail should self-heal to the module file, got {cands:?}"
+        );
+    }
+
+    #[test]
+    fn external_crate_unknown_ident_stays_unresolved() {
+        let layout = CrateLayout::from_map(
+            [("mettail_prattail".to_string(), "prattail/src".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        // std/tokio/etc. are not workspace members → no candidates.
+        let imp = RawImport {
+            raw_path: "std::collections::HashMap".to_string(),
+            kind: "use".to_string(),
+        };
+        assert!(resolve_rust_import(&imp, "runtime/src/lib.rs", Some(&layout)).is_empty());
+        // And with no layout at all, externals also stay unresolved (back-compat).
+        assert!(resolve_rust_import(&imp, "runtime/src/lib.rs", None).is_empty());
+    }
+
+    #[test]
+    fn self_module_resolves_under_current_module_dir() {
+        // In `a/b.rs`, `self::c` is the child module `a::b::c` under `a/b/`.
+        let imp = RawImport {
+            raw_path: "self::c".to_string(),
+            kind: "use".to_string(),
+        };
+        let cands = resolve_rust_import(&imp, "a/b.rs", None);
+        assert!(
+            cands.contains(&"a/b/c.rs".to_string()),
+            "self:: child should resolve under the module dir, got {cands:?}"
+        );
+        // In a module root (`a/mod.rs`), `self::c` is a sibling `a/c.rs`.
+        let cands_root = resolve_rust_import(&imp, "a/mod.rs", None);
+        assert!(
+            cands_root.contains(&"a/c.rs".to_string()),
+            "self:: from mod.rs resolves in the same dir, got {cands_root:?}"
+        );
+    }
+
+    #[test]
+    fn widened_rust_use_regex_captures_external_crate_root() {
+        // The regex fallback now harvests any ident-rooted `use`, so the
+        // symbol-less regex path can also resolve workspace-member crates.
+        let src = "use mettail_prattail::wpda::Foo;\nuse crate::db::queries;\n";
+        let imports = extract_imports(src, "rust");
+        let paths: Vec<&str> = imports.iter().map(|i| i.raw_path.as_str()).collect();
+        assert!(paths.contains(&"mettail_prattail::wpda::Foo"));
+        assert!(paths.contains(&"crate::db::queries"));
     }
 
     #[test]
@@ -713,7 +862,7 @@ mod tests {
             raw_path: "my-app.core-utils".to_string(),
             kind: "require".to_string(),
         };
-        let candidates = resolve_import_candidates(&imp, "src/my_app/main.clj", "clojure");
+        let candidates = resolve_import_candidates(&imp, "src/my_app/main.clj", "clojure", None);
         assert!(
             candidates.contains(&"src/my_app/core_utils.clj".to_string()),
             "candidates: {:?}",
@@ -731,7 +880,7 @@ mod tests {
             raw_path: "java.util.Date".to_string(),
             kind: "require".to_string(),
         };
-        let candidates = resolve_import_candidates(&imp, "src/app/core.clj", "clojure");
+        let candidates = resolve_import_candidates(&imp, "src/app/core.clj", "clojure", None);
         assert!(candidates.is_empty(), "got: {:?}", candidates);
     }
 

@@ -1022,6 +1022,56 @@ pub async fn get_imports_from_symbols(
     .await
 }
 
+/// Per-file abstract / concrete TYPE-symbol counts for a project, from
+/// `file_symbols` (content-independent — survives the `content = NULL` disk
+/// storage policy). A "type" is one of Martin's countable type declarations;
+/// abstract = `trait`/`interface`, concrete = `struct`/`enum`/`class`. The kind
+/// strings match `crate::parsing::symbols::SymbolKind::as_db_str` exactly (pinned
+/// by `file_abstract_kind_strings_match_enum`). Only files with ≥1 type symbol
+/// appear; callers treat absent file_ids as `(0, 0)` → not abstract.
+/// `file_symbols` has no `project_id`, so scope via `indexed_files`.
+pub async fn file_abstract_type_counts(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Vec<(i64, i64, i64)>, sqlx::Error> {
+    sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT fs.file_id,
+                COUNT(*) FILTER (WHERE fs.kind IN ('trait','interface'))    AS abstract_cnt,
+                COUNT(*) FILTER (WHERE fs.kind IN ('struct','enum','class')) AS concrete_cnt
+         FROM file_symbols fs
+         JOIN indexed_files f ON f.id = fs.file_id
+         WHERE f.project_id = $1
+           AND fs.kind IN ('trait','interface','struct','enum','class')
+         GROUP BY fs.file_id",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
+/// Per-file abstractness booleans `(relative_path, is_abstract)` for a project,
+/// from the persisted `file_metrics.is_abstract` (computed content-independently
+/// from `file_symbols` by the graph-analysis cron). The SINGLE source of truth
+/// for Martin's per-file Abstractness across every consumer
+/// (`coupling_cohesion_report` / `architecture_violations` /
+/// `fix_circular_dependency`), replacing the divergent content-regex and
+/// path-name heuristics those tools used to carry. Absent rows (cron not yet
+/// run) simply don't appear, and callers default them to not-abstract.
+pub async fn file_abstractions(
+    pool: &PgPool,
+    project_id: i32,
+) -> Result<Vec<(String, bool)>, sqlx::Error> {
+    sqlx::query_as::<_, (String, bool)>(
+        "SELECT f.relative_path, fm.is_abstract
+         FROM file_metrics fm
+         JOIN indexed_files f ON f.id = fm.file_id AND f.project_id = fm.project_id
+         WHERE fm.project_id = $1",
+    )
+    .bind(project_id)
+    .fetch_all(pool)
+    .await
+}
+
 /// One import-hygiene violation: an `import_use` reference whose resolved
 /// enclosing symbol (`source_symbol_id`) is a callable body — `function` /
 /// `method` / `lambda` — rather than a file / module / test-module top.
@@ -1401,4 +1451,24 @@ pub async fn resolve_profile_symbols(
     .bind(names)
     .fetch_all(pool)
     .await
+}
+
+#[cfg(test)]
+mod abstractness_kind_tests {
+    use crate::parsing::symbols::SymbolKind;
+
+    /// The kind strings hardcoded in `file_abstract_type_counts`'s SQL must stay
+    /// in lockstep with the `SymbolKind` enum (the ADR-003 golden-test idiom): if
+    /// a rename drifts the enum's `as_db_str`, this fails loudly instead of
+    /// silently zeroing every project's abstractness.
+    #[test]
+    fn abstract_and_concrete_kind_strings_match_enum() {
+        // Abstract numerator.
+        assert_eq!(SymbolKind::Trait.as_db_str(), "trait");
+        assert_eq!(SymbolKind::Interface.as_db_str(), "interface");
+        // Concrete denominator (with the abstract kinds = total type kinds).
+        assert_eq!(SymbolKind::Struct.as_db_str(), "struct");
+        assert_eq!(SymbolKind::Enum.as_db_str(), "enum");
+        assert_eq!(SymbolKind::Class.as_db_str(), "class");
+    }
 }

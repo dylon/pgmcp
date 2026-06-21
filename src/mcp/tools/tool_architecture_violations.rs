@@ -271,18 +271,15 @@ pub async fn tool_architecture_violations(
         }
     }
 
-    // 5. Zone of Pain / Zone of Uselessness
-    // Need abstractness — load file content for a quick check
-    let mut file_abstractions: std::collections::HashMap<String, bool> =
-        std::collections::HashMap::new();
-    for f in &file_metas {
-        // Quick heuristic: check file name patterns
-        let is_abstract = f.relative_path.contains("trait")
-            || f.relative_path.contains("interface")
-            || f.relative_path.contains("abstract")
-            || f.relative_path.ends_with("mod.rs");
-        file_abstractions.insert(f.relative_path.clone(), is_abstract);
-    }
+    // 5. Zone of Pain / Zone of Uselessness — abstractness from the persisted,
+    // symbol-derived per-file metric (single source of truth) rather than a
+    // file-name heuristic.
+    let file_abstractions: std::collections::HashMap<String, bool> =
+        crate::db::queries::file_abstractions(pool, project_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
 
     let mut mm = module_metrics;
     update_abstractness(&mut mm, &file_abstractions);

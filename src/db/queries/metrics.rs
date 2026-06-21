@@ -43,6 +43,7 @@ pub async fn count_call_sites_to_files(
             FROM targets t
             LEFT JOIN code_graph_edges cge
                   ON cge.target_file_id = t.id AND cge.edge_type = 'import'
+                 AND cge.target_project_id IS NULL
             GROUP BY t.id
          ),
          unresolved AS (
