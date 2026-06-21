@@ -41,9 +41,6 @@ use crate::db::queries::{WorkItemRow, get_work_item_by_public_id, get_work_item_
 use crate::mcp::server::CsmSynthesizeProtocolParams;
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err};
 
-/// Work-item kinds that become protocol states (the doable units).
-const ACTIONABLE_KINDS: &[&str] = &["task", "sub_task", "todo", "fixme", "bug", "action_item"];
-
 /// Soft advisory threshold above which a synthesized protocol is unusually large.
 const LARGE_PROTOCOL_HINT: usize = 32;
 
@@ -54,6 +51,30 @@ struct Worker {
     task_public_id: String,
     task_title: String,
     peer: String,
+}
+
+/// The minimal view of a work item the hierarchy-preserving fold needs (id,
+/// tree edge, identity, and the optional assignee). Decoupling the fold from the
+/// full [`WorkItemRow`] keeps [`synth_node`] / [`assign_workers`] unit-testable
+/// without constructing a 30-column DB row.
+struct PlanItem {
+    id: i64,
+    parent_id: Option<i64>,
+    public_id: String,
+    title: String,
+    assignee: Option<String>,
+}
+
+impl PlanItem {
+    fn from_row(r: &WorkItemRow) -> Self {
+        PlanItem {
+            id: r.id,
+            parent_id: r.parent_id,
+            public_id: r.public_id.clone(),
+            title: r.title.clone(),
+            assignee: r.assignee.clone(),
+        }
+    }
 }
 
 /// Soft peer→url lookup (does not fail when a peer is not yet registered — this is
@@ -82,7 +103,10 @@ fn build_releases(orchestrator: &Role, workers: &[Worker]) -> GlobalType {
         })
 }
 
-/// `O→Wᵢ:tᵢ_req . Wᵢ→O:tᵢ_done . … . tail` — the worker request/response chain.
+/// `O→Wᵢ:tᵢ_req . Wᵢ→O:tᵢ_done . … . tail` — the flat worker request/response
+/// chain. Used by the **Critic-gated** mode, whose verify/revise loop re-runs the
+/// leaf set; hierarchy preservation applies to the linear (non-Critic) synthesis
+/// via [`synth_node`].
 fn workers_chain(orchestrator: &Role, workers: &[Worker], tail: GlobalType) -> GlobalType {
     workers.iter().enumerate().rev().fold(tail, |cont, (i, w)| {
         global::interaction(
@@ -99,15 +123,163 @@ fn workers_chain(orchestrator: &Role, workers: &[Worker], tail: GlobalType) -> G
     })
 }
 
-/// Fold the bound workers (+ optional critic) into a `GlobalType`.
-fn build_protocol(orchestrator: &Role, workers: &[Worker], critic: Option<&Role>) -> GlobalType {
+/// The **hierarchy-PRESERVING** fold (ADR-030): synthesize the protocol for the
+/// plan subtree rooted at `idx`, continuing as `tail` after it completes. A leaf
+/// work-item (a doable unit) becomes a worker request/response
+/// `O→W:<id>_req . W→O:<id>_done`; an **interior** item becomes a hierarchical
+/// `GlobalBox` composite state `box⟨enter_<id>⟩{ children… }⟨exit_<id>⟩` whose
+/// body is its children in subtree order. The work-item tree's nesting is thus
+/// carried into the protocol as nested HSM boxes — a Planner's *hierarchical*
+/// plan projects to a genuinely hierarchical (pushdown) protocol, not the
+/// flattened linear chain the pre-ADR-030 fold produced. Boundary labels are
+/// keyed by `public_id` (globally unique ⇒ the visibly-pushdown WF-VPA check
+/// holds: each label maps to exactly one stack action).
+fn synth_node(
+    idx: usize,
+    rows: &[PlanItem],
+    kids: &BTreeMap<i64, Vec<usize>>,
+    worker_role: &BTreeMap<i64, Role>,
+    orchestrator: &Role,
+    tail: GlobalType,
+) -> GlobalType {
+    let row = &rows[idx];
+    match kids.get(&row.id) {
+        Some(children) if !children.is_empty() => global::gbox(
+            Label::text(format!("enter_{}", row.public_id)),
+            synth_seq(
+                children,
+                rows,
+                kids,
+                worker_role,
+                orchestrator,
+                global::end(),
+            ),
+            Label::text(format!("exit_{}", row.public_id)),
+            tail,
+        ),
+        // A leaf bound to a worker role is a request/response unit; an unbound
+        // leaf (none assigned) contributes nothing but the continuation.
+        _ => match worker_role.get(&row.id) {
+            Some(w) => global::interaction(
+                orchestrator.clone(),
+                w.clone(),
+                Label::text(format!("{}_req", row.public_id)),
+                global::interaction(
+                    w.clone(),
+                    orchestrator.clone(),
+                    Label::text(format!("{}_done", row.public_id)),
+                    tail,
+                ),
+            ),
+            None => tail,
+        },
+    }
+}
+
+/// Synthesize a sequence of sibling subtrees in order, continuing as `tail`.
+fn synth_seq(
+    idxs: &[usize],
+    rows: &[PlanItem],
+    kids: &BTreeMap<i64, Vec<usize>>,
+    worker_role: &BTreeMap<i64, Role>,
+    orchestrator: &Role,
+    tail: GlobalType,
+) -> GlobalType {
+    idxs.iter().rev().fold(tail, |cont, &i| {
+        synth_node(i, rows, kids, worker_role, orchestrator, cont)
+    })
+}
+
+/// Children indices per parent id, in subtree (row) order — the plan tree
+/// reconstructed from the flat `WITH RECURSIVE` row set.
+fn children_map(rows: &[PlanItem]) -> BTreeMap<i64, Vec<usize>> {
+    let mut kids: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        if let Some(p) = r.parent_id {
+            kids.entry(p).or_default().push(i);
+        }
+    }
+    kids
+}
+
+/// Assign a worker role to every **leaf** of the subtree (the doable units), in
+/// subtree order, binding each to a fleet peer (explicit override, else the
+/// item's assignee, else the default solver). Interior nodes become boxes and get
+/// no worker. Returns `(workers, node-id → role)`.
+fn assign_workers(
+    root_idx: usize,
+    rows: &[PlanItem],
+    kids: &BTreeMap<i64, Vec<usize>>,
+    bindings: &BTreeMap<&str, &str>,
+    default_agent: &str,
+) -> (Vec<Worker>, BTreeMap<i64, Role>) {
+    let mut workers = Vec::new();
+    let mut worker_role = BTreeMap::new();
+    fn walk(
+        idx: usize,
+        rows: &[PlanItem],
+        kids: &BTreeMap<i64, Vec<usize>>,
+        bindings: &BTreeMap<&str, &str>,
+        default_agent: &str,
+        workers: &mut Vec<Worker>,
+        worker_role: &mut BTreeMap<i64, Role>,
+    ) {
+        let row = &rows[idx];
+        match kids.get(&row.id) {
+            Some(children) if !children.is_empty() => {
+                for &c in children {
+                    walk(c, rows, kids, bindings, default_agent, workers, worker_role);
+                }
+            }
+            _ => {
+                let role = Role::new(format!("W{}", workers.len()));
+                worker_role.insert(row.id, role.clone());
+                let peer = bindings
+                    .get(row.public_id.as_str())
+                    .map(|s| s.to_string())
+                    .or_else(|| row.assignee.clone().filter(|a| !a.trim().is_empty()))
+                    .unwrap_or_else(|| default_agent.to_string());
+                workers.push(Worker {
+                    role,
+                    task_public_id: row.public_id.clone(),
+                    task_title: row.title.clone(),
+                    peer,
+                });
+            }
+        }
+    }
+    walk(
+        root_idx,
+        rows,
+        kids,
+        bindings,
+        default_agent,
+        &mut workers,
+        &mut worker_role,
+    );
+    (workers, worker_role)
+}
+
+/// Fold the plan subtree (+ optional critic) into a `GlobalType`.
+///
+/// - **No critic:** the hierarchy-preserving fold ([`synth_node`]) — the plan
+///   tree's nesting becomes nested `GlobalBox` composite states (ADR-030).
+/// - **Critic-gated:** the flat verify/revise loop over the leaf set (the loop
+///   re-runs the workers; a hierarchical revise would face an unmergeable
+///   bystander projection, so the Critic mode flattens — the useful, projectable
+///   form). The `release`/`req` same-sender receives in both branches are the
+///   MPST external-choice merge that keeps each worker bystander projectable.
+#[allow(clippy::too_many_arguments)]
+fn build_protocol(
+    orchestrator: &Role,
+    root_idx: usize,
+    rows: &[PlanItem],
+    kids: &BTreeMap<i64, Vec<usize>>,
+    worker_role: &BTreeMap<i64, Role>,
+    workers: &[Worker],
+    critic: Option<&Role>,
+) -> GlobalType {
     match critic {
-        // Critic-gated loop. The workers run once, then the loop verifies; on `revise`
-        // the workers RE-RUN, so every worker faces a same-sender receive in BOTH choice
-        // branches (`release` in pass vs `req` in revise) — the MPST external-choice merge
-        // that keeps the bystander projectable. (Projecting a bare `Var` against a
-        // `Recv` is unmergeable, which is why the revise branch re-engages the workers
-        // rather than looping back directly.)
         Some(c) => {
             let loop_node = global::rec(
                 "loop",
@@ -136,8 +308,15 @@ fn build_protocol(orchestrator: &Role, workers: &[Worker], critic: Option<&Role>
             // Initial worker run, then the verify/revise loop.
             workers_chain(orchestrator, workers, loop_node)
         }
-        // No critic: a linear, statically-drivable chain.
-        None => workers_chain(orchestrator, workers, global::end()),
+        // No critic: the hierarchy-preserving nested-box protocol.
+        None => synth_node(
+            root_idx,
+            rows,
+            kids,
+            worker_role,
+            orchestrator,
+            global::end(),
+        ),
     }
 }
 
@@ -160,65 +339,52 @@ pub async fn tool_csm_synthesize_protocol(
         .await
         .map_err(|e| McpError::internal_error(format!("subtree query failed: {e}"), None))?;
 
-    // 2. Select actionable items: actionable kinds; else leaves; else the root.
-    let child_of: BTreeSet<i64> = rows.iter().filter_map(|r| r.parent_id).collect();
-    let actionable: Vec<&WorkItemRow> = {
-        let by_kind: Vec<&WorkItemRow> = rows
-            .iter()
-            .filter(|r| ACTIONABLE_KINDS.contains(&r.kind.as_str()))
-            .collect();
-        if !by_kind.is_empty() {
-            by_kind
-        } else {
-            let leaves: Vec<&WorkItemRow> =
-                rows.iter().filter(|r| !child_of.contains(&r.id)).collect();
-            if !leaves.is_empty() {
-                leaves
-            } else {
-                rows.iter().collect()
-            }
-        }
-    };
-    if actionable.is_empty() {
-        return Err(McpError::invalid_params(
-            format!(
-                "subtree of '{}' has no actionable items to synthesize",
-                params.public_id
-            ),
-            None,
-        ));
-    }
-
-    // 3. Bind each actionable item to a fleet peer (explicit override else default).
+    // 2. Reconstruct the plan tree and bind a worker role to every LEAF (the
+    //    doable units), in subtree order. Interior items become hierarchical
+    //    `GlobalBox` composite states (ADR-030), so the plan's nesting is
+    //    preserved in the synthesized protocol rather than flattened.
+    let items: Vec<PlanItem> = rows.iter().map(PlanItem::from_row).collect();
+    let root_idx = items
+        .iter()
+        .position(|r| r.id == root.id)
+        .ok_or_else(|| McpError::internal_error("subtree query omitted its root row", None))?;
+    let kids = children_map(&items);
     let bindings: BTreeMap<&str, &str> = params
         .role_bindings
         .iter()
         .flatten()
         .map(|b| (b.public_id.as_str(), b.agent.as_str()))
         .collect();
-    let workers: Vec<Worker> = actionable
-        .iter()
-        .enumerate()
-        .map(|(i, item)| {
-            let peer = bindings
-                .get(item.public_id.as_str())
-                .map(|s| s.to_string())
-                .or_else(|| item.assignee.clone().filter(|a| !a.trim().is_empty()))
-                .unwrap_or_else(|| params.default_solver_agent.clone());
-            Worker {
-                role: Role::new(format!("W{i}")),
-                task_public_id: item.public_id.clone(),
-                task_title: item.title.clone(),
-                peer,
-            }
-        })
-        .collect();
+    let (workers, worker_role) = assign_workers(
+        root_idx,
+        &items,
+        &kids,
+        &bindings,
+        &params.default_solver_agent,
+    );
+    if workers.is_empty() {
+        return Err(McpError::invalid_params(
+            format!(
+                "subtree of '{}' has no leaf items to synthesize",
+                params.public_id
+            ),
+            None,
+        ));
+    }
 
     let orchestrator = Role::new("O");
     let critic_role = params.critic_agent.as_ref().map(|_| Role::new("C"));
 
-    // 4. Fold → GlobalType.
-    let g = build_protocol(&orchestrator, &workers, critic_role.as_ref());
+    // 3. Fold → GlobalType (hierarchy-preserving unless Critic-gated).
+    let g = build_protocol(
+        &orchestrator,
+        root_idx,
+        &items,
+        &kids,
+        &worker_role,
+        &workers,
+        critic_role.as_ref(),
+    );
 
     // 5. Validate: well-formedness, then the black-box media discipline, then
     //    projectability per role. Black-box set = every participant (all fleet peers
@@ -355,36 +521,88 @@ pub async fn tool_csm_synthesize_protocol(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::csm::conformance::{Event, check_conformance};
+    use crate::csm::machine::EdgeKind;
 
-    fn worker(i: usize) -> Worker {
-        Worker {
-            role: Role::new(format!("W{i}")),
-            task_public_id: format!("p{i}"),
-            task_title: format!("task {i}"),
-            peer: "code-generator".to_string(),
+    fn item(id: i64, parent: Option<i64>, public_id: &str) -> PlanItem {
+        PlanItem {
+            id,
+            parent_id: parent,
+            public_id: public_id.to_string(),
+            title: format!("task {id}"),
+            assignee: None,
         }
     }
 
-    /// The Critic-gated loop must be well-formed, media-clean, and — critically —
-    /// every worker role must still PROJECT despite being a bystander at the
-    /// Choice. This is the `release`-branch merge (pass: Recv(release) vs revise:
-    /// Recv(req), same sender O) that keeps the bystander projectable.
+    /// The Critic-gated mode flattens to the leaf set: well-formed, media-clean,
+    /// every worker projects (the `release`/`req` same-sender merge that keeps the
+    /// bystander projectable), and NOT statically drivable (O faces the verify
+    /// Choice, resolved at runtime).
     #[test]
-    fn critic_loop_well_formed_and_projects() {
+    fn critic_mode_is_flat_well_formed_and_projects() {
+        // root → { a, b } (two leaves).
+        let items = vec![
+            item(1, None, "root"),
+            item(2, Some(1), "a"),
+            item(3, Some(1), "b"),
+        ];
+        let kids = children_map(&items);
+        let (workers, worker_role) =
+            assign_workers(0, &items, &kids, &BTreeMap::new(), "code-generator");
+        assert_eq!(workers.len(), 2, "two leaves ⇒ two workers");
+
         let o = Role::new("O");
         let c = Role::new("C");
-        let workers = vec![worker(0), worker(1)];
-        let g = build_protocol(&o, &workers, Some(&c));
+        let g = build_protocol(&o, 0, &items, &kids, &worker_role, &workers, Some(&c));
 
         assert!(
             well_formed(&g).is_ok(),
             "well_formed failed: {:?}",
             well_formed(&g).err().map(|e| e.message())
         );
-
         let bb: BTreeSet<Role> = g.participants().into_iter().collect();
         assert!(check_media_discipline(&g, &bb).is_ok());
+        for role in g.participants() {
+            assert!(
+                project(&g, &role).is_ok(),
+                "role {} did not project: {:?}",
+                role.as_str(),
+                project(&g, &role).err().map(|e| e.message())
+            );
+        }
+        // A Critic-gated loop is NOT a static linear chain (O faces a Choice).
+        let net = Network::build("test", &g).expect("network builds");
+        assert!(ProtocolDriver::plan(&net, &o).is_none());
+    }
 
+    /// The non-Critic mode PRESERVES the plan hierarchy (ADR-030): interior items
+    /// become nested `GlobalBox` composite states. The synthesized protocol is
+    /// well-formed, projects for every role, compiles to genuine pushdown
+    /// `Call`/`Return` boundary edges (not a flat chain), and a complete run
+    /// conforms (well-nested) — the operational proof that a *hierarchical*
+    /// crucible plan becomes a hierarchical/pushdown protocol.
+    #[test]
+    fn hierarchy_is_preserved_as_nested_boxes_and_conforms() {
+        // root → phase → { a, b }: a two-level nesting.
+        let items = vec![
+            item(1, None, "root"),
+            item(2, Some(1), "phase"),
+            item(3, Some(2), "a"),
+            item(4, Some(2), "b"),
+        ];
+        let kids = children_map(&items);
+        let (workers, worker_role) =
+            assign_workers(0, &items, &kids, &BTreeMap::new(), "code-generator");
+        assert_eq!(workers.len(), 2, "two leaves a,b ⇒ two workers");
+
+        let o = Role::new("O");
+        let g = build_protocol(&o, 0, &items, &kids, &worker_role, &workers, None);
+
+        assert!(
+            well_formed(&g).is_ok(),
+            "well_formed failed: {:?}",
+            well_formed(&g).err().map(|e| e.message())
+        );
         for role in g.participants() {
             assert!(
                 project(&g, &role).is_ok(),
@@ -394,26 +612,27 @@ mod tests {
             );
         }
 
-        // A Critic-gated loop is NOT a static linear chain (O faces a Choice).
         let net = Network::build("test", &g).expect("network builds");
-        assert!(ProtocolDriver::plan(&net, &o).is_none());
-    }
+        let om = net.machine(&o).expect("orchestrator machine");
+        assert!(
+            om.edges
+                .iter()
+                .any(|e| matches!(e.kind, EdgeKind::Call { .. })),
+            "a hierarchical plan must compile to pushdown Call edges, not a flat chain"
+        );
 
-    /// Without a critic the fold is a linear chain: well-formed, projectable, and
-    /// statically drivable (one request/response step per worker).
-    #[test]
-    fn linear_chain_is_drivable() {
-        let o = Role::new("O");
-        let workers = vec![worker(0), worker(1)];
-        let g = build_protocol(&o, &workers, None);
-
-        assert!(well_formed(&g).is_ok());
-        for role in g.participants() {
-            assert!(project(&g, &role).is_ok());
-        }
-
-        let net = Network::build("test", &g).expect("network builds");
-        let plan = ProtocolDriver::plan(&net, &o).expect("linear chain is drivable");
-        assert_eq!(plan.len(), 2);
+        // A complete run is well-nested and conforms. The trace carries only the
+        // real worker communications; the enter/exit box boundaries are taken by
+        // the conformance ε-closure.
+        let w0 = workers[0].role.clone();
+        let w1 = workers[1].role.clone();
+        let trace = vec![
+            Event::new(o.clone(), w0.clone(), Label::text("a_req")),
+            Event::new(w0, o.clone(), Label::text("a_done")),
+            Event::new(o.clone(), w1.clone(), Label::text("b_req")),
+            Event::new(w1, o.clone(), Label::text("b_done")),
+        ];
+        check_conformance(&net, &trace)
+            .unwrap_or_else(|e| panic!("hierarchical run should conform: {}", e.message()));
     }
 }

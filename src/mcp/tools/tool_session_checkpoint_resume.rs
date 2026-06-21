@@ -36,7 +36,7 @@ use tracing::error;
 use uuid::Uuid;
 
 use crate::context::SystemContext;
-use crate::csm::conformance::{Event, replay_to_states};
+use crate::csm::conformance::{Event, replay_to_configs};
 use crate::csm::driver::ProtocolDriver;
 use crate::csm::machine::Network;
 use crate::csm::mpst::global::GlobalType;
@@ -141,8 +141,14 @@ pub async fn tool_session_checkpoint_resume(
         trace = unflushed;
     }
 
-    // 3. Replay → position. A Step error ⇒ corrupt trace ⇒ refuse loudly.
-    let states = replay_to_states(&net, &trace).map_err(|e| {
+    // 3. Replay → position. A Step error ⇒ corrupt trace ⇒ refuse loudly. We use
+    //    the PUSHDOWN replay (`replay_to_configs`) so that for a hierarchical
+    //    (boxed / recursive) protocol the recovered position includes each role's
+    //    call/box **frame stack** — "the *stack of frames* IS the position"
+    //    (ADR-030), the pushdown generalization of "the trace is the position". For
+    //    a call-free protocol every stack is empty and this coincides with the
+    //    finite-state replay.
+    let configs = replay_to_configs(&net, &trace).map_err(|e| {
         error!(
             session_key = %resumed_key, error = %e.message(),
             "resume: recorded trace does not replay (corrupt) — refusing"
@@ -152,12 +158,16 @@ pub async fn tool_session_checkpoint_resume(
             None,
         )
     })?;
-    let orch_state = *states.get(&orchestrator).ok_or_else(|| {
+    let orch_cfg = configs.get(&orchestrator).ok_or_else(|| {
         McpError::internal_error(
             format!("orchestrator role '{orchestrator}' not in the network"),
             None,
         )
     })?;
+    let orch_state = orch_cfg.state;
+    // The orchestrator's open call/box frames at the pause point (0 for a
+    // finite-state session); the stack-aware resume position.
+    let frame_depth = orch_cfg.stack.len();
 
     // Rehydrate the context-tape WORKING SET for the recovered position. The
     // orchestration cursor `row.cursor` recovered above (the protocol position)
@@ -293,6 +303,10 @@ pub async fn tool_session_checkpoint_resume(
         "status": new_status.as_str(),
         "conformant_prefix": true,
         "replayed_events": trace.len(),
+        // The stack-aware position: the orchestrator's open call/box frames at the
+        // pause point (0 ⇒ a finite-state session paused at top level; >0 ⇒ paused
+        // inside a hierarchical sub-region / recursion).
+        "frame_depth": frame_depth,
         "next_step": next_step,
         "next_choice": next_choice,
         "done": done,

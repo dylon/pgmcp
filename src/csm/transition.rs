@@ -4,7 +4,7 @@
 //! authoritative function that both the (future) interpreter and the Phase-2
 //! conformance observer funnel through, so they cannot diverge.
 
-use crate::csm::machine::{LocalMachine, LocalState};
+use crate::csm::machine::{EdgeKind, LocalMachine, LocalState};
 use crate::csm::role::{Action, Label};
 
 /// What the machine knows when attempting a step. For a receive, `recv_head` is
@@ -46,6 +46,12 @@ pub fn check_step(
     ctx: &StepContext,
 ) -> Result<LocalState, StepError> {
     for e in machine.edges_from(state) {
+        // `check_step` is the oracle for ordinary peer communications only; the
+        // stack-boundary edges (`Call`/`Return`) are taken by the pushdown
+        // conformance engine's ε-closure (`crate::csm::conformance`), never here.
+        if e.kind != EdgeKind::Internal {
+            continue;
+        }
         if &e.action == action {
             if let Action::Recv { label, .. } = action
                 && let Some(head) = ctx.recv_head

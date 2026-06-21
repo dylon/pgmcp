@@ -201,6 +201,47 @@ fn collect(
             rec_vars.insert(var.clone());
             collect(body, index_of, uf, boxes, rec_vars, seq);
         }
+        GlobalType::GlobalCall {
+            callee,
+            subst,
+            cont,
+        } => {
+            // Every caller-side role in the frame is coupled by the call.
+            let parts: Vec<&Role> = subst.values().collect();
+            for w in parts.windows(2) {
+                union_pair(w[0], w[1], index_of, uf);
+            }
+            boxes.push(DiagramBox {
+                seq_index: *seq,
+                kind: "call".to_string(),
+                from: callee.name.clone(),
+                to: parts
+                    .iter()
+                    .map(|r| r.as_str())
+                    .collect::<Vec<_>>()
+                    .join("+"),
+                label: format!("call:{}", callee.name),
+            });
+            *seq += 1;
+            collect(cont, index_of, uf, boxes, rec_vars, seq);
+        }
+        GlobalType::GlobalBox {
+            enter,
+            body,
+            exit,
+            cont,
+        } => {
+            boxes.push(DiagramBox {
+                seq_index: *seq,
+                kind: "box".to_string(),
+                from: enter.name.clone(),
+                to: exit.name.clone(),
+                label: enter.name.clone(),
+            });
+            *seq += 1;
+            collect(body, index_of, uf, boxes, rec_vars, seq);
+            collect(cont, index_of, uf, boxes, rec_vars, seq);
+        }
         GlobalType::Var { .. } | GlobalType::End => {}
     }
 }
@@ -246,6 +287,11 @@ fn depth(g: &GlobalType) -> usize {
             1 + branches.iter().map(|b| depth(&b.cont)).max().unwrap_or(0)
         }
         GlobalType::Rec { body, .. } => depth(body),
+        // A call is one nesting step plus its return continuation (the callee's
+        // own depth is intrinsic to the callee, not counted in the caller's trace).
+        GlobalType::GlobalCall { cont, .. } => 1 + depth(cont),
+        // A box contributes its boundary step plus the inline body plus the cont.
+        GlobalType::GlobalBox { body, cont, .. } => 1 + depth(body) + depth(cont),
         GlobalType::Var { .. } | GlobalType::End => 0,
     }
 }

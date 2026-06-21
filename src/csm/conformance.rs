@@ -15,9 +15,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-use crate::csm::machine::{LocalState, Network};
+use crate::csm::machine::{EdgeKind, LocalState, Network};
 use crate::csm::registry::ProtocolId;
-use crate::csm::role::{Action, Label, Role};
+use crate::csm::role::{Action, Label, MAX_STACK_DEPTH, Role};
 use crate::csm::transition::{StepContext, StepError, check_step};
 
 /// One communication event in a run: `from` sends `label` to `to`.
@@ -55,6 +55,13 @@ pub enum ConformanceError {
     /// The run ended with a machine in a non-terminal state (a prefix, not a
     /// complete protocol path).
     Incomplete { role: String, state: LocalState },
+    /// The run ended with a machine holding unreturned call frames — the pushdown
+    /// stack was non-empty (an unbalanced / non-well-nested run), or a `Return`
+    /// boundary was reached with no frame to pop.
+    Unbalanced { role: String, depth: usize },
+    /// A `Call` boundary would push past [`MAX_STACK_DEPTH`] — the run's nesting
+    /// exceeds the configured bound (the decidability/termination guard).
+    DepthExceeded { role: String, ord: usize },
 }
 
 impl ConformanceError {
@@ -69,35 +76,135 @@ impl ConformanceError {
             ConformanceError::Incomplete { role, state } => {
                 format!("run incomplete: role '{role}' stalled at non-terminal state {state}")
             }
+            ConformanceError::Unbalanced { role, depth } => {
+                format!(
+                    "run unbalanced: role '{role}' ended with {depth} unreturned call frame(s) \
+                     (or popped an empty stack) — the run is not well-nested"
+                )
+            }
+            ConformanceError::DepthExceeded { role, ord } => format!(
+                "event {ord}: role '{role}' would push past MAX_STACK_DEPTH={MAX_STACK_DEPTH} \
+                 (call nesting exceeds the bound)"
+            ),
         }
     }
 }
 
-/// Replay `trace` against `net`, returning the per-role [`LocalState`] each
-/// machine is left in. Each event advances the sender on a `Send` and the
-/// receiver on a `Recv` through the single legality oracle [`check_step`]; a step
-/// that the network refuses is a [`ConformanceError::Step`] (the trace is not a
-/// legal protocol path).
+/// A role's **pushdown configuration** during replay: its control state plus the
+/// stack of pending return addresses — the call/box frames it has entered but not
+/// yet returned from. For a call-free protocol the stack stays empty, so a
+/// `RoleConfig` degenerates to just `state` and the pushdown replay coincides
+/// exactly with the pre-pushdown finite-state replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoleConfig {
+    pub state: LocalState,
+    pub stack: Vec<LocalState>,
+}
+
+/// Internal replay error, mapped to a [`ConformanceError`] with role/ord context.
+enum ReplayErr {
+    Step(StepError),
+    Unbalanced,
+    DepthExceeded,
+}
+
+fn map_replay_err(e: ReplayErr, role: &Role, ord: usize) -> ConformanceError {
+    match e {
+        ReplayErr::Step(err) => ConformanceError::Step {
+            ord,
+            role: role.to_string(),
+            err,
+        },
+        ReplayErr::Unbalanced => ConformanceError::Unbalanced {
+            role: role.to_string(),
+            depth: 0,
+        },
+        ReplayErr::DepthExceeded => ConformanceError::DepthExceeded {
+            role: role.to_string(),
+            ord,
+        },
+    }
+}
+
+/// Chase a role's ε-transitions — the stack-boundary `Call` (push) and `Return`
+/// (pop) edges — from `state`, mutating `stack`, until the role reaches a state
+/// with no boundary edge (it is waiting for a communication, or is terminal).
+/// A `Call` pushes its return address and enters the callee/box; a `Return` pops
+/// the matching return address. Bounded by [`MAX_STACK_DEPTH`] (a push past the
+/// bound is `DepthExceeded`; a `Return` on an empty stack is `Unbalanced`), so it
+/// terminates even on a pathological no-communication recursion. This is the
+/// well-nesting discipline made operational: every `Call` is matched by the
+/// `Return` that pops exactly the address it pushed.
+fn epsilon_close(
+    m: &crate::csm::machine::LocalMachine,
+    mut state: LocalState,
+    stack: &mut Vec<LocalState>,
+) -> Result<LocalState, ReplayErr> {
+    loop {
+        let mut moved = false;
+        for e in m.edges_from(state) {
+            match e.kind {
+                EdgeKind::Call { return_state } => {
+                    if stack.len() >= MAX_STACK_DEPTH {
+                        return Err(ReplayErr::DepthExceeded);
+                    }
+                    stack.push(return_state);
+                    state = e.to;
+                    moved = true;
+                    break;
+                }
+                EdgeKind::Return => {
+                    let r = stack.pop().ok_or(ReplayErr::Unbalanced)?;
+                    state = r;
+                    moved = true;
+                    break;
+                }
+                EdgeKind::Internal => {}
+            }
+        }
+        if !moved {
+            return Ok(state);
+        }
+    }
+}
+
+/// Advance one role by one communication `action`: ε-close to its waiting state,
+/// take the matching `Internal` edge ([`check_step`]), then ε-close again so any
+/// `Call`/`Return` boundaries immediately following are consumed and the role
+/// rests at its next waiting/terminal state.
+fn advance_role(
+    m: &crate::csm::machine::LocalMachine,
+    state: LocalState,
+    stack: &mut Vec<LocalState>,
+    action: &Action,
+    recv_head: Option<&Label>,
+) -> Result<LocalState, ReplayErr> {
+    let s = epsilon_close(m, state, stack)?;
+    let ns = check_step(m, s, action, &StepContext { recv_head }).map_err(ReplayErr::Step)?;
+    epsilon_close(m, ns, stack)
+}
+
+/// Replay `trace` against `net`, returning each role's pushdown [`RoleConfig`]
+/// (state + stack). Each event advances the sender on a `Send` and the receiver
+/// on a `Recv` through the single legality oracle [`check_step`], with the
+/// stack-boundary `Call`/`Return` edges taken by ε-closure on either side. This
+/// is the pushdown generalization of [`replay_to_states`]: for a call-free
+/// protocol every stack stays empty and the result is exactly the flat state map.
 ///
-/// Unlike [`check_conformance`], this **does not** assert that every machine is
-/// terminal: a mid-protocol *prefix* (e.g. a paused session that has executed
-/// some — but not all — of its turns) replays cleanly to a set of non-terminal
-/// states, which is exactly the PAUSE/RESUME recovery input. The returned map is
-/// "the position": replaying the recorded trace recovers where every role sits,
-/// from which the orchestrator's next step can be planned
-/// (`crate::csm::driver::next_step_from`).
-///
-/// `check_conformance` is re-expressed as `replay_to_states(...).and_then(<all
-/// machines terminal>)`, so the two share one replay implementation.
-pub fn replay_to_states(
+/// Like [`replay_to_states`], this **does not** assert termination: a mid-protocol
+/// *prefix* (a paused session — possibly mid-call, with a non-empty stack) replays
+/// cleanly to its configurations, which is exactly the stack-aware PAUSE/RESUME
+/// recovery input ("the stack of frames IS the position").
+pub fn replay_to_configs(
     net: &Network,
     trace: &[Event],
-) -> Result<BTreeMap<Role, LocalState>, ConformanceError> {
-    let mut states: BTreeMap<Role, LocalState> = net
-        .machines
-        .iter()
-        .map(|(r, m)| (r.clone(), m.initial))
-        .collect();
+) -> Result<BTreeMap<Role, RoleConfig>, ConformanceError> {
+    let mut configs: BTreeMap<Role, RoleConfig> = BTreeMap::new();
+    for (r, m) in &net.machines {
+        let mut stack = Vec::new();
+        let state = epsilon_close(m, m.initial, &mut stack).map_err(|e| map_replay_err(e, r, 0))?;
+        configs.insert(r.clone(), RoleConfig { state, stack });
+    }
 
     for (ord, ev) in trace.iter().enumerate() {
         // Sender performs a Send.
@@ -107,22 +214,15 @@ pub fn replay_to_states(
                 role: ev.from.to_string(),
                 ord,
             })?;
-        let cur = *states.get(&ev.from).expect("sender state tracked at init");
-        let ns = check_step(
-            sm,
-            cur,
-            &Action::Send {
+        {
+            let cfg = configs.get_mut(&ev.from).expect("sender tracked at init");
+            let action = Action::Send {
                 to: ev.to.clone(),
                 label: ev.label.clone(),
-            },
-            &StepContext::default(),
-        )
-        .map_err(|err| ConformanceError::Step {
-            ord,
-            role: ev.from.to_string(),
-            err,
-        })?;
-        states.insert(ev.from.clone(), ns);
+            };
+            cfg.state = advance_role(sm, cfg.state, &mut cfg.stack, &action, None)
+                .map_err(|e| map_replay_err(e, &ev.from, ord))?;
+        }
 
         // Receiver performs the matching Recv (FIFO head = the event's label).
         let rm = net
@@ -131,52 +231,59 @@ pub fn replay_to_states(
                 role: ev.to.to_string(),
                 ord,
             })?;
-        let cur_r = *states.get(&ev.to).expect("receiver state tracked at init");
-        let nr = check_step(
-            rm,
-            cur_r,
-            &Action::Recv {
+        {
+            let cfg = configs.get_mut(&ev.to).expect("receiver tracked at init");
+            let action = Action::Recv {
                 from: ev.from.clone(),
                 label: ev.label.clone(),
-            },
-            &StepContext {
-                recv_head: Some(&ev.label),
-            },
-        )
-        .map_err(|err| ConformanceError::Step {
-            ord,
-            role: ev.to.to_string(),
-            err,
-        })?;
-        states.insert(ev.to.clone(), nr);
+            };
+            cfg.state = advance_role(rm, cfg.state, &mut cfg.stack, &action, Some(&ev.label))
+                .map_err(|e| map_replay_err(e, &ev.to, ord))?;
+        }
     }
 
-    Ok(states)
+    Ok(configs)
 }
 
-/// Assert every machine in `states` is in a terminal state; the terminal check
-/// `check_conformance` adds on top of [`replay_to_states`].
-fn assert_all_terminal(
+/// Replay `trace` and return each role's [`LocalState`] (dropping the stack — the
+/// call-free "position"). For a call-free protocol the stack is always empty, so
+/// this is lossless; call-bearing PAUSE/RESUME uses [`replay_to_configs`] to keep
+/// the frame stack ("the stack of frames is the position"). The returned map is
+/// the resume position from which `crate::csm::driver::next_step_from` plans the
+/// next step.
+pub fn replay_to_states(
     net: &Network,
-    states: BTreeMap<Role, LocalState>,
-) -> Result<(), ConformanceError> {
-    for (role, st) in &states {
+    trace: &[Event],
+) -> Result<BTreeMap<Role, LocalState>, ConformanceError> {
+    Ok(replay_to_configs(net, trace)?
+        .into_iter()
+        .map(|(r, c)| (r, c.state))
+        .collect())
+}
+
+/// Replay `trace` against `net`. A run conforms iff every event is legal, every
+/// machine ends in a terminal state, AND every machine's pushdown stack is empty
+/// — i.e. the run is **well-nested** (every call returned). An unreturned call is
+/// [`ConformanceError::Unbalanced`]; a mid-protocol prefix is
+/// [`ConformanceError::Incomplete`].
+pub fn check_conformance(net: &Network, trace: &[Event]) -> Result<(), ConformanceError> {
+    let configs = replay_to_configs(net, trace)?;
+    for (role, cfg) in &configs {
+        if !cfg.stack.is_empty() {
+            return Err(ConformanceError::Unbalanced {
+                role: role.to_string(),
+                depth: cfg.stack.len(),
+            });
+        }
         let m = net.machine(role).expect("machine for tracked role");
-        if !m.is_terminal(*st) {
+        if !m.is_terminal(cfg.state) {
             return Err(ConformanceError::Incomplete {
                 role: role.to_string(),
-                state: *st,
+                state: cfg.state,
             });
         }
     }
     Ok(())
-}
-
-/// Replay `trace` against `net`. Each event advances the sender on a `Send` and
-/// the receiver on a `Recv`; the run conforms iff every step is legal and every
-/// machine ends terminal.
-pub fn check_conformance(net: &Network, trace: &[Event]) -> Result<(), ConformanceError> {
-    replay_to_states(net, trace).and_then(|states| assert_all_terminal(net, states))
 }
 
 /// One recorded turn of an `a2a_pattern_*` run, as persisted to
@@ -294,6 +401,30 @@ pub fn lift_transcript(pattern: ProtocolId, turns: &[TranscriptTurn]) -> Trace {
                 let sub = Role::new(format!("Sub{k}"));
                 tr.push(Event::new(o.clone(), sub.clone(), Label::text("subcall")));
                 tr.push(Event::new(sub, o.clone(), Label::text("subresult")));
+            }
+        }
+        ProtocolId::RecursiveCf => {
+            // The genuine pushdown RLM: a well-nested run over the self-recursive
+            // `recursive_cf` protocol. `turns.len()` is the nesting depth: each
+            // non-bottom level takes the `recurse` branch (and the conformance
+            // engine's ε-closure PUSHES a frame on `O` and `Sub` alike), the bottom
+            // level takes the `leaf` base case, then every frame POPS (an ε-closure
+            // `Return`) and stitches its parent's `subresult`. The trace carries
+            // ONLY the real communications — the `Call`/`Return` boundaries are
+            // structural ε-moves taken by [`replay_to_configs`], so the run is
+            // Dyck-balanced by construction (it leaves every stack empty iff every
+            // `recurse` is matched by its `subresult` unwind).
+            let sub = Role::new("Sub");
+            let depth = turns.len().max(1);
+            for _ in 0..depth.saturating_sub(1) {
+                tr.push(Event::new(o.clone(), sub.clone(), Label::text("subcall")));
+                tr.push(Event::new(o.clone(), sub.clone(), Label::text("recurse")));
+            }
+            tr.push(Event::new(o.clone(), sub.clone(), Label::text("subcall")));
+            tr.push(Event::new(o.clone(), sub.clone(), Label::text("leaf")));
+            tr.push(Event::new(sub.clone(), o.clone(), Label::text("subresult")));
+            for _ in 0..depth.saturating_sub(1) {
+                tr.push(Event::new(sub.clone(), o.clone(), Label::text("subresult")));
             }
         }
         ProtocolId::WorktreeNegotiation => {
@@ -807,5 +938,123 @@ mod tests {
         // Exactly three protocol events survive (the chatter is dropped).
         assert_eq!(trace.len(), 3, "non-protocol turn dropped from the lift");
         check_conformance(&n, &trace).expect("conforms despite stray chatter");
+    }
+
+    // ── Pushdown protocols: RecursiveCf (genuine recursion) + HSM box ────────
+    //
+    // These exercise the stack: `Call`/`Return` boundary edges are taken by the
+    // ε-closure in `replay_to_configs`, and a run conforms iff it is well-nested
+    // (every frame returned ⇒ every per-role stack ends empty).
+
+    use crate::csm::examples::hsm_tool_box;
+    use crate::csm::registry::protocol_env;
+
+    fn recursive_cf_net() -> Network {
+        let g = global_of(ProtocolId::RecursiveCf, &ProtocolParams::default());
+        Network::build_in("recursive_cf", &g, &protocol_env()).expect("recursive_cf builds")
+    }
+
+    #[test]
+    fn recursive_cf_depth_one_leaf_conforms() {
+        // A single leaf level (no recursion): subcall · leaf · subresult.
+        let n = recursive_cf_net();
+        let trace = lift_transcript(ProtocolId::RecursiveCf, &[turn("L1")]);
+        check_conformance(&n, &trace)
+            .unwrap_or_else(|e| panic!("depth-1 leaf run should conform: {}", e.message()));
+    }
+
+    #[test]
+    fn recursive_cf_deep_well_nested_runs_conform() {
+        // Depths 2..=5 must all conform: each `recurse` pushes a frame (an ε-Call
+        // on both O and Sub), the leaf bottoms out, and every frame returns — the
+        // Dyck-balanced run the VPA accepts. This is the property a finite-state
+        // machine cannot recognize: unbounded matched call/return nesting.
+        let n = recursive_cf_net();
+        for depth in 2..=5usize {
+            let turns: Vec<TranscriptTurn> = (0..depth).map(|i| turn(&format!("L{i}"))).collect();
+            let trace = lift_transcript(ProtocolId::RecursiveCf, &turns);
+            check_conformance(&n, &trace).unwrap_or_else(|e| {
+                panic!(
+                    "depth-{depth} well-nested RLM run should conform: {}",
+                    e.message()
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn recursive_cf_missing_unwind_is_not_well_nested() {
+        // A run that recurses one level, leafs, and returns ONCE but never delivers
+        // the parent level's `subresult` is not a complete well-nested run: O is
+        // left mid-protocol (Incomplete) — exactly the divergence the observer
+        // surfaces. (Both roles still have balanced ε-stacks at the point they
+        // stall, so this manifests as Incomplete, not Unbalanced.)
+        let n = recursive_cf_net();
+        let o = Role::new("O");
+        let sub = Role::new("Sub");
+        let trace = vec![
+            Event::new(o.clone(), sub.clone(), Label::text("subcall")), // level 1
+            Event::new(o.clone(), sub.clone(), Label::text("recurse")), // push
+            Event::new(o.clone(), sub.clone(), Label::text("subcall")), // level 2
+            Event::new(o.clone(), sub.clone(), Label::text("leaf")),
+            Event::new(sub.clone(), o.clone(), Label::text("subresult")), // level 2 only
+                                                                          // …level-1 subresult missing
+        ];
+        let err = check_conformance(&n, &trace)
+            .expect_err("a run missing the parent-level unwind is non-conforming");
+        assert!(
+            matches!(
+                err,
+                ConformanceError::Incomplete { .. } | ConformanceError::Unbalanced { .. }
+            ),
+            "expected Incomplete/Unbalanced, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn recursive_cf_subresult_before_subcall_is_step_rejected() {
+        // Causal order: a `subresult` cannot precede its `subcall`. The very first
+        // event being a `subresult` is an illegal protocol path.
+        let n = recursive_cf_net();
+        let trace = vec![Event::new("Sub", "O", Label::text("subresult"))];
+        let err = check_conformance(&n, &trace).expect_err("subresult-first is illegal");
+        assert!(matches!(
+            err,
+            ConformanceError::Step { .. } | ConformanceError::Incomplete { .. }
+        ));
+    }
+
+    #[test]
+    fn hsm_tool_box_run_conforms() {
+        // The inline HSM box: O is a bystander to the boxed sub-region (it never
+        // sees into it); W and Tool push on entry and pop on exit. A complete run
+        // leaves every stack empty.
+        let g = hsm_tool_box();
+        let n = Network::build("hsm", &g).expect("HSM box builds with an empty env (inline box)");
+        let trace = vec![
+            Event::new("O", "W", Label::text("task")),
+            Event::new("W", "Tool", Label::text("invoke")),
+            Event::new("Tool", "W", Label::text("result")),
+            Event::new("W", "O", Label::text("done")),
+        ];
+        check_conformance(&n, &trace)
+            .unwrap_or_else(|e| panic!("HSM box run should conform: {}", e.message()));
+    }
+
+    #[test]
+    fn hsm_tool_box_skipping_the_box_body_is_rejected() {
+        // Jumping straight from `task` to `done` without the boxed invoke/result is
+        // not a legal path: W is still inside the box (it must invoke the tool).
+        let g = hsm_tool_box();
+        let n = Network::build("hsm", &g).expect("builds");
+        let trace = vec![
+            Event::new("O", "W", Label::text("task")),
+            Event::new("W", "O", Label::text("done")),
+        ];
+        let err = check_conformance(&n, &trace).expect_err("skipping the box body is illegal");
+        assert!(matches!(
+            err,
+            ConformanceError::Step { .. } | ConformanceError::Incomplete { .. }
+        ));
     }
 }

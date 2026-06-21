@@ -69,6 +69,16 @@ pub fn check_media_discipline(
             Ok(())
         }
         GlobalType::Rec { body, .. } => check_media_discipline(body, black_box),
+        // The `call:`/`ret:` boundary symbols are Text control events (black-box
+        // legal by construction); the callee's own edges are checked when the
+        // callee protocol is validated. So only the return continuation is local.
+        GlobalType::GlobalCall { cont, .. } => check_media_discipline(cont, black_box),
+        // A box's `enter`/`exit` are Text boundary symbols; its inline body carries
+        // the real (from,to,label) edges, so check the body and the continuation.
+        GlobalType::GlobalBox { body, cont, .. } => {
+            check_media_discipline(body, black_box)?;
+            check_media_discipline(cont, black_box)
+        }
         GlobalType::Var { .. } | GlobalType::End => Ok(()),
     }
 }
@@ -167,7 +177,10 @@ mod tests {
                     var,
                     body: Box::new(make_ack_latent(*body)),
                 },
-                other @ (GlobalType::Var { .. } | GlobalType::End) => other,
+                other @ (GlobalType::Var { .. }
+                | GlobalType::End
+                | GlobalType::GlobalCall { .. }
+                | GlobalType::GlobalBox { .. }) => other,
             }
         }
 

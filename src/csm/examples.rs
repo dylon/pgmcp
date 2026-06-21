@@ -4,8 +4,12 @@
 //! literal, to validate the whole CSM/MPST pipeline end-to-end. Phase 2's
 //! `registry.rs` supersedes this with builders for all five patterns.
 
-use crate::csm::mpst::global::{GlobalType, choice, end, gbranch, interaction, rec, var};
-use crate::csm::role::Label;
+use std::collections::BTreeMap;
+
+use crate::csm::mpst::global::{
+    GlobalType, ProtocolRef, choice, end, gbox, gbranch, gcall, interaction, rec, var,
+};
+use crate::csm::role::{Label, Role};
 
 /// The Deliberation pattern (`tool_a2a_pattern_deliberation.rs`), with roles
 /// `O` = Orchestrator, `R` = Reflector, `T` = Tool-Caller:
@@ -177,6 +181,94 @@ pub fn tape_paging() -> GlobalType {
                     ],
                 ),
             ),
+        ),
+    )
+}
+
+/// The genuine **pushdown** RLM protocol (`ProtocolId::RecursiveCf`), the
+/// context-free counterpart of the registry's finite depth-unrolled `recursive`.
+/// Roles `O` = the level's Orchestrator and `Sub` = the delegated sub-solver:
+///
+/// ```text
+/// recursive_cf =
+///   O → Sub : subcall .
+///   O → Sub { leaf    : Sub → O : subresult . end
+///           ; recurse : call recursive_cf[O↦O, Sub↦Sub] . Sub → O : subresult . end }
+/// ```
+///
+/// Unlike the finite ladder in [`crate::csm::registry`] (`recursive(depth)`, which
+/// unrolls into *distinct* roles `Sub1..Subk`), this is a single 2-role protocol
+/// that **calls itself**: the [`GlobalType::GlobalCall`] pushes a return frame and
+/// the callee's `End` pops it, so nesting depth is carried by the conformance
+/// **stack** (bounded by [`crate::csm::role::MAX_STACK_DEPTH`]) rather than baked
+/// into the type. The `leaf` branch is the base case (no further decomposition);
+/// `recurse` delegates a deeper level and then stitches the sub-result. The
+/// substitution is the identity `{O↦O, Sub↦Sub}` — the recursion reuses the same
+/// positional role structure at every level, exactly the RSM "box" discipline
+/// (Alur et al., TOPLAS 2005). Validate it with [`crate::csm::registry::protocol_env`]
+/// in scope (it references its own name, so an empty environment makes the call an
+/// `UnknownCallee`).
+pub fn recursive_cf() -> GlobalType {
+    let mut subst = BTreeMap::new();
+    subst.insert(Role::new("O"), Role::new("O"));
+    subst.insert(Role::new("Sub"), Role::new("Sub"));
+    interaction(
+        "O",
+        "Sub",
+        Label::text("subcall"),
+        choice(
+            "O",
+            "Sub",
+            vec![
+                gbranch(
+                    Label::text("leaf"),
+                    interaction("Sub", "O", Label::text("subresult"), end()),
+                ),
+                gbranch(
+                    Label::text("recurse"),
+                    gcall(
+                        ProtocolRef::new("recursive_cf"),
+                        subst,
+                        interaction("Sub", "O", Label::text("subresult"), end()),
+                    ),
+                ),
+            ],
+        ),
+    )
+}
+
+/// An **HSM composite-state** worked example using an inline [`GlobalType::GlobalBox`].
+/// Roles `O` = Orchestrator, `W` = Worker, `Tool` = a tool back-end. The worker's
+/// "do the work" step is refined into a hierarchical sub-region (the box) that `O`
+/// never sees into:
+///
+/// ```text
+/// O → W : task .
+/// box⟨enter_tool⟩{ W → Tool : invoke . Tool → W : result }⟨exit_tool⟩ .
+/// W → O : done . end
+/// ```
+///
+/// `O` is a **bystander** to the box (it is not in the body's participants
+/// `{W, Tool}`), so it projects straight through the closed frame (`task` then
+/// `done`); `W` and `Tool` project to a [`crate::csm::mpst::local::LocalType::LocalBox`]
+/// and push/pop the frame synchronously on `enter_tool`/`exit_tool`. The box is
+/// inline (not a named callee), so it is bounded and needs no environment — it
+/// validates against an empty one.
+pub fn hsm_tool_box() -> GlobalType {
+    interaction(
+        "O",
+        "W",
+        Label::text("task"),
+        gbox(
+            Label::text("enter_tool"),
+            interaction(
+                "W",
+                "Tool",
+                Label::text("invoke"),
+                interaction("Tool", "W", Label::text("result"), end()),
+            ),
+            Label::text("exit_tool"),
+            interaction("W", "O", Label::text("done"), end()),
         ),
     )
 }

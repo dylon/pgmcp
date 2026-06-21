@@ -971,9 +971,13 @@ mod tests {
         // working_set tables, the `content` column, and the relaxed session FK — up
         // to date) so these DB-backed tests are self-contained against any reachable
         // isolated test DB rather than depending on its prior migration state.
-        crate::db::migrations::run_migrations(&pool, &crate::config::VectorConfig::default(), false)
-            .await
-            .ok()?;
+        crate::db::migrations::run_migrations(
+            &pool,
+            &crate::config::VectorConfig::default(),
+            false,
+        )
+        .await
+        .ok()?;
         Some(pool)
     }
 

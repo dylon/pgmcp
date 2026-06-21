@@ -17,7 +17,7 @@
 //! TLC + the conformance observer.
 
 use crate::csm::conformance::{Event, check_conformance, lift_transcript, transcript_to_turns};
-use crate::csm::machine::{LocalState, Network};
+use crate::csm::machine::{EdgeKind, LocalState, Network};
 use crate::csm::registry::{ProtocolId, ProtocolParams, global_of};
 use crate::csm::role::{Action, Label, Role};
 
@@ -74,6 +74,13 @@ impl ProtocolDriver {
                 return None; // a choice/branch — not a static linear chain
             }
             let send = outs[0];
+            // A `Call`/`Return` boundary on the orchestrator's path means the
+            // protocol enters a sub-protocol / recurses; that has no finite static
+            // schedule, so it is driven at runtime (resolved client-side), exactly
+            // like a sender-driven choice.
+            if send.kind != EdgeKind::Internal {
+                return None;
+            }
             let (peer, request) = match &send.action {
                 Action::Send { to, label } => (to.clone(), label.clone()),
                 Action::Recv { .. } => return None, // orchestrator must lead with a send
@@ -83,6 +90,9 @@ impl ProtocolDriver {
                 return None;
             }
             let recv = mids[0];
+            if recv.kind != EdgeKind::Internal {
+                return None;
+            }
             let response = match &recv.action {
                 Action::Recv { from, label } if *from == peer => label.clone(),
                 _ => return None,
@@ -129,6 +139,11 @@ impl ProtocolDriver {
             return None; // a choice/branch (the Critic loop) — resolved at runtime
         }
         let send = outs[0];
+        // A call/return boundary (sub-protocol entry/recursion) is resolved at
+        // runtime, like a choice — there is no single static next step.
+        if send.kind != EdgeKind::Internal {
+            return None;
+        }
         let (peer, request) = match &send.action {
             Action::Send { to, label } => (to.clone(), label.clone()),
             Action::Recv { .. } => return None, // orchestrator must lead with a send
@@ -138,6 +153,9 @@ impl ProtocolDriver {
             return None;
         }
         let recv = mids[0];
+        if recv.kind != EdgeKind::Internal {
+            return None;
+        }
         let response = match &recv.action {
             Action::Recv { from, label } if *from == peer => label.clone(),
             _ => return None,
@@ -186,13 +204,17 @@ pub fn driver_report(
     }
     let turns = transcript_to_turns(transcript);
     let g = global_of(pattern, &ProtocolParams::default());
-    let (conformant, err): (bool, Option<String>) = match Network::build(pattern.name(), &g) {
-        Ok(net) => match check_conformance(&net, &lift_transcript(pattern, &turns)) {
-            Ok(()) => (true, None),
+    // Build against the protocol environment so call-bearing patterns (RecursiveCf)
+    // resolve their callees; call-free patterns are unaffected by the populated env.
+    let env = crate::csm::registry::protocol_env();
+    let (conformant, err): (bool, Option<String>) =
+        match Network::build_in(pattern.name(), &g, &env) {
+            Ok(net) => match check_conformance(&net, &lift_transcript(pattern, &turns)) {
+                Ok(()) => (true, None),
+                Err(e) => (false, Some(e.message())),
+            },
             Err(e) => (false, Some(e.message())),
-        },
-        Err(e) => (false, Some(e.message())),
-    };
+        };
     serde_json::json!({
         "mode": "hardcoded",
         "protocol_interpreter": true,
@@ -378,6 +400,17 @@ mod tests {
         assert!(
             ProtocolDriver::plan(&net(ProtocolId::Deliberation, &p), &Role::new("O")).is_none()
         );
+    }
+
+    #[test]
+    fn recursive_cf_is_not_statically_drivable() {
+        // The genuine pushdown RLM faces both a sender-driven choice (leaf/recurse)
+        // and a sub-protocol `Call` — neither has a finite static schedule (the
+        // stack is unbounded), so it is driven at runtime, not statically planned.
+        use crate::csm::registry::protocol_env;
+        let g = global_of(ProtocolId::RecursiveCf, &ProtocolParams::default());
+        let n = Network::build_in("recursive_cf", &g, &protocol_env()).expect("builds");
+        assert!(ProtocolDriver::plan(&n, &Role::new("O")).is_none());
     }
 
     #[test]

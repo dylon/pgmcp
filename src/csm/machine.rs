@@ -9,20 +9,45 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use crate::csm::mpst::global::{GlobalType, TypeVar};
+use crate::csm::mpst::global::{GlobalType, ProtocolEnv, ProtocolRef, TypeVar};
 use crate::csm::mpst::local::LocalType;
 use crate::csm::mpst::project::{ProjectionError, project};
-use crate::csm::role::{Action, Channel, Role};
+use crate::csm::role::{Action, Channel, Label, Role};
 
 /// A state index within a [`LocalMachine`].
 pub type LocalState = usize;
 
-/// A labelled transition: from `from`, performing `action`, to `to`.
+/// The visibly-pushdown class of an edge — what it does to the conformance stack
+/// (Alur–Madhusudan). `Internal` is an ordinary peer communication (the stack is
+/// unchanged); `Call` is a frame-entry boundary (push, the `to` state is the
+/// callee/box entry and the return address is supplied by the pushdown engine);
+/// `Return` is a frame-exit boundary (pop — the real target is the popped return
+/// address, so a `Return` edge's static `to` is a placeholder). Call-free
+/// protocols have only `Internal` edges, so the flat machine is byte-identical to
+/// the pre-pushdown CSM; the `Call`/`Return` boundary edges are read by the
+/// pushdown conformance engine (`crate::csm::conformance`), never by the
+/// call-free driver/`check_step` paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeKind {
+    /// An ordinary peer communication; the conformance stack is unchanged.
+    Internal,
+    /// A frame-entry boundary: push `return_state` (where to resume once the
+    /// callee/box returns), then move to this edge's `to` (the callee/box entry).
+    Call { return_state: LocalState },
+    /// A frame-exit boundary: pop the return context and resume at the popped
+    /// state. A `Return` edge's static `to` is a placeholder — the real target is
+    /// the popped return address supplied by the pushdown engine.
+    Return,
+}
+
+/// A labelled transition: from `from`, performing `action`, to `to`, with its
+/// visibly-pushdown `kind`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalEdge {
     pub from: LocalState,
     pub action: Action,
     pub to: LocalState,
+    pub kind: EdgeKind,
 }
 
 /// One role's communicating finite-state machine.
@@ -46,70 +71,164 @@ impl LocalMachine {
     }
 }
 
-/// Compile a role's local type into its machine.
+/// Compile a **call-free** role's local type into its machine. A convenience
+/// wrapper over [`compile_in`] with an empty environment; it panics if `lt`
+/// contains a `LocalCall` (which needs an environment to resolve the callee — use
+/// [`compile_in`] for protocols with calls). Every existing call-free caller and
+/// test relies on this infallible form.
 pub fn compile(role: &Role, lt: &LocalType) -> LocalMachine {
+    compile_in(role, lt, &ProtocolEnv::new())
+        .expect("call-free local type compiles (use compile_in for protocols with calls)")
+}
+
+/// Compile `lt` for `role` into a [`LocalMachine`], resolving any `LocalCall`
+/// against `penv`. Calls/boxes compile to genuine `Call`/`Return` boundary edges
+/// over a single global state space: a `Call` edge pushes the call site's return
+/// state and enters the callee/box; the callee/box `End` becomes a `Return` (pop).
+/// A recursive callee is compiled once per `(callee, callee-role)` and reused (the
+/// RSM back-edge), so finite syntax yields unbounded nesting that the conformance
+/// stack bounds. Call-free protocols produce only `Internal` edges, so the flat
+/// view is byte-identical to the pre-pushdown CSM.
+pub fn compile_in(
+    role: &Role,
+    lt: &LocalType,
+    penv: &ProtocolEnv,
+) -> Result<LocalMachine, ProjectionError> {
     let mut c = Compiler {
         edges: Vec::new(),
         n: 0,
         terminals: BTreeSet::new(),
-        env: HashMap::new(),
+        rec_env: HashMap::new(),
+        role: role.clone(),
+        box_exit_labels: Vec::new(),
+        penv,
+        box_memo: HashMap::new(),
     };
-    let initial = c.go(lt, None);
-    LocalMachine {
+    let initial = c.go(lt, None)?;
+    Ok(LocalMachine {
         role: role.clone(),
         n_states: c.n,
         initial,
         edges: c.edges,
         terminals: c.terminals,
-    }
+    })
 }
 
-struct Compiler {
+struct Compiler<'a> {
     edges: Vec<LocalEdge>,
     n: usize,
     terminals: BTreeSet<LocalState>,
-    env: HashMap<TypeVar, LocalState>,
+    /// Recursion-variable scope: `μ var` binder state for `Var` back-edges.
+    rec_env: HashMap<TypeVar, LocalState>,
+    /// The role this machine belongs to (the "self" peer of a stack-boundary edge).
+    role: Role,
+    /// Stack of active box/callee exit labels. While compiling a box or callee
+    /// body, its `End` emits a `Return` edge carrying the top label (the real
+    /// return target is the popped address, not a static `to`); a stack handles
+    /// nested frames.
+    box_exit_labels: Vec<Label>,
+    /// The environment resolving named callees ([`LocalType::LocalCall`]).
+    penv: &'a ProtocolEnv,
+    /// Memoized box entry per `(callee-name, callee-role)` — the RSM back-edge that
+    /// makes a recursive callee reuse its own box instead of unrolling forever.
+    box_memo: HashMap<(String, Role), LocalState>,
 }
 
-impl Compiler {
+impl Compiler<'_> {
     fn fresh(&mut self) -> LocalState {
         let s = self.n;
         self.n += 1;
         s
     }
 
-    /// Compile `lt`, returning its entry state. If `entry` is supplied (only by
-    /// a `Rec` binder), that state is used as the node's own state so the
-    /// binder and its body's head coincide and `Var` can back-edge to it.
-    fn go(&mut self, lt: &LocalType, entry: Option<LocalState>) -> LocalState {
+    /// Compile a named callee, projected onto the callee-role `cr` this machine's
+    /// role plays, into a memoized box; return the box entry state. Allocating and
+    /// memoizing the entry BEFORE compiling the body is what lets a recursive
+    /// callee back-edge to itself (finite syntax → unbounded nesting bounded only
+    /// by the conformance stack).
+    fn compile_callee_box(
+        &mut self,
+        callee_name: &str,
+        cr: &Role,
+    ) -> Result<LocalState, ProjectionError> {
+        let key = (callee_name.to_string(), cr.clone());
+        if let Some(&e) = self.box_memo.get(&key) {
+            return Ok(e);
+        }
+        let g = self
+            .penv
+            .resolve(&ProtocolRef::new(callee_name))
+            .ok_or_else(|| ProjectionError::UnresolvedCallee {
+                name: callee_name.to_string(),
+            })?
+            .clone();
+        let callee_lt = project(&g, cr)?;
+        let entry = self.fresh();
+        self.box_memo.insert(key, entry);
+        self.box_exit_labels
+            .push(Label::text(format!("ret:{callee_name}")));
+        let got = self.go(&callee_lt, Some(entry))?;
+        self.box_exit_labels.pop();
+        debug_assert_eq!(got, entry, "callee box head must reuse the allocated entry");
+        Ok(entry)
+    }
+
+    /// Compile `lt`, returning its entry state. If `entry` is supplied (by a `Rec`
+    /// binder or a box/callee entry), that state is the node's own state so the
+    /// binder/entry and its body's head coincide and `Var`/recursive calls can
+    /// back-edge to it.
+    fn go(
+        &mut self,
+        lt: &LocalType,
+        entry: Option<LocalState>,
+    ) -> Result<LocalState, ProjectionError> {
         match lt {
             LocalType::End => {
                 let s = entry.unwrap_or_else(|| self.fresh());
-                self.terminals.insert(s);
-                s
+                match self.box_exit_labels.last() {
+                    // Inside a box/callee body: `End` is the frame's pop point — emit
+                    // a `Return` edge carrying the exit label. Its static `to` is a
+                    // placeholder; the real target is the popped return address.
+                    Some(exit_label) => {
+                        let exit_label = exit_label.clone();
+                        self.edges.push(LocalEdge {
+                            from: s,
+                            action: Action::Send {
+                                to: self.role.clone(),
+                                label: exit_label,
+                            },
+                            to: s,
+                            kind: EdgeKind::Return,
+                        });
+                    }
+                    None => {
+                        self.terminals.insert(s);
+                    }
+                }
+                Ok(s)
             }
-            LocalType::Var { var } => *self
-                .env
+            LocalType::Var { var } => Ok(*self
+                .rec_env
                 .get(var)
-                .expect("unbound recursion variable in compile (well-formedness should prevent)"),
+                .expect("unbound recursion variable in compile (well-formedness should prevent)")),
             LocalType::Rec { var, body } => {
                 let s = entry.unwrap_or_else(|| self.fresh());
-                let prev = self.env.insert(var.clone(), s);
-                let got = self.go(body, Some(s));
+                let prev = self.rec_env.insert(var.clone(), s);
+                let got = self.go(body, Some(s))?;
                 debug_assert_eq!(got, s, "rec body head must reuse the binder state");
                 match prev {
                     Some(p) => {
-                        self.env.insert(var.clone(), p);
+                        self.rec_env.insert(var.clone(), p);
                     }
                     None => {
-                        self.env.remove(var);
+                        self.rec_env.remove(var);
                     }
                 }
-                s
+                Ok(s)
             }
             LocalType::Send { to, label, cont } => {
                 let s = entry.unwrap_or_else(|| self.fresh());
-                let t = self.go(cont, None);
+                let t = self.go(cont, None)?;
                 self.edges.push(LocalEdge {
                     from: s,
                     action: Action::Send {
@@ -117,12 +236,13 @@ impl Compiler {
                         label: label.clone(),
                     },
                     to: t,
+                    kind: EdgeKind::Internal,
                 });
-                s
+                Ok(s)
             }
             LocalType::Recv { from, label, cont } => {
                 let s = entry.unwrap_or_else(|| self.fresh());
-                let t = self.go(cont, None);
+                let t = self.go(cont, None)?;
                 self.edges.push(LocalEdge {
                     from: s,
                     action: Action::Recv {
@@ -130,13 +250,14 @@ impl Compiler {
                         label: label.clone(),
                     },
                     to: t,
+                    kind: EdgeKind::Internal,
                 });
-                s
+                Ok(s)
             }
             LocalType::Select { to, branches } => {
                 let s = entry.unwrap_or_else(|| self.fresh());
                 for br in branches {
-                    let t = self.go(&br.cont, None);
+                    let t = self.go(&br.cont, None)?;
                     self.edges.push(LocalEdge {
                         from: s,
                         action: Action::Send {
@@ -144,14 +265,15 @@ impl Compiler {
                             label: br.label.clone(),
                         },
                         to: t,
+                        kind: EdgeKind::Internal,
                     });
                 }
-                s
+                Ok(s)
             }
             LocalType::Branch { from, branches } => {
                 let s = entry.unwrap_or_else(|| self.fresh());
                 for br in branches {
-                    let t = self.go(&br.cont, None);
+                    let t = self.go(&br.cont, None)?;
                     self.edges.push(LocalEdge {
                         from: s,
                         action: Action::Recv {
@@ -159,9 +281,63 @@ impl Compiler {
                             label: br.label.clone(),
                         },
                         to: t,
+                        kind: EdgeKind::Internal,
                     });
                 }
-                s
+                Ok(s)
+            }
+            LocalType::LocalCall {
+                callee,
+                subst,
+                cont,
+            } => {
+                // A call pushes the return state (this site's continuation) and
+                // enters the callee's box (compiled/memoized, so recursion is a
+                // back-edge). `self.role` plays callee-role `cr = subst⁻¹(role)`.
+                let s = entry.unwrap_or_else(|| self.fresh());
+                let ret = self.go(cont, None)?;
+                let cr = subst
+                    .iter()
+                    .find(|(_, v)| **v == self.role)
+                    .map(|(k, _)| k.clone())
+                    .expect("projection only emits LocalCall when the role participates");
+                let box_entry = self.compile_callee_box(&callee.name, &cr)?;
+                self.edges.push(LocalEdge {
+                    from: s,
+                    action: Action::Send {
+                        to: self.role.clone(),
+                        label: Label::text(format!("call:{}", callee.name)),
+                    },
+                    to: box_entry,
+                    kind: EdgeKind::Call { return_state: ret },
+                });
+                Ok(s)
+            }
+            LocalType::LocalBox {
+                enter,
+                body,
+                exit,
+                cont,
+            } => {
+                // An inline box pushes the return state and enters the compiled
+                // body; the body's `End` pops (a `Return` carrying `exit`).
+                let s = entry.unwrap_or_else(|| self.fresh());
+                let ret = self.go(cont, None)?;
+                let body_entry = self.fresh();
+                self.box_exit_labels.push(exit.clone());
+                let got = self.go(body, Some(body_entry))?;
+                self.box_exit_labels.pop();
+                debug_assert_eq!(got, body_entry, "box body head must reuse its entry");
+                self.edges.push(LocalEdge {
+                    from: s,
+                    action: Action::Send {
+                        to: self.role.clone(),
+                        label: enter.clone(),
+                    },
+                    to: body_entry,
+                    kind: EdgeKind::Call { return_state: ret },
+                });
+                Ok(s)
             }
         }
     }
@@ -177,14 +353,27 @@ pub struct Network {
 }
 
 impl Network {
-    /// Build the network for a global type: project onto every participant,
-    /// compile each projection, and collect the channel topology.
+    /// Build the network for a **call-free** global type against an empty
+    /// environment. A convenience wrapper over [`Network::build_in`]; protocols
+    /// containing a `GlobalCall` must use `build_in` with the environment that
+    /// defines their callees.
     pub fn build(protocol: impl Into<String>, g: &GlobalType) -> Result<Network, ProjectionError> {
+        Network::build_in(protocol, g, &ProtocolEnv::new())
+    }
+
+    /// Build the network for a global type against `penv`: project onto every
+    /// participant, compile each projection (resolving any callee through `penv`),
+    /// and collect the channel topology.
+    pub fn build_in(
+        protocol: impl Into<String>,
+        g: &GlobalType,
+        penv: &ProtocolEnv,
+    ) -> Result<Network, ProjectionError> {
         let roles = g.participants();
         let mut machines = BTreeMap::new();
         for r in &roles {
             let lt = project(g, r)?;
-            machines.insert(r.clone(), compile(r, &lt));
+            machines.insert(r.clone(), compile_in(r, &lt, penv)?);
         }
         let mut channels = BTreeSet::new();
         collect_channels(g, &mut channels);
@@ -214,6 +403,14 @@ fn collect_channels(g: &GlobalType, acc: &mut BTreeSet<Channel>) {
             }
         }
         GlobalType::Rec { body, .. } => collect_channels(body, acc),
+        // The callee's channels belong to the callee (collected when it is built);
+        // here only the return continuation is local to this protocol.
+        GlobalType::GlobalCall { cont, .. } => collect_channels(cont, acc),
+        // A box's inline body channels ARE part of this protocol.
+        GlobalType::GlobalBox { body, cont, .. } => {
+            collect_channels(body, acc);
+            collect_channels(cont, acc);
+        }
         GlobalType::Var { .. } | GlobalType::End => {}
     }
 }

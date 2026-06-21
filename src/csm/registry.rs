@@ -14,8 +14,8 @@
 //! It rides the A2A mailbox as typed message kinds rather than an
 //! `a2a_pattern_*` run, but shares the same projection/conformance machinery.
 
-use crate::csm::examples::{deliberation, tape_paging, worktree_negotiation};
-use crate::csm::mpst::global::{GlobalType, end, interaction};
+use crate::csm::examples::{deliberation, recursive_cf, tape_paging, worktree_negotiation};
+use crate::csm::mpst::global::{GlobalType, ProtocolEnv, end, interaction};
 use crate::csm::role::{Label, Role};
 
 /// The five patterns. The join key `pattern_skill_id` matches `a2a_tasks.skill_id`
@@ -39,10 +39,19 @@ pub enum ProtocolId {
     /// All-`Label::text` (black-box-legal); the grammar is built by
     /// [`crate::csm::examples::tape_paging`].
     TapePaging,
+    /// The genuine **pushdown** RLM protocol — the context-free counterpart of
+    /// [`ProtocolId::Recursive`] (a finite depth-unrolled ladder). A single 2-role
+    /// protocol (`O`/`Sub`) that calls *itself* via a [`GlobalType::GlobalCall`];
+    /// nesting depth is carried by the conformance stack (bounded by
+    /// [`crate::csm::role::MAX_STACK_DEPTH`]), not baked into the type. Built by
+    /// [`crate::csm::examples::recursive_cf`]; validate/compile it against
+    /// [`protocol_env`] (it references its own name, so an empty environment makes
+    /// the self-call an `UnknownCallee`).
+    RecursiveCf,
 }
 
 impl ProtocolId {
-    pub const ALL: [ProtocolId; 7] = [
+    pub const ALL: [ProtocolId; 8] = [
         ProtocolId::Sequential,
         ProtocolId::Mixture,
         ProtocolId::Distillation,
@@ -50,6 +59,7 @@ impl ProtocolId {
         ProtocolId::Recursive,
         ProtocolId::WorktreeNegotiation,
         ProtocolId::TapePaging,
+        ProtocolId::RecursiveCf,
     ];
 
     /// Short stable name (`"sequential"`, …).
@@ -62,6 +72,7 @@ impl ProtocolId {
             ProtocolId::Recursive => "recursive",
             ProtocolId::WorktreeNegotiation => "worktree_negotiation",
             ProtocolId::TapePaging => "tape_paging",
+            ProtocolId::RecursiveCf => "recursive_cf",
         }
     }
 
@@ -77,6 +88,7 @@ impl ProtocolId {
             ProtocolId::Recursive => "a2a_pattern_recursive",
             ProtocolId::WorktreeNegotiation => "coordinate_dependency_block",
             ProtocolId::TapePaging => "tape_page",
+            ProtocolId::RecursiveCf => "a2a_pattern_recursive_cf",
         }
     }
 
@@ -128,7 +140,22 @@ pub fn global_of(id: ProtocolId, p: &ProtocolParams) -> GlobalType {
         // Fixed two-party paging control loop — no parameters (the recursion is a
         // back-edge `μ loop`, not an unroll, so it is parameter-free).
         ProtocolId::TapePaging => tape_paging(),
+        // The genuine pushdown RLM (self-recursive); nesting depth is bounded at
+        // runtime by the conformance stack, so it takes no unroll parameter.
+        ProtocolId::RecursiveCf => recursive_cf(),
     }
+}
+
+/// The environment of named, callable sub-protocols — what
+/// [`crate::csm::mpst::wellformed::well_formed_in`] and
+/// [`crate::csm::machine::compile_in`] / [`crate::csm::machine::Network::build_in`]
+/// resolve a [`GlobalType::GlobalCall`] against. The base environment registers the
+/// self-recursive RLM (`recursive_cf`); a synthesized crucible plan that nests
+/// sub-plans extends a clone of this with its own named sub-protocols.
+pub fn protocol_env() -> ProtocolEnv {
+    let mut env = ProtocolEnv::new();
+    env.insert("recursive_cf", recursive_cf());
+    env
 }
 
 fn lbl(s: &str) -> Label {
@@ -244,18 +271,51 @@ fn recursive(depth: usize) -> GlobalType {
 mod tests {
     use super::*;
     use crate::csm::machine::Network;
-    use crate::csm::mpst::wellformed::well_formed;
+    use crate::csm::mpst::wellformed::{WfError, well_formed, well_formed_in};
 
     #[test]
     fn every_protocol_is_well_formed_and_builds_a_network() {
         let p = ProtocolParams::default();
+        let env = protocol_env();
         for id in ProtocolId::ALL {
             let g = global_of(id, &p);
-            well_formed(&g)
+            well_formed_in(&g, &env)
                 .unwrap_or_else(|e| panic!("{} not well-formed: {}", id.name(), e.message()));
-            Network::build(id.name(), &g)
+            Network::build_in(id.name(), &g, &env)
                 .unwrap_or_else(|e| panic!("{} does not project: {}", id.name(), e.message()));
         }
+    }
+
+    #[test]
+    fn recursive_cf_is_a_genuine_self_calling_pushdown_protocol() {
+        // RecursiveCf must (a) be well-formed only WITH its environment (the
+        // self-call is `UnknownCallee` against an empty env), and (b) compile to a
+        // network whose O machine contains a `Call` boundary edge (the pushdown
+        // structure), unlike the finite-unrolled `Recursive`.
+        use crate::csm::machine::EdgeKind;
+
+        let g = global_of(ProtocolId::RecursiveCf, &ProtocolParams::default());
+        // (a) empty environment ⇒ the self-call is unresolved.
+        assert!(matches!(
+            well_formed(&g),
+            Err(WfError::UnknownCallee { .. })
+        ));
+        // ...but the populated environment validates it.
+        well_formed_in(&g, &protocol_env()).expect("recursive_cf well-formed in its env");
+
+        // (b) compiling against the env yields a real Call edge for O.
+        let net = Network::build_in("recursive_cf", &g, &protocol_env()).expect("builds");
+        let o = net.machine(&Role::new("O")).expect("O machine");
+        assert!(
+            o.edges
+                .iter()
+                .any(|e| matches!(e.kind, EdgeKind::Call { .. })),
+            "RecursiveCf's O machine must contain a pushdown Call edge"
+        );
+        assert!(
+            o.edges.iter().any(|e| e.kind == EdgeKind::Return),
+            "RecursiveCf's O machine must contain a pushdown Return edge"
+        );
     }
 
     #[test]

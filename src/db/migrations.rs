@@ -69,6 +69,7 @@ mod v50_orchestration_sessions;
 mod v51_working_set;
 mod v52_experiment_hardening;
 mod v53_working_set_bytes;
+mod v54_csm_pushdown;
 mod v5_work_items_collab;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
@@ -2745,6 +2746,23 @@ pub async fn run_migrations(
         v53_working_set_bytes::WORKING_SET_BYTES,
         v53_working_set_bytes::WORKING_SET_BYTES_NAME,
         || v53_working_set_bytes::apply(pool),
+    )
+    .await?;
+
+    // ================================================================
+    // Step 54 — pushdown / hierarchical CSM (ADR-030): the visibly-pushdown
+    // protocol alphabet (`csm_protocol_alphabet`), the sub-protocol call graph
+    // (`csm_protocol_calls`), and the stack-aware resume column
+    // (`orchestration_sessions.frame_stack`). Purely additive — the GlobalType
+    // already round-trips through `csm_protocols.global_type` JSONB, so storing a
+    // pushdown protocol needs no schema change; this is analytics + the resume
+    // frame stack. See `src/db/migrations/v54_csm_pushdown.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v54_csm_pushdown::CSM_PUSHDOWN,
+        v54_csm_pushdown::CSM_PUSHDOWN_NAME,
+        || v54_csm_pushdown::apply(pool),
     )
     .await?;
 

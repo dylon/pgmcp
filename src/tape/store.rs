@@ -573,9 +573,13 @@ mod tests {
             .connect(&url)
             .await
             .ok()?;
-        crate::db::migrations::run_migrations(&pool, &crate::config::VectorConfig::default(), false)
-            .await
-            .ok()?;
+        crate::db::migrations::run_migrations(
+            &pool,
+            &crate::config::VectorConfig::default(),
+            false,
+        )
+        .await
+        .ok()?;
         Some(pool)
     }
 

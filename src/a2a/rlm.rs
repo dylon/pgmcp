@@ -183,6 +183,18 @@ impl DecomposeStrategy {
 }
 
 /// Hard cap on RLM recursion depth (tree height); bounds latency + cost.
+///
+/// IMPORTANT — this RUNTIME bound is deliberately SMALL and is **distinct from**
+/// the static conformance stack bound [`crate::csm::role::MAX_STACK_DEPTH`] (4096).
+/// Each RLM level issues real LM sub-calls, so its depth is a cost/DoS bound that
+/// must stay low; the conformance bound governs *cheap static* trace-checking of
+/// the genuine pushdown protocol `recursive_cf`
+/// ([`crate::csm::registry::ProtocolId::RecursiveCf`]), where deep nesting costs
+/// nothing. The two intentionally differ: equating them (making the runtime
+/// recurse to 4096) would turn the RLM into a DoS vector. A recorded RLM run is
+/// still conformance-checkable against `RecursiveCf` via
+/// [`crate::csm::conformance::lift_transcript`] regardless of the runtime cap.
+/// (ADR-030 records this runtime-vs-static-bound distinction.)
 pub const MAX_RLM_DEPTH: u32 = 4;
 /// Hard cap on total sub-calls across an entire recursion tree.
 pub const MAX_RLM_BUDGET: u32 = 256;

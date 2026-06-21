@@ -22,6 +22,10 @@ pub enum ProjectionError {
     /// A bystander's branch continuations cannot be merged (they diverge in a
     /// way no later message can distinguish).
     Unmergeable { left: String, right: String },
+    /// A `GlobalCall` names a sub-protocol absent from the compilation environment
+    /// (so its box cannot be compiled). Well-formedness (`WF-CLOSED`) catches this
+    /// earlier; it is surfaced here for callers that compile without pre-checking.
+    UnresolvedCallee { name: String },
 }
 
 impl ProjectionError {
@@ -29,6 +33,9 @@ impl ProjectionError {
         match self {
             ProjectionError::Unmergeable { left, right } => {
                 format!("cannot merge projections: {left}  ⊓  {right}")
+            }
+            ProjectionError::UnresolvedCallee { name } => {
+                format!("cannot compile call: sub-protocol '{name}' is not in the environment")
             }
         }
     }
@@ -106,6 +113,50 @@ pub fn project(g: &GlobalType, role: &Role) -> Result<LocalType, ProjectionError
             var: var.clone(),
             body: Box::new(project(body, role)?),
         }),
+        GlobalType::GlobalCall {
+            callee,
+            subst,
+            cont,
+        } => {
+            // PARTICIPATION RULE (the load-bearing reconciliation, ADR-030): a role
+            // that plays in the call frame (it is in the substitution image) projects
+            // to a `LocalCall` and pushes/pops synchronously with the other
+            // participants; a *bystander* skips the entire closed frame and projects
+            // only the return continuation. WF-THREAD guarantees the frame's role-set
+            // is fixed across choice branches, so a bystander is never "in the call in
+            // one branch and out in another" — keeping `merge` total and projection
+            // sound without any global broadcast.
+            let c = project(cont, role)?;
+            if subst.values().any(|r| r == role) {
+                Ok(LocalType::LocalCall {
+                    callee: callee.clone(),
+                    subst: subst.clone(),
+                    cont: Box::new(c),
+                })
+            } else {
+                Ok(c)
+            }
+        }
+        GlobalType::GlobalBox {
+            enter,
+            body,
+            exit,
+            cont,
+        } => {
+            // Same participation rule for an inline box: a role appearing in the body
+            // plays the box; a bystander skips it (projecting only the continuation).
+            let c = project(cont, role)?;
+            if body.participants().contains(role) {
+                Ok(LocalType::LocalBox {
+                    enter: enter.clone(),
+                    body: Box::new(project(body, role)?),
+                    exit: exit.clone(),
+                    cont: Box::new(c),
+                })
+            } else {
+                Ok(c)
+            }
+        }
         GlobalType::Var { var } => Ok(LocalType::Var { var: var.clone() }),
         GlobalType::End => Ok(LocalType::End),
     }
@@ -135,6 +186,61 @@ pub fn merge(a: LocalType, b: LocalType) -> Result<LocalType, ProjectionError> {
         return Ok(LocalType::Rec {
             var: v1.clone(),
             body: Box::new(merged),
+        });
+    }
+
+    // Same call (identical callee + role renaming): merge the return continuations.
+    // A bystander that sees the *same* sub-protocol call in two choice branches but
+    // with different post-return behaviour is projectable (WF-THREAD guarantees the
+    // call's role-set, hence its participation, is identical across branches).
+    if let (
+        LocalType::LocalCall {
+            callee: c1,
+            subst: s1,
+            cont: k1,
+        },
+        LocalType::LocalCall {
+            callee: c2,
+            subst: s2,
+            cont: k2,
+        },
+    ) = (&a, &b)
+        && c1 == c2
+        && s1 == s2
+    {
+        let merged = merge((**k1).clone(), (**k2).clone())?;
+        return Ok(LocalType::LocalCall {
+            callee: c1.clone(),
+            subst: s1.clone(),
+            cont: Box::new(merged),
+        });
+    }
+
+    // Same box (identical enter/exit boundary): merge body and continuation.
+    if let (
+        LocalType::LocalBox {
+            enter: e1,
+            body: bd1,
+            exit: x1,
+            cont: k1,
+        },
+        LocalType::LocalBox {
+            enter: e2,
+            body: bd2,
+            exit: x2,
+            cont: k2,
+        },
+    ) = (&a, &b)
+        && e1 == e2
+        && x1 == x2
+    {
+        let merged_body = merge((**bd1).clone(), (**bd2).clone())?;
+        let merged_cont = merge((**k1).clone(), (**k2).clone())?;
+        return Ok(LocalType::LocalBox {
+            enter: e1.clone(),
+            body: Box::new(merged_body),
+            exit: x1.clone(),
+            cont: Box::new(merged_cont),
         });
     }
 
@@ -203,6 +309,8 @@ fn describe(t: &LocalType) -> String {
         LocalType::Select { to, .. } => format!("⊕{to}{{…}}"),
         LocalType::Branch { from, .. } => format!("&{from}{{…}}"),
         LocalType::Rec { var, .. } => format!("μ{var}.…"),
+        LocalType::LocalCall { callee, .. } => format!("call {}…", callee.name),
+        LocalType::LocalBox { enter, exit, .. } => format!("box⟨{enter}⟩{{…}}⟨{exit}⟩…"),
         LocalType::Var { var } => var.clone(),
         LocalType::End => "end".to_string(),
     }

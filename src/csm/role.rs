@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::tracker::kind::join_quoted;
+
 /// A protocol participant — e.g. `"Orchestrator"`, `"Reflector"`,
 /// `"Tool-Caller"`. A newtype over `String` so role identity is explicit in
 /// every signature (a bare `String` would be ambiguous against labels).
@@ -162,6 +164,71 @@ impl Action {
     }
 }
 
+/// The visibly-pushdown stack action a protocol-alphabet symbol triggers
+/// (Alur & Madhusudan, *Visibly Pushdown Languages*, STOC 2004): a *call* symbol
+/// pushes a return context, a *return* symbol pops it, and an *internal* symbol
+/// leaves the stack untouched. The action is determined by the **symbol class**,
+/// not the state — this "visibility" is exactly what keeps conformance decidable
+/// and the language class closed under ∩/∪/¬ (so compositional conformance is
+/// decidable). It is what lifts the CSM from finite-state (regular) to a
+/// *visibly pushdown* recognizer over well-nested protocol runs.
+///
+/// Stored in `csm_protocol_alphabet.stack_action` (the ADR-003 idiom: a `TEXT`
+/// column plus a `CHECK` built from [`StackAction::sql_in_list`], with a
+/// `#[cfg(test)]` golden test pinning the set — the same closed-vocabulary
+/// discipline as `PageState` (`crate::tape::vocab`) and `SessionStatus`
+/// (`crate::csm::session_store`)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StackAction {
+    /// Σ_int — an ordinary `Interaction`/`Choice` message; the stack is unchanged.
+    Neutral,
+    /// Σ_call — entering a sub-protocol frame (a `GlobalCall`/`GlobalBox` boundary);
+    /// push the matching return context.
+    Push,
+    /// Σ_ret — a sub-protocol reached `End`; pop the matching return context.
+    Pop,
+}
+
+impl StackAction {
+    /// Canonical ordering; also the source of the DB CHECK vocabulary.
+    pub const ALL: &'static [StackAction] = &[Self::Neutral, Self::Push, Self::Pop];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Neutral => "neutral",
+            Self::Push => "push",
+            Self::Pop => "pop",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|x| x.as_str() == s)
+    }
+
+    /// SQL `IN (...)` value list — the single source of truth shared with the
+    /// `csm_protocol_alphabet.stack_action` CHECK constraint (v54 migration).
+    pub fn sql_in_list() -> String {
+        join_quoted(Self::ALL.iter().map(|x| x.as_str()))
+    }
+}
+
+/// The maximum pushdown stack depth — one shared bound across the whole CSM:
+/// the type layer's well-formedness check (`WF-BOUND` in
+/// [`crate::csm::mpst::wellformed`]), the conformance engine
+/// (`PdaDecoder::with_max_stack_depth` in [`crate::csm::conformance`]), and the
+/// RLM runtime ([`crate::a2a::rlm`]), so the conformance stack and the runtime
+/// call stack are literally the same depth.
+///
+/// It equals `lling_llang::pushdown::PdaDecoder::DEFAULT_MAX_STACK_DEPTH` (a
+/// `#[cfg(test)]` test in [`crate::csm::conformance`] pins the equality so the two
+/// cannot drift). A *large finite* bound is the bridge that keeps the recognized
+/// language decidable (Alur–Madhusudan), keeps the Rocq model an ordinary
+/// `Inductive` (no coinduction — the reachable-configuration set stays finite),
+/// and makes termination provable via a `(MAX_STACK_DEPTH − depth, …)` measure.
+/// It is config-overridable at the runtime edge (`[a2a.rlm] max_depth`).
+pub const MAX_STACK_DEPTH: usize = 4096;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -193,5 +260,27 @@ mod tests {
         };
         assert_eq!(a.peer().as_str(), "R");
         assert_eq!(a.label().name, "reflect_req");
+    }
+
+    #[test]
+    fn stack_action_vocabulary_is_pinned() {
+        // ADR-003 golden test: the DB CHECK vocabulary must match this exact
+        // closed set; if a variant is added/renamed, this fails until the v54
+        // `csm_protocol_alphabet` CHECK is regenerated from `sql_in_list()`.
+        assert_eq!(StackAction::sql_in_list(), "'neutral','push','pop'");
+        for a in StackAction::ALL {
+            assert_eq!(StackAction::parse(a.as_str()), Some(*a));
+        }
+        assert_eq!(StackAction::parse("bogus"), None);
+    }
+
+    #[test]
+    fn stack_action_round_trips_as_snake_case_json() {
+        for a in StackAction::ALL {
+            let json = serde_json::to_string(a).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", a.as_str()));
+            let back: StackAction = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, *a);
+        }
     }
 }

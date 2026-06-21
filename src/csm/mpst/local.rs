@@ -8,9 +8,11 @@
 //! Adjacent serde tagging for the same reason as [`GlobalType`] (ADR-006): this
 //! enum is recursive.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
-use crate::csm::mpst::global::TypeVar;
+use crate::csm::mpst::global::{ProtocolRef, TypeVar};
 use crate::csm::role::{Label, Role};
 
 /// One role's local protocol type.
@@ -46,6 +48,29 @@ pub enum LocalType {
     Rec { var: TypeVar, body: Box<LocalType> },
     /// `var`
     Var { var: TypeVar },
+    /// `call C[σ] . cont` — this role's projection of a [`GlobalType::GlobalCall`]
+    /// it participates in: play the callee frame (under the role renaming `subst`),
+    /// then continue as `cont` once the callee returns. The callee is a *reference*
+    /// (not inlined), which the compiler resolves to a sub-machine box — this is
+    /// what carries the role's view of unbounded recursion.
+    ///
+    /// [`GlobalType::GlobalCall`]: super::global::GlobalType::GlobalCall
+    LocalCall {
+        callee: ProtocolRef,
+        subst: BTreeMap<Role, Role>,
+        cont: Box<LocalType>,
+    },
+    /// `box⟨enter⟩{ body }⟨exit⟩ . cont` — this role's projection of a
+    /// [`GlobalType::GlobalBox`] it participates in: an inline hierarchical
+    /// sub-region (HSM box) entered on `enter`, exited on `exit`, then `cont`.
+    ///
+    /// [`GlobalType::GlobalBox`]: super::global::GlobalType::GlobalBox
+    LocalBox {
+        enter: Label,
+        body: Box<LocalType>,
+        exit: Label,
+        cont: Box<LocalType>,
+    },
     /// `end`
     End,
 }
@@ -92,6 +117,21 @@ impl LocalType {
     }
     pub fn var(var: impl Into<TypeVar>) -> Self {
         LocalType::Var { var: var.into() }
+    }
+    pub fn lcall(callee: ProtocolRef, subst: BTreeMap<Role, Role>, cont: LocalType) -> Self {
+        LocalType::LocalCall {
+            callee,
+            subst,
+            cont: Box::new(cont),
+        }
+    }
+    pub fn lbox(enter: Label, body: LocalType, exit: Label, cont: LocalType) -> Self {
+        LocalType::LocalBox {
+            enter,
+            body: Box::new(body),
+            exit,
+            cont: Box::new(cont),
+        }
     }
 }
 
