@@ -86,4 +86,73 @@ impl McpServer {
         )
         .await
     }
+
+    #[tool(
+        description = "Effect-policy conformance: do the effects reachable from a seed \
+            symbol (over the resolved-call subgraph) stay within an allowed set? Sound \
+            inclusion reachable ⊆ allowed; each violation reports its shortest call \
+            depth. In-process; no prattail. Params: seed_symbol_id, allowed_effects, \
+            max_depth (default 8)."
+    )]
+    async fn effect_verify(
+        &self,
+        Parameters(params): Parameters<EffectVerifyParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "effect_verify",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_effect_verify::tool_effect_verify(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Behavioral check — CTL model-checking of a finite labelled \
+            transition system (Clarke–Emerson–Sistla fixpoint labelling). Full CTL \
+            (EX/AX/EF/AF/EG/AG/EU/AU + boolean); the branching-time complement to the \
+            SFA/SMT/Presburger tools. In-process; no prattail. Params: num_states, \
+            initial, transitions, labels (atoms per state), formula."
+    )]
+    async fn behavioral_check(
+        &self,
+        Parameters(params): Parameters<BehavioralCheckParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "behavioral_check",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_behavioral_check::tool_behavioral_check(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "KAT Hoare check — decide {precond} program {postcond} \
+            (Kleene Algebra with Tests: p·c·¬q ≡ 0) over a finite Boolean state space, \
+            via the hoisted lling-llang BooleanTest/eval_test_public. Returns a \
+            falsifiable counterexample state on failure. In-process; no prattail. \
+            Params: atoms, precond, program (assume/assign/havoc), postcond."
+    )]
+    async fn kat_hoare_check(
+        &self,
+        Parameters(params): Parameters<KatHoareCheckParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "kat_hoare_check",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_kat_hoare_check::tool_kat_hoare_check(self.ctx(), params),
+        )
+        .await
+    }
 }

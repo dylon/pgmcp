@@ -148,3 +148,210 @@ pub struct PresburgerDecideParams {
 fn default_bit_width() -> usize {
     8
 }
+
+// ──────────────────────────────────────────────────────────────────────────────
+// effect_verify
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// `effect_verify` — does the set of effects reachable from a seed symbol conform to
+/// an allowed-effect policy? The reachable effects (over the resolved-call subgraph,
+/// `sema_helpers::effects`) form a set; conformance is the sound inclusion
+/// `reachable ⊆ allowed`. Any reachable effect outside the policy is a violation
+/// (with its shortest call depth as a witness).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct EffectVerifyParams {
+    /// The seed symbol id (root of the effect-reachability subgraph).
+    pub seed_symbol_id: i64,
+    /// The permitted effect kinds (e.g. `["pure", "alloc", "channel_send"]`).
+    pub allowed_effects: Vec<String>,
+    /// Maximum call-graph depth to explore. Default `8`.
+    #[serde(default = "default_effect_depth")]
+    pub max_depth: u32,
+}
+
+fn default_effect_depth() -> u32 {
+    8
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// behavioral_check (CTL model-checking over a finite Kripke structure)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A transition `from → to` of the labelled transition system.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LtsEdgeSpec {
+    /// Source state index.
+    pub from: usize,
+    /// Target state index.
+    pub to: usize,
+}
+
+/// A Computation-Tree-Logic formula (branching-time behavioral spec). `E` = "there
+/// exists a path", `A` = "for all paths"; `X` next, `F` eventually, `G` globally,
+/// `U` until.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum CtlFormula {
+    /// `⊤`
+    True,
+    /// `⊥`
+    False,
+    /// Atomic proposition holding at a state.
+    Atom {
+        /// Proposition name.
+        prop: String,
+    },
+    /// `¬a`
+    Not {
+        /// The negated formula.
+        inner: Box<CtlFormula>,
+    },
+    /// `a ∧ b`
+    And {
+        /// Left conjunct.
+        left: Box<CtlFormula>,
+        /// Right conjunct.
+        right: Box<CtlFormula>,
+    },
+    /// `a ∨ b`
+    Or {
+        /// Left disjunct.
+        left: Box<CtlFormula>,
+        /// Right disjunct.
+        right: Box<CtlFormula>,
+    },
+    /// `EX a` — some successor satisfies `a`.
+    Ex {
+        /// The sub-formula.
+        inner: Box<CtlFormula>,
+    },
+    /// `AX a` — every successor satisfies `a`.
+    Ax {
+        /// The sub-formula.
+        inner: Box<CtlFormula>,
+    },
+    /// `EF a` — on some path, `a` eventually holds.
+    Ef {
+        /// The sub-formula.
+        inner: Box<CtlFormula>,
+    },
+    /// `AF a` — on every path, `a` eventually holds.
+    Af {
+        /// The sub-formula.
+        inner: Box<CtlFormula>,
+    },
+    /// `EG a` — on some path, `a` holds forever.
+    Eg {
+        /// The sub-formula.
+        inner: Box<CtlFormula>,
+    },
+    /// `AG a` — on every path, `a` holds forever (invariant).
+    Ag {
+        /// The sub-formula.
+        inner: Box<CtlFormula>,
+    },
+    /// `E[a U b]` — on some path, `a` until `b`.
+    Eu {
+        /// The "until" condition.
+        left: Box<CtlFormula>,
+        /// The eventual goal.
+        right: Box<CtlFormula>,
+    },
+    /// `A[a U b]` — on every path, `a` until `b`.
+    Au {
+        /// The "until" condition.
+        left: Box<CtlFormula>,
+        /// The eventual goal.
+        right: Box<CtlFormula>,
+    },
+}
+
+/// `behavioral_check` — CTL model-checking of a finite labelled transition system.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BehavioralCheckParams {
+    /// Number of states (`0..num_states`).
+    pub num_states: usize,
+    /// The state to check the formula at.
+    pub initial: usize,
+    /// Transitions of the LTS.
+    pub transitions: Vec<LtsEdgeSpec>,
+    /// Atomic propositions true at each state (indexed by state).
+    pub labels: Vec<Vec<String>>,
+    /// The CTL formula to check.
+    pub formula: CtlFormula,
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// kat_hoare_check (propositional KAT Hoare logic over Boolean tests)
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// A Boolean test (mirrors `lling_llang::symbolic::kat_algebra::BooleanTest`).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum BoolTestSpec {
+    /// `⊤`
+    True,
+    /// `⊥`
+    False,
+    /// Atomic proposition.
+    Atom {
+        /// Proposition name.
+        name: String,
+    },
+    /// `¬a`
+    Not {
+        /// The negated test.
+        inner: Box<BoolTestSpec>,
+    },
+    /// `a ∧ b`
+    And {
+        /// Left conjunct.
+        left: Box<BoolTestSpec>,
+        /// Right conjunct.
+        right: Box<BoolTestSpec>,
+    },
+    /// `a ∨ b`
+    Or {
+        /// Left disjunct.
+        left: Box<BoolTestSpec>,
+        /// Right disjunct.
+        right: Box<BoolTestSpec>,
+    },
+}
+
+/// One guarded-command statement of the KAT program.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum KatStmt {
+    /// `assume(test)` — keep only states satisfying `test` (a KAT test/guard).
+    Assume {
+        /// The guard.
+        test: BoolTestSpec,
+    },
+    /// `var := value` — set a Boolean variable.
+    Assign {
+        /// The variable.
+        var: String,
+        /// The new value.
+        value: bool,
+    },
+    /// `havoc(var)` — set `var` non-deterministically (both values).
+    Havoc {
+        /// The variable.
+        var: String,
+    },
+}
+
+/// `kat_hoare_check` — decide the propositional Hoare triple `{precond} program
+/// {postcond}` over a finite Boolean state space (`2^|atoms|` valuations).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KatHoareCheckParams {
+    /// The Boolean variables (atomic propositions).
+    pub atoms: Vec<String>,
+    /// Precondition.
+    pub precond: BoolTestSpec,
+    /// The guarded-command program.
+    pub program: Vec<KatStmt>,
+    /// Postcondition.
+    pub postcond: BoolTestSpec,
+}

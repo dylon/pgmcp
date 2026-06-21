@@ -960,6 +960,9 @@ impl McpServer {
             "protocol_soundness"          => protocol_soundness(ProtocolSoundnessParams),
             "language_inclusion"          => language_inclusion(LanguageInclusionParams),
             "presburger_decide"           => presburger_decide(PresburgerDecideParams),
+            "effect_verify"               => effect_verify(EffectVerifyParams),
+            "behavioral_check"            => behavioral_check(BehavioralCheckParams),
+            "kat_hoare_check"             => kat_hoare_check(KatHoareCheckParams),
             "fca_concept_lattice"     => fca_concept_lattice(FcaConceptLatticeParams),
             // Crucible session PAUSE/RESUME (ADR-009)
             "session_checkpoint_save"   => session_checkpoint_save(SessionCheckpointSaveParams),
