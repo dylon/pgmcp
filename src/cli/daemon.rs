@@ -180,6 +180,12 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
 
     let config_snapshot = config.load();
 
+    // ADR-016 E8: apply the configured outbound A2A timeout (0 = keep the
+    // built-in 60s default) before any peer call is dispatched.
+    if config_snapshot.a2a.timeout_secs > 0 {
+        crate::a2a::client::set_default_timeout_secs(config_snapshot.a2a.timeout_secs);
+    }
+
     // 1. Initialize database
     let db_pool = db::pool::create_pool(&config_snapshot.database).await?;
     // Retry on transient lock contention (e.g. an orphaned backend from a killed

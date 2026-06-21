@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde_json::json;
@@ -14,6 +15,18 @@ use super::types::{Message, Part, Role, Task};
 pub struct A2aClient {
     pub base_url: String,
     pub timeout: Duration,
+}
+
+/// Process-global default per-call A2A timeout (seconds), set once at daemon
+/// startup from `[a2a] timeout_secs` (ADR-016 E8). `A2aClient::new` reads it so
+/// every outbound peer call honors the configured budget without threading
+/// config through all call sites; `with_timeout` still overrides per call (e.g.
+/// the RLM depth-scaled budget).
+static DEFAULT_TIMEOUT_SECS: AtomicU64 = AtomicU64::new(60);
+
+/// Set the process-global default A2A timeout (clamped to ≥ 1s).
+pub fn set_default_timeout_secs(secs: u64) {
+    DEFAULT_TIMEOUT_SECS.store(secs.max(1), Ordering::Relaxed);
 }
 
 /// Options for an outbound `tasks/send` call.
@@ -29,7 +42,7 @@ impl A2aClient {
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(DEFAULT_TIMEOUT_SECS.load(Ordering::Relaxed)),
         }
     }
 

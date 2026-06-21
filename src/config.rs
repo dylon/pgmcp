@@ -584,6 +584,11 @@ pub struct A2aConfig {
     /// (Part A write-back seam).
     #[serde(default)]
     pub writeback_enabled: bool,
+    /// Per-call outbound A2A timeout in seconds (0 = the built-in 60s default).
+    /// Applied once at startup via `client::set_default_timeout_secs` (ADR-016 E8),
+    /// so slow sparky models don't hit the fixed 60s ceiling.
+    #[serde(default)]
+    pub timeout_secs: u64,
     /// When true, peer best practices are retrieved and injected into
     /// pattern role prompts and the `/api/session/observe`
     /// `additional_context` (Part A read-before-act).
