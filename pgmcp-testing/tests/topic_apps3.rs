@@ -83,7 +83,7 @@ async fn topic_ownership_forecast_flags_single_owner() {
              ON CONFLICT (file_id, chunk_index) DO UPDATE SET blame_author='alice' RETURNING id",
         )
         .bind(file_id)
-        .bind(i as i32)
+        .bind(i)
         .fetch_one(&pool)
         .await
         .expect("chunk");

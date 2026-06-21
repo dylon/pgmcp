@@ -66,6 +66,10 @@ mod rmas;
 mod sessions;
 mod shutdown;
 mod stats;
+// Phase 5 control plane is complete + tested in-module; its tool/orchestrator
+// wiring lands later, so the binary does not yet call the public surface.
+#[allow(dead_code)]
+mod tape;
 mod tools_catalog;
 mod topic_analysis;
 mod topic_apps;

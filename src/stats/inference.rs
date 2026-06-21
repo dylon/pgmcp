@@ -1240,6 +1240,255 @@ pub fn required_n_per_arm(effect_d: f64, alpha: f64, power: f64, tail: Tail) -> 
     (n.ceil() as usize).max(2)
 }
 
+// ============================================================================
+// Exact binomial test
+// ============================================================================
+
+/// Exact (or, for very large `n`, normal-approximated) binomial test of the
+/// observed `successes` out of `n` trials against a null success probability
+/// `p0`. Returns the p-value for the requested [`Tail`].
+///
+/// ## Two-sided convention — the doubling rule
+///
+/// The two-sided p-value uses the **doubling rule** `min(1, 2·min(P_left,
+/// P_right))` where `P_left = P(X ≤ successes)` and `P_right = P(X ≥ successes)`
+/// under `X ~ Binomial(n, p0)`. This is the convention R's `binom.test`
+/// documents as the "central" / minimum-likelihood-free variant and is what
+/// McNemar's exact test (where `p0 = 0.5`) calls for. It is simpler and more
+/// numerically robust than the "sum of all outcomes no more probable than the
+/// observed" (`minlike`) rule, and identical to it for the symmetric
+/// `p0 = 0.5` case that drives McNemar. Note the doubled smaller tail double-
+/// counts the shared point mass at `successes`, so for a symmetric null the
+/// p-value correctly saturates to `1.0` when `successes` sits at the median.
+///
+/// ## Exact vs. normal approximation
+///
+/// For `n ≤ 1000` the tails are summed exactly from the binomial PMF, evaluated
+/// in log-space (`ln_binom_pmf`) so the binomial coefficient never overflows and
+/// small probabilities keep full relative precision. This is the regime
+/// McNemar's exact path (`n ≤ 25`) depends on, so it must be exact there. For
+/// `n > 1000` an exact summation over up to a thousand-plus terms buys nothing
+/// over the central-limit regime and risks needless work, so we fall back to the
+/// normal approximation with a continuity correction (mean `n·p0`, variance
+/// `n·p0·(1−p0)`); the threshold is documented here and pinned by a unit test.
+///
+/// ## Errors
+///
+/// Returns [`StatsError::InvalidParam`] when `successes > n` or `p0` is outside
+/// the open interval `(0, 1)` (the test statistic is undefined at the
+/// boundaries, where the binomial is degenerate).
+pub fn exact_binomial_test(successes: u64, n: u64, p0: f64, tail: Tail) -> Result<f64, StatsError> {
+    if successes > n {
+        return Err(StatsError::InvalidParam(format!(
+            "successes ({successes}) must be <= n ({n})"
+        )));
+    }
+    if !(p0 > 0.0 && p0 < 1.0) {
+        return Err(StatsError::InvalidParam(format!(
+            "p0 must be in (0,1), got {p0}"
+        )));
+    }
+
+    // Degenerate trial count: zero trials means the only outcome is 0 successes,
+    // which is exactly what was observed — no evidence against H0.
+    if n == 0 {
+        return Ok(1.0);
+    }
+
+    // Large-n normal approximation with continuity correction.
+    const EXACT_MAX_N: u64 = 1000;
+    if n > EXACT_MAX_N {
+        let nf = n as f64;
+        let mu = nf * p0;
+        let sigma = (nf * p0 * (1.0 - p0)).sqrt();
+        if sigma <= 0.0 {
+            // Cannot happen for p0 ∈ (0,1), n ≥ 1, but stay total.
+            return Ok(1.0);
+        }
+        let k = successes as f64;
+        return Ok(match tail {
+            // P(X ≥ k) ≈ 1 − Φ((k − 0.5 − μ)/σ).
+            Tail::Greater => {
+                let z = (k - 0.5 - mu) / sigma;
+                one_sided_normal_p(z, Tail::Greater)
+            }
+            // P(X ≤ k) ≈ Φ((k + 0.5 − μ)/σ).
+            Tail::Less => {
+                let z = (k + 0.5 - mu) / sigma;
+                one_sided_normal_p(z, Tail::Less)
+            }
+            Tail::TwoSided => {
+                let z_left = (k + 0.5 - mu) / sigma; // for P(X ≤ k)
+                let z_right = (k - 0.5 - mu) / sigma; // for P(X ≥ k)
+                let p_left = standard_normal().cdf(z_left).clamp(0.0, 1.0);
+                let p_right = (1.0 - standard_normal().cdf(z_right)).clamp(0.0, 1.0);
+                (2.0 * p_left.min(p_right)).min(1.0)
+            }
+        });
+    }
+
+    // Exact summation from the binomial PMF (log-space for numerical safety).
+    let n_usize = n as usize;
+    let s = successes as usize;
+    // P(X ≤ successes): sum the lower s+1 PMF terms.
+    let p_left: f64 = (0..=s).map(|k| ln_binom_pmf(k, n_usize, p0).exp()).sum();
+    // P(X ≥ successes): sum the upper (n−s+1) PMF terms.
+    let p_right: f64 = (s..=n_usize)
+        .map(|k| ln_binom_pmf(k, n_usize, p0).exp())
+        .sum();
+
+    let p = match tail {
+        Tail::Greater => p_right,
+        Tail::Less => p_left,
+        // Doubling rule (see the doc comment): saturates to 1.0 at the median.
+        Tail::TwoSided => (2.0 * p_left.min(p_right)).min(1.0),
+    };
+    Ok(p.clamp(0.0, 1.0))
+}
+
+/// Natural log of the binomial PMF `C(n,k)·pᵏ·(1−p)ⁿ⁻ᵏ`, computed via
+/// `ln_gamma` so the coefficient never overflows for the `n ≤ 1000` exact path.
+/// `ln Γ(m+1) = ln(m!)`, so `ln C(n,k) = lnΓ(n+1) − lnΓ(k+1) − lnΓ(n−k+1)`.
+fn ln_binom_pmf(k: usize, n: usize, p: f64) -> f64 {
+    use statrs::function::gamma::ln_gamma;
+    let nf = n as f64;
+    let kf = k as f64;
+    let ln_choose = ln_gamma(nf + 1.0) - ln_gamma(kf + 1.0) - ln_gamma(nf - kf + 1.0);
+    ln_choose + kf * p.ln() + (nf - kf) * (1.0 - p).ln()
+}
+
+// ============================================================================
+// McNemar's test (paired binary outcomes)
+// ============================================================================
+
+/// Result of [`mcnemar_test`]: McNemar's paired test for two binary
+/// classifiers scored on the **same** test cases.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McNemarResult {
+    /// On the χ² path: the continuity-corrected χ² statistic. On the exact
+    /// path: the discordant imbalance `|b − c|` (the χ² statistic is not
+    /// computed there, so this carries the magnitude of disagreement instead).
+    pub statistic: f64,
+    /// Two-sided p-value.
+    pub p_value: f64,
+    /// Number of discordant pairs, `b + c`.
+    pub n_discordant: u64,
+    /// `c − b` as f64 — the net count of discordant pairs favoring the
+    /// treatment (positive ⇒ treatment fixed more cases than it broke).
+    pub effect_treatment_minus_control: f64,
+    /// True when the exact-binomial path was used (`n_discordant ≤ 25`).
+    pub exact: bool,
+}
+
+/// McNemar's test (McNemar 1947) for two binary classifiers evaluated on a
+/// **paired** sample — the same test cases scored by a control arm and a
+/// treatment arm.
+///
+/// ## Why not Welch / two-proportion tests here
+///
+/// When both arms are scored on the *same* cases, the per-arm accuracies are
+/// **dependent**: a Welch t-test (or an unpaired two-proportion z-test) ignores
+/// that pairing and is statistically wrong — it answers the wrong question and
+/// is anticonservative. McNemar conditions on the **discordant** pairs (cases
+/// the two arms disagree on) and asks only whether disagreements split
+/// symmetrically. The concordant cells (`both_correct`, `both_wrong`) carry no
+/// information about a difference and drop out of the statistic entirely.
+///
+/// ## The 2×2 table
+///
+/// ```text
+///                          treatment correct   treatment wrong
+///   control correct        a = both_correct    b = control_only_correct
+///   control wrong          c = treatment_only  d = both_wrong
+///                              _correct
+/// ```
+///
+/// Under H₀ (no difference in error rates) the `n = b + c` discordant pairs
+/// split as `b ~ Binomial(n, ½)`.
+///
+/// ## Exact vs. χ² (continuity-corrected) path
+///
+/// - `n == 0`: no discordant pairs, hence no evidence of a difference — returns
+///   `p = 1.0`, `statistic = 0.0`, `exact = true`.
+/// - `n ≤ 25`: the **exact binomial** two-sided test (the χ² approximation is
+///   unreliable for few discordant pairs). `statistic` is reported as the
+///   discordant imbalance `|b − c|` (the χ² value is not meaningful here).
+/// - `n > 25`: Edwards' **continuity-corrected** χ² with one degree of freedom,
+///   `statistic = (max(|b − c| − 1, 0))² / n`, and `p_value` is its χ²(1) upper
+///   tail. The `max(·, 0)` clamp keeps the corrected term non-negative when
+///   `|b − c| < 1` (i.e. `b == c`), which would otherwise square a negative.
+///
+/// The effect is oriented treatment − control: `effect_treatment_minus_control
+/// = c − b`.
+///
+/// ## References
+///
+/// - McNemar, Q. (1947). *Psychometrika* 12(2). (the paired test)
+/// - Edwards, A. L. (1948). *Psychometrika* 13(3). (continuity correction)
+pub fn mcnemar_test(
+    both_correct: u64,
+    control_only_correct: u64,
+    treatment_only_correct: u64,
+    both_wrong: u64,
+) -> Result<McNemarResult, StatsError> {
+    // Concordant cells carry no information about a difference; named for the
+    // table documentation above and to make the "ignored except for context"
+    // contract explicit.
+    let _a = both_correct;
+    let _d = both_wrong;
+    let b = control_only_correct;
+    let c = treatment_only_correct;
+
+    let n = b + c; // discordant pairs
+    let effect = c as f64 - b as f64;
+
+    // No discordant pairs → no evidence of any difference.
+    if n == 0 {
+        return Ok(McNemarResult {
+            statistic: 0.0,
+            p_value: 1.0,
+            n_discordant: 0,
+            effect_treatment_minus_control: 0.0,
+            exact: true,
+        });
+    }
+
+    // Exact path for small discordant counts (the χ² approximation is unreliable
+    // for few discordant pairs).
+    const EXACT_MAX_DISCORDANT: u64 = 25;
+    if n <= EXACT_MAX_DISCORDANT {
+        // Under H0, b ~ Binomial(n, 0.5). The two-sided doubling rule applied at
+        // the smaller cell (min(b,c) ≤ n/2, so its lower tail is the smaller
+        // one) yields exactly min(1, 2·P(X ≤ min(b,c))).
+        let p_value = exact_binomial_test(b.min(c), n, 0.5, Tail::TwoSided)?;
+        return Ok(McNemarResult {
+            // The exact path has no χ² statistic; report the discordant
+            // imbalance |b − c| as the magnitude of disagreement.
+            statistic: (b as f64 - c as f64).abs(),
+            p_value,
+            n_discordant: n,
+            effect_treatment_minus_control: effect,
+            exact: true,
+        });
+    }
+
+    // χ² path with Edwards' continuity correction.
+    let diff = (b as f64 - c as f64).abs();
+    let corrected = (diff - 1.0).max(0.0); // clamp so it can't go negative
+    let statistic = corrected * corrected / n as f64;
+    let chi2 =
+        ChiSquared::new(1.0).map_err(|e| StatsError::InvalidParam(format!("chi2 df=1: {e}")))?;
+    let p_value = (1.0 - chi2.cdf(statistic)).clamp(0.0, 1.0);
+
+    Ok(McNemarResult {
+        statistic,
+        p_value,
+        n_discordant: n,
+        effect_treatment_minus_control: effect,
+        exact: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1450,5 +1699,143 @@ mod tests {
         // Larger effect needs fewer samples.
         let n_big = required_n_per_arm(1.0, 0.05, 0.8, Tail::TwoSided);
         assert!(n_big < n);
+    }
+
+    // ------------------------------------------------------------------------
+    // Exact binomial test
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn exact_binomial_two_sided_8_of_10() {
+        // R: binom.test(8, 10, 0.5)$p.value = 0.109375 (doubling rule).
+        let p = exact_binomial_test(8, 10, 0.5, Tail::TwoSided).expect("binom");
+        assert!(approx(p, 0.1094, 1e-3), "p={p}");
+    }
+
+    #[test]
+    fn exact_binomial_two_sided_at_median_is_one() {
+        // 5 of 10 under p0=0.5 sits at the median → two-sided p saturates to 1.0.
+        let p = exact_binomial_test(5, 10, 0.5, Tail::TwoSided).expect("binom");
+        assert!(approx(p, 1.0, 1e-12), "p={p}");
+    }
+
+    #[test]
+    fn exact_binomial_two_sided_boundary_zero() {
+        // 0 of 10 successes under p0=0.5: two-sided p = 2·P(X=0) = 2·(1/1024).
+        let p = exact_binomial_test(0, 10, 0.5, Tail::TwoSided).expect("binom");
+        assert!(approx(p, 0.00195, 1e-3), "p={p}");
+    }
+
+    #[test]
+    fn exact_binomial_one_sided_tails_complementary_at_extreme() {
+        // At the lower extreme: P(X ≤ 0) is tiny; P(X ≥ 0) is exactly 1.0.
+        let left = exact_binomial_test(0, 10, 0.5, Tail::Less).expect("left");
+        let right = exact_binomial_test(0, 10, 0.5, Tail::Greater).expect("right");
+        assert!(approx(left, 1.0 / 1024.0, 1e-9), "left={left}");
+        assert!(approx(right, 1.0, 1e-12), "right={right}");
+    }
+
+    #[test]
+    fn exact_binomial_validates_inputs() {
+        assert!(matches!(
+            exact_binomial_test(11, 10, 0.5, Tail::TwoSided),
+            Err(StatsError::InvalidParam(_))
+        ));
+        assert!(matches!(
+            exact_binomial_test(5, 10, 0.0, Tail::TwoSided),
+            Err(StatsError::InvalidParam(_))
+        ));
+        assert!(matches!(
+            exact_binomial_test(5, 10, 1.0, Tail::TwoSided),
+            Err(StatsError::InvalidParam(_))
+        ));
+    }
+
+    #[test]
+    fn exact_binomial_normal_fallback_for_large_n() {
+        // n > 1000 uses the normal approximation; a 60%-success vs p0=0.5 over
+        // 2000 trials is overwhelmingly significant two-sided.
+        let p = exact_binomial_test(1200, 2000, 0.5, Tail::TwoSided).expect("approx");
+        assert!(p < 1e-6, "p={p}");
+        // And a result right at the null mean is non-significant.
+        let p_mid = exact_binomial_test(1000, 2000, 0.5, Tail::TwoSided).expect("approx");
+        assert!(p_mid > 0.5, "p_mid={p_mid}");
+    }
+
+    // ------------------------------------------------------------------------
+    // McNemar's test
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn mcnemar_chi2_path() {
+        // b=30, c=10, n=40 > 25 → χ² path.
+        // statistic = (|30-10| - 1)² / 40 = 19² / 40 = 361/40 = 9.025.
+        // χ²(1) upper tail of 9.025 ≈ 0.002663 (SciPy chi2.sf(9.025, 1)).
+        let r = mcnemar_test(0, 30, 10, 0).expect("mcnemar");
+        assert!(!r.exact, "n=40 should use the χ² path");
+        assert!(approx(r.statistic, 9.025, 1e-3), "stat={}", r.statistic);
+        assert!(approx(r.p_value, 0.00266, 1e-3), "p={}", r.p_value);
+        assert_eq!(r.n_discordant, 40);
+        // c - b = 10 - 30 = -20 (treatment broke more than it fixed).
+        assert!(approx(r.effect_treatment_minus_control, -20.0, 1e-12));
+    }
+
+    #[test]
+    fn mcnemar_exact_path() {
+        // b=12, c=5, n=17 ≤ 25 → exact path; two-sided exact p ≈ 0.143463.
+        let r = mcnemar_test(50, 12, 5, 33).expect("mcnemar");
+        assert!(r.exact, "n=17 should use the exact path");
+        assert!(approx(r.p_value, 0.1435, 1e-3), "p={}", r.p_value);
+        // Exact path reports |b - c| = 7 as the statistic.
+        assert!(approx(r.statistic, 7.0, 1e-12), "stat={}", r.statistic);
+        assert_eq!(r.n_discordant, 17);
+        // c - b = 5 - 12 = -7.
+        assert!(approx(r.effect_treatment_minus_control, -7.0, 1e-12));
+    }
+
+    #[test]
+    fn mcnemar_symmetric_discordant_is_one() {
+        // b = c = 8 → perfectly symmetric disagreement → p = 1.0.
+        let r = mcnemar_test(20, 8, 8, 4).expect("mcnemar");
+        assert!(r.exact, "n=16 should use the exact path");
+        assert!(approx(r.p_value, 1.0, 1e-12), "p={}", r.p_value);
+        assert!(approx(r.statistic, 0.0, 1e-12), "stat={}", r.statistic);
+        assert!(approx(r.effect_treatment_minus_control, 0.0, 1e-12));
+    }
+
+    #[test]
+    fn mcnemar_no_discordant_pairs() {
+        // n = 0 → no evidence of a difference.
+        let r = mcnemar_test(40, 0, 0, 10).expect("mcnemar");
+        assert_eq!(r.n_discordant, 0);
+        assert!(approx(r.p_value, 1.0, 1e-12), "p={}", r.p_value);
+        assert!(approx(r.statistic, 0.0, 1e-12), "stat={}", r.statistic);
+        assert!(r.exact);
+        assert!(approx(r.effect_treatment_minus_control, 0.0, 1e-12));
+    }
+
+    #[test]
+    fn mcnemar_symmetry_under_arm_swap() {
+        // Swapping b and c must leave the p-value unchanged and negate the
+        // effect (the test is on the magnitude of disagreement; the direction
+        // is carried by the sign of c - b). Exercised on both paths.
+        for (b, c) in [(12_u64, 5_u64), (30, 10)] {
+            let r = mcnemar_test(7, b, c, 9).expect("orig");
+            let swapped = mcnemar_test(7, c, b, 9).expect("swapped");
+            assert!(
+                approx(r.p_value, swapped.p_value, 1e-12),
+                "p mismatch for (b={b}, c={c}): {} vs {}",
+                r.p_value,
+                swapped.p_value
+            );
+            assert!(approx(r.statistic, swapped.statistic, 1e-12));
+            assert!(approx(
+                r.effect_treatment_minus_control,
+                -swapped.effect_treatment_minus_control,
+                1e-12
+            ));
+            assert_eq!(r.n_discordant, swapped.n_discordant);
+            assert_eq!(r.exact, swapped.exact);
+        }
     }
 }

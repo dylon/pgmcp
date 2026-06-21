@@ -101,6 +101,81 @@ pub struct Config {
     /// on-demand `security_scan` MCP tool works regardless.
     #[serde(default)]
     pub security_scan: SecurityScanConfig,
+    /// `[tape]` — defaults for the Crucible context-tape paging control plane
+    /// (`src/tape/`): the per-session token budget, eviction policy, and logical
+    /// TTL used when a session does not specify its own `working_set_config`.
+    /// Pure coordination/MEMORY; no shell, no user-file writes.
+    #[serde(default)]
+    pub tape: TapeConfig,
+}
+
+/// `[tape]` — defaults for the context-tape paging control plane
+/// (`src/tape/`). A session may override any of these via its
+/// `working_set_config` row; these supply the fallbacks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TapeConfig {
+    /// Default token budget the resident working set must not exceed when a
+    /// session does not specify one (default 128_000 — a typical large-model
+    /// window). The controller evicts mechanically to keep within this.
+    #[serde(default = "default_tape_budget_tokens")]
+    pub budget_tokens: i32,
+    /// Default eviction policy label (one of [`crate::tape::vocab::EvictionPolicy`]
+    /// — `lru`/`lfu`/`ttl`/`fifo`/`cost_aware`/`importance_weighted`). Default
+    /// `importance_weighted`. An unrecognized value falls back to the default at
+    /// read time.
+    #[serde(default = "default_tape_policy")]
+    pub policy: String,
+    /// Default logical TTL in clock ticks for the `ttl` policy — a page whose
+    /// logical age (clock delta, never wall-time) exceeds this is eligible for
+    /// TTL eviction. `0` (default) disables logical-TTL eviction.
+    #[serde(default)]
+    pub ttl_secs: i32,
+    /// Whether a dirty page's write-back (`RealTapeDataPlane::put`) is allowed to
+    /// **promote** an agent-edited corpus page into durable memory as a
+    /// bi-temporal supersession in `memory_observations` (never `file_chunks` —
+    /// the corpus is read-only). `false` (default) makes `put` a no-op DB-side:
+    /// the mutated bytes live only in the per-tree `TapeStore` (the hot/OOC tier)
+    /// and are discarded on eviction, so a stray write can never leak into durable
+    /// memory. Operators opt in explicitly (`[tape] allow_promotion = true`) when
+    /// they want agent scratch edits to survive as observations.
+    #[serde(default)]
+    pub allow_promotion: bool,
+    /// Idle-tree reaper: a per-tree `TapeStore` not touched for this many seconds
+    /// is reclaimed by the `tape-store-reaper` cron — the backstop for a recursion
+    /// tree that ended without an explicit `drop_tree` (e.g. a crashed run). `0`
+    /// (default) disables it. Wall-clock by design: it only frees RAM and never
+    /// affects a resume's reconstructed residency (which is replay-deterministic
+    /// from the LOGICAL clock, not wall-time).
+    #[serde(default)]
+    pub reaper_idle_secs: u64,
+    /// How often the `tape-store-reaper` cron runs, in seconds. `0` (default)
+    /// disables the cron. BOTH `reaper_interval_secs` and `reaper_idle_secs` must
+    /// be `> 0` for any reaping to occur.
+    #[serde(default)]
+    pub reaper_interval_secs: u64,
+}
+
+impl Default for TapeConfig {
+    fn default() -> Self {
+        Self {
+            budget_tokens: default_tape_budget_tokens(),
+            policy: default_tape_policy(),
+            ttl_secs: 0,
+            allow_promotion: false,
+            reaper_idle_secs: 0,
+            reaper_interval_secs: 0,
+        }
+    }
+}
+
+fn default_tape_budget_tokens() -> i32 {
+    128_000
+}
+
+fn default_tape_policy() -> String {
+    crate::tape::vocab::EvictionPolicy::ImportanceWeighted
+        .as_str()
+        .to_string()
 }
 
 /// `[security_scan]` — the external security-scanner subsystem
@@ -372,6 +447,20 @@ pub struct ExperimentsConfig {
     /// CPU is on the `performance` governor (per the benchmarking mandate).
     #[serde(default = "default_true")]
     pub require_performance_governor: bool,
+    /// Whether a **verified positive** experiment decision may be promoted into
+    /// durable memory as a bi-temporal supersession in `memory_observations`
+    /// (the P9 context-tape pre-registration's promotion path — see
+    /// [`crate::experiment::context_tape::promote_decision`]). `false` (default)
+    /// makes promotion a no-op: a verified positive decision is recorded in the
+    /// `experiment_*` tables but never written to the memory graph, so an
+    /// accepted result can never silently mutate durable memory. Mirrors the
+    /// `[tape] allow_promotion` write-back gate and the tracker's "no agent arm
+    /// into `verified`" boundary: promotion is gated on a real server-computed
+    /// decision AND this explicit opt-in. Operators set
+    /// `[experiments] allow_promotion = true` to let accepted pre-registered
+    /// results graduate into memory.
+    #[serde(default)]
+    pub allow_promotion: bool,
 }
 
 fn default_experiment_alpha() -> f64 {
@@ -405,6 +494,7 @@ impl Default for ExperimentsConfig {
             auto_render_ledger: false,
             ledger_dir: default_experiment_ledger_dir(),
             require_performance_governor: default_true(),
+            allow_promotion: false,
         }
     }
 }

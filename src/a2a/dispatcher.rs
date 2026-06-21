@@ -230,7 +230,7 @@ async fn try_dispatch_rlm(
 
     let ctx = &state.system_ctx;
     let frame = frame.entered(own_a2a_url(ctx));
-    let env = match RlmEnvironment::from_json(&frame.environment) {
+    let env = match RlmEnvironment::from_frame(&frame.environment, &frame) {
         Ok(e) => e,
         Err(e) => {
             tracing::error!(error = %e, "RLM frame environment unparseable; answering as leaf");

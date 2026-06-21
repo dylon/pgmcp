@@ -28,7 +28,7 @@ use rmcp::ErrorData as McpError;
 use rmcp::model::CallToolResult;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tracing::warn;
+use tracing::{error, warn};
 use uuid::Uuid;
 
 use crate::a2a::types::TaskState;
@@ -162,6 +162,26 @@ pub async fn tool_session_checkpoint_save(
             })?;
         }
 
+        // Flush the durable working set (the context-tape residency state) at the
+        // suspend point, mirroring the transcript flush above: the paging engine
+        // wrote pages incrementally to working_set_pages keyed by (session_key,
+        // cursor); re-committing them here makes the resume-side load_working_set
+        // reconstruct a bit-identical snapshot (the logical-clock determinism
+        // guarantee). Keyed by the SAME cursor the checkpoint caches as its
+        // position — "the trace IS the position". A missing working set is a
+        // benign no-op (0 pages flushed). A DB fault here is ADR-021 error!-grade
+        // (a real persistence failure), surfaced to the caller.
+        let working_set_pages_flushed =
+            crate::tape::store::flush_working_set(pool, &params.session_key, cursor)
+                .await
+                .map_err(|e| {
+                    error!(
+                        session_key = %params.session_key, cursor, error = %e,
+                        "session_checkpoint_save: working-set flush failed during pause"
+                    );
+                    McpError::internal_error(format!("working-set flush failed: {e}"), None)
+                })?;
+
         // Drop the work-item lease (best-effort: a missing/foreign-owned item is
         // not fatal — the lease may already have lapsed or never been claimed).
         let mut lease_dropped = false;
@@ -214,6 +234,7 @@ pub async fn tool_session_checkpoint_save(
             "critic_iteration": critic_iteration,
             "trace_events_flushed": events.len(),
             "csm_run_trace_id": flushed_trace_id,
+            "working_set_pages_flushed": working_set_pages_flushed,
             "lease_dropped": lease_dropped,
             "note": "session suspended; resume with session_checkpoint_resume(session_key)",
         }));

@@ -275,4 +275,133 @@ without writing. The structured record is the source of truth; the ledger is the
         )
         .await
     }
+
+    #[tool(
+        description = "Crucible P9: the FROZEN, pre-registered Context-Tape 3×3×5 experiment \
+(3 arms × 3 task families × 5 metrics) with a composite acceptance criterion frozen BEFORE any run \
+(accuracy: treatment Welch-t > control; cost: TOST-equivalent within ±20%; p95 latency ≤ SLO; \
+max-context-handled ≥ 2× baseline). Always echoes the frozen definition. open=true opens the experiment \
+(locking the criterion). Supply real `cells` [{arm,family,metric,samples}] to record + decide against the \
+frozen rule. The 3×3×5 EXECUTION is dataset-gated (OOLONG-Pairs/BrowseComp-Plus/LongBench-CodeQA + live local \
+models); no measurement is fabricated. Promotion of a verified positive decision into memory is gated on \
+[experiments] allow_promotion (default OFF) AND promote_to_obs."
+    )]
+    async fn experiment_preregister_context_tape(
+        &self,
+        Parameters(params): Parameters<ExperimentPreregisterContextTapeParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_preregister_context_tape",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_experiments::tool_experiment_preregister_context_tape(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    // ── Thread 5b — experiment-API hardening ───────────────────────────────
+    // EXPERIMENT subsystem only: these never touch the work-item tracker or post
+    // →verified evidence (the self-verification loophole was reverted 2026-06-20).
+
+    #[tool(
+        description = "Store the paired-corpus 2×2 (both_correct, control_only, treatment_only, both_wrong) for a \
+(experiment, hypothesis, metric) — the correct representation for classification/recall benchmarks where the two \
+arms score the SAME cases — and return the SERVER-COMPUTED McNemar verdict (statistic, p-value, discordant count, \
+effect, exact-vs-χ², significant-at-0.05). The agent supplies counts; the daemon computes the test (never asserts \
+it). hypothesis_id is required (the 2×2 dedupes per-hypothesis)."
+    )]
+    async fn experiment_record_paired_binary_counts(
+        &self,
+        Parameters(params): Parameters<ExperimentRecordPairedBinaryCountsParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_record_paired_binary_counts",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_experiments::tool_experiment_record_paired_binary_counts(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Seal a measurement run for use in a decision: compute + store its tamper-evident SHA-256 \
+samples digest, set status='finalized', and append to the immutable run-status audit trail. Idempotent. Returns \
+{samples_digest, sample_count, status}. Use before experiment_decide when you want the run's data sealed."
+    )]
+    async fn experiment_finalize_run(
+        &self,
+        Parameters(params): Parameters<ExperimentFinalizeRunParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_finalize_run",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_experiments::tool_experiment_finalize_run(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Audited EXCLUSION of a run from decisions (status 'invalid' or 'superseded' ONLY; a \
+non-empty reason is REQUIRED). The anti-cherry-pick guardrail: any rendered decision that consumed the run is \
+RE-OPENED (its hypothesis verdict reverts to pending), so excluding unfavorable data after a decision can never \
+silently keep the favourable verdict. Returns {old_status, new_status, reopened_decisions}."
+    )]
+    async fn experiment_set_run_status(
+        &self,
+        Parameters(params): Parameters<ExperimentSetRunStatusParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_set_run_status",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_experiments::tool_experiment_set_run_status(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Ingest benchmark samples from an artifact FILE parsed SERVER-SIDE (CSV or JSONL), so you \
+pass a path instead of a huge inline payload. The path is resolved relative to the working directory, \
+canonicalized, and rejected if it escapes that root (path-traversal safety — no reading /etc/*). Extracts the \
+numeric value_column → samples (unit_key from unit_key_columns; optional arm_column splits rows into per-arm \
+runs; is_warmup_column flags warm-ups; filters select rows). Non-numeric/empty values are skipped + reported. \
+Returns {runs:[{arm,run_id,inserted_samples}], skipped}."
+    )]
+    async fn experiment_record_measurement_from_artifact(
+        &self,
+        Parameters(params): Parameters<ExperimentRecordMeasurementFromArtifactParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "experiment_record_measurement_from_artifact",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_experiments::tool_experiment_record_measurement_from_artifact(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
 }

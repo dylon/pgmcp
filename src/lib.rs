@@ -72,6 +72,16 @@ pub mod rmas;
 pub mod sessions;
 pub mod shutdown;
 pub mod stats;
+/// The Crucible context-tape paging control plane (Phase 5): mechanical
+/// working-set residency over the indexed corpus (budget + policy + a logical
+/// clock), decoupled from the data-plane crate via the `TapeDataPlane` seam.
+///
+/// `#[allow(dead_code)]`: the control plane is complete and tested in-module,
+/// but its MCP-tool / orchestrator wiring lands in a later phase, so the binary
+/// crate does not yet *call* the public surface — matching the convention for
+/// other not-yet-wired modules (`topic_store`, `wfst`).
+#[allow(dead_code)]
+pub mod tape;
 pub mod tools_catalog;
 pub mod topic_analysis;
 pub mod topic_apps;

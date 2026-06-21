@@ -884,6 +884,33 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         });
     }
 
+    // 11e-bis. Schedule the tape-store-reaper cron: reclaim per-tree `TapeStore`s
+    // left resident by a recursion run that ended without an explicit `drop_tree`
+    // (e.g. a crashed / abandoned run). The primary reclamation is `drop_tree` at
+    // root-frame completion in `run_rlm`; this cron is the backstop. Off by default
+    // — BOTH `[tape] reaper_interval_secs` and `reaper_idle_secs` must be > 0.
+    // Wall-clock idleness only frees RAM; it never affects a resume's residency
+    // (which is replay-deterministic from the LOGICAL clock, not wall-time).
+    if config_snapshot.tape.reaper_interval_secs > 0 && config_snapshot.tape.reaper_idle_secs > 0 {
+        let registry = Arc::clone(system_ctx.tape_registry());
+        let idle = std::time::Duration::from_secs(config_snapshot.tape.reaper_idle_secs);
+        let interval_ms = config_snapshot
+            .tape
+            .reaper_interval_secs
+            .saturating_mul(1000);
+        // 60s initial delay so it runs after boot/warmup.
+        cron_handle.schedule_recurring(60_000, interval_ms, "tape-store-reaper", move || {
+            let reaped = registry.reap_idle(idle);
+            if !reaped.is_empty() {
+                tracing::info!(
+                    count = reaped.len(),
+                    "tape-store-reaper: reclaimed idle context-tape trees"
+                );
+            }
+            true
+        });
+    }
+
     // 11f. Schedule the memory-concept-extract cron (Stage 4 auto-population).
     // Off by default ([memory.concepts] cron_enabled = false). Seeds concept
     // entities from code topics (deterministic) + optional LLM-emergent concepts

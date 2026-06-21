@@ -14,7 +14,7 @@
 //! It rides the A2A mailbox as typed message kinds rather than an
 //! `a2a_pattern_*` run, but shares the same projection/conformance machinery.
 
-use crate::csm::examples::{deliberation, worktree_negotiation};
+use crate::csm::examples::{deliberation, tape_paging, worktree_negotiation};
 use crate::csm::mpst::global::{GlobalType, end, interaction};
 use crate::csm::role::{Label, Role};
 
@@ -32,16 +32,24 @@ pub enum ProtocolId {
     /// Requester (`R`) with a dependency's Editor (`E`) and is gatekept by
     /// pgmcp's git scanner (modelled in `docs/formal/WorktreeNegotiation.tla`).
     WorktreeNegotiation,
+    /// The context-tape **paging** control protocol (Phase 6). Not a RecursiveMAS
+    /// collaboration pattern — it makes the [`crate::tape`] paging control plane
+    /// conformance-checkable: the Orchestrator (`O`) drives the data plane
+    /// (`Tape`) through the page-in / get / put / page-out / demote / done verbs.
+    /// All-`Label::text` (black-box-legal); the grammar is built by
+    /// [`crate::csm::examples::tape_paging`].
+    TapePaging,
 }
 
 impl ProtocolId {
-    pub const ALL: [ProtocolId; 6] = [
+    pub const ALL: [ProtocolId; 7] = [
         ProtocolId::Sequential,
         ProtocolId::Mixture,
         ProtocolId::Distillation,
         ProtocolId::Deliberation,
         ProtocolId::Recursive,
         ProtocolId::WorktreeNegotiation,
+        ProtocolId::TapePaging,
     ];
 
     /// Short stable name (`"sequential"`, …).
@@ -53,6 +61,7 @@ impl ProtocolId {
             ProtocolId::Deliberation => "deliberation",
             ProtocolId::Recursive => "recursive",
             ProtocolId::WorktreeNegotiation => "worktree_negotiation",
+            ProtocolId::TapePaging => "tape_paging",
         }
     }
 
@@ -67,6 +76,7 @@ impl ProtocolId {
             ProtocolId::Deliberation => "a2a_pattern_deliberation",
             ProtocolId::Recursive => "a2a_pattern_recursive",
             ProtocolId::WorktreeNegotiation => "coordinate_dependency_block",
+            ProtocolId::TapePaging => "tape_page",
         }
     }
 
@@ -115,6 +125,9 @@ pub fn global_of(id: ProtocolId, p: &ProtocolParams) -> GlobalType {
         ProtocolId::Recursive => recursive(p.rlm_depth),
         // Fixed two-party negotiation — no parameters.
         ProtocolId::WorktreeNegotiation => worktree_negotiation(),
+        // Fixed two-party paging control loop — no parameters (the recursion is a
+        // back-edge `μ loop`, not an unroll, so it is parameter-free).
+        ProtocolId::TapePaging => tape_paging(),
     }
 }
 
@@ -269,6 +282,107 @@ mod tests {
         let g = mixture(3);
         // O, Sp1, Sp2, Sp3, Sum = 5 roles.
         assert_eq!(g.participants().len(), 5);
+    }
+
+    #[test]
+    fn tape_paging_is_two_party_o_tape_and_resolves_by_name() {
+        // The paging control protocol is exactly the two roles O (the controller
+        // / pi) and Tape (the data plane). pgmcp's working set is the `Tape` side;
+        // the orchestrator drives the verbs.
+        let g = global_of(ProtocolId::TapePaging, &ProtocolParams::default());
+        let parts: std::collections::HashSet<String> =
+            g.participants().iter().map(|r| r.to_string()).collect();
+        assert_eq!(parts.len(), 2, "exactly two roles: {parts:?}");
+        assert!(
+            parts.contains("O") && parts.contains("Tape"),
+            "Orchestrator O and data-plane Tape: {parts:?}"
+        );
+        well_formed(&g).expect("tape_paging well-formed");
+        Network::build("tp", &g).expect("tape_paging projects to a network");
+
+        // The declared alphabet is the page-in handshake plus the five verbs and
+        // their acks — exactly the engine's mechanical residency operations.
+        let comms: std::collections::HashSet<String> = g
+            .communications()
+            .into_iter()
+            .map(|(_, _, label)| label)
+            .collect();
+        for label in [
+            "page_in_req",
+            "page_in_ack",
+            "get",
+            "got",
+            "put",
+            "put_ack",
+            "page_out",
+            "evicted",
+            "demote",
+            "demoted",
+            "done",
+        ] {
+            assert!(comms.contains(label), "missing protocol label '{label}'");
+        }
+
+        // Name/skill resolution round-trips through the registry like the patterns.
+        assert_eq!(
+            ProtocolId::from_name("tape_paging"),
+            Some(ProtocolId::TapePaging)
+        );
+        assert_eq!(
+            ProtocolId::from_skill_id("tape_page"),
+            Some(ProtocolId::TapePaging)
+        );
+    }
+
+    #[test]
+    fn tape_paging_is_a_sender_driven_choice_loop_on_o() {
+        // The structure is `μ loop. O→Tape:page_in_req . Tape→O:page_in_ack .
+        // O→Tape{ … }` — a recursion whose body ends in a sender-driven choice
+        // made by the controller O (Tape is the receiver of the selection).
+        use crate::csm::mpst::global::GlobalType;
+        let g = global_of(ProtocolId::TapePaging, &ProtocolParams::default());
+        let GlobalType::Rec { var, body } = g else {
+            panic!("tape_paging must be a μ-recursion, got {g:?}");
+        };
+        assert_eq!(var, "loop");
+        // body = O→Tape:page_in_req . (Tape→O:page_in_ack . choice)
+        let GlobalType::Interaction {
+            from,
+            to,
+            label,
+            cont,
+        } = *body
+        else {
+            panic!("body must open with the page_in_req interaction");
+        };
+        assert_eq!(
+            (from.to_string(), to.to_string()),
+            ("O".into(), "Tape".into())
+        );
+        assert_eq!(label.name, "page_in_req");
+        let GlobalType::Interaction { cont: ack_cont, .. } = *cont else {
+            panic!("page_in_req must be followed by the page_in_ack interaction");
+        };
+        let GlobalType::Choice { from, to, branches } = *ack_cont else {
+            panic!("the loop body must end in a sender-driven choice");
+        };
+        assert_eq!(
+            (from.to_string(), to.to_string()),
+            ("O".into(), "Tape".into()),
+            "the choice is the controller O selecting a verb for Tape"
+        );
+        assert_eq!(
+            branches.len(),
+            5,
+            "five verbs: get/put/page_out/demote/done"
+        );
+        // Exactly one branch (`done`) terminates; the other four loop back.
+        let terminal: Vec<&str> = branches
+            .iter()
+            .filter(|b| matches!(b.cont, GlobalType::End))
+            .map(|b| b.label.name.as_str())
+            .collect();
+        assert_eq!(terminal, ["done"], "only `done` ends the loop");
     }
 
     #[test]

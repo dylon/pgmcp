@@ -66,6 +66,9 @@ mod v48_hier_metrics;
 mod v49_toolbox_debug_tools;
 mod v4_work_items;
 mod v50_orchestration_sessions;
+mod v51_working_set;
+mod v52_experiment_hardening;
+mod v53_working_set_bytes;
 mod v5_work_items_collab;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
@@ -2692,6 +2695,59 @@ pub async fn run_migrations(
     )
     .await?;
 
+    // ================================================================
+    // Migration step 51 — working_set
+    // The Crucible context-tape paging control-plane state: working_set_pages
+    // (per-session/cursor resident page rows, keyed to orchestration_sessions
+    // ON DELETE CASCADE) + working_set_config (per-session budget/policy/TTL +
+    // the monotonic logical_clock). `last_access_ord` is a LOGICAL clock so a
+    // resumed session reconstructs a bit-identical working set. Closed
+    // vocabularies (page_kind/state/policy) follow the ADR-003 idiom. See
+    // `src/db/migrations/v51_working_set.rs` and `src/tape/`.
+    // ================================================================
+    apply_step(
+        pool,
+        v51_working_set::WORKING_SET,
+        v51_working_set::WORKING_SET_NAME,
+        || v51_working_set::apply(pool),
+    )
+    .await?;
+
+    // ================================================================
+    // Migration step 52 — experiment_hardening
+    // Anti-tampering hardening of the experiment subsystem + paired-corpus
+    // support: experiment_runs.status closed vocabulary (ExperimentRunStatus) +
+    // status audit columns + the append-only experiment_run_status_audit trail +
+    // a tamper-evident samples_digest column + the experiment_paired_binary 2×2
+    // counts table (McNemar / exact-binomial). experiment_decide consumes only
+    // decision-usable runs; experiment outcomes never cross the work-item
+    // →verified boundary. See `src/db/migrations/v52_experiment_hardening.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v52_experiment_hardening::EXPERIMENT_HARDENING,
+        v52_experiment_hardening::EXPERIMENT_HARDENING_NAME,
+        || v52_experiment_hardening::apply(pool),
+    )
+    .await?;
+
+    // ================================================================
+    // Migration step 53 — working_set_bytes
+    // Make the context-tape working-set tables usable by the live RLM path:
+    // relax the hard FK so `session_key` may be the synthetic `"rlm:{root_task_id}"`
+    // tree key (the RLM path has no orchestration session — the reason the engine
+    // had no production caller), add `working_set_pages.content` for durable scratch
+    // byte carriage, index `tree_path`, and preserve cascade-on-session-delete for
+    // the CSM path via a trigger. See `src/db/migrations/v53_working_set_bytes.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v53_working_set_bytes::WORKING_SET_BYTES,
+        v53_working_set_bytes::WORKING_SET_BYTES_NAME,
+        || v53_working_set_bytes::apply(pool),
+    )
+    .await?;
+
     // Every-boot vocabulary-catalog reconcile (RC1 durable fix). Unconditional
     // and idempotent; closes the post-v2 catalog-drift gap that silently
     // FK-skipped symbol extraction for files carrying a newly-added effect.
@@ -3551,13 +3607,94 @@ async fn ensure_trajectory_similarities(pool: &PgPool) -> Result<(), sqlx::Error
     Ok(())
 }
 
+/// Whether each `memory_unified` graph relation currently exists as a
+/// MATERIALIZED VIEW (`relkind = 'm'`), returned as `(nodes_present,
+/// edges_present)`. The asymmetry is load-bearing: the edges matview is cheap (a
+/// join + GROUP BY over indexed base tables), while the nodes matview carries the
+/// multi-minute HNSW index — so a caller can repair a missing edges matview
+/// without re-running the HNSW.
+async fn matviews_present(pool: &PgPool) -> Result<(bool, bool), sqlx::Error> {
+    let nodes: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = 'memory_unified_nodes' AND relkind = 'm')",
+    )
+    .fetch_one(pool)
+    .await?;
+    let edges: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = 'memory_unified_edges' AND relkind = 'm')",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok((nodes, edges))
+}
+
+/// Create the `memory_unified_edges` matview + its four indexes (unique edge key
+/// plus both endpoint b-trees plus the validity-interval index). NO drop, NO hash
+/// write — the caller owns both. Shared by `build_memory_unified_views` (which
+/// drops first and now creates edges BEFORE the nodes HNSW build) and
+/// `ensure_edges_only` (the cheap self-heal).
+async fn create_memory_unified_edges(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(MEMORY_UNIFIED_EDGES_SQL).execute(pool).await?;
+    // Unique index on the edge key. REQUIRED for REFRESH MATERIALIZED VIEW
+    // CONCURRENTLY (see refresh_memory_unified_edges); the outer GROUP BY in
+    // MEMORY_UNIFIED_EDGES_SQL guarantees (from_id, to_id, edge_type) is unique.
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_unified_edges_uq
+            ON memory_unified_edges (from_id, to_id, edge_type)",
+    )
+    .execute(pool)
+    .await?;
+    // Edge-traversal indexes: the recursive-CTE walks
+    // (`memory_neighbors`/`memory_path_search`) filter on
+    // `from_id = current OR to_id = current`, so both endpoints need an index;
+    // the validity index serves as-of / recency interval pruning.
+    for idx in [
+        "CREATE INDEX IF NOT EXISTS idx_memory_unified_edges_from ON memory_unified_edges (from_id)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_unified_edges_to ON memory_unified_edges (to_id)",
+        "CREATE INDEX IF NOT EXISTS idx_memory_unified_edges_valid ON memory_unified_edges (valid_from, valid_to)",
+    ] {
+        sqlx::query(idx).execute(pool).await?;
+    }
+    Ok(())
+}
+
+/// Self-heal a MISSING `memory_unified_edges` matview while `memory_unified_nodes`
+/// is already present — cheaply (no HNSW). Repairs the failure mode behind the
+/// 2026-06-20 `graph_neighbors` outage: `build_memory_unified_views` drops edges
+/// FIRST and only recreates it after the multi-minute nodes HNSW build, so a
+/// SIGKILL/restart in that window leaves edges dropped; the matching stored
+/// views-hash then masked the gap (the hash gate skipped and the startup guard
+/// only checked nodes), so the relation stayed missing across restarts. Drops
+/// whichever form exists (plain VIEW pre-Stage-2 or MATERIALIZED VIEW), then
+/// recreates. Does NOT touch `memory_unified_nodes` and does NOT write the
+/// views-hash (the hash attests to a full build of BOTH matviews — only
+/// `build_memory_unified_views` records it).
+async fn ensure_edges_only(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DO $$
+         BEGIN
+            IF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'memory_unified_edges' AND relkind = 'v') THEN
+                DROP VIEW memory_unified_edges;
+            ELSIF EXISTS (SELECT 1 FROM pg_class WHERE relname = 'memory_unified_edges' AND relkind = 'm') THEN
+                DROP MATERIALIZED VIEW memory_unified_edges;
+            END IF;
+         END $$;",
+    )
+    .execute(pool)
+    .await?;
+    create_memory_unified_edges(pool).await?;
+    info!("memory_unified_edges was missing (nodes present); rebuilt edges-only, skipped HNSW");
+    Ok(())
+}
+
 /// Daemon-background / CLI-inline path: hash-gated rebuild of the memory_unified
-/// matviews. Skips when the combined CREATE SQL is unchanged; otherwise drops &
-/// rebuilds both matviews + their indexes (incl. the HNSW vector index). On a
-/// large corpus the HNSW build can take minutes, so the DAEMON runs this OFF the
-/// startup critical path as a post-READY background task (see
-/// `ensure_memory_unified_views_present` and `src/cli/daemon.rs`). CLI callers
-/// run it inline — they have no systemd start-timeout to exceed.
+/// matviews. Skips ONLY when the combined CREATE SQL is unchanged AND both
+/// matviews actually exist — existence dominates the hash gate, so a dropped
+/// edges matview can never be masked by a matching hash. When only edges is
+/// missing it is repaired cheaply (no HNSW); otherwise both are dropped &
+/// rebuilt (incl. the HNSW vector index). On a large corpus the HNSW build can
+/// take minutes, so the DAEMON runs this OFF the startup critical path as a
+/// post-READY background task (see `ensure_memory_unified_views_present` and
+/// `src/cli/daemon.rs`). CLI callers run it inline — no systemd start-timeout.
 pub(crate) async fn ensure_memory_unified_views(
     pool: &PgPool,
     config: &VectorConfig,
@@ -3574,16 +3711,31 @@ pub(crate) async fn ensure_memory_unified_views(
             .fetch_optional(pool)
             .await?;
 
+    // Existence dominates the hash gate: a matching hash must NEVER let a missing
+    // matview slip through (the 2026-06-20 outage — an interrupted rebuild dropped
+    // edges after the hash was stored, and the bare hash-skip then masked it).
+    let (nodes_present, edges_present) = matviews_present(pool).await?;
     if stored.as_deref() == Some(current_hash.as_str()) {
-        info!(
-            "memory_unified_views definition unchanged (hash {}); skipping rebuild",
-            current_hash
-        );
-        return Ok(());
+        if nodes_present && edges_present {
+            info!(
+                "memory_unified_views definition unchanged (hash {}); both matviews present; skipping rebuild",
+                current_hash
+            );
+            return Ok(());
+        }
+        if nodes_present && !edges_present {
+            // Cheap, targeted self-heal — no nodes/HNSW rebuild.
+            tracing::error!(
+                "memory_unified_edges missing though nodes present and views-hash unchanged ({}); repairing edges-only",
+                current_hash
+            );
+            return ensure_edges_only(pool).await;
+        }
+        // nodes absent with a stored hash (rare) — fall through to a full build.
     }
 
     info!(
-        "memory_unified_views definition changed (was {:?}, now {}); rebuilding",
+        "memory_unified_views definition changed or matviews missing (was {:?}, now {}); rebuilding",
         stored, current_hash
     );
     build_memory_unified_views(pool, config, &current_hash).await
@@ -3602,14 +3754,28 @@ pub(crate) async fn ensure_memory_unified_views_present(
     pool: &PgPool,
     config: &VectorConfig,
 ) -> Result<(), sqlx::Error> {
-    let present: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = 'memory_unified_nodes' AND relkind = 'm')",
-    )
-    .fetch_one(pool)
-    .await?;
-    if present {
+    let (nodes_present, edges_present) = matviews_present(pool).await?;
+    if nodes_present && edges_present {
         return Ok(());
     }
+    if nodes_present && !edges_present {
+        // Cheap self-heal on the startup critical path: rebuild ONLY the edges
+        // matview (no HNSW), so a missing-edges state (an interrupted prior
+        // rebuild, masked by a matching hash) cannot persist across restarts.
+        // NON-FATAL by design — a repair failure must NOT abort startup and
+        // crash-loop the daemon (the exact failure mode the deferral exists to
+        // avoid); the post-READY background `ensure_memory_unified_views` (and
+        // the next boot) retry. Degraded-fallback ⇒ error! per ADR-021.
+        if let Err(e) = ensure_edges_only(pool).await {
+            tracing::error!(
+                error = %e,
+                "startup edges-only repair failed; unified-graph traversal degraded until the background rebuild"
+            );
+        }
+        return Ok(());
+    }
+    // nodes (and possibly edges) absent — a fresh/empty corpus, so this build is
+    // near-instant and safe on the critical path.
     let combined = format!(
         "{}\n---\n{}",
         MEMORY_UNIFIED_NODES_SQL, MEMORY_UNIFIED_EDGES_SQL
@@ -3670,6 +3836,17 @@ async fn build_memory_unified_views(
     )
     .execute(pool)
     .await?;
+    // Edges matview FIRST — BEFORE the (multi-minute, large-corpus) nodes HNSW
+    // build below — so the window in which `memory_unified_edges` does not exist
+    // collapses from the entire HNSW duration to ~the matview-create time. A
+    // SIGKILL/restart during the HNSW now leaves edges PRESENT (the 2026-06-20
+    // `graph_neighbors` outage left it dropped precisely because edges was created
+    // LAST). Cheap: a join + GROUP BY over indexed base tables, no HNSW. If a
+    // future edit reintroduces a duplicate (from_id,to_id,edge_type) triple, the
+    // UNIQUE index here fails the build loudly at boot — before any concurrent
+    // refresh can hit the duplicate.
+    create_memory_unified_edges(pool).await?;
+
     // HNSW on embedding for vector retrieval. Built via the F8
     // helper so `maintenance_work_mem` / `statement_timeout` /
     // parallel-workers tuning kicks in.
@@ -3682,31 +3859,7 @@ async fn build_memory_unified_views(
     )
     .await?;
 
-    sqlx::query(MEMORY_UNIFIED_EDGES_SQL).execute(pool).await?;
-    // Unique index on the edge key. REQUIRED for REFRESH MATERIALIZED VIEW
-    // CONCURRENTLY (see refresh_memory_unified_edges); the outer GROUP BY in
-    // MEMORY_UNIFIED_EDGES_SQL guarantees (from_id, to_id, edge_type) is unique.
-    // If a future edit reintroduces a duplicate triple, THIS build fails loudly
-    // at boot — before any concurrent refresh can hit the duplicate.
-    sqlx::query(
-        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_unified_edges_uq
-            ON memory_unified_edges (from_id, to_id, edge_type)",
-    )
-    .execute(pool)
-    .await?;
-    // Edge-traversal indexes: the recursive-CTE walks
-    // (`memory_neighbors`/`memory_path_search`) filter on
-    // `from_id = current OR to_id = current`, so both endpoints need an index.
-    // The edges view is materialized now, so without these a BFS hop would
-    // seq-scan the entire edge set.
-    for idx in [
-        "CREATE INDEX IF NOT EXISTS idx_memory_unified_edges_from ON memory_unified_edges (from_id)",
-        "CREATE INDEX IF NOT EXISTS idx_memory_unified_edges_to ON memory_unified_edges (to_id)",
-        // Stage 5a: as-of / recency interval pruning on edge validity.
-        "CREATE INDEX IF NOT EXISTS idx_memory_unified_edges_valid ON memory_unified_edges (valid_from, valid_to)",
-    ] {
-        sqlx::query(idx).execute(pool).await?;
-    }
+    // (memory_unified_edges + its 4 indexes were created above, before the HNSW.)
 
     sqlx::query(
         "INSERT INTO pgmcp_metadata (key, value)

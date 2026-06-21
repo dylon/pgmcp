@@ -83,6 +83,8 @@ mod handlers_security;
 mod handlers_sema;
 #[path = "server/handlers/similarity.rs"]
 mod handlers_similarity;
+#[path = "server/handlers/tape.rs"]
+mod handlers_tape;
 #[path = "server/handlers/toolbox.rs"]
 mod handlers_toolbox;
 #[path = "server/handlers/topics.rs"]
@@ -516,6 +518,7 @@ impl McpServer {
             + Self::router_toolbox()
             + Self::router_meta()
             + Self::router_feedback()
+            + Self::router_tape()
     }
 }
 
@@ -590,6 +593,7 @@ impl McpServer {
             ("ontology", names(Self::router_ontology())),
             ("toolbox", names(Self::router_toolbox())),
             ("meta", names(Self::router_meta())),
+            ("tape", names(Self::router_tape())),
         ]
     }
 
@@ -953,6 +957,18 @@ impl McpServer {
             "session_checkpoint_save"   => session_checkpoint_save(SessionCheckpointSaveParams),
             "session_checkpoint_resume" => session_checkpoint_resume(SessionCheckpointResumeParams),
             "session_checkpoint_list"   => session_checkpoint_list(SessionCheckpointListParams),
+            // Phase 4 — the agent-facing tape verbs (black-box-legal).
+            "tape_get"      => tape_get(TapeGetParams),
+            "tape_put"      => tape_put(TapePutParams),
+            "tape_peek"     => tape_peek(TapePeekParams),
+            "tape_slice"    => tape_slice(TapeSliceParams),
+            "tape_grep"     => tape_grep(TapeGrepParams),
+            "tape_fuzzy"    => tape_fuzzy(TapeFuzzyParams),
+            "tape_semantic" => tape_semantic(TapeSemanticParams),
+            "tape_list"     => tape_list(TapeListParams),
+            "tape_stat"     => tape_stat(TapeStatParams),
+            // Phase 8 — the white-box / latent-tier sandboxed REPL (gated).
+            "tape_repl"     => tape_repl(TapeReplParams),
             "a2a_report_outcome"     => a2a_report_outcome(A2aReportOutcomeParams),
             // Scientific-experiment subsystem (share the tool_experiments module).
             "experiment_open"               => experiment_open(ExperimentOpenParams) in tool_experiments,
@@ -966,6 +982,12 @@ impl McpServer {
             "experiment_log_artifact"       => experiment_log_artifact(ExperimentLogArtifactParams) in tool_experiments,
             "profile_ingest"                => profile_ingest(ProfileIngestParams),
             "experiment_render_ledger"      => experiment_render_ledger(ExperimentRenderLedgerParams) in tool_experiments,
+            "experiment_preregister_context_tape" => experiment_preregister_context_tape(ExperimentPreregisterContextTapeParams) in tool_experiments,
+            // Thread 5b — experiment-API hardening (run finalize/status audit, paired-corpus 2×2 + McNemar, artifact ingestion).
+            "experiment_record_paired_binary_counts" => experiment_record_paired_binary_counts(ExperimentRecordPairedBinaryCountsParams) in tool_experiments,
+            "experiment_finalize_run"       => experiment_finalize_run(ExperimentFinalizeRunParams) in tool_experiments,
+            "experiment_set_run_status"     => experiment_set_run_status(ExperimentSetRunStatusParams) in tool_experiments,
+            "experiment_record_measurement_from_artifact" => experiment_record_measurement_from_artifact(ExperimentRecordMeasurementFromArtifactParams) in tool_experiments,
             // JSON data tables (share the data_tables module).
             // Agent feedback + voting (ADR-023).
             "submit_feedback"        => submit_feedback(SubmitFeedbackParams) in tool_feedback,

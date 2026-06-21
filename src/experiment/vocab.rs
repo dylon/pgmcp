@@ -111,6 +111,77 @@ impl ExperimentStatus {
     }
 }
 
+/// Lifecycle status of an `experiment_runs` row (closed vocab, ADR-003). A
+/// measurement run is `Pending` while open for chunked ingestion, `Complete` once
+/// its samples are recorded, `Finalized` when explicitly sealed (the chunked
+/// ingestion is committed and conformance-checked), and `Invalid`/`Superseded`
+/// when an operator excludes it from decisions — always with a recorded reason,
+/// appended immutably to `experiment_run_status_audit`.
+///
+/// ANTI-TAMPERING: `experiment_decide` consumes ONLY runs where
+/// [`usable_in_decision`](Self::usable_in_decision) is true (`complete`/`finalized`)
+/// — never `invalid`/`superseded`/`pending` — so a nonconforming or operator-excluded
+/// run cannot silently skew a verdict, and a post-decision invalidation is required
+/// to re-open the decision rather than quietly dropping unfavorable data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExperimentRunStatus {
+    Pending,
+    Complete,
+    Finalized,
+    Invalid,
+    Superseded,
+}
+
+impl ExperimentRunStatus {
+    pub const ALL: &'static [ExperimentRunStatus] = &[
+        Self::Pending,
+        Self::Complete,
+        Self::Finalized,
+        Self::Invalid,
+        Self::Superseded,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Complete => "complete",
+            Self::Finalized => "finalized",
+            Self::Invalid => "invalid",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|x| x.as_str() == s)
+    }
+
+    /// Whether a run with this status may contribute samples to a decision.
+    /// `experiment_decide` MUST gate on this (the conformance/anti-tamper rule).
+    pub fn usable_in_decision(self) -> bool {
+        matches!(self, Self::Complete | Self::Finalized)
+    }
+
+    pub fn sql_in_list() -> String {
+        join_quoted(Self::ALL.iter().map(|x| x.as_str()))
+    }
+
+    /// SQL `IN (...)` list of the statuses usable in a decision — derived from
+    /// [`usable_in_decision`](Self::usable_in_decision) so the conformance gate
+    /// and the vocabulary cannot drift. Used by `load_experiment_samples` and
+    /// `experiment_decide` (the anti-tamper rule: only conforming, non-excluded
+    /// runs contribute samples to a verdict).
+    pub fn usable_in_decision_sql_list() -> String {
+        join_quoted(
+            Self::ALL
+                .iter()
+                .copied()
+                .filter(|s| s.usable_in_decision())
+                .map(|s| s.as_str()),
+        )
+    }
+}
+
 /// Verdict on an experiment hypothesis. Stored in
 /// `experiment_hypotheses.verdict` (default `pending`) and
 /// `experiment_results.verdict`.

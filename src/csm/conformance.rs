@@ -323,6 +323,63 @@ pub fn lift_transcript(pattern: ProtocolId, turns: &[TranscriptTurn]) -> Trace {
                 }
             }
         }
+        ProtocolId::TapePaging => {
+            // Each turn names one paging *verb* the engine performed against the
+            // working set (the turn's `role` carries the verb, mirroring how
+            // WorktreeNegotiation reuses `role` for the mailbox kind). Every verb
+            // is preceded by the `page_in_req . page_in_ack` handshake — one loop
+            // iteration — and each looping verb is followed by its Tape→O ack:
+            // get→got, put→put_ack, page_out→evicted, demote→demoted. `done` is the
+            // terminal arm (handshake then the bare selection). The mapping is 1:1
+            // with the engine's mechanical residency operations, so a recorded
+            // paging run lifts into a conformance-checkable trace; a verb whose
+            // handshake is missing (e.g. a `get` not preceded by a page-in) yields
+            // a non-conforming trace the observer surfaces.
+            let tape = Role::new("Tape");
+            // The Tape→O acknowledgement for each looping verb (None ⇒ terminal).
+            let ack_of = |verb: &str| -> Option<&'static str> {
+                match verb {
+                    "get" => Some("got"),
+                    "put" => Some("put_ack"),
+                    "page_out" => Some("evicted"),
+                    "demote" => Some("demoted"),
+                    _ => None,
+                }
+            };
+            for t in turns {
+                let verb = t.role.to_lowercase();
+                let verb = verb.as_str();
+                // Only the five protocol verbs participate; other turns are noise.
+                let is_verb = matches!(verb, "get" | "put" | "page_out" | "demote" | "done");
+                if !is_verb {
+                    continue;
+                }
+                // Each iteration opens with the page-in handshake.
+                tr.push(Event::new(
+                    o.clone(),
+                    tape.clone(),
+                    Label::text("page_in_req"),
+                ));
+                tr.push(Event::new(
+                    tape.clone(),
+                    o.clone(),
+                    Label::text("page_in_ack"),
+                ));
+                // The verb selection (O drives the choice).
+                tr.push(Event::new(
+                    o.clone(),
+                    tape.clone(),
+                    Label::text(verb.to_string()),
+                ));
+                // …and its acknowledgement, for the four looping arms.
+                if let Some(ack) = ack_of(verb) {
+                    tr.push(Event::new(tape.clone(), o.clone(), Label::text(ack)));
+                } else {
+                    // `done` terminates the loop — stop lifting further turns.
+                    break;
+                }
+            }
+        }
     }
     tr
 }
@@ -513,6 +570,159 @@ mod tests {
             matches!(err, ConformanceError::Step { .. }),
             "a corrupt prefix must return Step, got {err:?}"
         );
+    }
+
+    // ── TapePaging (Phase 6) ────────────────────────────────────────────────
+    //
+    // The paging control loop `μ loop. O→Tape:page_in_req . Tape→O:page_in_ack .
+    // O→Tape{ get|put|page_out|demote : … . loop ; done : end }`. The trace is
+    // built directly from `Event`s (the integration `tape_resume_lifecycle` test
+    // drives the engine; here we pin the protocol's causal order).
+    //
+    // IMPORTANT — every loop iteration, *including the terminating one*, opens
+    // with the `page_in_req . page_in_ack` handshake, because `done` is one arm of
+    // the SAME sender-driven choice as the verbs. So a run that does one `get`
+    // transaction and then stops must re-handshake before selecting `done`:
+    // `page_in_req . page_in_ack . get . got . page_in_req . page_in_ack . done`.
+
+    fn tp_net() -> Network {
+        net(ProtocolId::TapePaging, &ProtocolParams::default())
+    }
+
+    /// One `O→Tape:page_in_req . Tape→O:page_in_ack` handshake, appended to `tr`.
+    fn tp_handshake(tr: &mut Trace) {
+        tr.push(Event::new("O", "Tape", Label::text("page_in_req")));
+        tr.push(Event::new("Tape", "O", Label::text("page_in_ack")));
+    }
+
+    /// One verb transaction `O→Tape:verb . Tape→O:ack`, appended to `tr`.
+    fn tp_verb(tr: &mut Trace, verb: &str, ack: &str) {
+        tr.push(Event::new("O", "Tape", Label::text(verb)));
+        tr.push(Event::new("Tape", "O", Label::text(ack)));
+    }
+
+    #[test]
+    fn tape_paging_get_then_done_conforms() {
+        // A full conforming run: handshake, `get`/`got`, loop, handshake, `done`.
+        let n = tp_net();
+        let mut trace = Trace::new();
+        tp_handshake(&mut trace); // iteration 1
+        tp_verb(&mut trace, "get", "got"); // … select get, loop back
+        tp_handshake(&mut trace); // iteration 2
+        trace.push(Event::new("O", "Tape", Label::text("done"))); // … select done → end
+        check_conformance(&n, &trace)
+            .unwrap_or_else(|e| panic!("get→done should conform: {}", e.message()));
+    }
+
+    #[test]
+    fn tape_paging_all_verbs_then_done_conforms() {
+        // Each of the four looping verbs in turn, then `done`. Exercises every
+        // choice arm's loop-back plus the terminal arm.
+        let n = tp_net();
+        let mut trace = Trace::new();
+        for (verb, ack) in [
+            ("get", "got"),
+            ("put", "put_ack"),
+            ("page_out", "evicted"),
+            ("demote", "demoted"),
+        ] {
+            tp_handshake(&mut trace);
+            tp_verb(&mut trace, verb, ack);
+        }
+        tp_handshake(&mut trace);
+        trace.push(Event::new("O", "Tape", Label::text("done")));
+        check_conformance(&n, &trace)
+            .unwrap_or_else(|e| panic!("all-verbs→done should conform: {}", e.message()));
+    }
+
+    #[test]
+    fn tape_paging_get_before_page_in_is_step_rejected() {
+        // Causal order: you cannot `get` a page before paging one in. A `get`
+        // selection with no preceding `page_in_req . page_in_ack` handshake is not
+        // a legal path — the choice is only reachable AFTER the handshake.
+        let n = tp_net();
+        // The very first event is the verb selection (no handshake).
+        let trace = vec![Event::new("O", "Tape", Label::text("get"))];
+        let err = check_conformance(&n, &trace)
+            .expect_err("get-before-page_in_req is an illegal protocol path");
+        assert!(
+            matches!(err, ConformanceError::Step { .. }),
+            "an un-paged get must be Step-rejected, got {err:?}"
+        );
+        // `replay_to_states` must also refuse it loudly (the resume path must not
+        // silently accept a corrupt prefix).
+        assert!(matches!(
+            replay_to_states(&n, &trace),
+            Err(ConformanceError::Step { .. })
+        ));
+    }
+
+    #[test]
+    fn tape_paging_page_in_req_only_prefix_replays_clean_but_non_terminal() {
+        // The PAUSE input: a `page_in_req`-only prefix (the controller has asked
+        // for a page-in and is awaiting the ack) replays cleanly via
+        // `replay_to_states` to a NON-terminal orchestrator state, but the full
+        // terminal check reports Incomplete — exactly mirroring the existing
+        // prefix tests for the other protocols.
+        let n = tp_net();
+        let prefix = vec![Event::new("O", "Tape", Label::text("page_in_req"))];
+        let states = replay_to_states(&n, &prefix).expect("page_in_req prefix replays cleanly");
+        let o = Role::new("O");
+        let m = n.machine(&o).expect("orchestrator machine");
+        let st = *states.get(&o).expect("orchestrator state tracked");
+        assert!(
+            !m.is_terminal(st),
+            "a page_in_req-only prefix must leave O mid-protocol, was terminal at {st}"
+        );
+        assert!(matches!(
+            check_conformance(&n, &prefix),
+            Err(ConformanceError::Incomplete { .. })
+        ));
+    }
+
+    #[test]
+    fn tape_paging_lift_of_get_done_turns_conforms() {
+        // The lift path: a recorded paging run whose verbs are `get` then `done`
+        // lifts to the same conforming trace (handshake·get·got·handshake·done).
+        let n = tp_net();
+        let turns = [turn("get"), turn("done")];
+        let trace = lift_transcript(ProtocolId::TapePaging, &turns);
+        // 4 events for the get iteration + 3 for the done iteration (handshake×2 +
+        // the bare done selection).
+        assert_eq!(trace.len(), 7, "get→done lifts to seven events: {trace:?}");
+        check_conformance(&n, &trace)
+            .unwrap_or_else(|e| panic!("lifted get→done should conform: {}", e.message()));
+    }
+
+    #[test]
+    fn tape_paging_lift_ignores_non_verb_turns_and_stops_at_done() {
+        // A stray non-verb turn is dropped, and turns AFTER `done` are not lifted
+        // (the protocol has ended). `get`, chatter, `done`, `put` ⇒ the put is
+        // never reached.
+        let n = tp_net();
+        let turns = [turn("get"), turn("heartbeat"), turn("done"), turn("put")];
+        let trace = lift_transcript(ProtocolId::TapePaging, &turns);
+        assert_eq!(
+            trace.len(),
+            7,
+            "chatter dropped, post-done put ignored: {trace:?}"
+        );
+        check_conformance(&n, &trace).expect("conforms despite chatter and trailing put");
+    }
+
+    #[test]
+    fn tape_paging_done_without_handshake_is_rejected() {
+        // `done` is gated behind the page-in handshake (it is an arm of the choice
+        // that follows `page_in_ack`). Selecting `done` as the very first event —
+        // before any `page_in_req`/`page_in_ack` — is not a legal path.
+        let n = tp_net();
+        let trace = vec![Event::new("O", "Tape", Label::text("done"))];
+        let err = check_conformance(&n, &trace)
+            .expect_err("done-before-handshake diverges from the loop");
+        assert!(matches!(
+            err,
+            ConformanceError::Step { .. } | ConformanceError::Incomplete { .. }
+        ));
     }
 
     #[test]

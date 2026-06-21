@@ -31,7 +31,11 @@ pub async fn tool_a2a_pattern_recursive(
         .fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
 
-    let env = RlmEnvironment::from_json(&params.environment)
+    // Validate the environment shape up front (cheap param check). The
+    // authoritative `RlmEnvironment` is rebuilt with `from_frame` once the root
+    // frame exists, so a `kind:"store"` env binds its `root_task_id` from the
+    // trusted frame (the root task id) rather than the request JSON.
+    RlmEnvironment::from_json(&params.environment)
         .map_err(|e| McpError::invalid_params(e, None))?;
     let sub_url = resolve_agent_url(pool, &params.sub_agent).await?;
     let reduce_url = match &params.reduce_agent {
@@ -76,6 +80,11 @@ pub async fn tool_a2a_pattern_recursive(
         params.rlm_budget.unwrap_or(def_budget),
         parent_task_id,
     );
+
+    // Authoritative env: a Store env's `root_task_id` is bound from the frame
+    // (== the root task id), never from the request JSON.
+    let env = RlmEnvironment::from_frame(&params.environment, &frame)
+        .map_err(|e| McpError::invalid_params(e, None))?;
 
     let outcome = run_rlm(ctx, &env, &frame, parent_task_id).await?;
 

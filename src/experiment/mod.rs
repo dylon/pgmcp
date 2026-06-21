@@ -3,6 +3,11 @@
 //!
 //! - [`protocol`] — kind-aware experiment-design prescription (sample size via
 //!   power, warm-up, the recommended test, the reproducibility checklist).
+//! - [`context_tape`] — the **pre-registered Context-Tape experiment** (P9): the
+//!   frozen `3 × 3 × 5` design (arms × task families × metrics), its frozen
+//!   composite acceptance criterion, a runner harness over the existing
+//!   record/decide paths, and a default-OFF, verified-gated promotion of a
+//!   positive decision into pgmcp memory.
 //!
 //! The statistical engine and the acceptance-criterion taxonomy live in
 //! `crate::stats::{inference, acceptance}`; the schema in
@@ -14,6 +19,7 @@
 //! Design: `docs/experiments/README.md` and
 //! `~/.claude/plans/plan-how-to-effectively-drifting-fox.md`.
 
+pub mod context_tape;
 pub mod extract;
 pub mod ledger;
 pub mod mirror;

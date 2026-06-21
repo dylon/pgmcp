@@ -7,6 +7,8 @@
 //! are `pgvector::Vector` (1024-d BGE-M3), bound as `Option<Vector>`.
 
 use chrono::{DateTime, Utc};
+
+use crate::experiment::vocab::ExperimentRunStatus;
 use pgvector::Vector;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
@@ -584,7 +586,12 @@ pub async fn load_experiment_samples(
     arm_label: &str,
     metric_name: &str,
 ) -> Result<Vec<(f64, Option<String>)>, sqlx::Error> {
-    sqlx::query_as::<_, (f64, Option<String>)>(
+    // ANTI-TAMPER (Thread 5b): only runs usable in a decision contribute
+    // samples — an `invalid`/`superseded`/`pending` run is excluded so it cannot
+    // silently skew the verdict. The status list is derived from
+    // `ExperimentRunStatus::usable_in_decision` so the gate and the vocabulary
+    // cannot drift.
+    let sql = format!(
         "SELECT s.value, s.unit_key
          FROM experiment_samples s
          JOIN experiment_runs r ON r.id = s.run_id
@@ -593,14 +600,394 @@ pub async fn load_experiment_samples(
            AND s.arm = $3
            AND s.metric_name = $4
            AND NOT s.is_warmup
+           AND r.status IN ({usable})
          ORDER BY s.unit_key NULLS FIRST, s.replicate_index",
+        usable = crate::experiment::vocab::ExperimentRunStatus::usable_in_decision_sql_list(),
+    );
+    sqlx::query_as::<_, (f64, Option<String>)>(sqlx::AssertSqlSafe(sql))
+        .bind(experiment_id)
+        .bind(hypothesis_id)
+        .bind(arm_label)
+        .bind(metric_name)
+        .fetch_all(pool)
+        .await
+}
+
+// ============================================================================
+// Thread 5b — experiment-API hardening: run finalize/status audit + tamper-
+// evident samples digest + paired-corpus 2×2 counts. All anti-tampering machinery
+// stays inside the experiment subsystem (it never crosses the work-item tracker's
+// →verified boundary).
+// ============================================================================
+
+/// Counts of a paired-corpus 2×2 (same test cases scored by both arms).
+#[derive(Debug, Clone, Copy)]
+pub struct PairedBinaryCounts {
+    pub both_correct: i64,
+    pub control_only: i64,
+    pub treatment_only: i64,
+    pub both_wrong: i64,
+}
+
+/// Result of finalizing a measurement run.
+pub struct RunFinalizeResult {
+    pub samples_digest: String,
+    pub sample_count: i64,
+}
+
+/// Outcome of an audited run-status change.
+pub struct RunStatusChange {
+    pub old_status: String,
+    pub new_status: String,
+    /// Decision ids re-opened because they had used this (now-excluded) run.
+    pub reopened_decisions: Vec<i64>,
+}
+
+/// One run's audit-visible state, for `experiment_get`.
+pub struct RunOverview {
+    pub run_id: Uuid,
+    pub arm_label: String,
+    pub arm_kind: String,
+    pub status: String,
+    pub sample_count: i64,
+    pub samples_digest: Option<String>,
+    pub status_reason: Option<String>,
+    pub finalized_at: Option<DateTime<Utc>>,
+}
+
+/// Column tuple for a run row as selected by [`experiment_runs_overview`]
+/// (id, arm_label, arm_kind, status, non-warmup sample_count, samples_digest,
+/// status_reason, finalized_at). Named per the `HypothesisRowTuple` idiom so the
+/// `sqlx::query_as` target type stays readable.
+type RunOverviewTuple = (
+    Uuid,
+    String,
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<DateTime<Utc>>,
+);
+
+/// Tamper-evident SHA-256 over a run's ordered raw samples. Deterministic: rows
+/// are ordered canonically and values are hashed bit-exactly (`f64::to_bits`), so
+/// any later mutation of the samples changes the digest. Snapshotted at finalize
+/// and on a decision, so excluded/altered data is detectable after the fact.
+pub async fn compute_run_samples_digest(
+    pool: &PgPool,
+    run_id: Uuid,
+) -> Result<String, sqlx::Error> {
+    use sha2::{Digest, Sha256};
+    let rows: Vec<(String, String, i32, f64, Option<String>, bool)> = sqlx::query_as(
+        "SELECT metric_name, arm, replicate_index, value, unit_key, is_warmup
+         FROM experiment_samples WHERE run_id = $1
+         ORDER BY metric_name, arm, unit_key NULLS FIRST, replicate_index, value",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    let mut hasher = Sha256::new();
+    hasher.update((rows.len() as u64).to_le_bytes());
+    for (metric, arm, idx, value, unit_key, is_warmup) in &rows {
+        hasher.update(
+            format!(
+                "{metric}\u{1f}{arm}\u{1f}{}\u{1f}{idx}\u{1f}{is_warmup}\u{1f}{:016x}\n",
+                unit_key.as_deref().unwrap_or(""),
+                value.to_bits(),
+            )
+            .as_bytes(),
+        );
+    }
+    Ok(format!("sha256:{:x}", hasher.finalize()))
+}
+
+/// Append one row to the immutable `experiment_run_status_audit` trail.
+async fn append_run_status_audit(
+    conn: &mut sqlx::PgConnection,
+    run_id: Uuid,
+    old_status: Option<&str>,
+    new_status: &str,
+    reason: &str,
+    changed_by: &str,
+    decision_id: Option<i64>,
+    samples_digest: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO experiment_run_status_audit
+            (run_id, old_status, new_status, reason, changed_by, decision_id, samples_digest)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(run_id)
+    .bind(old_status)
+    .bind(new_status)
+    .bind(reason)
+    .bind(changed_by)
+    .bind(decision_id)
+    .bind(samples_digest)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Seal a run for use in decisions: compute + store its samples digest, set
+/// `status='finalized'`, and append to the audit trail. Idempotent-ish (re-running
+/// recomputes the digest and re-stamps). Returns the digest + non-warmup count.
+pub async fn finalize_experiment_run(
+    pool: &PgPool,
+    run_id: Uuid,
+    changed_by: &str,
+    reason: &str,
+) -> Result<RunFinalizeResult, sqlx::Error> {
+    let samples_digest = compute_run_samples_digest(pool, run_id).await?;
+    let mut tx = pool.begin().await?;
+    let old_status: Option<String> =
+        sqlx::query_scalar("SELECT status FROM experiment_runs WHERE id = $1 FOR UPDATE")
+            .bind(run_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let Some(old_status) = old_status else {
+        return Err(sqlx::Error::RowNotFound);
+    };
+    let sample_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM experiment_samples WHERE run_id = $1 AND NOT is_warmup",
+    )
+    .bind(run_id)
+    .fetch_one(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE experiment_runs
+         SET status = 'finalized', samples_digest = $2, finalized_at = NOW(),
+             status_reason = $3, status_changed_by = $4, status_changed_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(run_id)
+    .bind(&samples_digest)
+    .bind(reason)
+    .bind(changed_by)
+    .execute(&mut *tx)
+    .await?;
+    append_run_status_audit(
+        &mut tx,
+        run_id,
+        Some(&old_status),
+        "finalized",
+        reason,
+        changed_by,
+        None,
+        Some(&samples_digest),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(RunFinalizeResult {
+        samples_digest,
+        sample_count,
+    })
+}
+
+/// Audited exclusion of a run from decisions (`invalid`/`superseded`). THE
+/// anti-cherry-pick guardrail: any rendered decision that USED this run is
+/// re-opened (its hypothesis verdict reverts to `pending`), so excluding data
+/// after a decision can never silently keep the favourable verdict — it forces a
+/// re-decision. Every change is appended to the immutable audit trail with the
+/// reason + actor + the samples digest at the time. The caller (tool layer)
+/// validates that `new_status ∈ {invalid, superseded}` and `reason` is non-empty.
+pub async fn set_experiment_run_status(
+    pool: &PgPool,
+    run_id: Uuid,
+    new_status: ExperimentRunStatus,
+    reason: &str,
+    changed_by: &str,
+) -> Result<RunStatusChange, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    let row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT status, samples_digest FROM experiment_runs WHERE id = $1 FOR UPDATE",
+    )
+    .bind(run_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((old_status, samples_digest)) = row else {
+        return Err(sqlx::Error::RowNotFound);
+    };
+    // Decisions that consumed this run (as control or treatment) must be re-opened.
+    let affected: Vec<(i64,)> = sqlx::query_as(
+        "SELECT id FROM experiment_results WHERE control_run_id = $1 OR treatment_run_id = $1",
+    )
+    .bind(run_id)
+    .fetch_all(&mut *tx)
+    .await?;
+    sqlx::query(
+        "UPDATE experiment_runs
+         SET status = $2, status_reason = $3, status_changed_by = $4, status_changed_at = NOW()
+         WHERE id = $1",
+    )
+    .bind(run_id)
+    .bind(new_status.as_str())
+    .bind(reason)
+    .bind(changed_by)
+    .execute(&mut *tx)
+    .await?;
+    let mut reopened_decisions = Vec::with_capacity(affected.len());
+    for (decision_id,) in &affected {
+        sqlx::query(
+            "UPDATE experiment_hypotheses h
+             SET verdict = 'pending'
+             FROM experiment_results r
+             WHERE r.id = $1 AND h.id = r.hypothesis_id",
+        )
+        .bind(decision_id)
+        .execute(&mut *tx)
+        .await?;
+        append_run_status_audit(
+            &mut tx,
+            run_id,
+            Some(&old_status),
+            new_status.as_str(),
+            reason,
+            changed_by,
+            Some(*decision_id),
+            samples_digest.as_deref(),
+        )
+        .await?;
+        reopened_decisions.push(*decision_id);
+    }
+    if affected.is_empty() {
+        append_run_status_audit(
+            &mut tx,
+            run_id,
+            Some(&old_status),
+            new_status.as_str(),
+            reason,
+            changed_by,
+            None,
+            samples_digest.as_deref(),
+        )
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(RunStatusChange {
+        old_status,
+        new_status: new_status.as_str().to_string(),
+        reopened_decisions,
+    })
+}
+
+/// Upsert the paired-corpus 2×2 counts for a `(experiment, hypothesis, metric)`.
+/// Returns the row id.
+#[allow(clippy::too_many_arguments)]
+pub async fn upsert_paired_binary_counts(
+    pool: &PgPool,
+    experiment_id: i64,
+    hypothesis_id: Option<i64>,
+    metric_name: &str,
+    control_run_id: Option<Uuid>,
+    treatment_run_id: Option<Uuid>,
+    counts: PairedBinaryCounts,
+    source: Option<&str>,
+    detail_json: &str,
+) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "INSERT INTO experiment_paired_binary
+            (experiment_id, hypothesis_id, metric_name, control_run_id, treatment_run_id,
+             both_correct, control_only, treatment_only, both_wrong, source, detail, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, NOW())
+         ON CONFLICT (experiment_id, hypothesis_id, metric_name) DO UPDATE SET
+            control_run_id = EXCLUDED.control_run_id,
+            treatment_run_id = EXCLUDED.treatment_run_id,
+            both_correct = EXCLUDED.both_correct,
+            control_only = EXCLUDED.control_only,
+            treatment_only = EXCLUDED.treatment_only,
+            both_wrong = EXCLUDED.both_wrong,
+            source = EXCLUDED.source,
+            detail = EXCLUDED.detail,
+            updated_at = NOW()
+         RETURNING id",
     )
     .bind(experiment_id)
     .bind(hypothesis_id)
-    .bind(arm_label)
     .bind(metric_name)
-    .fetch_all(pool)
+    .bind(control_run_id)
+    .bind(treatment_run_id)
+    .bind(counts.both_correct)
+    .bind(counts.control_only)
+    .bind(counts.treatment_only)
+    .bind(counts.both_wrong)
+    .bind(source)
+    .bind(detail_json)
+    .fetch_one(pool)
     .await
+}
+
+/// Load the paired-corpus 2×2 for a `(experiment, hypothesis, metric)`, if any.
+pub async fn load_paired_binary_counts(
+    pool: &PgPool,
+    experiment_id: i64,
+    hypothesis_id: Option<i64>,
+    metric_name: &str,
+) -> Result<Option<PairedBinaryCounts>, sqlx::Error> {
+    let row: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT both_correct, control_only, treatment_only, both_wrong
+         FROM experiment_paired_binary
+         WHERE experiment_id = $1 AND hypothesis_id IS NOT DISTINCT FROM $2 AND metric_name = $3",
+    )
+    .bind(experiment_id)
+    .bind(hypothesis_id)
+    .bind(metric_name)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(
+        |(both_correct, control_only, treatment_only, both_wrong)| PairedBinaryCounts {
+            both_correct,
+            control_only,
+            treatment_only,
+            both_wrong,
+        },
+    ))
+}
+
+/// Audit-visible overview of every run of an experiment (status + sample counts +
+/// digest), for `experiment_get`.
+pub async fn experiment_runs_overview(
+    pool: &PgPool,
+    experiment_id: i64,
+) -> Result<Vec<RunOverview>, sqlx::Error> {
+    let rows: Vec<RunOverviewTuple> = sqlx::query_as(
+        "SELECT r.id, r.arm_label, r.arm_kind, r.status,
+                (SELECT count(*) FROM experiment_samples s WHERE s.run_id = r.id AND NOT s.is_warmup),
+                r.samples_digest, r.status_reason, r.finalized_at
+         FROM experiment_runs r
+         WHERE r.experiment_id = $1
+         ORDER BY r.created_at, r.arm_label",
+    )
+    .bind(experiment_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(
+                run_id,
+                arm_label,
+                arm_kind,
+                status,
+                sample_count,
+                samples_digest,
+                status_reason,
+                finalized_at,
+            )| {
+                RunOverview {
+                    run_id,
+                    arm_label,
+                    arm_kind,
+                    status,
+                    sample_count,
+                    samples_digest,
+                    status_reason,
+                    finalized_at,
+                }
+            },
+        )
+        .collect())
 }
 
 /// The earliest non-warm-up sample time for a hypothesis (anti-p-hacking guard

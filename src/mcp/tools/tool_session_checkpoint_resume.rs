@@ -159,6 +159,56 @@ pub async fn tool_session_checkpoint_resume(
         )
     })?;
 
+    // Rehydrate the context-tape WORKING SET for the recovered position. The
+    // orchestration cursor `row.cursor` recovered above (the protocol position)
+    // is the SAME `state_cursor` the paging engine keyed its working set under —
+    // "the trace IS the position" — so loading by (resumed_key, cursor)
+    // reconstructs the resident set the session paused with. `load_working_set`
+    // replays the persisted logical metadata deterministically (FIFO order by
+    // `last_access_ord`), so the rehydrated residency is bit-identical to the
+    // pre-pause snapshot. A fresh fork has no working set of its own yet (the
+    // child table is keyed by session_key and is not copied by fork_checkpoint),
+    // so it correctly rehydrates to zero resident pages. A DB fault is
+    // ADR-021 error!-grade.
+    let working_set = crate::tape::store::load_working_set(pool, &resumed_key, row.cursor)
+        .await
+        .map_err(|e| {
+            error!(
+                session_key = %resumed_key, cursor = row.cursor, error = %e,
+                "resume: working-set metadata load failed"
+            );
+            McpError::internal_error(format!("working-set load failed: {e}"), None)
+        })?;
+    // Actually RECONSTRUCT the in-RAM `TapeStore` from the persisted scratch-page
+    // bytes (the v53 `content` column), not just count the metadata. Scratch pages
+    // (accumulator / REPL output) have no corpus source, so their bytes must be
+    // rebuilt here; corpus/observation/summary pages are re-fetched lazily on first
+    // access. Without this the resumed session's pages would be "resident" in the
+    // metadata but absent from RAM — the inert round-trip the review flagged. A DB
+    // fault is ADR-021 error!-grade.
+    let rehydrated_scratch_pages = crate::tape::store::rehydrate_store_from_pages(
+        pool,
+        ctx.tape_registry(),
+        &resumed_key,
+        row.cursor,
+    )
+    .await
+    .map_err(|e| {
+        error!(
+            session_key = %resumed_key, cursor = row.cursor, error = %e,
+            "resume: TapeStore rehydrate failed"
+        );
+        McpError::internal_error(format!("TapeStore rehydrate failed: {e}"), None)
+    })?;
+    let working_set_summary = json!({
+        "resident_pages": working_set.pages.len(),
+        "resident_tokens": working_set.resident_tokens,
+        "budget_tokens": working_set.budget_tokens,
+        "policy": working_set.policy.as_str(),
+        "logical_clock": working_set.clock,
+        "rehydrated_scratch_pages": rehydrated_scratch_pages,
+    });
+
     // 4. Next step — or the Critic-verdict await at a Choice.
     let machine = net
         .machine(&orchestrator)
@@ -246,6 +296,7 @@ pub async fn tool_session_checkpoint_resume(
         "next_step": next_step,
         "next_choice": next_choice,
         "done": done,
+        "working_set": working_set_summary,
         "role_peer": row.role_peer,
         "cursor": row.cursor,
         "critic_iteration": row.critic_iteration,

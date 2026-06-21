@@ -244,6 +244,23 @@ llammer-pipeline = { path = "../llammer-pipeline", features = ["phonetic-rescore
 # `mathml`/`serde` (only `thiserror`, already in the tree).
 latex-parser = { path = "../latex-parser", default-features = false }
 
+# context-tape: the Crucible context-tape DATA plane (P0-P2: PageAddress/Page +
+# TapeStore + AddressIndex + OOC + scoring). pgmcp's `src/tape/` paging CONTROL
+# plane (P5) bridges to it in P3 (`src/tape/{address_resolve,registry,hydrate,
+# real_data_plane}.rs`). Declared as a PLAIN path dep — NO feature selection here:
+# context-tape's OWN Cargo.toml already carries `pathmap[arena_compact]`,
+# `memmap2`, `liblevenshtein`, `duallity`, `lling-llang`. pgmcp has no `[features]`
+# table and adds none for this dep (CLAUDE.md: "no cargo features on pgmcp").
+#
+# pathmap version coexistence (verified by a clean `cargo build --bin pgmcp`):
+# pgmcp pulls a crates.io `pathmap` 0.2 transitively (libgrammstein →
+# liblevenshtein[pathmap-backend]); context-tape pulls the LOCAL `pathmap` 0.3.
+# They are SEPARATE semver-incompatible versions Cargo keeps side-by-side. No
+# pathmap TYPE crosses context-tape's public API (it exposes only PageAddress /
+# Page / PageMeta / PageKind / TapeStore / TapeError — none parameterized by a
+# `pathmap` type), so the two never have to unify.
+context-tape = { path = "../context-tape" }
+
 # P13.3: BCP-47 language detection for per-project phonetic-rule
 # dispatch. Pinned to a direct dep so we don't depend on a version
 # transitively pulled by libgrammstein's optional `language-full`

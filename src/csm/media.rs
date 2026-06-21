@@ -109,4 +109,88 @@ mod tests {
         let g = interaction("O", "P", Label::latent("thoughts", 4096, "qwen3-8b"), end());
         assert!(check_media_discipline(&g, &bb(&["Claude", "Codex"])).is_ok());
     }
+
+    #[test]
+    fn tape_paging_is_black_box_legal_for_o_tape_claude_codex() {
+        // Phase 6: the whole TapePaging protocol is all-Text, so the discipline
+        // admits it for ANY black-box set — including its own roles O + Tape plus
+        // the agent roles Claude + Codex. This is the property that lets a
+        // black-box orchestrator DRIVE paging (vs. the white-box-only latent tier).
+        use crate::csm::registry::{ProtocolId, ProtocolParams, global_of};
+        let g = global_of(ProtocolId::TapePaging, &ProtocolParams::default());
+        check_media_discipline(&g, &bb(&["O", "Tape", "Claude", "Codex"]))
+            .expect("all-Text TapePaging is black-box-legal for every role");
+    }
+
+    #[test]
+    fn tape_paging_with_one_latent_edge_and_black_box_tape_is_rejected() {
+        // CONTRAST: the discipline still BITES. Take the real TapePaging global
+        // type and flip exactly ONE edge (the `page_in_ack` Tape→O reply) to a
+        // latent medium. With `Tape` black-box, that single latent edge touching a
+        // black-box role is a projection-time error — proving the all-Text version
+        // passes for a reason (the medium gate), not by vacuity.
+        use crate::csm::mpst::global::GlobalType;
+        use crate::csm::registry::{ProtocolId, ProtocolParams, global_of};
+
+        // Recursively rewrite the `page_in_ack` label to latent.
+        fn make_ack_latent(g: GlobalType) -> GlobalType {
+            match g {
+                GlobalType::Interaction {
+                    from,
+                    to,
+                    label,
+                    cont,
+                } => {
+                    let label = if label.name == "page_in_ack" {
+                        Label::latent("page_in_ack", 4096, "qwen3-8b")
+                    } else {
+                        label
+                    };
+                    GlobalType::Interaction {
+                        from,
+                        to,
+                        label,
+                        cont: Box::new(make_ack_latent(*cont)),
+                    }
+                }
+                GlobalType::Choice { from, to, branches } => GlobalType::Choice {
+                    from,
+                    to,
+                    branches: branches
+                        .into_iter()
+                        .map(|b| {
+                            crate::csm::mpst::global::gbranch(b.label, make_ack_latent(b.cont))
+                        })
+                        .collect(),
+                },
+                GlobalType::Rec { var, body } => GlobalType::Rec {
+                    var,
+                    body: Box::new(make_ack_latent(*body)),
+                },
+                other @ (GlobalType::Var { .. } | GlobalType::End) => other,
+            }
+        }
+
+        let g = make_ack_latent(global_of(
+            ProtocolId::TapePaging,
+            &ProtocolParams::default(),
+        ));
+        // Sanity: the all-Text original passed for {Tape}; the flipped one must not.
+        assert!(
+            check_media_discipline(
+                &global_of(ProtocolId::TapePaging, &ProtocolParams::default()),
+                &bb(&["Tape"])
+            )
+            .is_ok(),
+            "the unflipped protocol is black-box-legal for Tape"
+        );
+        let err = check_media_discipline(&g, &bb(&["Tape"]))
+            .expect_err("a latent page_in_ack with black-box Tape must be rejected");
+        match err {
+            MediaError::BlackBoxOnLatent { role, label } => {
+                assert_eq!(role, "Tape");
+                assert_eq!(label, "page_in_ack");
+            }
+        }
+    }
 }

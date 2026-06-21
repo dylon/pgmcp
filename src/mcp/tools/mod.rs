@@ -28,6 +28,9 @@ pub mod result_shaping;
 pub mod sema_helpers;
 pub mod sota_helpers;
 pub mod sota_regex_scan;
+// Shared scaffolding for the Phase 4 tape verbs (tree-id derivation + the
+// address ↔ PageAddress bridge + head-preview helper).
+pub mod tape_support;
 pub mod tool_ontology;
 
 pub mod tool_active_clients;
@@ -321,11 +324,25 @@ pub mod tool_orchestrator_recommend_next;
 pub mod tool_session_checkpoint_list;
 pub mod tool_session_checkpoint_resume;
 pub mod tool_session_checkpoint_save;
+// Phase 4 — the agent-facing tape verbs (black-box-legal: analytical, no
+// shell/exec, never writes the user's files; corpus is read-only).
+pub mod tool_tape_fuzzy;
+pub mod tool_tape_get;
+pub mod tool_tape_grep;
+pub mod tool_tape_list;
+pub mod tool_tape_peek;
+pub mod tool_tape_put;
+// Phase 8 — the white-box / latent-tier sandboxed REPL (gated; analytical
+// wrapper, no shell/exec in pgmcp; corpus is read-only).
+pub mod tool_tape_repl;
+pub mod tool_tape_semantic;
+pub mod tool_tape_slice;
+pub mod tool_tape_stat;
 pub use tool_experiments::{
     tool_experiment_decide, tool_experiment_get, tool_experiment_list,
-    tool_experiment_log_artifact, tool_experiment_open, tool_experiment_protocol,
-    tool_experiment_record_measurement, tool_experiment_render_ledger, tool_experiment_search,
-    tool_experiment_timeline,
+    tool_experiment_log_artifact, tool_experiment_open, tool_experiment_preregister_context_tape,
+    tool_experiment_protocol, tool_experiment_record_measurement, tool_experiment_render_ledger,
+    tool_experiment_search, tool_experiment_timeline,
 };
 
 // Work-item / plan tracker tool surface (CRUD + lifecycle). Submodule layout

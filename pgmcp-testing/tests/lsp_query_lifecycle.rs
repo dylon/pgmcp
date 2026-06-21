@@ -56,19 +56,20 @@ async fn lsp_query_core_ops() {
     .expect("sym BetaType");
 
     // Occurrences of alphaFn: a definition + a code reference; one in a comment.
-    for (line, col, kind) in [
+    let occurrences: [(i32, i32, &str); 3] = [
         (5, 3, "definition"),
         (7, 8, "code_reference"),
         (3, 4, "comment"),
-    ] {
+    ];
+    for (line, col, kind) in occurrences {
         sqlx::query(
             "INSERT INTO symbol_occurrences (file_id, name, start_line, start_col, end_col, occurrence_kind, enclosing_symbol_id)
              VALUES ($1, 'alphaFn', $2, $3, $4, $5, $6)",
         )
         .bind(file_id)
-        .bind(line as i32)
-        .bind(col as i32)
-        .bind((col + 7) as i32)
+        .bind(line)
+        .bind(col)
+        .bind(col + 7)
         .bind(kind)
         .bind(sid)
         .execute(&pool)

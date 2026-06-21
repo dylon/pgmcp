@@ -789,3 +789,185 @@ pub struct ExperimentSearchParams {
     #[schemars(description = "Max results (default 20, max 100)")]
     pub limit: Option<i32>,
 }
+
+/// Parameters for `experiment_preregister_context_tape` (Crucible P9). The tool
+/// always returns the FROZEN pre-registration (arms, families, metrics, the
+/// composite criterion, the dataset-gated note). When `open=true` it opens the
+/// experiment through the standard `experiment_open` path (locking the frozen
+/// criterion). When `cells` are supplied with a resolved experiment+hypothesis
+/// it records them through the standard measurement path and decides against the
+/// frozen criterion. Promotion of a verified positive decision into memory is
+/// gated on `[experiments] allow_promotion` (default OFF) AND `promote_to_obs`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentPreregisterContextTapeParams {
+    #[schemars(
+        description = "Open the pre-registered experiment (insert experiment + hypothesis with the \
+                       frozen criterion locked). Default false: just echo the frozen definition."
+    )]
+    pub open: Option<bool>,
+    #[schemars(description = "Owning project id; omit for a workspace-general experiment")]
+    pub project_id: Option<i32>,
+    #[schemars(
+        description = "Existing experiment id to record cells against / decide (skip when open=true \
+                       returns a fresh one)"
+    )]
+    pub experiment_id: Option<i64>,
+    #[schemars(description = "Existing hypothesis id to record cells against / decide")]
+    pub hypothesis_id: Option<i64>,
+    #[schemars(
+        description = "Real per-(arm,family,metric) measurements to record then decide. Each item: \
+                       {arm: control|treatment|baseline, family: oolong_pairs|browsecomp_plus|\
+                       longbench_codeqa, metric: accuracy|dollar_cost|p95_latency_ms|\
+                       max_context_handled|pages_resident_vs_window, samples: [f64,…]}. NEVER \
+                       fabricated — supply real benchmark output."
+    )]
+    pub cells: Option<Vec<serde_json::Value>>,
+    #[schemars(
+        description = "Run the frozen-criterion decision after recording (or over already-recorded \
+                       samples). Default true when cells are supplied or ids resolve."
+    )]
+    pub decide: Option<bool>,
+    #[schemars(
+        description = "On a VERIFIED positive decision, supersede this memory_observations id with \
+                       the decision summary. Gated additionally on [experiments] allow_promotion \
+                       (default OFF). Omit to never promote."
+    )]
+    pub promote_to_obs: Option<i64>,
+    #[schemars(description = "Decider id recorded on the decision (agent/operator label)")]
+    pub decided_by: Option<String>,
+}
+
+// ============================================================================
+// Thread 5b — experiment-API hardening (run finalize/status audit, paired-corpus
+// 2×2 counts, artifact ingestion). EXPERIMENT subsystem only — these tools never
+// touch the work-item tracker or post →verified evidence (the self-verification
+// loophole was reverted 2026-06-20; see tool_experiments.rs).
+// ============================================================================
+
+/// Parameters for `experiment_record_paired_binary_counts` — store the
+/// paired-corpus 2×2 (`{both_correct, control_only, treatment_only, both_wrong}`)
+/// for a `(experiment, hypothesis, metric)` and return the SERVER-COMPUTED
+/// McNemar verdict. The agent supplies the counts; the daemon computes the test.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentRecordPairedBinaryCountsParams {
+    #[schemars(description = "Experiment slug (resolved to its id)")]
+    pub experiment_slug: String,
+    #[schemars(
+        description = "Hypothesis id (REQUIRED: the 2×2 is per-hypothesis; the upsert dedupes on \
+                       (experiment, hypothesis, metric))"
+    )]
+    pub hypothesis_id: i64,
+    #[schemars(description = "Metric name the 2×2 scores (e.g. \"answer_correct\")")]
+    pub metric: String,
+    #[schemars(description = "Cases BOTH arms got correct (the a cell; ≥ 0)")]
+    pub both_correct: i64,
+    #[schemars(
+        description = "Cases ONLY the control arm got correct (the b cell; ≥ 0). Discordant."
+    )]
+    pub control_only: i64,
+    #[schemars(
+        description = "Cases ONLY the treatment arm got correct (the c cell; ≥ 0). Discordant."
+    )]
+    pub treatment_only: i64,
+    #[schemars(description = "Cases BOTH arms got wrong (the d cell; ≥ 0)")]
+    pub both_wrong: i64,
+    #[schemars(description = "Control arm label, resolved to a run id pointer (optional)")]
+    pub control_arm: Option<String>,
+    #[schemars(description = "Treatment arm label, resolved to a run id pointer (optional)")]
+    pub treatment_arm: Option<String>,
+    #[schemars(description = "Provenance of the counts (e.g. \"external_benchmark\"; optional)")]
+    pub source: Option<String>,
+}
+
+/// Parameters for `experiment_finalize_run` — seal a measurement run for use in a
+/// decision (compute + store its tamper-evident samples digest, set
+/// `status='finalized'`, append to the immutable audit trail).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentFinalizeRunParams {
+    #[schemars(description = "Experiment slug (resolved to its id)")]
+    pub experiment_slug: String,
+    #[schemars(description = "Hypothesis id the run belongs to (optional; matches a NULL run)")]
+    pub hypothesis_id: Option<i64>,
+    #[schemars(description = "Arm label of the run to finalize")]
+    pub arm_label: String,
+    #[schemars(description = "Reason recorded on the audit trail (default \"finalized via MCP\")")]
+    pub reason: Option<String>,
+    #[schemars(description = "Actor recorded on the audit trail (default \"mcp\")")]
+    pub changed_by: Option<String>,
+}
+
+/// Parameters for `experiment_set_run_status` — audited EXCLUSION of a run from
+/// decisions (`invalid` / `superseded` only). The anti-cherry-pick guardrail: any
+/// decision that consumed the run is re-opened (its verdict reverts to pending).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentSetRunStatusParams {
+    #[schemars(description = "Experiment slug (resolved to its id)")]
+    pub experiment_slug: String,
+    #[schemars(description = "Hypothesis id the run belongs to (optional; matches a NULL run)")]
+    pub hypothesis_id: Option<i64>,
+    #[schemars(description = "Arm label of the run whose status changes")]
+    pub arm_label: String,
+    #[schemars(
+        description = "New status: \"invalid\" | \"superseded\" ONLY (use experiment_finalize_run \
+                       for \"finalized\"; \"pending\"/\"complete\" are not settable here)"
+    )]
+    pub status: String,
+    #[schemars(
+        description = "REQUIRED non-empty reason for the exclusion (recorded on the audit trail)"
+    )]
+    pub reason: String,
+    #[schemars(description = "Actor recorded on the audit trail (default \"mcp\")")]
+    pub changed_by: Option<String>,
+}
+
+/// Parameters for `experiment_record_measurement_from_artifact` — parse a
+/// benchmark artifact file SERVER-SIDE (CSV / JSONL) and ingest its numeric
+/// column as samples, so the agent passes a path, not a giant inline payload.
+/// The path is resolved against the daemon's working directory, CANONICALIZED,
+/// and REJECTED if it escapes that root (path-traversal safety — no `/etc/*`).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExperimentRecordMeasurementFromArtifactParams {
+    #[schemars(description = "Experiment slug (resolved to its id)")]
+    pub experiment_slug: String,
+    #[schemars(description = "Hypothesis id this measurement is for (recommended)")]
+    pub hypothesis_id: Option<i64>,
+    #[schemars(
+        description = "Arm label for the ingested run (ignored when arm_column splits rows per-arm)"
+    )]
+    pub arm_label: String,
+    #[schemars(description = "Arm kind: control | treatment | baseline (default treatment)")]
+    pub arm_kind: Option<String>,
+    #[schemars(description = "Metric name to record the samples under")]
+    pub metric: String,
+    #[schemars(
+        description = "Working-directory-relative path to the artifact (canonicalized; must stay \
+                       within the daemon's working directory — absolute or escaping paths reject)"
+    )]
+    pub artifact_path: String,
+    #[schemars(description = "Artifact format: \"csv\" | \"jsonl\"")]
+    pub format: String,
+    #[schemars(description = "Column/field name holding the numeric metric value")]
+    pub value_column: String,
+    #[schemars(
+        description = "Column/field names whose joined values form each sample's unit_key (paired \
+                       tests). Optional."
+    )]
+    pub unit_key_columns: Option<Vec<String>>,
+    #[schemars(
+        description = "If present, split rows into per-arm runs by THIS column's value (overrides \
+                       arm_label per row). Optional."
+    )]
+    pub arm_column: Option<String>,
+    #[schemars(
+        description = "Column whose truthy value marks a row as warm-up (excluded from the test). \
+                       Optional."
+    )]
+    pub is_warmup_column: Option<String>,
+    #[schemars(
+        description = "Simple key=value row filters (string equality on the raw cell). Only rows \
+                       matching ALL pairs are ingested. Optional."
+    )]
+    pub filters: Option<std::collections::BTreeMap<String, String>>,
+    #[schemars(description = "Metric source label (default external_benchmark)")]
+    pub source: Option<String>,
+}

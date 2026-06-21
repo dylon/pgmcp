@@ -120,6 +120,13 @@ pub struct SystemContext {
     /// Cron bodies and the manual `trigger_cron` path build a `CronRunGuard`
     /// from this handle. See `src/cron/history/` and ADR-018.
     cron_history: CronHistoryWriter,
+    /// Per-recursion-tree context-tape store registry (Phase 3). Holds one
+    /// `context_tape::TapeStore` per `TreeId` (== `RlmFrame.root_task_id`),
+    /// lazily created on first touch. Backs `RealTapeDataPlane`'s hot / out-of-
+    /// core tiers. Pure coordination state: agent/engine working-set pages in
+    /// RAM (+ optional spill files) — never the user's files, never the corpus.
+    /// Empty until the first paging operation touches a tree.
+    tape_registry: Arc<crate::tape::registry::TapeRegistry>,
 }
 
 impl SystemContext {
@@ -159,6 +166,7 @@ impl SystemContext {
                 crate::mcp::tool_policy::ToolPolicySnapshot::default(),
             )),
             cron_history,
+            tape_registry: Arc::new(crate::tape::registry::TapeRegistry::new()),
         }
     }
 
@@ -197,6 +205,7 @@ impl SystemContext {
                 crate::mcp::tool_policy::ToolPolicySnapshot::default(),
             )),
             cron_history,
+            tape_registry: Arc::new(crate::tape::registry::TapeRegistry::new()),
         }
     }
 
@@ -213,6 +222,14 @@ impl SystemContext {
     /// CLI / test mode this is the no-op `null` writer. See `src/cron/history/`.
     pub fn cron_history(&self) -> &CronHistoryWriter {
         &self.cron_history
+    }
+
+    /// The per-recursion-tree context-tape store registry (Phase 3). The
+    /// `RealTapeDataPlane` borrows it to reach each tree's hot / out-of-core tier;
+    /// run finalisation calls `drop_tree`. Returns the cloneable `Arc` so a caller
+    /// that spawns a task needing ownership can hold it past the borrow.
+    pub fn tape_registry(&self) -> &Arc<crate::tape::registry::TapeRegistry> {
+        &self.tape_registry
     }
 
     /// P14.4 — clone the per-project phonetics registry Arc. The
