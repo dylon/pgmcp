@@ -31,6 +31,25 @@ const MAX_RECURSION_ROUNDS: u32 = 10;
 /// threading each round's output as conditioning context into the next.
 /// This implements the paper's "Recursive-TextMAS" baseline (Yang et al.
 /// 2026 Section 5).
+/// True iff `a2a_cancel_task` has marked this task `Canceled` in the store — the
+/// per-task cancel signal the recursion loop polls between rounds (ADR-016 E8),
+/// so a cancel actually aborts an in-flight multi-round task (the black-box leaf
+/// can't be interrupted mid-generation — §8 — so the abort lands at the round
+/// boundary; a single round is bounded by the configurable A2A timeout).
+async fn task_is_canceled(state: &ApiState, task_id: Uuid) -> bool {
+    if let Some(pool) = state.db.pool() {
+        matches!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM a2a_tasks WHERE id = $1")
+                .bind(task_id)
+                .fetch_optional(pool)
+                .await,
+            Ok(Some(s)) if s == "canceled"
+        )
+    } else {
+        false
+    }
+}
+
 pub async fn create_and_start(state: &ApiState, params: SendParams) -> Result<Task, String> {
     let task_id = params.id.unwrap_or_else(Uuid::new_v4);
     let pool = state.db.pool().ok_or("no pool")?;
@@ -135,6 +154,18 @@ pub async fn create_and_start(state: &ApiState, params: SendParams) -> Result<Ta
             emit_event(state, task_id, "final", json!({ "task": t })).await?;
             return Ok(t);
         }
+        // ADR-016 E8: per-task cancel — a2a_cancel_task marked us Canceled; abort.
+        if task_is_canceled(state, task_id).await {
+            let mut t = initial_task(task_id, params.session_id, params.message.clone());
+            t.status = TaskStatus {
+                state: TaskState::Canceled,
+                message: Some(text_message("task canceled")),
+                timestamp: Utc::now(),
+            };
+            t.parent_task_id = params.parent_task_id;
+            emit_event(state, task_id, "final", json!({ "task": t })).await?;
+            return Ok(t);
+        }
         let prompt_text = match &prev_output {
             None => original_text.clone(),
             Some(prev) => format!(
@@ -166,7 +197,25 @@ pub async fn create_and_start(state: &ApiState, params: SendParams) -> Result<Ta
         }
     }
 
+    // ADR-016 E8: honor a cancel that landed during the final round (don't let
+    // the completion path overwrite it back to Completed).
+    let canceled_late = last_err.is_none() && task_is_canceled(state, task_id).await;
     let final_task = match last_err {
+        None if canceled_late => {
+            state
+                .stats
+                .a2a_tasks_canceled
+                .fetch_add(1, Ordering::Relaxed);
+            let mut t = initial_task(task_id, params.session_id, params.message.clone());
+            t.status = TaskStatus {
+                state: TaskState::Canceled,
+                message: Some(text_message("task canceled")),
+                timestamp: Utc::now(),
+            };
+            t.parent_task_id = params.parent_task_id;
+            emit_event(state, task_id, "final", json!({ "task": t })).await?;
+            return Ok(t);
+        }
         None => {
             set_state(state, task_id, TaskState::Completed, None).await?;
             state
