@@ -76,7 +76,9 @@ pub async fn run_or_log(pool: PgPool, stats: Arc<StatsTracker>, cfg: SelfImprove
     }
 
     if created > 0 {
-        stats.findings_promoted.fetch_add(created, Ordering::Relaxed);
+        stats
+            .findings_promoted
+            .fetch_add(created, Ordering::Relaxed);
         info!(
             promoted = created,
             "self-improvement: filed pending idea proposals"
@@ -122,7 +124,10 @@ async fn propose_outcome_failures(
         let provenance_key = format!(
             "{}:outcome_failure:{}:{}:{}",
             FindingSource::SelfImprovement.as_str(),
-            c.project_id.map(|p| p.to_string()).as_deref().unwrap_or("_"),
+            c.project_id
+                .map(|p| p.to_string())
+                .as_deref()
+                .unwrap_or("_"),
             c.task_kind,
             c.approach
         );
@@ -141,7 +146,17 @@ async fn propose_outcome_failures(
             c.task_kind,
             c.avg_conf.unwrap_or(0.0)
         );
-        if file_proposal(pool, &provenance_key, c.project_id, &title, &body, 30, tag_id).await {
+        if file_proposal(
+            pool,
+            &provenance_key,
+            c.project_id,
+            &title,
+            &body,
+            30,
+            tag_id,
+        )
+        .await
+        {
             created += 1;
         }
     }
@@ -237,7 +252,8 @@ async fn file_proposal(
             if was_created {
                 if let Some(tid) = tag_id
                     && let Err(e) =
-                        queries::tag_work_item(pool, item_id, tid, Some("self_improvement_cron")).await
+                        queries::tag_work_item(pool, item_id, tid, Some("self_improvement_cron"))
+                            .await
                 {
                     error!(error = %e, item_id, "self-improvement: tag attach failed");
                 }

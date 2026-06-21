@@ -13,8 +13,6 @@ pub mod embedding_migration;
 #[allow(dead_code)]
 pub mod findings_promotion;
 #[allow(dead_code)]
-pub mod self_improvement;
-#[allow(dead_code)]
 pub mod function_metrics;
 #[allow(dead_code)]
 pub mod fuzzy_sync;
@@ -52,6 +50,8 @@ pub mod memory_retention;
 pub mod ngram_lm_train;
 #[allow(dead_code)]
 pub mod project_deps_index;
+#[allow(dead_code)]
+pub mod self_improvement;
 
 pub mod ontology_build;
 

@@ -1602,7 +1602,12 @@ pub async fn scanner_findings_ingest(
         Some("ingested via POST /api/scanner/findings"),
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert run: {e}")))?;
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("insert run: {e}"),
+        )
+    })?;
 
     let mut seen: Vec<String> = Vec::with_capacity(req.findings.len());
     let mut stored = 0u64;

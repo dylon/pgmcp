@@ -788,9 +788,14 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             let stats = Arc::clone(&stats_for_si);
             let cfg = si_cfg.clone();
             let hist = hist_si.clone();
-            crate::cron::history::spawn_recorded(&rt_for_si, hist, "self-improvement", async move {
-                cron::self_improvement::run_or_log(pool, stats, cfg).await;
-            });
+            crate::cron::history::spawn_recorded(
+                &rt_for_si,
+                hist,
+                "self-improvement",
+                async move {
+                    cron::self_improvement::run_or_log(pool, stats, cfg).await;
+                },
+            );
             true
         });
     }

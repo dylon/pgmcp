@@ -139,7 +139,13 @@ pub async fn create_and_start(state: &ApiState, params: SendParams) -> Result<Ta
     for round in 0..rounds {
         // ADR-016 E8: fleet-wide ALL-STOP — abort in-flight between rounds.
         if state.halted.load(Ordering::Relaxed) {
-            set_state(state, task_id, TaskState::Canceled, Some("fleet halted (all-stop)")).await?;
+            set_state(
+                state,
+                task_id,
+                TaskState::Canceled,
+                Some("fleet halted (all-stop)"),
+            )
+            .await?;
             state
                 .stats
                 .a2a_tasks_canceled
