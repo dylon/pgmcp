@@ -24,7 +24,10 @@ fn convert(spec: &PresburgerSpec) -> PresburgerPred {
             // Eq ≡ (≤ ∧ ≥). Expressed as a conjunction to avoid the inherent
             // `LinearConstraint::eq` clashing with the `PartialEq::eq` trait method.
             PresburgerRel::Eq => PresburgerPred::And(
-                Box::new(PresburgerPred::Atom(LinearConstraint::new(terms.clone(), *rhs))),
+                Box::new(PresburgerPred::Atom(LinearConstraint::new(
+                    terms.clone(),
+                    *rhs,
+                ))),
                 Box::new(PresburgerPred::Atom(LinearConstraint::from_gte(
                     terms.clone(),
                     *rhs,

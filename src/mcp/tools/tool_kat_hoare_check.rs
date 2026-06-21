@@ -43,7 +43,10 @@ fn valuation(state: &State, atoms: &[String]) -> HashMap<String, bool> {
 
 fn dedup(states: Vec<State>) -> Vec<State> {
     let mut seen = std::collections::HashSet::new();
-    states.into_iter().filter(|s| seen.insert(s.clone())).collect()
+    states
+        .into_iter()
+        .filter(|s| seen.insert(s.clone()))
+        .collect()
 }
 
 pub async fn tool_kat_hoare_check(

@@ -31,10 +31,7 @@ impl McpServer {
             30,
             &_ctx,
             &summarize_debug(&params),
-            crate::mcp::tools::tool_protocol_soundness::tool_protocol_soundness(
-                self.ctx(),
-                params,
-            ),
+            crate::mcp::tools::tool_protocol_soundness::tool_protocol_soundness(self.ctx(), params),
         )
         .await
     }
@@ -57,10 +54,7 @@ impl McpServer {
             30,
             &_ctx,
             &summarize_debug(&params),
-            crate::mcp::tools::tool_language_inclusion::tool_language_inclusion(
-                self.ctx(),
-                params,
-            ),
+            crate::mcp::tools::tool_language_inclusion::tool_language_inclusion(self.ctx(), params),
         )
         .await
     }
@@ -133,13 +127,11 @@ impl McpServer {
         .await
     }
 
-    #[tool(
-        description = "KAT Hoare check — decide {precond} program {postcond} \
+    #[tool(description = "KAT Hoare check — decide {precond} program {postcond} \
             (Kleene Algebra with Tests: p·c·¬q ≡ 0) over a finite Boolean state space, \
             via the hoisted lling-llang BooleanTest/eval_test_public. Returns a \
             falsifiable counterexample state on failure. In-process; no prattail. \
-            Params: atoms, precond, program (assume/assign/havoc), postcond."
-    )]
+            Params: atoms, precond, program (assume/assign/havoc), postcond.")]
     async fn kat_hoare_check(
         &self,
         Parameters(params): Parameters<KatHoareCheckParams>,

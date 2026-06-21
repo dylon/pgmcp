@@ -47,10 +47,10 @@ mod handlers_data_tables;
 mod handlers_experiments;
 #[path = "server/handlers/feedback.rs"]
 mod handlers_feedback;
-#[path = "server/handlers/fv.rs"]
-mod handlers_fv;
 #[path = "server/handlers/fuzzy.rs"]
 mod handlers_fuzzy;
+#[path = "server/handlers/fv.rs"]
+mod handlers_fv;
 #[path = "server/handlers/graph_advanced.rs"]
 mod handlers_graph_advanced;
 #[path = "server/handlers/graph_core.rs"]
