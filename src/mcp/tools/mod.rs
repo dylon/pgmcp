@@ -121,6 +121,8 @@ pub mod tool_project_groups;
 pub mod tool_project_topic_profile;
 pub mod tool_project_topic_similarity;
 pub mod tool_project_tree;
+pub mod tool_language_inclusion;
+pub mod tool_presburger_decide;
 pub mod tool_protocol_soundness;
 pub mod tool_quality_forecast;
 pub mod tool_quality_report;

@@ -38,4 +38,52 @@ impl McpServer {
         )
         .await
     }
+
+    #[tool(
+        description = "Language inclusion L(impl) ⊆ L(spec) over Symbolic Finite \
+            Automata (lling-llang), via is_empty(impl ∩ ¬spec). The merge-coordinator \
+            feature-preservation primitive: 'no exported behavior lost'. A non-empty \
+            residual is a falsifiable witness word. In-process; no prattail. Params: \
+            impl_sfa, spec_sfa (states/initial/accepting/transitions over [lo,hi) guards)."
+    )]
+    async fn language_inclusion(
+        &self,
+        Parameters(params): Parameters<LanguageInclusionParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "language_inclusion",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_language_inclusion::tool_language_inclusion(
+                self.ctx(),
+                params,
+            ),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Presburger-arithmetic satisfiability via the automata-based \
+            decision procedure in lling-llang (PresburgerNfa). In-process; no \
+            subprocess, no prattail. Params: formula (True/False/Atom{terms,rhs,rel}/ \
+            And/Or/Not/Exists), bit_width (default 8)."
+    )]
+    async fn presburger_decide(
+        &self,
+        Parameters(params): Parameters<PresburgerDecideParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "presburger_decide",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_presburger_decide::tool_presburger_decide(self.ctx(), params),
+        )
+        .await
+    }
 }

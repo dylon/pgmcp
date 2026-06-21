@@ -958,6 +958,8 @@ impl McpServer {
             "csm_protocol_string_diagram" => csm_protocol_string_diagram(CsmProtocolStringDiagramParams),
             "csm_protocol_to_tla"         => csm_protocol_to_tla(CsmProtocolToTlaParams),
             "protocol_soundness"          => protocol_soundness(ProtocolSoundnessParams),
+            "language_inclusion"          => language_inclusion(LanguageInclusionParams),
+            "presburger_decide"           => presburger_decide(PresburgerDecideParams),
             "fca_concept_lattice"     => fca_concept_lattice(FcaConceptLatticeParams),
             // Crucible session PAUSE/RESUME (ADR-009)
             "session_checkpoint_save"   => session_checkpoint_save(SessionCheckpointSaveParams),
