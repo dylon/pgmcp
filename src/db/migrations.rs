@@ -74,6 +74,7 @@ mod v55_file_abstractness;
 mod v56_cross_project_edges;
 mod v57_self_improvement_findings;
 mod v58_lint_finding_class;
+mod v59_system_control;
 mod v5_work_items_collab;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
@@ -2830,6 +2831,20 @@ pub async fn run_migrations(
         v58_lint_finding_class::LINT_FINDING_CLASS_V1,
         v58_lint_finding_class::LINT_FINDING_CLASS_V1_NAME,
         || v58_lint_finding_class::apply(pool),
+    )
+    .await?;
+
+    // ================================================================
+    // Step 59 — system control. A singleton `system_control` row backing the
+    // fleet-wide ALL-STOP (ADR-016 E8): durable `halted` flag the A2A dispatcher
+    // checks to refuse new tasks / abort in-flight at round boundaries. See
+    // `src/db/migrations/v59_system_control.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v59_system_control::SYSTEM_CONTROL_V1,
+        v59_system_control::SYSTEM_CONTROL_V1_NAME,
+        || v59_system_control::apply(pool),
     )
     .await?;
 

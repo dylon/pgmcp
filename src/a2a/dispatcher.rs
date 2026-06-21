@@ -39,6 +39,11 @@ pub async fn create_and_start(state: &ApiState, params: SendParams) -> Result<Ta
         .unwrap_or(1)
         .clamp(1, MAX_RECURSION_ROUNDS);
 
+    // ADR-016 E8: refuse new dispatch while the fleet is halted (all-stop).
+    if state.halted.load(Ordering::Relaxed) {
+        return Err("fleet halted (all-stop active); dispatch refused".to_string());
+    }
+
     // Insert Task row with recursion + parent metadata.
     sqlx::query(
         "INSERT INTO a2a_tasks
@@ -113,6 +118,23 @@ pub async fn create_and_start(state: &ApiState, params: SendParams) -> Result<Ta
     let mut last_parts: Vec<Part> = Vec::new();
     let mut last_err: Option<String> = None;
     for round in 0..rounds {
+        // ADR-016 E8: fleet-wide ALL-STOP — abort in-flight between rounds.
+        if state.halted.load(Ordering::Relaxed) {
+            set_state(state, task_id, TaskState::Canceled, Some("fleet halted (all-stop)")).await?;
+            state
+                .stats
+                .a2a_tasks_canceled
+                .fetch_add(1, Ordering::Relaxed);
+            let mut t = initial_task(task_id, params.session_id, params.message.clone());
+            t.status = TaskStatus {
+                state: TaskState::Canceled,
+                message: Some(text_message("fleet halted (all-stop)")),
+                timestamp: Utc::now(),
+            };
+            t.parent_task_id = params.parent_task_id;
+            emit_event(state, task_id, "final", json!({ "task": t })).await?;
+            return Ok(t);
+        }
         let prompt_text = match &prev_output {
             None => original_text.clone(),
             Some(prev) => format!(

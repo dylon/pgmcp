@@ -1678,6 +1678,93 @@ pub async fn scanner_findings_ingest(
 }
 
 // ============================================================================
+// POST /api/control/{halt,resume} — fleet-wide ALL-STOP (ADR-016 E8)
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ControlRequest {
+    /// Must match `[tracker] user_token` — the operator credential.
+    pub token: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// Credential gate shared by the control endpoints: the request `token` must
+/// equal `[tracker] user_token` (an agent does not have it).
+fn require_tracker_token(state: &ApiState, token: &str) -> Result<(), (StatusCode, String)> {
+    let ok = {
+        let cfg = state.config.load();
+        cfg.tracker
+            .user_token
+            .as_deref()
+            .map(|t| t == token)
+            .unwrap_or(false)
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::FORBIDDEN,
+            "invalid or missing tracker token (set [tracker] user_token)".to_string(),
+        ))
+    }
+}
+
+async fn set_halted(
+    state: &ApiState,
+    halt: bool,
+    reason: Option<&str>,
+) -> Result<(), (StatusCode, String)> {
+    state
+        .halted
+        .store(halt, std::sync::atomic::Ordering::Relaxed);
+    if let Some(pool) = state.db.pool() {
+        sqlx::query(
+            "UPDATE system_control
+                SET halted = $1,
+                    halted_at = CASE WHEN $1 THEN now() ELSE halted_at END,
+                    reason = $2
+              WHERE id = 1",
+        )
+        .bind(halt)
+        .bind(reason)
+        .execute(pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("persist halt: {e}"),
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// POST /api/control/halt — engage the fleet-wide all-stop: the A2A dispatcher
+/// refuses new tasks and aborts in-flight ones at the next round boundary. The
+/// flag is durable (survives a restart; resume is explicit).
+pub async fn control_halt(
+    State(state): State<ApiState>,
+    Json(req): Json<ControlRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_tracker_token(&state, &req.token)?;
+    set_halted(&state, true, req.reason.as_deref()).await?;
+    tracing::warn!(reason = ?req.reason, "fleet ALL-STOP engaged via /api/control/halt");
+    Ok(Json(serde_json::json!({ "ok": true, "halted": true })))
+}
+
+/// POST /api/control/resume — clear the all-stop; new dispatch resumes.
+pub async fn control_resume(
+    State(state): State<ApiState>,
+    Json(req): Json<ControlRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    require_tracker_token(&state, &req.token)?;
+    set_halted(&state, false, req.reason.as_deref()).await?;
+    tracing::warn!("fleet all-stop cleared via /api/control/resume");
+    Ok(Json(serde_json::json!({ "ok": true, "halted": false })))
+}
+
+// ============================================================================
 // POST /api/tracker/ci_evidence — CI closes the loop by public_id
 // ============================================================================
 

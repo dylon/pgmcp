@@ -19,6 +19,10 @@ use crate::stats::tracker::StatsTracker;
 #[derive(Clone)]
 pub struct ApiState {
     pub db: Arc<dyn DbClient>,
+    /// Fleet-wide ALL-STOP flag (ADR-016 E8). When true, the A2A dispatcher
+    /// refuses new tasks and aborts in-flight ones at the next round boundary.
+    /// Mirrored durably in `system_control`; restored at startup.
+    pub halted: Arc<std::sync::atomic::AtomicBool>,
     pub query_embedder: QueryEmbedder,
     pub config: Arc<ArcSwap<Config>>,
     /// Live in-process counters. The `/api/status` endpoint reads

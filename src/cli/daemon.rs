@@ -1314,9 +1314,23 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             });
         }
 
+        // ADR-016 E8: restore the durable ALL-STOP flag (an all-stop survives a
+        // daemon restart; the operator must explicitly resume).
+        let halted_init = if let Some(p) = cron_db.pool() {
+            sqlx::query_scalar::<_, bool>("SELECT halted FROM system_control WHERE id = 1")
+                .fetch_optional(p)
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
         // REST API state (shares query_embedder, db, and stats with MCP server)
         let api_state = api::ApiState {
             db: Arc::clone(&cron_db),
+            halted: Arc::new(std::sync::atomic::AtomicBool::new(halted_init)),
             query_embedder: query_embedder.clone(),
             config: Arc::clone(&config),
             stats: Arc::clone(&stats_tracker),
@@ -1375,6 +1389,14 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             .route(
                 "/api/scanner/findings",
                 axum::routing::post(api::handlers::scanner_findings_ingest),
+            )
+            .route(
+                "/api/control/halt",
+                axum::routing::post(api::handlers::control_halt),
+            )
+            .route(
+                "/api/control/resume",
+                axum::routing::post(api::handlers::control_resume),
             )
             .merge(crate::a2a::a2a_router())
             .with_state(api_state);
