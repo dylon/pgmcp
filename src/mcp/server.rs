@@ -47,6 +47,8 @@ mod handlers_data_tables;
 mod handlers_experiments;
 #[path = "server/handlers/feedback.rs"]
 mod handlers_feedback;
+#[path = "server/handlers/fv.rs"]
+mod handlers_fv;
 #[path = "server/handlers/fuzzy.rs"]
 mod handlers_fuzzy;
 #[path = "server/handlers/graph_advanced.rs"]
@@ -496,6 +498,7 @@ impl McpServer {
             + Self::router_prediction()
             + Self::router_a2a()
             + Self::router_csm()
+            + Self::router_fv()
             + Self::router_experiments()
             + Self::router_work_items_a()
             + Self::router_work_items_b()
@@ -571,6 +574,7 @@ impl McpServer {
             ("prediction", names(Self::router_prediction())),
             ("a2a", names(Self::router_a2a())),
             ("csm", names(Self::router_csm())),
+            ("fv", names(Self::router_fv())),
             ("experiments", names(Self::router_experiments())),
             ("work_items_a", names(Self::router_work_items_a())),
             ("work_items_b", names(Self::router_work_items_b())),
@@ -953,6 +957,7 @@ impl McpServer {
             // Category-theoretic analytical tools (ADR-028 CT-3 / CT-4)
             "csm_protocol_string_diagram" => csm_protocol_string_diagram(CsmProtocolStringDiagramParams),
             "csm_protocol_to_tla"         => csm_protocol_to_tla(CsmProtocolToTlaParams),
+            "protocol_soundness"          => protocol_soundness(ProtocolSoundnessParams),
             "fca_concept_lattice"     => fca_concept_lattice(FcaConceptLatticeParams),
             // Crucible session PAUSE/RESUME (ADR-009)
             "session_checkpoint_save"   => session_checkpoint_save(SessionCheckpointSaveParams),
