@@ -1366,6 +1366,10 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
                 "/api/tracker/project_event",
                 axum::routing::post(api::handlers::tracker_project_event),
             )
+            .route(
+                "/api/scanner/findings",
+                axum::routing::post(api::handlers::scanner_findings_ingest),
+            )
             .merge(crate::a2a::a2a_router())
             .with_state(api_state);
         let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)

@@ -67,6 +67,10 @@ pub async fn tool_security_scan(
         None => 0,
     };
     let scanners = params.scanners.clone();
+    // Default to security findings; lint findings (finding_class='lint', posted by
+    // the crucible linter loop via POST /api/scanner/findings) are excluded unless
+    // explicitly requested, so they never masquerade as vulnerabilities (ADR-014).
+    let finding_class_filter: Option<&str> = params.finding_class.as_deref().or(Some("security"));
 
     // --- optional refresh: run the scanners now (heavy — spawns subprocesses) ---
     let mut scan_report: Option<Value> = None;
@@ -136,6 +140,7 @@ pub async fn tool_security_scan(
                     min_rank,
                     status_filter,
                     limit,
+                    finding_class_filter,
                 )
                 .await
                 .map_err(|e| McpError::internal_error(format!("query findings: {e}"), None))?;
@@ -156,6 +161,7 @@ pub async fn tool_security_scan(
                 min_rank,
                 status_filter,
                 limit,
+                finding_class_filter,
             )
             .await
             .map_err(|e| McpError::internal_error(format!("query findings: {e}"), None))?;

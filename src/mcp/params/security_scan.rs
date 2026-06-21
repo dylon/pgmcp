@@ -36,4 +36,9 @@ pub struct SecurityScanParams {
     pub include_resolved: Option<bool>,
     #[schemars(description = "Maximum findings to return (default 100, max 2000).")]
     pub limit: Option<i64>,
+    #[schemars(
+        description = "Finding class to query: \"security\" (default) | \"lint\". Lint findings \
+                       are posted by the crucible linter loop (ADR-014) via POST /api/scanner/findings."
+    )]
+    pub finding_class: Option<String>,
 }

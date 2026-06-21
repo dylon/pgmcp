@@ -747,6 +747,7 @@ async fn run_and_persist(
                     &f.raw,
                     &fp,
                     &provenance_key,
+                    "security",
                 )
                 .await;
                 match res {

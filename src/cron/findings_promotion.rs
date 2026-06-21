@@ -335,6 +335,7 @@ async fn promote_security_scan(pool: &PgPool, project_id: i32) -> Result<u64, sq
         3,
         Some("open"),
         MAX_PROMOTIONS_PER_SOURCE as i64,
+        Some("security"),
     )
     .await?;
 

@@ -95,12 +95,14 @@ pub async fn upsert_scanner_finding(
     raw: &serde_json::Value,
     fingerprint: &str,
     provenance_key: &str,
+    finding_class: &str,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO external_scanner_findings
             (project_id, run_id, scanner, rule_id, severity, file_path, line,
-             title, message, raw, fingerprint, provenance_key, status, last_seen_at)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'open', now())
+             title, message, raw, fingerprint, provenance_key, finding_class,
+             status, last_seen_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'open', now())
          ON CONFLICT (fingerprint) DO UPDATE SET
             run_id = EXCLUDED.run_id,
             severity = EXCLUDED.severity,
@@ -123,6 +125,7 @@ pub async fn upsert_scanner_finding(
     .bind(raw)
     .bind(fingerprint)
     .bind(provenance_key)
+    .bind(finding_class)
     .execute(pool)
     .await?;
     Ok(())
@@ -161,6 +164,7 @@ pub async fn query_scanner_findings(
     min_severity_rank: i32,
     status: Option<&str>,
     limit: i64,
+    finding_class: Option<&str>,
 ) -> Result<Vec<ScannerFindingRow>, sqlx::Error> {
     let scanners_vec: Option<Vec<String>> = scanners.map(<[String]>::to_vec);
     sqlx::query_as::<_, ScannerFindingRow>(
@@ -171,6 +175,7 @@ pub async fn query_scanner_findings(
           WHERE ($1::int IS NULL OR project_id = $1)
             AND ($2::text[] IS NULL OR scanner = ANY($2))
             AND ($3::text IS NULL OR status = $3)
+            AND ($6::text IS NULL OR finding_class = $6)
             AND (CASE severity
                     WHEN 'critical' THEN 4 WHEN 'high' THEN 3
                     WHEN 'medium' THEN 2 WHEN 'low' THEN 1 ELSE 0 END) >= $4
@@ -185,6 +190,7 @@ pub async fn query_scanner_findings(
     .bind(status)
     .bind(min_severity_rank)
     .bind(limit)
+    .bind(finding_class)
     .fetch_all(pool)
     .await
 }

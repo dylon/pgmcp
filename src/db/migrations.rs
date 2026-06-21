@@ -73,6 +73,7 @@ mod v54_csm_pushdown;
 mod v55_file_abstractness;
 mod v56_cross_project_edges;
 mod v57_self_improvement_findings;
+mod v58_lint_finding_class;
 mod v5_work_items_collab;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
@@ -2814,6 +2815,21 @@ pub async fn run_migrations(
         v57_self_improvement_findings::SELF_IMPROVEMENT_FINDINGS_V1,
         v57_self_improvement_findings::SELF_IMPROVEMENT_FINDINGS_V1_NAME,
         || v57_self_improvement_findings::apply(pool),
+    )
+    .await?;
+
+    // ================================================================
+    // Step 58 — lint finding class. Adds `external_scanner_findings.finding_class`
+    // (default 'security'; 'lint' for crucible linter-loop diagnostics posted via
+    // POST /api/scanner/findings, ADR-014 E7), so lint findings are queryable but
+    // excluded from `security_scan` by default. See
+    // `src/db/migrations/v58_lint_finding_class.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v58_lint_finding_class::LINT_FINDING_CLASS_V1,
+        v58_lint_finding_class::LINT_FINDING_CLASS_V1_NAME,
+        || v58_lint_finding_class::apply(pool),
     )
     .await?;
 

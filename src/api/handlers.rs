@@ -1505,6 +1505,182 @@ pub async fn tracker_record_evidence(
 // POST /api/tracker/ci_evidence — CI closes the loop by public_id
 // ============================================================================
 
+// ============================================================================
+// POST /api/scanner/findings — ingest pi-run linter (or scanner) diagnostics
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ScannerFindingIngest {
+    #[serde(default)]
+    pub rule_id: Option<String>,
+    /// critical | high | medium | low (other strings map to low; tool levels like
+    /// "error"/"warning" are accepted and mapped).
+    pub severity: String,
+    #[serde(default)]
+    pub file: Option<String>,
+    #[serde(default)]
+    pub line: Option<i32>,
+    pub title: String,
+    #[serde(default)]
+    pub message: Option<String>,
+    /// Tool-native finding JSON (default `{}`).
+    #[serde(default)]
+    pub raw: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ScannerFindingsRequest {
+    /// Must match `[tracker] user_token` — the trusted-producer credential.
+    pub token: String,
+    /// Project name (resolved to `project_id`).
+    pub project: String,
+    /// Tool slug, e.g. "clippy" | "eslint" | "clj-kondo" | "tsc".
+    pub scanner: String,
+    /// Finding class: "lint" (default) | "security".
+    #[serde(default)]
+    pub finding_class: Option<String>,
+    pub findings: Vec<ScannerFindingIngest>,
+}
+
+/// Ingest externally-run scanner/linter findings (ADR-014 E7). pi runs the linter
+/// (the no-file boundary keeps pgmcp from spawning it) and POSTs the parsed
+/// diagnostics here; pgmcp persists them in `external_scanner_findings` (idempotent
+/// on a derived fingerprint), tagging `finding_class='lint'` by default so they are
+/// queryable/trended without masquerading as vulnerabilities. Credential-gated by
+/// `[tracker] user_token` (a trusted-producer route, like `/api/tracker/ci_evidence`);
+/// it stores findings only — no work-item transitions.
+pub async fn scanner_findings_ingest(
+    State(state): State<ApiState>,
+    Json(req): Json<ScannerFindingsRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    use sha2::{Digest, Sha256};
+
+    let token_ok = {
+        let cfg = state.config.load();
+        cfg.tracker
+            .user_token
+            .as_deref()
+            .map(|t| t == req.token)
+            .unwrap_or(false)
+    };
+    if !token_ok {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "invalid or missing tracker token (set [tracker] user_token)".to_string(),
+        ));
+    }
+    let finding_class = match req.finding_class.as_deref().unwrap_or("lint") {
+        c @ ("lint" | "security") => c,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "finding_class must be \"lint\" or \"security\"".to_string(),
+            ));
+        }
+    };
+    let pool = state.db.pool().ok_or((
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "raw pool unavailable".to_string(),
+    ))?;
+    let project_id = crate::db::queries::resolve_project_id(pool, Some(&req.project))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("db error: {e}")))?
+        .ok_or((
+            StatusCode::NOT_FOUND,
+            format!("no indexed project '{}'", req.project),
+        ))?;
+
+    let run_id = crate::db::queries::insert_scanner_run(
+        pool,
+        project_id,
+        &req.scanner,
+        "ok",
+        None,
+        0,
+        req.findings.len() as i32,
+        None,
+        Some("ingested via POST /api/scanner/findings"),
+    )
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("insert run: {e}")))?;
+
+    let mut seen: Vec<String> = Vec::with_capacity(req.findings.len());
+    let mut stored = 0u64;
+    for f in &req.findings {
+        let severity = match f.severity.to_ascii_lowercase().as_str() {
+            "critical" => "critical",
+            "high" | "error" => "high",
+            "medium" | "warning" | "warn" => "medium",
+            _ => "low",
+        };
+        let file = f.file.as_deref().unwrap_or("");
+        let rule = f.rule_id.as_deref().unwrap_or("");
+        let mut hasher = Sha256::new();
+        hasher.update(
+            format!(
+                "{}|{}|{}|{}|{}|{}",
+                req.scanner,
+                req.project,
+                file,
+                f.line.unwrap_or(0),
+                rule,
+                f.title
+            )
+            .as_bytes(),
+        );
+        let fingerprint = format!("{:x}", hasher.finalize());
+        let provenance_key = format!("{}:{}", req.scanner, fingerprint);
+        let raw = f.raw.clone().unwrap_or_else(|| serde_json::json!({}));
+        match crate::db::queries::upsert_scanner_finding(
+            pool,
+            project_id,
+            run_id,
+            &req.scanner,
+            f.rule_id.as_deref(),
+            severity,
+            f.file.as_deref(),
+            f.line,
+            &f.title,
+            f.message.as_deref(),
+            &raw,
+            &fingerprint,
+            &provenance_key,
+            finding_class,
+        )
+        .await
+        {
+            Ok(()) => {
+                stored += 1;
+                seen.push(fingerprint);
+            }
+            Err(e) => {
+                tracing::error!(scanner = %req.scanner, error = %e, "scanner-ingest: upsert finding failed");
+            }
+        }
+    }
+    // A previously-open finding for this (project, scanner) not in this batch is
+    // resolved (the linter ran and no longer reports it). Scanner slugs are
+    // class-disjoint (clippy/eslint vs gitleaks/semgrep), so this never crosses
+    // the lint/security boundary.
+    let resolved = crate::db::queries::mark_unseen_resolved(pool, project_id, &req.scanner, &seen)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("resolve: {e}")))?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "project_id": project_id,
+        "scanner": req.scanner,
+        "finding_class": finding_class,
+        "run_id": run_id,
+        "stored": stored,
+        "resolved": resolved,
+    })))
+}
+
+// ============================================================================
+// POST /api/tracker/ci_evidence — CI closes the loop by public_id
+// ============================================================================
+
 #[derive(Debug, Deserialize)]
 pub struct TrackerCiEvidenceRequest {
     /// Must match `[tracker] user_token` — the trusted-producer credential.
