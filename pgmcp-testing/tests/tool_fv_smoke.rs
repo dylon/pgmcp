@@ -22,7 +22,10 @@ async fn fv_protocol_soundness_end_is_deadlock_free() {
     // The `End` global type is well-formed ⇒ deadlock-free + progress by typing
     // (CsmDeadlockFreedom.v). Adjacent-tagged JSON for GlobalType::End.
     let r = server
-        .call_tool_cli("protocol_soundness", json!({"global_type": {"type": "end"}}))
+        .call_tool_cli(
+            "protocol_soundness",
+            json!({"global_type": {"type": "end"}}),
+        )
         .await
         .expect("protocol_soundness must not error on a valid GlobalType");
     let v = body(&r);
