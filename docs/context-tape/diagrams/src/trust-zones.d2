@@ -1,0 +1,35 @@
+# The tape's trust zones: black-box callers may use the 9 analytical verbs but are
+# refused the white-box REPL at the gate; the corpus sits behind a one-way RO valve.
+direction: right
+
+untrusted: "Black-box zone\nClaude · Codex · pi  (no hidden state)" {
+  style: { fill: "#fee2e2"; stroke: "#b91c1c"; font-color: "#7f1d1d"; border-radius: 8 }
+}
+trusted: "White-box zone\nlocal backbone (latent tier)" {
+  style: { fill: "#dcfce7"; stroke: "#15803d"; font-color: "#14532d"; border-radius: 8 }
+}
+
+verbs: "9 black-box-legal verbs\nget put peek slice grep fuzzy semantic list stat" {
+  style: { fill: "#fef3c7"; stroke: "#b45309"; font-color: "#7c2d12"; border-radius: 8 }
+}
+gate: "admission gate\nwhite-box caller AND Open experiment" {
+  style: { fill: "#fde68a"; stroke: "#b45309"; font-color: "#7c2d12"; border-radius: 8 }
+}
+repl: "tape_repl\n(white-box / latent tier, sandboxed rhai)" {
+  style: { fill: "#ede9fe"; stroke: "#7c3aed"; font-color: "#4c1d95"; border-radius: 8 }
+}
+store: "per-tree TapeStore\n(scratch, DIRTY)" {
+  style: { fill: "#ccfbf1"; stroke: "#0f766e"; font-color: "#134e4a"; border-radius: 8 }
+}
+corpus: "durable corpus\nfile_chunks · memory_observations" {
+  style: { fill: "#e2e8f0"; stroke: "#334155"; font-color: "#0f172a"; border-radius: 8 }
+}
+
+untrusted -> verbs: "may call"
+trusted -> verbs: "may call"
+untrusted -> gate: "REFUSED (black-box on latent edge)" { style.stroke: "#b91c1c" }
+trusted -> gate: "passes" { style.stroke: "#15803d" }
+gate -> repl
+verbs -> store: "write (scratch only)"
+repl -> store
+verbs -> corpus: "read only (one-way valve)" { style.stroke: "#334155" }

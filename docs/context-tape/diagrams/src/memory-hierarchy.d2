@@ -1,0 +1,23 @@
+# The tape's memory hierarchy: window → hot tier → out-of-core → durable corpus.
+# Colour gradient hot→cold (red → amber → blue → slate).
+direction: down
+
+win: "Model window — the resident working set\nbudget_tokens · fastest · smallest · what the model actually sees" {
+  style: { fill: "#fecaca"; stroke: "#b91c1c"; font-color: "#7f1d1d"; border-radius: 8 }
+}
+hot: "Hot tier — TapeStore (PathMap<Page> in RAM)\nnanosecond access · no DB round-trip · per recursion tree" {
+  style: { fill: "#fde68a"; stroke: "#b45309"; font-color: "#7c2d12"; border-radius: 8 }
+}
+ooc: "Out-of-core overlay — mmap'd spill segments on local disk\nserved from the OS page cache · no DB round-trip · clean pages only" {
+  style: { fill: "#bfdbfe"; stroke: "#1d4ed8"; font-color: "#1e3a8a"; border-radius: 8 }
+}
+corpus: "Durable corpus — PostgreSQL (file_chunks · memory_observations)\nhydrate (READ-ONLY) · slowest · effectively unbounded" {
+  style: { fill: "#e2e8f0"; stroke: "#334155"; font-color: "#0f172a"; border-radius: 8 }
+}
+
+win -> hot: "evict / demote  ↓" { style.stroke: "#b45309" }
+hot -> ooc: "spill cold-clean  ↓" { style.stroke: "#1d4ed8" }
+ooc -> corpus: "miss  ↓" { style.stroke: "#334155" }
+corpus -> ooc: "" { style.stroke: "#0f766e" }
+ooc -> hot: "hydrate_from_overlay  ↑" { style.stroke: "#0f766e" }
+hot -> win: "page_in  ↑" { style.stroke: "#0f766e" }

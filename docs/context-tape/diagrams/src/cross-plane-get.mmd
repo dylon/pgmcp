@@ -1,0 +1,27 @@
+%% A cross-plane read: how one tape_get descends verb → control plane → data plane → corpus.
+sequenceDiagram
+    autonumber
+    participant V as Verb · tape_get
+    participant R as RealTapeDataPlane
+    participant REG as TapeRegistry
+    participant S as TapeStore (per tree)
+    participant H as hydrate
+    participant DB as Postgres (READ-ONLY)
+
+    V->>R: get(tree, addr)
+    R->>R: parse_addr  (PageAddr to PageAddress)
+    R->>REG: with_store(tree_id = SHA256(tree_path))
+    REG->>S: get_cascade(address)
+    alt resident in hot tier or OOC overlay
+        S-->>R: Page  (content, est_tokens)
+    else cold miss
+        opt scratch address
+            S-->>R: NotFound  (no corpus backing)
+        end
+        R->>H: hydrate(address)
+        H->>DB: SELECT file_chunks / memory_observations
+        DB-->>H: row
+        H-->>R: situated Page  (clean)
+        R->>S: insert_hydrated  (admit clean)
+    end
+    R-->>V: PageContent  (bytes, est_tokens)

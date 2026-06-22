@@ -1,0 +1,39 @@
+// The spine of the overview: the context tape is paged virtual memory, concept
+// for concept. Left = OS virtual memory (slate); right = the context tape (teal);
+// dashed edges read "plays the role of".
+digraph vm_analogy {
+  rankdir=LR; bgcolor="transparent";
+  node [shape=box, style="rounded,filled", fontname="Inter", fontsize=12, margin="0.14,0.09"];
+  edge [color="#475569", style=dashed, fontname="Inter", fontsize=10, arrowsize=0.7];
+
+  subgraph cluster_os {
+    label="Operating-system virtual memory"; fontname="Inter"; fontsize=13;
+    color="#334155"; style="rounded"; bgcolor="#f1f5f9";
+    os_ram   [label="physical RAM (frames)",        fillcolor="#e2e8f0", color="#334155"];
+    os_disk  [label="backing store / disk",          fillcolor="#e2e8f0", color="#334155"];
+    os_fault [label="page fault",                     fillcolor="#e2e8f0", color="#334155"];
+    os_repl  [label="page replacement",               fillcolor="#e2e8f0", color="#334155"];
+    os_flush [label="dirty-page write-back",          fillcolor="#e2e8f0", color="#334155"];
+    os_swap  [label="compressed swap (zswap)",        fillcolor="#e2e8f0", color="#334155"];
+    os_frame [label="frame size",                     fillcolor="#e2e8f0", color="#334155"];
+  }
+  subgraph cluster_tape {
+    label="Context tape"; fontname="Inter"; fontsize=13;
+    color="#0f766e"; style="rounded"; bgcolor="#ecfdf5";
+    t_win    [label="model window\n(budget_tokens)",            fillcolor="#ccfbf1", color="#0f766e"];
+    t_back   [label="corpus + OOC overlay",                     fillcolor="#ccfbf1", color="#0f766e"];
+    t_pagein [label="page_in / hydrate",                        fillcolor="#ccfbf1", color="#0f766e"];
+    t_evict  [label="eviction policy",                          fillcolor="#ccfbf1", color="#0f766e"];
+    t_wb     [label="dirty write-back\n(bi-temporal supersede)",fillcolor="#ccfbf1", color="#0f766e"];
+    t_demote [label="demotion ladder\n(summary node)",          fillcolor="#ccfbf1", color="#0f766e"];
+    t_tok    [label="est_tokens",                               fillcolor="#ccfbf1", color="#0f766e"];
+  }
+
+  os_ram   -> t_win    [label="plays the role of"];
+  os_disk  -> t_back   [label="plays the role of"];
+  os_fault -> t_pagein [label="plays the role of"];
+  os_repl  -> t_evict  [label="plays the role of"];
+  os_flush -> t_wb     [label="plays the role of"];
+  os_swap  -> t_demote [label="plays the role of"];
+  os_frame -> t_tok    [label="plays the role of"];
+}

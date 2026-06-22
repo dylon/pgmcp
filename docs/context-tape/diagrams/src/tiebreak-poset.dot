@@ -1,0 +1,15 @@
+// The tie-break total order: equal policy scores resolve by the lexically-smaller
+// PageAddress::to_key, so a victim (and a resumed insertion order) is always unique.
+digraph tiebreak {
+  rankdir=LR; bgcolor="transparent";
+  labelloc="t"; fontname="Inter"; fontsize=12;
+  label="Equal policy score → smaller to_key wins (a TOTAL order ⇒ a unique victim, an order-independent rank)";
+  node [shape=box, style="rounded,filled", fillcolor="#e0e7ff", color="#3730a3", fontname="Inter", fontsize=11];
+  edge [fontname="Inter", fontsize=10, color="#475569", label="< lex"];
+
+  a [label="corpus/chunk/1"];
+  b [label="corpus/chunk/2"];
+  c [label="corpus/file/3"];
+  d [label="scratch/<tree>/00", fillcolor="#fde68a", color="#b45309"];
+  a -> b -> c -> d;
+}

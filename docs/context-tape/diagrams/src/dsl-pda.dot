@@ -1,0 +1,29 @@
+// The TapeDslMask pushdown automaton. '(' pushes a PAREN (purple), ')' pops one
+// (amber); the verb-name trie is a closed allow-list; ε on Z₀ reaches DONE.
+digraph dsl_pda {
+  rankdir=LR; bgcolor="transparent";
+  node [shape=circle, fontname="Inter", fontsize=10, style=filled, fillcolor="#e2e8f0", color="#475569", width=0.5];
+  edge [fontname="Inter", fontsize=9];
+
+  EXPR;
+  AFTER_NAME [label="AFTER\nNAME"];
+  AFTER_ARG [label="AFTER\nARG"];
+  IN_STRING [label="IN\nSTRING", fillcolor="#ccfbf1", color="#0f766e"];
+  INT_RUN [label="INT\nRUN"];
+  DONE [shape=doublecircle, fillcolor="#bbf7d0", color="#15803d"];
+  verbs [shape=box, style="rounded,filled", fillcolor="#fef3c7", color="#b45309", label="verb-name trie\n(9 verbs, closed allow-list)"];
+
+  EXPR -> verbs [label="byte"];
+  verbs -> AFTER_NAME [label="name complete"];
+  AFTER_NAME -> EXPR [label="'(' / push PAREN", color="#7c3aed", fontcolor="#7c3aed"];
+  EXPR -> AFTER_ARG [label="')' / pop PAREN (empty args)", color="#d97706", fontcolor="#b45309"];
+  AFTER_ARG -> EXPR [label="',' / read"];
+  AFTER_ARG -> AFTER_ARG [label="')' / pop PAREN", color="#d97706", fontcolor="#b45309"];
+  AFTER_ARG -> DONE [label="ε [Z₀]", style=dashed];
+  EXPR -> IN_STRING [label="'\\\"'"];
+  IN_STRING -> IN_STRING [label="non-quote byte"];
+  IN_STRING -> AFTER_ARG [label="'\\\"'"];
+  EXPR -> INT_RUN [label="digit"];
+  INT_RUN -> INT_RUN [label="digit"];
+  INT_RUN -> AFTER_ARG [label="ε", style=dashed];
+}

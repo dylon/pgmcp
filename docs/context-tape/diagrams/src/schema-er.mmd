@@ -1,0 +1,35 @@
+%% The two durable tables. v53 relaxed the hard FK to orchestration_sessions to a
+%% trigger-cascade, so session_key may be a real session OR a synthetic rlm: key.
+erDiagram
+    ORCHESTRATION_SESSIONS ||..o{ WORKING_SET_PAGES : "v53 trigger cascade"
+    ORCHESTRATION_SESSIONS ||..o| WORKING_SET_CONFIG : "v53 trigger cascade"
+    WORKING_SET_CONFIG ||--o{ WORKING_SET_PAGES : "session_key"
+
+    WORKING_SET_PAGES {
+        bigserial id PK
+        text session_key "real session OR rlm-root-task (v53)"
+        int state_cursor "the trace position"
+        text page_kind "CHECK file_chunk memory_observation summary_node"
+        text page_addr "equals PageAddress to_path"
+        text tree_path "v53 indexed"
+        text state "CHECK resident pinned dirty evicted"
+        real importance
+        int est_tokens
+        int use_count
+        bigint last_access_ord "LOGICAL clock value"
+        bool dirty
+        text evict_reason "CHECK budget_pressure ttl explicit superseded"
+        text content "v53 scratch bytes NULL if re-fetchable"
+        timestamptz valid_from "bitemporal lower bound"
+        timestamptz created_at
+    }
+
+    WORKING_SET_CONFIG {
+        text session_key PK
+        int model_window_tokens
+        int budget_tokens "the token budget B"
+        text policy "CHECK lru lfu ttl fifo cost_aware importance_weighted"
+        int ttl_secs "logical ticks not seconds"
+        bigint logical_clock "monotonic bump_clock authority"
+        timestamptz updated_at
+    }

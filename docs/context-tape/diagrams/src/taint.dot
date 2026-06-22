@@ -1,0 +1,21 @@
+// Where agent-controlled bytes may and may not flow. Green = allowed, red dashed =
+// structurally blocked, purple = allowed only through the doubly-gated promotion.
+digraph taint {
+  rankdir=LR; bgcolor="transparent";
+  node [shape=box, style="rounded,filled", fontname="Inter", fontsize=11];
+  edge [fontname="Inter", fontsize=10];
+
+  agent [label="agent-controlled bytes\n(tape_put / REPL put)", fillcolor="#fee2e2", color="#b91c1c"];
+
+  scratch [label="scratch page (DIRTY)\ntree-local", fillcolor="#dcfce7", color="#15803d"];
+  corpus  [label="corpus file_chunks / files", fillcolor="#e2e8f0", color="#334155"];
+  files   [label="user source files", fillcolor="#e2e8f0", color="#334155"];
+  sibling [label="another tree's store", fillcolor="#e2e8f0", color="#334155"];
+  mem     [label="durable memory_observations", fillcolor="#ede9fe", color="#7c3aed"];
+
+  agent -> scratch [label="✓ allowed", color="#15803d"];
+  agent -> corpus  [label="✗ read-only", color="#b91c1c", style=dashed];
+  agent -> files   [label="✗ never (no fs verb)", color="#b91c1c", style=dashed];
+  agent -> sibling [label="✗ frame-bound tree", color="#b91c1c", style=dashed];
+  agent -> mem     [label="only via the double gate", color="#7c3aed"];
+}

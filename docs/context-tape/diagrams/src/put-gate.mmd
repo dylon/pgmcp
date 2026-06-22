@@ -1,0 +1,21 @@
+%% tape_put: stage DIRTY into the tree store, with the doubly-gated, default-off
+%% promotion into durable memory. The corpus is never a promotion target.
+flowchart TD
+    PUT["tape_put(tree, address?, content, promote?)"]:::surf --> ADDR{"address given"}
+    ADDR -- no --> MINT["mint a fresh Scratch slot (v4 UUID)"]:::data
+    ADDR -- yes --> PARSE["parse the address path"]:::data
+    MINT --> STAGE
+    PARSE --> STAGE["admit_scratch stages DIRTY in the per-tree store, residency-tracked"]:::ctrl
+    STAGE --> G1{"promote = true"}
+    G1 -- no --> DONE["staged only, discarded on eviction"]:::data
+    G1 -- yes --> G2{"daemon allow_promotion"}
+    G2 -- no --> DONE
+    G2 -- yes --> G3{"address is an existing memory_observation"}
+    G3 -- no --> DONE2["no durable target, the corpus is read-only"]:::corpus
+    G3 -- yes --> SUP["bi-temporal supersede into memory_observations"]:::promote
+
+    classDef surf fill:#fef3c7,stroke:#b45309,color:#7c2d12
+    classDef data fill:#ccfbf1,stroke:#0f766e,color:#134e4a
+    classDef ctrl fill:#e0e7ff,stroke:#3730a3,color:#1e1b4b
+    classDef corpus fill:#e2e8f0,stroke:#334155,color:#0f172a
+    classDef promote fill:#ede9fe,stroke:#7c3aed,color:#4c1d95

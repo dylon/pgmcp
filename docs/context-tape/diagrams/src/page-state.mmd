@@ -1,0 +1,26 @@
+%% PageState residency lifecycle (working_set_pages.state) — mechanical, never agent-asserted.
+stateDiagram-v2
+    direction LR
+    [*] --> Resident: page_in (admit, clean)
+    Resident --> Pinned: hard demand anchor
+    Resident --> Dirty: write-through (tape_put / scratch)
+    Dirty --> Resident: written back / re-hydrated clean
+    Resident --> Evicted: budget_pressure · ttl · explicit
+    Dirty --> Evicted: write-back (supersede) then evict
+    Pinned --> Pinned: never evicted
+    Evicted --> Resident: re-demand → re-hydrate
+    Evicted --> [*]
+
+    note right of Evicted
+      row retained for audit + replay determinism;
+      scratch content kept for rehydrate
+    end note
+
+    classDef resident fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef dirty fill:#fef3c7,stroke:#b45309,color:#7c2d12
+    classDef evicted fill:#e5e7eb,stroke:#6b7280,color:#374151
+    classDef pinned fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a
+    class Resident resident
+    class Dirty dirty
+    class Evicted evicted
+    class Pinned pinned

@@ -1,0 +1,30 @@
+// Which capability each verb exercises. Verbs (amber) → data-plane capabilities
+// (teal); the white-box tape_repl (purple, dashed) scripts the same nine verbs.
+digraph verb_axes {
+  rankdir=LR; bgcolor="transparent"; nodesep=0.18;
+  node [fontname="Inter", fontsize=11, style="rounded,filled"];
+  edge [color="#475569", arrowsize=0.7];
+
+  node [shape=box, fillcolor="#fef3c7", color="#b45309"];
+  get [label="tape_get"]; put [label="tape_put"]; peek [label="tape_peek"];
+  slice [label="tape_slice"]; grep [label="tape_grep"]; fuzzy [label="tape_fuzzy"];
+  semantic [label="tape_semantic"]; list [label="tape_list"]; stat [label="tape_stat"];
+
+  node [shape=box, fillcolor="#ccfbf1", color="#0f766e"];
+  hyd [label="hydrate\n(corpus, READ-ONLY)"]; write [label="write\n(scratch, DIRTY)"];
+  pos [label="positional slice\n(trie, key order)"]; pathx [label="path index\n(exact / prefix)"];
+  subx [label="substring index"]; fuzx [label="fuzzy Levenshtein"];
+  semx [label="semantic cosine"]; statx [label="residency stats"];
+
+  get -> hyd [label="hot/OOC else hydrate"];
+  put -> write;
+  peek -> pathx [label="resident head/size"];
+  slice -> pos;
+  grep -> subx [label="tree"];
+  grep -> hyd [label="corpus"];
+  fuzzy -> fuzx;
+  semantic -> semx;
+  semantic -> hyd [label="host embed"];
+  list -> pathx;
+  stat -> statx;
+}

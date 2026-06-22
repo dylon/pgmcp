@@ -1,0 +1,20 @@
+# The lexicographic-semiring scorer as a priority cascade: each level decides;
+# only an exact tie descends. Better → worse runs green → amber.
+direction: down
+
+l1: "Level 1 — edit_distance  (lower better)\nmissing → MISSING_DISTANCE = 1e9 (finite, never ∞)" {
+  style: { fill: "#dcfce7"; stroke: "#15803d"; font-color: "#14532d" }
+}
+l2: "Level 2 — −semantic_sim  (higher better)\nmissing → MISSING_SEMANTIC = 2.0" {
+  style: { fill: "#fef9c3"; stroke: "#a16207"; font-color: "#713f12" }
+}
+l3: "Level 3 — −importance  (higher better)" {
+  style: { fill: "#fed7aa"; stroke: "#b45309"; font-color: "#7c2d12" }
+}
+tk: "tie-break — PageAddress::to_key (ascending)\n⇒ a STRICT TOTAL order, input-order-independent" {
+  style: { fill: "#e2e8f0"; stroke: "#334155"; font-color: "#0f172a" }
+}
+
+l1 -> l2: "on tie ↓"
+l2 -> l3: "on tie ↓"
+l3 -> tk: "on exact tie ↓"

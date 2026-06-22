@@ -1,0 +1,30 @@
+%% Reading-order dependency DAG for the context-tape documentation set.
+%% Node colour = plane: theory(slate) data(teal) control(indigo) surface(amber) security(red) experiment(green) decision(purple).
+flowchart TD
+    ADR["ADR-033<br/>decision record"]:::dec --> O["01 Overview &amp; theory"]:::th
+    O --> A["03 Addressing &amp; pages"]:::data
+    O --> ARCH["02 Architecture (3 planes)"]:::ctrl
+    O --> SCH["08 Persistence schema"]:::ctrl
+    A --> D["04 Data plane: store &amp; OOC"]:::data
+    ARCH --> D
+    D --> IX["05 Index portfolio"]:::data
+    ARCH --> ENG["06 Control plane: paging engine"]:::ctrl
+    D --> ENG
+    SCH --> ENG
+    ENG --> DET["07 Determinism &amp; resume"]:::ctrl
+    SCH --> DET
+    IX --> V["09 MCP verb surface"]:::surf
+    ENG --> V
+    IX --> WA["12 Weighted automata:<br/>constrained addressing"]:::data
+    V --> WA
+    WA --> SEC["10 Trust boundary &amp; security"]:::sec
+    DET --> RLM["11 RLM integration &amp; experiment"]:::exp
+    SEC --> RLM
+
+    classDef dec fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    classDef th fill:#f1f5f9,stroke:#475569,color:#0f172a
+    classDef data fill:#ccfbf1,stroke:#0f766e,color:#134e4a
+    classDef ctrl fill:#e0e7ff,stroke:#3730a3,color:#1e1b4b
+    classDef surf fill:#fef3c7,stroke:#b45309,color:#7c2d12
+    classDef sec fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
+    classDef exp fill:#dcfce7,stroke:#15803d,color:#14532d

@@ -1,0 +1,21 @@
+%% spill_cold: snapshot clean victims, build+mmap one segment, THEN drop from hot.
+%% The snapshot-before-drop ordering means a concurrent reader is never blind.
+sequenceDiagram
+    autonumber
+    participant E as Controller
+    participant S as TapeStore (hot)
+    participant O as OocOverlay
+    participant D as Disk (mmap segment triple)
+
+    E->>S: spill_cold(victims)
+    Note over S: keep only resident AND clean (skip dirty)
+    S->>S: snapshot (addr, page) pairs
+    S->>O: spill_segment(stem, snapshot)
+    O->>D: write .act (key to u64 slot)
+    O->>D: write .vals (CtVal01 magic, length-framed Pages)
+    O->>D: write .paths (serialize_paths manifest)
+    O->>D: mmap the segment, push newest-first
+    O-->>S: written count
+    S->>S: drop spilled pages from hot PathMap, free RAM
+    Note over S: reader sees hot before the drop, overlay after the mmap, never a gap
+    S-->>E: count

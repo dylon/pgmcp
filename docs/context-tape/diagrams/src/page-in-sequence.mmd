@@ -1,0 +1,36 @@
+%% Headline sequence: a tape_get page-in that must evict to fit, then demote.
+sequenceDiagram
+    autonumber
+    participant A as Agent · tape_get
+    participant E as PagingEngine
+    participant P as EvictionPolicy
+    participant D as TapeDataPlane
+    participant W as WorkingSet
+    participant DB as Postgres
+
+    A->>E: page_in(query)
+    E->>D: resolve(query) returns candidate PageRefs
+    Note over E: sort by importance, desc
+    Note over E: evict_expired logical-TTL sweep
+    E->>W: fits(est_tokens)?
+    alt resident set over budget
+        rect rgb(254, 243, 199)
+        E->>P: select_victim(unpinned, clock)
+        P-->>E: worst victim
+        opt victim is dirty
+            E->>D: put(victim), bi-temporal supersede
+        end
+        E->>W: remove victim, free est_tokens
+        E->>DB: evict_page reason budget_pressure
+        E->>D: summary_of([victim])
+        D-->>E: SummaryNode, a compact stand-in
+        opt smaller and not resident
+            E->>W: demote-in the summary
+        end
+        end
+    end
+    E->>D: get_many(admitted addresses)
+    D-->>E: situated bytes
+    E->>W: insert, last_access_ord = advance_clock()
+    E->>DB: save_working_set, one transaction
+    E-->>A: PageInOutcome admitted/evicted/demoted_in/exhausted

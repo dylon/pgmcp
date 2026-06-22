@@ -1,0 +1,21 @@
+// One PageAddress, three coordinated representations: the order-preserving byte
+// key (positional axis), the human path (= the control-plane PageAddr string),
+// and the unified-graph node_id. Dashed = the inverse maps.
+digraph addr_representations {
+  rankdir=LR; bgcolor="transparent";
+  node [fontname="Inter", fontsize=11];
+  edge [fontname="Inter", fontsize=10, color="#475569"];
+
+  pa [label="PageAddress::Chunk { chunk_id: 42 }", shape=box, style="rounded,filled",
+      fillcolor="#ccfbf1", color="#0f766e", fontsize=12];
+
+  key  [label="to_key()  →  [0x01] ⧺ enc_i64(42)\norder-preserving PathMap byte key", shape=note, style=filled, fillcolor="#e0e7ff", color="#3730a3"];
+  path [label="to_path()  →  \"corpus/chunk/42\"\nhuman path  (= the PageAddr string)", shape=note, style=filled, fillcolor="#fef3c7", color="#b45309"];
+  nid  [label="node_id()  →  \"chunk:42\"\nunified-graph node", shape=note, style=filled, fillcolor="#e2e8f0", color="#334155"];
+
+  pa -> key  [label="positional axis (slice)"];
+  pa -> path [label="path / prefix axis"];
+  pa -> nid  [label="graph identity"];
+  key  -> pa [label="from_key", style=dashed, constraint=false];
+  path -> pa [label="parse_path", style=dashed, constraint=false];
+}

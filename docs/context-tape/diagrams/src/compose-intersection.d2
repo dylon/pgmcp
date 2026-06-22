@@ -1,0 +1,26 @@
+# Inside a string literal (get("corpus/...), the DSL mask (permissive: any
+# non-quote byte) is intersected with the flat AddressMask (restrictive: only the
+# bytes that continue an existent page). teal ∩ amber = the green safe set.
+direction: down
+
+ctx: "cursor inside IN_STRING:  get(\"corpus/…" {
+  style: { fill: "#fef3c7"; stroke: "#b45309"; font-color: "#7c2d12" }
+}
+dsl: "DSL mask  (TapeDslMask.legal_next)\nany non-quote byte — PERMISSIVE" {
+  style: { fill: "#fde68a"; stroke: "#b45309"; font-color: "#7c2d12" }
+}
+addr: "address mask  (AddressMask.legal_next(\"corpus/\"))\nonly bytes that continue an existent page — RESTRICTIVE" {
+  style: { fill: "#99f6e4"; stroke: "#0f766e"; font-color: "#134e4a" }
+}
+result: "∩ result (TokenMask AND)\nthe safe legal byte set" {
+  style: { fill: "#bbf7d0"; stroke: "#15803d"; font-color: "#14532d" }
+}
+quote: "if the address prefix is itself accepting →\nre-admit the closing quote  '\\\"'" {
+  style: { fill: "#ddd6fe"; stroke: "#7c3aed"; font-color: "#4c1d95" }
+}
+
+ctx -> dsl
+ctx -> addr
+dsl -> result: "AND"
+addr -> result: "AND"
+result -> quote

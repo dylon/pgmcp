@@ -1,0 +1,13 @@
+%% v53 replaced the dropped ON DELETE CASCADE with a BEFORE DELETE trigger, so the
+%% CSM path still cascades while RLM rows (no matching session row) are left alone.
+flowchart TD
+    DEL["DELETE FROM orchestration_sessions WHERE session_key = X"]:::corpus --> TRG["trg_working_set_cascade (BEFORE DELETE)"]:::ctrl
+    TRG --> P["DELETE working_set_pages WHERE session_key = X"]:::db
+    TRG --> C["DELETE working_set_config WHERE session_key = X"]:::db
+    RLM["RLM rows, session_key = rlm:root_task_id"]:::rlm -. no matching session row .-> UN["unaffected by the trigger"]:::rlm
+    UN --> REAP["reclaimed by drop_tree plus the tape-store reaper"]:::rlm
+
+    classDef corpus fill:#e2e8f0,stroke:#334155,color:#0f172a
+    classDef ctrl fill:#e0e7ff,stroke:#3730a3,color:#1e1b4b
+    classDef db fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a
+    classDef rlm fill:#ccfbf1,stroke:#0f766e,color:#134e4a

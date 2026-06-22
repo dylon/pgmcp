@@ -1,0 +1,16 @@
+{
+  "theme": "base",
+  "themeVariables": {
+    "fontFamily": "Inter, Helvetica, Arial, sans-serif",
+    "fontSize": "15px",
+    "primaryColor": "#e0e7ff",
+    "primaryBorderColor": "#3730a3",
+    "primaryTextColor": "#1e1b4b",
+    "lineColor": "#475569",
+    "tertiaryColor": "#f1f5f9"
+  },
+  "flowchart": { "curve": "basis", "htmlLabels": true, "padding": 12 },
+  "sequence": { "useMaxWidth": true, "showSequenceNumbers": false, "wrap": true },
+  "er": { "useMaxWidth": true },
+  "stateDiagram": { "useMaxWidth": true }
+}

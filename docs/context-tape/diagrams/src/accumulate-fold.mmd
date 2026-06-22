@@ -1,0 +1,19 @@
+%% accumulate-in-store stitch: partials become accum pages, folded in BOUNDED
+%% windows into a rolling summary — so no single reduce prompt holds them all,
+%% which is what makes RLM output unbounded.
+flowchart TD
+    L1["sub-call answer 0"]:::leaf --> A0["put accum/&lt;parent&gt;/0"]:::data
+    L2["sub-call answer 1"]:::leaf --> A1["put accum/&lt;parent&gt;/1"]:::data
+    L3["sub-call answer N"]:::leaf --> AN["put accum/&lt;parent&gt;/N"]:::data
+    A0 --> R{"reduce in bounded windows (RLM_STITCH_WINDOW pages)"}:::ctrl
+    A1 --> R
+    AN --> R
+    R --> S["rolling accum/&lt;parent&gt;/summary"]:::summary
+    S -. fold next window .-> R
+    S --> ANS["final answer (output unbounded)"]:::ok
+
+    classDef leaf fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef data fill:#ccfbf1,stroke:#0f766e,color:#134e4a
+    classDef ctrl fill:#e0e7ff,stroke:#3730a3,color:#1e1b4b
+    classDef summary fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    classDef ok fill:#fef3c7,stroke:#b45309,color:#7c2d12

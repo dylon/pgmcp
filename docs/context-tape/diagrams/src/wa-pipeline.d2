@@ -1,0 +1,30 @@
+# The weighted-automata pipeline: a scorer that RANKS which page to fetch, and a
+# stack of masks that CONSTRAIN what address/script a model may emit.
+direction: right
+
+rank: "RANK — which page to fetch" {
+  style: { fill: "#eef2ff"; stroke: "#3730a3" }
+  query: "query (path / NL / fuzzy)" { style.fill: "#fef3c7" }
+  fuzzy: "fuzzy axis\nLevenshtein WFST" { style.fill: "#ccfbf1" }
+  sem: "semantic axis\ncosine" { style.fill: "#ccfbf1" }
+  path: "path axis\nDAWG" { style.fill: "#ccfbf1" }
+  scorer: "ChunkScorer\nLexicographic3<Trop,Trop,Trop>\nedits → −sim → −importance" { style.fill: "#e0e7ff" }
+  ranked: "ranked candidates\n(strict total order)" { style.fill: "#dcfce7" }
+  query -> fuzzy; query -> sem; query -> path
+  fuzzy -> scorer; sem -> scorer; path -> scorer
+  scorer -> ranked
+}
+
+constrain: "CONSTRAIN — what a model may emit" {
+  style: { fill: "#fffbeb"; stroke: "#b45309" }
+  decode: "model decode step\n(prefix so far)" { style.fill: "#fef3c7" }
+  wpda: "TapeDslMask (WPDA)\nnested DSL grammar" { style.fill: "#ddd6fe" }
+  wfst: "AddressMask (WFST)\nflat address syntax" { style.fill: "#99f6e4" }
+  mask: "legal TokenMask" { style.fill: "#dcfce7" }
+  sample: "sample ⊆ mask" { style.fill: "#fde68a" }
+  decode -> wpda
+  wpda -> wfst: "∩ inside a string literal"
+  wpda -> mask
+  wfst -> mask
+  mask -> sample
+}

@@ -1,0 +1,20 @@
+// Closed-vocabulary provenance (ADR-003 idiom): one Rust enum is the single
+// source of truth for the DB CHECK constraint and the golden test that pins it.
+digraph vocab_provenance {
+  rankdir=LR;
+  bgcolor="transparent";
+  node [shape=box, style="rounded,filled", fontname="Inter", fontsize=12, margin="0.16,0.10"];
+  edge [fontname="Inter", fontsize=11, color="#475569"];
+
+  enum  [label="Rust enum\nEvictionPolicy::ALL\n{lru,lfu,ttl,fifo,cost_aware,importance_weighted}", fillcolor="#ccfbf1", color="#0f766e"];
+  sql   [label="sql_in_list()\njoin_quoted(...)", fillcolor="#e0e7ff", color="#3730a3"];
+  ddl   [label="DDL\nCHECK (policy IN ('lru',…))", fillcolor="#e2e8f0", color="#334155"];
+  test  [label="golden test\nvocabularies_are_pinned", fillcolor="#fef3c7", color="#b45309"];
+
+  enum -> sql  [label="generates"];
+  sql  -> ddl  [label="embeds (v51 migration)"];
+  enum -> test [label="pins as_str() set", style=dashed, color="#b45309"];
+  test -> ddl  [label="cannot drift", style=dashed, dir=back, color="#b45309"];
+
+  { rank=same; ddl; test; }
+}

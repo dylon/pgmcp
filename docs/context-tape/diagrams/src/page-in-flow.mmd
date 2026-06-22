@@ -1,0 +1,22 @@
+%% The page_in decision flow (engine.rs). Green = admit, amber = evict, red = exhausted.
+flowchart TD
+    R["resolve(query) returns candidates"]:::ctrl --> SORT["sort by importance, desc"]:::ctrl
+    SORT --> TTL["evict_expired: logical-TTL sweep"]:::evict
+    TTL --> LOOP{"next candidate"}
+    LOOP -- already resident --> HIT["demand-hit: use_count + 1, restamp clock"]:::admit
+    HIT --> LOOP
+    LOOP -- est_tokens over whole budget --> EXH["budget_exhausted, can never fit"]:::exh
+    EXH --> LOOP
+    LOOP -- otherwise --> FIT{"resident_tokens + est ≤ budget"}
+    FIT -- yes --> ADMIT["reserve tokens, queue for fetch"]:::admit
+    FIT -- no --> EV["evict_to_fit"]:::evict
+    EV -- freed enough --> ADMIT
+    EV -- only pinned remain --> EXH
+    ADMIT --> LOOP
+    LOOP -- candidates done --> FETCH["get_many, situate, insert, stamp advance_clock"]:::admit
+    FETCH --> PERSIST["save_working_set in one transaction"]:::ctrl
+
+    classDef ctrl fill:#e0e7ff,stroke:#3730a3,color:#1e1b4b
+    classDef admit fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef evict fill:#fef3c7,stroke:#b45309,color:#7c2d12
+    classDef exh fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d

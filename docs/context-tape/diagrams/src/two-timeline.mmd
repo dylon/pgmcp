@@ -1,0 +1,14 @@
+%% Two processes, one logical clock: the resumed run reproduces the same clock values.
+sequenceDiagram
+    autonumber
+    participant R1 as Run (process 1)
+    participant DB as Postgres
+    participant R2 as Resume (process 2)
+
+    R1->>DB: page_in, bump_clock returns 1, 2, 3, ...
+    R1->>DB: PAUSE, flush_working_set (rows + content + logical_clock = N)
+    Note over R1: process exits
+    R2->>DB: load_working_set(cursor) returns budget, policy, clock = N
+    R2->>DB: rehydrate_store_from_pages (scratch bytes)
+    Note over R2: same clock N, same residency, same future victims
+    R2->>DB: page_in continues, bump_clock returns N+1, N+2, ...

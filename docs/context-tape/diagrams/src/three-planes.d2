@@ -1,0 +1,46 @@
+# Three-plane architecture of the context-tape subsystem.
+# Palette: agents=green, verbs=amber, control=indigo, data=teal, postgres=slate.
+direction: down
+
+agents: "Agents — Claude · Codex · pi  (black-box callers)" {
+  style: { fill: "#dcfce7"; stroke: "#15803d"; font-color: "#14532d"; border-radius: 8 }
+}
+
+surface: "MCP verb surface  (pgmcp/src/mcp/.../tape)" {
+  style: { fill: "#fef3c7"; stroke: "#b45309"; font-color: "#7c2d12"; border-radius: 8 }
+  verbs: "9 black-box-legal verbs\ntape_get · put · peek · slice · grep · fuzzy · semantic · list · stat"
+  repl: "tape_repl  (white-box only, gated)" { style: { stroke-dash: 4; fill: "#fde68a" } }
+}
+
+control: "Control plane — pgmcp/src/tape/" {
+  style: { fill: "#e0e7ff"; stroke: "#3730a3"; font-color: "#1e1b4b"; border-radius: 8 }
+  engine: "PagingEngine\npage_in · evict_to_fit · demotion ladder"
+  ws: "WorkingSet (+ logical clock)"
+  seam: "TapeDataPlane seam\nReal | Mock"
+  store: "store → working_set_pages / _config"
+  hydrate: "hydrate — READ-ONLY corpus reader"
+}
+
+data: "Data plane — context-tape crate  (CPU-only, no pgmcp dep)" {
+  style: { fill: "#ccfbf1"; stroke: "#0f766e"; font-color: "#134e4a"; border-radius: 8 }
+  addr: "PageAddress · Page · PageKind"
+  tapestore: "TapeStore (PathMap) + AddressIndex"
+  ooc: "OocOverlay (mmap spill) + checkpoint/restore"
+}
+
+pg: "PostgreSQL + pgvector" {
+  style: { fill: "#e2e8f0"; stroke: "#334155"; font-color: "#0f172a"; border-radius: 8 }
+  corpus: "file_chunks (RO) · memory_observations"
+  wsp: "working_set_pages / working_set_config"
+}
+
+agents -> surface.verbs: "MCP / JSON-RPC"
+surface.verbs -> control.seam: "PageAddr  (= PageAddress::to_path())"
+surface.repl -> data.tapestore: "rhai sandbox\n(only the 9 verbs)"
+control.engine -> control.ws
+control.engine -> control.seam
+control.engine -> control.store
+control.seam -> data.tapestore: "get_cascade / put"
+control.hydrate -> pg.corpus: "SELECT only"
+control.store -> pg.wsp: "UPSERT residency"
+data.ooc -> data.tapestore: "spill / hydrate"

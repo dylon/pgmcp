@@ -1,0 +1,17 @@
+// The frozen composite acceptance criterion: AllOf of four gated clauses, each a
+// reused framework leaf. ACCEPT iff every clause passes.
+digraph criterion {
+  rankdir=TB; bgcolor="transparent";
+  node [fontname="Inter", fontsize=11, style="rounded,filled"];
+  edge [color="#475569", arrowsize=0.7];
+
+  root [label="AllOf  (frozen before any data)\nACCEPT iff every clause passes", fillcolor="#fde68a", color="#b45309", shape=box, fontsize=12];
+
+  node [fillcolor="#dcfce7", color="#15803d", shape=box];
+  c1 [label="accuracy\nWelch-t: treatment > control\n(one-sided, α = 0.05)"];
+  c2 [label="cost\nTOST-equivalent within ±20%\n(α = 0.05)"];
+  c3 [label="p95 latency\ntreatment p95 ≤ 30 000 ms SLO"];
+  c4 [label="max-context-handled\ntreatment ≥ 2× baseline\n(RelativeImprovement +100%)"];
+
+  root -> c1; root -> c2; root -> c3; root -> c4;
+}

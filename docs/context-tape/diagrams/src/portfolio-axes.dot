@@ -1,0 +1,27 @@
+// The addressing-index portfolio: AddressIndex fans to four non-positional axes
+// over a shared AddressIdTable. The positional axis is OUTSIDE the portfolio — it
+// is the store's own order-preserving trie (drawn amber, the hot tier).
+digraph portfolio {
+  rankdir=TB; bgcolor="transparent";
+  node [fontname="Inter", fontsize=11, style="rounded,filled", shape=box];
+  edge [fontname="Inter", fontsize=10, color="#475569"];
+
+  store [label="TapeStore.pages : PathMap<Page>\n— positional axis: slice() in key order —", fillcolor="#fde68a", color="#b45309"];
+  idx   [label="AddressIndex (portfolio)", fillcolor="#ccfbf1", color="#0f766e", shape=box3d, fontsize=12];
+  ids   [label="AddressIdTable\nPageAddress ↔ u64  (dense, tombstoned)", fillcolor="#e2e8f0", color="#334155"];
+
+  path  [label="path axis\nDynamicDawgChar<u64>\nexact + prefix", fillcolor="#ccfbf1", color="#0f766e"];
+  sub   [label="substring axis\nSuffixAutomatonChar\ngrep, O(m)", fillcolor="#ccfbf1", color="#0f766e"];
+  fuzzy [label="fuzzy axis\nLevenshtein Transducer\n(over the path DAWG)", fillcolor="#ccfbf1", color="#0f766e"];
+  sem   [label="semantic axis\nflat cosine over host &[f32]", fillcolor="#ccfbf1", color="#0f766e"];
+
+  store -> idx [label="upsert / reindex / remove", style=dotted];
+  idx -> path;
+  idx -> sub;
+  idx -> fuzzy;
+  idx -> sem;
+  idx -> ids;
+  fuzzy -> path [label="reuses the DAWG", style=dashed, constraint=false];
+  path -> ids [label="values are ids", style=dashed];
+  sub -> ids [label="resolves source-id", style=dashed];
+}

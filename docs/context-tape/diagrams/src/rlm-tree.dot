@@ -1,0 +1,22 @@
+// One recursion tree shares ONE TapeStore (keyed by root_task_id). Only the root
+// (depth 1) drops it; children fold their partials into accum/<parent>/<ord> pages.
+digraph rlm_tree {
+  rankdir=TB; bgcolor="transparent";
+  node [shape=box, style="rounded,filled", fontname="Inter", fontsize=11];
+  edge [fontname="Inter", fontsize=10, color="#475569"];
+
+  root [label="root frame (depth 1)\nRlmEnvironment::Store { root_task_id }", fillcolor="#e0e7ff", color="#3730a3"];
+  c1 [label="child (depth 2)\nFileRegion / snippet", fillcolor="#e0e7ff", color="#3730a3"];
+  c2 [label="child (depth 2)", fillcolor="#e0e7ff", color="#3730a3"];
+  l1 [label="leaf sub-call", fillcolor="#dcfce7", color="#15803d"];
+  l2 [label="leaf sub-call", fillcolor="#dcfce7", color="#15803d"];
+  l3 [label="leaf sub-call", fillcolor="#dcfce7", color="#15803d"];
+
+  tape [label="ONE TapeStore per tree\nTreeId = SHA-256(rlm:root_task_id)\nscratch  accum/<parent>/<ord>", shape=cylinder, fillcolor="#ccfbf1", color="#0f766e"];
+
+  root -> c1; root -> c2;
+  c1 -> l1; c1 -> l2; c2 -> l3;
+  root -> tape [label="drop_tree only at depth 1", style=dashed, color="#0f766e"];
+  c1 -> tape [style=dotted, label="put accum"]; c2 -> tape [style=dotted];
+  l1 -> tape [style=dotted]; l2 -> tape [style=dotted]; l3 -> tape [style=dotted];
+}

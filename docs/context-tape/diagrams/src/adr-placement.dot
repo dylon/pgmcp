@@ -1,0 +1,24 @@
+// Where the context-tape constrained-decoding masks sit in the language-class
+// lattice (regular ⊊ VPL ⊊ DCFL ⊆ CFL) that ADR-030 introduced. The flat
+// AddressMask is regular (a WFST); the nested DSL TapeDslMask is a VPL (a WPDA,
+// matched parens = visible call/return).
+digraph adr_placement {
+  compound=true; bgcolor="transparent"; fontname="Inter"; fontsize=12;
+  node [fontname="Inter", fontsize=11];
+
+  subgraph cluster_cfl {
+    label="CFL (context-free)"; color="#334155"; style="rounded"; bgcolor="#f8fafc"; fontcolor="#334155";
+    subgraph cluster_dcfl {
+      label="DCFL (deterministic context-free)"; color="#475569"; style="rounded"; bgcolor="#f1f5f9"; fontcolor="#475569";
+      subgraph cluster_vpl {
+        label="VPL (visibly pushdown)"; color="#7c3aed"; style="rounded"; bgcolor="#ede9fe"; fontcolor="#5b21b6";
+        wpda [label="TapeDslMask  (WPDA)\nnested REPL DSL — matched parens", shape=box, style="rounded,filled", fillcolor="#ddd6fe", color="#7c3aed"];
+        subgraph cluster_reg {
+          label="regular (FSM)"; color="#0f766e"; style="rounded"; bgcolor="#ccfbf1"; fontcolor="#134e4a";
+          wfst [label="AddressMask  (WFST)\nflat address syntax", shape=box, style="rounded,filled", fillcolor="#99f6e4", color="#0f766e"];
+          band [label="…TapePaging band  (ADR-030)", shape=box, style="rounded,filled", fillcolor="#fed7aa", color="#b45309"];
+        }
+      }
+    }
+  }
+}

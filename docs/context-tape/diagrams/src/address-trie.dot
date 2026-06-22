@@ -1,0 +1,25 @@
+// The flat AddressMask is a byte-trie WFST over the known address strings. Shared
+// prefixes share states; accepting states (double ring) mark complete addresses.
+// A byte that continues no address yields an empty mask (red dashed = masked).
+digraph address_trie {
+  rankdir=LR; bgcolor="transparent";
+  node [fontname="Inter", fontsize=10];
+  edge [fontname="Inter", fontsize=10];
+
+  start [shape=circle, style=filled, fillcolor="#bbf7d0", color="#15803d", label="q₀"];
+  c [shape=circle, style=filled, fillcolor="#e2e8f0", color="#475569", label="·"];
+  f [shape=circle, style=filled, fillcolor="#e2e8f0", color="#475569", label="·"];
+  k [shape=circle, style=filled, fillcolor="#e2e8f0", color="#475569", label="·"];
+  a5 [shape=doublecircle, style=filled, fillcolor="#bbf7d0", color="#15803d", label="corpus/file/5"];
+  a6 [shape=doublecircle, style=filled, fillcolor="#bbf7d0", color="#15803d", label="corpus/file/6"];
+  a7 [shape=doublecircle, style=filled, fillcolor="#bbf7d0", color="#15803d", label="corpus/chunk/7"];
+  x  [shape=circle, style=filled, fillcolor="#fee2e2", color="#dc2626", label="✗"];
+
+  start -> c [label="c·o·r·p·u·s·/", color="#0d9488"];
+  c -> f [label="f·i·l·e·/", color="#0d9488"];
+  c -> k [label="c·h·u·n·k·/", color="#0d9488"];
+  f -> a5 [label="5", color="#0d9488"];
+  f -> a6 [label="6", color="#0d9488"];
+  k -> a7 [label="7", color="#0d9488"];
+  f -> x [label="7  (masked: no such page)", color="#dc2626", style=dashed];
+}

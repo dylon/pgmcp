@@ -1,0 +1,29 @@
+// Attack tree: each escalation an adversarial agent might attempt via the tape,
+// and the structural control that blocks it (green leaf).
+digraph attack_tree {
+  rankdir=TB; bgcolor="transparent"; ranksep=0.5;
+  node [shape=box, style="rounded,filled", fontname="Inter", fontsize=11];
+  edge [color="#475569", arrowsize=0.7];
+
+  root [label="GOAL: an adversarial agent escalates via the tape", fillcolor="#fee2e2", color="#b91c1c", fontsize=12];
+
+  node [fillcolor="#fef3c7", color="#b45309"];
+  a1 [label="run arbitrary code"];
+  a2 [label="write the corpus / user files"];
+  a3 [label="self-promote into durable memory"];
+  a4 [label="reach a sibling tree's memory"];
+  a5 [label="run the REPL as a black-box agent"];
+
+  node [fillcolor="#dcfce7", color="#15803d"];
+  c1 [label="BLOCKED — verbs are analytical; rhai new_raw,\neval disabled, only the 9 verbs, no fs/net/proc"];
+  c2 [label="BLOCKED — corpus read-only (hydrate only);\nput is Scratch-only (CorpusWriteRefused)"];
+  c3 [label="BLOCKED — promotion doubly-gated, default OFF;\nmemory_observations only, bi-temporal"];
+  c4 [label="BLOCKED — tree_id from the trusted frame, never JSON;\nScratch is tree-local"];
+  c5 [label="BLOCKED — admission refuses black-box on the\nlatent edge (fail-closed identity)"];
+
+  root -> a1 -> c1;
+  root -> a2 -> c2;
+  root -> a3 -> c3;
+  root -> a4 -> c4;
+  root -> a5 -> c5;
+}

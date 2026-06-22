@@ -1,0 +1,17 @@
+// The demotion ladder: when a leaf set is evicted, page in a compact SummaryNode
+// to stand in for it (the "compressed swap" analogue) — if it actually reduces.
+digraph demotion {
+  rankdir=TB; bgcolor="transparent";
+  node [fontname="Inter", fontsize=11, style="rounded,filled", shape=box];
+  edge [fontname="Inter", fontsize=10, color="#475569"];
+
+  leaves [label="evicted leaf  (est_tokens freed)", fillcolor="#e5e7eb", color="#6b7280"];
+  sum    [label="summary_of([victim])\n→ SummaryNode ref (compact)", fillcolor="#ede9fe", color="#7c3aed"];
+  cond   [label="kind = SummaryNode\nAND smaller than the leaf\nAND not already resident\nAND fits headroom?", shape=diamond, fillcolor="#fef3c7", color="#b45309"];
+  yes    [label="page in the summary\n(stands in for the leaf)", fillcolor="#dcfce7", color="#15803d"];
+  no     [label="no stand-in\n(warn!, by-design)", fillcolor="#e5e7eb", color="#6b7280"];
+
+  leaves -> sum -> cond;
+  cond -> yes [label="yes"];
+  cond -> no  [label="no"];
+}

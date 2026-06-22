@@ -1,0 +1,46 @@
+@startuml
+' The data-plane page model: PageAddress (the handle), Page, PageMeta, PageKind.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+hide empty members
+
+enum PageAddress #ccfbf1 {
+  Chunk{ chunk_id: i64 }
+  FileRegion{ file_id, start_chunk, end_chunk }
+  File{ file_id: i64 }
+  Observation{ obs_id: i64 }
+  Scratch{ tree: TreeId, slot: Box<[u8]> }
+  --
+  +to_key(): Vec<u8>
+  +from_key(&[u8]): Option<PageAddress>
+  +to_path(): String
+  +parse_path(&str): Option<PageAddress>
+  +node_id(): Option<String>
+}
+
+class Page #ccfbf1 {
+  +addr: PageAddress
+  +content: String   <i>(situated bytes)</i>
+  +meta: PageMeta
+  +estimate_tokens(&str): u32
+}
+
+class PageMeta #e0e7ff {
+  +kind: PageKind
+  +est_tokens: u32
+  +importance: f32
+  +dirty: bool
+}
+
+enum PageKind #fef3c7 {
+  FileChunk
+  MemoryObservation
+  SummaryNode
+  Scratch
+}
+
+Page *-- PageAddress
+Page *-- PageMeta
+PageMeta *-- PageKind
+@enduml

@@ -1,0 +1,12 @@
+%% The residency-aware read: hot PathMap -> OOC overlay (mmap) -> corpus hydrate.
+flowchart TD
+    Q["get_cascade(addr)"]:::q --> H{"resident in hot PathMap?"}
+    H -- yes --> HOT["return hot Page (clone), zero DB"]:::clean
+    H -- no --> O{"in OOC overlay, newest segment first?"}
+    O -- yes --> SP["deserialize from mmap .vals, zero DB"]:::spilled
+    O -- no --> M["None, host hydrates from corpus (SELECT only)"]:::corpus
+
+    classDef q fill:#e0e7ff,stroke:#3730a3,color:#1e1b4b
+    classDef clean fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef spilled fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a
+    classDef corpus fill:#e2e8f0,stroke:#334155,color:#0f172a

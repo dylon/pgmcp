@@ -1,0 +1,47 @@
+@startuml
+' Module dependency graph across the data plane (teal) and control plane (indigo).
+skinparam backgroundColor transparent
+skinparam componentStyle rectangle
+skinparam defaultFontName Inter
+skinparam shadowing false
+
+package "context-tape crate · data plane" #ccfbf1 {
+  [PageAddress] as ADDR
+  [TapeStore] as TS
+  [OocOverlay] as OOC
+  [AddressIndex] as AI
+}
+
+package "pgmcp/src/tape · control plane" #e0e7ff {
+  [PagingEngine] as ENG
+  [WorkingSet] as WS
+  [store] as STORE
+  [TapeDataPlane seam] as SEAM
+  [RealTapeDataPlane] as REAL
+  [registry] as REG
+  [hydrate] as HYD
+  [address_resolve] as AR
+  [prefetch] as PF
+}
+
+database "PostgreSQL" #e2e8f0 {
+  [file_chunks (RO)] as FC
+  [working_set_pages] as WSP
+}
+
+ENG --> WS
+ENG --> SEAM
+ENG --> STORE
+ENG ..> PF
+SEAM <|.. REAL
+REAL --> REG
+REAL --> HYD
+REAL --> AR
+REG --> TS
+TS --> AI
+TS --> OOC
+AR --> ADDR
+HYD --> FC
+STORE --> WSP
+STORE --> WS
+@enduml

@@ -1,0 +1,30 @@
+%% A page's residency lifecycle WITHIN the data-plane store (hot tier + OOC overlay).
+%% Distinct from the control-plane PageState (doc 08): this is where the bytes live.
+stateDiagram-v2
+    direction LR
+    [*] --> HotClean: insert_hydrated (from corpus)
+    [*] --> HotDirty: put (scratch or edit)
+    HotClean --> HotDirty: put (write-through)
+    HotDirty --> HotClean: re-hydrated clean
+    HotClean --> Spilled: spill_cold (clean only)
+    Spilled --> HotClean: hydrate_from_overlay
+    HotClean --> Removed: remove
+    HotDirty --> Removed: remove after write-back
+    Spilled --> Gone: segment handle dropped
+    Gone --> HotClean: corpus re-hydrate
+    Removed --> [*]
+
+    note right of HotDirty
+      dirty pages are NEVER spilled
+      (the only copy of an unsaved write)
+    end note
+
+    classDef clean fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef dirty fill:#fef3c7,stroke:#b45309,color:#7c2d12
+    classDef spilled fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a
+    classDef gone fill:#e5e7eb,stroke:#6b7280,color:#374151
+    class HotClean clean
+    class HotDirty dirty
+    class Spilled spilled
+    class Removed gone
+    class Gone gone

@@ -1,0 +1,16 @@
+%% The tape_repl admission gate: fail-closed on identity, then the experiment arm.
+flowchart TD
+    C["caller identity = host-extracted clientInfo.name, lowercased"]:::surf --> R{"caller_role (fail-closed)"}
+    R -- "empty / unknown / cli" --> BB["mapped to a black-box role"]:::untrusted
+    R -- "claude / codex" --> BB
+    R -- "white-box backbone" --> WB["white-box role"]:::trusted
+    BB --> REF1["REFUSED, black-box on the latent edge"]:::refuse
+    WB --> EXP{"experiment_slug resolves to Open"}
+    EXP -- "no / unverifiable" --> REF2["REFUSED, experiment not open"]:::refuse
+    EXP -- yes --> ADM["ADMITTED, run the sandboxed rhai engine"]:::admit
+
+    classDef surf fill:#fef3c7,stroke:#b45309,color:#7c2d12
+    classDef untrusted fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d
+    classDef trusted fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef refuse fill:#fecaca,stroke:#b91c1c,color:#7f1d1d
+    classDef admit fill:#dcfce7,stroke:#15803d,color:#14532d

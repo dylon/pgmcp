@@ -1,0 +1,18 @@
+%% Pause/resume reconstruction: the working set at a cursor is rebuilt bit-identically.
+flowchart TD
+    P["PAUSE at state_cursor c"]:::ctrl --> FL["flush_working_set re-persists resident rows + config"]:::persist
+    FL --> ROWS[("working_set_pages — metadata + scratch content")]:::db
+    FL --> CFG[("working_set_config — budget, policy, logical_clock")]:::db
+    ROWS -. later .-> LD["RESUME — load_working_set(c)"]:::load
+    CFG -. later .-> LD
+    LD --> RH["rehydrate_store_from_pages rebuilds the RAM plane from scratch content"]:::load
+    RH --> WS["WorkingSet at cursor c"]:::derive
+    WS --> ID{"bit-identical to the original run?"}:::derive
+    ID -- "yes, logical clock replays identically" --> OK["resume continues exactly"]:::ok
+
+    classDef ctrl fill:#e0e7ff,stroke:#3730a3,color:#1e1b4b
+    classDef persist fill:#dbeafe,stroke:#1d4ed8,color:#1e3a8a
+    classDef db fill:#e2e8f0,stroke:#334155,color:#0f172a
+    classDef load fill:#dcfce7,stroke:#15803d,color:#14532d
+    classDef derive fill:#ede9fe,stroke:#7c3aed,color:#4c1d95
+    classDef ok fill:#dcfce7,stroke:#15803d,color:#14532d
