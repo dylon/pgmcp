@@ -3471,6 +3471,11 @@ pub struct TargetCleanupConfig {
     /// (default 30, matching systemd-tmpfiles).
     #[serde(default = "default_target_cleanup_tmp_unattributed_var_age_days")]
     pub tmp_unattributed_var_age_days: u64,
+    /// Retain only the newest N run manifests in the state dir; older ones are
+    /// pruned each run so the audit log stays bounded under a frequent cadence
+    /// (default 50 ≈ a day of 30-min runs). 0 disables pruning.
+    #[serde(default = "default_target_cleanup_manifest_keep")]
+    pub manifest_keep: usize,
 }
 
 impl Default for TargetCleanupConfig {
@@ -3490,6 +3495,7 @@ impl Default for TargetCleanupConfig {
             tmp_session_grace_secs: default_target_cleanup_tmp_session_grace(),
             tmp_unattributed_age_days: default_target_cleanup_tmp_unattributed_age_days(),
             tmp_unattributed_var_age_days: default_target_cleanup_tmp_unattributed_var_age_days(),
+            manifest_keep: default_target_cleanup_manifest_keep(),
         }
     }
 }
@@ -3526,6 +3532,9 @@ fn default_target_cleanup_tmp_unattributed_age_days() -> u64 {
 }
 fn default_target_cleanup_tmp_unattributed_var_age_days() -> u64 {
     30
+}
+fn default_target_cleanup_manifest_keep() -> usize {
+    50
 }
 
 fn default_work_item_presence_interval() -> u64 {

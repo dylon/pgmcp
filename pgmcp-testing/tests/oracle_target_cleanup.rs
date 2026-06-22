@@ -150,6 +150,7 @@ async fn target_cleanup_wipes_stale_target_keeps_source_and_honors_tmp_provenanc
         tmp_session_grace_secs: 7200,
         tmp_unattributed_age_days: 10,
         tmp_unattributed_var_age_days: 30,
+        manifest_keep: 50,
     };
 
     let report = run_target_cleanup(&pool, &cfg, None).await;

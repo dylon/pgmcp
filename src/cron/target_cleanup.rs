@@ -112,12 +112,12 @@ pub async fn run_target_cleanup(
         (HashMap::new(), HashSet::new(), HashSet::new())
     };
 
-    let self_root = detect_self_project_root();
+    let self_roots = detect_self_project_roots();
 
     let inputs = PassInputs {
         cfg: cfg.clone(),
         now,
-        self_root,
+        self_roots,
         project_candidates,
         project_filter: project_filter.map(str::to_string),
         tmp_prov,
@@ -241,7 +241,7 @@ async fn load_alive_mcp(pool: &PgPool) -> HashSet<String> {
 struct PassInputs {
     cfg: TargetCleanupConfig,
     now: DateTime<Utc>,
-    self_root: Option<PathBuf>,
+    self_roots: Vec<PathBuf>,
     project_candidates: Vec<(PathBuf, String)>,
     project_filter: Option<String>,
     tmp_prov: HashMap<PathBuf, ProvRecord>,
@@ -274,7 +274,7 @@ fn cleanup_pass(inputs: PassInputs) -> CleanupReport {
     let PassInputs {
         cfg,
         now,
-        self_root,
+        self_roots,
         project_candidates,
         project_filter,
         tmp_prov,
@@ -288,15 +288,19 @@ fn cleanup_pass(inputs: PassInputs) -> CleanupReport {
     };
 
     // Allowlist of project roots that must never be touched: the configured
-    // entries plus the running daemon's own project (canonicalized).
+    // entries plus every self-anchor of the running daemon (each canonicalized,
+    // so the comparison against the canonicalized discovered `project_root`s is
+    // exact).
     let mut allowlist: HashSet<PathBuf> = HashSet::new();
     for a in &cfg.allowlist {
         if let Ok(c) = fs::canonicalize(a) {
             allowlist.insert(c);
         }
     }
-    if let Some(root) = self_root.as_ref().and_then(|r| fs::canonicalize(r).ok()) {
-        allowlist.insert(root);
+    for root in &self_roots {
+        if let Ok(c) = fs::canonicalize(root) {
+            allowlist.insert(c);
+        }
     }
 
     // Discover target dirs (DB project roots ∪ configured-roots walk).
@@ -305,6 +309,11 @@ fn cleanup_pass(inputs: PassInputs) -> CleanupReport {
     // Open the manifest (best-effort: tracing still records on failure).
     let mut manifest = Manifest::create(now, cfg.dry_run);
     report.manifest_path = manifest.path.as_ref().map(|p| p.display().to_string());
+    // Bound the audit log: keep only the newest `manifest_keep` manifests. This
+    // is housekeeping of the cron's own logs (runs in dry-run and armed modes);
+    // critical at a frequent cadence where ~48 manifests/day would otherwise
+    // accumulate unbounded in the same filesystem the cron is reclaiming.
+    prune_old_manifests(cfg.manifest_keep);
 
     // Disk-pressure gate for Tiers 1/2 (Tier 0 always runs). `free_floor_gb=0`
     // ⇒ always escalate (the "Moderate" default).
@@ -1227,19 +1236,46 @@ fn current_euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// The running daemon's own project root (`<root>/target/release/pgmcp` →
-/// `<root>`), so it is always allowlisted. Falls back to the daemon cwd.
-fn detect_self_project_root() -> Option<PathBuf> {
+/// Every candidate project root for the running daemon, each unconditionally
+/// allowlisted so the daemon never deletes its own build artifacts. We return
+/// *all* anchors we can derive because no single one is reliable across launch
+/// styles:
+///
+/// * `CARGO_MANIFEST_DIR` — the source tree this binary was *built* from,
+///   embedded at compile time. The only anchor that survives an installed-binary
+///   launch (e.g. `~/.local/bin/pgmcp` with cwd `$HOME`), where `current_exe()`
+///   has no `target/` ancestor and `current_dir()` is not the project root.
+/// * `current_exe()` above `target/` — correct when run straight from
+///   `<root>/target/release/pgmcp`.
+/// * `current_dir()` — last-resort fallback when launched from the project root.
+///
+/// Anchors need not exist on this host (a binary built elsewhere harmlessly
+/// contributes a non-matching path); the caller canonicalizes each and the
+/// allowlist `HashSet` dedups.
+fn detect_self_project_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+
+    // Compile-time source root: robust to where the binary is installed/launched.
+    roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+
+    // Runtime: the dir above a `target/` ancestor of the executable.
     if let Ok(exe) = std::env::current_exe() {
         for anc in exe.ancestors() {
             if anc.file_name().map(|n| n == "target").unwrap_or(false)
                 && let Some(parent) = anc.parent()
             {
-                return Some(parent.to_path_buf());
+                roots.push(parent.to_path_buf());
+                break;
             }
         }
     }
-    std::env::current_dir().ok()
+
+    // Last-resort: the daemon's working directory.
+    if let Ok(cwd) = std::env::current_dir() {
+        roots.push(cwd);
+    }
+
+    roots
 }
 
 // ============================================================================
@@ -1315,6 +1351,50 @@ fn manifest_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))?;
     Some(base.join("pgmcp").join("target-cleanup"))
+}
+
+/// Keep only the newest `keep` `manifest-*.tsv` files in the state dir, pruning
+/// the rest so the audit log stays bounded under a frequent cadence (one
+/// manifest is written per run — ~48/day at a 30-min interval). `keep == 0`
+/// disables pruning. Best-effort housekeeping of the cron's *own* logs, applied
+/// in both dry-run and armed modes — it never touches user `target/` data.
+fn prune_old_manifests(keep: usize) {
+    if let Some(dir) = manifest_dir() {
+        prune_manifests_in(&dir, keep);
+    }
+}
+
+/// Pure core of [`prune_old_manifests`]: prune all but the newest `keep`
+/// `manifest-*.tsv` entries directly under `dir`. Filenames embed a sortable
+/// UTC timestamp, so lexical order is chronological. A failed unlink is logged
+/// and skipped (the run still completes).
+fn prune_manifests_in(dir: &Path, keep: usize) {
+    if keep == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut manifests: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            matches!(
+                p.file_name().and_then(|n| n.to_str()),
+                Some(n) if n.starts_with("manifest-") && n.ends_with(".tsv")
+            )
+        })
+        .collect();
+    if manifests.len() <= keep {
+        return;
+    }
+    manifests.sort();
+    let cut = manifests.len() - keep;
+    for stale in &manifests[..cut] {
+        if let Err(e) = fs::remove_file(stale) {
+            error!(path = %stale.display(), error = %e, "target-cleanup: manifest prune failed");
+        }
+    }
 }
 
 // ============================================================================
@@ -1650,6 +1730,68 @@ mod tests {
         assert_eq!(bytes, 0, "allowlisted project not removed");
         assert!(proj.join("target").exists());
         assert_eq!(report.errors, 1, "DENY recorded as an error");
+    }
+
+    #[test]
+    fn self_project_roots_include_cargo_manifest_dir() {
+        // The compile-time source root must always be among the self-allowlist
+        // anchors, regardless of where the binary is installed or what cwd it
+        // runs under — this is what keeps pgmcp's own `target/` out of the
+        // delete set when the daemon runs from an installed path such as
+        // `~/.local/bin/pgmcp` (cwd `$HOME`), where `current_exe()` has no
+        // `target/` ancestor and `current_dir()` is not the project root.
+        let roots = detect_self_project_roots();
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert!(
+            roots.contains(&manifest_dir),
+            "CARGO_MANIFEST_DIR ({}) missing from self-roots: {:?}",
+            manifest_dir.display(),
+            roots
+        );
+    }
+
+    #[test]
+    fn prune_manifests_keeps_newest_n() {
+        let tmp = TempDir::new();
+        let dir = tmp.path();
+        // Five manifests whose names sort chronologically, plus an unrelated
+        // file the pruner must never touch.
+        for ts in [
+            "20260101T000000Z",
+            "20260102T000000Z",
+            "20260103T000000Z",
+            "20260104T000000Z",
+            "20260105T000000Z",
+        ] {
+            write(&dir.join(format!("manifest-{ts}.tsv")), "row");
+        }
+        write(&dir.join("unrelated.log"), "keep me");
+
+        prune_manifests_in(dir, 2);
+
+        let mut left: Vec<String> = fs::read_dir(dir)
+            .expect("read temp dir")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "manifest-20260104T000000Z.tsv".to_string(),
+                "manifest-20260105T000000Z.tsv".to_string(),
+                "unrelated.log".to_string(),
+            ],
+            "prune must keep the 2 newest manifests and never touch other files"
+        );
+
+        // keep == 0 disables pruning entirely.
+        prune_manifests_in(dir, 0);
+        assert_eq!(
+            fs::read_dir(dir).expect("read temp dir").count(),
+            3,
+            "keep=0 must prune nothing"
+        );
     }
 
     // -- /proc busy matching ----------------------------------------------
