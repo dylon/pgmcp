@@ -15,6 +15,10 @@
   `src/mcp/tools/tool_session_checkpoint_resume.rs`,
   `src/db/migrations/v54_csm_pushdown.rs`. Reuses the workspace's bounded
   pushdown primitive concept from `lling-llang::pushdown` / `context-tape`.
+- **Pedagogical treatise:** [`docs/csm/`](../csm/README.md) — the from-scratch design record;
+  the pushdown lift is developed in [ch.04 (automata spine)](../csm/04-automata-spine.md),
+  [ch.05–06 (machines + conformance)](../csm/05-data-model-and-compiled-machines.md), and
+  [ch.09 (the Recursive Language Model)](../csm/09-recursive-language-model.md).
 
 ## Context
 

@@ -1,0 +1,33 @@
+# RSM boxes: component machines that call one another with matched return; one calls
+# ITSELF (RecursiveCf). HSM composite states are just inline boxes. Palette:
+# box=violet, call/push=violet edge, return/pop=fuchsia edge, self-call=bold.
+direction: right
+
+root: "ROOT box  (e.g. crucible plan)" {
+  style: { fill: "#ede9fe"; stroke: "#6d28d9"; font-color: "#4c1d95"; border-radius: 8 }
+  s0: "step 0"
+  s1: "phase  (composite state)"
+  s2: "step 2"
+  s0 -> s1: "" { style.stroke: "#475569" }
+  s1 -> s2: "" { style.stroke: "#475569" }
+}
+
+phase: "PHASE box  (HSM composite = inline GlobalBox)" {
+  style: { fill: "#ede9fe"; stroke: "#6d28d9"; font-color: "#4c1d95"; border-radius: 8 }
+  a: "sub-step a"
+  b: "sub-step b"
+  a -> b: "" { style.stroke: "#475569" }
+}
+
+rec: "RecursiveCf box  (GlobalCall to its OWN name)" {
+  style: { fill: "#ede9fe"; stroke: "#6d28d9"; font-color: "#4c1d95"; border-radius: 8 }
+  o: "O → Sub : decompose_req"
+  sub: "Sub → O : done"
+  o -> sub: "" { style.stroke: "#475569" }
+}
+
+root.s1 -> phase.a: "enter  (Σ_call · push return addr)" { style: { stroke: "#7c3aed"; stroke-width: 2 } }
+phase.b -> root.s2: "exit  (Σ_ret · pop → resume step 2)" { style: { stroke: "#c026d3"; stroke-width: 2 } }
+
+rec.o -> rec.o: "call recursive_cf  (self-call · push)" { style: { stroke: "#7c3aed"; stroke-width: 3; bold: true } }
+rec.sub -> rec.sub: "End  (pop · ≤ MAX_STACK_DEPTH)" { style: { stroke: "#c026d3"; stroke-width: 2 } }

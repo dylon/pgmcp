@@ -1,0 +1,27 @@
+// Mixture: the Orchestrator fans the SAME query to N specialists in parallel (cap 8),
+// then a Summarizer reduces. Palette: O=indigo, specialists=sky, summarizer=emerald.
+digraph mixture {
+  rankdir=LR;
+  bgcolor="transparent";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=11];
+  edge [fontname="Inter", fontsize=9];
+
+  O [label="O\nOrchestrator", shape=box3d, color="#3730a3", fillcolor="#e0e7ff", fontcolor="#1e1b4b"];
+
+  node [color="#075985", fillcolor="#e0f2fe", fontcolor="#0c4a6e"];
+  Sp1 [label="Sp₁"]; Sp2 [label="Sp₂"]; Sp3 [label="Sp₃ … Spₙ"];
+
+  Sum [label="Sum\nSummarizer", color="#047857", fillcolor="#d1fae5", fontcolor="#065f46"];
+
+  O -> Sp1 [label="query", color="#059669"];
+  O -> Sp2 [label="query", color="#059669"];
+  O -> Sp3 [label="query", color="#059669"];
+  Sp1 -> O [label="answer", color="#0284c7", style=dashed];
+  Sp2 -> O [label="answer", color="#0284c7", style=dashed];
+  Sp3 -> O [label="answer", color="#0284c7", style=dashed];
+  O -> Sum [label="reduce_req", color="#059669"];
+  Sum -> O [label="summary", color="#0284c7", style=dashed];
+
+  note [label="independent per-specialist channels\n⇒ any runtime interleaving conforms", shape=note, color="#334155", fillcolor="#e2e8f0", fontcolor="#0f172a"];
+  Sp2 -> note [style=invis];
+}

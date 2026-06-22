@@ -1,0 +1,36 @@
+@startuml
+' RLM self-call: a recursive sub-call is a real A2A round-trip to the daemon's OWN
+' loopback endpoint, carrying the child frame in Message.metadata.rlm; the inbound
+' dispatcher detects the frame and CONTINUES decomposing. Palette: engine=violet,
+' loopback=fuchsia, leaf=sky.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam sequence {
+  ArrowColor #475569
+  LifeLineBorderColor #94a3b8
+  ParticipantBorderColor #6d28d9
+  ParticipantBackgroundColor #ede9fe
+  ParticipantFontColor #4c1d95
+}
+
+participant "run_rlm\n(node, depth d)" as N
+participant "A2aClient\n→ own_a2a_url" as C
+participant "dispatcher\ntry_dispatch_rlm" as D
+participant "LM peer\n(leaf)" as L
+
+N -> N : peek · strategy · decompose → snippets
+alt depth_remaining > 0 AND budget ok
+  N -[#7c3aed]> C : send_task_rlm(frame = child_frame)\nframe in Message.metadata.rlm
+  C -[#c026d3]> D : POST /a2a/jsonrpc  (loopback)
+  D -> D : frame.entered() — re-clamp depth/budget
+  D -[#7c3aed]> N : run_rlm(env, frame, task)  **one level deeper**
+  N --> D : partial answer
+  D --> C : Task result
+  C --> N : text_of(task)  (subresult — pop)
+else depth_remaining = 0 OR exhausted
+  N -[#0284c7]> L : leaf_prompt(query, snippet)
+  L --> N : leaf answer
+end
+N -> N : stitch(partials) → answer
+@enduml

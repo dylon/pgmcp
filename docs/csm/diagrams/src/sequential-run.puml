@@ -1,0 +1,27 @@
+@startuml
+' Sequential pattern: Orchestrator drives Planner → Critic → Solver, threading outputs.
+' Palette: O=indigo, request=emerald (Send), response=sky (Recv).
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam sequence {
+  ArrowColor #475569
+  LifeLineBorderColor #94a3b8
+  ParticipantBorderColor #3730a3
+  ParticipantBackgroundColor #e0e7ff
+  ParticipantFontColor #1e1b4b
+}
+
+participant "O\nOrchestrator" as O
+participant "P\nPlanner" as P
+participant "C\nCritic" as C
+participant "S\nSolver" as S
+
+O -[#059669]> P : plan_req
+P -[#0284c7]-> O : plan
+O -[#059669]> C : critique_req
+C -[#0284c7]-> O : critique
+O -[#059669]> S : solve_req
+S -[#0284c7]-> O : solution
+note over O,S : round k's solution threads into round k+1's plan_req (clamp 1..5), then end
+@enduml

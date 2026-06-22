@@ -16,6 +16,7 @@
 pub mod a2a_csm;
 pub mod category;
 pub mod core_memory_a;
+pub mod crucible_trace;
 pub mod data_table_links;
 pub mod data_tables;
 pub mod feedback;
@@ -41,6 +42,7 @@ pub mod worklog;
 pub use a2a_csm::*;
 pub use category::*;
 pub use core_memory_a::*;
+pub use crucible_trace::*;
 pub use data_table_links::*;
 pub use data_tables::*;
 pub use feedback::*;

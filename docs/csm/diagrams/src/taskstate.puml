@@ -1,0 +1,34 @@
+@startuml
+' The A2A Task lifecycle (types.rs TaskState). Terminal = Completed | Canceled | Failed.
+' Palette: task plane=orange, terminal-good=green, terminal-bad=red.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam state {
+  BackgroundColor #ffedd5
+  BorderColor #c2410c
+  FontColor #7c2d12
+}
+
+state Completed #dcfce7
+state Failed #fee2e2
+state Canceled #fee2e2
+
+[*] --> Submitted
+Submitted --> Working : dispatcher picks it up
+Working --> InputRequired : needs caller input
+InputRequired --> Working : input supplied
+Working --> Completed : success
+Working --> Failed : error
+Submitted --> Canceled : a2a_cancel_task
+Working --> Canceled : a2a_cancel_task
+Completed --> [*]
+Canceled --> [*]
+Failed --> [*]
+
+note right of Working
+  pattern driver advances each
+  Interaction's Send/Recv via
+  blocking tasks/send (rendezvous)
+end note
+@enduml

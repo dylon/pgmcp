@@ -1,0 +1,24 @@
+@startuml
+' Distillation: Expert answers thoroughly; Learner answers concisely, CONDITIONED on the
+' Expert's reasoning. Palette: O=indigo, request=emerald, response=sky.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam sequence {
+  ArrowColor #475569
+  LifeLineBorderColor #94a3b8
+  ParticipantBorderColor #3730a3
+  ParticipantBackgroundColor #e0e7ff
+  ParticipantFontColor #1e1b4b
+}
+
+participant "O\nOrchestrator" as O
+participant "E\nExpert" as E
+participant "L\nLearner" as L
+
+O -[#059669]> E : query
+E -[#0284c7]-> O : expert  (thorough, explicit reasoning)
+O -[#059669]> L : distill_req  (carries the Expert's reasoning)
+L -[#0284c7]-> O : learner  (concise)
+note over O,L : compression_ratio = |learner| / |expert| ; then end
+@enduml

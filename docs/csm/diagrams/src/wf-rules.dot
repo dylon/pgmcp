@@ -1,0 +1,52 @@
+// The eight well-formedness rules, grouped into the three passes of well_formed_in.
+// Palette: pass-1 structural=indigo, pass-2 VPA=violet, pass-3 callees=fuchsia,
+// reject examples=red.
+digraph wf {
+  rankdir=LR;
+  bgcolor="transparent";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=10];
+  edge [color="#475569", arrowsize=0.6];
+
+  g [label="GlobalType G", shape=box3d, color="#312e81", fillcolor="#e0e7ff", fontcolor="#1e1b4b"];
+
+  subgraph cluster_p1 {
+    label="Pass 1 — structural (check)"; fontname="Inter"; fontsize=12;
+    color="#3730a3"; style="rounded"; bgcolor="#eef2ff";
+    node [color="#3730a3", fillcolor="#e0e7ff", fontcolor="#1e1b4b"];
+    r1 [label="no self-message\nfrom ≠ to"];
+    r2 [label="closed\nVar bound by Rec"];
+    r3 [label="guarded recursion\nno μt.t"];
+    r4 [label="sender-driven choice\nnon-empty, distinct labels"];
+    r5 [label="matching-return box\nbody can reach End"];
+    r6 [label="WF-THREAD\ninjective subst"];
+  }
+  subgraph cluster_p2 {
+    label="Pass 2 — visibly-pushdown (check_visibility)"; fontname="Inter"; fontsize=12;
+    color="#6d28d9"; style="rounded"; bgcolor="#f5f3ff";
+    node [color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+    r7 [label="WF-VPA: one stack action\nper label name"];
+    r8 [label="no reserved boundary\ncall:/ret: prefix"];
+  }
+  subgraph cluster_p3 {
+    label="Pass 3 — callees (check_callees)"; fontname="Inter"; fontsize=12;
+    color="#a21caf"; style="rounded"; bgcolor="#fdf4ff";
+    node [color="#a21caf", fillcolor="#fae8ff", fontcolor="#701a75"];
+    r9  [label="WF-CLOSED\nevery call resolves"];
+    r10 [label="WF-BOUND\nnesting ≤ MAX_STACK_DEPTH"];
+  }
+
+  g -> r1 -> r2 -> r3 -> r4 -> r5 -> r6 [style=invis];
+  g -> r1; r6 -> r7 [style=invis]; r7 -> r8 [style=invis]; r8 -> r9 [style=invis]; r9 -> r10 [style=invis];
+
+  // a reject example per pass (red)
+  node [shape=note, color="#b91c1c", fillcolor="#fee2e2", fontcolor="#7f1d1d"];
+  x1 [label="✗ O → O : loop\n(SelfMessage)"];
+  x2 [label="✗ μt.t\n(UnguardedRec)"];
+  x3 [label="✗ Neutral label \"call:foo\"\n(ReservedBoundaryLabel)"];
+  x4 [label="✗ call C, C ∉ env\n(UnknownCallee)"];
+  r1 -> x1 [color="#dc2626"]; r3 -> x2 [color="#dc2626"];
+  r8 -> x3 [color="#dc2626"]; r9 -> x4 [color="#dc2626"];
+
+  ok [label="well_formed ✓\n(projectable, safe — ch.03)", shape=box, style="filled,rounded", color="#15803d", fillcolor="#dcfce7", fontcolor="#14532d"];
+  r10 -> ok [color="#16a34a"];
+}

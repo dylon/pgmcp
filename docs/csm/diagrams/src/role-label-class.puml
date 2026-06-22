@@ -1,0 +1,60 @@
+@startuml
+' The CFSM vocabulary (src/csm/role.rs): Role, Label, MessageMedium, Channel,
+' Action, StackAction. Colour by concept: role=indigo, label/medium=text-green vs
+' latent-amber, action=emerald/sky, stack=violet.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+hide empty members
+
+class Role #e0e7ff {
+  +0: String
+  --
+  +new(s): Role
+  +as_str(): &str
+}
+
+class Label #dcfce7 {
+  +name: String   <i>(the branch selector)</i>
+  +medium: MessageMedium
+  --
+  +text(name): Label
+  +latent(name, hidden, sig): Label
+}
+
+enum MessageMedium #dcfce7 {
+  Text                              <i>(black-box-legal; default)</i>
+  Latent{ hidden_size, backbone_sig }  <i>(white-box only)</i>
+}
+
+class Channel #e0e7ff {
+  +from: Role
+  +to: Role
+}
+
+enum Action #d1fae5 {
+  Send{ to: Role, label: Label }
+  Recv{ from: Role, label: Label }
+  --
+  +label(): &Label
+  +peer(): &Role
+}
+
+enum StackAction #ede9fe {
+  Neutral   <i>(Σ_int — stack unchanged)</i>
+  Push      <i>(Σ_call — enter a frame)</i>
+  Pop       <i>(Σ_ret — return a frame)</i>
+  --
+  +sql_in_list(): String  <i>'neutral','push','pop'</i>
+}
+
+note bottom of StackAction
+  MAX_STACK_DEPTH = 4096
+  one shared bound: WF · conformance · RLM runtime
+end note
+
+Label *-- MessageMedium
+Channel *-- Role
+Action *-- Label
+Action *-- Role
+@enduml

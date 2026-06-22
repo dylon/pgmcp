@@ -75,6 +75,7 @@ mod v56_cross_project_edges;
 mod v57_self_improvement_findings;
 mod v58_lint_finding_class;
 mod v59_system_control;
+mod v60_crucible_trace;
 mod v5_work_items_collab;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
@@ -2845,6 +2846,21 @@ pub async fn run_migrations(
         v59_system_control::SYSTEM_CONTROL_V1,
         v59_system_control::SYSTEM_CONTROL_V1_NAME,
         || v59_system_control::apply(pool),
+    )
+    .await?;
+
+    // Step 60 — unified run tracing (ADR-020 E10). Sibling tables that ANNOTATE
+    // `csm_run_traces` (the position, ADR-011): the span tree + its closure, span
+    // annotations, the append-only control-plane audit journal (ADR-016), and the
+    // counterexample-witness store (ADR-012/017). All vocabularies are sourced from
+    // the `crate::csm::trace_store` enums. See
+    // `src/db/migrations/v60_crucible_trace.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v60_crucible_trace::CRUCIBLE_TRACE,
+        v60_crucible_trace::CRUCIBLE_TRACE_NAME,
+        || v60_crucible_trace::apply(pool),
     )
     .await?;
 

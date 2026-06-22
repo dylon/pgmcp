@@ -1,0 +1,45 @@
+// Reading-order dependency graph for the CSM treatise.
+// An edge A -> B means "read A before B". Palette: spine=indigo, cross-cutting=teal,
+// reference=slate.
+digraph nav {
+  rankdir=TB;
+  bgcolor="transparent";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=11,
+        color="#3730a3", fillcolor="#e0e7ff", fontcolor="#1e1b4b"];
+  edge [color="#475569", arrowsize=0.7];
+
+  c00 [label="00 Motivation"];
+  c01 [label="01 CFSM & MPST"];
+  c02 [label="02 Projection & WF"];
+  c03 [label="03 Safety theorems"];
+  c04 [label="04 Automata spine"];
+  c05 [label="05 Data model"];
+  c06 [label="06 Conformance"];
+  c07 [label="07 A2A & agents"];
+  c08 [label="08 Patterns"];
+  c09 [label="09 Recursive LM"];
+  c10 [label="10 State = trace"];
+  c11 [label="11 Crucible exec"];
+
+  // cross-cutting layers (teal)
+  c12 [label="12 Category theory", color="#0f766e", fillcolor="#ccfbf1", fontcolor="#134e4a"];
+  c13 [label="13 Formal artifacts", color="#0f766e", fillcolor="#ccfbf1", fontcolor="#134e4a"];
+  c14 [label="14 Tools & examples", color="#0f766e", fillcolor="#ccfbf1", fontcolor="#134e4a"];
+  c15 [label="15 Glossary", shape=note, color="#334155", fillcolor="#e2e8f0", fontcolor="#0f172a"];
+
+  c00 -> c01 -> c02 -> c03 -> c04 -> c05 -> c06 -> c07 -> c08 -> c09 -> c10 -> c11;
+
+  // additional dependencies (dotted = supporting, not strictly linear)
+  c03 -> c04;
+  c04 -> c09 [style=dotted];   // RLM needs the pushdown story
+  c02 -> c12 [style=dotted];
+  c05 -> c12 [style=dotted];
+  c03 -> c13 [style=dotted];
+  c06 -> c13 [style=dotted];
+  c08 -> c11 [style=dotted];
+  c11 -> c14 [style=dotted];
+  c13 -> c14 [style=dotted];
+
+  // glossary supports everything (rendered loosely linked)
+  c01 -> c15 [style=invis];
+}

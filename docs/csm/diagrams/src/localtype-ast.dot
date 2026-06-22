@@ -1,0 +1,27 @@
+// The LocalType AST: one role's view. Send=emerald, Recv=sky, Select(⊕)=emerald,
+// Branch(&)=sky, recursion=indigo, call/box=violet, End=green.
+digraph localtype {
+  rankdir=TB;
+  bgcolor="transparent";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=11];
+  edge [color="#475569", arrowsize=0.7];
+
+  root [label="LocalType  G ↾ r", shape=box3d, color="#0f766e", fillcolor="#ccfbf1", fontcolor="#134e4a"];
+
+  send   [label="Send {to, label, cont}\n!to⟨ℓ⟩ . cont", color="#047857", fillcolor="#d1fae5", fontcolor="#065f46"];
+  sel    [label="Select {to, branches}\n⊕to{ ℓᵢ : Lᵢ }  (internal choice)", color="#047857", fillcolor="#d1fae5", fontcolor="#065f46"];
+  recv   [label="Recv {from, label, cont}\n?from⟨ℓ⟩ . cont", color="#075985", fillcolor="#e0f2fe", fontcolor="#0c4a6e"];
+  branch [label="Branch {from, branches}\n&from{ ℓᵢ : Lᵢ }  (external choice)", color="#075985", fillcolor="#e0f2fe", fontcolor="#0c4a6e"];
+  rec    [label="Rec / Var\nμ t. … / t", color="#3730a3", fillcolor="#e0e7ff", fontcolor="#1e1b4b"];
+  lcall  [label="LocalCall {callee, subst, cont}\ncall C[σ] . cont", color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+  lbox   [label="LocalBox {enter, body, exit, cont}\nbox⟨e⟩{…}⟨x⟩ . cont", color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+  end    [label="End\nend", color="#15803d", fillcolor="#dcfce7", fontcolor="#14532d"];
+
+  root -> send; root -> sel; root -> recv; root -> branch; root -> rec; root -> lcall; root -> lbox; root -> end;
+
+  // projection provenance (dotted notes)
+  send  -> p1 [style=dotted]; p1 [label="= project(Interaction) onto sender", shape=note, fillcolor="#e2e8f0", color="#334155", fontcolor="#0f172a"];
+  recv  -> p2 [style=dotted]; p2 [label="= project(Interaction) onto receiver", shape=note, fillcolor="#e2e8f0", color="#334155", fontcolor="#0f172a"];
+  sel   -> p3 [style=dotted]; p3 [label="= project(Choice) onto sender", shape=note, fillcolor="#e2e8f0", color="#334155", fontcolor="#0f172a"];
+  branch-> p4 [style=dotted]; p4 [label="= project(Choice) onto receiver\nOR merged bystander", shape=note, fillcolor="#e2e8f0", color="#334155", fontcolor="#0f172a"];
+}

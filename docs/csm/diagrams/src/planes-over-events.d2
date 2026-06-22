@@ -1,0 +1,36 @@
+# Five planes over ONE append-only event log: position, content, trace-spans, control,
+# tracker. The events are the sole source of position; the rest ANNOTATE them.
+# Palette: events=slate (source of truth), position=teal, content=teal, spans=indigo,
+# control=red, tracker=amber.
+direction: down
+
+events: "csm_run_traces.events  —  the single append-only event log  (the sole source of position)" {
+  style: { fill: "#e2e8f0"; stroke: "#334155"; font-color: "#0f172a"; border-radius: 8; bold: true }
+}
+
+position: "POSITION plane  (ADR-011)" {
+  style: { fill: "#ccfbf1"; stroke: "#0f766e"; font-color: "#134e4a"; border-radius: 8 }
+  p: "per-role (state, stack) = replay(events)\nnothing else checkpointed"
+}
+content: "CONTENT plane — the tape  (ADR-019)" {
+  style: { fill: "#ccfbf1"; stroke: "#0d9488"; font-color: "#134e4a"; border-radius: 8 }
+  c: "working_set_pages keyed rlm:{root_task_id}\nbit-identical on resume (logical clock)"
+}
+spans: "TRACE-SPANS plane  (ADR-020)" {
+  style: { fill: "#e0e7ff"; stroke: "#3730a3"; font-color: "#1e1b4b"; border-radius: 8 }
+  s: "crucible_trace_spans annotate event slices\ncached orch_state VALIDATED against replay, never trusted over it"
+}
+control: "CONTROL plane  (ADR-016)" {
+  style: { fill: "#fee2e2"; stroke: "#b91c1c"; font-color: "#7f1d1d"; border-radius: 8 }
+  ct: "system_control.halted + watch flag\ncrucible_control_journal (audit) + ~/.crucible/HALT trip-file"
+}
+tracker: "TRACKER / experiment / memory" {
+  style: { fill: "#fef3c7"; stroke: "#b45309"; font-color: "#7c2d12"; border-radius: 8 }
+  t: "work_items (claimed_done vs verified) · experiments · memory_*"
+}
+
+events -> position.p: "replay (the oracle)"
+events -> content.c: "shares session_key"
+events -> spans.s: "annotated by"
+events -> control.ct: "halt/resume recover by replay"
+events -> tracker.t: "outcomes feed the ledger"

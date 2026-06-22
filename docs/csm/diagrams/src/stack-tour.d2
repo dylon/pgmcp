@@ -1,0 +1,56 @@
+# The CSM stack tour — plan → typed protocol → projected machines → driven run → proof.
+# Palette: pi/file-work=green, pgmcp/analytical=indigo, type=indigo-deep, runtime=teal,
+# A2A task plane=orange, accept=green, proof=slate.
+direction: down
+
+consumer: "crucible consumer  (pi — does ALL file work)" {
+  style: { fill: "#dcfce7"; stroke: "#15803d"; font-color: "#14532d"; border-radius: 8 }
+  plan: "plan = work-item tree\n(plan → epic → task → todo)"
+  drive: "orchestrator: bind roles → fleet peers, drive, loop until Critic pass"
+}
+
+pgmcp: "pgmcp coordination daemon  (analytical / communicative / verification — never edits files)" {
+  style: { fill: "#e0e7ff"; stroke: "#3730a3"; font-color: "#1e1b4b"; border-radius: 8 }
+
+  type: "Type layer (MPST)  —  src/csm/mpst/" {
+    style: { fill: "#e0e7ff"; stroke: "#312e81" }
+    g: "GlobalType G  (bird's-eye protocol)"
+    proj: "project:  G ↾ r  per role"
+    l: "LocalType  (one role's view)"
+    g -> proj -> l
+  }
+
+  automata: "Automata  —  src/csm/role.rs  (StackAction)" {
+    style: { fill: "#ede9fe"; stroke: "#6d28d9"; font-color: "#4c1d95" }
+    vpa: "regular ⊊ VPL ⊊ DCFL ⊆ CFL\nvisibly-pushdown = decidable conformance"
+  }
+
+  runtime: "Runtime model  —  src/csm/machine.rs" {
+    style: { fill: "#ccfbf1"; stroke: "#0f766e"; font-color: "#134e4a" }
+    lm: "LocalMachine\nstates + Internal/Call/Return edges"
+    cfg: "RoleConfig (state, stack)"
+  }
+
+  conf: "Conformance observer  —  src/csm/conformance.rs" {
+    style: { fill: "#dcfce7"; stroke: "#15803d"; font-color: "#14532d" }
+    check: "lift_transcript → replay → accept ⇔ well-nested ∧ terminal"
+  }
+}
+
+a2a: "A2A substrate  —  src/a2a/  (mailbox plane · task plane)" {
+  style: { fill: "#ffedd5"; stroke: "#c2410c"; font-color: "#7c2d12"; border-radius: 8 }
+  wire: "JSON-RPC tasks/send · a2a_tasks/events · fleet registry"
+}
+
+formal: "Formal layer  —  docs/formal/  (Rocq + TLA⁺, axiom-free)" {
+  style: { fill: "#e2e8f0"; stroke: "#334155"; font-color: "#0f172a"; border-radius: 8 }
+  proof: "deadlock-freedom · conformance soundness · termination"
+}
+
+consumer.plan -> pgmcp.type.g: "csm_synthesize_protocol  (fold the tree)"
+pgmcp.type.l -> pgmcp.runtime.lm: "compile_in"
+pgmcp.runtime.lm -> consumer.drive: "one machine per fleet role"
+consumer.drive -> a2a.wire: "a2a_send_task / a2a_pattern_*"
+a2a.wire -> pgmcp.conf.check: "recorded transcript"
+pgmcp.type.g -> formal.proof: "csm_protocol_to_tla / Rocq cert"
+pgmcp.automata.vpa -> pgmcp.conf.check: "bounded stack ⇒ decidable"

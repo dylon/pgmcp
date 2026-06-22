@@ -1,0 +1,31 @@
+@startuml
+' A compiled LocalMachine showing all three EdgeKinds: Internal (ordinary comm),
+' Call (push a return frame), Return (pop). This is the orchestrator O of a
+' call-bearing protocol. Palette: internal=slate, call/push=violet, return/pop=fuchsia,
+' terminal=green.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam state {
+  BackgroundColor #e2e8f0
+  BorderColor #334155
+  FontColor #0f172a
+}
+
+[*] --> s0
+s0 : initial
+s0 -[#475569]-> s1 : Send(Sub, subcall) / Internal
+s1 -[#7c3aed,bold]-> box : "call:recursive_cf" / **Call{return_state = s2}**  (PUSH)
+box : callee box entry\n(compiled once · reused)
+box -[#475569]-> box2 : … callee body (Internal) …
+box2 -[#c026d3,bold]-> s2 : End / **Return**  (POP → return_state)
+s2 -[#475569]-> s3 : Recv(Sub, subresult) / Internal
+s3 --> [*]
+s3 : terminal
+
+note right of box
+  recursive callee back-edges to its own
+  box entry: finite syntax, unbounded
+  nesting bounded by MAX_STACK_DEPTH
+end note
+@enduml

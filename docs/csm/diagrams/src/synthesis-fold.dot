@@ -1,0 +1,39 @@
+// csm_synthesize_protocol: fold a work-item tree into a typed GlobalType. A leaf →
+// request/response interaction; an interior item → nested GlobalBox (sequenced via the
+// `then` monoid); an iterate-until-pass loop → Rec/Var + Critic-gated Choice.
+// Palette: tree=amber, leaf→interaction=emerald, interior→box=violet, loop→critic=gold.
+digraph fold {
+  rankdir=LR;
+  bgcolor="transparent";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=10];
+  edge [color="#475569", arrowsize=0.6];
+
+  subgraph cluster_tree {
+    label="plan = work-item tree (pgmcp)"; fontname="Inter"; fontsize=12;
+    color="#b45309"; style="rounded"; bgcolor="#fffbeb";
+    node [color="#b45309", fillcolor="#fef3c7", fontcolor="#7c2d12"];
+    root [label="plan (root)"];
+    phase [label="epic / interior task\n(has children)"];
+    t1 [label="leaf task t₁"];
+    t2 [label="leaf task t₂"];
+    loop [label="iterate-until-pass task"];
+    root -> phase; phase -> t1; phase -> t2; root -> loop;
+  }
+
+  fold [label="csm_synthesize_protocol\n(hierarchy-preserving fold,\nsequenced by GlobalType::then)", shape=box3d, color="#312e81", fillcolor="#c7d2fe", fontcolor="#1e1b4b"];
+
+  subgraph cluster_g {
+    label="GlobalType G (validated: well_formed ∧ media_ok ∧ projects ∀role)"; fontname="Inter"; fontsize=12;
+    color="#3730a3"; style="rounded"; bgcolor="#eef2ff";
+    i1 [label="O→W₁:t₁_req . W₁→O:t₁_done", color="#047857", fillcolor="#d1fae5", fontcolor="#065f46"];
+    box [label="GlobalBox⟨enter⟩{ … }⟨exit⟩\n(interior → composite state, push/pop)", color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+    crit [label="μL. … C→O{ pass:end ; fail:L }\n(Critic owns the gating Choice)", color="#a16207", fillcolor="#fef9c3", fontcolor="#713f12"];
+  }
+
+  root -> fold [style=bold, color="#b45309"];
+  loop -> fold [style=bold, color="#b45309"];
+  fold -> i1; fold -> box; fold -> crit;
+
+  drive [label="client-drivable plan\n[{peer, request, response}…]", shape=note, color="#15803d", fillcolor="#dcfce7", fontcolor="#14532d"];
+  i1 -> drive [style=dotted]; box -> drive [style=dotted]; crit -> drive [style=dotted];
+}

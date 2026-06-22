@@ -1,0 +1,31 @@
+// The RLM decomposition tree: PEEK → STRATEGY → DECOMPOSE into snippets; each snippet
+// either RECURSES (self-call, depth_remaining>0 + budget) or is a LEAF (LM peer answers).
+// Partials STITCH upward. Palette: recurse/internal node=violet, leaf=sky, stitch=emerald.
+digraph rlmtree {
+  rankdir=TB;
+  bgcolor="transparent";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=10];
+  edge [color="#475569", arrowsize=0.6];
+
+  root [label="root run  (depth 1, budget B)\npeek · strategy · decompose", shape=box3d, color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+
+  // depth 2 — internal (recurse) and leaf nodes
+  n1 [label="recurse  (depth 2)\nchild_frame: depth−1, budget slice", color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+  l1 [label="LEAF\nLM peer answers snippet", color="#075985", fillcolor="#e0f2fe", fontcolor="#0c4a6e"];
+
+  // depth 3 — two leaves
+  l2 [label="LEAF", color="#075985", fillcolor="#e0f2fe", fontcolor="#0c4a6e"];
+  l3 [label="LEAF\n(depth_remaining = 0 ⇒ forced leaf)", color="#075985", fillcolor="#e0f2fe", fontcolor="#0c4a6e"];
+
+  root -> n1 [label="recurse (push)", color="#7c3aed"];
+  root -> l1 [label="leaf", color="#0284c7"];
+  n1 -> l2 [label="recurse (push)", color="#7c3aed"];
+  n1 -> l3 [label="leaf", color="#0284c7"];
+
+  // stitch (pop) back up
+  st [label="stitch  (≤ RLM_STITCH_WINDOW folds)\nunbounded output", color="#047857", fillcolor="#d1fae5", fontcolor="#065f46"];
+  l2 -> st [label="subresult (pop)", color="#c026d3", style=dashed];
+  l3 -> st [label="subresult (pop)", color="#c026d3", style=dashed];
+  l1 -> st [label="subresult", color="#c026d3", style=dashed];
+  st -> root [label="answer", color="#16a34a"];
+}

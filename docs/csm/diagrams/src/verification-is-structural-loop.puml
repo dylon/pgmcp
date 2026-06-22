@@ -1,0 +1,39 @@
+@startuml
+' Verification is structural: the Critic-gated loop's ONLY path to End runs through the
+' Critic's `pass` branch, so the machine cannot terminate with an unverified result.
+' Palette: work=indigo, critic=gold, pass/end=green, fail/loop=red.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam state {
+  BackgroundColor #e0e7ff
+  BorderColor #3730a3
+  FontColor #1e1b4b
+}
+
+state "μL (loop head)" as L
+state "O→S:attempt_req" as Req
+state "S→O:attempt" as Att
+state "O→C:verify_req" as Ver
+state CriticGate <<choice>> #fef9c3
+state "O→S:release · end" as Done #dcfce7
+
+[*] --> L
+L --> Req
+Req --> Att
+Att --> Ver
+Ver --> CriticGate : C→O : verdict
+CriticGate --> Done : **pass**  (the ONLY exit)
+CriticGate --> L : **fail**  (back-edge — try again)
+Done --> [*]
+
+note right of CriticGate #fef9c3
+  the Critic owns the gating Choice;
+  workers are bystanders → projection
+  MERGES both branches (same-sender Recv)
+end note
+note bottom of Done #dcfce7
+  the machine cannot reach End without a `pass`
+  ⇒ no termination with an unverified result
+end note
+@enduml

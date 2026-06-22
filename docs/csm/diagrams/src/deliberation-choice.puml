@@ -1,0 +1,31 @@
+@startuml
+' Deliberation: the only pattern with a genuine sender-driven choice. The Reflector
+' either continues (dispatch the Tool-Caller, loop) or converges (finalize). Palette:
+' choice/critic=gold, loop=indigo, converge=green, divergence=red.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam state {
+  BackgroundColor #e0e7ff
+  BorderColor #3730a3
+  FontColor #1e1b4b
+}
+
+[*] --> Reflect
+state "μL: O→R:reflect_req" as Reflect
+Reflect --> Choice : R→O : verdict
+state Choice <<choice>> #fef9c3
+Choice --> Act : **continue**
+Choice --> Converged : **converged**
+state "O→T:act_req · T→O:result" as Act #e0e7ff
+Act --> Reflect : loop back to L
+state "O→T:finish · T→O:final" as Converged #dcfce7
+Converged --> [*]
+
+note right of Converged #fee2e2
+  spec: Tool-Caller produces the final answer.
+  text impl stops at R→O:converged ⇒
+  csm_validate_run reports Incomplete{T}
+  (the divergence the observer surfaces)
+end note
+@enduml

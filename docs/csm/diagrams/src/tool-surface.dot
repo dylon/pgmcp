@@ -1,0 +1,50 @@
+// The 9 csm_* tools + protocol_soundness, grouped by job, each pointing at the artifact
+// it consumes/produces. Palette: introspect=indigo, synthesize=violet, observe=green,
+// export=teal, artifact=slate.
+digraph tools {
+  rankdir=LR;
+  bgcolor="transparent";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=10];
+  edge [color="#475569", arrowsize=0.6];
+
+  subgraph cluster_intro {
+    label="INTROSPECT"; fontname="Inter"; fontsize=12; color="#3730a3"; style="rounded"; bgcolor="#eef2ff";
+    node [color="#3730a3", fillcolor="#e0e7ff", fontcolor="#1e1b4b"];
+    t_list [label="csm_list_protocols"];
+    t_of   [label="csm_protocol_of_pattern"];
+    t_proj [label="csm_show_projection"];
+    t_plan [label="csm_protocol_plan"];
+  }
+  subgraph cluster_synth {
+    label="SYNTHESIZE"; fontname="Inter"; fontsize=12; color="#6d28d9"; style="rounded"; bgcolor="#f5f3ff";
+    node [color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+    t_syn [label="★ csm_synthesize_protocol\n(plan tree → GlobalType)"];
+  }
+  subgraph cluster_obs {
+    label="OBSERVE"; fontname="Inter"; fontsize=12; color="#15803d"; style="rounded"; bgcolor="#f0fdf4";
+    node [color="#15803d", fillcolor="#dcfce7", fontcolor="#14532d"];
+    t_val [label="★ csm_validate_run\n(run → conformance verdict)"];
+    t_inf [label="csm_infer_peer_fsm"];
+  }
+  subgraph cluster_exp {
+    label="EXPORT & PROVE"; fontname="Inter"; fontsize=12; color="#0f766e"; style="rounded"; bgcolor="#f0fdfa";
+    node [color="#0f766e", fillcolor="#ccfbf1", fontcolor="#134e4a"];
+    t_tla [label="csm_protocol_to_tla"];
+    t_str [label="csm_protocol_string_diagram"];
+    t_snd [label="protocol_soundness"];
+  }
+
+  // artifacts (slate)
+  node [shape=box3d, color="#334155", fillcolor="#e2e8f0", fontcolor="#0f172a"];
+  g     [label="GlobalType G"];
+  net   [label="Network\n(LocalMachine per role)"];
+  trace [label="Trace\n(csm_run_traces.events)"];
+  tla   [label="TLA⁺ module"];
+
+  t_list -> g; t_of -> g; t_syn -> g;
+  t_proj -> net; t_plan -> net;
+  t_val -> trace; t_inf -> trace;
+  t_tla -> tla; t_str -> g; t_snd -> g;
+  g -> net [label="project + compile", color="#6d28d9"];
+  net -> trace [label="drive → replay", color="#15803d"];
+}

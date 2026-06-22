@@ -1,0 +1,45 @@
+// Coordination before vs after the CSM. Left: hardcoded control flow, invisible to the
+// four capabilities. Right: a typed protocol, transparent to all four.
+// Palette: before/opaque=red, after/typed=indigo, capabilities=teal.
+digraph beforeafter {
+  rankdir=LR;
+  bgcolor="transparent";
+  fontname="Inter";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=11];
+  edge [fontname="Inter", fontsize=10, color="#475569"];
+
+  subgraph cluster_before {
+    label="BEFORE — coordination as code";
+    fontname="Inter"; fontsize=13; color="#b91c1c"; style="rounded"; bgcolor="#fee2e2";
+    node [color="#b91c1c", fillcolor="#fecaca", fontcolor="#7f1d1d"];
+    b_loop [label="hardcoded async/await loop\n+ string sentinel \"CONVERGED\""];
+    b_op [label="opaque control flow", shape=octagon, fillcolor="#fca5a5"];
+    b_loop -> b_op;
+  }
+
+  subgraph cluster_after {
+    label="AFTER — coordination as a typed protocol";
+    fontname="Inter"; fontsize=13; color="#3730a3"; style="rounded"; bgcolor="#e0e7ff";
+    node [color="#3730a3", fillcolor="#c7d2fe", fontcolor="#1e1b4b"];
+    a_g [label="GlobalType G", shape=box3d];
+    a_proj [label="project: G ↾ r"];
+    a_g -> a_proj;
+  }
+
+  // the four capabilities a typed protocol unlocks (teal)
+  node [color="#0f766e", fillcolor="#ccfbf1", fontcolor="#134e4a", shape=box];
+  inspect [label="INSPECT\ncsm_show_projection"];
+  check   [label="MODEL-CHECK\ncsm_protocol_to_tla → TLC"];
+  replay  [label="REPLAY\ncsm_validate_run"];
+  learn   [label="LEARN\nMSM trajectory"];
+
+  b_op -> inspect [label="✗", color="#dc2626", fontcolor="#dc2626"];
+  b_op -> check   [label="✗", color="#dc2626", fontcolor="#dc2626"];
+  b_op -> replay  [label="✗", color="#dc2626", fontcolor="#dc2626"];
+  b_op -> learn   [label="✗", color="#dc2626", fontcolor="#dc2626"];
+
+  a_proj -> inspect [label="✓", color="#16a34a", fontcolor="#16a34a"];
+  a_proj -> check   [label="✓", color="#16a34a", fontcolor="#16a34a"];
+  a_proj -> replay  [label="✓", color="#16a34a", fontcolor="#16a34a"];
+  a_proj -> learn   [label="✓", color="#16a34a", fontcolor="#16a34a"];
+}

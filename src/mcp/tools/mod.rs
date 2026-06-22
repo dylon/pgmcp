@@ -327,6 +327,7 @@ pub mod tool_csm_synthesize_protocol;
 pub mod tool_csm_validate_run;
 pub mod tool_experiments;
 pub mod tool_fca_concept_lattice;
+pub mod tool_crucible_trace;
 pub mod tool_orchestrator_recommend_next;
 pub mod tool_session_checkpoint_list;
 pub mod tool_session_checkpoint_resume;

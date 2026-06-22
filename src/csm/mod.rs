@@ -34,6 +34,7 @@ pub mod session_store;
 pub mod store;
 pub mod string_diagram;
 pub mod tla_export;
+pub mod trace_store;
 pub mod trajectory;
 pub mod transition;
 pub mod validate;

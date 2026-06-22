@@ -41,6 +41,25 @@ pub async fn tool_a2a_cancel_task(
         .cancel_task(task_id)
         .await
         .map_err(|e| McpError::internal_error(format!("A2A cancel failed: {}", e), None))?;
+
+    // Journal the per-task cancel to the control-plane audit (ADR-020/D4): which task
+    // was abandoned, on which peer. Best-effort — a journal failure must not fail the
+    // cancel (which has already taken effect on the peer).
+    let entry = crate::csm::trace_store::ControlInput {
+        action: crate::csm::trace_store::ControlAction::Cancel,
+        scope: crate::csm::trace_store::ControlScope::Task,
+        session_key: None,
+        task_id: Some(task_id),
+        work_item_public_id: None,
+        trace_id: None,
+        span_id: None,
+        reason: None,
+        actor: Some("mcp".to_string()),
+        attributes: json!({ "target_agent": params.target_agent }),
+    };
+    if let Err(e) = crate::csm::trace_store::record_control(pool, &entry).await {
+        tracing::warn!(error = %e, "cancel control-journal append failed (cancel still applied)");
+    }
     // Shadow-ASR channel (Phase D2b): project-scoped effect distribution
     // (resolved from the local parent-task row, if this id is a local task).
     let pid: Option<i32> = sqlx::query_scalar::<_, i32>(

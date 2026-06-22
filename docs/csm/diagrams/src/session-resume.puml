@@ -1,0 +1,36 @@
+@startuml
+' Session pause → resume by replay: pause refuses unless children terminal, then flushes
+' the transcript; resume rebuilds the Network from the stored global_type and replays the
+' events to recover every role's (state, stack). Palette: pause=indigo, replay=teal,
+' refuse=red, resume=green.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam ActivityBackgroundColor #e0e7ff
+skinparam ActivityBorderColor #3730a3
+skinparam ActivityDiamondBackgroundColor #fef9c3
+skinparam ActivityDiamondBorderColor #a16207
+
+start
+partition "PAUSE" {
+  if (every child a2a_task terminal?) then (no)
+    #fee2e2:refuse — {paused:false, reason:"peer W1 is Working"};
+    stop
+  else (yes)
+    #e0e7ff:flush transcript → csm_run_traces.events;
+    #e0e7ff:status ← paused, stamp paused_at;
+  endif
+}
+partition "RESUME" {
+  #ccfbf1:rebuild Network = build(global_type);
+  #ccfbf1:replay_to_configs(events + unflushed transcript);
+  if (prefix replays cleanly?) then (yes)
+    #ccfbf1:recover per-role (state, stack) + frame_depth;
+    #dcfce7:next_step_from → re-plan, status ← running;
+    stop
+  else (no)
+    #fee2e2:resume refuses LOUDLY (error!) — never silently desync;
+    stop
+  endif
+}
+@enduml

@@ -1,0 +1,37 @@
+# The two A2A planes: a durable mailbox (async notes) and a synchronous task protocol,
+# over a shared agent registry. Palette: mailbox=cyan, task=orange, registry=indigo,
+# postgres=slate.
+direction: right
+
+fleet: "Fleet agents  (registered peers + pi)" {
+  style: { fill: "#dcfce7"; stroke: "#15803d"; font-color: "#14532d"; border-radius: 8 }
+}
+
+registry: "Agent registry — a2a_agents  ⋈  mcp_clients (liveness)" {
+  style: { fill: "#e0e7ff"; stroke: "#3730a3"; font-color: "#1e1b4b"; border-radius: 8 }
+  cols: "name · specialty[] · recommended_role · url · last_seen_at"
+  disc: "discovery: find_agents_by_specialty · active_agents · fleet_view"
+}
+
+mailbox: "MAILBOX plane  (durable async notes)" {
+  style: { fill: "#cffafe"; stroke: "#0e7490"; font-color: "#164e63"; border-radius: 8 }
+  msgs: "agent_messages\nto_session | to_project_id | to_agent · kind · reply_to"
+  rcpt: "agent_message_receipts\ndelivered_at → read_at → acked_at (monotonic)"
+  tools: "a2a_send_message · reply · ack · inbox (pull = reliable floor)"
+}
+
+task: "TASK plane  (synchronous request → typed result)" {
+  style: { fill: "#ffedd5"; stroke: "#c2410c"; font-color: "#7c2d12"; border-radius: 8 }
+  tasks: "a2a_tasks\nTaskState: Submitted→Working→…→Completed/Canceled/Failed"
+  evt: "a2a_events  (SSE @200ms · pg_notify reserved)"
+  tools: "a2a_send_task · get_task · subscribe_task · cancel_task"
+  rlm: "Message.metadata.rlm  → carries the RLM frame (ch.09)"
+}
+
+fleet -> registry: "register / discover"
+fleet -> mailbox.tools: "FYI · request · WorktreeNegotiation kinds"
+fleet -> task.tools: "blocking tasks/send  (= each Interaction's Send/Recv)"
+task.tasks -> registry.disc: "bind role → peer by specialty"
+mailbox -> pg
+task -> pg
+pg: "PostgreSQL" { style: { fill: "#e2e8f0"; stroke: "#334155"; font-color: "#0f172a"; border-radius: 8 } }

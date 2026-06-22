@@ -1,0 +1,36 @@
+@startuml
+' Network::build_in: from a GlobalType to one compiled LocalMachine per role.
+' Palette: global=indigo-deep, project=teal, local=teal, compile=teal, reject=red.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam ActivityBackgroundColor #ccfbf1
+skinparam ActivityBorderColor #0f766e
+skinparam ActivityDiamondBackgroundColor #fef9c3
+skinparam ActivityDiamondBorderColor #a16207
+
+start
+#e0e7ff:GlobalType  G   (well-formed, ch.02);
+:roles ← participants(G);
+repeat :pick next role r;
+  #ccfbf1:L ← project(G, r)   (ch.02);
+  if (projects?) then (yes)
+    #ccfbf1:compile_in(r, L, penv);
+    note right
+      Rec/Var → back-edge (self-loop)
+      LocalCall/Box → Call{return_state}/Return
+      recursive callee compiled ONCE (memoized box)
+      call-free ⇒ Internal-only edges
+    end note
+    #ccfbf1:machines[r] ← LocalMachine;
+  else (no)
+    #fee2e2:ProjectionError — refuse whole build;
+    stop
+  endif
+repeat while (more roles?) is (yes)
+->no;
+:channels ← collect_channels(G);
+#dcfce7:Network { machines, channels }
+(drivable + checkable — ch.05/06);
+stop
+@enduml

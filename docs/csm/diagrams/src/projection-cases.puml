@@ -1,0 +1,47 @@
+@startuml
+' project(G, r): the decision taken per GlobalType construct.
+' Palette: send=emerald, recv=sky, bystander/merge=slate, call=violet, reject=red.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam ActivityBackgroundColor #e0e7ff
+skinparam ActivityBorderColor #3730a3
+skinparam ActivityDiamondBackgroundColor #fef9c3
+skinparam ActivityDiamondBorderColor #a16207
+
+start
+:project(G, r);
+switch (construct of G?)
+case (Interaction from→to:ℓ)
+  if (r = from?) then (yes)
+    #d1fae5:return  !to⟨ℓ⟩ . project(cont);
+  elseif (r = to?) then (yes)
+    #e0f2fe:return  ?from⟨ℓ⟩ . project(cont);
+  else (bystander)
+    #e2e8f0:return  project(cont)  (skip);
+  endif
+case (Choice from→to)
+  if (r = from?) then (sender)
+    #d1fae5:return  ⊕to{ ℓᵢ : project(Gᵢ) };
+  elseif (r = to?) then (receiver)
+    #e0f2fe:return  &from{ ℓᵢ : project(Gᵢ) };
+  else (bystander)
+    #e2e8f0:acc ← merge over all branches;
+    if (mergeable?) then (yes)
+      #dcfce7:return acc;
+    else (no)
+      #fee2e2:raise Unmergeable;
+      stop
+    endif
+  endif
+case (GlobalCall / GlobalBox)
+  if (r participates in frame?) then (yes)
+    #ede9fe:return  call/box … . project(cont)  (push/pop);
+  else (bystander)
+    #e2e8f0:return  project(cont)  (skip closed frame);
+  endif
+case (Rec / Var / End)
+  #e0e7ff:return  μt./t/end  (structural);
+endswitch
+stop
+@enduml

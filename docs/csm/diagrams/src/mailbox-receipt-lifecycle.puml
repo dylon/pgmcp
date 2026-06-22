@@ -1,0 +1,29 @@
+@startuml
+' The monotonic mailbox receipt lifecycle: a read implies delivered, an ack implies
+' read + delivered (COALESCE, never moving a timestamp backward). Palette: mailbox=cyan.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam state {
+  BackgroundColor #cffafe
+  BorderColor #0e7490
+  FontColor #164e63
+}
+
+[*] --> Sent : a2a_send_message
+Sent --> Delivered : push channel\nOR inbox pull
+Delivered : delivered_at stamped
+Delivered --> Read : agent reads it
+Read : read_at  (implies delivered_at)
+Read --> Acked : a2a_ack_message
+Acked : acked_at  (implies read_at + delivered_at)
+Acked --> [*]
+Read --> Replied : a2a_reply_message
+Replied : new message, reply_to → this id
+Replied --> [*]
+
+note right of Sent
+  3 addressing dimensions:
+  to_session · to_project_id · to_agent
+end note
+@enduml

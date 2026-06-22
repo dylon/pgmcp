@@ -1,0 +1,27 @@
+// The black-box-Text-only law: a black-box agent may ride only Text edges; a Latent
+// edge is a ProjectionError caught before any agent runs. Palette: Text=green,
+// Latent=amber, black-box=slate, reject=red, accept=green.
+digraph blackbox {
+  rankdir=LR;
+  bgcolor="transparent";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=11];
+  edge [fontname="Inter", fontsize=10];
+
+  bb [label="black-box agent\n(Claude · Codex · pi)\nno hidden-state API",
+      shape=box3d, color="#334155", fillcolor="#e2e8f0", fontcolor="#0f172a"];
+  wb [label="white-box backbone\n(local Qwen3, logits/hidden-state)",
+      shape=box3d, color="#b45309", fillcolor="#fef3c7", fontcolor="#7c2d12"];
+
+  txt [label="Text edge\nMessageMedium::Text", color="#15803d", fillcolor="#dcfce7", fontcolor="#14532d"];
+  lat [label="Latent edge\nMessageMedium::Latent{…}", color="#b45309", fillcolor="#fef3c7", fontcolor="#7c2d12"];
+
+  ok   [label="✓ projects\n(role bound, run proceeds)", color="#15803d", fillcolor="#dcfce7", fontcolor="#14532d"];
+  bad  [label="✗ ProjectionError\ncaught BEFORE any agent runs\n(CsmMedium.v)", shape=octagon, color="#b91c1c", fillcolor="#fee2e2", fontcolor="#7f1d1d"];
+
+  bb -> txt [color="#16a34a", label="legal"];
+  txt -> ok [color="#16a34a"];
+  bb -> lat [color="#dc2626", style=bold, label="ILLEGAL"];
+  lat -> bad [color="#dc2626", style=bold];
+  wb -> lat [color="#d97706", label="legal (white-box only)"];
+  lat -> ok [color="#d97706", style=dashed];
+}

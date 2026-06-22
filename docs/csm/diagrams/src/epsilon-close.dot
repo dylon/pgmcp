@@ -1,0 +1,39 @@
+// The conformance replay step (a coloured re-render of ADR-030's ε-closure ASCII):
+// each event advances sender + receiver through check_step, with Call(push)/Return(pop)
+// boundary edges chased as ε-moves. Palette: event=slate, push=violet, pop=fuchsia,
+// internal=emerald/sky, accept=green, reject=red.
+digraph epsilon {
+  rankdir=TB;
+  bgcolor="transparent";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=10];
+  edge [color="#475569", arrowsize=0.7, fontname="Inter", fontsize=9];
+
+  ev [label="event  e = (from → label → to)", shape=box3d, color="#334155", fillcolor="#e2e8f0", fontcolor="#0f172a"];
+
+  subgraph cluster_close {
+    label="advance_role(machine, state, stack, action)"; fontname="Inter"; fontsize=11;
+    color="#3730a3"; style="rounded"; bgcolor="#eef2ff";
+
+    c1 [label="ε-close\nchase Call/Return", color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+    step [label="check_step\ntake matching Internal edge", color="#047857", fillcolor="#d1fae5", fontcolor="#065f46"];
+    c2 [label="ε-close again\nconsume trailing boundaries", color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+
+    c1 -> step -> c2;
+  }
+
+  // the stack actions taken during ε-closure
+  push [label="Call{return_state}\n|stack| ≥ MAX ? → DepthExceeded\nelse push return_state", color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+  pop  [label="Return\npop() or → Unbalanced", color="#a21caf", fillcolor="#fae8ff", fontcolor="#701a75"];
+
+  ev -> c1 [label="sender: Send / receiver: Recv"];
+  c1 -> push [label="ε", style=dashed, color="#7c3aed"];
+  c1 -> pop  [label="ε", style=dashed, color="#c026d3"];
+  push -> c1 [style=dashed, color="#7c3aed"];
+  pop  -> c1 [style=dashed, color="#c026d3"];
+
+  accept [label="ACCEPT ✓\n∀ roles: terminal(state) ∧ stack empty\n(well-nested / Dyck-balanced)", color="#15803d", fillcolor="#dcfce7", fontcolor="#14532d"];
+  reject [label="REJECT ✗\nStep · Incomplete · Unbalanced · DepthExceeded", shape=octagon, color="#b91c1c", fillcolor="#fee2e2", fontcolor="#7f1d1d"];
+
+  c2 -> accept [label="trace exhausted, all clean", color="#16a34a"];
+  c2 -> reject [label="any failure", color="#dc2626"];
+}

@@ -1,0 +1,35 @@
+// The GlobalType AST: seven constructors, coloured by language class.
+// Regular (finite-state) = indigo; context-free (visibly-pushdown) = violet (push)
+// / fuchsia (pop). Each context-free node is annotated with its StackAction.
+digraph globaltype {
+  rankdir=TB;
+  bgcolor="transparent";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=11];
+  edge [color="#475569", arrowsize=0.7];
+
+  root [label="GlobalType  G", shape=box3d, color="#312e81", fillcolor="#e0e7ff", fontcolor="#1e1b4b"];
+
+  // regular constructors (indigo)
+  node [color="#3730a3", fillcolor="#e0e7ff", fontcolor="#1e1b4b"];
+  inter  [label="Interaction\n{from, to, label, cont}\nfrom → to : ℓ . cont"];
+  choice [label="Choice\n{from, to, branches}\nfrom → to { ℓᵢ : Gᵢ }"];
+  rec    [label="Rec {var, body}\nμ t. body"];
+  var    [label="Var {var}\nt  (back-edge)"];
+  end    [label="End\nend", color="#15803d", fillcolor="#dcfce7", fontcolor="#14532d"];
+
+  // context-free constructors (violet = push frame)
+  gcall [label="GlobalCall\n{callee, subst, cont}\ncall C[σ] . cont\n— push (Σ_call) / pop (Σ_ret)",
+         color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+  gbox  [label="GlobalBox\n{enter, body, exit, cont}\nbox⟨e⟩{ body }⟨x⟩ . cont\n— push (enter) / pop (exit)",
+         color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+
+  root -> inter; root -> choice; root -> rec; root -> var; root -> end;
+  root -> gcall; root -> gbox;
+
+  // the discriminating field
+  inter -> i_cont [style=dotted]; i_cont [label="cont : Box<GlobalType>", shape=note, fillcolor="#e2e8f0", color="#334155", fontcolor="#0f172a"];
+  gcall -> g_cont [style=dotted]; g_cont [label="cont = RETURN continuation\n(what Rec/Var cannot express)", shape=note, fillcolor="#fae8ff", color="#a21caf", fontcolor="#701a75"];
+  gbox  -> g_cont [style=dotted];
+
+  { rank=same; inter; choice; rec; var; end; gcall; gbox; }
+}

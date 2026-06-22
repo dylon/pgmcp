@@ -1741,6 +1741,34 @@ async fn set_halted(
                 format!("persist halt: {e}"),
             )
         })?;
+
+        // Append the action to the append-only control-plane audit journal so the
+        // halt/resume history is post-mortemable (ADR-020/D4) — the mutable
+        // `system_control` row above is only the current-state cache. Best-effort:
+        // a journal failure must NEVER block the stop itself, so log and continue.
+        // This is the single choke point every channel funnels through (REST,
+        // `scripts/all-stop.sh`, the UPS `on-power-fail.sh` hook), so every
+        // fleet-wide halt/resume is journaled here exactly once.
+        let action = if halt {
+            crate::csm::trace_store::ControlAction::Halt
+        } else {
+            crate::csm::trace_store::ControlAction::Resume
+        };
+        let entry = crate::csm::trace_store::ControlInput {
+            action,
+            scope: crate::csm::trace_store::ControlScope::Fleet,
+            session_key: None,
+            task_id: None,
+            work_item_public_id: None,
+            trace_id: None,
+            span_id: None,
+            reason: reason.map(str::to_string),
+            actor: Some("rest".to_string()),
+            attributes: serde_json::json!({}),
+        };
+        if let Err(e) = crate::csm::trace_store::record_control(pool, &entry).await {
+            tracing::warn!(error = %e, "control-journal append failed (all-stop still applied)");
+        }
     }
     Ok(())
 }

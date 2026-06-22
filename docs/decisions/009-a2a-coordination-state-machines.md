@@ -9,6 +9,9 @@
   (`src/llm/`), and `docs/formal/` (the TLA⁺/Rocq precedent: `CronStateMachine.tla`,
   `TransducerMandateDedup.v`).
 - **Design plan:** `~/.claude/plans/we-have-modeled-the-compiled-ritchie.md`
+- **Pedagogical treatise:** [`docs/csm/`](../csm/README.md) — the from-scratch design record
+  (theory → data model → conformance → patterns → RLM → crucible execution), with diagrams,
+  literate pseudocode, and links to the proofs.
 
 ## Context
 

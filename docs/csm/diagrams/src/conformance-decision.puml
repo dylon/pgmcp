@@ -1,0 +1,36 @@
+@startuml
+' check_conformance: the three-part acceptance condition. Palette: legal/accept=green,
+' reject=red, checks=gold.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam ActivityBackgroundColor #dcfce7
+skinparam ActivityBorderColor #15803d
+skinparam ActivityDiamondBackgroundColor #fef9c3
+skinparam ActivityDiamondBorderColor #a16207
+
+start
+:replay_to_configs(net, trace);
+if (every event legal?) then (yes)
+  if (every machine's stack empty?) then (yes\nwell-nested)
+    if (every machine terminal?) then (yes)
+      #dcfce7:**CONFORM ✓**
+      (legal ∧ well-nested ∧ complete);
+      stop
+    else (no)
+      #fee2e2:Incomplete(role, state)
+      — a prefix, not a full path
+      (e.g. Deliberation convergence divergence);
+      stop
+    endif
+  else (no)
+    #fee2e2:Unbalanced(role, depth)
+    — unreturned call frames / popped empty stack;
+    stop
+  endif
+else (no)
+  #fee2e2:Step / UnknownRole / DepthExceeded
+  — an illegal or out-of-protocol event;
+  stop
+endif
+@enduml

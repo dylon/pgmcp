@@ -1,0 +1,28 @@
+@startuml
+' The automata capability ladder: DFA → PDA → DPDA → VPA, with memory + conformance
+' decidability per rung, and VPA marked as the chosen class. Palette: regular=indigo,
+' general-PDA=red (undecidable), VPA=violet (chosen).
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam rectangle {
+  BorderColor #475569
+  FontColor #1e293b
+}
+
+rectangle "DFA / FSM\n—\nmemory: state only\nclass: regular\nconformance: decidable ✓\n(the OLD CSM)" as dfa #e0e7ff
+rectangle "PDA\n—\nmemory: + unbounded stack\nclass: CFL\nconformance/inclusion: UNDECIDABLE ✗" as pda #fee2e2
+rectangle "DPDA\n—\nmemory: + deterministic stack\nclass: DCFL\nnot closed under ∩/∪ ✗" as dpda #e2e8f0
+rectangle "**VPA**  ★ chosen\n—\nstack action fixed by SYMBOL CLASS\nclass: VPL\nclosed ∩∪¬ ✓ · inclusion decidable ✓\n(RecursiveCf · HSM boxes · crucible plans)" as vpa #ede9fe
+
+dfa -right-> pda : "add a stack\n(too much power)"
+pda -down-> dpda : "make it\ndeterministic"
+dpda -left-> vpa : "make the stack action\nVISIBLE in the symbol"
+dfa -down-> vpa : "the CSM lift\n(ADR-030): exactly\none band further"
+
+note bottom of vpa
+  bounded stack (MAX_STACK_DEPTH = 4096)
+  ⇒ finite reachable configs
+  ⇒ Rocq Inductive (no coinduction), TLC finite model
+end note
+@enduml

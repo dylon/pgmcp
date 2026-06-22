@@ -39,6 +39,8 @@ mod handlers_core;
 mod handlers_core_advanced;
 #[path = "server/handlers/csm.rs"]
 mod handlers_csm;
+#[path = "server/handlers/trace.rs"]
+mod handlers_trace;
 #[path = "server/handlers/data_eng.rs"]
 mod handlers_data_eng;
 #[path = "server/handlers/data_tables.rs"]
@@ -498,6 +500,7 @@ impl McpServer {
             + Self::router_prediction()
             + Self::router_a2a()
             + Self::router_csm()
+            + Self::router_trace()
             + Self::router_fv()
             + Self::router_experiments()
             + Self::router_work_items_a()
@@ -574,6 +577,7 @@ impl McpServer {
             ("prediction", names(Self::router_prediction())),
             ("a2a", names(Self::router_a2a())),
             ("csm", names(Self::router_csm())),
+            ("trace", names(Self::router_trace())),
             ("fv", names(Self::router_fv())),
             ("experiments", names(Self::router_experiments())),
             ("work_items_a", names(Self::router_work_items_a())),
@@ -968,6 +972,22 @@ impl McpServer {
             "session_checkpoint_save"   => session_checkpoint_save(SessionCheckpointSaveParams),
             "session_checkpoint_resume" => session_checkpoint_resume(SessionCheckpointResumeParams),
             "session_checkpoint_list"   => session_checkpoint_list(SessionCheckpointListParams),
+            // Crucible unified run tracing (ADR-020 E10)
+            "crucible_trace_open_span"             => crucible_trace_open_span(CrucibleTraceSpanParams) in tool_crucible_trace,
+            "crucible_trace_record_span"           => crucible_trace_record_span(CrucibleTraceSpanParams) in tool_crucible_trace,
+            "crucible_trace_close_span"            => crucible_trace_close_span(CrucibleTraceCloseParams) in tool_crucible_trace,
+            "crucible_trace_event"                 => crucible_trace_event(CrucibleTraceEventParams) in tool_crucible_trace,
+            "crucible_trace_record_counterexample" => crucible_trace_record_counterexample(CrucibleRecordCexParams) in tool_crucible_trace,
+            "crucible_trace_control"               => crucible_trace_control(CrucibleControlParams) in tool_crucible_trace,
+            "crucible_trace_get"                   => crucible_trace_get(CrucibleTraceRefParams) in tool_crucible_trace,
+            "crucible_trace_timeline"              => crucible_trace_timeline(CrucibleTraceTimelineParams) in tool_crucible_trace,
+            "crucible_trace_query"                 => crucible_trace_query(CrucibleTraceQueryParams) in tool_crucible_trace,
+            "crucible_trace_replay"                => crucible_trace_replay(CrucibleTraceReplayParams) in tool_crucible_trace,
+            "crucible_trace_reconcile"             => crucible_trace_reconcile(CrucibleTraceRefParams) in tool_crucible_trace,
+            "crucible_trace_why"                   => crucible_trace_why(CrucibleTraceRefParams) in tool_crucible_trace,
+            "crucible_trace_diff"                  => crucible_trace_diff(CrucibleTraceDiffParams) in tool_crucible_trace,
+            "crucible_trace_audit"                 => crucible_trace_audit(CrucibleTraceAuditParams) in tool_crucible_trace,
+            "crucible_trace_counterexample"        => crucible_trace_counterexample(CrucibleTraceCexParams) in tool_crucible_trace,
             // Phase 4 — the agent-facing tape verbs (black-box-legal).
             "tape_get"      => tape_get(TapeGetParams),
             "tape_put"      => tape_put(TapePutParams),

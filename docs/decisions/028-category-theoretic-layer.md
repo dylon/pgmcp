@@ -7,6 +7,9 @@
   (pullback), `integration_point` (pushout), `effect_functor`, `naturality_gap`, `colimit_view`.
   Formal: `docs/formal/containment_functor.v` (Rocq, coqc-verified), `ContainmentFunctor.tla`
   (TLC: no error). Experiment: `docs/experiments/item4-categorical-validation.md`.
+- **Pedagogical treatise:** [`docs/csm/`](../csm/README.md) — CT-1 (projection-as-functor),
+  CT-2 (the `then` monoid + projection homomorphism), and CT-3 (string-diagram tensor) are
+  developed for the Communicating State Machine in [ch.12](../csm/12-category-theory-layer.md).
 
 ## Context
 

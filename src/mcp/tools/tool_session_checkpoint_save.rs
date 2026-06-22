@@ -225,6 +225,25 @@ pub async fn tool_session_checkpoint_save(
             McpError::internal_error(format!("checkpoint UPSERT failed: {e}"), None)
         })?;
 
+        // Journal the graceful pause to the control-plane audit (ADR-020/D4) so the
+        // operator can post-mortem when/why a session was checkpointed. Best-effort:
+        // a journal failure must not fail the pause itself.
+        let entry = crate::csm::trace_store::ControlInput {
+            action: crate::csm::trace_store::ControlAction::Checkpoint,
+            scope: crate::csm::trace_store::ControlScope::Session,
+            session_key: Some(params.session_key.clone()),
+            task_id: None,
+            work_item_public_id: None,
+            trace_id: None,
+            span_id: None,
+            reason: Some("pause".to_string()),
+            actor: Some("mcp".to_string()),
+            attributes: json!({ "cursor": cursor, "critic_iteration": critic_iteration }),
+        };
+        if let Err(e) = crate::csm::trace_store::record_control(pool, &entry).await {
+            tracing::warn!(error = %e, "checkpoint control-journal append failed (pause still applied)");
+        }
+
         return json_result(&json!({
             "session_key": params.session_key,
             "id": id,

@@ -1,0 +1,43 @@
+// Traceability: each formal artifact → the theorem/invariant it discharges → the code it
+// covers. Palette: Rocq=violet, TLA=indigo, code=teal, property=green.
+digraph proofmap {
+  rankdir=LR;
+  bgcolor="transparent";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=9];
+  edge [color="#475569", arrowsize=0.6];
+
+  subgraph cluster_rocq {
+    label="Rocq (.v) — axiom-free, Qed"; fontname="Inter"; fontsize=11;
+    color="#6d28d9"; style="rounded"; bgcolor="#f5f3ff";
+    node [color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+    mpst [label="CsmMpst.v\nT3 progress · T4 subject reduction\nT5 projection soundness · T6 op. corr.\nCT-2 monoid laws"];
+    pd   [label="CsmPushdown.v\nconformance_sound/complete/decidable\npushdown_terminates (stack = nat)"];
+    dl   [label="CsmDeadlockFreedom.v\nwf ⇒ deadlock_free ∧ progress"];
+    med  [label="CsmMedium.v\nblack-box never on Latent edge"];
+  }
+  subgraph cluster_tla {
+    label="TLA⁺ (.tla) — TLC / TLAPS"; fontname="Inter"; fontsize=11;
+    color="#3730a3"; style="rounded"; bgcolor="#eef2ff";
+    node [color="#3730a3", fillcolor="#e0e7ff", fontcolor="#1e1b4b"];
+    cfsm [label="CfsmNetwork.tla\nDeadlockFreedom · NoOrphan\nRoundsBounded · EventualTermination"];
+    lin  [label="A2aLinearPipeline.tla\nDeadlockFreedom · EventualTermination"];
+    vpa  [label="PushdownCsm + VpaConformance.tla\nStackBounded · WellNested\nBalancedInv · BadRejectedInv"];
+    wn   [label="WorktreeNegotiation.tla\nGatekeeperSafety · EventuallyUnblocked"];
+  }
+
+  subgraph cluster_code {
+    label="code locus"; fontname="Inter"; fontsize=11;
+    color="#0f766e"; style="rounded"; bgcolor="#f0fdfa";
+    node [color="#0f766e", fillcolor="#ccfbf1", fontcolor="#134e4a"];
+    cproj [label="csm/mpst/project.rs"];
+    cconf [label="csm/conformance.rs"];
+    creg  [label="csm/registry.rs"];
+    cmed  [label="csm/role.rs (MessageMedium)"];
+  }
+
+  mpst -> cproj; pd -> cconf; dl -> cproj; med -> cmed;
+  cfsm -> creg; lin -> creg; vpa -> cconf; wn -> creg;
+
+  gold [label="golden topology test (csm/mod.rs)\npins (roles,channels) ⇒ TLA/Rust cannot drift", shape=note, color="#15803d", fillcolor="#dcfce7", fontcolor="#14532d"];
+  creg -> gold [style=dotted];
+}

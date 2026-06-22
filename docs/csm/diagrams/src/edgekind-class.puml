@@ -1,0 +1,48 @@
+@startuml
+' The compiled-machine data model: LocalMachine, LocalEdge, EdgeKind, RoleConfig.
+' Palette: machine=teal, edge=teal, edgekind by class (internal=slate/call=violet/
+' return=fuchsia), config=teal.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+hide empty members
+
+class LocalMachine #ccfbf1 {
+  +role: Role
+  +n_states: usize
+  +initial: LocalState
+  +edges: Vec<LocalEdge>
+  +terminals: BTreeSet<LocalState>
+  --
+  +edges_from(state): Iterator<LocalEdge>
+  +is_terminal(state): bool
+}
+
+class LocalEdge #ccfbf1 {
+  +from: LocalState
+  +action: Action
+  +to: LocalState
+  +kind: EdgeKind
+}
+
+enum EdgeKind #ede9fe {
+  Internal                       <i>(Σ_int — stack unchanged)</i>
+  Call{ return_state: LocalState }  <i>(Σ_call — push)</i>
+  Return                          <i>(Σ_ret — pop; static `to` is a placeholder)</i>
+}
+
+class RoleConfig #ccfbf1 {
+  +state: LocalState
+  +stack: Vec<LocalState>   <i>(pending return addresses)</i>
+}
+
+note bottom of RoleConfig
+  call-free protocol ⇒ stack always empty
+  ⇒ RoleConfig degenerates to `state`
+  ⇒ byte-identical to the pre-pushdown CSM
+end note
+
+LocalMachine *-- "many" LocalEdge
+LocalEdge *-- EdgeKind
+RoleConfig ..> LocalMachine : configuration of
+@enduml

@@ -1,0 +1,38 @@
+// The 8 protocols: each a2a_pattern_* skill_id ↔ ProtocolId ↔ GlobalType, grouped by
+// language band. Palette: regular=indigo, VPL/pushdown=violet, coordination=cyan.
+digraph patmap {
+  rankdir=LR;
+  bgcolor="transparent";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=10];
+  edge [color="#475569", arrowsize=0.6];
+
+  subgraph cluster_collab {
+    label="5 RecursiveMAS collaboration patterns (regular band)"; fontname="Inter"; fontsize=12;
+    color="#3730a3"; style="rounded"; bgcolor="#eef2ff";
+    node [color="#3730a3", fillcolor="#e0e7ff", fontcolor="#1e1b4b"];
+    seq  [label="Sequential\na2a_pattern_sequential\nO,P,C,S"];
+    mix  [label="Mixture\na2a_pattern_mixture\nO,Sp₁…Spₙ,Sum"];
+    dis  [label="Distillation\na2a_pattern_distillation\nO,E,L"];
+    del  [label="Deliberation\na2a_pattern_deliberation\nO,R,T  (the only Choice)"];
+    rec  [label="Recursive\na2a_pattern_recursive\nO,Sub₁…Subₖ (unrolled)"];
+  }
+  subgraph cluster_coord {
+    label="coordination protocols (regular band)"; fontname="Inter"; fontsize=12;
+    color="#0e7490"; style="rounded"; bgcolor="#ecfeff";
+    node [color="#0e7490", fillcolor="#cffafe", fontcolor="#164e63"];
+    wn  [label="WorktreeNegotiation\ncoordinate_dependency_block\nR,E  (mailbox)"];
+    tp  [label="TapePaging\ntape_page\nO,Tape  (μ loop + choice)"];
+  }
+  subgraph cluster_vpl {
+    label="VPL band — genuine pushdown"; fontname="Inter"; fontsize=12;
+    color="#6d28d9"; style="rounded"; bgcolor="#f5f3ff";
+    node [color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+    rcf [label="RecursiveCf\na2a_pattern_recursive_cf\nO,Sub  (calls ITSELF → Call/Return edges)"];
+  }
+
+  reg [label="ProtocolId\n(registry.rs)\nglobal_of(id, params) → GlobalType", shape=box3d, color="#312e81", fillcolor="#c7d2fe", fontcolor="#1e1b4b"];
+  reg -> seq; reg -> mix; reg -> dis; reg -> del; reg -> rec; reg -> wn; reg -> tp; reg -> rcf;
+
+  obs [label="csm_validate_run\nlift_transcript → check_conformance", shape=note, color="#15803d", fillcolor="#dcfce7", fontcolor="#14532d"];
+  seq -> obs [style=dotted]; del -> obs [style=dotted]; rcf -> obs [style=dotted];
+}

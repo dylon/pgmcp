@@ -1,0 +1,40 @@
+// The visibly-pushdown alphabet partition: every protocol symbol is classed by
+// GlobalType::alphabet() into Σ_int (Neutral) / Σ_call (Push) / Σ_ret (Pop), and the
+// class — not the state — fixes the stack action. Palette: neutral=slate, push=violet,
+// pop=fuchsia.
+digraph vpa {
+  rankdir=TB;
+  bgcolor="transparent";
+  node [shape=box, style="filled,rounded", fontname="Inter", fontsize=11];
+  edge [color="#475569", arrowsize=0.7];
+
+  alpha [label="GlobalType::alphabet()\nclassifies each symbol structurally", shape=box3d, color="#312e81", fillcolor="#e0e7ff", fontcolor="#1e1b4b"];
+
+  subgraph cluster_int {
+    label="Σ_int — Neutral (stack unchanged)"; fontname="Inter"; fontsize=11;
+    color="#334155"; style="rounded"; bgcolor="#f1f5f9";
+    node [color="#334155", fillcolor="#e2e8f0", fontcolor="#0f172a"];
+    i1 [label="Interaction label  (from→to:ℓ)"];
+    i2 [label="Choice label  (ℓᵢ)"];
+  }
+  subgraph cluster_call {
+    label="Σ_call — Push (enter frame)"; fontname="Inter"; fontsize=11;
+    color="#6d28d9"; style="rounded"; bgcolor="#f5f3ff";
+    node [color="#6d28d9", fillcolor="#ede9fe", fontcolor="#4c1d95"];
+    c1 [label="call:<callee>   (GlobalCall)"];
+    c2 [label="enter           (GlobalBox)"];
+  }
+  subgraph cluster_ret {
+    label="Σ_ret — Pop (return frame)"; fontname="Inter"; fontsize=11;
+    color="#a21caf"; style="rounded"; bgcolor="#fdf4ff";
+    node [color="#a21caf", fillcolor="#fae8ff", fontcolor="#701a75"];
+    r1 [label="ret:<callee>    (GlobalCall)"];
+    r2 [label="exit            (GlobalBox)"];
+  }
+
+  alpha -> i1; alpha -> c1; alpha -> r1;
+  i1 -> i2 [style=invis]; c1 -> c2 [style=invis]; r1 -> r2 [style=invis];
+
+  inv [label="WF-VPA: each label → exactly ONE stack action\n(the symbol class, not the state, decides)\n⇒ recognized language is a VPL", shape=note, color="#15803d", fillcolor="#dcfce7", fontcolor="#14532d"];
+  i2 -> inv [style=dotted]; c2 -> inv [style=dotted]; r2 -> inv [style=dotted];
+}

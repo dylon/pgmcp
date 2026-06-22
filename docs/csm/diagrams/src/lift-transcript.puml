@@ -1,0 +1,46 @@
+@startuml
+' lift_transcript: an a2a_pattern_* transcript becomes a protocol Trace, faithful to
+' what the tool DID (it never invents steps). Palette: transcript=orange (task plane),
+' lift=indigo, trace=slate, divergence=red.
+skinparam backgroundColor transparent
+skinparam defaultFontName Inter
+skinparam shadowing false
+skinparam ActivityBackgroundColor #e0e7ff
+skinparam ActivityBorderColor #3730a3
+skinparam ActivityDiamondBackgroundColor #fef9c3
+skinparam ActivityDiamondBorderColor #a16207
+
+start
+#ffedd5:a2a_tasks.metadata.csm_transcript
+[{round, role, output}, …];
+:transcript_to_turns
+(derive `converged` from a Reflector "CONVERGED");
+:match ProtocolId;
+split
+  -[#3730a3]->
+  :Sequential / Mixture / Distillation / Recursive
+  → synthesize O→W:req . W→O:resp per turn;
+split again
+  -[#dc2626]->
+  :Deliberation
+  → on `converged`, emit O→R:reflect_req . R→O:converged
+  then STOP (text impl omits the final O→T:finish.T→O:final);
+  note right #fee2e2
+    the lifted trace ends early ⇒ check_conformance
+    reports Incomplete{T} — the real spec/impl
+    divergence the observer exists to surface
+  end note
+split again
+  -[#7c3aed]->
+  :RecursiveCf
+  → emit real comms (subcall/recurse/leaf/subresult);
+  note right #ede9fe
+    Call/Return boundaries are ε-moves taken
+    by replay_to_configs ⇒ Dyck-balanced by
+    construction
+  end note
+end split
+#e2e8f0:Trace = Vec<Event>;
+:replay_to_configs → check_conformance (ch.06);
+stop
+@enduml
