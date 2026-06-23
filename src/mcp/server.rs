@@ -39,8 +39,6 @@ mod handlers_core;
 mod handlers_core_advanced;
 #[path = "server/handlers/csm.rs"]
 mod handlers_csm;
-#[path = "server/handlers/trace.rs"]
-mod handlers_trace;
 #[path = "server/handlers/data_eng.rs"]
 mod handlers_data_eng;
 #[path = "server/handlers/data_tables.rs"]
@@ -93,6 +91,8 @@ mod handlers_tape;
 mod handlers_toolbox;
 #[path = "server/handlers/topics.rs"]
 mod handlers_topics;
+#[path = "server/handlers/trace.rs"]
+mod handlers_trace;
 #[path = "server/handlers/trajectory.rs"]
 mod handlers_trajectory;
 #[path = "server/handlers/work_items_a.rs"]

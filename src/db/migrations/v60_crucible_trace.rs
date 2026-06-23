@@ -298,12 +298,21 @@ mod db_roundtrip {
         super::apply(&pool).await.expect("v60 apply is idempotent");
 
         let tid = Uuid::new_v4();
-        let root = ts::record_span(&pool, &span(tid, ts::SpanKind::Run, "run", None, ts::SpanStatus::Unset))
-            .await
-            .expect("root span");
+        let root = ts::record_span(
+            &pool,
+            &span(tid, ts::SpanKind::Run, "run", None, ts::SpanStatus::Unset),
+        )
+        .await
+        .expect("root span");
         let child = ts::record_span(
             &pool,
-            &span(tid, ts::SpanKind::PlannedStep, "step:0", Some(root), ts::SpanStatus::Ok),
+            &span(
+                tid,
+                ts::SpanKind::PlannedStep,
+                "step:0",
+                Some(root),
+                ts::SpanStatus::Ok,
+            ),
         )
         .await
         .expect("child span");
@@ -348,9 +357,16 @@ mod db_roundtrip {
             content_sha256: "a".repeat(64),
             metrics: json!({}),
         };
-        let c1 = ts::record_counterexample(&pool, &cex_in).await.expect("cex 1");
-        let c2 = ts::record_counterexample(&pool, &cex_in).await.expect("cex 2");
-        assert_eq!(c1, c2, "record_counterexample is idempotent on content_sha256");
+        let c1 = ts::record_counterexample(&pool, &cex_in)
+            .await
+            .expect("cex 1");
+        let c2 = ts::record_counterexample(&pool, &cex_in)
+            .await
+            .expect("cex 2");
+        assert_eq!(
+            c1, c2,
+            "record_counterexample is idempotent on content_sha256"
+        );
 
         ts::record_control(
             &pool,
@@ -375,16 +391,26 @@ mod db_roundtrip {
         assert_eq!(spans.len(), 2);
         let q = ts::query_spans(
             &pool,
-            &ts::SpanQuery { kind: Some("planned_step".into()), limit: 10, ..Default::default() },
+            &ts::SpanQuery {
+                kind: Some("planned_step".into()),
+                limit: 10,
+                ..Default::default()
+            },
         )
         .await
         .expect("query_spans");
         assert!(q.iter().any(|s| s.span_id == child));
-        let header = ts::trace_header(&pool, tid).await.expect("header").expect("a header");
+        let header = ts::trace_header(&pool, tid)
+            .await
+            .expect("header")
+            .expect("a header");
         assert_eq!(header.n_spans, 2);
         let journal = ts::load_control_journal(
             &pool,
-            &ts::ControlQuery { limit: 10, ..Default::default() },
+            &ts::ControlQuery {
+                limit: 10,
+                ..Default::default()
+            },
         )
         .await
         .expect("journal");
@@ -400,6 +426,8 @@ mod db_roundtrip {
             .expect("a row");
         assert_eq!(closed.status, "ok");
 
-        eprintln!("v60 round-trip OK: 2 spans, closure ok, cex idempotent, journal+header+reads ok");
+        eprintln!(
+            "v60 round-trip OK: 2 spans, closure ok, cex idempotent, journal+header+reads ok"
+        );
     }
 }

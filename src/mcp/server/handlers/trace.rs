@@ -31,7 +31,10 @@ Returns {span_id, trace_id}. Pair with crucible_trace_close_span."
             30,
             &_ctx,
             &summarize_debug(&params),
-            crate::mcp::tools::tool_crucible_trace::tool_crucible_trace_open_span(self.ctx(), params),
+            crate::mcp::tools::tool_crucible_trace::tool_crucible_trace_open_span(
+                self.ctx(),
+                params,
+            ),
         )
         .await
     }
@@ -171,7 +174,10 @@ fork|...) to the append-only audit journal."
             30,
             &_ctx,
             &summarize_debug(&params),
-            crate::mcp::tools::tool_crucible_trace::tool_crucible_trace_timeline(self.ctx(), params),
+            crate::mcp::tools::tool_crucible_trace::tool_crucible_trace_timeline(
+                self.ctx(),
+                params,
+            ),
         )
         .await
     }
@@ -230,7 +236,10 @@ divergence (off-protocol step | stall | unbalanced), or conformant. The runtime_
             30,
             &_ctx,
             &summarize_debug(&params),
-            crate::mcp::tools::tool_crucible_trace::tool_crucible_trace_reconcile(self.ctx(), params),
+            crate::mcp::tools::tool_crucible_trace::tool_crucible_trace_reconcile(
+                self.ctx(),
+                params,
+            ),
         )
         .await
     }
@@ -295,7 +304,9 @@ with channel + reason + affected sessions/tasks)."
         .await
     }
 
-    #[tool(description = "ADR-020/D3: fetch a persisted counterexample witness (by id, or latest for a trace).")]
+    #[tool(
+        description = "ADR-020/D3: fetch a persisted counterexample witness (by id, or latest for a trace)."
+    )]
     async fn crucible_trace_counterexample(
         &self,
         Parameters(params): Parameters<CrucibleTraceCexParams>,

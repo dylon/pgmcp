@@ -25,14 +25,14 @@ use crate::csm::role::Role;
 use crate::csm::session_store::load_checkpoint;
 use crate::csm::trace_store::{
     self as ts, AnnotationInput, AnnotationKind, AnnotationSeverity, CexSource, CexVerdict,
-    ControlAction, ControlInput, ControlScope, CounterexampleInput, SpanInput, SpanKind, SpanStatus,
-    WitnessKind,
+    ControlAction, ControlInput, ControlScope, CounterexampleInput, SpanInput, SpanKind,
+    SpanStatus, WitnessKind,
 };
 use crate::mcp::server::{
-    CrucibleControlParams, CrucibleRecordCexParams, CrucibleTraceAuditParams, CrucibleTraceCexParams,
-    CrucibleTraceCloseParams, CrucibleTraceDiffParams, CrucibleTraceEventParams,
-    CrucibleTraceQueryParams, CrucibleTraceRefParams, CrucibleTraceReplayParams,
-    CrucibleTraceSpanParams, CrucibleTraceTimelineParams,
+    CrucibleControlParams, CrucibleRecordCexParams, CrucibleTraceAuditParams,
+    CrucibleTraceCexParams, CrucibleTraceCloseParams, CrucibleTraceDiffParams,
+    CrucibleTraceEventParams, CrucibleTraceQueryParams, CrucibleTraceRefParams,
+    CrucibleTraceReplayParams, CrucibleTraceSpanParams, CrucibleTraceTimelineParams,
 };
 use crate::mcp::tools::sota_helpers::{json_result, pool_or_err};
 
@@ -42,7 +42,8 @@ fn internal(e: impl std::fmt::Display) -> McpError {
     McpError::internal_error(e.to_string(), None)
 }
 fn parse_uuid(s: &str) -> Result<Uuid, McpError> {
-    Uuid::parse_str(s).map_err(|e| McpError::invalid_params(format!("invalid UUID '{s}': {e}"), None))
+    Uuid::parse_str(s)
+        .map_err(|e| McpError::invalid_params(format!("invalid UUID '{s}': {e}"), None))
 }
 fn parse_opt_uuid(s: &Option<String>) -> Result<Option<Uuid>, McpError> {
     s.as_deref().map(parse_uuid).transpose()
@@ -129,7 +130,9 @@ async fn resolve_run(
     let cp = load_checkpoint(pool, &sk)
         .await
         .map_err(internal)?
-        .ok_or_else(|| McpError::invalid_params(format!("no orchestration session '{sk}'"), None))?;
+        .ok_or_else(|| {
+            McpError::invalid_params(format!("no orchestration session '{sk}'"), None)
+        })?;
     let g: GlobalType = serde_json::from_value(cp.global_type.clone())
         .map_err(|e| internal(format!("stored global_type is not a GlobalType: {e}")))?;
     let net = Network::build(cp.protocol_name.clone(), &g)
@@ -177,7 +180,9 @@ pub async fn tool_crucible_trace_record_span(
     };
     let input = build_span_input(&params, status, Some(Utc::now()))?;
     let span_id = ts::record_span(pool, &input).await.map_err(internal)?;
-    json_result(&json!({ "span_id": span_id, "trace_id": params.trace_id, "status": status.as_str() }))
+    json_result(
+        &json!({ "span_id": span_id, "trace_id": params.trace_id, "status": status.as_str() }),
+    )
 }
 
 /// Close an open span: set its terminal status + `ended_at`.
@@ -191,10 +196,16 @@ pub async fn tool_crucible_trace_close_span(
         None => SpanStatus::Ok,
         Some(s) => req(SpanStatus::parse(s), &format!("status '{s}'"))?,
     };
-    let row = ts::close_span(pool, params.span_id, status, params.status_message.as_deref(), None)
-        .await
-        .map_err(internal)?
-        .ok_or_else(|| McpError::invalid_params(format!("no span {}", params.span_id), None))?;
+    let row = ts::close_span(
+        pool,
+        params.span_id,
+        status,
+        params.status_message.as_deref(),
+        None,
+    )
+    .await
+    .map_err(internal)?
+    .ok_or_else(|| McpError::invalid_params(format!("no span {}", params.span_id), None))?;
     json_result(&to_value(&row)?)
 }
 
@@ -221,7 +232,9 @@ pub async fn tool_crucible_trace_event(
         counterexample_id: params.counterexample_id,
         attributes: params.attributes.clone().unwrap_or_else(empty_obj),
     };
-    let id = ts::record_annotation(pool, &input).await.map_err(internal)?;
+    let id = ts::record_annotation(pool, &input)
+        .await
+        .map_err(internal)?;
     json_result(&json!({ "id": id }))
 }
 
@@ -237,7 +250,10 @@ pub async fn tool_crucible_trace_record_counterexample(
         span_id: params.span_id,
         experiment_id: params.experiment_id,
         work_item_public_id: params.work_item_public_id.clone(),
-        source: req(CexSource::parse(&params.source), &format!("source '{}'", params.source))?,
+        source: req(
+            CexSource::parse(&params.source),
+            &format!("source '{}'", params.source),
+        )?,
         verdict: match params.verdict.as_deref() {
             None => CexVerdict::Violated,
             Some(s) => req(CexVerdict::parse(s), &format!("verdict '{s}'"))?,
@@ -252,7 +268,9 @@ pub async fn tool_crucible_trace_record_counterexample(
         content_sha256: params.content_sha256.clone(),
         metrics: params.metrics.clone().unwrap_or_else(empty_obj),
     };
-    let id = ts::record_counterexample(pool, &input).await.map_err(internal)?;
+    let id = ts::record_counterexample(pool, &input)
+        .await
+        .map_err(internal)?;
     json_result(&json!({ "id": id }))
 }
 
@@ -264,7 +282,10 @@ pub async fn tool_crucible_trace_control(
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
     let input = ControlInput {
-        action: req(ControlAction::parse(&params.action), &format!("action '{}'", params.action))?,
+        action: req(
+            ControlAction::parse(&params.action),
+            &format!("action '{}'", params.action),
+        )?,
         scope: match params.scope.as_deref() {
             None => ControlScope::Fleet,
             Some(s) => req(ControlScope::parse(s), &format!("scope '{s}'"))?,
@@ -310,14 +331,19 @@ pub async fn tool_crucible_trace_timeline(
         (Some(t), _) => ts::load_spans(pool, parse_uuid(t)?).await,
         (None, Some(s)) => ts::load_spans_by_session(pool, s).await,
         (None, None) => {
-            return Err(McpError::invalid_params("provide trace_id or session_key", None));
+            return Err(McpError::invalid_params(
+                "provide trace_id or session_key",
+                None,
+            ));
         }
     }
     .map_err(internal)?;
     let mut out = json!({ "count": spans.len(), "spans": to_value(&spans)? });
     if params.include_annotations.unwrap_or(true) {
         if let Some(first) = spans.first() {
-            let anns = ts::load_annotations(pool, first.trace_id).await.map_err(internal)?;
+            let anns = ts::load_annotations(pool, first.trace_id)
+                .await
+                .map_err(internal)?;
             out["annotations"] = to_value(&anns)?;
         }
     }
@@ -402,14 +428,18 @@ pub async fn tool_crucible_trace_why(
         (Some(t), _) => ts::load_spans(pool, parse_uuid(t)?).await,
         (None, Some(s)) => ts::load_spans_by_session(pool, s).await,
         (None, None) => {
-            return Err(McpError::invalid_params("provide trace_id or session_key", None));
+            return Err(McpError::invalid_params(
+                "provide trace_id or session_key",
+                None,
+            ));
         }
     }
     .map_err(internal)?;
     let first_error = spans.iter().find(|s| s.status == "error");
 
     // Protocol-level reconcile (best-effort: only if the run has a linked session).
-    let (divergence, position) = match resolve_run(pool, &params.trace_id, &params.session_key).await
+    let (divergence, position) = match resolve_run(pool, &params.trace_id, &params.session_key)
+        .await
     {
         Ok((net, events, orch)) => {
             let div = ts::first_divergence(&net, &events, &orch);
@@ -422,7 +452,10 @@ pub async fn tool_crucible_trace_why(
                 }
                 None => None,
             };
-            (div.map(|d| to_value(&d)).transpose()?, pos.map(|p| to_value(&p)).transpose()?)
+            (
+                div.map(|d| to_value(&d)).transpose()?,
+                pos.map(|p| to_value(&p)).transpose()?,
+            )
         }
         Err(_) => (None, None),
     };
@@ -442,8 +475,12 @@ pub async fn tool_crucible_trace_diff(
 ) -> Result<CallToolResult, McpError> {
     ctx.stats().mcp_requests.fetch_add(1, Ordering::Relaxed);
     let pool = pool_or_err(ctx)?;
-    let fail = ts::load_spans(pool, parse_uuid(&params.failing)?).await.map_err(internal)?;
-    let pass = ts::load_spans(pool, parse_uuid(&params.passing)?).await.map_err(internal)?;
+    let fail = ts::load_spans(pool, parse_uuid(&params.failing)?)
+        .await
+        .map_err(internal)?;
+    let pass = ts::load_spans(pool, parse_uuid(&params.passing)?)
+        .await
+        .map_err(internal)?;
 
     // Align step spans by cursor; report the first cursor whose (kind, role, status,
     // peer, model) differs — the regression "what changed".
@@ -469,11 +506,13 @@ pub async fn tool_crucible_trace_diff(
                 }
             }
             (Some(f), None) => {
-                first_divergence = Some(json!({ "cursor": f.gtype_cursor, "failing_only": f.kind }));
+                first_divergence =
+                    Some(json!({ "cursor": f.gtype_cursor, "failing_only": f.kind }));
                 break;
             }
             (None, Some(p)) => {
-                first_divergence = Some(json!({ "cursor": p.gtype_cursor, "passing_only": p.kind }));
+                first_divergence =
+                    Some(json!({ "cursor": p.gtype_cursor, "passing_only": p.kind }));
                 break;
             }
             (None, None) => break,
@@ -530,7 +569,9 @@ async fn resolve_trace_id(
         return parse_uuid(t);
     }
     let sk = req(session_key.as_deref(), "trace_id or session_key")?;
-    let spans = ts::load_spans_by_session(pool, sk).await.map_err(internal)?;
+    let spans = ts::load_spans_by_session(pool, sk)
+        .await
+        .map_err(internal)?;
     spans
         .first()
         .map(|s| s.trace_id)

@@ -130,7 +130,9 @@ pub struct CrucibleRecordCexParams {
         description = "Checker source: tlc|smt|rocq|sfa|presburger|kat|conformance|behavioral."
     )]
     pub source: String,
-    #[schemars(description = "Witness shape: event_trace|state_assignment|smt_model|tla_trace|proof_term.")]
+    #[schemars(
+        description = "Witness shape: event_trace|state_assignment|smt_model|tla_trace|proof_term."
+    )]
     pub witness_kind: String,
     #[schemars(description = "The structured, machine-replayable witness (JSON).")]
     pub witness: Value,
@@ -165,7 +167,9 @@ pub struct CrucibleRecordCexParams {
 /// `crucible_trace_control` — append a control-plane action to the audit journal.
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CrucibleControlParams {
-    #[schemars(description = "Action: halt|resume|checkpoint|cancel|fork|lease_expire|power_fail.")]
+    #[schemars(
+        description = "Action: halt|resume|checkpoint|cancel|fork|lease_expire|power_fail."
+    )]
     pub action: String,
     #[serde(default)]
     #[schemars(description = "Scope: fleet|session|task|work_item (default fleet).")]

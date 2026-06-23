@@ -512,9 +512,9 @@ pub struct SpanQuery {
 
 /// Cross-trace span filter (the `crucible_trace_query` tool). Newest-first.
 pub async fn query_spans(pool: &PgPool, q: &SpanQuery) -> Result<Vec<TraceSpan>, sqlx::Error> {
-    let mut qb: QueryBuilder<sqlx::Postgres> =
-        QueryBuilder::new("SELECT ");
-    qb.push(SPAN_COLS).push(" FROM crucible_trace_spans WHERE TRUE");
+    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new("SELECT ");
+    qb.push(SPAN_COLS)
+        .push(" FROM crucible_trace_spans WHERE TRUE");
     if let Some(k) = &q.kind {
         qb.push(" AND kind = ").push_bind(k.clone());
     }
@@ -651,11 +651,12 @@ pub async fn trace_header(
 /// sequence replay/reconcile run against; a paused session's unflushed tail lives on
 /// `orchestration_sessions.transcript` ([`crate::csm::session_store::SessionCheckpoint::transcript_events`]).
 pub async fn load_run_events(pool: &PgPool, task_id: Uuid) -> Result<Vec<Event>, sqlx::Error> {
-    let row: Option<Value> =
-        sqlx::query_scalar("SELECT events FROM csm_run_traces WHERE task_id = $1 ORDER BY id DESC LIMIT 1")
-            .bind(task_id)
-            .fetch_optional(pool)
-            .await?;
+    let row: Option<Value> = sqlx::query_scalar(
+        "SELECT events FROM csm_run_traces WHERE task_id = $1 ORDER BY id DESC LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
     Ok(row
         .and_then(|v| serde_json::from_value::<Vec<Event>>(v).ok())
         .unwrap_or_default())
@@ -705,11 +706,7 @@ pub enum Divergence {
 /// an empty stack). `orchestrator` is preferred when reporting a stall so the
 /// surfaced role is the one the operator drives. Pure — reuses
 /// [`replay_to_configs`] unchanged (no new soundness surface).
-pub fn first_divergence(
-    net: &Network,
-    trace: &[Event],
-    orchestrator: &Role,
-) -> Option<Divergence> {
+pub fn first_divergence(net: &Network, trace: &[Event], orchestrator: &Role) -> Option<Divergence> {
     match replay_to_configs(net, trace) {
         Err(ConformanceError::Step { ord, role, err }) => Some(Divergence::OffProtocol {
             step: ord,
@@ -846,7 +843,10 @@ pub fn replay_position(
             role: r.to_string(),
             state: c.state,
             stack_depth: c.stack.len(),
-            terminal: net.machine(r).map(|m| m.is_terminal(c.state)).unwrap_or(false),
+            terminal: net
+                .machine(r)
+                .map(|m| m.is_terminal(c.state))
+                .unwrap_or(false),
         })
         .collect();
 
@@ -904,15 +904,98 @@ mod tests {
             }
         };
     }
-    pin_vocab!(span_kind_pinned, SpanKind, ["run","plan","synthesize","fv_gate","planned_step","call_frame","critic_iteration","tool_call","red_team","validate"]);
-    pin_vocab!(span_status_pinned, SpanStatus, ["unset","ok","error","canceled"]);
-    pin_vocab!(annotation_kind_pinned, AnnotationKind, ["model_chosen","retry","failure","counterexample_found","fv_verdict","critic_verdict","halt","resume","cancel","lease_lost","conformance_fail","off_protocol"]);
-    pin_vocab!(annotation_severity_pinned, AnnotationSeverity, ["info","warn","error"]);
-    pin_vocab!(control_action_pinned, ControlAction, ["halt","resume","checkpoint","cancel","fork","lease_expire","power_fail"]);
-    pin_vocab!(control_scope_pinned, ControlScope, ["fleet","session","task","work_item"]);
-    pin_vocab!(cex_source_pinned, CexSource, ["tlc","smt","rocq","sfa","presburger","kat","conformance","behavioral"]);
-    pin_vocab!(cex_verdict_pinned, CexVerdict, ["violated","sat","unsat_core","timeout"]);
-    pin_vocab!(witness_kind_pinned, WitnessKind, ["event_trace","state_assignment","smt_model","tla_trace","proof_term"]);
+    pin_vocab!(
+        span_kind_pinned,
+        SpanKind,
+        [
+            "run",
+            "plan",
+            "synthesize",
+            "fv_gate",
+            "planned_step",
+            "call_frame",
+            "critic_iteration",
+            "tool_call",
+            "red_team",
+            "validate"
+        ]
+    );
+    pin_vocab!(
+        span_status_pinned,
+        SpanStatus,
+        ["unset", "ok", "error", "canceled"]
+    );
+    pin_vocab!(
+        annotation_kind_pinned,
+        AnnotationKind,
+        [
+            "model_chosen",
+            "retry",
+            "failure",
+            "counterexample_found",
+            "fv_verdict",
+            "critic_verdict",
+            "halt",
+            "resume",
+            "cancel",
+            "lease_lost",
+            "conformance_fail",
+            "off_protocol"
+        ]
+    );
+    pin_vocab!(
+        annotation_severity_pinned,
+        AnnotationSeverity,
+        ["info", "warn", "error"]
+    );
+    pin_vocab!(
+        control_action_pinned,
+        ControlAction,
+        [
+            "halt",
+            "resume",
+            "checkpoint",
+            "cancel",
+            "fork",
+            "lease_expire",
+            "power_fail"
+        ]
+    );
+    pin_vocab!(
+        control_scope_pinned,
+        ControlScope,
+        ["fleet", "session", "task", "work_item"]
+    );
+    pin_vocab!(
+        cex_source_pinned,
+        CexSource,
+        [
+            "tlc",
+            "smt",
+            "rocq",
+            "sfa",
+            "presburger",
+            "kat",
+            "conformance",
+            "behavioral"
+        ]
+    );
+    pin_vocab!(
+        cex_verdict_pinned,
+        CexVerdict,
+        ["violated", "sat", "unsat_core", "timeout"]
+    );
+    pin_vocab!(
+        witness_kind_pinned,
+        WitnessKind,
+        [
+            "event_trace",
+            "state_assignment",
+            "smt_model",
+            "tla_trace",
+            "proof_term"
+        ]
+    );
 
     // ── pure replay / reconcile (no DB) ──────────────────────────────────────
     //
