@@ -54,9 +54,15 @@ pub async fn active_clients(
 /// One (client, project) cell of the m:n attribution matrix, aggregated from
 /// `client_file_events` over a recent window. `edit_count` weights
 /// writes/edits/closes; `read_count` covers reads/opens. The client identity is
-/// best-effort: PID-native rows (eBPF/`proc_fd`) resolve a `client_name` via
-/// `mcp_clients`; hook rows (`source='client_hook'`) are Claude Code by
-/// construction; anything else is `unknown`.
+/// best-effort, resolved in priority order (ADR-022):
+/// 1. PID-native rows (`ebpf`/`proc_fd`) join `mcp_clients` on `mcp_session_id`;
+/// 2. subprocess rows (`ebpf_cgroup`, where `mcp_session_id` is NULL) join
+///    `mcp_clients` on `cgroup_id` to recover the owning agent (a `cargo`/`rustc`
+///    child attributed back to the agent whose cgroup it inherited);
+/// 3. the row's own `agent_id` (`claude-code` | `codex` | …) — now that two
+///    agents share the hook ingest, this replaces the old `client_hook ⇒
+///    claude-code` hardcode;
+/// 4. else `claude-code` for legacy hook rows / `unknown`.
 #[derive(Debug, Serialize, sqlx::FromRow)]
 pub struct ClientProjectMatrixRow {
     pub project_id: Option<i32>,
@@ -82,24 +88,31 @@ pub async fn client_project_matrix(
         "SELECT
             cfe.project_id,
             p.name AS project,
-            COALESCE(cfe.mcp_session_id, cfe.session_id::text) AS client_key,
-            COALESCE(mc.client_name,
+            COALESCE(cfe.mcp_session_id, cfe.session_id::text, mc2.mcp_session_id,
+                     'agent:' || cfe.agent_id, 'cgroup:' || cfe.cgroup_id::text) AS client_key,
+            COALESCE(mc.client_name, mc2.client_name, cfe.agent_id,
                      CASE WHEN cfe.source = 'client_hook' THEN 'claude-code'
                           ELSE 'unknown' END) AS client_name,
-            COALESCE(mc.pid, MAX(cfe.pid)) AS pid,
+            COALESCE(mc.pid, mc2.pid, MAX(cfe.pid)) AS pid,
             COUNT(*) FILTER (WHERE cfe.op IN ('write','edit','close')) AS edit_count,
             COUNT(*) FILTER (WHERE cfe.op IN ('read','open'))          AS read_count,
             COUNT(DISTINCT cfe.abs_path)                               AS file_count,
             MAX(cfe.ts) FILTER (WHERE cfe.op IN ('write','edit','close')) AS last_edit,
             MAX(cfe.ts)                                                AS last_activity
          FROM client_file_events cfe
-         LEFT JOIN projects p     ON p.id = cfe.project_id
-         LEFT JOIN mcp_clients mc ON mc.mcp_session_id = cfe.mcp_session_id
+         LEFT JOIN projects p      ON p.id = cfe.project_id
+         LEFT JOIN mcp_clients mc  ON mc.mcp_session_id = cfe.mcp_session_id
+         -- Subprocess (ebpf_cgroup) rows carry no mcp_session_id; recover the
+         -- owning agent by the cgroup id its process subtree inherited.
+         LEFT JOIN mcp_clients mc2 ON mc2.cgroup_id = cfe.cgroup_id
+                                  AND cfe.cgroup_id IS NOT NULL
          WHERE cfe.ts > now() - make_interval(mins => $1)
            AND ($2::text IS NULL OR p.name = $2)
          GROUP BY cfe.project_id, p.name,
-                  COALESCE(cfe.mcp_session_id, cfe.session_id::text),
-                  mc.client_name, mc.pid, cfe.source
+                  COALESCE(cfe.mcp_session_id, cfe.session_id::text, mc2.mcp_session_id,
+                           'agent:' || cfe.agent_id, 'cgroup:' || cfe.cgroup_id::text),
+                  mc.client_name, mc2.client_name, cfe.agent_id,
+                  mc.pid, mc2.pid, cfe.source
          ORDER BY cfe.project_id NULLS LAST, edit_count DESC, last_activity DESC",
     )
     .bind(since_minutes)

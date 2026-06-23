@@ -1,63 +1,115 @@
-//! Phase-2B **client-agnostic** file-event capture via an in-kernel BPF probe.
+//! eBPF file-event capture (Phase 2B/2C) — client-agnostic syscall tracing that
+//! attributes `open`/`openat` to a connected client **and, in cgroup mode, every
+//! subprocess it spawns**.
 //!
-//! Phase 2A (the Claude Code `PostToolUse` hook) is precise but covers only
-//! Claude Code. This path attributes file touches for *any* connected client
-//! (Codex, an editor's language server, a shell) by tracing the `openat`/`open`
-//! syscalls of exactly the PIDs pgmcp already tracks in `mcp_clients`, and
-//! recording each as an `ebpf`-source [`client_file_events`] row. The live
-//! client PID set (maintained by Phase 1 + the liveness cron) is the elegant
-//! in-kernel filter: we trace the clients we know, nothing else.
+//! ## Two modes (ADR-022)
+//!
+//! - [`EbpfMode::Pid`] (Phase 2B, `source='ebpf'`) — trace exactly the live
+//!   client PIDs in `mcp_clients`. Sees the agent process itself, *not* its
+//!   children, so a `cargo build` it launches is invisible.
+//! - [`EbpfMode::Cgroup`] (Phase 2C, `source='ebpf_cgroup'`) — trace by
+//!   `bpf_get_current_cgroup_id()`. cgroup membership is **inherited across
+//!   `fork`/`exec`**, so a single `cgroup == <id>` predicate captures the agent
+//!   *and* its whole process subtree (`cargo` → `rustc` → `rg`, …). Clients
+//!   without a private registered cgroup (interactive / shared scope) fall back
+//!   to a `pid == <p>` term in the same mixed predicate, so they still get
+//!   per-PID capture rather than nothing.
+//!
+//! Either way the probe is a thin **producer**: it parses each trace line and
+//! emits a [`FileTouchEvent`] into the shared reactive ingestion stream
+//! (`proc_clients::ingest`) via [`StatsTracker::emit_file_event`]. Dedup,
+//! batching, project/file resolution, and the DB insert all live downstream in
+//! the stream — this module no longer touches the database at all.
 //!
 //! ## Why bpftrace, not an in-tree `aya-ebpf` loader
 //!
-//! pgmcp deliberately has **no cargo features** (CUDA is mandatory; swap seams
-//! are traits), and `scripts/verify.sh` builds the whole workspace on **stable**
-//! Rust. A self-contained kernel-side `aya-ebpf` program needs nightly, a custom
-//! `bpfel-unknown-none` target, and `-Z build-std` — none of which can be gated
-//! behind a *runtime* `[clients] ebpf_enabled` flag, so vendoring it in-tree
-//! would force nightly + a BPF cross-build into every `verify.sh` run and break
-//! the contract. The project's hosts ship `bpftrace`/`bcc` (an in-kernel BPF VM
-//! reached from userspace), so this module drives a `bpftrace` probe over a
-//! pipe: it compiles on stable, adds zero build-time dependency, and stays
-//! **off by default** (`ebpf_enabled = false`) so cap-less hosts are unaffected.
-//! The probe needs `CAP_BPF`+`CAP_PERFMON` (or root) at *run* time; absent that,
-//! the child exits and we log the reason and back off — never spin.
+//! pgmcp builds the whole workspace on **stable** Rust with no cargo features
+//! (`scripts/verify.sh`). A self-contained kernel-side `aya-ebpf` program needs
+//! nightly, a `bpfel-unknown-none` target, and `-Z build-std`, none of which can
+//! hide behind a *runtime* flag, so it would force a BPF cross-build into every
+//! `verify.sh` run. Driving the host's `bpftrace` over a pipe compiles on stable,
+//! adds zero build-time dependency, and stays off by default. The probe needs
+//! `CAP_BPF`+`CAP_PERFMON` (or root) at *run* time; absent that the child exits,
+//! we log the reason and back off — never spin.
 //!
-//! The wire format between the probe and this consumer is one this module
-//! *defines* (`E\t<pid>\t<flags>\t<path>` via a controlled `printf`), so parsing
-//! is a defined protocol, not fragile screen-scraping.
+//! The wire format is one this module *defines* — `E\t<pid>\t<cgroupid>\t<flags>\t<path>`
+//! via a controlled `printf` — so parsing is a defined protocol, not screen-scraping.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::sync::Arc;
+use std::time::Duration;
 
 use sqlx::PgPool;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
-use crate::proc_clients::file_events::FileOp;
+use crate::proc_clients::file_events::{FileEventSource, FileOp, FileTouchEvent};
+use crate::stats::tracker::StatsTracker;
 
 /// Linux `O_ACCMODE` mask — the low two bits of `open` flags hold the access
 /// mode (`O_RDONLY=0`, `O_WRONLY=1`, `O_RDWR=2`).
 const O_ACCMODE: i64 = 0o3;
 
+/// Which filter the probe applies, and therefore which `source` it records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EbpfMode {
+    /// Per-PID (Phase 2B): trace exactly the client PIDs. `source='ebpf'`.
+    Pid,
+    /// Per-cgroup (Phase 2C): trace the client's whole process subtree.
+    /// `source='ebpf_cgroup'`.
+    Cgroup,
+}
+
+impl EbpfMode {
+    fn source(self) -> FileEventSource {
+        match self {
+            EbpfMode::Pid => FileEventSource::Ebpf,
+            EbpfMode::Cgroup => FileEventSource::EbpfCgroup,
+        }
+    }
+}
+
 /// A parsed `openat`/`open` trace event emitted by the probe.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawEvent {
     pub pid: i32,
+    pub cgroup_id: u64,
     pub flags: i64,
     pub path: String,
 }
 
+/// The live filter set + a `(cgroup|pid) → mcp_session_id` map for attribution.
+/// In cgroup mode a client with a known `cgroup_id` contributes a `cgroup` term;
+/// one without (interactive / shared scope) falls back to a `pid` term. In pid
+/// mode every client contributes a `pid` term.
+#[derive(Debug, Default)]
+struct LiveTargets {
+    cgroups: HashSet<u64>,
+    pids: HashSet<i32>,
+    cgroup_session: HashMap<u64, String>,
+    pid_session: HashMap<i32, String>,
+}
+
+impl LiveTargets {
+    fn is_empty(&self) -> bool {
+        self.cgroups.is_empty() && self.pids.is_empty()
+    }
+    /// Only the *filter sets* determine the probe predicate; the session maps are
+    /// userspace-only attribution and can change without a respawn.
+    fn same_filter(&self, other: &LiveTargets) -> bool {
+        self.cgroups == other.cgroups && self.pids == other.pids
+    }
+}
+
 /// Classify an `open` `flags` value into a [`FileOp`]: any writable access mode
 /// (`O_WRONLY`/`O_RDWR`) is a [`FileOp::Write`]; a read-only open is
-/// [`FileOp::Open`]. We cannot see the eventual read/write *payload* from the
-/// open alone, and an open-for-write is the high-signal edit event — Claude
-/// Code, Codex, and editors all `open(…, O_WRONLY|O_CREAT|O_TRUNC)` to save.
+/// [`FileOp::Open`]. An open-for-write is the high-signal edit event — Claude
+/// Code, Codex, `rustc`, and editors all `open(…, O_WRONLY|O_CREAT|O_TRUNC)`.
 pub fn classify_op(flags: i64) -> FileOp {
     if flags & O_ACCMODE != 0 {
         FileOp::Write
@@ -66,42 +118,54 @@ pub fn classify_op(flags: i64) -> FileOp {
     }
 }
 
-/// Parse one probe output line of the form `E\t<pid>\t<flags>\t<path>`. Returns
-/// `None` for bpftrace's attach banner and any malformed / non-absolute row.
+/// Parse one probe line of the form `E\t<pid>\t<cgroupid>\t<flags>\t<path>`.
+/// Returns `None` for bpftrace's attach banner and any malformed / non-absolute
+/// row. `splitn(4, '\t')` means a path containing tabs survives intact.
 pub fn parse_trace_line(line: &str) -> Option<RawEvent> {
     let rest = line.strip_prefix("E\t")?;
-    let mut f = rest.splitn(3, '\t');
+    let mut f = rest.splitn(4, '\t');
     let pid = f.next()?.trim().parse::<i32>().ok()?;
+    let cgroup_id = f.next()?.trim().parse::<u64>().ok()?;
     let flags = f.next()?.trim().parse::<i64>().ok()?;
     let path = f.next()?;
     // Absolute paths only — drops relative opens (resolved against an unknown
-    // cwd) and bpftrace's `(unknown)`/empty string sentinels.
+    // cwd) and bpftrace's `(unknown)`/empty-string sentinels.
     if !path.starts_with('/') {
         return None;
     }
     Some(RawEvent {
         pid,
+        cgroup_id,
         flags,
         path: path.to_string(),
     })
 }
 
-/// Build the bpftrace program tracing `openat`+`open` for exactly `pids`,
-/// emitting `E\t<pid>\t<flags>\t<path>`. Both tracepoints expose `args->flags`
-/// (a `long`) and `args->filename` (a userspace `const char *`) directly, so the
-/// probe is BTF-independent and robust across kernels. Caller guarantees `pids`
-/// is non-empty (an empty predicate is not a valid filter).
-fn build_program(pids: &HashSet<i32>) -> String {
-    let pred = pids
-        .iter()
-        .map(|p| format!("pid == {p}"))
-        .collect::<Vec<_>>()
-        .join(" || ");
+/// Build the bpftrace program for `targets`, emitting
+/// `E\t<pid>\t<cgroupid>\t<flags>\t<path>`. The predicate ORs every `cgroup == X`
+/// and `pid == Y` term; when `capture_reads` is false an in-kernel write-only
+/// guard (`& O_ACCMODE != 0`) drops read-only opens so a build's tens of
+/// thousands of header reads never cross into userspace. Caller guarantees
+/// `targets` is non-empty (an empty predicate is not a valid filter).
+fn build_program(targets: &LiveTargets, capture_reads: bool) -> String {
+    let mut terms: Vec<String> = Vec::with_capacity(targets.cgroups.len() + targets.pids.len());
+    for c in &targets.cgroups {
+        terms.push(format!("cgroup == {c}"));
+    }
+    for p in &targets.pids {
+        terms.push(format!("pid == {p}"));
+    }
+    let pred = terms.join(" || ");
+    let guard = if capture_reads {
+        String::new()
+    } else {
+        " && (args->flags & 3) != 0".to_string()
+    };
     format!(
-        "tracepoint:syscalls:sys_enter_openat /{pred}/ \
-            {{ printf(\"E\\t%d\\t%d\\t%s\\n\", pid, args->flags, str(args->filename)); }}\n\
-         tracepoint:syscalls:sys_enter_open /{pred}/ \
-            {{ printf(\"E\\t%d\\t%d\\t%s\\n\", pid, args->flags, str(args->filename)); }}"
+        "tracepoint:syscalls:sys_enter_openat /({pred}){guard}/ \
+            {{ printf(\"E\\t%d\\t%lu\\t%d\\t%s\\n\", pid, cgroup, args->flags, str(args->filename)); }}\n\
+         tracepoint:syscalls:sys_enter_open /({pred}){guard}/ \
+            {{ printf(\"E\\t%d\\t%lu\\t%d\\t%s\\n\", pid, cgroup, args->flags, str(args->filename)); }}"
     )
 }
 
@@ -125,23 +189,30 @@ fn locate_tracer() -> Option<PathBuf> {
     .find(|p| p.is_file())
 }
 
-/// Live, PID-resolved MCP clients: the in-kernel trace filter set plus a
-/// `pid → mcp_session_id` map so captured events join back to the client row.
-async fn fetch_live_pids(
-    pool: &PgPool,
-) -> Result<(HashSet<i32>, HashMap<i32, String>), sqlx::Error> {
-    let rows: Vec<(i32, String)> = sqlx::query_as(
-        "SELECT pid, mcp_session_id FROM mcp_clients WHERE alive AND pid IS NOT NULL",
+/// Read the live targets for `mode` from `mcp_clients`. In cgroup mode a client
+/// with a `cgroup_id` becomes a cgroup target (its whole subtree); one without
+/// falls back to a pid target. In pid mode every client is a pid target.
+async fn fetch_live_targets(pool: &PgPool, mode: EbpfMode) -> Result<LiveTargets, sqlx::Error> {
+    let rows: Vec<(i32, Option<i64>, String)> = sqlx::query_as(
+        "SELECT pid, cgroup_id, mcp_session_id FROM mcp_clients WHERE alive AND pid IS NOT NULL",
     )
     .fetch_all(pool)
     .await?;
-    let mut pids = HashSet::with_capacity(rows.len());
-    let mut map = HashMap::with_capacity(rows.len());
-    for (pid, sid) in rows {
-        pids.insert(pid);
-        map.insert(pid, sid);
+    let mut t = LiveTargets::default();
+    for (pid, cgroup_id, sid) in rows {
+        match (mode, cgroup_id) {
+            (EbpfMode::Cgroup, Some(cg)) => {
+                let cg = cg as u64; // BIGINT i64 → kernel u64 (bit-cast inverse).
+                t.cgroups.insert(cg);
+                t.cgroup_session.insert(cg, sid);
+            }
+            _ => {
+                t.pids.insert(pid);
+                t.pid_session.insert(pid, sid);
+            }
+        }
     }
-    Ok((pids, map))
+    Ok(t)
 }
 
 /// Sleep up to `secs`, returning `true` if shutdown fired first.
@@ -156,8 +227,8 @@ async fn sleep_or_cancel(secs: u64, shutdown: &CancellationToken) -> bool {
 enum ProbeExit {
     /// The daemon is shutting down.
     Shutdown,
-    /// The live client PID set changed — respawn with the new filter.
-    PidSetChanged,
+    /// The live target set changed — respawn with the new filter.
+    TargetsChanged,
     /// The probe exited / failed; the string is the captured reason.
     Failed(String),
 }
@@ -177,85 +248,58 @@ async fn drain_stderr(child: &mut Child) -> String {
     }
 }
 
-/// Handle one parsed event: workspace-root prefilter → TTL dedup → resolve
-/// project/file/session → insert an `ebpf` `client_file_events` row.
-#[allow(clippy::too_many_arguments)]
-async fn handle_event(
-    pool: &PgPool,
-    pid_session: &HashMap<i32, String>,
+/// Handle one parsed event: workspace-root prefilter → resolve the owning session
+/// (cgroup first, then pid) → emit a [`FileTouchEvent`] into the ingestion
+/// stream. Synchronous and best-effort; dedup/batch/insert happen downstream.
+fn handle_event(
+    stats: &StatsTracker,
     roots: &[String],
-    dedup_secs: u64,
-    dedup: &mut HashMap<String, Instant>,
+    mode: EbpfMode,
+    targets: &LiveTargets,
     ev: RawEvent,
 ) {
-    // Cheap string prefilter so a busy client's opens of /usr, /etc, libs, and
-    // its own transcript never reach the database.
+    // Cheap string prefilter so a busy subtree's opens of /usr, /etc, libs, and
+    // ~/.cargo never reach the stream — only `[workspace] paths` survive.
     if !roots.iter().any(|r| ev.path.starts_with(r.as_str())) {
         return;
     }
-    let op = classify_op(ev.flags);
-    let key = format!("{}:{}:{}", ev.pid, op.as_str(), ev.path);
-    let now = Instant::now();
-    if let Some(prev) = dedup.get(&key)
-        && now.duration_since(*prev) < Duration::from_secs(dedup_secs.max(1))
-    {
-        return; // same (pid, op, path) within the dedup window — collapse
-    }
-    dedup.insert(key, now);
-    if dedup.len() > 4096 {
-        let window = Duration::from_secs(dedup_secs.max(1));
-        dedup.retain(|_, t| now.duration_since(*t) < window);
-    }
-
-    // Longest-prefix project match (NULL ⇒ not under any indexed project: skip).
-    let project_id = match crate::db::queries::find_project_by_cwd(pool, &ev.path).await {
-        Ok(Some(p)) => p.id,
-        Ok(None) => return,
-        Err(e) => {
-            debug!(error = %e, "ebpf: project resolve failed");
-            return;
-        }
-    };
-    let file_id: Option<i64> = sqlx::query_scalar("SELECT id FROM indexed_files WHERE path = $1")
-        .bind(&ev.path)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-    let session = pid_session.get(&ev.pid).cloned();
-    if let Err(e) = sqlx::query(
-        "INSERT INTO client_file_events
-            (mcp_session_id, pid, file_id, project_id, abs_path, op, source, ts)
-         VALUES ($1, $2, $3, $4, $5, $6, 'ebpf', now())",
-    )
-    .bind(session)
-    .bind(ev.pid)
-    .bind(file_id)
-    .bind(project_id)
-    .bind(&ev.path)
-    .bind(op.as_str())
-    .execute(pool)
-    .await
-    {
-        debug!(error = %e, "ebpf: client_file_events insert failed");
-    }
+    // Recover the owning client's session: by cgroup (the subtree's root agent),
+    // else by pid (the fallback/legacy term). NULL ⇒ the cgroup-attribution
+    // join in `client_project_matrix` still resolves it at query time.
+    let mcp_session_id = targets
+        .cgroup_session
+        .get(&ev.cgroup_id)
+        .or_else(|| targets.pid_session.get(&ev.pid))
+        .cloned();
+    stats.emit_file_event(FileTouchEvent {
+        source: mode.source(),
+        op: classify_op(ev.flags),
+        abs_path: ev.path,
+        pid: Some(ev.pid),
+        ppid: None,
+        root_pid: None,
+        cgroup_id: Some(ev.cgroup_id),
+        mcp_session_id,
+        session_id: None,
+        agent_id: None,
+    });
 }
 
-/// Run one bpftrace invocation for the current PID set, streaming events until
-/// the set changes, the child dies, or shutdown fires.
+/// Run one bpftrace invocation for the current targets, streaming events until
+/// the target set changes, the child dies, or shutdown fires.
 #[allow(clippy::too_many_arguments)]
 async fn run_one_probe(
     tracer: &PathBuf,
-    pids: &HashSet<i32>,
-    pid_session: &HashMap<i32, String>,
+    targets: &LiveTargets,
     pool: &PgPool,
     roots: &[String],
+    mode: EbpfMode,
+    capture_reads: bool,
     refresh_secs: u64,
-    dedup_secs: u64,
-    dedup: &mut HashMap<String, Instant>,
+    stats: &StatsTracker,
     shutdown: &CancellationToken,
 ) -> ProbeExit {
-    let program = build_program(pids);
+    let program = build_program(targets, capture_reads);
     let mut child = match Command::new(tracer)
         .arg("-B")
         .arg("line") // line-buffered stdout → timely per-event reads
@@ -284,19 +328,19 @@ async fn run_one_probe(
                 return ProbeExit::Shutdown;
             }
             _ = tick.tick() => {
-                if let Ok((now_pids, _)) = fetch_live_pids(pool).await
-                    && &now_pids != pids
+                if let Ok(now) = fetch_live_targets(pool, mode).await
+                    && !now.same_filter(targets)
                 {
                     let _ = child.start_kill();
                     let _ = child.wait().await;
-                    return ProbeExit::PidSetChanged;
+                    return ProbeExit::TargetsChanged;
                 }
             }
             line = lines.next_line() => {
                 match line {
                     Ok(Some(l)) => {
                         if let Some(ev) = parse_trace_line(&l) {
-                            handle_event(pool, pid_session, roots, dedup_secs, dedup, ev).await;
+                            handle_event(stats, roots, mode, targets, ev);
                         }
                     }
                     Ok(None) => return ProbeExit::Failed(drain_stderr(&mut child).await),
@@ -311,27 +355,30 @@ async fn run_one_probe(
 }
 
 /// Spawn the long-lived eBPF file-event consumer. Returns immediately with a
-/// `JoinHandle`; the task loops — (re)fetching the live client PID set, spawning
-/// a `bpftrace` probe scoped to it, and respawning when the set changes — until
-/// `shutdown` fires. `roots` are the workspace path prefixes (`[workspace]
-/// paths`) used to prefilter events before any DB hit.
+/// `JoinHandle`; the task loops — (re)fetching the live target set, spawning a
+/// `bpftrace` probe scoped to it, and respawning when the set changes — until
+/// `shutdown` fires. `roots` are the `[workspace] paths` prefixes used to
+/// prefilter events. `stats` carries the ingestion-stream sender events are
+/// emitted into.
+#[allow(clippy::too_many_arguments)]
 pub fn start_ebpf_consumer(
     pool: PgPool,
     roots: Vec<String>,
     refresh_secs: u64,
-    dedup_secs: u64,
+    capture_reads: bool,
+    mode: EbpfMode,
+    stats: Arc<StatsTracker>,
     shutdown: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let Some(tracer) = locate_tracer() else {
             warn!(
-                "[clients] ebpf_enabled = true but `bpftrace` was not found on PATH; \
-                 Phase-2B eBPF capture is disabled (install bpftrace, or grant the daemon \
-                 CAP_BPF+CAP_PERFMON, to enable client-agnostic file attribution)"
+                "[clients] eBPF capture enabled but `bpftrace` was not found on PATH; \
+                 disabled (install bpftrace, or grant CAP_BPF+CAP_PERFMON, to enable \
+                 client-agnostic file attribution)"
             );
             return;
         };
-        // Normalise roots to trimmed, non-empty prefixes once.
         let roots: Vec<String> = roots
             .into_iter()
             .map(|r| r.trim_end_matches('/').to_string())
@@ -339,27 +386,27 @@ pub fn start_ebpf_consumer(
             .collect();
         info!(
             tracer = %tracer.display(),
-            refresh_secs, dedup_secs,
+            refresh_secs, capture_reads,
+            mode = ?mode,
             roots = roots.len(),
-            "eBPF file-event capture started (Phase 2B, source='ebpf')"
+            "eBPF file-event capture started"
         );
 
-        let mut dedup: HashMap<String, Instant> = HashMap::new();
         loop {
             if shutdown.is_cancelled() {
                 return;
             }
-            let (pids, pid_session) = match fetch_live_pids(&pool).await {
+            let targets = match fetch_live_targets(&pool, mode).await {
                 Ok(v) => v,
                 Err(e) => {
-                    error!(error = %e, "ebpf: live-pid fetch failed");
+                    error!(error = %e, "ebpf: live-target fetch failed");
                     if sleep_or_cancel(refresh_secs, &shutdown).await {
                         return;
                     }
                     continue;
                 }
             };
-            if pids.is_empty() {
+            if targets.is_empty() {
                 // No PID-resolved clients yet — wait for one to connect.
                 if sleep_or_cancel(refresh_secs, &shutdown).await {
                     return;
@@ -368,19 +415,19 @@ pub fn start_ebpf_consumer(
             }
             match run_one_probe(
                 &tracer,
-                &pids,
-                &pid_session,
+                &targets,
                 &pool,
                 &roots,
+                mode,
+                capture_reads,
                 refresh_secs,
-                dedup_secs,
-                &mut dedup,
+                &stats,
                 &shutdown,
             )
             .await
             {
                 ProbeExit::Shutdown => return,
-                ProbeExit::PidSetChanged => continue,
+                ProbeExit::TargetsChanged => continue,
                 ProbeExit::Failed(reason) => {
                     // Most often a permission/attach failure (no CAP_BPF). Back
                     // off generously so a cap-less host does not log-spam; the
@@ -401,8 +448,6 @@ mod tests {
 
     #[test]
     fn classify_op_reads_vs_writes() {
-        // O_RDONLY = 0 → Open; O_WRONLY = 1, O_RDWR = 2 → Write (with/without
-        // O_CREAT(0o100)/O_TRUNC(0o1000) high bits set).
         assert_eq!(classify_op(0), FileOp::Open);
         assert_eq!(classify_op(0o1), FileOp::Write);
         assert_eq!(classify_op(0o2), FileOp::Write);
@@ -412,9 +457,10 @@ mod tests {
 
     #[test]
     fn parse_trace_line_accepts_well_formed_events() {
-        let ev = parse_trace_line("E\t12345\t577\t/home/u/ws/proj/src/main.rs")
+        let ev = parse_trace_line("E\t12345\t303106\t577\t/home/u/ws/proj/src/main.rs")
             .expect("well-formed event parses");
         assert_eq!(ev.pid, 12345);
+        assert_eq!(ev.cgroup_id, 303106);
         assert_eq!(ev.flags, 577); // 0o1101 = O_WRONLY|O_CREAT|O_TRUNC
         assert_eq!(ev.path, "/home/u/ws/proj/src/main.rs");
         assert_eq!(classify_op(ev.flags), FileOp::Write);
@@ -422,46 +468,65 @@ mod tests {
 
     #[test]
     fn parse_trace_line_rejects_banner_and_malformed() {
-        // bpftrace attach banner and stray lines.
         assert_eq!(parse_trace_line("Attaching 2 probes..."), None);
         assert_eq!(parse_trace_line(""), None);
-        // Non-E-prefixed.
-        assert_eq!(parse_trace_line("X\t1\t0\t/x"), None);
+        assert_eq!(parse_trace_line("X\t1\t2\t0\t/x"), None);
         // Relative / sentinel path is dropped (unknown cwd).
-        assert_eq!(parse_trace_line("E\t1\t0\trelative/path"), None);
-        assert_eq!(parse_trace_line("E\t1\t0\t(unknown)"), None);
-        // Non-numeric pid / flags.
-        assert_eq!(parse_trace_line("E\tnotapid\t0\t/x"), None);
-        assert_eq!(parse_trace_line("E\t1\tnotflags\t/x"), None);
+        assert_eq!(parse_trace_line("E\t1\t2\t0\trelative/path"), None);
+        assert_eq!(parse_trace_line("E\t1\t2\t0\t(unknown)"), None);
+        // Non-numeric pid / cgroup / flags.
+        assert_eq!(parse_trace_line("E\tnotapid\t2\t0\t/x"), None);
+        assert_eq!(parse_trace_line("E\t1\tnotacg\t0\t/x"), None);
+        assert_eq!(parse_trace_line("E\t1\t2\tnotflags\t/x"), None);
     }
 
     #[test]
     fn parse_trace_line_keeps_paths_with_spaces_and_tabs() {
-        // splitn(3) means only the first two tabs split fields — a path may
+        // splitn(4) means only the first three tabs split fields — a path may
         // itself contain spaces (and even tabs) and survives intact.
-        let ev = parse_trace_line("E\t9\t0\t/home/u/My Docs/a.txt").expect("space path");
+        let ev = parse_trace_line("E\t9\t5\t0\t/home/u/My Docs/a.txt").expect("space path");
         assert_eq!(ev.path, "/home/u/My Docs/a.txt");
-        let ev2 = parse_trace_line("E\t9\t0\t/home/u/od\tap.txt").expect("tab-in-path");
+        let ev2 = parse_trace_line("E\t9\t5\t0\t/home/u/od\tap.txt").expect("tab-in-path");
         assert_eq!(ev2.path, "/home/u/od\tap.txt");
     }
 
     #[test]
-    fn build_program_filters_to_the_pid_set() {
-        let pids: HashSet<i32> = [101, 202].into_iter().collect();
-        let prog = build_program(&pids);
+    fn build_program_cgroup_and_pid_terms() {
+        let mut t = LiveTargets::default();
+        t.cgroups.insert(303106);
+        t.pids.insert(101);
+        let prog = build_program(&t, true);
         assert!(prog.contains("sys_enter_openat"));
         assert!(prog.contains("sys_enter_open "), "legacy open traced too");
+        assert!(prog.contains("cgroup == 303106"));
         assert!(prog.contains("pid == 101"));
-        assert!(prog.contains("pid == 202"));
-        assert!(prog.contains("||"), "multi-pid predicate is disjunctive");
+        assert!(prog.contains("||"), "multi-target predicate is disjunctive");
+        assert!(prog.contains("%lu"), "cgroup id printed as u64");
         assert!(prog.contains("str(args->filename)"));
+        // capture_reads = true ⇒ no write-only guard.
+        assert!(!prog.contains("& 3) != 0"));
     }
 
     #[test]
-    fn build_program_single_pid_has_no_disjunction() {
-        let pids: HashSet<i32> = [7].into_iter().collect();
-        let prog = build_program(&pids);
-        assert!(prog.contains("pid == 7"));
-        assert!(!prog.contains("||"));
+    fn build_program_write_only_guard_when_reads_disabled() {
+        let mut t = LiveTargets::default();
+        t.cgroups.insert(7);
+        let prog = build_program(&t, false);
+        assert!(prog.contains("cgroup == 7"));
+        assert!(prog.contains("& 3) != 0"), "write-only guard injected");
+    }
+
+    #[test]
+    fn live_targets_same_filter_ignores_session_maps() {
+        let mut a = LiveTargets::default();
+        a.cgroups.insert(1);
+        a.cgroup_session.insert(1, "sess-a".to_string());
+        let mut b = LiveTargets::default();
+        b.cgroups.insert(1);
+        b.cgroup_session.insert(1, "sess-b".to_string()); // different session
+        // Same filter set ⇒ no respawn needed despite the session map differing.
+        assert!(a.same_filter(&b));
+        b.pids.insert(99);
+        assert!(!a.same_filter(&b)); // filter set changed ⇒ respawn
     }
 }

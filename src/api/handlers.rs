@@ -486,16 +486,26 @@ pub async fn search(
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ClientFileEventRequest {
-    pub session_id: uuid::Uuid,
+    /// Agent session UUID (the Claude hook sends one). Optional — Codex and other
+    /// agents whose session id is not a UUID simply omit it; attribution then
+    /// rests on `agent_id` + the resolved project. A non-UUID string still 400s
+    /// (it cannot deserialize to `Uuid`), so such producers must omit the key.
+    #[serde(default)]
+    pub session_id: Option<uuid::Uuid>,
     pub cwd: String,
     pub file_path: String,
     /// Closed `FileOp` vocab: open|read|write|edit|close. Unknown values are
     /// rejected (400) so a typo can't land an unconstrained row.
     pub op: String,
-    // NB: the hook also sends a constant `agent_id` ("claude-code"); it is
-    // intentionally not a field here — it is fully implied by `source='client_hook'`
-    // and adds no attribution beyond the per-session/pid columns. serde ignores
-    // the extra JSON key, so the hook needs no change.
+    /// Which agent produced the touch: `claude-code` | `codex` | … . The Claude
+    /// hook sends `"claude-code"`; the Codex hook (ADR-022) sends `"codex"`.
+    /// Optional for backward compatibility — absent ⇒ `claude-code`. Recorded in
+    /// `client_file_events.agent_id` (orthogonal to `source`, which stays the
+    /// *mechanism* `client_hook`), so `client_project_matrix` can tell Codex hook
+    /// rows from Claude ones — the old `client_hook ⇒ claude-code` assumption no
+    /// longer holds now that two agents share the hook ingest.
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -515,6 +525,8 @@ pub async fn client_file_event(
     State(state): State<ApiState>,
     Json(req): Json<ClientFileEventRequest>,
 ) -> Result<Json<ClientFileEventResponse>, (StatusCode, String)> {
+    use crate::proc_clients::file_events::{FileEventSource, FileTouchEvent};
+
     // Honor the `[clients] file_events` switch — a no-op (not an error) when
     // off, so the hook stays harmless even if left wired in settings.json.
     if !state.config.load().clients.file_events {
@@ -534,8 +546,10 @@ pub async fn client_file_event(
         ),
     ))?;
 
-    // DB-availability breaker (src/health): spool to the outbox while the DB is
-    // down (replayed on recovery) instead of stalling the PostToolUse hook.
+    // DB-availability breaker (src/health): while the DB is down, spool the raw
+    // request to the outbox (replayed on recovery via loopback re-POST) instead
+    // of stalling the PostToolUse hook. This is the hook path's durability story;
+    // PID-native sources just drop their batches under an outage.
     if !state.stats.db_health().is_up() {
         if let Some(ob) = state.outbox.as_ref() {
             ob.append(
@@ -550,52 +564,101 @@ pub async fn client_file_event(
         }));
     }
 
-    let pool = state.db.pool().ok_or((
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "raw pool unavailable".to_string(),
-    ))?;
-
-    // Best-effort project (longest-prefix cwd) + indexed-file (absolute path)
-    // resolution — a NULL on either is fine (cwd outside any project, or an
-    // unindexed/just-written file); the row still attributes the touch.
-    let project_id = state
-        .db
-        .find_project_by_cwd(&req.cwd)
-        .await
-        .ok()
-        .flatten()
-        .map(|p| p.id);
-    let file_id: Option<i64> = sqlx::query_scalar("SELECT id FROM indexed_files WHERE path = $1")
-        .bind(&req.file_path)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-
-    sqlx::query(
-        "INSERT INTO client_file_events
-            (session_id, file_id, project_id, abs_path, op, source, ts)
-         VALUES ($1, $2, $3, $4, $5, 'client_hook', now())",
-    )
-    .bind(req.session_id)
-    .bind(file_id)
-    .bind(project_id)
-    .bind(&req.file_path)
-    .bind(op.as_str())
-    .execute(pool)
-    .await
-    .map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("client_file_event insert failed: {e}"),
-        )
-    })?;
+    // DB up: emit into the reactive ingestion stream (ADR-022) as a thin
+    // producer. The batched writer resolves project + indexed-file once per
+    // distinct path and performs the multi-row INSERT (~`ebpf_batch_ms` later) —
+    // the fire-and-forget hook does not wait on it. Identity is the Claude/Codex
+    // session UUID; `agent_id` distinguishes the agent behind `source='client_hook'`.
+    // A NULL project/file is fine downstream (unindexed/just-written file).
+    let recorded = state.stats.emit_file_event(FileTouchEvent {
+        source: FileEventSource::ClientHook,
+        op,
+        abs_path: req.file_path,
+        pid: None,
+        ppid: None,
+        root_pid: None,
+        cgroup_id: None,
+        mcp_session_id: None,
+        session_id: req.session_id,
+        agent_id: Some(req.agent_id.unwrap_or_else(|| "claude-code".to_string())),
+    });
 
     Ok(Json(ClientFileEventResponse {
-        recorded: true,
-        project_id,
-        file_id,
+        recorded,
+        project_id: None,
+        file_id: None,
     }))
+}
+
+// ============================================================================
+// GET /api/client/file_events/stream — live SSE feed of file touches (ADR-022)
+// ============================================================================
+
+/// Server-Sent Events feed of `client_file_events` rows as they land — the HTTP
+/// face of the live fan-out (ADR-022). Polls by `id` cursor every 200 ms
+/// (mirroring the a2a SSE bridge, so no `LISTEN` connection is held open),
+/// starting at the current max id so only NEW rows stream. Emits nothing when
+/// `[clients] file_event_stream` is off; external tools / pi may instead `LISTEN`
+/// on the `pg_notify` channel directly.
+pub async fn client_file_events_stream(
+    State(state): State<ApiState>,
+) -> axum::response::sse::Sse<
+    impl futures::Stream<Item = Result<axum::response::sse::Event, axum::Error>>,
+> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use std::time::{Duration, Instant};
+
+    let enabled = state.config.load().clients.file_event_stream;
+    let pool = state.db.pool().cloned();
+    // Start at the current max id so only rows that land AFTER subscription
+    // stream (a fresh subscriber doesn't replay history).
+    let start_id: i64 = match (enabled, &pool) {
+        (true, Some(p)) => {
+            sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM client_file_events")
+                .fetch_one(p)
+                .await
+                .unwrap_or(0)
+        }
+        _ => i64::MAX, // disabled / no pool → cursor past everything → emits nothing
+    };
+
+    let stream = futures::stream::unfold(
+        (pool, start_id, Instant::now()),
+        move |(pool, last_id, started)| async move {
+            if !enabled || pool.is_none() || started.elapsed() > Duration::from_secs(300) {
+                return None; // disabled, CLI-mode, or 5-min cap reached
+            }
+            let p = pool.as_ref().expect("pool present when enabled");
+            let rows = sqlx::query_as::<_, (i64, String, String, String, Option<String>)>(
+                "SELECT id, abs_path, op, source, agent_id FROM client_file_events
+                 WHERE id > $1 ORDER BY id LIMIT 500",
+            )
+            .bind(last_id)
+            .fetch_all(p)
+            .await
+            .unwrap_or_default();
+            if rows.is_empty() {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                return Some((
+                    Ok(Event::default().comment("heartbeat")),
+                    (pool, last_id, started),
+                ));
+            }
+            let next = rows.last().expect("non-empty").0;
+            let payload = serde_json::json!({
+                "events": rows.iter().map(|(id, path, op, source, agent)| serde_json::json!({
+                    "id": id, "abs_path": path, "op": op, "source": source, "agent_id": agent,
+                })).collect::<Vec<_>>(),
+            });
+            Some((
+                Ok(Event::default()
+                    .event("file_events")
+                    .data(payload.to_string())),
+                (pool, next, started),
+            ))
+        },
+    );
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 // ============================================================================

@@ -7,6 +7,7 @@
 //! paths.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::tracker::kind::join_quoted;
 
@@ -70,17 +71,37 @@ pub enum FileEventSource {
     Ebpf,
     /// `/proc/<pid>/fd` sampling on the liveness tick — best-effort supplement.
     ProcFd,
+    /// eBPF syscall tracing filtered by **cgroup id** — captures the agent's
+    /// whole process *subtree* (`cargo`→`rustc`→`rg`, …), because cgroup
+    /// membership is inherited across `fork`/`exec`. The PID-exact `Ebpf` source
+    /// sees only the agent process itself; this one closes the subprocess gap
+    /// (Phase 2C, ADR-022).
+    EbpfCgroup,
+    /// Unprivileged `LD_PRELOAD` libc interposition in the agent's process
+    /// *subtree* — captures file *edits* by spawned subprocesses (`cargo`/`rustc`/
+    /// …) with **no caps, no root, no cgroup**; attribution rests on `agent_id`
+    /// set by the launch wrapper. Complements `EbpfCgroup`; blind to statically
+    /// linked / setuid children (Phase 2D, ADR-022).
+    Preload,
 }
 
 impl FileEventSource {
     /// Canonical set; the source of the DB CHECK vocabulary.
-    pub const ALL: &'static [FileEventSource] = &[Self::ClientHook, Self::Ebpf, Self::ProcFd];
+    pub const ALL: &'static [FileEventSource] = &[
+        Self::ClientHook,
+        Self::Ebpf,
+        Self::ProcFd,
+        Self::EbpfCgroup,
+        Self::Preload,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ClientHook => "client_hook",
             Self::Ebpf => "ebpf",
             Self::ProcFd => "proc_fd",
+            Self::EbpfCgroup => "ebpf_cgroup",
+            Self::Preload => "preload",
         }
     }
 
@@ -96,6 +117,45 @@ impl FileEventSource {
 /// SQL `IN (...)` value list for the `client_file_events_source_check` constraint.
 pub fn source_sql_in_list() -> String {
     join_quoted(FileEventSource::ALL.iter().map(|s| s.as_str()))
+}
+
+/// One unified file-touch event flowing through the reactive ingestion stream
+/// (ADR-022). **Every** capture source — the `POST /api/client/file_event`
+/// handler, the eBPF cgroup probe, the `/proc/<pid>/fd` sampler — emits this into
+/// a single bounded [`crate::reactive::subject::Subject`]; one batched writer is
+/// the sole consumer that resolves `project_id`/`file_id` and inserts a
+/// `client_file_events` row.
+///
+/// Project/file resolution is deliberately **absent** here: it is deferred to the
+/// writer so it runs once per *distinct path* **after** the dedup/debounce
+/// operators have collapsed a burst (a `cargo build` opens tens of thousands of
+/// files). The struct must be `Clone` for the reactive `Subject<T: Clone>` bound.
+#[derive(Debug, Clone, Serialize)]
+pub struct FileTouchEvent {
+    /// Capture mechanism — the `source` column.
+    pub source: FileEventSource,
+    /// What happened to the file — the `op` column.
+    pub op: FileOp,
+    /// Absolute path; recorded even when the file is not (yet) indexed
+    /// (`file_id` then resolves to `NULL`).
+    pub abs_path: String,
+    /// Acting PID (PID-native sources); `None` on the hook side.
+    pub pid: Option<i32>,
+    /// Immediate parent PID — advisory/forensic backstop for attribution.
+    pub ppid: Option<i32>,
+    /// Owning agent/session-leader PID — advisory/forensic.
+    pub root_pid: Option<i32>,
+    /// cgroup-v2 id (the cgroup directory inode) — the subtree-attribution key
+    /// joining to `mcp_clients.cgroup_id`. Persisted as `BIGINT` via a `as i64`
+    /// bit-cast (inode values fit below 2^63 in practice).
+    pub cgroup_id: Option<u64>,
+    /// MCP streamable-HTTP session id (PID-native sources, after resolution).
+    pub mcp_session_id: Option<String>,
+    /// Claude/Codex hook session UUID (the hook side).
+    pub session_id: Option<Uuid>,
+    /// Which agent produced it (`claude-code` | `codex` | `pi` | …) — orthogonal
+    /// to `source`, which records the *mechanism*, not the agent.
+    pub agent_id: Option<String>,
 }
 
 #[cfg(test)]
@@ -117,10 +177,12 @@ mod tests {
     #[test]
     fn file_event_source_vocabulary_is_pinned() {
         let got: HashSet<&str> = FileEventSource::ALL.iter().map(|s| s.as_str()).collect();
-        let expected: HashSet<&str> = ["client_hook", "ebpf", "proc_fd"].into_iter().collect();
+        let expected: HashSet<&str> = ["client_hook", "ebpf", "proc_fd", "ebpf_cgroup", "preload"]
+            .into_iter()
+            .collect();
         assert_eq!(got, expected, "FileEventSource vocabulary drifted");
-        assert_eq!(FileEventSource::ALL.len(), 3);
-        assert_eq!(got.len(), 3, "duplicate as_str() in FileEventSource");
+        assert_eq!(FileEventSource::ALL.len(), 5);
+        assert_eq!(got.len(), 5, "duplicate as_str() in FileEventSource");
     }
 
     #[test]

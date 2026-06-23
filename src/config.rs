@@ -410,6 +410,82 @@ pub struct ClientsConfig {
     /// open-close editors, so cheap but low-signal.
     #[serde(default)]
     pub proc_fd_supplement: bool,
+    /// Capture files touched by the agent's spawned **subprocesses** (`cargo`,
+    /// `rustc`, test runners, `rg`) via cgroup-v2 + eBPF subtree tracing
+    /// (Phase 2C, ADR-022). Off by default; requires `cgroup_scope = "ebpf"`,
+    /// `CAP_BPF`+`CAP_PERFMON`, and — for clean per-agent subtrees — agents
+    /// launched in their own cgroup scope (else it degrades to per-PID).
+    #[serde(default)]
+    pub subprocess_capture: bool,
+    /// Subprocess-capture mechanism: `"off"` | `"ebpf"`. `"ebpf"` switches the
+    /// probe filter from per-PID to `bpf_get_current_cgroup_id()`, so the agent's
+    /// whole process subtree is traced (cgroup membership is inherited across
+    /// `fork`/`exec`). Clients without a private registered cgroup fall back to
+    /// the per-PID predicate. Default `"off"`.
+    #[serde(default = "default_cgroup_scope")]
+    pub cgroup_scope: String,
+    /// Whether the subprocess probe records read-only opens. `false` injects an
+    /// in-kernel write-only guard (`flags & O_ACCMODE != 0`), turning a build's
+    /// tens of thousands of header reads into a few hundred write events.
+    /// Default true (record reads + writes).
+    #[serde(default = "default_true_clients")]
+    pub capture_reads: bool,
+    /// Reactive-ingestion batch-flush window (ms): a coalesced batch of file
+    /// events is written after this long, or after `ingest_batch_max` events —
+    /// whichever first. Default 200.
+    #[serde(default = "default_ebpf_batch_ms")]
+    pub ebpf_batch_ms: u64,
+    /// Reactive-ingestion `Subject` buffer capacity; when full, producers
+    /// drop-newest (attribution-telemetry loss is acceptable). Default 8192.
+    #[serde(default = "default_ingest_capacity")]
+    pub ingest_capacity: usize,
+    /// Max events per coalesced write batch (bounds the multi-row INSERT well
+    /// under Postgres' 65535 bind-parameter cap). Default 256.
+    #[serde(default = "default_ingest_batch_max")]
+    pub ingest_batch_max: usize,
+    /// Enable the live file-event fan-out (ADR-022): the batched writer emits
+    /// `pg_notify(pg_notify_channel, <batch json>)` and the
+    /// `GET /api/client/file_events/stream` SSE endpoint streams events, so
+    /// external tools / the pi orchestrator can react to touches live. Off by
+    /// default ⇒ byte-identical current semantics.
+    #[serde(default)]
+    pub file_event_stream: bool,
+    /// Postgres `LISTEN`/`NOTIFY` channel for the fan-out (when
+    /// `file_event_stream` is on). Default `pgmcp_client_file_events`.
+    #[serde(default = "default_file_event_channel")]
+    pub pg_notify_channel: String,
+    /// Capture files *edited* by an agent's spawned subprocesses (cargo/rustc/test
+    /// runners) via an UNPRIVILEGED `LD_PRELOAD` shim — no caps, no root, no
+    /// private cgroup (ADR-022 Phase 2D). The daemon binds a `SOCK_DGRAM` at
+    /// `preload_socket` and records `source='preload'`; the launch wrapper
+    /// (`crucible/scripts/agent-scope.sh`) exports `LD_PRELOAD` +
+    /// `PGMCP_FSTRACE_SOCK` + `PGMCP_AGENT_ID`. Complements (not replaces) the
+    /// eBPF path; the ingest dedup collapses overlap when both run. Off by default.
+    #[serde(default)]
+    pub preload_capture: bool,
+    /// Datagram socket path the preload shim sends to. Empty ⇒ default
+    /// `$XDG_RUNTIME_DIR/pgmcp/fstrace.sock`. The launch wrapper must export the
+    /// same path as `PGMCP_FSTRACE_SOCK`.
+    #[serde(default)]
+    pub preload_socket: String,
+    /// Capture files edited by **Codex's** subprocesses via the shim's FILE
+    /// transport (its seccomp sandbox EPERMs the socket but allows `write()` to a
+    /// `writable_roots` file; ADR-022 Phase 2E). The daemon tails per-launch
+    /// `<agent>-<pid>.log` files under `preload_file_dir` and reaps each when its
+    /// owning agent process exits. Off by default. Complements `preload_capture`
+    /// (the socket transport); both feed the same ingest stream.
+    #[serde(default)]
+    pub preload_file_capture: bool,
+    /// Directory the shim's FILE transport appends to (and the daemon tails).
+    /// Empty ⇒ `$XDG_RUNTIME_DIR/pgmcp/fstrace`. Must equal a Codex
+    /// `[sandbox_workspace_write] writable_roots` entry and the parent dir of the
+    /// wrapper-exported `PGMCP_FSTRACE_FILE`.
+    #[serde(default)]
+    pub preload_file_dir: String,
+    /// Per-file size (bytes) at which the tailer truncates a trace file in place
+    /// once fully drained (bounds tmpfs growth under a build flood). Default 8 MiB.
+    #[serde(default = "default_preload_file_rotate_bytes")]
+    pub preload_file_rotate_bytes: u64,
 }
 
 impl Default for ClientsConfig {
@@ -421,8 +497,63 @@ impl Default for ClientsConfig {
             ebpf_refresh_secs: default_ebpf_refresh_secs(),
             ebpf_dedup_secs: default_ebpf_dedup_secs(),
             proc_fd_supplement: false,
+            subprocess_capture: false,
+            cgroup_scope: default_cgroup_scope(),
+            capture_reads: true,
+            ebpf_batch_ms: default_ebpf_batch_ms(),
+            ingest_capacity: default_ingest_capacity(),
+            ingest_batch_max: default_ingest_batch_max(),
+            file_event_stream: false,
+            pg_notify_channel: default_file_event_channel(),
+            preload_capture: false,
+            preload_socket: String::new(),
+            preload_file_capture: false,
+            preload_file_dir: String::new(),
+            preload_file_rotate_bytes: default_preload_file_rotate_bytes(),
         }
     }
+}
+
+impl ClientsConfig {
+    /// Resolve the preload shim's datagram socket path. An explicit
+    /// `preload_socket` wins; otherwise `$XDG_RUNTIME_DIR/pgmcp/fstrace.sock` (a
+    /// user-private tmpfs), falling back to `<tmpdir>/pgmcp/fstrace.sock`. The
+    /// daemon binds it (unlink-then-bind, mode 0600); the wrapper exports the same
+    /// path as `PGMCP_FSTRACE_SOCK`.
+    pub fn resolved_preload_socket(&self) -> std::path::PathBuf {
+        if !self.preload_socket.is_empty() {
+            return std::path::PathBuf::from(&self.preload_socket);
+        }
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("pgmcp")
+            .join("fstrace.sock")
+    }
+
+    /// Resolve the FILE-transport trace directory (Phase 2E). Explicit
+    /// `preload_file_dir` wins; otherwise `$XDG_RUNTIME_DIR/pgmcp/fstrace`, falling
+    /// back to `<tmpdir>/pgmcp/fstrace`. The daemon creates it 0700 and tails it;
+    /// the wrapper writes `<dir>/<agent>-<pid>.log` here (so this must match a
+    /// Codex `writable_roots` entry).
+    pub fn resolved_preload_file_dir(&self) -> std::path::PathBuf {
+        if !self.preload_file_dir.is_empty() {
+            return std::path::PathBuf::from(&self.preload_file_dir);
+        }
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join("pgmcp")
+            .join("fstrace")
+    }
+}
+
+fn default_file_event_channel() -> String {
+    "pgmcp_client_file_events".to_string()
+}
+
+fn default_preload_file_rotate_bytes() -> u64 {
+    8 * 1024 * 1024
 }
 
 fn default_ebpf_refresh_secs() -> u64 {
@@ -431,6 +562,22 @@ fn default_ebpf_refresh_secs() -> u64 {
 
 fn default_ebpf_dedup_secs() -> u64 {
     5
+}
+
+fn default_cgroup_scope() -> String {
+    "off".to_string()
+}
+
+fn default_ebpf_batch_ms() -> u64 {
+    200
+}
+
+fn default_ingest_capacity() -> usize {
+    8192
+}
+
+fn default_ingest_batch_max() -> usize {
+    256
 }
 
 fn default_true_clients() -> bool {

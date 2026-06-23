@@ -75,8 +75,10 @@ mod v56_cross_project_edges;
 mod v57_self_improvement_findings;
 mod v58_lint_finding_class;
 mod v59_system_control;
-mod v60_crucible_trace;
 mod v5_work_items_collab;
+mod v60_crucible_trace;
+mod v61_subprocess_capture;
+mod v62_preload_source;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
 mod v8_csm_protocols;
@@ -2861,6 +2863,33 @@ pub async fn run_migrations(
         v60_crucible_trace::CRUCIBLE_TRACE,
         v60_crucible_trace::CRUCIBLE_TRACE_NAME,
         || v60_crucible_trace::apply(pool),
+    )
+    .await?;
+
+    // Step 61 — subprocess file-attribution (ADR-022 E11). Additive columns on
+    // `client_file_events` (cgroup_id / root_pid / ppid / agent_id) plus the
+    // `mcp_clients.cgroup_id` join target, and widens the `source` CHECK for the
+    // new `ebpf_cgroup` capture path (cgroup-v2 + eBPF subtree tracing). See
+    // `src/db/migrations/v61_subprocess_capture.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v61_subprocess_capture::SUBPROCESS_CAPTURE_V1,
+        v61_subprocess_capture::SUBPROCESS_CAPTURE_V1_NAME,
+        || v61_subprocess_capture::apply(pool),
+    )
+    .await?;
+
+    // Step 62 — widen the client_file_events.source CHECK for the unprivileged
+    // `preload` source (ADR-022 Phase 2D, LD_PRELOAD shim). CHECK-widen only; the
+    // columns it uses (agent_id/cgroup_id/ppid) already exist from v61. See
+    // `src/db/migrations/v62_preload_source.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v62_preload_source::PRELOAD_SOURCE_V1,
+        v62_preload_source::PRELOAD_SOURCE_V1_NAME,
+        || v62_preload_source::apply(pool),
     )
     .await?;
 

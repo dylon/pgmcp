@@ -81,6 +81,45 @@ fn main() {
         panic!("nvcc failed to compile {cu_src} (exit {:?})", status.code());
     }
     println!("cargo:warning=pgmcp: compiled fcm_kernels.ptx → {ptx_out}");
+
+    // Compile the unprivileged LD_PRELOAD file-write tracer shim (ADR-022 Phase
+    // 2D): src/proc_clients/preload_shim.c → $OUT_DIR/libpgmcp_fstrace.so. The
+    // daemon does NOT link this; the launch wrapper (crucible/scripts/agent-scope.sh)
+    // preloads it into agent subprocesses. Built here so it ships next to the
+    // binary and stays version-locked to the datagram format in
+    // src/proc_clients/preload.rs. Best-effort: unlike the mandatory CUDA kernel,
+    // the shim is opt-in, so a missing/failed `cc` only disables preload capture
+    // (`cargo:warning`) rather than failing the whole build.
+    let shim_src = "src/proc_clients/preload_shim.c";
+    let shim_out = format!("{out_dir}/libpgmcp_fstrace.so");
+    println!("cargo:rerun-if-changed={shim_src}");
+    match std::process::Command::new("cc")
+        .args([
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-fvisibility=hidden",
+            "-Wall",
+            "-Wextra",
+            "-o",
+            &shim_out,
+            shim_src,
+            "-ldl",
+        ])
+        .status()
+    {
+        Ok(s) if s.success() => {
+            println!("cargo:warning=pgmcp: built fstrace shim → {shim_out}");
+        }
+        Ok(s) => println!(
+            "cargo:warning=pgmcp: cc failed to build fstrace shim (exit {:?}); \
+             preload capture unavailable",
+            s.code()
+        ),
+        Err(e) => {
+            println!("cargo:warning=pgmcp: cc not found ({e}); preload capture unavailable");
+        }
+    }
 }
 
 /// Find a directory that contains BOTH `libcudart.so` and `libcublasLt.so`.

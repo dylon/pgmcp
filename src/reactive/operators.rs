@@ -184,6 +184,104 @@ where
     out_rx
 }
 
+/// Dedup with a time-to-live: emit an item only if its key has **not** been
+/// emitted within the last `ttl`; otherwise suppress it (a keyed throttle-first).
+///
+/// This is the burst-collapser for the file-event ingestion stream (ADR-022): a
+/// `cargo build` re-`open`s the same headers thousands of times, and we want at
+/// most one row per `(actor, op, path)` per window. It is the standalone,
+/// reusable form of the hand-rolled dedup that previously lived inside
+/// `proc_clients::ebpf::handle_event` (same 4096-entry opportunistic eviction).
+pub fn dedup_ttl<T, K, F>(rx: Receiver<T>, ttl: Duration, key_fn: F) -> Receiver<T>
+where
+    T: Send + 'static,
+    K: Eq + Hash + Send + 'static,
+    F: Fn(&T) -> K + Send + 'static,
+{
+    let (tx, out_rx) = bounded(256);
+
+    thread::Builder::new()
+        .name("rx-dedup-ttl".into())
+        .spawn(move || {
+            let mut seen: HashMap<K, Instant> = HashMap::new();
+            for item in rx {
+                let now = Instant::now();
+                let k = key_fn(&item);
+                if let Some(prev) = seen.get(&k)
+                    && now.duration_since(*prev) < ttl
+                {
+                    continue; // same key within the window — collapse
+                }
+                seen.insert(k, now);
+                // Opportunistic bound: when the map grows large, drop entries
+                // whose window has already elapsed (cannot suppress anything).
+                if seen.len() > 4096 {
+                    seen.retain(|_, t| now.duration_since(*t) < ttl);
+                }
+                if tx.send(item).is_err() {
+                    break;
+                }
+            }
+        })
+        .expect("Failed to spawn dedup_ttl thread");
+
+    out_rx
+}
+
+/// Buffer items into a `Vec`, flushing when **either** `max_count` items have
+/// accumulated **or** `window` elapses with a non-empty buffer — whichever comes
+/// first. This bounds both latency (the window) and batch size (the count) so a
+/// flood within one window cannot grow an unbounded batch. Used by the file-event
+/// writer to coalesce many touches into one multi-row INSERT.
+pub fn buffer_time_count<T: Send + 'static>(
+    rx: Receiver<T>,
+    window: Duration,
+    max_count: usize,
+) -> Receiver<Vec<T>> {
+    let (tx, out_rx) = bounded(64);
+    let cap = max_count.max(1);
+
+    thread::Builder::new()
+        .name("rx-buffer-time-count".into())
+        .spawn(move || {
+            let mut buf: Vec<T> = Vec::with_capacity(cap);
+            let mut deadline = Instant::now() + window;
+            loop {
+                let timeout = deadline.saturating_duration_since(Instant::now());
+                match rx.recv_timeout(timeout) {
+                    Ok(item) => {
+                        buf.push(item);
+                        if buf.len() >= cap {
+                            let batch = std::mem::replace(&mut buf, Vec::with_capacity(cap));
+                            if tx.send(batch).is_err() {
+                                break;
+                            }
+                            deadline = Instant::now() + window;
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        if !buf.is_empty() {
+                            let batch = std::mem::replace(&mut buf, Vec::with_capacity(cap));
+                            if tx.send(batch).is_err() {
+                                break;
+                            }
+                        }
+                        deadline = Instant::now() + window;
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        if !buf.is_empty() {
+                            let _ = tx.send(std::mem::take(&mut buf));
+                        }
+                        break;
+                    }
+                }
+            }
+        })
+        .expect("Failed to spawn buffer_time_count thread");
+
+    out_rx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +387,40 @@ mod tests {
             results.push(v);
         }
         assert_eq!(results, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn test_dedup_ttl_suppresses_within_window() {
+        let (tx, rx) = unbounded();
+        // A long TTL so every repeat inside this test is suppressed.
+        let deduped = dedup_ttl(rx, Duration::from_secs(3600), |k: &i32| *k);
+        for v in [1, 1, 2, 1, 2] {
+            tx.send(v).expect("send failed");
+        }
+        drop(tx);
+        let mut out = Vec::new();
+        while let Ok(v) = deduped.recv() {
+            out.push(v);
+        }
+        // First 1 and first 2 pass; subsequent repeats are within-window dups.
+        assert_eq!(out, vec![1, 2]);
+    }
+
+    #[test]
+    fn test_buffer_time_count_flushes_on_count() {
+        let (tx, rx) = unbounded();
+        // A long window so only the count threshold triggers the in-band flushes.
+        let batched = buffer_time_count(rx, Duration::from_secs(3600), 3);
+        for i in 0..7 {
+            tx.send(i).expect("send failed");
+        }
+        drop(tx);
+        let mut batches = Vec::new();
+        while let Ok(b) = batched.recv() {
+            batches.push(b);
+        }
+        // 7 items, cap 3 → two full batches then the disconnect-flush remainder.
+        assert_eq!(batches, vec![vec![0, 1, 2], vec![3, 4, 5], vec![6]]);
     }
 
     // ========================================================================

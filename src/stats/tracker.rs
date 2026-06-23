@@ -793,6 +793,16 @@ pub struct StatsTracker {
     /// or before `start_client_writer` has registered it. Lock-free
     /// (`ArcSwapOption`) for the hot `instrumented_tool_wrap` path.
     client_tx: ArcSwapOption<mpsc::Sender<ClientObservation>>,
+    /// Multi-producer sender into the reactive file-event ingestion stream
+    /// (ADR-022); `None` until `proc_clients::ingest::FileEventIngest::start`
+    /// registers it (CLI mode / capture disabled leave it empty). Hung off
+    /// StatsTracker — like `db_health` below — because it is already Arc-threaded
+    /// into every file-event producer (the REST hook handler via `ApiState.stats`,
+    /// the `proc_fd` liveness sweep, the eBPF cgroup consumer), so no producer
+    /// needs a new constructor parameter. Lock-free (`ArcSwapOption`); producers
+    /// `try_send` (drop-on-full) so they never block.
+    file_event_tx:
+        ArcSwapOption<crossbeam_channel::Sender<crate::proc_clients::file_events::FileTouchEvent>>,
     /// Sessions whose OS identity has already been captured, so `note_client`
     /// enqueues each session exactly once (the ~100 ms `/proc` resolution is not
     /// repeated per tool call). Pruned by the liveness cron when a session exits.
@@ -1096,6 +1106,7 @@ impl StatsTracker {
             trajectory_edges_emitted: AtomicU64::new(0),
             telemetry_tx: ArcSwapOption::empty(),
             client_tx: ArcSwapOption::empty(),
+            file_event_tx: ArcSwapOption::empty(),
             client_seen: DashMap::new(),
             mcp_server_port: AtomicU16::new(0),
             uptime_start: Instant::now(),
@@ -1120,6 +1131,27 @@ impl StatsTracker {
     /// Register the MCP-client capture writer's sender (see `start_client_writer`).
     pub fn set_client_sender(&self, tx: mpsc::Sender<ClientObservation>) {
         self.client_tx.store(Some(std::sync::Arc::new(tx)));
+    }
+
+    /// Register the reactive file-event ingestion sender (see
+    /// `proc_clients::ingest::FileEventIngest::start`). Called once at startup.
+    pub fn set_file_event_sender(
+        &self,
+        tx: crossbeam_channel::Sender<crate::proc_clients::file_events::FileTouchEvent>,
+    ) {
+        self.file_event_tx.store(Some(std::sync::Arc::new(tx)));
+    }
+
+    /// Emit one file-touch event into the ingestion stream. Best-effort: drops
+    /// the event when no stream is registered (capture disabled / CLI mode) or
+    /// the bounded buffer is full (`try_send`), so a producer — the REST hook,
+    /// the eBPF reader, the liveness sweep — never blocks. Returns whether the
+    /// event was accepted.
+    pub fn emit_file_event(&self, ev: crate::proc_clients::file_events::FileTouchEvent) -> bool {
+        match self.file_event_tx.load_full() {
+            Some(tx) => tx.try_send(ev).is_ok(),
+            None => false,
+        }
     }
 
     /// Record the daemon's MCP listen port so `note_client` can disambiguate the

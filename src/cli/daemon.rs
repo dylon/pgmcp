@@ -602,6 +602,35 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         None
     };
 
+    // 11b‴. Reactive file-event ingestion pipeline (ADR-022). The single fan-in
+    // point for every capture source — the REST `/api/client/file_event` hook,
+    // the eBPF cgroup/PID probe, the `proc_fd` liveness sampler — and the single
+    // batched writer of `client_file_events`. Built whenever any capture is on so
+    // all producers share one bounded stream (dedup → coalesce → multi-row
+    // INSERT). The sender is hung off `StatsTracker` (already Arc-threaded into
+    // every producer), so no producer constructor needs a new parameter. Held in
+    // `_file_event_ingest` for the daemon's lifetime — dropping it cancels the
+    // writer and tears the operator chain down.
+    let _file_event_ingest = {
+        let c = &config_snapshot.clients;
+        if (c.enabled || c.file_events)
+            && let Some(pool) = system_ctx.db().pool()
+        {
+            let ingest = proc_clients::ingest::FileEventIngest::start(
+                pool.clone(),
+                c.ingest_capacity,
+                c.ebpf_dedup_secs,
+                c.ebpf_batch_ms,
+                c.ingest_batch_max,
+                c.file_event_stream.then(|| c.pg_notify_channel.clone()),
+            );
+            stats_tracker.set_file_event_sender(ingest.sender());
+            Some(ingest)
+        } else {
+            None
+        }
+    };
+
     // 11b-bis. MCP-client OS-identity capture writer. Resolves each connected
     // client's PID/cwd/project from `/proc` (via the TCP peer) and upserts
     // `mcp_clients`, feeding the `active_clients` tool and the A2A
@@ -628,25 +657,81 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         None
     };
 
-    // 11b′. Phase-2B eBPF file-event capture (client-agnostic, opt-in). Long-lived
-    // task tracing the live client PIDs' openat/open syscalls via bpftrace and
-    // recording `ebpf`-source client_file_events. Off by default; needs
-    // CAP_BPF+CAP_PERFMON at runtime, so it never affects cap-less hosts.
-    let _ebpf_handle = if config_snapshot.clients.enabled && config_snapshot.clients.ebpf_enabled {
-        if let Some(pool) = system_ctx.db().pool() {
-            Some(proc_clients::ebpf::start_ebpf_consumer(
+    // 11b′. eBPF file-event capture (client-agnostic, opt-in; emits into the
+    // reactive ingestion stream above). Cgroup mode (`subprocess_capture` +
+    // `cgroup_scope = "ebpf"`, ADR-022 Phase 2C) traces each client's whole
+    // process subtree — `cargo`/`rustc`/… inherit the cgroup across fork/exec —
+    // and records `source='ebpf_cgroup'`; it supersedes the legacy per-PID mode
+    // (Phase 2B, `ebpf_enabled`, `source='ebpf'`), which sees only the agent
+    // process itself. Off by default; needs CAP_BPF+CAP_PERFMON at runtime, so
+    // cap-less hosts are unaffected. `stats` carries the ingestion-stream sender.
+    let _ebpf_handle = {
+        let c = &config_snapshot.clients;
+        let mode = if c.enabled && c.subprocess_capture && c.cgroup_scope == "ebpf" {
+            Some(proc_clients::ebpf::EbpfMode::Cgroup)
+        } else if c.enabled && c.ebpf_enabled {
+            Some(proc_clients::ebpf::EbpfMode::Pid)
+        } else {
+            None
+        };
+        match (mode, system_ctx.db().pool()) {
+            (Some(mode), Some(pool)) => Some(proc_clients::ebpf::start_ebpf_consumer(
                 pool.clone(),
                 config_snapshot.workspace.paths.clone(),
-                config_snapshot.clients.ebpf_refresh_secs,
-                config_snapshot.clients.ebpf_dedup_secs,
+                c.ebpf_refresh_secs,
+                c.capture_reads,
+                mode,
+                Arc::clone(&stats_tracker),
+                shutdown.cancellation_token(),
+            )),
+            (Some(_), None) => {
+                tracing::warn!("eBPF capture disabled: DbClient has no PgPool (CLI mode?)");
+                None
+            }
+            (None, _) => None,
+        }
+    };
+
+    // 11b⁗. Unprivileged LD_PRELOAD file-event capture (ADR-022 Phase 2D). Binds a
+    // SOCK_DGRAM Unix socket and reads `P\t…` datagrams that a wrapper-launched
+    // agent's subprocesses send (the shim is preloaded by
+    // crucible/scripts/agent-scope.sh), emitting into the same reactive ingestion
+    // stream. Zero privilege: no caps, no root, no cgroup. Off by default
+    // ([clients] preload_capture = false). Relies on the 11b‴ ingest sender.
+    let _preload_handle = {
+        let c = &config_snapshot.clients;
+        if c.enabled && c.preload_capture {
+            Some(proc_clients::preload::start_preload_consumer(
+                config_snapshot.workspace.paths.clone(),
+                c.resolved_preload_socket(),
+                c.capture_reads,
+                Arc::clone(&stats_tracker),
                 shutdown.cancellation_token(),
             ))
         } else {
-            tracing::warn!("eBPF capture disabled: DbClient has no PgPool (CLI mode?)");
             None
         }
-    } else {
-        None
+    };
+
+    // 11b⁗-file. Preload FILE-transport consumer (ADR-022 Phase 2E): tails the
+    // per-launch `<agent>-<pid>.log` trace files Codex's shim appends to (its
+    // seccomp sandbox blocks the socket but allows file writes), emitting into the
+    // same ingest stream, and reaps each file when its owning agent exits. Off by
+    // default ([clients] preload_file_capture = false).
+    let _preload_file_handle = {
+        let c = &config_snapshot.clients;
+        if c.enabled && c.preload_file_capture {
+            Some(proc_clients::preload::start_preload_file_consumer(
+                config_snapshot.workspace.paths.clone(),
+                c.resolved_preload_file_dir(),
+                c.capture_reads,
+                c.preload_file_rotate_bytes,
+                Arc::clone(&stats_tracker),
+                shutdown.cancellation_token(),
+            ))
+        } else {
+            None
+        }
     };
 
     // 11b″. Resilience (src/health): DB-availability breaker prober + disk-space
@@ -1366,6 +1451,10 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             .route(
                 "/api/client/file_event",
                 axum::routing::post(api::handlers::client_file_event),
+            )
+            .route(
+                "/api/client/file_events/stream",
+                axum::routing::get(api::handlers::client_file_events_stream),
             )
             .route(
                 "/api/client/inbox_peek",

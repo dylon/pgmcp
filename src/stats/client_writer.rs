@@ -95,21 +95,29 @@ async fn run_client_writer(
 async fn resolve_and_upsert(pool: &PgPool, obs: &ClientObservation) -> Result<(), sqlx::Error> {
     let peer = obs.peer;
     let server_port = obs.server_port;
-    let (pid, cwd, start_ticks): (Option<i32>, Option<String>, Option<u64>) =
-        tokio::task::spawn_blocking(move || {
-            let pid = crate::proc_clients::resolve_pid_for_peer(peer, server_port);
-            match pid {
-                Some(p) => (
-                    Some(p),
-                    crate::proc_clients::read_process_cwd(p)
-                        .map(|c| c.to_string_lossy().into_owned()),
-                    crate::proc_clients::proc_start_ticks(p),
-                ),
-                None => (None, None, None),
-            }
-        })
-        .await
-        .unwrap_or((None, None, None));
+    let (pid, cwd, start_ticks, cgroup_id): (
+        Option<i32>,
+        Option<String>,
+        Option<u64>,
+        Option<u64>,
+    ) = tokio::task::spawn_blocking(move || {
+        let pid = crate::proc_clients::resolve_pid_for_peer(peer, server_port);
+        match pid {
+            Some(p) => (
+                Some(p),
+                crate::proc_clients::read_process_cwd(p).map(|c| c.to_string_lossy().into_owned()),
+                crate::proc_clients::proc_start_ticks(p),
+                // cgroup-v2 id of the client process — the eBPF subtree-capture
+                // probe (ADR-022) filters by this, so resolving it at first sight
+                // means a client's subprocesses are traceable without waiting for
+                // the first liveness tick.
+                crate::proc_clients::read_process_cgroup_id(p),
+            ),
+            None => (None, None, None, None),
+        }
+    })
+    .await
+    .unwrap_or((None, None, None, None));
 
     let project_id = match &cwd {
         Some(c) => crate::db::queries::find_project_by_cwd(pool, c)
@@ -121,9 +129,9 @@ async fn resolve_and_upsert(pool: &PgPool, obs: &ClientObservation) -> Result<()
     sqlx::query(
         "INSERT INTO mcp_clients
             (mcp_session_id, client_name, client_version, protocol_version,
-             pid, proc_start_ticks, cwd, project_id,
+             pid, proc_start_ticks, cwd, project_id, cgroup_id,
              first_seen, last_seen, last_liveness_at, alive)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now(), now(), TRUE)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), now(), TRUE)
          ON CONFLICT (mcp_session_id) DO UPDATE SET
             client_name      = EXCLUDED.client_name,
             client_version   = EXCLUDED.client_version,
@@ -132,6 +140,7 @@ async fn resolve_and_upsert(pool: &PgPool, obs: &ClientObservation) -> Result<()
             proc_start_ticks = EXCLUDED.proc_start_ticks,
             cwd              = EXCLUDED.cwd,
             project_id       = EXCLUDED.project_id,
+            cgroup_id        = EXCLUDED.cgroup_id,
             last_seen        = now(),
             last_liveness_at = now(),
             alive            = TRUE,
@@ -145,6 +154,7 @@ async fn resolve_and_upsert(pool: &PgPool, obs: &ClientObservation) -> Result<()
     .bind(start_ticks.map(|t| t as i64))
     .bind(&cwd)
     .bind(project_id)
+    .bind(cgroup_id.map(|c| c as i64))
     .execute(pool)
     .await?;
 

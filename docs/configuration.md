@@ -163,6 +163,30 @@ ebpf_refresh_secs = 15       # how often the eBPF consumer re-reads the live PID
 ebpf_dedup_secs = 5          # collapse identical (pid, op, path) eBPF events within this window
 proc_fd_supplement = false   # also sample /proc/<pid>/fd on each liveness tick (source='proc_fd');
                              #   near-blind to open-close editors, so low-signal — off by default
+subprocess_capture = false   # Phase-2C (ADR-022): capture files touched by the agent's SUBPROCESSES
+                             #   (cargo/rustc/test runners) via cgroup-v2 + eBPF subtree tracing
+                             #   (source='ebpf_cgroup'). Needs cgroup_scope="ebpf" + CAP_BPF+CAP_PERFMON.
+cgroup_scope = "off"         # "off" | "ebpf"; "ebpf" filters the probe by bpf_get_current_cgroup_id() so
+                             #   a client's whole process subtree is traced (cgroup is inherited across
+                             #   fork/exec). Clients without a private cgroup fall back to per-PID.
+capture_reads = true         # false injects an in-kernel write-only guard, dropping read-only opens
+                             #   (turns a build's tens of thousands of header reads into ~hundreds of writes)
+ebpf_batch_ms = 200          # reactive-ingestion batch-flush window (or ingest_batch_max events, whichever first)
+ingest_capacity = 8192       # ingestion Subject buffer; full ⇒ producers drop-newest (telemetry loss is ok)
+ingest_batch_max = 256       # max events per coalesced multi-row INSERT
+file_event_stream = false    # live fan-out: writer pg_notify()s each batch + a
+                             #   GET /api/client/file_events/stream SSE endpoint. Off ⇒ no fan-out.
+pg_notify_channel = "pgmcp_client_file_events"  # LISTEN/NOTIFY channel for the fan-out
+preload_capture = false      # Phase-2D UNPRIVILEGED subprocess capture via an LD_PRELOAD shim (no
+                             #   caps/root/cgroup; source='preload'). The launch wrapper exports
+                             #   LD_PRELOAD + PGMCP_FSTRACE_SOCK + PGMCP_AGENT_ID. Complements eBPF.
+preload_socket = ""          # datagram socket the shim sends to; "" ⇒ $XDG_RUNTIME_DIR/pgmcp/fstrace.sock
+preload_file_capture = false # Phase-2E: capture Codex's subprocess edits via the shim's FILE transport
+                             #   (its sandbox blocks the socket but allows file write()); the daemon tails
+                             #   per-launch <agent>-<pid>.log files + reaps each on agent exit. source='preload'.
+preload_file_dir = ""        # trace dir the shim appends to / daemon tails; "" ⇒ $XDG_RUNTIME_DIR/pgmcp/fstrace
+                             #   (must match a Codex [sandbox_workspace_write] writable_roots entry)
+preload_file_rotate_bytes = 8388608  # in-place truncate a trace file once fully drained past this size
 ```
 
 ### Configuration Reference
@@ -235,6 +259,19 @@ proc_fd_supplement = false   # also sample /proc/<pid>/fd on each liveness tick 
 | `clients`    | `ebpf_refresh_secs`               | `15`                                | eBPF consumer: live-PID-set re-read & probe-respawn interval |
 | `clients`    | `ebpf_dedup_secs`                 | `5`                                 | eBPF consumer: collapse identical `(pid, op, path)` within this window |
 | `clients`    | `proc_fd_supplement`              | `false`                             | Sample `/proc/<pid>/fd` on each liveness tick (`proc_fd` source; low-signal) |
+| `clients`    | `subprocess_capture`              | `false`                             | Phase-2C (ADR-022): capture the agent's subprocess (`cargo`/`rustc`/…) file touches via cgroup-v2 + eBPF subtree tracing (`source='ebpf_cgroup'`); needs `cgroup_scope="ebpf"` + `CAP_BPF`/`CAP_PERFMON` |
+| `clients`    | `cgroup_scope`                    | `"off"`                             | `"off"`/`"ebpf"`; `"ebpf"` filters the probe by `bpf_get_current_cgroup_id()` (whole subtree), falling back to per-PID for clients without a private cgroup |
+| `clients`    | `capture_reads`                   | `true`                              | `false` injects an in-kernel write-only guard (drops read-only opens) |
+| `clients`    | `ebpf_batch_ms`                   | `200`                               | Reactive-ingestion batch-flush window (ms); also flushes at `ingest_batch_max` events |
+| `clients`    | `ingest_capacity`                 | `8192`                              | Ingestion `Subject` buffer capacity; full ⇒ producers drop-newest |
+| `clients`    | `ingest_batch_max`                | `256`                               | Max events per coalesced multi-row INSERT |
+| `clients`    | `file_event_stream`               | `false`                             | Live fan-out: writer `pg_notify`s each batch + a `GET /api/client/file_events/stream` SSE endpoint |
+| `clients`    | `pg_notify_channel`               | `"pgmcp_client_file_events"`        | `LISTEN`/`NOTIFY` channel for the fan-out |
+| `clients`    | `preload_capture`                 | `false`                             | Phase-2D **unprivileged** subprocess capture via an `LD_PRELOAD` shim (no caps/root/cgroup; `source='preload'`) |
+| `clients`    | `preload_socket`                  | `""`                                | Shim datagram socket; `""` ⇒ `$XDG_RUNTIME_DIR/pgmcp/fstrace.sock` |
+| `clients`    | `preload_file_capture`            | `false`                             | Phase-2E: capture Codex subprocess edits via the shim's FILE transport (sandbox-safe; tails `<agent>-<pid>.log`, reaps each on agent exit) |
+| `clients`    | `preload_file_dir`                | `""`                                | FILE-transport trace dir; `""` ⇒ `$XDG_RUNTIME_DIR/pgmcp/fstrace` (must match a Codex `writable_roots`) |
+| `clients`    | `preload_file_rotate_bytes`       | `8388608`                           | In-place truncate a trace file once drained past this size (bounds tmpfs growth) |
 
 ### Per-Project Configuration (`.pgmcp.toml`)
 

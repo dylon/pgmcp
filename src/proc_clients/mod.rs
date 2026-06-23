@@ -14,7 +14,10 @@
 //! - liveness via `kill(pid, 0)` (the idiom from
 //!   `crate::indexer::extract::subprocess`),
 //! - a start-time fingerprint (field 22 of `/proc/<pid>/stat`) that guards
-//!   against PID reuse, and
+//!   against PID reuse,
+//! - the cgroup-v2 id (the cgroup directory inode, matching the in-kernel
+//!   `bpf_get_current_cgroup_id()`), which attributes a client's whole process
+//!   *subtree* — `cargo`/`rustc`/… — back to the client (ADR-022), and
 //! - the set of currently-open regular files (a best-effort Phase-2 supplement).
 //!
 //! Every function is best-effort and returns `None`/empty off-Linux or on a
@@ -23,6 +26,8 @@
 
 pub mod ebpf;
 pub mod file_events;
+pub mod ingest;
+pub mod preload;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -75,6 +80,42 @@ pub fn proc_start_ticks(pid: i32) -> Option<u64> {
     let rparen = stat.rfind(')')?;
     let rest = stat.get(rparen + 2..)?;
     rest.split_whitespace().nth(19)?.parse::<u64>().ok()
+}
+
+/// cgroup-v2 id of `pid` — the **inode of its cgroup directory**, which is
+/// exactly the value the in-kernel `bpf_get_current_cgroup_id()` helper returns
+/// on a unified (cgroup2fs) hierarchy. We parse the unified line of
+/// `/proc/<pid>/cgroup` (format `0::<relpath>`) and `stat()` the corresponding
+/// `/sys/fs/cgroup<relpath>` directory for its inode.
+///
+/// Resolving the id in pure Rust (rather than `bpftrace cgroupid()`, which needs
+/// `CAP_DAC_READ_SEARCH`) lets the daemon hand a plain integer to the eBPF probe,
+/// which then filters by `cgroup == <id>`. Because cgroup membership is inherited
+/// across `fork`/`exec`, that single predicate captures the agent **and every
+/// subprocess it spawns** (`cargo` → `rustc` → `rg`, …) — the subtree the
+/// PID-exact filter cannot see. `None` off cgroup-v2, on a hybrid/v1 hierarchy
+/// (no `0::` line), or on any read/stat/race failure. Linux-only.
+pub fn read_process_cgroup_id(pid: i32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if pid <= 0 {
+            return None;
+        }
+        let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        // The unified (v2) hierarchy is the `0::<relpath>` line; controller lines
+        // on hybrid/v1 systems look like `N:cpu:/…` and are deliberately ignored.
+        let rel = content.lines().find_map(|l| l.strip_prefix("0::"))?;
+        // `rel` is absolute ("/" for the root cgroup), so it concatenates onto the
+        // cgroup2 mount point directly. The directory inode IS the cgroup id.
+        let meta = std::fs::metadata(format!("/sys/fs/cgroup{rel}")).ok()?;
+        Some(meta.ino())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 /// Resolve the OS PID that owns the *client* side of a loopback TCP connection
@@ -222,6 +263,23 @@ mod tests {
         let self_pid = std::process::id() as i32;
         assert!(proc_start_ticks(self_pid).is_some());
         assert_eq!(proc_start_ticks(0x7fff_ffff), None);
+    }
+
+    #[test]
+    fn read_process_cgroup_id_self_some_bogus_none() {
+        // Gate the positive assertion on a unified (cgroup2fs) host — the file
+        // `cgroup.controllers` exists only on cgroup v2 — so this stays green on
+        // hybrid/v1 CI while still exercising the happy path on the real target.
+        if std::path::Path::new("/sys/fs/cgroup/cgroup.controllers").exists() {
+            let self_pid = std::process::id() as i32;
+            assert!(
+                read_process_cgroup_id(self_pid).is_some(),
+                "own cgroup-v2 id should resolve on a cgroup2 host"
+            );
+        }
+        assert_eq!(read_process_cgroup_id(0x7fff_ffff), None);
+        assert_eq!(read_process_cgroup_id(0), None);
+        assert_eq!(read_process_cgroup_id(-1), None);
     }
 
     #[test]
