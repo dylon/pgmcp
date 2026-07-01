@@ -339,13 +339,13 @@ pub async fn tool_crucible_trace_timeline(
     }
     .map_err(internal)?;
     let mut out = json!({ "count": spans.len(), "spans": to_value(&spans)? });
-    if params.include_annotations.unwrap_or(true) {
-        if let Some(first) = spans.first() {
-            let anns = ts::load_annotations(pool, first.trace_id)
-                .await
-                .map_err(internal)?;
-            out["annotations"] = to_value(&anns)?;
-        }
+    if params.include_annotations.unwrap_or(true)
+        && let Some(first) = spans.first()
+    {
+        let anns = ts::load_annotations(pool, first.trace_id)
+            .await
+            .map_err(internal)?;
+        out["annotations"] = to_value(&anns)?;
     }
     json_result(&out)
 }
