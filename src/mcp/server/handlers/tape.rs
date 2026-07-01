@@ -1,7 +1,7 @@
 //! The **tape verbs** — the agent-facing MCP surface over the context-tape
 //! paging substrate (Phase 4).
 //!
-//! These nine `#[tool]` methods are the **black-box-legal** addressable surface
+//! These ten `#[tool]` methods are the **black-box-legal** addressable surface
 //! any agent (Claude, Codex, …) may call against a recursion tree's tape: they
 //! are *analytical* (NO shell, NO code execution), they NEVER write the user's
 //! source files, and the durable corpus is READ-ONLY (reads may hydrate from it;
@@ -86,6 +86,29 @@ no shell/exec; reads only; never writes the user's files."
             &_ctx,
             &summarize_debug(&params),
             crate::mcp::tools::tool_tape_peek::tool_tape_peek(self.ctx(), params),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "tape_excerpt — bounded materialization from one tape page: selects either a \
+1-based inclusive line range or a zero-based byte start, clamps output to max_bytes (default 4096, \
+hard cap 8192), and truncates on UTF-8 boundaries. It may hydrate through the normal read-only \
+data-plane cascade internally, but NEVER returns a whole unbounded page. Black-box-legal: \
+analytical, no shell/exec; reads only; never writes the user's files."
+    )]
+    async fn tape_excerpt(
+        &self,
+        Parameters(params): Parameters<TapeExcerptParams>,
+        _ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        instrumented_tool_wrap(
+            self.stats(),
+            "tape_excerpt",
+            30,
+            &_ctx,
+            &summarize_debug(&params),
+            crate::mcp::tools::tool_tape_excerpt::tool_tape_excerpt(self.ctx(), params),
         )
         .await
     }

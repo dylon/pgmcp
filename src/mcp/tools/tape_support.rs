@@ -1,6 +1,6 @@
 //! Shared scaffolding for the **tape verb** tool bodies (Phase 4).
 //!
-//! The nine tape verbs share a small amount of plumbing: derive the per-tree
+//! The tape verbs share a small amount of plumbing: derive the per-tree
 //! [`TreeId`](context_tape::TreeId) from the agent-supplied `tree` string,
 //! translate the MCP `address` string ↔ [`context_tape::PageAddress`] through
 //! the P3 bridge, and shape error responses. This module centralizes that so

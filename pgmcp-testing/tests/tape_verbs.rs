@@ -1,14 +1,14 @@
 //! Integration tests for the **tape verbs** — the agent-facing MCP surface over
 //! the context-tape paging substrate (Phase 4).
 //!
-//! These exercise every one of the nine verbs through
+//! These exercise every one of the ten verbs through
 //! `McpServer::call_tool_cli("tape_<verb>", …)` — the same CLI dispatch path the
 //! `every_dispatched_tool_has_an_integration_test` coverage guard scans, so each
 //! verb is reachable and the guard stays green.
 //!
 //! Two tiers, matching the verbs' data needs:
 //!   - **Tree-store-only** verbs (`tape_put` / `tape_get`(resident) / `tape_peek`
-//!     / `tape_slice` / `tape_grep`(tree) / `tape_fuzzy` / `tape_list` /
+//!     / `tape_excerpt` / `tape_slice` / `tape_grep`(tree) / `tape_fuzzy` / `tape_list` /
 //!     `tape_stat`) need no database — they run over a `MockDbClient`-backed
 //!     server and the in-RAM per-tree `TapeStore`. The headline test is a
 //!     `put → get → fuzzy → grep → list → stat` round-trip on a fresh tree.
@@ -250,6 +250,66 @@ fn peek_returns_bounded_head_and_size() {
 }
 
 // ===========================================================================
+// tape_excerpt returns bounded material without hydrating a full page into the response.
+// ===========================================================================
+#[test]
+fn excerpt_returns_bounded_line_and_byte_ranges() {
+    with_big_stack(async {
+        let server = mock_server();
+        let tree = fresh_tree();
+        let tid = tree_uuid(&server, &tree).await;
+        let address = format!("scratch/{tid}/02");
+        let body = "line-1\nline-2\nline-3\nline-4\n";
+
+        call(server.call_tool_cli(
+            "tape_put",
+            json!({"tree": tree, "address": address, "content": body}),
+        ))
+        .await;
+
+        let line_v = call(server.call_tool_cli(
+            "tape_excerpt",
+            json!({"tree": tree, "address": address, "start_line": 2, "end_line": 3, "max_bytes": 1024}),
+        ))
+        .await;
+        assert_eq!(line_v["found"], true);
+        assert_eq!(line_v["content"], "line-2\nline-3\n");
+        assert_eq!(line_v["content_truncated"], false);
+
+        let byte_v = call(server.call_tool_cli(
+            "tape_excerpt",
+            json!({"tree": tree, "address": address, "start_byte": 0, "max_bytes": 6}),
+        ))
+        .await;
+        assert_eq!(byte_v["content"], "line-1");
+        assert_eq!(byte_v["excerpt_bytes"].as_u64(), Some(6));
+        assert_eq!(byte_v["content_truncated"], true);
+
+        let missing = call(server.call_tool_cli(
+            "tape_excerpt",
+            json!({"tree": tree, "address": format!("scratch/{tid}/03")}),
+        ))
+        .await;
+        assert_eq!(missing["found"], false);
+
+        let large_address = format!("scratch/{tid}/04");
+        call(server.call_tool_cli(
+            "tape_put",
+            json!({"tree": tree, "address": large_address, "content": "x".repeat(10_000)}),
+        ))
+        .await;
+        let capped = call(server.call_tool_cli(
+            "tape_excerpt",
+            json!({"tree": tree, "address": large_address, "max_bytes": 20_000}),
+        ))
+        .await;
+        assert_eq!(capped["max_bytes"].as_u64(), Some(8192));
+        assert_eq!(capped["excerpt_bytes"].as_u64(), Some(8192));
+        assert_eq!(capped["content_truncated"], true);
+    });
+}
+
+// ===========================================================================
 // tape_slice scans resident pages in address order between two bounds.
 // ===========================================================================
 #[test]
@@ -300,24 +360,26 @@ fn slice_scans_resident_pages_in_address_order() {
 // tape_semantic degrades gracefully (no hits) in mock-DB mode — still reachable
 // via call_tool_cli for the coverage guard.
 // ===========================================================================
-#[tokio::test]
-async fn semantic_is_reachable_and_degrades_without_db() {
-    let server = mock_server();
-    let tree = fresh_tree();
-    let v = call(server.call_tool_cli(
-        "tape_semantic",
-        json!({"tree": tree, "query": "authentication flow", "k": 4}),
-    ))
-    .await;
-    assert_eq!(
-        v["available"], false,
-        "semantic retrieval is unavailable without a live pool"
-    );
-    assert_eq!(
-        v["hits"].as_array().map(|h| h.len()),
-        Some(0),
-        "no hits without the corpus"
-    );
+#[test]
+fn semantic_is_reachable_and_degrades_without_db() {
+    with_big_stack(async {
+        let server = mock_server();
+        let tree = fresh_tree();
+        let v = call(server.call_tool_cli(
+            "tape_semantic",
+            json!({"tree": tree, "query": "authentication flow", "k": 4}),
+        ))
+        .await;
+        assert_eq!(
+            v["available"], false,
+            "semantic retrieval is unavailable without a live pool"
+        );
+        assert_eq!(
+            v["hits"].as_array().map(|h| h.len()),
+            Some(0),
+            "no hits without the corpus"
+        );
+    });
 }
 
 // ===========================================================================

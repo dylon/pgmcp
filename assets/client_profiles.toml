@@ -48,6 +48,69 @@ include_provenance = false
 "memory_hybrid_search" = "Memory observations, vector+keyword RRF."
 "adoption_report" = "Per-family tool-adoption call-share + nudge conversion, by client."
 
+
+# Pi MCP adapter connects to this server as pi-mcp-pgmcp. Direct tools are
+# registered from the adapter metadata cache at Pi startup, so Crucible tools
+# that Pi expects directly must be visible in this profile tools/list.
+[[profiles]]
+name = "pi-mcp-pgmcp"
+output_format = "compact_json"
+default_brief = true
+include_provenance = false
+tool_surface = "learned"
+mandatory_core = [
+  "tool_catalog",
+  "enable_tools",
+  "disable_tools",
+  "call_tool",
+  "orient",
+  "semantic_search",
+  "text_search",
+  "grep",
+  "hybrid_search",
+  "read_file",
+  "file_info",
+  "project_tree",
+  "list_projects",
+  "index_stats",
+  "mandate_context",
+  "memory_unified_search",
+  "memory_semantic_search",
+  "memory_create_entities",
+  "a2a_send_task",
+  "a2a_pattern_sequential",
+  "a2a_pattern_mixture",
+  "a2a_fleet_view",
+  "csm_synthesize_protocol",
+  "csm_validate_run",
+  "csm_protocol_plan",
+  "crucible_trace_event",
+  "crucible_trace_get",
+  "crucible_trace_timeline",
+  "crucible_trace_replay",
+  "crucible_trace_reconcile",
+  "crucible_trace_why",
+  "crucible_trace_audit",
+  "tape_put",
+  "tape_peek",
+  "tape_excerpt",
+  "tape_grep",
+  "tape_semantic",
+  "tape_fuzzy",
+  "tape_list",
+  "tape_stat",
+  "session_checkpoint_save",
+  "session_checkpoint_resume",
+  "session_checkpoint_list",
+  "orchestrator_recommend_next",
+  "work_item_ingest_plan",
+  "experiment_open",
+  "experiment_record_measurement",
+  "experiment_decide",
+  "experiment_render_ledger",
+  "experiment_preregister_context_tape",
+]
+
 [[profiles]]
 name = "generic"
 output_format = "markdown"

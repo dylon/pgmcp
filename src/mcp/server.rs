@@ -992,6 +992,7 @@ impl McpServer {
             "tape_get"      => tape_get(TapeGetParams),
             "tape_put"      => tape_put(TapePutParams),
             "tape_peek"     => tape_peek(TapePeekParams),
+            "tape_excerpt"  => tape_excerpt(TapeExcerptParams),
             "tape_slice"    => tape_slice(TapeSliceParams),
             "tape_grep"     => tape_grep(TapeGrepParams),
             "tape_fuzzy"    => tape_fuzzy(TapeFuzzyParams),

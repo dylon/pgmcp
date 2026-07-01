@@ -1,8 +1,8 @@
 //! Parameter types for the **tape verbs** — the agent-facing MCP surface over
 //! the context-tape paging substrate (Phase 4).
 //!
-//! These nine verbs (`tape_get` / `tape_put` / `tape_peek` / `tape_slice` /
-//! `tape_grep` / `tape_fuzzy` / `tape_semantic` / `tape_list` / `tape_stat`)
+//! These ten verbs (`tape_get` / `tape_put` / `tape_peek` / `tape_excerpt` /
+//! `tape_slice` / `tape_grep` / `tape_fuzzy` / `tape_semantic` / `tape_list` / `tape_stat`)
 //! are the **black-box-legal**, safe addressable surface any agent (Claude,
 //! Codex, …) may call: they are *analytical* (no shell, no code execution),
 //! they never write the user's source files, and the durable corpus is
@@ -73,6 +73,38 @@ pub struct TapePeekParams {
                        Clamped to the page size; truncated on a UTF-8 char boundary."
     )]
     pub bytes: Option<usize>,
+}
+
+/// `tape_excerpt` — fetch bounded text from one page. The tool may hydrate the
+/// page internally through the normal data-plane cascade, but it never returns
+/// more than the hard output cap to the caller.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TapeExcerptParams {
+    #[schemars(description = "Recursion-tree scope (the per-tree TapeStore namespace). Required.")]
+    pub tree: String,
+    #[schemars(description = "Page address (== PageAddress::to_path()).")]
+    pub address: String,
+    #[schemars(
+        description = "Optional 1-based inclusive first line to return. Mutually exclusive with \
+                       start_byte. Defaults to 1 when end_line is supplied."
+    )]
+    pub start_line: Option<usize>,
+    #[schemars(
+        description = "Optional 1-based inclusive last line to return. Mutually exclusive with \
+                       start_byte. Defaults to the page's final line when start_line is supplied."
+    )]
+    pub end_line: Option<usize>,
+    #[schemars(
+        description = "Optional zero-based byte offset to start from. Mutually exclusive with \
+                       start_line/end_line. If it lands inside a UTF-8 code point, the start moves \
+                       forward to the next character boundary."
+    )]
+    pub start_byte: Option<usize>,
+    #[schemars(
+        description = "Maximum bytes to return (default 4096, hard cap 8192). The returned excerpt is \
+                       truncated on a UTF-8 character boundary."
+    )]
+    pub max_bytes: Option<usize>,
 }
 
 /// `tape_slice` — positional range scan over the per-tree store, in address
@@ -223,8 +255,8 @@ impl ReplLimitsParams {
 /// `tape_repl` — run a **sandboxed white-box REPL** script against the per-tree
 /// tape store, gated by a structural admission check.
 ///
-/// This is the *white-box / latent-tier* counterpart of the nine black-box-legal
-/// tape verbs: it scripts the tape through context-tape's deny-by-default `rhai`
+/// This is the *white-box / latent-tier* counterpart of the black-box-legal tape
+/// surface: it scripts the tape through context-tape's deny-by-default `rhai`
 /// engine (only the nine verbs `peek`/`slice`/`grep`/`get`/`put`/`fuzzy`/
 /// `semantic`/`list`/`stat`; no filesystem/network/process; `eval` disabled) under
 /// hard, deterministic [`ReplLimitsParams`]. Admission requires **both** a

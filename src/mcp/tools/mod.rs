@@ -334,6 +334,7 @@ pub mod tool_session_checkpoint_resume;
 pub mod tool_session_checkpoint_save;
 // Phase 4 — the agent-facing tape verbs (black-box-legal: analytical, no
 // shell/exec, never writes the user's files; corpus is read-only).
+pub mod tool_tape_excerpt;
 pub mod tool_tape_fuzzy;
 pub mod tool_tape_get;
 pub mod tool_tape_grep;
