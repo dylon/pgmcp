@@ -136,7 +136,7 @@ fn bind_socket(path: &Path) -> Option<UnixDatagram> {
             Some(sock)
         }
         Err(e) => {
-            warn!(socket = %path.display(), error = %e,
+            error!(socket = %path.display(), error = %e,
                   "preload: socket bind failed; preload capture disabled");
             None
         }
@@ -468,8 +468,14 @@ mod tests {
 
     #[test]
     fn parse_pid_from_name_extracts_suffix() {
-        assert_eq!(parse_pid_from_name(Path::new("/x/codex-12345.log")), Some(12345));
-        assert_eq!(parse_pid_from_name(Path::new("/x/claude-code-9.log")), Some(9));
+        assert_eq!(
+            parse_pid_from_name(Path::new("/x/codex-12345.log")),
+            Some(12345)
+        );
+        assert_eq!(
+            parse_pid_from_name(Path::new("/x/claude-code-9.log")),
+            Some(9)
+        );
         assert_eq!(parse_pid_from_name(Path::new("/x/codex.log")), None);
         assert_eq!(parse_pid_from_name(Path::new("/x/codex-abc.log")), None);
     }
@@ -520,7 +526,11 @@ mod tests {
             pid: None,
         };
         // Second record has no trailing '\n' — it must buffer, not emit torn.
-        std::fs::write(&tmp, b"P\t1\t2\t0\tc\tw\t0\t/ws/a.rs\nP\t3\t4\t0\tc\tw\t0\t/ws/b").unwrap();
+        std::fs::write(
+            &tmp,
+            b"P\t1\t2\t0\tc\tw\t0\t/ws/a.rs\nP\t3\t4\t0\tc\tw\t0\t/ws/b",
+        )
+        .unwrap();
         drain_file(&tmp, &mut st, &roots, true, 8 << 20, &stats);
         assert_eq!(rx.try_iter().count(), 1); // only the complete a.rs
         assert!(!st.carry.is_empty());

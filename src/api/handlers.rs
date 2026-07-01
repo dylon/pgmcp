@@ -1830,7 +1830,7 @@ async fn set_halted(
             attributes: serde_json::json!({}),
         };
         if let Err(e) = crate::csm::trace_store::record_control(pool, &entry).await {
-            tracing::warn!(error = %e, "control-journal append failed (all-stop still applied)");
+            tracing::error!(error = %e, "control-journal append failed (all-stop still applied)");
         }
     }
     Ok(())

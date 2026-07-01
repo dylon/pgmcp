@@ -241,7 +241,7 @@ pub async fn tool_session_checkpoint_save(
             attributes: json!({ "cursor": cursor, "critic_iteration": critic_iteration }),
         };
         if let Err(e) = crate::csm::trace_store::record_control(pool, &entry).await {
-            tracing::warn!(error = %e, "checkpoint control-journal append failed (pause still applied)");
+            tracing::error!(error = %e, "checkpoint control-journal append failed (pause still applied)");
         }
 
         return json_result(&json!({

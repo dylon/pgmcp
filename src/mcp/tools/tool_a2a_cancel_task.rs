@@ -58,7 +58,7 @@ pub async fn tool_a2a_cancel_task(
         attributes: json!({ "target_agent": params.target_agent }),
     };
     if let Err(e) = crate::csm::trace_store::record_control(pool, &entry).await {
-        tracing::warn!(error = %e, "cancel control-journal append failed (cancel still applied)");
+        tracing::error!(error = %e, "cancel control-journal append failed (cancel still applied)");
     }
     // Shadow-ASR channel (Phase D2b): project-scoped effect distribution
     // (resolved from the local parent-task row, if this id is a local task).
