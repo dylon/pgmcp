@@ -96,9 +96,16 @@ pub async fn tool_trigger_cron(
         crate::cron::history::CronTriggerSource::Manual,
         project.clone(),
     );
-    let result = trigger_cron_dispatch(ctx, job, project).await;
+    // A job arm may surface per-run counters (e.g. target-cleanup's reclaimed
+    // bytes) so the manual run's `cron_run_history.counters` matches what the
+    // scheduled path records via `spawn_recorded_with` — instead of an empty `{}`.
+    let mut counters: Option<serde_json::Value> = None;
+    let result = trigger_cron_dispatch(ctx, job, project, &mut counters).await;
     match &result {
-        Ok(_) => run.ok(),
+        Ok(_) => match counters {
+            Some(c) => run.ok_with(c),
+            None => run.ok(),
+        },
         Err(e) => run.fail(format!("{e:?}")),
     }
     result
@@ -112,6 +119,7 @@ async fn trigger_cron_dispatch(
     ctx: &SystemContext,
     job: &str,
     project: Option<String>,
+    counters_out: &mut Option<serde_json::Value>,
 ) -> Result<CallToolResult, McpError> {
     let db = ctx.db();
     let stats = ctx.stats();
@@ -131,6 +139,9 @@ async fn trigger_cron_dispatch(
                 )
                 .await;
                 report.log_summary();
+                // Surface the reclamation counts to the manual run's history row
+                // (D1: parity with the scheduled `spawn_recorded_with` path).
+                *counters_out = Some(report.to_counters());
                 json_result(&json!({
                     "job": job,
                     "project": project,

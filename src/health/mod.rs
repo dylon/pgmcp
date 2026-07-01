@@ -20,6 +20,7 @@
 
 pub mod db_health;
 pub mod disk_pressure;
+pub mod disk_report;
 pub mod fs;
 pub mod outbox;
 pub mod prober;

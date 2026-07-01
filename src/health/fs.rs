@@ -62,3 +62,37 @@ pub fn fs_avail(path: &Path) -> Option<FsAvail> {
 pub fn avail_bytes(path: &Path) -> Option<u64> {
     fs_avail(path).map(|a| a.avail_bytes)
 }
+
+/// Total bytes of the filesystem containing `path` (`f_blocks · f_frsize`), or
+/// `None` if the `statvfs` call fails. Used by the disk-pressure report to
+/// compute used-percentage (a fuller signal than free-bytes on a large disk:
+/// 95% full with 100+ GiB free still warrants attention).
+pub fn fs_total(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statvfs(c.as_ptr(), &mut s) };
+    if rc != 0 {
+        return None;
+    }
+    Some((s.f_blocks as u64).saturating_mul(s.f_frsize as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn root_total_is_at_least_available() {
+        // `/` always exists; total capacity must be ≥ the free portion.
+        let total = fs_total(Path::new("/")).expect("statvfs / total");
+        let avail = avail_bytes(Path::new("/")).expect("statvfs / avail");
+        assert!(total >= avail, "total {total} < avail {avail}");
+        assert!(total > 0, "root filesystem reports zero total bytes");
+    }
+
+    #[test]
+    fn missing_path_reports_none() {
+        assert!(fs_total(Path::new("/pgmcp/no/such/path/xyzzy")).is_none());
+    }
+}

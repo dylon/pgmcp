@@ -822,6 +822,15 @@ pub struct StatsTracker {
     // no subsystem constructor needs a new parameter.
     db_health: Arc<DbHealth>,
     disk_pressure: Arc<DiskPressure>,
+    /// Latest disk-pressure consumer breakdown, set by the watchdog when a
+    /// watched filesystem crosses the alert threshold; surfaced in
+    /// `/api/status`. `None` until the first alert. Lock-free (`ArcSwapOption`).
+    disk_report: ArcSwapOption<crate::health::disk_report::DiskReport>,
+    /// Live used-% of the worst watched filesystem, written every watchdog poll
+    /// (encoded via `f64::to_bits`; `NaN` until the first poll). The cheap
+    /// headline that always matches `df` — independent of the throttled, more
+    /// expensive `disk_report` consumer walk.
+    disk_used_pct_bits: AtomicU64,
 }
 
 impl StatsTracker {
@@ -1112,6 +1121,8 @@ impl StatsTracker {
             uptime_start: Instant::now(),
             db_health: Arc::new(DbHealth::new()),
             disk_pressure: Arc::new(DiskPressure::new()),
+            disk_report: ArcSwapOption::empty(),
+            disk_used_pct_bits: AtomicU64::new(f64::NAN.to_bits()),
         }
     }
 
@@ -1273,6 +1284,30 @@ impl StatsTracker {
     /// `crate::health`.
     pub fn disk_pressure(&self) -> &Arc<DiskPressure> {
         &self.disk_pressure
+    }
+
+    /// Store the latest disk-pressure consumer breakdown (watchdog → /api/status).
+    pub fn set_disk_report(&self, report: crate::health::disk_report::DiskReport) {
+        self.disk_report.store(Some(Arc::new(report)));
+    }
+
+    /// The latest disk-pressure consumer breakdown, if one has been emitted.
+    pub fn disk_report(&self) -> Option<Arc<crate::health::disk_report::DiskReport>> {
+        self.disk_report.load_full()
+    }
+
+    /// Store the live used-% of the worst watched filesystem (watchdog → every
+    /// poll → `/api/status`). The always-current fullness headline.
+    pub fn set_disk_used_pct(&self, pct: f64) {
+        self.disk_used_pct_bits
+            .store(pct.to_bits(), Ordering::Release);
+    }
+
+    /// The live used-% of the worst watched filesystem, or `None` before the
+    /// first watchdog poll (or when the disk guard is disabled).
+    pub fn disk_used_pct(&self) -> Option<f64> {
+        let p = f64::from_bits(self.disk_used_pct_bits.load(Ordering::Acquire));
+        (!p.is_nan()).then_some(p)
     }
 
     /// Mark a named cron job as permanently disabled until daemon
@@ -1609,6 +1644,15 @@ impl StatsTracker {
             "disk_pressure": disk_pressure.paused,
             "disk_avail_bytes": disk_pressure.last_avail_bytes,
             "disk_pressure_generation": disk_pressure.generation,
+            // Live used-% of the fullest watched filesystem (matches `df`), set
+            // every watchdog poll — the always-current fullness headline, vs. the
+            // throttled `disk_report` consumer breakdown below.
+            "disk_used_pct": self.disk_used_pct()
+                .map(|p| serde_json::json!((p * 100.0).round() / 100.0))
+                .unwrap_or(serde_json::Value::Null),
+            "disk_report": self.disk_report.load_full()
+                .and_then(|r| serde_json::to_value(&*r).ok())
+                .unwrap_or(serde_json::Value::Null),
             "tool_invocations": serde_json::Value::Object(
                 self.tool_invocations.iter()
                     .map(|e| (e.key().clone(), serde_json::Value::from(e.value().count.load(Ordering::Relaxed))))

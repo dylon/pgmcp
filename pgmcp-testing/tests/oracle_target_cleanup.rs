@@ -151,6 +151,9 @@ async fn target_cleanup_wipes_stale_target_keeps_source_and_honors_tmp_provenanc
         tmp_unattributed_age_days: 10,
         tmp_unattributed_var_age_days: 30,
         manifest_keep: 50,
+        reap_superseded: true,
+        reap_keep_per_stem: 2,
+        reap_window_secs: 86400,
     };
 
     let report = run_target_cleanup(&pool, &cfg, None).await;
@@ -191,6 +194,129 @@ async fn target_cleanup_wipes_stale_target_keeps_source_and_honors_tmp_provenanc
         eprintln!("NOTE: `touch -d` unavailable; skipped the age-fallback assertion");
         assert!(report.tmp_files_removed >= 1, "gone removed");
     }
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+/// THE GAP, end-to-end: an **active** project (committed today) whose
+/// `target/<profile>/deps/` holds superseded duplicate units gets those
+/// duplicates reaped — while its live working set and its `target/` survive —
+/// even though it is far from Tier-2 stale. This is the case a freshly rebuilt
+/// 200 GB `target/debug/` falls into, which the staleness tiers never reclaimed.
+#[tokio::test]
+async fn reaper_reclaims_active_project_superseded_artifacts() {
+    let db = require_test_db!();
+    let pool = db.pool().clone();
+
+    let id = std::process::id();
+    let base = std::env::temp_dir().join(format!("pgmcp_tc_oracle_reaper_{id}"));
+    let _ = std::fs::remove_dir_all(&base);
+    let proj = base.join("ws").join("active-proj");
+
+    write(
+        &proj.join("Cargo.toml"),
+        "[package]\nname=\"x\"\nversion=\"0.0.0\"\nedition=\"2021\"\n",
+    );
+    write(&proj.join("src/lib.rs"), "pub fn f() {}\n");
+
+    let deps = proj.join("target/debug/deps");
+    let fp = proj.join("target/debug/.fingerprint");
+    // Live unit (hash bbbb…) — written now, the current working set.
+    write(
+        &deps.join("libfoo-bbbbbbbb22222222.rlib"),
+        "LIVE-RLIB-XXXXXXXX",
+    );
+    write(&deps.join("foo-bbbbbbbb22222222.d"), "live depinfo");
+    write(&fp.join("foo-bbbbbbbb22222222/lib"), "fp");
+    // Superseded unit (hash aaaa…) — same crate, an earlier build.
+    write(
+        &deps.join("libfoo-aaaaaaaa11111111.rlib"),
+        "DEAD-RLIB-XXXXXXXX",
+    );
+    write(&deps.join("foo-aaaaaaaa11111111.d"), "dead depinfo");
+    write(&fp.join("foo-aaaaaaaa11111111/lib"), "fp");
+
+    // Age the superseded unit ~100 days back so it falls outside the 24h window.
+    // (The live unit stays at "now".) Skip cleanly if GNU `touch -d` is absent.
+    let aged = ["libfoo-aaaaaaaa11111111.rlib", "foo-aaaaaaaa11111111.d"]
+        .iter()
+        .all(|f| {
+            Command::new("touch")
+                .args(["-a", "-m", "-d", "100 days ago"])
+                .arg(deps.join(f))
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+        && Command::new("touch")
+            .args(["-a", "-m", "-d", "100 days ago"])
+            .arg(fp.join("foo-aaaaaaaa11111111"))
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+    if !aged {
+        eprintln!("SKIPPED: GNU `touch -d` unavailable");
+        let _ = std::fs::remove_dir_all(&base);
+        return;
+    }
+
+    // Active project: a commit dated NOW keeps age_days ≈ 0 (≤ active_days).
+    if !git(&proj, &[], &["-c", "init.defaultBranch=main", "init"]) {
+        eprintln!("SKIPPED: git unavailable");
+        let _ = std::fs::remove_dir_all(&base);
+        return;
+    }
+    assert!(git(&proj, &[], &["config", "user.name", "T"]));
+    assert!(git(&proj, &[], &["config", "user.email", "t@t"]));
+    assert!(git(&proj, &[], &["add", "-A"]));
+    assert!(git(&proj, &[], &["commit", "-m", "now", "--no-gpg-sign"],));
+
+    seed_project(&pool, "active-proj", proj.to_str().expect("utf8 proj")).await;
+
+    let cfg = TargetCleanupConfig {
+        interval_secs: 604_800,
+        dry_run: false,
+        active_days: 14,
+        stale_days: 60,
+        build_quiet_mins: 0,
+        free_floor_gb: 0,
+        roots: Vec::new(),
+        allowlist: Vec::new(),
+        sweep_tmp: false,
+        tmp_dirs: Vec::new(),
+        tmp_attributed_grace_secs: 3600,
+        tmp_session_grace_secs: 7200,
+        tmp_unattributed_age_days: 10,
+        tmp_unattributed_var_age_days: 30,
+        manifest_keep: 50,
+        reap_superseded: true,
+        reap_keep_per_stem: 2,
+        reap_window_secs: 86400,
+    };
+
+    let report = run_target_cleanup(&pool, &cfg, None).await;
+
+    // The reaper (which runs before the tiers) reclaimed the superseded unit.
+    assert!(
+        report.reap_superseded_bytes > 0,
+        "reaper reclaimed superseded bytes from an ACTIVE project"
+    );
+    assert!(
+        !deps.join("libfoo-aaaaaaaa11111111.rlib").exists(),
+        "superseded rlib reaped"
+    );
+    assert!(
+        !fp.join("foo-aaaaaaaa11111111").exists(),
+        "superseded fingerprint reaped coherently"
+    );
+    // Live working set + target/ survive (NOT a Tier-2 wipe — the project is active).
+    assert!(
+        deps.join("libfoo-bbbbbbbb22222222.rlib").exists(),
+        "live unit preserved — next build stays incremental"
+    );
+    assert!(proj.join("target").exists(), "active target/ not wiped");
+    assert!(proj.join("src/lib.rs").exists(), "source kept");
+    assert_eq!(report.tier2_bytes, 0, "active project: no full wipe");
 
     let _ = std::fs::remove_dir_all(&base);
 }

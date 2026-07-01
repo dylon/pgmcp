@@ -1297,15 +1297,52 @@ pub fn schedule_maintenance_jobs(
                 let cfg = tc_cfg.clone();
                 let hist = hist_tc.clone();
                 if let Some(pool) = db_clone_tc.pool().cloned() {
-                    crate::cron::history::spawn_recorded(
+                    crate::cron::history::spawn_recorded_with(
                         &rt_clone_tc,
                         hist,
                         "target-cleanup",
                         async move {
-                            crate::cron::target_cleanup::run_or_log(pool, cfg).await;
+                            crate::cron::target_cleanup::run_or_log(pool, cfg)
+                                .await
+                                .to_counters()
                         },
                     );
                 }
+                true
+            },
+        );
+    }
+
+    // docker-cleanup: bounded reclamation of Docker's build cache + dangling
+    // images (never tagged images, running containers, or named volumes). Light
+    // job — shells to `docker`, no DB, no Ready gate; ships enabled-but-dry-run.
+    // interval 0 disables. Uses the standard restart-survival initial delay.
+    if config.docker_cleanup.interval_secs > 0 {
+        let rt_clone_dc = rt.clone();
+        let lc_dc = lifecycle.clone();
+        let dc_interval = config.docker_cleanup.interval_secs;
+        let dc_cfg = config.docker_cleanup.clone();
+        let hist_dc = system_ctx.cron_history().clone();
+        handle.schedule_recurring(
+            initial_delay("docker-cleanup", dc_interval * 1000),
+            dc_interval * 1000,
+            "docker-cleanup",
+            move || {
+                if lc_dc.is_stopping() {
+                    return false;
+                }
+                let cfg = dc_cfg.clone();
+                let hist = hist_dc.clone();
+                crate::cron::history::spawn_recorded_with(
+                    &rt_clone_dc,
+                    hist,
+                    "docker-cleanup",
+                    async move {
+                        crate::cron::docker_cleanup::run_or_log(cfg)
+                            .await
+                            .to_counters()
+                    },
+                );
                 true
             },
         );

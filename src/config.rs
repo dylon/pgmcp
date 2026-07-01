@@ -2507,6 +2507,26 @@ pub struct DiskGuardConfig {
     /// then `[workspace] paths`, then `/`.
     #[serde(default)]
     pub paths: Vec<String>,
+    /// Used-percent of a watched filesystem at/above which to emit the
+    /// ranked-consumers disk-pressure alert (a *softer, earlier* signal than the
+    /// byte/inode pause floors — a 2 TB disk can be 95% full with 100+ GiB free,
+    /// tripping no floor yet still worth surfacing). 0 disables the alert.
+    /// Default 85.
+    #[serde(default = "default_disk_guard_alert_used_pct")]
+    pub alert_used_pct: u8,
+    /// Directories probed for the consumer breakdown in that alert (each a
+    /// best-effort recursive size; entries that don't exist contribute nothing).
+    /// `~/` is expanded. Docker, the PostgreSQL DB, and stale rustup toolchains
+    /// are probed separately and need no entry here.
+    #[serde(default = "default_disk_guard_consumer_paths")]
+    pub consumer_paths: Vec<String>,
+    /// While a watched filesystem stays at/above `alert_used_pct`, re-assemble the
+    /// (expensive: dir-walk + `docker`/`rustup` shell-out) consumer breakdown at
+    /// most this often — so the stored `disk_report` tracks the live disk instead
+    /// of freezing at the first crossing. The alert *log line* stays edge-fired.
+    /// Default 300 s; clamped to ≥ 30 s at runtime.
+    #[serde(default = "default_disk_guard_report_refresh_secs")]
+    pub report_refresh_secs: u64,
 }
 
 impl Default for DiskGuardConfig {
@@ -2520,8 +2540,26 @@ impl Default for DiskGuardConfig {
             pause_floor_inodes: default_disk_guard_pause_inodes(),
             resume_floor_inodes: default_disk_guard_resume_inodes(),
             paths: Vec::new(),
+            alert_used_pct: default_disk_guard_alert_used_pct(),
+            consumer_paths: default_disk_guard_consumer_paths(),
+            report_refresh_secs: default_disk_guard_report_refresh_secs(),
         }
     }
+}
+
+fn default_disk_guard_alert_used_pct() -> u8 {
+    85
+}
+fn default_disk_guard_report_refresh_secs() -> u64 {
+    300
+}
+fn default_disk_guard_consumer_paths() -> Vec<String> {
+    vec![
+        "/var/lib/libvirt/images".to_string(),
+        "~/.cache".to_string(),
+        "~/.rustup".to_string(),
+        "~/.cargo".to_string(),
+    ]
 }
 
 fn default_disk_guard_poll_secs() -> u64 {
@@ -3456,6 +3494,14 @@ pub struct CronConfig {
     /// [`TargetCleanupConfig`] and `src/cron/target_cleanup.rs`.
     #[serde(default)]
     pub target_cleanup: TargetCleanupConfig,
+
+    /// `docker-cleanup` cron: bounded reclamation of Docker's regeneratable
+    /// build cache + dangling (untagged) images — never tagged images, running
+    /// containers, or named volumes. Nested under `[cron.docker_cleanup]`. Ships
+    /// **enabled but dry-run**; see [`DockerCleanupConfig`] and
+    /// `src/cron/docker_cleanup.rs`.
+    #[serde(default)]
+    pub docker_cleanup: DockerCleanupConfig,
 }
 
 impl Default for CronConfig {
@@ -3546,6 +3592,7 @@ impl Default for CronConfig {
             project_deps_index_interval_secs: default_project_deps_index_interval(),
             git_state_scan_interval_secs: default_git_state_scan_interval(),
             target_cleanup: TargetCleanupConfig::default(),
+            docker_cleanup: DockerCleanupConfig::default(),
         }
     }
 }
@@ -3623,6 +3670,30 @@ pub struct TargetCleanupConfig {
     /// (default 50 ≈ a day of 30-min runs). 0 disables pruning.
     #[serde(default = "default_target_cleanup_manifest_keep")]
     pub manifest_keep: usize,
+    /// Reap superseded cargo artifacts (the accumulated hash-suffixed duplicate
+    /// `.rlib`/`.rmeta`/`.d`/bin units in `target/<profile>/deps/`, plus their
+    /// matching `.fingerprint/` and `build/` dirs) for **every** project in
+    /// **every** staleness tier (default true). Safe and recompile-cheap: only
+    /// duplicates *superseded* by a newer build of the same crate are removed —
+    /// the live working set is preserved, so the next build stays incremental,
+    /// not from-scratch. This closes the active-project gap where a freshly
+    /// rebuilt but huge `target/debug/` was never reclaimed (Tier 2 needs
+    /// staleness; Tier 1's mtime cutoff skips fresh files). All reaped paths are
+    /// regeneratable and routed through the same `safe_remove` chokepoint.
+    #[serde(default = "default_target_cleanup_reap_superseded")]
+    pub reap_superseded: bool,
+    /// Floor for the reaper: among a crate stem's units that predate the recent
+    /// build window, keep the newest this-many as a safety margin (protects
+    /// old-but-still-live unchanged deps and crates legitimately linked in
+    /// multiple versions). Only applies to stems with no in-window unit; a stem
+    /// that *was* rebuilt this session has all its older units reaped (default 2).
+    #[serde(default = "default_target_cleanup_reap_keep_per_stem")]
+    pub reap_keep_per_stem: usize,
+    /// Recent-build window (seconds, default 86400 = 24h): every deps unit whose
+    /// newest file was written within this of the profile's most-recent artifact
+    /// is treated as part of the live working set and never reaped.
+    #[serde(default = "default_target_cleanup_reap_window_secs")]
+    pub reap_window_secs: u64,
 }
 
 impl Default for TargetCleanupConfig {
@@ -3643,6 +3714,9 @@ impl Default for TargetCleanupConfig {
             tmp_unattributed_age_days: default_target_cleanup_tmp_unattributed_age_days(),
             tmp_unattributed_var_age_days: default_target_cleanup_tmp_unattributed_var_age_days(),
             manifest_keep: default_target_cleanup_manifest_keep(),
+            reap_superseded: default_target_cleanup_reap_superseded(),
+            reap_keep_per_stem: default_target_cleanup_reap_keep_per_stem(),
+            reap_window_secs: default_target_cleanup_reap_window_secs(),
         }
     }
 }
@@ -3682,6 +3756,72 @@ fn default_target_cleanup_tmp_unattributed_var_age_days() -> u64 {
 }
 fn default_target_cleanup_manifest_keep() -> usize {
     50
+}
+fn default_target_cleanup_reap_superseded() -> bool {
+    true
+}
+fn default_target_cleanup_reap_keep_per_stem() -> usize {
+    2
+}
+fn default_target_cleanup_reap_window_secs() -> u64 {
+    86400
+}
+
+/// `[cron.docker_cleanup]` — bounded Docker reclamation: the build cache and
+/// dangling (untagged) images only. **Never** prunes tagged images, running
+/// containers, or named volumes, so it cannot break a running stack. Ships
+/// **enabled but `dry_run = true`**: it reports the reclaimable size (via
+/// `docker system df`) and removes nothing until an operator sets
+/// `dry_run = false`. Full design: `src/cron/docker_cleanup.rs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DockerCleanupConfig {
+    /// Cadence in seconds (default 86400 = daily). 0 disables the cron.
+    #[serde(default = "default_docker_cleanup_interval")]
+    pub interval_secs: u64,
+    /// Log-only when true (default true): the reclaimable size is reported but
+    /// nothing is pruned. Set false to arm actual pruning.
+    #[serde(default = "default_docker_cleanup_dry_run")]
+    pub dry_run: bool,
+    /// Prune build-cache entries unused for at least this many hours
+    /// (`docker builder prune --filter until=<h>h`); 0 = no age filter (prune
+    /// all reclaimable cache). Default 168 (7 days) — keeps an in-flight build's
+    /// fresh cache.
+    #[serde(default = "default_docker_cleanup_builder_until_hours")]
+    pub builder_until_hours: u64,
+    /// Also prune dangling (untagged) images (`docker image prune`). Default true.
+    #[serde(default = "default_docker_cleanup_prune_dangling_images")]
+    pub prune_dangling_images: bool,
+    /// The `docker` (or compatible, e.g. `podman`) CLI binary. Default "docker".
+    #[serde(default = "default_docker_binary")]
+    pub docker_bin: String,
+}
+
+impl Default for DockerCleanupConfig {
+    fn default() -> Self {
+        Self {
+            interval_secs: default_docker_cleanup_interval(),
+            dry_run: default_docker_cleanup_dry_run(),
+            builder_until_hours: default_docker_cleanup_builder_until_hours(),
+            prune_dangling_images: default_docker_cleanup_prune_dangling_images(),
+            docker_bin: default_docker_binary(),
+        }
+    }
+}
+
+fn default_docker_cleanup_interval() -> u64 {
+    86400
+}
+fn default_docker_cleanup_dry_run() -> bool {
+    true
+}
+fn default_docker_cleanup_builder_until_hours() -> u64 {
+    168
+}
+fn default_docker_cleanup_prune_dangling_images() -> bool {
+    true
+}
+fn default_docker_binary() -> String {
+    "docker".to_string()
 }
 
 fn default_work_item_presence_interval() -> u64 {

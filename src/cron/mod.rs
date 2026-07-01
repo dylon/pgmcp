@@ -8,6 +8,7 @@ pub mod concurrency_scan;
 #[allow(dead_code)]
 pub mod cross_language_signatures;
 pub mod csm_validate;
+pub mod docker_cleanup;
 #[allow(dead_code)]
 pub mod embedding_migration;
 #[allow(dead_code)]

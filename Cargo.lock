@@ -3157,13 +3157,13 @@ name = "liblevenshtein"
 version = "0.9.1"
 dependencies = [
  "arc-swap",
- "bincode 1.3.3",
+ "bincode 2.0.1",
  "libdictenstein",
  "memmap2",
  "parking_lot",
  "pathmap 0.2.2",
  "rayon",
- "rustc-hash 1.1.0",
+ "rustc-hash 2.1.2",
  "serde",
  "serde_json",
  "smallvec",

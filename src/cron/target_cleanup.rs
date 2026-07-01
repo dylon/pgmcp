@@ -70,10 +70,13 @@ const INNER_WALK_MAX_DEPTH: usize = 32;
 
 /// Daemon-facing entry point: run a full sweep and log the summary, swallowing
 /// errors so one bad tick never kills the cron thread. Called from the
-/// scheduler (`schedule_maintenance_jobs`) on the configured interval.
-pub async fn run_or_log(pool: PgPool, cfg: TargetCleanupConfig) {
+/// scheduler (`schedule_maintenance_jobs`) on the configured interval. Returns
+/// the [`CleanupReport`] so the scheduler can persist its reclamation counts
+/// into the `cron_run_history.counters` ledger (see [`CleanupReport::to_counters`]).
+pub async fn run_or_log(pool: PgPool, cfg: TargetCleanupConfig) -> CleanupReport {
     let report = run_target_cleanup(&pool, &cfg, None).await;
     report.log_summary();
+    report
 }
 
 /// Orchestrate one sweep: gather the async DB inputs (project list + tmp
@@ -366,6 +369,22 @@ fn cleanup_pass(inputs: PassInputs) -> CleanupReport {
             cfg.active_days,
             cfg.stale_days,
         );
+
+        // Record the target's total size for the disk-pressure alert (Part 3),
+        // reused there so it need not re-walk the targets.
+        report
+            .target_sizes
+            .push((t.name.clone(), path_size(&t.target)));
+
+        // Reap superseded cargo artifacts (safe in every tier; preserves the
+        // live working set). Skip only the stale-escalate arm, which wipes the
+        // whole `target/` below and would make this a redundant walk.
+        if cfg.reap_superseded && !matches!((staleness, escalate), (Staleness::Stale, true)) {
+            let (rb, rf) =
+                reap_superseded(t, &cfg, &allowlist, &now_str, &mut manifest, &mut report);
+            report.reap_superseded_bytes += rb;
+            report.reap_files += rf;
+        }
 
         // Two statements per tier (not `report.x += f(&mut report)`) so the
         // `&mut report` passed into the helper is released before we touch the
@@ -695,6 +714,339 @@ fn tier1_trim(
         );
     }
     bytes
+}
+
+// ============================================================================
+// Superseded-artifact reaper
+// ============================================================================
+//
+// Cargo writes a fresh hash-suffixed copy of every crate's artifacts
+// (`lib<crate>-<hash>.rlib`/`.rmeta`, `<crate>-<hash>.d`, bin `<crate>-<hash>`)
+// into `target/<profile>/deps/` whenever a unit's identity changes — a toolchain
+// bump, a `Cargo.lock` update, a feature/cfg/profile change — and **never** GCs
+// the old ones. Over weeks these superseded duplicates dominate a large
+// `target/`. The reaper removes them while preserving the live working set, so
+// the next `cargo build` stays incremental (it never has to rebuild from
+// scratch). A wrong reap costs at worst an incremental recompile of one unit —
+// never source loss — because every reaped path is gitignored, regeneratable
+// output funnelled through [`safe_remove`]'s fail-closed chokepoint. Unlike
+// Tier 2 (which needs a *stale* project) and Tier 1 (whose mtime cutoff skips
+// freshly-built files), the reaper runs in every tier, so it reclaims even an
+// actively-developed project's huge, freshly-rebuilt `target/debug/`.
+
+/// One cargo compilation unit within a profile's `deps/`: all files sharing the
+/// metadata `hash` (the `rlib`/`rmeta`/`d`/bin of a single build of one crate).
+struct Unit {
+    hash: String,
+    /// Crate-identity stem (hash-stripped name of the unit's primary artifact),
+    /// used to group a crate's units across rebuilds for the keep-floor.
+    stem: String,
+    stem_priority: u8,
+    /// Newest mtime (epoch secs) across the unit's files.
+    mtime: i64,
+    size: u64,
+    files: Vec<PathBuf>,
+}
+
+impl Unit {
+    fn new(hash: String) -> Self {
+        Self {
+            hash,
+            stem: String::new(),
+            stem_priority: 0,
+            mtime: i64::MIN,
+            size: 0,
+            files: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, path: PathBuf, mtime: i64, size: u64, priority: u8, stem: String) {
+        if mtime > self.mtime {
+            self.mtime = mtime;
+        }
+        self.size += size;
+        // The highest-priority artifact (rlib > rmeta > dylib/so > a > bin > d)
+        // names the unit's stem, so a crate's lib units group consistently
+        // across rebuilds (always via the `lib<crate>` rlib) and never collide
+        // with its same-named bin/test units (which derive the bare stem).
+        if self.stem.is_empty() || priority > self.stem_priority {
+            self.stem_priority = priority;
+            self.stem = stem;
+        }
+        self.files.push(path);
+    }
+}
+
+/// Artifact-kind ranking for choosing a unit's canonical stem-naming file.
+fn type_priority(fname: &str) -> u8 {
+    if fname.ends_with(".rlib") {
+        6
+    } else if fname.ends_with(".rmeta") {
+        5
+    } else if fname.ends_with(".dylib") || fname.ends_with(".so") {
+        4
+    } else if fname.ends_with(".a") {
+        3
+    } else if fname.ends_with(".d") {
+        1
+    } else {
+        2 // no/unknown extension = an executable (bin / test / bench / example)
+    }
+}
+
+/// Strip a known cargo deps extension, leaving `<stem>-<hash>` (or the whole
+/// name for an extensionless executable artifact).
+fn strip_dep_ext(name: &str) -> &str {
+    for ext in [".rlib", ".rmeta", ".dylib", ".so", ".a", ".d"] {
+        if let Some(s) = name.strip_suffix(ext) {
+            return s;
+        }
+    }
+    name
+}
+
+/// Split a deps/fingerprint/build artifact name into `(stem, Some(hash))` by
+/// peeling a known extension then a trailing `-<hex>{8,}` metadata hash. Returns
+/// `(name, None)` when no hash is present. Pure — unit-tested without a
+/// filesystem.
+fn split_unit_hash(name: &str) -> (String, Option<String>) {
+    let base = strip_dep_ext(name);
+    if let Some(pos) = base.rfind('-') {
+        let cand = &base[pos + 1..];
+        if cand.len() >= 8 && cand.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return (base[..pos].to_string(), Some(cand.to_string()));
+        }
+    }
+    (base.to_string(), None)
+}
+
+/// Pure keep/reap decision over candidate units, each given as `(stem, mtime)`.
+/// Returns the (ascending) indices to reap. No IO — unit-tested like
+/// [`classify_staleness`].
+///
+/// Rule: let `last_build` be the newest mtime present; every unit within
+/// `window_secs` of it is the live working set and is kept. Among the *older*
+/// units, a stem that also has an in-window unit was rebuilt this session, so
+/// all its older units are superseded and reaped; a stem with **no** in-window
+/// unit (an unchanged dependency cargo didn't rewrite) keeps its newest
+/// `keep_per_stem` as a safety floor and reaps the rest.
+fn select_superseded(items: &[(&str, i64)], keep_per_stem: usize, window_secs: i64) -> Vec<usize> {
+    if items.is_empty() {
+        return Vec::new();
+    }
+    let last_build = items
+        .iter()
+        .map(|&(_, m)| m)
+        .max()
+        .expect("items non-empty");
+    let recent_cutoff = last_build - window_secs;
+
+    let mut stem_has_recent: HashMap<&str, bool> = HashMap::new();
+    for &(stem, m) in items {
+        let entry = stem_has_recent.entry(stem).or_insert(false);
+        if m >= recent_cutoff {
+            *entry = true;
+        }
+    }
+
+    let mut old_by_stem: HashMap<&str, Vec<usize>> = HashMap::new();
+    for (i, &(stem, m)) in items.iter().enumerate() {
+        if m >= recent_cutoff {
+            continue; // live working set
+        }
+        old_by_stem.entry(stem).or_default().push(i);
+    }
+
+    let mut reap: Vec<usize> = Vec::new();
+    for (stem, mut idxs) in old_by_stem {
+        if stem_has_recent.get(stem).copied().unwrap_or(false) {
+            reap.extend(idxs); // rebuilt this session → every older unit is dead
+        } else {
+            idxs.sort_by_key(|&i| std::cmp::Reverse(items[i].1));
+            reap.extend(idxs.into_iter().skip(keep_per_stem));
+        }
+    }
+    reap.sort_unstable();
+    reap
+}
+
+/// Collect the build-profile dirs under a `target/` — every immediate subdir
+/// that holds a `deps/` (debug, release, custom profiles), plus one level deeper
+/// for cross-compile target-triple dirs (e.g. `x86_64-unknown-linux-gnu/debug`).
+/// Symlinks are never followed.
+fn collect_profile_dirs(target: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(target) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        let Ok(md) = fs::symlink_metadata(&p) else {
+            continue;
+        };
+        if md.file_type().is_symlink() || !md.file_type().is_dir() {
+            continue;
+        }
+        if p.join("deps").is_dir() {
+            out.push(p.clone());
+        }
+        // One level deeper: target-triple dirs hold their own profile subdirs.
+        let Ok(sub) = fs::read_dir(&p) else {
+            continue;
+        };
+        for e2 in sub.flatten() {
+            let p2 = e2.path();
+            let Ok(md2) = fs::symlink_metadata(&p2) else {
+                continue;
+            };
+            if md2.file_type().is_symlink() || !md2.file_type().is_dir() {
+                continue;
+            }
+            if p2.join("deps").is_dir() {
+                out.push(p2);
+            }
+        }
+    }
+}
+
+/// Reap superseded units within one profile dir: group `deps/` files into units
+/// by metadata hash, decide which are superseded ([`select_superseded`]), then
+/// remove those units' files plus their hash-matched `.fingerprint/` and
+/// `build/` dirs so cargo's three-way cache stays coherent — a unit is left
+/// either fully present or fully gone, so cargo cleanly recompiles only what is
+/// missing. Returns `(bytes, files)` reclaimed (would-be, under dry-run).
+#[allow(clippy::too_many_arguments)]
+fn reap_profile(
+    prof: &Path,
+    t: &TargetDir,
+    cfg: &TargetCleanupConfig,
+    allowlist: &HashSet<PathBuf>,
+    now_str: &str,
+    manifest: &mut Manifest,
+    report: &mut CleanupReport,
+) -> (u64, u64) {
+    let deps = prof.join("deps");
+    let mut units: HashMap<String, Unit> = HashMap::new();
+    if let Ok(entries) = fs::read_dir(&deps) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(md) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if !md.file_type().is_file() {
+                continue; // deps/ holds files; skip dirs and symlinks
+            }
+            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let (stem, Some(hash)) = split_unit_hash(fname) else {
+                continue; // only hash-keyed artifacts participate
+            };
+            units
+                .entry(hash.clone())
+                .or_insert_with(|| Unit::new(hash))
+                .add(p.clone(), md.mtime(), md.len(), type_priority(fname), stem);
+        }
+    }
+    if units.is_empty() {
+        return (0, 0);
+    }
+
+    let unit_vec: Vec<&Unit> = units.values().collect();
+    let items: Vec<(&str, i64)> = unit_vec
+        .iter()
+        .map(|u| (u.stem.as_str(), u.mtime))
+        .collect();
+    let reap_idx = select_superseded(&items, cfg.reap_keep_per_stem, cfg.reap_window_secs as i64);
+
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    let mut reaped_hashes: HashSet<&str> = HashSet::with_capacity(reap_idx.len());
+    for &i in &reap_idx {
+        let u = unit_vec[i];
+        reaped_hashes.insert(u.hash.as_str());
+        for f in &u.files {
+            let b = safe_remove(
+                f,
+                &t.target,
+                &t.name,
+                "reap-superseded",
+                cfg,
+                allowlist,
+                now_str,
+                manifest,
+                report,
+            );
+            if b > 0 {
+                bytes += b;
+                files += 1;
+            }
+        }
+    }
+
+    // Hash-matched fingerprint + build dirs (coherent with the reaped units).
+    for sub in [".fingerprint", "build"] {
+        let dir = prof.join(sub);
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            let Ok(md) = fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if md.file_type().is_symlink() || !md.file_type().is_dir() {
+                continue;
+            }
+            let Some(fname) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let (_stem, Some(hash)) = split_unit_hash(fname) else {
+                continue;
+            };
+            if reaped_hashes.contains(hash.as_str()) {
+                let b = safe_remove(
+                    &p,
+                    &t.target,
+                    &t.name,
+                    "reap-superseded",
+                    cfg,
+                    allowlist,
+                    now_str,
+                    manifest,
+                    report,
+                );
+                if b > 0 {
+                    bytes += b;
+                    files += 1;
+                }
+            }
+        }
+    }
+    (bytes, files)
+}
+
+/// Reaper entry — remove superseded cargo artifacts across every profile dir of
+/// `t.target`, preserving the live working set. See [`reap_profile`] /
+/// [`select_superseded`]. Returns `(bytes, files)` reclaimed (would-be, dry-run).
+#[allow(clippy::too_many_arguments)]
+fn reap_superseded(
+    t: &TargetDir,
+    cfg: &TargetCleanupConfig,
+    allowlist: &HashSet<PathBuf>,
+    now_str: &str,
+    manifest: &mut Manifest,
+    report: &mut CleanupReport,
+) -> (u64, u64) {
+    let mut profiles: Vec<PathBuf> = Vec::new();
+    collect_profile_dirs(&t.target, &mut profiles);
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    for prof in &profiles {
+        let (b, f) = reap_profile(prof, t, cfg, allowlist, now_str, manifest, report);
+        bytes += b;
+        files += f;
+    }
+    (bytes, files)
 }
 
 // ============================================================================
@@ -1412,11 +1764,18 @@ pub struct CleanupReport {
     pub tier0_bytes: u64,
     pub tier1_bytes: u64,
     pub tier2_bytes: u64,
+    /// Bytes reclaimed by the superseded-artifact reaper (would-be, under dry-run).
+    pub reap_superseded_bytes: u64,
+    /// Count of superseded artifact files/dirs reaped (would-be, under dry-run).
+    pub reap_files: u64,
     pub tmp_prov_bytes: u64,
     pub tmp_age_bytes: u64,
     pub tmp_files_removed: u64,
     pub tmp_protected_live: u64,
     pub tmp_within_grace: u64,
+    /// Per-target total size `(project_name, bytes)` captured during the scan,
+    /// surfaced by the disk-pressure alert so it need not re-walk targets.
+    pub target_sizes: Vec<(String, u64)>,
     pub manifest_path: Option<String>,
     pub errors: u64,
 }
@@ -1426,8 +1785,35 @@ impl CleanupReport {
         self.tier0_bytes
             + self.tier1_bytes
             + self.tier2_bytes
+            + self.reap_superseded_bytes
             + self.tmp_prov_bytes
             + self.tmp_age_bytes
+    }
+
+    /// Render this pass's reclamation counts as a `cron_run_history.counters`
+    /// JSON object, so `cron_history` reflects what was actually reclaimed (per
+    /// tier + reaper + tmp, in bytes and files) instead of an empty `{}`. The
+    /// keys mirror the `RECLAIMED` log line emitted by [`log_summary`].
+    pub fn to_counters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "dry_run": self.dry_run,
+            "targets_scanned": self.targets_scanned,
+            "targets_skipped_busy": self.targets_skipped_busy,
+            "targets_skipped_allowlist": self.targets_skipped_allowlist,
+            "targets_skipped_build_quiet": self.targets_skipped_build_quiet,
+            "tier0_bytes": self.tier0_bytes,
+            "tier1_bytes": self.tier1_bytes,
+            "tier2_bytes": self.tier2_bytes,
+            "reap_superseded_bytes": self.reap_superseded_bytes,
+            "reap_files": self.reap_files,
+            "tmp_prov_bytes": self.tmp_prov_bytes,
+            "tmp_age_bytes": self.tmp_age_bytes,
+            "tmp_files_removed": self.tmp_files_removed,
+            "tmp_protected_live": self.tmp_protected_live,
+            "tmp_within_grace": self.tmp_within_grace,
+            "total_bytes": self.total_bytes(),
+            "errors": self.errors,
+        })
     }
 
     /// Emit the single summary line (the `RECLAIMED …` record).
@@ -1441,6 +1827,8 @@ impl CleanupReport {
             tier0_bytes = self.tier0_bytes,
             tier1_bytes = self.tier1_bytes,
             tier2_bytes = self.tier2_bytes,
+            reap_superseded_bytes = self.reap_superseded_bytes,
+            reap_files = self.reap_files,
             tmp_prov_bytes = self.tmp_prov_bytes,
             tmp_age_bytes = self.tmp_age_bytes,
             tmp_files_removed = self.tmp_files_removed,
@@ -1511,6 +1899,33 @@ mod tests {
         }
     }
 
+    // -- report ------------------------------------------------------------
+
+    #[test]
+    fn to_counters_reports_reclamation_fields() {
+        let report = CleanupReport {
+            dry_run: false,
+            targets_scanned: 30,
+            tier0_bytes: 7,
+            reap_superseded_bytes: 48,
+            reap_files: 2818,
+            tmp_prov_bytes: 5,
+            tmp_files_removed: 3,
+            errors: 0,
+            ..Default::default()
+        };
+        let c = report.to_counters();
+        assert_eq!(c["targets_scanned"], 30);
+        assert_eq!(c["tier0_bytes"], 7);
+        assert_eq!(c["reap_superseded_bytes"], 48);
+        assert_eq!(c["reap_files"], 2818);
+        // total_bytes folds tier0/1/2 + reap_superseded + tmp_{prov,age}.
+        assert_eq!(c["total_bytes"], 7 + 48 + 5);
+        assert_eq!(c["dry_run"], false);
+        // A populated object, not the empty `{}` this fixes in `cron_history`.
+        assert!(c.as_object().is_some_and(|m| !m.is_empty()));
+    }
+
     // -- staleness ---------------------------------------------------------
 
     #[test]
@@ -1521,6 +1936,195 @@ mod tests {
         assert_eq!(classify_staleness(60.0, 14, 60), Staleness::Warm);
         assert_eq!(classify_staleness(60.001, 14, 60), Staleness::Stale);
         assert_eq!(classify_staleness(f64::INFINITY, 14, 60), Staleness::Stale);
+    }
+
+    // -- superseded reaper -------------------------------------------------
+
+    /// Set a path's atime+mtime to `epoch` seconds (test-only helper; libc is
+    /// already a dependency — see `current_euid`).
+    fn set_mtime(path: &Path, epoch: i64) {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("cstring");
+        let tv = libc::timeval {
+            tv_sec: epoch as libc::time_t,
+            tv_usec: 0,
+        };
+        let times = [tv, tv];
+        let rc = unsafe { libc::utimes(c.as_ptr(), times.as_ptr()) };
+        assert_eq!(rc, 0, "utimes failed for {}", path.display());
+    }
+
+    #[test]
+    fn split_unit_hash_parses_cargo_artifact_names() {
+        assert_eq!(
+            split_unit_hash("libserde-1a2b3c4d5e6f7890.rlib"),
+            ("libserde".to_string(), Some("1a2b3c4d5e6f7890".to_string()))
+        );
+        assert_eq!(
+            split_unit_hash("serde-1a2b3c4d5e6f7890.d"),
+            ("serde".to_string(), Some("1a2b3c4d5e6f7890".to_string()))
+        );
+        // Extensionless executable (bin / test / bench).
+        assert_eq!(
+            split_unit_hash("my_bin-deadbeefdeadbeef"),
+            ("my_bin".to_string(), Some("deadbeefdeadbeef".to_string()))
+        );
+        // Dashes inside the crate name are preserved (hash is the last segment).
+        assert_eq!(
+            split_unit_hash("proc-macro2-00112233aabbccdd.rmeta"),
+            (
+                "proc-macro2".to_string(),
+                Some("00112233aabbccdd".to_string())
+            )
+        );
+        // No hash → the (ext-stripped) name with None.
+        assert_eq!(split_unit_hash("README"), ("README".to_string(), None));
+        // A too-short suffix is not a hash.
+        assert_eq!(split_unit_hash("foo-abc"), ("foo-abc".to_string(), None));
+        // A non-hex suffix is not a hash.
+        assert_eq!(
+            split_unit_hash("foo-zzzzzzzz"),
+            ("foo-zzzzzzzz".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn select_superseded_keeps_live_window() {
+        // Everything within the window of the newest → keep all.
+        let items = [("libx", 100i64), ("libx", 95), ("liby", 90)];
+        assert!(select_superseded(&items, 2, 50).is_empty());
+        // Empty input is a no-op.
+        assert!(select_superseded(&[], 2, 50).is_empty());
+    }
+
+    #[test]
+    fn select_superseded_reaps_old_when_stem_rebuilt() {
+        // libx has a recent unit (1000) and two old ones (40, 30); the recent
+        // build supersedes both old units regardless of the keep floor.
+        let items = [("libx", 1000i64), ("libx", 40), ("libx", 30)];
+        assert_eq!(select_superseded(&items, 2, 10), vec![1, 2]);
+    }
+
+    #[test]
+    fn select_superseded_floor_protects_unrebuilt_stem() {
+        // libz sets last_build=1000 (recent); liby was not rebuilt this session,
+        // so keep its newest 2 old units and reap only the oldest (mtime 30).
+        let items = [("libz", 1000i64), ("liby", 50), ("liby", 40), ("liby", 30)];
+        assert_eq!(select_superseded(&items, 2, 5), vec![3]);
+    }
+
+    #[test]
+    fn select_superseded_keep_zero_reaps_all_old() {
+        let items = [("libz", 1000i64), ("liby", 50), ("liby", 40)];
+        assert_eq!(select_superseded(&items, 0, 5), vec![1, 2]);
+    }
+
+    #[test]
+    fn select_superseded_window_boundary_is_inclusive() {
+        // mtime exactly at last_build - window is kept (>=).
+        let items = [("libx", 100i64), ("libx", 90)];
+        assert!(select_superseded(&items, 0, 10).is_empty());
+        // One second older falls outside the window and is reaped.
+        let items2 = [("libx", 100i64), ("libx", 89)];
+        assert_eq!(select_superseded(&items2, 0, 10), vec![1]);
+    }
+
+    #[test]
+    fn reap_superseded_removes_old_units_keeps_live() {
+        let tmp = TempDir::new();
+        let proj = make_project(tmp.path(), "p");
+        let deps = proj.join("target/debug/deps");
+        let fp = proj.join("target/debug/.fingerprint");
+        let build = proj.join("target/debug/build");
+        // Superseded unit (hash aaaa…): rlib + rmeta + dep-info, with matching
+        // fingerprint and build dirs.
+        write(
+            &deps.join("libfoo-aaaaaaaa11111111.rlib"),
+            "OLD-RLIB-CONTENT",
+        );
+        write(&deps.join("libfoo-aaaaaaaa11111111.rmeta"), "OLD-RMETA");
+        write(&deps.join("foo-aaaaaaaa11111111.d"), "old depinfo");
+        write(&fp.join("foo-aaaaaaaa11111111/lib"), "fp");
+        write(
+            &build.join("foo-aaaaaaaa11111111/out/generated"),
+            "buildout",
+        );
+        // Live unit (hash bbbb…) = the current working set.
+        write(&deps.join("libfoo-bbbbbbbb22222222.rlib"), "NEW-RLIB");
+        write(&deps.join("libfoo-bbbbbbbb22222222.rmeta"), "NEW-RMETA");
+        write(&deps.join("foo-bbbbbbbb22222222.d"), "new depinfo");
+        write(&fp.join("foo-bbbbbbbb22222222/lib"), "fp");
+
+        // Age the superseded unit ~100 days back (well outside the 24h window).
+        let old = Utc::now().timestamp() - 100 * 86400;
+        for p in [
+            deps.join("libfoo-aaaaaaaa11111111.rlib"),
+            deps.join("libfoo-aaaaaaaa11111111.rmeta"),
+            deps.join("foo-aaaaaaaa11111111.d"),
+            fp.join("foo-aaaaaaaa11111111/lib"),
+            fp.join("foo-aaaaaaaa11111111"),
+            build.join("foo-aaaaaaaa11111111/out/generated"),
+            build.join("foo-aaaaaaaa11111111/out"),
+            build.join("foo-aaaaaaaa11111111"),
+        ] {
+            set_mtime(&p, old);
+        }
+
+        let td = genuine_target(&proj, Some("p")).unwrap();
+        let cfg = cfg_apply();
+        let allow = HashSet::new();
+        let mut manifest = Manifest {
+            writer: None,
+            path: None,
+        };
+        let mut report = CleanupReport::default();
+        let (bytes, files) = reap_superseded(&td, &cfg, &allow, "now", &mut manifest, &mut report);
+
+        assert!(bytes > 0, "reaped some bytes");
+        assert_eq!(files, 5, "3 deps files + fingerprint dir + build dir");
+        // Superseded unit fully gone (deps + fingerprint + build), coherently.
+        assert!(!deps.join("libfoo-aaaaaaaa11111111.rlib").exists());
+        assert!(!deps.join("libfoo-aaaaaaaa11111111.rmeta").exists());
+        assert!(!deps.join("foo-aaaaaaaa11111111.d").exists());
+        assert!(!fp.join("foo-aaaaaaaa11111111").exists());
+        assert!(!build.join("foo-aaaaaaaa11111111").exists());
+        // Live working set preserved → next build stays incremental.
+        assert!(deps.join("libfoo-bbbbbbbb22222222.rlib").exists());
+        assert!(deps.join("libfoo-bbbbbbbb22222222.rmeta").exists());
+        assert!(fp.join("foo-bbbbbbbb22222222").exists());
+        // Source untouched — the recoverability invariant.
+        assert!(proj.join("src/lib.rs").exists());
+    }
+
+    #[test]
+    fn reap_superseded_dry_run_keeps_files() {
+        let tmp = TempDir::new();
+        let proj = make_project(tmp.path(), "p");
+        let deps = proj.join("target/debug/deps");
+        write(&deps.join("libfoo-aaaaaaaa11111111.rlib"), "OLD");
+        write(&deps.join("libfoo-bbbbbbbb22222222.rlib"), "NEW");
+        set_mtime(
+            &deps.join("libfoo-aaaaaaaa11111111.rlib"),
+            Utc::now().timestamp() - 100 * 86400,
+        );
+        let td = genuine_target(&proj, Some("p")).unwrap();
+        let cfg = TargetCleanupConfig {
+            dry_run: true,
+            sweep_tmp: false,
+            ..Default::default()
+        };
+        let allow = HashSet::new();
+        let mut manifest = Manifest {
+            writer: None,
+            path: None,
+        };
+        let mut report = CleanupReport::default();
+        let (bytes, _files) = reap_superseded(&td, &cfg, &allow, "now", &mut manifest, &mut report);
+        assert!(bytes > 0, "dry-run reports would-be bytes");
+        assert!(
+            deps.join("libfoo-aaaaaaaa11111111.rlib").exists(),
+            "dry-run deleted nothing"
+        );
     }
 
     // -- discovery ---------------------------------------------------------

@@ -10,13 +10,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::config::Config;
 use crate::health::fs::{FsAvail, fs_avail};
@@ -81,8 +81,13 @@ pub fn spawn_disk_watchdog(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         info!("disk-watchdog: started");
-        // Edge flag so the warn line fires once per descent, not every poll.
+        // Edge flags so each line fires once per descent, not every poll.
         let mut warned = false;
+        let mut alerted = false;
+        // When the (expensive) consumer breakdown was last assembled — throttles
+        // its refresh while we stay above the alert threshold (the live used-% is
+        // recorded every poll regardless).
+        let mut last_report_at: Option<Instant> = None;
         loop {
             let dg = config.load().disk_guard.clone();
             let interval = Duration::from_secs(dg.poll_interval_secs.max(5));
@@ -154,6 +159,59 @@ pub fn spawn_disk_watchdog(
                 }
                 Decision::None => {}
             }
+
+            // Disk-pressure alert + live fullness. `worst_used_pct` is cheap
+            // (statvfs only), so it is recorded every poll as the `/api/status`
+            // headline that always matches `df`. The ranked-consumer breakdown is
+            // expensive (dir-walks + `docker`/`rustup` shell-outs), so while a
+            // filesystem stays at/above `alert_used_pct` (a softer, earlier signal
+            // than the byte/inode pause floors — a 2 TB disk can be 95% full with
+            // 100+ GiB free, tripping no floor) it is re-assembled only on a
+            // throttle — but *continuously*, so the stored report tracks the live
+            // disk instead of freezing at the first crossing. The alert *log line*
+            // stays edge-triggered (once per descent).
+            if let Some((part, used_pct)) = worst_used_pct(&paths) {
+                stats.set_disk_used_pct(used_pct);
+                let throttle = Duration::from_secs(dg.report_refresh_secs.max(30));
+                let since_last = last_report_at.map(|t| t.elapsed());
+                if crate::health::disk_report::report_refresh_due(
+                    used_pct,
+                    dg.alert_used_pct,
+                    since_last,
+                    throttle,
+                ) {
+                    last_report_at = Some(Instant::now());
+                    let pg_bytes = pg_database_size(&pool).await.unwrap_or(0);
+                    let dg2 = dg.clone();
+                    let part2 = part.clone();
+                    if let Ok(report) = tokio::task::spawn_blocking(move || {
+                        crate::health::disk_report::assemble_disk_report(&dg2, &part2, pg_bytes)
+                    })
+                    .await
+                    {
+                        // Edge-triggered log line (once per descent); the stored
+                        // report refreshes every throttle interval regardless.
+                        if crate::health::disk_report::alert_should_fire(
+                            used_pct,
+                            dg.alert_used_pct,
+                            alerted,
+                        ) {
+                            alerted = true;
+                            warn!(
+                                used_pct = format!("{:.1}", report.used_pct),
+                                partition = %report.partition,
+                                avail_gb = report.avail_bytes / GIB,
+                                top_consumers = %crate::health::disk_report::render_consumers(&report.consumers),
+                                "disk-watchdog: disk pressure — top reclaimable consumers"
+                            );
+                        }
+                        stats.set_disk_report(report);
+                    }
+                } else if dg.alert_used_pct > 0 && used_pct < dg.alert_used_pct as f64 {
+                    alerted = false; // recovered below the alert threshold
+                    last_report_at = None;
+                }
+            }
         }
         info!("disk-watchdog: stopped");
     })
@@ -208,6 +266,37 @@ fn min_avail(paths: &[PathBuf]) -> Option<FsAvail> {
         .iter()
         .filter_map(|p| fs_avail(p))
         .reduce(FsAvail::min)
+}
+
+/// The watched filesystem with the highest used-percentage, paired with that
+/// percentage — the partition the disk-pressure alert reports on.
+fn worst_used_pct(paths: &[PathBuf]) -> Option<(PathBuf, f64)> {
+    paths
+        .iter()
+        .filter_map(|p| {
+            let total = crate::health::fs::fs_total(p)?;
+            if total == 0 {
+                return None;
+            }
+            let avail = crate::health::fs::avail_bytes(p)?;
+            let used_pct = total.saturating_sub(avail) as f64 / total as f64 * 100.0;
+            Some((p.clone(), used_pct))
+        })
+        .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+/// Best-effort PostgreSQL database size for the disk-pressure report.
+async fn pg_database_size(pool: &PgPool) -> Option<u64> {
+    match sqlx::query_scalar::<_, i64>("SELECT pg_database_size(current_database())")
+        .fetch_one(pool)
+        .await
+    {
+        Ok(v) => Some(v.max(0) as u64),
+        Err(e) => {
+            error!(error = %e, "disk-watchdog: pg_database_size query failed");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

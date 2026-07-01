@@ -281,6 +281,27 @@ pub fn spawn_recorded<F>(
     });
 }
 
+/// Like [`spawn_recorded`], but the body yields a `serde_json::Value` of
+/// job-specific counters that are recorded into the `cron_run_history.counters`
+/// JSONB via [`CronRunGuard::ok_with`] — so a light cron's reclaimed/processed
+/// counts are queryable through `cron_history` instead of an empty `{}`. Used by
+/// `target-cleanup` / `docker-cleanup`, whose bodies return their reclamation
+/// report rendered with `to_counters()`.
+pub fn spawn_recorded_with<F>(
+    rt: &tokio::runtime::Handle,
+    hist: CronHistoryWriter,
+    job: &'static str,
+    fut: F,
+) where
+    F: std::future::Future<Output = Value> + Send + 'static,
+{
+    rt.spawn(async move {
+        let mut guard = CronRunGuard::new(hist, job, CronTriggerSource::Scheduled, None);
+        let counters = fut.await;
+        guard.ok_with(counters);
+    });
+}
+
 /// Spawn the writer task on the current tokio runtime. Returns the cloneable
 /// writer handle (stored on `SystemContext`) and the task `JoinHandle` (the
 /// daemon awaits it briefly on graceful shutdown to flush the final batch).
@@ -511,6 +532,32 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].outcome, CronOutcome::Ok);
         assert_eq!(rows[0].counters["edges"], 7);
+    }
+
+    #[test]
+    fn spawn_recorded_with_persists_body_counters() {
+        let (writer, mut rx) = test_writer();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime");
+        rt.block_on(async {
+            spawn_recorded_with(
+                &tokio::runtime::Handle::current(),
+                writer,
+                "target-cleanup",
+                async { serde_json::json!({"total_bytes": 55, "reap_files": 2818}) },
+            );
+            // The body is immediately ready, so yielding lets the spawned task run
+            // to completion (body → ok_with → guard drop → record) before we drain.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+        });
+        let rows = drain(&mut rx);
+        assert_eq!(rows.len(), 1, "exactly one row recorded");
+        assert_eq!(rows[0].outcome, CronOutcome::Ok);
+        assert_eq!(rows[0].job_name, "target-cleanup");
+        assert_eq!(rows[0].counters["total_bytes"], 55);
+        assert_eq!(rows[0].counters["reap_files"], 2818);
     }
 
     #[test]
