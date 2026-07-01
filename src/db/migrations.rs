@@ -79,6 +79,7 @@ mod v5_work_items_collab;
 mod v60_crucible_trace;
 mod v61_subprocess_capture;
 mod v62_preload_source;
+mod v63_toolbox_wolfram;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
 mod v8_csm_protocols;
@@ -2890,6 +2891,22 @@ pub async fn run_migrations(
         v62_preload_source::PRELOAD_SOURCE_V1,
         v62_preload_source::PRELOAD_SOURCE_V1_NAME,
         || v62_preload_source::apply(pool),
+    )
+    .await?;
+
+    // Step 63 — re-seed the toolbox catalog so existing installs pick up the two
+    // new Wolfram Language cards (`wolfram` for computer-algebra/modeling in the
+    // formal_verification domain, `wolfram-graphics` for scientific plotting in
+    // the diagramming domain) and the `sagemath` alternatives cross-link. Same
+    // idempotent, content-hash-driven upsert path as `toolbox_refresh`; run on
+    // migration because lazy seeding only fires on an EMPTY table. See
+    // `src/db/migrations/v63_toolbox_wolfram.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v63_toolbox_wolfram::TOOLBOX_WOLFRAM,
+        v63_toolbox_wolfram::TOOLBOX_WOLFRAM_NAME,
+        || v63_toolbox_wolfram::apply(pool),
     )
     .await?;
 

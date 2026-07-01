@@ -184,5 +184,21 @@ pub(super) fn seeds() -> Vec<ToolSeed> {
             "pacman: python-altair (v6.2.1); headless export via python-vl-convert (available in pacman extra, not yet installed)",
             "https://altair-viz.github.io/",
         ),
+        tool(
+            "wolfram-graphics",
+            "Wolfram Language graphics",
+            DIA,
+            "scientific_plotting",
+            "Mathematical visualization from the Wolfram Language kernel — function/data/3D/contour plots and graph diagrams exported to SVG/PDF/PNG.",
+            "The Wolfram Language renders a broad range of graphics — `Plot`/`ListPlot`/`Plot3D`/`ContourPlot`/`DensityPlot`, charts (`Histogram`/`BarChart`), and network/graph diagrams (`Graph`/`GraphPlot`/`LayeredGraphPlot`) — and `Export[\"f.svg\"|.pdf|.png, …]` writes them headlessly from the kernel (no display needed).",
+            "Reach for Wolfram graphics to plot a function/dataset or draw a graph diagram when the data or model is already in the Wolfram Language, or when you want publication-grade 2D/3D math visualization with exact symbolic input in one Export call.",
+            "Input: a Wolfram Language graphics expression (`.wl`/`.wls` script or `-code`). Output: `Export[\"fig.svg\"|\".pdf\"|\".png\"|\".eps\", expr]` (vector SVG/PDF, headless).",
+            "`wolfram -script plot.wl` whose body is `Export[\"fig.svg\", Plot[Sin[x],{x,0,2 Pi}]]`; `/usr/local/Wolfram/Wolfram/15.0/Executables/wolframscript -code 'Export[\"f.svg\", Plot3D[...]]'`; also the live `Wolfram` MCP server.",
+            "Symbolic + numeric input in one language; 2D/3D/contour and graph diagrams; exact math in labels; vector SVG/PDF straight from the kernel (headless).",
+            "Proprietary (needs license/activation); heavy kernel startup vs gnuplot/matplotlib; `wolframscript` not on PATH (use `wolfram -script` or the full path).",
+            &["matplotlib", "gnuplot", "pgfplots"],
+            "manual: Wolfram 15.0.0.0 (/usr/local/bin/wolfram; wolframscript at /usr/local/Wolfram/Wolfram/15.0/Executables/; MCP server \"Wolfram\")",
+            "https://reference.wolfram.com/language/guide/Graphics.html",
+        ),
     ]
 }
