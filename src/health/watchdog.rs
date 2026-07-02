@@ -218,8 +218,8 @@ pub fn spawn_disk_watchdog(
 }
 
 /// Out-of-band trigger of the existing `target-cleanup` cron. Reuses ALL of its
-/// safety machinery (dry-run default, `safe_remove` chokepoint, self-project
-/// allowlist); we only invoke its public entry point and log the outcome.
+/// safety machinery (dry-run default, `safe_remove` chokepoint, `/proc`
+/// busy-scan); we only invoke its public entry point and log the outcome.
 async fn run_complementary_cleanup(pool: &PgPool, config: &Arc<ArcSwap<Config>>) {
     let tc = config.load().cron.target_cleanup.clone();
     let report = crate::cron::target_cleanup::run_target_cleanup(pool, &tc, None).await;

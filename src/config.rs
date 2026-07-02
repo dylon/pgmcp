@@ -3625,6 +3625,14 @@ pub struct TargetCleanupConfig {
     /// `target/` is Tier-2 eligible for a full wipe (default 60).
     #[serde(default = "default_target_cleanup_stale_days")]
     pub stale_days: u64,
+    /// Wholesale-reclaim a project's `target/**/debug` profile when its newest
+    /// artifact is older than this many days, *independent* of the project's
+    /// overall staleness — so a release-active but debug-cold project still frees
+    /// its (dominant, fully regeneratable) debug tree. `0` disables (default 30).
+    /// Recoverable by a plain `cargo build`; routed through the `safe_remove`
+    /// chokepoint; skipped when the whole `target/` is already Tier-2 wiped.
+    #[serde(default = "default_target_cleanup_debug_stale_days")]
+    pub debug_stale_days: u64,
     /// Skip any `target/` with a file modified within this many minutes — a
     /// build may be in progress (default 10).
     #[serde(default = "default_target_cleanup_build_quiet_mins")]
@@ -3639,8 +3647,10 @@ pub struct TargetCleanupConfig {
     /// `<path>/target`). Set to force-include roots the index does not cover.
     #[serde(default)]
     pub roots: Vec<String>,
-    /// Project roots that must never be touched (in addition to the running
-    /// daemon's own project, which is always protected).
+    /// Project roots that must never be touched. There is NO implicit
+    /// self-exemption for pgmcp's own project — every workspace project is
+    /// cleaned equally; the running daemon's live/in-use artifacts are protected
+    /// by the universal `/proc` busy-scan + build-quiet skip, not an allowlist.
     #[serde(default)]
     pub allowlist: Vec<String>,
     /// Also sweep `/tmp` + `/var/tmp` (default true), provenance-first.
@@ -3703,6 +3713,7 @@ impl Default for TargetCleanupConfig {
             dry_run: default_target_cleanup_dry_run(),
             active_days: default_target_cleanup_active_days(),
             stale_days: default_target_cleanup_stale_days(),
+            debug_stale_days: default_target_cleanup_debug_stale_days(),
             build_quiet_mins: default_target_cleanup_build_quiet_mins(),
             free_floor_gb: 0,
             roots: Vec::new(),
@@ -3732,6 +3743,9 @@ fn default_target_cleanup_active_days() -> u64 {
 }
 fn default_target_cleanup_stale_days() -> u64 {
     60
+}
+fn default_target_cleanup_debug_stale_days() -> u64 {
+    30
 }
 fn default_target_cleanup_build_quiet_mins() -> u64 {
     10

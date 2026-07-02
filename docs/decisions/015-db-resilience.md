@@ -96,7 +96,7 @@ when *both* are back above their (strictly-greater) resume floors. On the enter
 edge it sets `DiskPressure` (pausing the embed intake gate + heavy crons via
 `SkipReason::DiskPressure`) and triggers `run_target_cleanup(...)` out-of-band —
 reusing all of the cron's safety machinery (dry-run default, `safe_remove`
-chokepoint, self-project allowlist). `[disk_guard] pause_floor_gb = 0` disables it.
+chokepoint, `/proc` busy-scan). `[disk_guard] pause_floor_gb = 0` disables it.
 
 ### 3. Ephemeral-event outbox (`outbox.rs`)
 

@@ -140,6 +140,7 @@ async fn target_cleanup_wipes_stale_target_keeps_source_and_honors_tmp_provenanc
         dry_run: false,
         active_days: 14,
         stale_days: 60,
+        debug_stale_days: 0,
         build_quiet_mins: 0, // do not skip the freshly-created fixture target
         free_floor_gb: 0,
         roots: Vec::new(), // discover via the seeded project row
@@ -278,6 +279,7 @@ async fn reaper_reclaims_active_project_superseded_artifacts() {
         dry_run: false,
         active_days: 14,
         stale_days: 60,
+        debug_stale_days: 0,
         build_quiet_mins: 0,
         free_floor_gb: 0,
         roots: Vec::new(),

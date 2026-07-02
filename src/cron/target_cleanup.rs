@@ -9,7 +9,9 @@
 //!    classifies each owning project by staleness (last git commit, falling
 //!    back to newest source mtime), and applies tiered, recoverable removals.
 //!    Tiers 1/2 may be gated on disk pressure (`free_floor_gb`); Tier 0 always
-//!    runs; the running daemon's own project is always protected. The tiers:
+//!    runs. No project is exempt (not even pgmcp's own): the running daemon's
+//!    live/in-use artifacts are protected by the universal `/proc` busy-scan +
+//!    build-quiet skip, not by a self-allowlist. The tiers:
 //!      - **Tier 0** — `target/**/incremental/` scratch (rustc regenerates it
 //!        transparently; zero rebuild cost). Runs for every non-stale project.
 //!      - **Tier 1** — mtime-trim: regular files under `target/` older than
@@ -115,12 +117,9 @@ pub async fn run_target_cleanup(
         (HashMap::new(), HashSet::new(), HashSet::new())
     };
 
-    let self_roots = detect_self_project_roots();
-
     let inputs = PassInputs {
         cfg: cfg.clone(),
         now,
-        self_roots,
         project_candidates,
         project_filter: project_filter.map(str::to_string),
         tmp_prov,
@@ -244,7 +243,6 @@ async fn load_alive_mcp(pool: &PgPool) -> HashSet<String> {
 struct PassInputs {
     cfg: TargetCleanupConfig,
     now: DateTime<Utc>,
-    self_roots: Vec<PathBuf>,
     project_candidates: Vec<(PathBuf, String)>,
     project_filter: Option<String>,
     tmp_prov: HashMap<PathBuf, ProvRecord>,
@@ -271,13 +269,27 @@ enum Staleness {
     Stale,
 }
 
+/// Build the deletion allowlist from the operator's configured entries only
+/// (canonicalized). There is deliberately NO implicit self-exemption for the
+/// running daemon's own project — unit-tested by `no_implicit_self_allowlist` —
+/// so every workspace project is cleaned equally; the daemon is protected by the
+/// `/proc` busy-scan + build-quiet skip, which apply uniformly to all projects.
+fn build_allowlist(entries: &[String]) -> HashSet<PathBuf> {
+    let mut allowlist: HashSet<PathBuf> = HashSet::new();
+    for a in entries {
+        if let Ok(c) = fs::canonicalize(a) {
+            allowlist.insert(c);
+        }
+    }
+    allowlist
+}
+
 /// The synchronous heart of the cron: discovery → /proc snapshot → tiered
 /// target removal → tmp sweep → manifest. Pure of async; safe to `spawn_blocking`.
 fn cleanup_pass(inputs: PassInputs) -> CleanupReport {
     let PassInputs {
         cfg,
         now,
-        self_roots,
         project_candidates,
         project_filter,
         tmp_prov,
@@ -290,21 +302,14 @@ fn cleanup_pass(inputs: PassInputs) -> CleanupReport {
         ..Default::default()
     };
 
-    // Allowlist of project roots that must never be touched: the configured
-    // entries plus every self-anchor of the running daemon (each canonicalized,
-    // so the comparison against the canonicalized discovered `project_root`s is
-    // exact).
-    let mut allowlist: HashSet<PathBuf> = HashSet::new();
-    for a in &cfg.allowlist {
-        if let Ok(c) = fs::canonicalize(a) {
-            allowlist.insert(c);
-        }
-    }
-    for root in &self_roots {
-        if let Ok(c) = fs::canonicalize(root) {
-            allowlist.insert(c);
-        }
-    }
+    // Allowlist of project roots that must never be touched: ONLY the operator's
+    // configured `[cron.target_cleanup] allowlist` entries (canonicalized so the
+    // comparison against the canonicalized discovered `project_root`s is exact).
+    // There is deliberately NO implicit self-exemption for pgmcp's own project —
+    // every workspace project is cleaned equally. The running daemon is protected
+    // by the universal `/proc` busy-scan (`collect_proc_paths`, which catches even
+    // a `(deleted)`-inode running binary) + the build-quiet skip, not an allowlist.
+    let allowlist = build_allowlist(&cfg.allowlist);
 
     // Discover target dirs (DB project roots ∪ configured-roots walk).
     let targets = discover_targets(&cfg.roots, &project_candidates, project_filter.as_deref());
@@ -348,7 +353,7 @@ fn cleanup_pass(inputs: PassInputs) -> CleanupReport {
 
         if allowlist.contains(&t.project_root) {
             report.targets_skipped_allowlist += 1;
-            debug!(project = %t.name, target = %t.target.display(), "target-cleanup: skip (allowlist/self)");
+            debug!(project = %t.name, target = %t.target.display(), "target-cleanup: skip (allowlist)");
             continue;
         }
         if path_is_busy(&busy_target_paths, &t.target) {
@@ -375,6 +380,25 @@ fn cleanup_pass(inputs: PassInputs) -> CleanupReport {
         report
             .target_sizes
             .push((t.name.clone(), path_size(&t.target)));
+
+        // Stale-debug reclamation: wholesale-remove a cold `*/debug` profile
+        // (the dominant, fully regeneratable slice of an idle `target/`)
+        // independent of the project's overall staleness — so a release-active
+        // but debug-cold project still frees it. Skipped when Tier 2 will wipe
+        // the whole `target/` below (same guard as the reaper); placed before the
+        // reaper so a wiped `debug/` drops out of the reaper's profile walk.
+        if !matches!((staleness, escalate), (Staleness::Stale, true)) {
+            let b = reclaim_stale_debug(
+                t,
+                &cfg,
+                &allowlist,
+                now,
+                &now_str,
+                &mut manifest,
+                &mut report,
+            );
+            report.debug_stale_bytes += b;
+        }
 
         // Reap superseded cargo artifacts (safe in every tier; preserves the
         // live working set). Skip only the stale-escalate arm, which wipes the
@@ -455,9 +479,10 @@ fn cleanup_pass(inputs: PassInputs) -> CleanupReport {
 // Discovery
 // ============================================================================
 
-/// Discover genuine cargo target dirs from two sources, deduplicated by
-/// canonical target path: (1) every indexed project root's `<root>/target`,
-/// and (2) a bounded, gitignore-blind walk of each configured `root`.
+/// Discover genuine cargo target dirs, deduplicated by canonical target path,
+/// from: (1) every indexed project root's `<root>/target`; (1b) agent worktrees
+/// under each indexed root's `.claude/worktrees` / `.crucible/worktrees`; and
+/// (2) a bounded, gitignore-blind walk of each configured `root`.
 fn discover_targets(
     roots: &[String],
     project_candidates: &[(PathBuf, String)],
@@ -470,6 +495,22 @@ fn discover_targets(
     for (root, name) in project_candidates {
         if let Some(td) = genuine_target(root, Some(name)) {
             push_unique(&mut seen, &mut out, td);
+        }
+    }
+
+    // Source 1b: agent worktrees under each indexed project's `.claude/worktrees`
+    // (and `.crucible/worktrees`). These aren't in the `projects` table and can
+    // sit below the configured-roots walk depth, so discover them explicitly —
+    // an abandoned agent worktree's `target/` is otherwise never reclaimed. A
+    // live agent's build is still protected by the /proc busy-scan + build-quiet.
+    for (root, _name) in project_candidates {
+        for container in [".claude/worktrees", ".crucible/worktrees"] {
+            walk_for_targets(
+                &root.join(container),
+                ROOT_WALK_MAX_DEPTH,
+                &mut seen,
+                &mut out,
+            );
         }
     }
 
@@ -1050,6 +1091,65 @@ fn reap_superseded(
 }
 
 // ============================================================================
+// Stale-debug reclamation
+// ============================================================================
+
+/// Wholesale-remove any cold `*/debug` build-profile dir — one whose newest
+/// artifact mtime is older than `debug_stale_days` — independent of the
+/// project's overall staleness. Debug artifacts are the dominant, most
+/// regeneratable slice of a `target/` (a plain `cargo build` rebuilds them), so
+/// a debug tree untouched for weeks is safe, age-gated reclamation even for a
+/// project whose *release* profile is active. Covers cross-compile
+/// `target/<triple>/debug` too (via [`collect_profile_dirs`]). Every removal is
+/// routed through the [`safe_remove`] chokepoint. Returns bytes reclaimed
+/// (would-be, under dry-run).
+#[allow(clippy::too_many_arguments)]
+fn reclaim_stale_debug(
+    t: &TargetDir,
+    cfg: &TargetCleanupConfig,
+    allowlist: &HashSet<PathBuf>,
+    now: DateTime<Utc>,
+    now_str: &str,
+    manifest: &mut Manifest,
+    report: &mut CleanupReport,
+) -> u64 {
+    if cfg.debug_stale_days == 0 {
+        return 0;
+    }
+    let mut profiles: Vec<PathBuf> = Vec::new();
+    collect_profile_dirs(&t.target, &mut profiles);
+    let cutoff = now.timestamp() - (cfg.debug_stale_days as i64) * 86_400;
+    let mut bytes = 0u64;
+    for prof in &profiles {
+        // Only debug profiles (`target/debug` or `target/<triple>/debug`); the
+        // release working set is preserved for incremental rebuilds.
+        if prof.file_name().and_then(|n| n.to_str()) != Some("debug") {
+            continue;
+        }
+        if let Some(newest) = newest_mtime(prof)
+            && newest < cutoff
+        {
+            let b = safe_remove(
+                prof,
+                &t.target,
+                &t.name,
+                "debug-stale",
+                cfg,
+                allowlist,
+                now_str,
+                manifest,
+                report,
+            );
+            if b > 0 {
+                bytes += b;
+                report.debug_dirs_removed += 1;
+            }
+        }
+    }
+    bytes
+}
+
+// ============================================================================
 // The deletion chokepoint
 // ============================================================================
 
@@ -1588,48 +1688,6 @@ fn current_euid() -> u32 {
     unsafe { libc::geteuid() }
 }
 
-/// Every candidate project root for the running daemon, each unconditionally
-/// allowlisted so the daemon never deletes its own build artifacts. We return
-/// *all* anchors we can derive because no single one is reliable across launch
-/// styles:
-///
-/// * `CARGO_MANIFEST_DIR` — the source tree this binary was *built* from,
-///   embedded at compile time. The only anchor that survives an installed-binary
-///   launch (e.g. `~/.local/bin/pgmcp` with cwd `$HOME`), where `current_exe()`
-///   has no `target/` ancestor and `current_dir()` is not the project root.
-/// * `current_exe()` above `target/` — correct when run straight from
-///   `<root>/target/release/pgmcp`.
-/// * `current_dir()` — last-resort fallback when launched from the project root.
-///
-/// Anchors need not exist on this host (a binary built elsewhere harmlessly
-/// contributes a non-matching path); the caller canonicalizes each and the
-/// allowlist `HashSet` dedups.
-fn detect_self_project_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-
-    // Compile-time source root: robust to where the binary is installed/launched.
-    roots.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
-
-    // Runtime: the dir above a `target/` ancestor of the executable.
-    if let Ok(exe) = std::env::current_exe() {
-        for anc in exe.ancestors() {
-            if anc.file_name().map(|n| n == "target").unwrap_or(false)
-                && let Some(parent) = anc.parent()
-            {
-                roots.push(parent.to_path_buf());
-                break;
-            }
-        }
-    }
-
-    // Last-resort: the daemon's working directory.
-    if let Ok(cwd) = std::env::current_dir() {
-        roots.push(cwd);
-    }
-
-    roots
-}
-
 // ============================================================================
 // Manifest
 // ============================================================================
@@ -1768,6 +1826,10 @@ pub struct CleanupReport {
     pub reap_superseded_bytes: u64,
     /// Count of superseded artifact files/dirs reaped (would-be, under dry-run).
     pub reap_files: u64,
+    /// Bytes reclaimed by wholesale removal of cold `*/debug` profiles (would-be, dry-run).
+    pub debug_stale_bytes: u64,
+    /// Count of cold `*/debug` profile dirs removed (would-be, dry-run).
+    pub debug_dirs_removed: u64,
     pub tmp_prov_bytes: u64,
     pub tmp_age_bytes: u64,
     pub tmp_files_removed: u64,
@@ -1786,6 +1848,7 @@ impl CleanupReport {
             + self.tier1_bytes
             + self.tier2_bytes
             + self.reap_superseded_bytes
+            + self.debug_stale_bytes
             + self.tmp_prov_bytes
             + self.tmp_age_bytes
     }
@@ -1806,6 +1869,8 @@ impl CleanupReport {
             "tier2_bytes": self.tier2_bytes,
             "reap_superseded_bytes": self.reap_superseded_bytes,
             "reap_files": self.reap_files,
+            "debug_stale_bytes": self.debug_stale_bytes,
+            "debug_dirs_removed": self.debug_dirs_removed,
             "tmp_prov_bytes": self.tmp_prov_bytes,
             "tmp_age_bytes": self.tmp_age_bytes,
             "tmp_files_removed": self.tmp_files_removed,
@@ -1829,6 +1894,8 @@ impl CleanupReport {
             tier2_bytes = self.tier2_bytes,
             reap_superseded_bytes = self.reap_superseded_bytes,
             reap_files = self.reap_files,
+            debug_stale_bytes = self.debug_stale_bytes,
+            debug_dirs_removed = self.debug_dirs_removed,
             tmp_prov_bytes = self.tmp_prov_bytes,
             tmp_age_bytes = self.tmp_age_bytes,
             tmp_files_removed = self.tmp_files_removed,
@@ -1909,6 +1976,8 @@ mod tests {
             tier0_bytes: 7,
             reap_superseded_bytes: 48,
             reap_files: 2818,
+            debug_stale_bytes: 100,
+            debug_dirs_removed: 1,
             tmp_prov_bytes: 5,
             tmp_files_removed: 3,
             errors: 0,
@@ -1919,11 +1988,125 @@ mod tests {
         assert_eq!(c["tier0_bytes"], 7);
         assert_eq!(c["reap_superseded_bytes"], 48);
         assert_eq!(c["reap_files"], 2818);
-        // total_bytes folds tier0/1/2 + reap_superseded + tmp_{prov,age}.
-        assert_eq!(c["total_bytes"], 7 + 48 + 5);
+        assert_eq!(c["debug_stale_bytes"], 100);
+        assert_eq!(c["debug_dirs_removed"], 1);
+        // total_bytes folds tier0/1/2 + reap_superseded + debug_stale + tmp_{prov,age}.
+        assert_eq!(c["total_bytes"], 7 + 48 + 100 + 5);
         assert_eq!(c["dry_run"], false);
         // A populated object, not the empty `{}` this fixes in `cron_history`.
         assert!(c.as_object().is_some_and(|m| !m.is_empty()));
+    }
+
+    // -- stale-debug reclamation ------------------------------------------
+
+    #[test]
+    fn reclaim_stale_debug_wipes_cold_debug_keeps_release() {
+        let tmp = TempDir::new();
+        let proj = make_project(tmp.path(), "p");
+        // Age every debug file ~60 days back (release stays fresh).
+        let old = Utc::now().timestamp() - 60 * 86400;
+        set_mtime(&proj.join("target/debug/incremental/foo/bar.bin"), old);
+        set_mtime(&proj.join("target/debug/deps/libx.rlib"), old);
+        let td = genuine_target(&proj, Some("p")).unwrap();
+        let cfg = TargetCleanupConfig {
+            dry_run: false,
+            sweep_tmp: false,
+            debug_stale_days: 30,
+            ..Default::default()
+        };
+        let allow = HashSet::new();
+        let mut manifest = Manifest {
+            writer: None,
+            path: None,
+        };
+        let mut report = CleanupReport::default();
+        let bytes = reclaim_stale_debug(
+            &td,
+            &cfg,
+            &allow,
+            Utc::now(),
+            "now",
+            &mut manifest,
+            &mut report,
+        );
+
+        assert!(bytes > 0, "reclaimed cold debug bytes");
+        assert_eq!(report.debug_dirs_removed, 1);
+        assert!(!proj.join("target/debug").exists(), "cold debug wiped");
+        assert!(
+            proj.join("target/release/x").exists(),
+            "release working set kept"
+        );
+        assert!(proj.join("src/lib.rs").exists(), "source untouched");
+    }
+
+    #[test]
+    fn reclaim_stale_debug_skips_fresh_debug() {
+        let tmp = TempDir::new();
+        let proj = make_project(tmp.path(), "p"); // debug written fresh (now)
+        let td = genuine_target(&proj, Some("p")).unwrap();
+        let cfg = TargetCleanupConfig {
+            dry_run: false,
+            sweep_tmp: false,
+            debug_stale_days: 30,
+            ..Default::default()
+        };
+        let allow = HashSet::new();
+        let mut manifest = Manifest {
+            writer: None,
+            path: None,
+        };
+        let mut report = CleanupReport::default();
+        let bytes = reclaim_stale_debug(
+            &td,
+            &cfg,
+            &allow,
+            Utc::now(),
+            "now",
+            &mut manifest,
+            &mut report,
+        );
+
+        assert_eq!(bytes, 0, "fresh debug is preserved");
+        assert_eq!(report.debug_dirs_removed, 0);
+        assert!(proj.join("target/debug/deps/libx.rlib").exists());
+    }
+
+    #[test]
+    fn reclaim_stale_debug_disabled_when_zero() {
+        let tmp = TempDir::new();
+        let proj = make_project(tmp.path(), "p");
+        let old = Utc::now().timestamp() - 90 * 86400;
+        set_mtime(&proj.join("target/debug/incremental/foo/bar.bin"), old);
+        set_mtime(&proj.join("target/debug/deps/libx.rlib"), old);
+        let td = genuine_target(&proj, Some("p")).unwrap();
+        let cfg = TargetCleanupConfig {
+            dry_run: false,
+            sweep_tmp: false,
+            debug_stale_days: 0, // disabled
+            ..Default::default()
+        };
+        let allow = HashSet::new();
+        let mut manifest = Manifest {
+            writer: None,
+            path: None,
+        };
+        let mut report = CleanupReport::default();
+        let bytes = reclaim_stale_debug(
+            &td,
+            &cfg,
+            &allow,
+            Utc::now(),
+            "now",
+            &mut manifest,
+            &mut report,
+        );
+
+        assert_eq!(bytes, 0, "debug_stale_days=0 disables reclamation");
+        assert!(
+            proj.join("target/debug").exists(),
+            "debug kept when disabled"
+        );
     }
 
     // -- staleness ---------------------------------------------------------
@@ -2337,20 +2520,26 @@ mod tests {
     }
 
     #[test]
-    fn self_project_roots_include_cargo_manifest_dir() {
-        // The compile-time source root must always be among the self-allowlist
-        // anchors, regardless of where the binary is installed or what cwd it
-        // runs under — this is what keeps pgmcp's own `target/` out of the
-        // delete set when the daemon runs from an installed path such as
-        // `~/.local/bin/pgmcp` (cwd `$HOME`), where `current_exe()` has no
-        // `target/` ancestor and `current_dir()` is not the project root.
-        let roots = detect_self_project_roots();
+    fn no_implicit_self_allowlist() {
+        // The deletion allowlist is built ONLY from operator-configured entries —
+        // there is NO implicit self-exemption for pgmcp's own project (the daemon
+        // is protected by the /proc busy-scan + build-quiet, not an allowlist), so
+        // every workspace project (pgmcp included) is cleaned equally.
+        assert!(
+            build_allowlist(&[]).is_empty(),
+            "empty config must yield an empty allowlist (no implicit self-entry)"
+        );
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         assert!(
-            roots.contains(&manifest_dir),
-            "CARGO_MANIFEST_DIR ({}) missing from self-roots: {:?}",
-            manifest_dir.display(),
-            roots
+            !build_allowlist(&[]).contains(&manifest_dir),
+            "pgmcp's own project root must NOT be implicitly allowlisted"
+        );
+        // A configured entry IS honored (canonicalized).
+        let tmp = TempDir::new();
+        let canon = fs::canonicalize(tmp.path()).expect("canonicalize temp dir");
+        assert!(
+            build_allowlist(&[tmp.path().to_string_lossy().into_owned()]).contains(&canon),
+            "a configured allowlist entry must be present (canonicalized)"
         );
     }
 
