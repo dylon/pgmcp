@@ -704,6 +704,23 @@ pub async fn set_work_item_status_in_tx(
     .execute(&mut **tx)
     .await?;
 
+    // Realtime event (topic=tracker): committed in THIS tx so the event's
+    // ins_xid is the transition's xact — the web UI never observes the status
+    // change before the domain row is visible. A failure aborts the transition.
+    crate::realtime::emit_in_tx(
+        tx,
+        &crate::realtime::RealtimeEvent::tracker_status(
+            &updated.public_id,
+            &updated.title,
+            from.as_str(),
+            to.as_str(),
+            actor.as_str(),
+            &updated.kind,
+            updated.project_id,
+        ),
+    )
+    .await?;
+
     // Auto-unblock cascade: when an item reaches `verified`, dependents that
     // were `blocked` solely on it may now be actionable. In the SAME tx, move
     // each such dependent `blocked → ready` as `Actor::System` — legal
@@ -990,6 +1007,33 @@ pub async fn resolve_project_id(
                 .await
         }
     }
+}
+
+/// Resolve a filesystem path (typically an MCP client's `cwd`) to the id of the
+/// most-specific project whose `projects.path` root contains it — the LONGEST
+/// `path` that is a prefix of `cwd` (or equals it). `None` when the path lies
+/// outside every indexed project root.
+///
+/// Prefix matching is done with `left($1, length(path)+1) = path || '/'` (an
+/// exact substring compare) rather than `LIKE path || '/%'` so that `_` / `%`
+/// characters in a project path are NOT treated as LIKE wildcards (a real
+/// false-positive risk on paths like `.../foo_bar`). `ORDER BY length(path)
+/// DESC` makes the deepest enclosing project win, so a nested worktree/clone is
+/// preferred over its parent.
+pub async fn resolve_project_by_path(pool: &PgPool, cwd: &str) -> Result<Option<i32>, sqlx::Error> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return Ok(None);
+    }
+    sqlx::query_scalar::<_, i32>(
+        "SELECT id FROM projects \
+         WHERE path = $1 OR left($1, length(path) + 1) = path || '/' \
+         ORDER BY length(path) DESC \
+         LIMIT 1",
+    )
+    .bind(cwd)
+    .fetch_optional(pool)
+    .await
 }
 
 /// One countable leaf of a subtree roll-up (deferred/cancelled excluded by the

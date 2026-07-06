@@ -201,6 +201,15 @@ async fn write_batch(pool: &PgPool, batch: Vec<FileTouchEvent>, pg_notify_channe
         return;
     }
 
+    // Realtime event (topic=client): a coalesced file-touch batch landed. Own-tx,
+    // best-effort — compact rollup only (a single batch may span many sessions /
+    // paths, so identity lives in the `client_file_events` rows, not here).
+    crate::realtime::emit(
+        pool,
+        &crate::realtime::RealtimeEvent::client_activity(batch.len(), distinct.len()),
+    )
+    .await;
+
     // Live fan-out (ADR-022): signal external LISTENers (the pi orchestrator,
     // tooling) that a batch landed. A Postgres NOTIFY payload is capped at 8000
     // bytes, so a large batch sends a compact summary instead of the full list —

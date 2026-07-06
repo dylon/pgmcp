@@ -66,6 +66,7 @@ pub mod patterns;
 pub mod proc_clients;
 pub mod quality;
 pub mod reactive;
+pub mod realtime;
 pub mod render;
 pub mod reranker;
 pub mod rmas;

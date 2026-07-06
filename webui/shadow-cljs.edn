@@ -1,0 +1,27 @@
+{:source-paths ["src-cljs" "test-cljs"]
+:dependencies [[reagent "2.0.1"]
+                [re-frame "1.4.7"]
+                [re-com "2.29.4"]
+                [com.andrewmcveigh/cljs-time "0.5.2"]]
+ :builds
+ {:webui
+  {:target :browser
+   :output-dir "resources/cljs"
+   :asset-path "/webui/cljs"
+   :modules {:app {:init-fn pgmcp.webui.core/init!}}
+   ;; :simple (not :advanced) so unified/remark and web-tree-sitter JS interop
+   ;; is not broken by advanced property renaming (the shared baseline with
+   ;; vinary-viewer + lightning-bug, which downgrade for the same reason).
+   :js-options {:resolve {"fs" false
+                          "fs/promises" false
+                          "path" false
+                          "url" false
+                          "node:fs" false
+                          "node:path" false
+                          "node:url" false}}
+   :compiler-options {:optimizations :simple
+                      :infer-externs :auto}}
+  :test
+  {:target :node-test
+   :output-to ".shadow-cljs/webui-test.js"
+   :autorun true}}}

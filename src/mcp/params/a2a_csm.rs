@@ -688,6 +688,10 @@ pub struct ExperimentOpenParams {
     pub kind: Option<String>,
     #[schemars(description = "Owning project id; omit for a workspace-general experiment")]
     pub project_id: Option<i32>,
+    #[schemars(
+        description = "Owning project NAME (projects.name); resolved to an id when project_id is omitted. If neither is given, the project is inferred from the caller's cwd."
+    )]
+    pub project: Option<String>,
     #[schemars(description = "The first hypothesis statement (testable prediction)")]
     pub hypothesis: String,
     #[schemars(description = "Primary metric name, e.g. \"p99_latency_ms\", \"lcom4\"")]

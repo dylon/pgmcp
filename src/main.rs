@@ -60,6 +60,7 @@ mod patterns;
 mod proc_clients;
 mod quality;
 mod reactive;
+mod realtime;
 mod render;
 mod reranker;
 mod rmas;

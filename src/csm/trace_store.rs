@@ -349,6 +349,22 @@ pub async fn record_span(pool: &PgPool, input: &SpanInput) -> Result<i64, sqlx::
     .execute(&mut *tx)
     .await?;
 
+    // Realtime event (topic=trace): gated to ROOT spans only (a full trace can
+    // open thousands of child spans; only roots drive the live Traces pane).
+    // Committed in this tx so the event can never precede the span it announces.
+    if input.parent_span_id.is_none() {
+        crate::realtime::emit_in_tx(
+            &mut tx,
+            &crate::realtime::RealtimeEvent::trace_append(
+                input.trace_id,
+                span_id,
+                &input.name,
+                input.status.as_str(),
+            ),
+        )
+        .await?;
+    }
+
     tx.commit().await?;
     Ok(span_id)
 }
@@ -368,13 +384,32 @@ pub async fn close_span(
           WHERE span_id = $1
           RETURNING {SPAN_COLS}"
     );
-    sqlx::query_as::<_, TraceSpan>(sqlx::AssertSqlSafe(sql))
+    let updated = sqlx::query_as::<_, TraceSpan>(sqlx::AssertSqlSafe(sql))
         .bind(span_id)
         .bind(status.as_str())
         .bind(status_message)
         .bind(ended_at)
         .fetch_optional(pool)
-        .await
+        .await?;
+
+    // Realtime event (topic=trace): a ROOT span closing is a status change the
+    // live Traces pane cares about. Own-tx, best-effort (no surrounding tx).
+    if let Some(span) = &updated
+        && span.parent_span_id.is_none()
+    {
+        crate::realtime::emit(
+            pool,
+            &crate::realtime::RealtimeEvent::trace_append(
+                span.trace_id,
+                span.span_id,
+                &span.name,
+                span.status.as_str(),
+            ),
+        )
+        .await;
+    }
+
+    Ok(updated)
 }
 
 /// Append one annotation to a span. Returns the new id.

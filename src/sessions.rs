@@ -18,7 +18,7 @@ use pgvector::Vector;
 use regex::Regex;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 mod polarity;
 pub use polarity::*;
@@ -1101,6 +1101,19 @@ pub async fn upsert_mandate(
     .bind(m.salience)
     .fetch_one(pool)
     .await?;
+    // Realtime event (topic=mandate): a new/reinforced session mandate. Own-tx,
+    // best-effort — a telemetry write must never fail mandate extraction.
+    crate::realtime::emit(
+        pool,
+        &crate::realtime::RealtimeEvent::mandate_upsert(
+            id,
+            "session",
+            m.polarity.as_str(),
+            &m.imperative,
+            m.target.as_deref(),
+        ),
+    )
+    .await;
     Ok(id)
 }
 
@@ -1239,10 +1252,23 @@ pub async fn list_active_mandates(
 /// production hook path does not call it yet.
 #[allow(dead_code)]
 pub async fn retire_mandate(pool: &PgPool, id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE session_mandates SET status = 'retired' WHERE id = $1")
-        .bind(id)
-        .execute(pool)
-        .await?;
+    // RETURNING the polarity/imperative lets the realtime delete event carry
+    // enough to identify the retired mandate without a second query; the
+    // `Option` also gates the emit on a row actually having been retired.
+    let retired: Option<(String, String)> = sqlx::query_as::<_, (String, String)>(
+        "UPDATE session_mandates SET status = 'retired' WHERE id = $1
+         RETURNING polarity, imperative",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?;
+    if let Some((polarity, imperative)) = retired {
+        crate::realtime::emit(
+            pool,
+            &crate::realtime::RealtimeEvent::mandate_delete(id, &polarity, &imperative),
+        )
+        .await;
+    }
     Ok(())
 }
 
@@ -1261,11 +1287,32 @@ pub async fn promote_mandate(
     file_path: Option<&str>,
 ) -> Result<i64, sqlx::Error> {
     let mut tx = pool.begin().await?;
+    let durable_id = promote_mandate_in_tx(&mut tx, id, scope, project_id, file_path).await?;
+    tx.commit().await?;
+    Ok(durable_id)
+}
+
+/// In-transaction body of [`promote_mandate`]: promote a session mandate to a
+/// durable one, mark the source `promoted`, and emit the `mandate` upsert event
+/// — all bound to the CALLER's transaction (no `begin`/`commit` here) so an
+/// operator write can commit the promotion together with its `webui_audit_log`
+/// row in one atomic transaction (the ADR-021 in-tx posture). Idempotent: a
+/// second promotion of an already-promoted mandate returns the existing durable
+/// id (optionally filling a previously-absent `file_path`) rather than inserting
+/// a duplicate. The `[webui] promote` handler reuses this instead of duplicating
+/// the subtle idempotency logic.
+pub async fn promote_mandate_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    id: i64,
+    scope: &str,
+    project_id: Option<i32>,
+    file_path: Option<&str>,
+) -> Result<i64, sqlx::Error> {
     let mandate = sqlx::query_as::<_, SessionMandate>(
         "SELECT * FROM session_mandates WHERE id = $1 FOR UPDATE",
     )
     .bind(id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
 
     let existing: Option<(i64, String, Option<i32>, Option<String>)> = sqlx::query_as(
@@ -1276,7 +1323,7 @@ pub async fn promote_mandate(
           LIMIT 1",
     )
     .bind(id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await?;
 
     if let Some((durable_id, existing_scope, existing_project_id, existing_file_path)) = existing {
@@ -1295,7 +1342,7 @@ pub async fn promote_mandate(
                 sqlx::query("UPDATE durable_mandates SET file_path = $2 WHERE id = $1")
                     .bind(durable_id)
                     .bind(requested)
-                    .execute(&mut *tx)
+                    .execute(&mut **tx)
                     .await?;
             }
             _ => {}
@@ -1303,10 +1350,21 @@ pub async fn promote_mandate(
 
         sqlx::query("UPDATE session_mandates SET status = 'promoted' WHERE id = $1")
             .bind(id)
-            .execute(&mut *tx)
+            .execute(&mut **tx)
             .await?;
 
-        tx.commit().await?;
+        crate::realtime::emit_in_tx(
+            tx,
+            &crate::realtime::RealtimeEvent::mandate_upsert(
+                durable_id,
+                scope,
+                &mandate.polarity,
+                &mandate.imperative,
+                mandate.target.as_deref(),
+            ),
+        )
+        .await?;
+
         return Ok(durable_id);
     }
 
@@ -1329,15 +1387,26 @@ pub async fn promote_mandate(
     .bind(mandate.target.as_deref())
     .bind(mandate.id)
     .bind(file_path)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
 
     sqlx::query("UPDATE session_mandates SET status = 'promoted' WHERE id = $1")
         .bind(id)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
-    tx.commit().await?;
+    crate::realtime::emit_in_tx(
+        tx,
+        &crate::realtime::RealtimeEvent::mandate_upsert(
+            durable_id,
+            scope,
+            &mandate.polarity,
+            &mandate.imperative,
+            mandate.target.as_deref(),
+        ),
+    )
+    .await?;
+
     Ok(durable_id)
 }
 

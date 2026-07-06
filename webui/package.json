@@ -1,0 +1,33 @@
+{
+  "private": true,
+  "name": "@pgmcp/webui",
+  "version": "0.1.0",
+  "description": "ClojureScript source build for the embedded pgmcp web UI.",
+  "scripts": {
+    "release": "shadow-cljs release webui",
+    "build": "shadow-cljs release webui && cp resources/cljs/app.js resources/app.js",
+    "check:architecture": "../scripts/check-webui-architecture.sh",
+    "test": "shadow-cljs compile test",
+    "watch": "shadow-cljs watch webui"
+  },
+  "dependencies": {
+    "@codemirror/autocomplete": "^6.20.3",
+    "@codemirror/commands": "^6.10.4",
+    "@codemirror/language": "^6.12.4",
+    "@codemirror/state": "^6.7.1",
+    "@codemirror/view": "^6.43.5",
+    "@f1r3fly-io/lightning-bug": "file:../../lightning-bug",
+    "react": "19.2.7",
+    "react-dom": "19.2.7",
+    "rehype-slug": "^6.0.0",
+    "remark-gfm": "^4.0.1",
+    "remark-parse": "^11.0.0",
+    "remark-rehype": "^11.1.2",
+    "rxjs": "^7.8.2",
+    "unified": "^11.0.5",
+    "web-tree-sitter": "^0.25.9"
+  },
+  "devDependencies": {
+    "shadow-cljs": "3.4.11"
+  }
+}

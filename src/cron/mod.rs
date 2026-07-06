@@ -12,6 +12,8 @@ pub mod docker_cleanup;
 #[allow(dead_code)]
 pub mod embedding_migration;
 #[allow(dead_code)]
+pub mod experiment_project_backfill;
+#[allow(dead_code)]
 pub mod findings_promotion;
 #[allow(dead_code)]
 pub mod function_metrics;

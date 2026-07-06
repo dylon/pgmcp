@@ -42,6 +42,14 @@ pub struct CronJobRollupRow {
     pub ok_count: i64,
     pub fail_count: i64,
     pub skip_count: i64,
+    /// Mean run duration across the ledger for this job (NULL only if the group
+    /// is somehow empty, which `GROUP BY` precludes).
+    pub avg_ms: Option<i64>,
+    /// The most recent non-NULL `error_detail` / `skip_reason` for this job, so
+    /// the operator sees *why* a job last failed or was skipped without opening
+    /// the per-run "Recent runs" table.
+    pub last_error: Option<String>,
+    pub last_skip_reason: Option<String>,
 }
 
 /// `(job_name, MAX(completed_at))` over successful runs — the restart-survival
@@ -91,7 +99,12 @@ pub async fn cron_job_rollup(pool: &PgPool) -> Result<Vec<CronJobRollupRow>, sql
                 COUNT(*)                                           AS run_count,
                 COUNT(*) FILTER (WHERE outcome = 'ok')             AS ok_count,
                 COUNT(*) FILTER (WHERE outcome IN ('failed','panicked')) AS fail_count,
-                COUNT(*) FILTER (WHERE outcome = 'skipped')        AS skip_count
+                COUNT(*) FILTER (WHERE outcome = 'skipped')        AS skip_count,
+                AVG(duration_ms)::bigint                           AS avg_ms,
+                (array_agg(error_detail ORDER BY completed_at DESC)
+                   FILTER (WHERE error_detail IS NOT NULL))[1]     AS last_error,
+                (array_agg(skip_reason ORDER BY completed_at DESC)
+                   FILTER (WHERE skip_reason IS NOT NULL))[1]      AS last_skip_reason
            FROM cron_run_history
           GROUP BY job_name
           ORDER BY job_name",

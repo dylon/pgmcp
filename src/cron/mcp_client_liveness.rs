@@ -28,15 +28,20 @@ struct AliveClient {
     mcp_session_id: String,
     pid: Option<i32>,
     proc_start_ticks: Option<i64>,
-    #[allow(dead_code)]
+    /// Last-known project (carried into the realtime disconnect event).
     project_id: Option<i32>,
 }
 
 /// One liveness sweep. `pool` is an owned `PgPool` (cheaply cloned from
 /// `DbClient::pool()`). `proc_fd` enables the open-files supplement.
-pub async fn run_or_log(pool: PgPool, stats: Arc<StatsTracker>, proc_fd: bool) {
+pub async fn run_or_log(
+    pool: PgPool,
+    stats: Arc<StatsTracker>,
+    proc_fd: bool,
+    stale_after_secs: u64,
+) {
     let _ = stats.cron_executions.fetch_add(1, Ordering::Relaxed);
-    match sweep(&pool, &stats, proc_fd).await {
+    match sweep(&pool, &stats, proc_fd, stale_after_secs).await {
         Ok((checked, exited, refreshed)) => {
             if exited + refreshed > 0 {
                 info!(
@@ -56,7 +61,26 @@ async fn sweep(
     pool: &PgPool,
     stats: &StatsTracker,
     proc_fd: bool,
+    stale_after_secs: u64,
 ) -> Result<(usize, usize, usize), sqlx::Error> {
+    // Time backstop: expire NULL-pid `alive` rows with no recent activity. The
+    // capture writer records `pid=NULL` when the TCP-peer→PID resolution fails;
+    // such a row has no `/proc` handle to liveness-check, so without this it
+    // would stay `alive` forever (surviving reboots — there is no stale PID to
+    // invalidate). Keyed on activity time, so it is reboot-safe. Has-pid rows
+    // are handled by the per-row `/proc` check below.
+    let time_expired = sqlx::query(
+        "UPDATE mcp_clients
+            SET alive = FALSE, exited_at = now(), cgroup_id = NULL
+          WHERE alive
+            AND pid IS NULL
+            AND COALESCE(last_liveness_at, last_seen) < now() - make_interval(secs => $1)",
+    )
+    .bind(stale_after_secs as f64)
+    .execute(pool)
+    .await?
+    .rows_affected() as usize;
+
     let rows: Vec<AliveClient> = sqlx::query_as::<_, AliveClient>(
         "SELECT mcp_session_id, pid, proc_start_ticks, project_id FROM mcp_clients WHERE alive",
     )
@@ -64,7 +88,7 @@ async fn sweep(
     .await?;
 
     let checked = rows.len();
-    let mut exited = 0usize;
+    let mut exited = time_expired;
     let mut refreshed = 0usize;
 
     for r in rows {
@@ -142,6 +166,13 @@ async fn sweep(
             .bind(&r.mcp_session_id)
             .execute(pool)
             .await?;
+            // Realtime event (topic=client): the client exited. Own-tx,
+            // best-effort — the sweep must not fail on a telemetry write.
+            crate::realtime::emit(
+                pool,
+                &crate::realtime::RealtimeEvent::client_disconnect(&r.mcp_session_id, r.project_id),
+            )
+            .await;
             stats.remove_seen_client(&r.mcp_session_id);
             exited += 1;
         }

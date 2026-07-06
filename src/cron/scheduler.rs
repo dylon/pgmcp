@@ -1018,6 +1018,7 @@ pub fn schedule_maintenance_jobs(
     let lc_lv = lifecycle.clone();
     let liveness_interval = config.mcp_client_liveness_interval_secs.max(1);
     let liveness_proc_fd = clients_config.proc_fd_supplement;
+    let liveness_stale_secs = clients_config.stale_after_secs.max(60);
     let hist_liveness = system_ctx.cron_history().clone();
     handle.schedule_recurring(
         initial_delay("mcp-client-liveness", liveness_interval * 1000),
@@ -1050,8 +1051,13 @@ pub fn schedule_maintenance_jobs(
                     hist,
                     "mcp-client-liveness",
                     async move {
-                        crate::cron::mcp_client_liveness::run_or_log(pool, stats, liveness_proc_fd)
-                            .await;
+                        crate::cron::mcp_client_liveness::run_or_log(
+                            pool,
+                            stats,
+                            liveness_proc_fd,
+                            liveness_stale_secs,
+                        )
+                        .await;
                     },
                 );
             }
@@ -1221,6 +1227,44 @@ pub fn schedule_maintenance_jobs(
                         "findings-promotion",
                         async move {
                             crate::cron::findings_promotion::run_or_log(pool, stats).await;
+                        },
+                    );
+                }
+                true
+            },
+        );
+    }
+
+    // experiment-project-backfill: fill `experiments.project_id` for experiments
+    // opened without one, inferring the project from git_ref → plan_ref → a
+    // linked work_item_experiment. Idempotent + non-destructive (never
+    // overwrites a set project). Light job (bounded, capped per run) — runs on
+    // the runtime like the findings sweep, no heavy-cron gate. Interval-gated
+    // (0 disables globally).
+    if config.experiment_project_backfill_interval_secs > 0 {
+        let db_clone_epb = Arc::clone(&db);
+        let rt_clone_epb = rt.clone();
+        let stats_clone_epb = Arc::clone(&stats);
+        let lc_epb = lifecycle.clone();
+        let epb_interval = config.experiment_project_backfill_interval_secs;
+        let hist_epb = system_ctx.cron_history().clone();
+        handle.schedule_recurring(
+            initial_delay("experiment-project-backfill", epb_interval * 1000),
+            epb_interval * 1000,
+            "experiment-project-backfill",
+            move || {
+                if lc_epb.is_stopping() {
+                    return false;
+                }
+                let stats = Arc::clone(&stats_clone_epb);
+                let hist = hist_epb.clone();
+                if let Some(pool) = db_clone_epb.pool().cloned() {
+                    crate::cron::history::spawn_recorded(
+                        &rt_clone_epb,
+                        hist,
+                        "experiment-project-backfill",
+                        async move {
+                            crate::cron::experiment_project_backfill::run_or_log(pool, stats).await;
                         },
                     );
                 }

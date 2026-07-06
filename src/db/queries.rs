@@ -14,6 +14,9 @@ pub use queries_stats::*;
 mod queries_experiments;
 pub use queries_experiments::*;
 
+#[path = "queries/dashboard_metrics.rs"]
+pub mod dashboard_metrics;
+
 #[path = "queries/work_items.rs"]
 mod queries_work_items;
 pub use queries_work_items::*;
@@ -121,6 +124,14 @@ pub use queries_cron_history::*;
 #[path = "queries/index_failures.rs"]
 mod queries_index_failures;
 pub use queries_index_failures::*;
+
+#[path = "queries/realtime_events.rs"]
+mod queries_realtime_events;
+pub use queries_realtime_events::*;
+
+#[path = "queries/mandates_write.rs"]
+mod queries_mandates_write;
+pub use queries_mandates_write::*;
 
 // The digest rate-limit ledger keeps its own namespace (`queries::digest::*`)
 // rather than being flattened with `pub use`, so the digest's sole write

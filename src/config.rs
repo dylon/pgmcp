@@ -48,6 +48,12 @@ pub struct Config {
     /// self-limiting (capped + own-filesystem self-floor).
     #[serde(default)]
     pub outbox: OutboxConfig,
+    /// `[webui]` — local admin console served by the daemon. The Rust crate is
+    /// CUDA-free and read-mostly; privileged search/operator actions stay on
+    /// daemon-side API routes where `ApiState` already owns the embedder,
+    /// indexes, config, and token-gated mutations.
+    #[serde(default)]
+    pub webui: WebuiConfig,
     /// `[fuzzy]` — disk-backed PersistentARTrieChar fuzzy-index layout.
     /// Populated in Phase 4 of the integration plan
     /// `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`.
@@ -410,6 +416,13 @@ pub struct ClientsConfig {
     /// open-close editors, so cheap but low-signal.
     #[serde(default)]
     pub proc_fd_supplement: bool,
+    /// A NULL-pid `alive` client (the capture writer could not resolve its PID
+    /// from the TCP peer) has no `/proc` handle to liveness-check, so the sweep
+    /// expires it by a time backstop: flip `alive=false` once its last activity
+    /// (`last_liveness_at`/`last_seen`) is older than this many seconds.
+    /// Reboot-safe — keyed on activity time, not a PID. Default 1800.
+    #[serde(default = "default_client_stale_after_secs")]
+    pub stale_after_secs: u64,
     /// Capture files touched by the agent's spawned **subprocesses** (`cargo`,
     /// `rustc`, test runners, `rg`) via cgroup-v2 + eBPF subtree tracing
     /// (Phase 2C, ADR-022). Off by default; requires `cgroup_scope = "ebpf"`,
@@ -497,6 +510,7 @@ impl Default for ClientsConfig {
             ebpf_refresh_secs: default_ebpf_refresh_secs(),
             ebpf_dedup_secs: default_ebpf_dedup_secs(),
             proc_fd_supplement: false,
+            stale_after_secs: default_client_stale_after_secs(),
             subprocess_capture: false,
             cgroup_scope: default_cgroup_scope(),
             capture_reads: true,
@@ -562,6 +576,10 @@ fn default_ebpf_refresh_secs() -> u64 {
 
 fn default_ebpf_dedup_secs() -> u64 {
     5
+}
+
+fn default_client_stale_after_secs() -> u64 {
+    1800
 }
 
 fn default_cgroup_scope() -> String {
@@ -1654,8 +1672,8 @@ fn default_traj_msm_c() -> f64 {
     0.1
 }
 
-/// `[memory.retention]` — Phase 8 eviction policy. Stub config now so
-/// the TOML accepts the section even though the cron lands in Phase 8.
+/// `[memory.retention]` — soft-delete retention policy used by the
+/// `memory-retention` cron and the memory-forget retention tool.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryRetentionConfig {
     #[serde(default = "default_true")]
@@ -2661,6 +2679,97 @@ fn default_outbox_on_full() -> String {
     "stop".to_string()
 }
 
+fn default_webui_heartbeat_secs() -> u64 {
+    15
+}
+fn default_webui_replay_page() -> i64 {
+    250
+}
+fn default_webui_max_msgs_per_sec() -> u32 {
+    200
+}
+fn default_webui_max_connections() -> usize {
+    16
+}
+fn default_webui_handshake_rate_per_min() -> u32 {
+    60
+}
+fn default_webui_resource_sample_secs() -> u64 {
+    2
+}
+fn default_webui_writes_enabled() -> bool {
+    true
+}
+
+/// `[webui]` — local, daemon-served admin console.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebuiConfig {
+    /// Master switch. Disabled by default so existing daemon installs do not
+    /// expose a new operator surface without an explicit config change.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Optional bearer/query token for `/webui/ws`. Empty/None means no token
+    /// check; use only on loopback-bound daemons.
+    #[serde(default)]
+    pub token: Option<String>,
+    /// Optional read-only database URL for the webui realtime reader. Empty
+    /// falls back to the daemon pool; deployments with a `pgmcp_webui_ro` role
+    /// should set this to make the least-privilege boundary structural.
+    #[serde(default)]
+    pub ro_database_url: Option<String>,
+    /// Allowed websocket origins. Empty resolves at runtime to the daemon's own
+    /// `http://host:port` origin.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    /// Seconds between websocket heartbeats when no replay rows are available.
+    #[serde(default = "default_webui_heartbeat_secs")]
+    pub heartbeat_secs: u64,
+    /// Maximum committed realtime rows returned per websocket replay query.
+    #[serde(default = "default_webui_replay_page")]
+    pub replay_page: i64,
+    /// Per-connection inbound websocket message budget.
+    #[serde(default = "default_webui_max_msgs_per_sec")]
+    pub max_msgs_per_sec: u32,
+    /// Maximum simultaneously upgraded web UI websocket connections.
+    #[serde(default = "default_webui_max_connections")]
+    pub max_connections: usize,
+    /// Process-local websocket handshake budget.
+    #[serde(default = "default_webui_handshake_rate_per_min")]
+    pub handshake_rate_per_min: u32,
+    /// Seconds between webui resource-sampler ticks (per-core CPU / memory /
+    /// GPU). The sampler enforces a 250 ms floor.
+    #[serde(default = "default_webui_resource_sample_secs")]
+    pub resource_sample_secs: u64,
+    /// Master kill-switch for the token-gated operator WRITE endpoints
+    /// (`/api/mandates/durable*`, `/api/mandates/promote`,
+    /// `/api/work_items/{id}/{transition,triage,confirm}`, `PATCH
+    /// /api/work_items/{id}`). When false, every write endpoint returns 403
+    /// "writes disabled" even for a correctly-authenticated operator — the
+    /// read surface and the realtime feed stay live. Default true: an enabled,
+    /// token-gated webui is a full operator console. Set false to run the
+    /// console read-only without dropping the `[webui] token`.
+    #[serde(default = "default_webui_writes_enabled")]
+    pub writes_enabled: bool,
+}
+
+impl Default for WebuiConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token: None,
+            ro_database_url: None,
+            allowed_origins: Vec::new(),
+            heartbeat_secs: default_webui_heartbeat_secs(),
+            replay_page: default_webui_replay_page(),
+            max_msgs_per_sec: default_webui_max_msgs_per_sec(),
+            max_connections: default_webui_max_connections(),
+            handshake_rate_per_min: default_webui_handshake_rate_per_min(),
+            resource_sample_secs: default_webui_resource_sample_secs(),
+            writes_enabled: default_webui_writes_enabled(),
+        }
+    }
+}
+
 impl DatabaseConfig {
     /// Build the database connection URL.
     pub fn connection_url(&self) -> String {
@@ -3267,6 +3376,14 @@ pub struct CronConfig {
     #[serde(default = "default_findings_promotion_interval")]
     pub findings_promotion_interval_secs: u64,
 
+    /// `experiment-project-backfill` cron interval (seconds, default 6h). Fills
+    /// `experiments.project_id` for experiments opened without one, inferring the
+    /// project from `git_ref` (→ `git_commits`), else `plan_ref` (→ the plan work
+    /// item's project), else a linked `work_item_experiment`'s work item. Never
+    /// overwrites a non-null assignment; a global interval of 0 disables it.
+    #[serde(default = "default_experiment_project_backfill_interval")]
+    pub experiment_project_backfill_interval_secs: u64,
+
     /// `concurrency-scan` cron interval (seconds). Runs the lock-order + channel
     /// deadlock analyses, records findings to `concurrency_findings`, and
     /// materializes `lock_order_edges` + health snapshots (Layer 4). Default 0 =
@@ -3554,6 +3671,8 @@ impl Default for CronConfig {
             topics_size_history_interval_secs: default_topics_size_history_interval(),
             tool_policy_interval_secs: default_tool_policy_interval(),
             findings_promotion_interval_secs: default_findings_promotion_interval(),
+            experiment_project_backfill_interval_secs: default_experiment_project_backfill_interval(
+            ),
             concurrency_scan_interval_secs: default_concurrency_scan_interval(),
             concurrency_auto_promote: false,
             cron_history_retention_days: default_cron_history_retention_days(),
@@ -4061,6 +4180,10 @@ fn default_tool_policy_interval() -> u64 {
 }
 
 fn default_findings_promotion_interval() -> u64 {
+    21_600 // 6h
+}
+
+fn default_experiment_project_backfill_interval() -> u64 {
     21_600 // 6h
 }
 

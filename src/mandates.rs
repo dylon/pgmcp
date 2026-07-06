@@ -68,10 +68,32 @@ pub struct ProjectOverrideFacts {
 }
 
 pub fn resolve_effective_mandates(config: &Config, project: Option<&ProjectInfo>) -> MandateBundle {
+    resolve_effective_mandates_with_global_roots(config, project, global_mandate_roots())
+}
+
+fn global_mandate_roots() -> Vec<PathBuf> {
+    Config::claude_dir().into_iter().collect()
+}
+
+fn resolve_effective_mandates_with_global_roots(
+    config: &Config,
+    project: Option<&ProjectInfo>,
+    global_roots: impl IntoIterator<Item = PathBuf>,
+) -> MandateBundle {
     let workspace_roots = relevant_workspace_roots(config, project);
     let mut sources = Vec::new();
     let mut skipped_sources = Vec::new();
     let mut seen = HashSet::new();
+
+    for global_root in global_roots {
+        collect_mandate_files(
+            global_root.as_path(),
+            "global",
+            &mut seen,
+            &mut sources,
+            &mut skipped_sources,
+        );
+    }
 
     for root in &workspace_roots {
         collect_mandate_files(
@@ -447,7 +469,7 @@ mod tests {
         config.workspace.paths = vec![workspace.to_string_lossy().into_owned()];
 
         let project = project_info(&workspace, &project);
-        let bundle = resolve_effective_mandates(&config, Some(&project));
+        let bundle = resolve_effective_mandates_with_global_roots(&config, Some(&project), []);
 
         assert_eq!(bundle.sources.len(), 2);
         assert!(bundle.sources.iter().any(|s| s.text == "workspace rules"));
@@ -463,7 +485,7 @@ mod tests {
         let mut config = Config::default();
         config.workspace.paths = vec![temp.path().to_string_lossy().into_owned()];
 
-        let bundle = resolve_effective_mandates(&config, None);
+        let bundle = resolve_effective_mandates_with_global_roots(&config, None, []);
 
         assert!(bundle.sources.is_empty());
         assert!(bundle.project_override.is_none());
@@ -478,12 +500,33 @@ mod tests {
 
         let mut config = Config::default();
         config.workspace.paths = vec![temp.path().to_string_lossy().into_owned()];
-        let bundle = resolve_effective_mandates(&config, None);
+        let bundle = resolve_effective_mandates_with_global_roots(&config, None, []);
 
         let source = &bundle.sources[0];
         assert!(source.truncated);
         assert_eq!(source.text.len(), MANDATE_TEXT_LIMIT_BYTES);
         assert!(source.text.is_char_boundary(source.text.len()));
+    }
+
+    #[test]
+    fn resolves_global_sources_before_workspace_sources() {
+        let temp = tempdir().expect("tempdir");
+        let global = temp.path().join("global");
+        let workspace = temp.path().join("workspace");
+        std::fs::create_dir_all(&global).expect("create global");
+        std::fs::create_dir_all(&workspace).expect("create workspace");
+        std::fs::write(global.join("AGENTS.md"), "global rules").expect("write global agents");
+        std::fs::write(workspace.join("AGENTS.md"), "workspace rules").expect("write agents");
+
+        let mut config = Config::default();
+        config.workspace.paths = vec![workspace.to_string_lossy().into_owned()];
+        let bundle = resolve_effective_mandates_with_global_roots(&config, None, [global]);
+
+        assert_eq!(bundle.sources.len(), 2);
+        assert_eq!(bundle.sources[0].scope, "global");
+        assert_eq!(bundle.sources[0].text, "global rules");
+        assert_eq!(bundle.sources[1].scope, "workspace");
+        assert_eq!(bundle.sources[1].text, "workspace rules");
     }
 
     #[cfg(unix)]
@@ -500,7 +543,7 @@ mod tests {
 
         let mut config = Config::default();
         config.workspace.paths = vec![root.to_string_lossy().into_owned()];
-        let bundle = resolve_effective_mandates(&config, None);
+        let bundle = resolve_effective_mandates_with_global_roots(&config, None, []);
 
         assert!(bundle.sources.is_empty());
         assert_eq!(bundle.skipped_sources.len(), 1);

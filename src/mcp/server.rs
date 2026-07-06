@@ -182,6 +182,35 @@ pub(crate) fn extract_mcp_session_id(ctx: &RequestContext<RoleServer>) -> Option
         .map(|s| s.to_string())
 }
 
+tokio::task_local! {
+    /// Request-scoped MCP session id (the `mcp-session-id` header), installed
+    /// once per tool dispatch by `McpServer::call_tool` — the SAME seam that
+    /// installs the render context (`client_profile::with_render_ctx`). Read by
+    /// the handful of tool bodies that need the caller's session (e.g.
+    /// `experiment_open`'s cwd-based project inference) via
+    /// [`current_mcp_session`], WITHOUT threading a parameter through 300+ tool
+    /// signatures. Absent (⇒ `None`) on the CLI / stdio path, which carries no
+    /// session — a safe degradation, never an error.
+    static CURRENT_MCP_SESSION: Option<String>;
+}
+
+/// Run `fut` with `session` installed as the current request-scoped MCP session
+/// id. The MCP `call_tool` dispatch wraps the whole tool future in this so any
+/// body polled within (rmcp awaits handlers inline, never on a fresh task) can
+/// read it via [`current_mcp_session`].
+pub(crate) async fn with_mcp_session<F>(session: Option<String>, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    CURRENT_MCP_SESSION.scope(session, fut).await
+}
+
+/// The current request-scoped MCP session id, or `None` when none is installed
+/// (CLI dispatch, tests, or a body polled outside a scope).
+pub(crate) fn current_mcp_session() -> Option<String> {
+    CURRENT_MCP_SESSION.try_with(|s| s.clone()).ok().flatten()
+}
+
 /// Extract the connecting client's TCP peer address (source ip:port) from the
 /// streamable-HTTP transport. The daemon serves the router via
 /// `into_make_service_with_connect_info::<SocketAddr>()` (`src/cli/daemon.rs`),
@@ -1474,10 +1503,20 @@ impl ServerHandler for McpServer {
         let rc = crate::mcp::client_profile::RenderCtx::from_profile(
             self.ctx().client_profiles().for_client(&client),
         );
+        // Capture the caller's MCP session id BEFORE `context` is moved into the
+        // dispatch ctx, and install it as a request-scoped task-local alongside
+        // the render context so session-aware tool bodies (e.g.
+        // `experiment_open`'s cwd→project inference) can read it without a
+        // threaded parameter. Covers every path that reaches the router — direct
+        // tool calls AND the `call_tool` meta-tool's inner dispatch.
+        let mcp_session = extract_mcp_session_id(&context);
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        crate::mcp::client_profile::with_render_ctx(rc, self.tool_router.call(tcc))
-            .await
-            .map(|result| reencode_result_for_format(result, rc))
+        crate::mcp::client_profile::with_render_ctx(
+            rc,
+            with_mcp_session(mcp_session, self.tool_router.call(tcc)),
+        )
+        .await
+        .map(|result| reencode_result_for_format(result, rc))
     }
 
     async fn list_tools(

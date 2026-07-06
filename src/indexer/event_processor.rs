@@ -898,6 +898,10 @@ fn rescan_workspace(
 
     let walk_ok = walk_handle.join().is_ok();
 
+    // Files pruned as phantom rows this pass (the realtime index snapshot's
+    // `files_deleted`). Set inside the prune block below.
+    let mut phantom_deleted: u64 = 0;
+
     // Phantom-row prune (root-scoped, walk-success-gated). A path indexed under
     // THIS workspace that the just-completed walk did not yield is gone from disk
     // — a deletion or a content-changing rename that the live inotify path
@@ -921,6 +925,7 @@ fn rescan_workspace(
             let detected = stale_paths.len() as u64;
             match rt_handle.block_on(db.delete_files_batch(&stale_paths)) {
                 Ok(deleted) => {
+                    phantom_deleted = deleted;
                     info!(
                         workspace = %workspace_path_str,
                         detected,
@@ -992,6 +997,26 @@ fn rescan_workspace(
         bounded_skipped,
         "Re-scan complete"
     );
+
+    // Realtime event (topic=index): batch-level rollup for this workspace
+    // rescan — NEVER per file. `submitted` is the combined added+updated count
+    // (the rescan path does not distinguish the two); `phantom_deleted` is the
+    // pruned count; per-file chunk counts are embedded asynchronously downstream
+    // and so are not known here. Own-tx, best-effort, driven on the runtime the
+    // rest of this (sync) function already uses for its DB work.
+    if let Some(pool) = db.pool() {
+        rt_handle.block_on(crate::realtime::emit(
+            pool,
+            &crate::realtime::RealtimeEvent::index_snapshot(
+                &workspace_path_str,
+                total_scanned,
+                skipped,
+                submitted,
+                phantom_deleted,
+                bounded_skipped,
+            ),
+        ));
+    }
 }
 
 // `handle_file_event` and `processor::process_file` are no longer needed:

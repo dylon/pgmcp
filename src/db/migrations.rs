@@ -80,6 +80,11 @@ mod v60_crucible_trace;
 mod v61_subprocess_capture;
 mod v62_preload_source;
 mod v63_toolbox_wolfram;
+mod v64_realtime_events;
+mod v65_global_mandates;
+mod v66_webui_audit_log;
+mod v67_durable_mandates_operator;
+mod v68_experiment_audit_action;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
 mod v8_csm_protocols;
@@ -2094,7 +2099,7 @@ pub async fn run_migrations(
         pool,
         "durable_mandates",
         "durable_mandates_scope_check",
-        "CHECK (scope IN ('project','workspace'))",
+        "CHECK (scope IN ('global','project','workspace'))",
     )
     .await?;
 
@@ -2907,6 +2912,62 @@ pub async fn run_migrations(
         v63_toolbox_wolfram::TOOLBOX_WOLFRAM,
         v63_toolbox_wolfram::TOOLBOX_WOLFRAM_NAME,
         || v63_toolbox_wolfram::apply(pool),
+    )
+    .await?;
+
+    // Step 64 — transactional event log used by the local web UI websocket
+    // replay path. The table is append-only and xid-watermarked so clients do
+    // not skip still-uncommitted sequence gaps. See
+    // `src/db/migrations/v64_realtime_events.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v64_realtime_events::REALTIME_EVENTS_V1,
+        v64_realtime_events::REALTIME_EVENTS_V1_NAME,
+        || v64_realtime_events::apply(pool),
+    )
+    .await?;
+
+    // Step 65 — widen durable mandate scope to include global (`~/.claude`)
+    // policy. Existing installs need a stamped CHECK refresh; fresh installs
+    // already receive the widened base constraint above.
+    // ================================================================
+    apply_step(
+        pool,
+        v65_global_mandates::GLOBAL_MANDATES,
+        v65_global_mandates::GLOBAL_MANDATES_NAME,
+        || v65_global_mandates::apply(pool),
+    )
+    .await?;
+
+    // Step 66 — append-only audit trail for token-gated webui operator writes.
+    // Step 67 — durable_mandates operator provenance / soft-delete columns.
+    // ================================================================
+    apply_step(
+        pool,
+        v66_webui_audit_log::WEBUI_AUDIT_LOG,
+        v66_webui_audit_log::WEBUI_AUDIT_LOG_NAME,
+        || v66_webui_audit_log::apply(pool),
+    )
+    .await?;
+    apply_step(
+        pool,
+        v67_durable_mandates_operator::DURABLE_MANDATES_OPERATOR,
+        v67_durable_mandates_operator::DURABLE_MANDATES_OPERATOR_NAME,
+        || v67_durable_mandates_operator::apply(pool),
+    )
+    .await?;
+
+    // Step 68 — widen the webui_audit_log action CHECK to admit
+    // `experiment_update` (experiment↔project assignment). Existing installs
+    // that already recorded v66 need this stamped-CHECK refresh; fresh installs
+    // received the widened base constraint from v66's vocabulary build.
+    // ================================================================
+    apply_step(
+        pool,
+        v68_experiment_audit_action::EXPERIMENT_AUDIT_ACTION,
+        v68_experiment_audit_action::EXPERIMENT_AUDIT_ACTION_NAME,
+        || v68_experiment_audit_action::apply(pool),
     )
     .await?;
 

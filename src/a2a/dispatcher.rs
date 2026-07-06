@@ -622,6 +622,14 @@ async fn set_state(
     .execute(pool)
     .await
     .map_err(|e| format!("set_state: {}", e))?;
+    // Realtime event (topic=task): task-state transition. Own-tx, best-effort —
+    // a2a task rows are autocommitted per statement (no surrounding tx here), so
+    // there is no in-tx variant to join; a telemetry write must not fail the task.
+    crate::realtime::emit(
+        pool,
+        &crate::realtime::RealtimeEvent::task_upsert(task_id, new_state.as_db_str()),
+    )
+    .await;
     emit_event(
         state,
         task_id,

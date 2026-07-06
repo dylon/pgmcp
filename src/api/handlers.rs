@@ -3,13 +3,18 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use serde::{Deserialize, Serialize};
 
 use super::ApiState;
-use crate::db::queries::{StatusSnapshot, status_snapshot};
+use crate::db::queries::{
+    AcceptanceCriterionRow, BugDetailsRow, StatusSnapshot, TimelineRow, WorkItemFilter,
+    WorkItemRow, current_realtime_seq, fetch_bug_details, get_work_item_by_public_id,
+    get_work_item_subtree, list_acceptance_criteria, list_work_items, next_actionable_work_items,
+    resolve_project_id, status_snapshot, work_item_timeline,
+};
 
 // ============================================================================
 // GET /health — Cheap liveness probe (no DB queries, no model touch)
@@ -89,8 +94,8 @@ pub async fn grep(
     let limit = req.limit.unwrap_or(10).clamp(1, 50);
 
     // The /api/grep endpoint is consumed by ~/.claude/hooks/pgmcp-grep-companion.sh
-    // which doesn't currently expose dedupe; default false preserves
-    // existing behavior. The hook can opt in later via a query param.
+    // whose contract does not carry a dedupe flag. Keep this endpoint's default
+    // stable; callers that need deduplication use the richer search surfaces.
     let results = state
         .db
         .grep_search(&req.pattern, req.glob.as_deref(), limit, false)
@@ -107,14 +112,140 @@ pub async fn grep(
 }
 
 // ============================================================================
+// POST /api/query — Closed read/query surface for the web UI
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct QueryRequest {
+    pub mode: String,
+    #[serde(default)]
+    pub query: Option<String>,
+    #[serde(default)]
+    pub pattern: Option<String>,
+    #[serde(default)]
+    pub glob: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i32>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct QueryResponse {
+    pub mode: String,
+    pub data: serde_json::Value,
+}
+
+pub async fn query(
+    State(state): State<ApiState>,
+    Json(req): Json<QueryRequest>,
+) -> Result<Json<QueryResponse>, (StatusCode, String)> {
+    let mode = req.mode.trim().to_ascii_lowercase();
+    let limit = req.limit.unwrap_or(10).clamp(1, 100);
+    match mode.as_str() {
+        "semantic" | "search" => {
+            let query = req.query.ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "query mode requires `query`".to_string(),
+                )
+            })?;
+            let Json(response) = search(
+                State(state.clone()),
+                Json(SearchRequest {
+                    query,
+                    limit: Some(limit),
+                    project: req.project,
+                    language: req.language,
+                }),
+            )
+            .await?;
+            Ok(Json(QueryResponse {
+                mode,
+                data: serde_json::to_value(response).map_err(json_error)?,
+            }))
+        }
+        "text" | "fts" => {
+            let query = req.query.ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "text mode requires `query`".to_string(),
+                )
+            })?;
+            let results = state
+                .db
+                .text_search(
+                    &query,
+                    limit,
+                    req.language.as_deref(),
+                    req.project.as_deref(),
+                    false,
+                )
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("text_search failed: {}", e),
+                    )
+                })?;
+            Ok(Json(QueryResponse {
+                mode,
+                data: serde_json::json!({
+                    "results": results,
+                    "truncated": results.len() == limit as usize,
+                }),
+            }))
+        }
+        "grep" | "regex" => {
+            let pattern = req.pattern.or(req.query).ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    "grep mode requires `pattern` or `query`".to_string(),
+                )
+            })?;
+            let results = state
+                .db
+                .grep_search_chunks(
+                    &pattern,
+                    req.project.as_deref(),
+                    req.language.as_deref(),
+                    req.glob.as_deref(),
+                    false,
+                    limit,
+                    false,
+                )
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("grep_search_chunks failed: {}", e),
+                    )
+                })?;
+            Ok(Json(QueryResponse {
+                mode,
+                data: serde_json::json!({
+                    "results": results,
+                    "truncated": results.len() == limit as usize,
+                }),
+            }))
+        }
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "mode must be one of semantic, search, text, fts, grep, regex".to_string(),
+        )),
+    }
+}
+
+// ============================================================================
 // POST /api/file_envelope — File metadata for the read-context hook
 // ============================================================================
 
 /// Compact envelope returned to `~/.claude/hooks/pgmcp-read-context.sh`
 /// when the model is about to `Read` a file: language, line count,
-/// last_indexed_at. Future expansion will include centrality_rank,
-/// top_topics, top_coupled_files, and recent_commits — for now it returns
-/// what the trait already exposes via `file_info`.
+/// last_indexed_at. The response is intentionally the compact metadata already
+/// exposed by `file_info`, keeping the read-context hook deterministic and cheap.
 #[derive(Debug, Deserialize)]
 pub struct FileEnvelopeRequest {
     pub path: String,
@@ -171,9 +302,17 @@ pub struct SearchResponse {
 #[derive(Debug, Serialize)]
 pub struct SearchResultItem {
     pub file_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relative_path: Option<String>,
     pub chunk: String,
     pub similarity: f64,
     pub language: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_line: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<i32>,
 }
 
 pub async fn search(
@@ -466,9 +605,13 @@ pub async fn search(
         .filter_map(|&(i, score)| {
             results.get(i).map(|r| SearchResultItem {
                 file_path: r.path.clone(),
+                relative_path: Some(r.relative_path.clone()),
                 chunk: r.chunk_content.clone(),
                 similarity: score,
                 language: r.language.clone(),
+                project_name: Some(r.project_name.clone()),
+                start_line: Some(r.start_line),
+                end_line: Some(r.end_line),
             })
         })
         .collect();
@@ -566,10 +709,11 @@ pub async fn client_file_event(
 
     // DB up: emit into the reactive ingestion stream (ADR-022) as a thin
     // producer. The batched writer resolves project + indexed-file once per
-    // distinct path and performs the multi-row INSERT (~`ebpf_batch_ms` later) —
-    // the fire-and-forget hook does not wait on it. Identity is the Claude/Codex
-    // session UUID; `agent_id` distinguishes the agent behind `source='client_hook'`.
-    // A NULL project/file is fine downstream (unindexed/just-written file).
+    // distinct path and performs the multi-row INSERT after the configured
+    // `ebpf_batch_ms` window. The fire-and-forget hook does not wait on it.
+    // Identity is the Claude/Codex session UUID; `agent_id` distinguishes the
+    // agent behind `source='client_hook'`. A NULL project/file is fine downstream
+    // (unindexed/just-written file).
     let recorded = state.stats.emit_file_event(FileTouchEvent {
         source: FileEventSource::ClientHook,
         op,
@@ -1021,9 +1165,13 @@ pub async fn session_observe(
                 .into_iter()
                 .map(|r| SearchResultItem {
                     file_path: r.path,
+                    relative_path: Some(r.relative_path),
                     chunk: r.chunk_content,
                     similarity: r.score.unwrap_or(0.0),
                     language: r.language,
+                    project_name: Some(r.project_name),
+                    start_line: Some(r.start_line),
+                    end_line: Some(r.end_line),
                 })
                 .collect();
         }
@@ -1734,6 +1882,14 @@ pub async fn scanner_findings_ingest(
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("resolve: {e}")))?;
 
+    // Realtime event (topic=scanner): a findings batch landed. Own-tx,
+    // best-effort — the ingest response must not fail on a telemetry write.
+    crate::realtime::emit(
+        pool,
+        &crate::realtime::RealtimeEvent::scanner_append(&req.project, &req.scanner, stored, run_id),
+    )
+    .await;
+
     Ok(Json(serde_json::json!({
         "ok": true,
         "project_id": project_id,
@@ -1832,6 +1988,15 @@ async fn set_halted(
         if let Err(e) = crate::csm::trace_store::record_control(pool, &entry).await {
             tracing::error!(error = %e, "control-journal append failed (all-stop still applied)");
         }
+
+        // Realtime event (topic=control): fleet-wide halt/resume. Own-tx,
+        // best-effort — the all-stop is already applied above; a telemetry write
+        // must never fail it. `actor="rest"` mirrors the control-journal entry.
+        crate::realtime::emit(
+            pool,
+            &crate::realtime::RealtimeEvent::control(halt, reason, "rest"),
+        )
+        .await;
     }
     Ok(())
 }
@@ -2295,14 +2460,36 @@ struct WorkItemStatusTarget(crate::tracker::status::WorkItemStatus);
 pub struct MandatesQuery {
     pub project: Option<String>,
     pub cwd: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
+    #[serde(default)]
+    pub as_of_seq: Option<i64>,
+    /// Session UUID for the DB-backed session-mandate merge (scope ∈
+    /// {all, session}). Ignored when absent or unparseable.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct MandatesResponse {
     pub requested_project: Option<String>,
     pub requested_cwd: Option<String>,
+    pub requested_scope: Option<String>,
+    pub as_of_seq: Option<i64>,
+    pub server_seq: Option<i64>,
     pub found_project: bool,
     pub mandates: crate::mandates::MandateBundle,
+    /// DB-backed durable (promoted / operator-authored) mandates, retired rows
+    /// excluded — populated for scope ∈ {all, global, project, workspace}. The
+    /// file-backed `mandates` bundle (AGENTS.md/CLAUDE.md) never carries the
+    /// promoted-rule store, so the console merges it in here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub durable_mandates: Option<Vec<crate::db::queries::DurableMandateRow>>,
+    /// DB-backed active session mandates for `session_id` — populated for scope
+    /// ∈ {all, session}. Fixes `scope=session` previously returning empty (no
+    /// file-backed source is ever session-scoped).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_mandates: Option<Vec<crate::sessions::SessionMandate>>,
 }
 
 pub async fn mandates(
@@ -2323,14 +2510,576 @@ pub async fn mandates(
     })?;
 
     let config = state.config.load();
-    let bundle = crate::mandates::resolve_effective_mandates(&config, project.as_ref());
+    let mut bundle = crate::mandates::resolve_effective_mandates(&config, project.as_ref());
+    let requested_scope = params.scope.clone();
+    if let Some(scope) = params.scope.as_deref() {
+        filter_mandate_bundle_by_scope(&mut bundle, scope)?;
+    }
+    let server_seq = if let Some(pool) = state.db.pool() {
+        current_realtime_seq(pool).await.ok()
+    } else {
+        None
+    };
+
+    // DB-backed merge (ADR-034 admin console). The `bundle` above is file-backed
+    // (AGENTS.md/CLAUDE.md) only; it never carries the DB-backed durable
+    // (promoted / operator-authored) or session mandates. Surface those so the
+    // console's scope filter is complete — in particular `scope=session`, which
+    // previously returned empty because no file source is ever session-scoped.
+    // Read-only + best-effort: a query failure logs at error! (ADR-021) and
+    // degrades to the file bundle alone rather than failing the whole read.
+    let scope_norm = params
+        .scope
+        .as_deref()
+        .map(|s| s.trim().to_ascii_lowercase());
+    // (scope_filter, project_filter) for the durable read, or None to skip it.
+    let durable_filter: Option<(Option<&str>, Option<i32>)> = match scope_norm.as_deref() {
+        Some("all") => Some((None, None)),
+        Some("global") => Some((Some("global"), None)),
+        Some("workspace") => Some((Some("workspace"), None)),
+        Some("project") => Some((Some("project"), project.as_ref().map(|p| p.id))),
+        _ => None,
+    };
+    let mut durable_mandates = None;
+    let mut session_mandates = None;
+    if let Some(pool) = state.db.pool() {
+        if let Some((scope_filter, project_filter)) = durable_filter {
+            match crate::db::queries::list_active_durable_mandates(
+                pool,
+                scope_filter,
+                project_filter,
+            )
+            .await
+            {
+                Ok(rows) => durable_mandates = Some(rows),
+                Err(e) => {
+                    tracing::error!(error = %e, "GET /api/mandates: durable mandate merge failed")
+                }
+            }
+        }
+        if matches!(scope_norm.as_deref(), Some("all") | Some("session"))
+            && let Some(sid) = params
+                .session_id
+                .as_deref()
+                .and_then(|s| uuid::Uuid::parse_str(s.trim()).ok())
+        {
+            match crate::sessions::list_active_mandates(pool, Some(sid), params.cwd.as_deref(), 100)
+                .await
+            {
+                Ok(rows) => session_mandates = Some(rows),
+                Err(e) => {
+                    tracing::error!(error = %e, "GET /api/mandates: session mandate merge failed")
+                }
+            }
+        }
+    }
 
     Ok(Json(MandatesResponse {
         requested_project: params.project,
         requested_cwd: params.cwd,
+        requested_scope,
+        as_of_seq: params.as_of_seq,
+        server_seq,
         found_project: project.is_some(),
         mandates: bundle,
+        durable_mandates,
+        session_mandates,
     }))
+}
+
+// ============================================================================
+// GET /api/work_items?view=... — Read-only tracker smart views for the web UI
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct WorkItemsQuery {
+    #[serde(default)]
+    pub view: Option<String>,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub plan_public_id: Option<String>,
+    /// Optional cross-cutting filters (layered on top of the smart-view).
+    /// Validated against the closed `WorkItemKind` / `WorkItemStatus`
+    /// vocabularies (unknown => 400). `project` is a project *name*, resolved
+    /// to an id (unknown => 400). `parent_id` restricts to direct children of
+    /// a numeric item id.
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub parent_id: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkItemsResponse {
+    pub view: String,
+    pub count: usize,
+    pub server_seq: Option<i64>,
+    pub items: Vec<WorkItemRow>,
+}
+
+pub async fn work_items(
+    State(state): State<ApiState>,
+    Query(params): Query<WorkItemsQuery>,
+) -> Result<Json<WorkItemsResponse>, (StatusCode, String)> {
+    let pool = real_pool(&state, "work item smart views")?;
+    // Was a view explicitly requested? (`parse_work_items_view` defaults a
+    // missing/blank view to `next-actionable`; we need the raw bit to decide
+    // whether ad-hoc filters browse unconstrained or compose with a chosen view.)
+    let view_explicit = trimmed_non_empty(params.view.as_deref()).is_some();
+    let view = parse_work_items_view(params.view.as_deref())?;
+    let limit = params.limit.unwrap_or(25).clamp(1, 100);
+    let assignee = trimmed_non_empty(params.assignee.as_deref());
+    let server_seq = current_realtime_seq(pool).await.ok();
+
+    // Optional cross-cutting filters, validated against their closed
+    // vocabularies (unknown => 400) so the filter never binds a value the DB
+    // CHECK would reject. `kind`/`status` become the canonical `&'static str`
+    // from the enum (parse succeeds only on an exact match).
+    let kind = parse_work_item_kind_filter(params.kind.as_deref())?;
+    let status_filter = parse_work_item_status_filter(params.status.as_deref())?;
+    let project_id = resolve_work_items_project(pool, params.project.as_deref()).await?;
+    let parent_id = params.parent_id;
+    let has_extra_filter =
+        kind.is_some() || status_filter.is_some() || project_id.is_some() || parent_id.is_some();
+
+    // Plan scoping (`plan_public_id`) is only available on the dedicated
+    // next-actionable path, which cannot also apply the cross-cutting filters.
+    // Reject the ambiguous combinations — this preserves the pre-existing "only
+    // valid for next-actionable" rule and extends it to the with-filters case.
+    let plan_public_id = trimmed_non_empty(params.plan_public_id.as_deref());
+    if plan_public_id.is_some()
+        && (view != crate::tracker::views::SmartView::NextActionable || has_extra_filter)
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "plan_public_id is only valid for the next-actionable view without \
+             kind/status/project/parent_id filters"
+                .to_string(),
+        ));
+    }
+
+    let items = if view_explicit
+        && view == crate::tracker::views::SmartView::NextActionable
+        && !has_extra_filter
+    {
+        // Unchanged dedicated path: next-actionable, optionally plan-scoped.
+        // Requires an EXPLICIT view — an absent view param falls through to the
+        // unconstrained browse below (the webui "All" option omits `view`).
+        let plan_root_id = match plan_public_id {
+            Some(public_id) => Some(resolve_work_item_public_id(pool, public_id).await?),
+            None => None,
+        };
+        next_actionable_work_items(pool, plan_root_id, assignee, limit)
+            .await
+            .map_err(work_items_query_error)?
+    } else {
+        // Filter path. Base = the explicitly chosen smart-view's filter, or an
+        // unconstrained browse when no view was given (so an ad-hoc
+        // `?status=verified` is not silently emptied by the next-actionable
+        // default). Explicit params then overwrite the view-derived fields.
+        let my_work_assignee = if view_explicit && view == crate::tracker::views::SmartView::MyWork
+        {
+            Some(assignee.unwrap_or("cli").to_string())
+        } else {
+            None
+        };
+        let mut filter = if view_explicit {
+            work_items_view_filter(view, my_work_assignee.as_deref(), limit)
+        } else {
+            WorkItemFilter {
+                limit,
+                ..Default::default()
+            }
+        };
+        // next-actionable (explicit but filter-routed) and the unconstrained
+        // browse both honor an `assignee` param; my-work already encoded it
+        // above; the other three views ignore it (unchanged behavior).
+        if filter.assignee.is_none()
+            && (!view_explicit || view == crate::tracker::views::SmartView::NextActionable)
+        {
+            filter.assignee = assignee;
+        }
+        if let Some(kind) = kind {
+            filter.kind = Some(kind);
+        }
+        if let Some(status) = status_filter {
+            filter.status = Some(status);
+        }
+        if let Some(project_id) = project_id {
+            filter.project_id = Some(project_id);
+        }
+        if let Some(parent_id) = parent_id {
+            filter.parent_id = Some(parent_id);
+        }
+        list_work_items(pool, &filter)
+            .await
+            .map_err(work_items_query_error)?
+    };
+
+    // Report the effective view: the chosen view, or `all` for an unconstrained
+    // ad-hoc filter browse (so the pane's summary line stays honest).
+    let view_label = if !view_explicit && has_extra_filter {
+        "all"
+    } else {
+        view.as_str()
+    };
+
+    Ok(Json(WorkItemsResponse {
+        view: view_label.to_string(),
+        count: items.len(),
+        server_seq,
+        items,
+    }))
+}
+
+fn parse_work_items_view(
+    raw: Option<&str>,
+) -> Result<crate::tracker::views::SmartView, (StatusCode, String)> {
+    let raw = raw
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(crate::tracker::views::SmartView::NextActionable.as_str());
+    crate::tracker::views::SmartView::parse(raw).ok_or_else(|| {
+        let allowed = crate::tracker::views::SmartView::ALL
+            .iter()
+            .map(|view| view.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        (
+            StatusCode::BAD_REQUEST,
+            format!("view must be one of {allowed}"),
+        )
+    })
+}
+
+fn trimmed_non_empty(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+async fn resolve_work_item_public_id(
+    pool: &sqlx::PgPool,
+    public_id: &str,
+) -> Result<i64, (StatusCode, String)> {
+    get_work_item_by_public_id(pool, public_id)
+        .await
+        .map_err(work_items_query_error)?
+        .map(|row| row.id)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("unknown plan_public_id '{public_id}'"),
+            )
+        })
+}
+
+fn work_items_view_filter<'a>(
+    view: crate::tracker::views::SmartView,
+    assignee: Option<&'a str>,
+    limit: i64,
+) -> WorkItemFilter<'a> {
+    match view {
+        crate::tracker::views::SmartView::MyWork => WorkItemFilter {
+            assignee,
+            limit,
+            ..Default::default()
+        },
+        crate::tracker::views::SmartView::NeedsTriage => WorkItemFilter {
+            needs_triage: true,
+            limit,
+            ..Default::default()
+        },
+        crate::tracker::views::SmartView::Overdue => WorkItemFilter {
+            overdue: true,
+            limit,
+            ..Default::default()
+        },
+        crate::tracker::views::SmartView::Blocked => WorkItemFilter {
+            status: Some("blocked"),
+            limit,
+            ..Default::default()
+        },
+        crate::tracker::views::SmartView::NextActionable => WorkItemFilter {
+            next_actionable: true,
+            limit,
+            ..Default::default()
+        },
+    }
+}
+
+fn work_items_query_error(e: sqlx::Error) -> (StatusCode, String) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("work item query failed: {e}"),
+    )
+}
+
+/// Validate an optional `kind` filter against the closed [`WorkItemKind`]
+/// vocabulary, returning the canonical `&'static str` (or `None` when
+/// absent/blank). An unknown kind is a `400` listing the accepted values.
+///
+/// [`WorkItemKind`]: crate::tracker::kind::WorkItemKind
+fn parse_work_item_kind_filter(
+    raw: Option<&str>,
+) -> Result<Option<&'static str>, (StatusCode, String)> {
+    match trimmed_non_empty(raw) {
+        None => Ok(None),
+        Some(k) => crate::tracker::kind::WorkItemKind::parse(k)
+            .map(|kind| Some(kind.as_str()))
+            .ok_or_else(|| {
+                let allowed = crate::tracker::kind::WorkItemKind::ALL
+                    .iter()
+                    .map(|kind| kind.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown kind '{k}' (must be one of {allowed})"),
+                )
+            }),
+    }
+}
+
+/// Validate an optional `status` filter against the closed [`WorkItemStatus`]
+/// vocabulary. An unknown status is a `400` listing the accepted values.
+///
+/// [`WorkItemStatus`]: crate::tracker::status::WorkItemStatus
+fn parse_work_item_status_filter(
+    raw: Option<&str>,
+) -> Result<Option<&'static str>, (StatusCode, String)> {
+    match trimmed_non_empty(raw) {
+        None => Ok(None),
+        Some(s) => crate::tracker::status::WorkItemStatus::parse(s)
+            .map(|status| Some(status.as_str()))
+            .ok_or_else(|| {
+                let allowed = crate::tracker::status::WorkItemStatus::ALL
+                    .iter()
+                    .map(|status| status.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown status '{s}' (must be one of {allowed})"),
+                )
+            }),
+    }
+}
+
+/// Resolve an optional `project` name filter to its id. A supplied-but-unknown
+/// name is a `400` (rather than silently widening to every project — the
+/// `resolve_project_id` "unknown => None" convention would otherwise drop the
+/// filter). Absent/blank yields `None` (unconstrained).
+async fn resolve_work_items_project(
+    pool: &sqlx::PgPool,
+    raw: Option<&str>,
+) -> Result<Option<i32>, (StatusCode, String)> {
+    match trimmed_non_empty(raw) {
+        None => Ok(None),
+        Some(name) => match resolve_project_id(pool, Some(name))
+            .await
+            .map_err(work_items_query_error)?
+        {
+            Some(id) => Ok(Some(id)),
+            None => Err((StatusCode::BAD_REQUEST, format!("unknown project '{name}'"))),
+        },
+    }
+}
+
+/// Upper bound on timeline events returned by the work-item detail endpoint.
+/// `work_item_timeline` clamps to `[1, 1000]`; 200 keeps a rich-but-bounded feed.
+const WORK_ITEM_DETAIL_TIMELINE_LIMIT: i64 = 200;
+
+/// Default subtree row cap for the tree endpoint when `?limit=` is omitted.
+/// `get_work_item_subtree` clamps to `[1, 100_000]`; 1000 bounds the default
+/// payload while remaining ample for realistic plan hierarchies.
+const WORK_ITEM_TREE_DEFAULT_ROWS: i64 = 1000;
+
+/// Response for `GET /api/work_items/{public_id}` — the item spine composed with
+/// its timeline, acceptance criteria, and (for `kind='bug'` only) the bug-detail
+/// sidecar. `bug_details` is `null` for every non-bug kind.
+#[derive(Debug, Serialize)]
+pub struct WorkItemDetailResponse {
+    pub item: WorkItemRow,
+    pub timeline: Vec<TimelineRow>,
+    pub acceptance_criteria: Vec<AcceptanceCriterionRow>,
+    pub bug_details: Option<BugDetailsRow>,
+}
+
+/// `GET /api/work_items/{public_id}` — one item plus its composed detail feeds.
+/// 404 if no item carries that `public_id`. `pub(crate)`: only `daemon.rs` routes
+/// it, and it is not part of the library's public API.
+pub(crate) async fn work_item_detail(
+    State(state): State<ApiState>,
+    Path(public_id): Path<String>,
+) -> Result<Json<WorkItemDetailResponse>, (StatusCode, String)> {
+    let pool = real_pool(&state, "work item detail")?;
+    let public_id = public_id.trim();
+    if public_id.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "public_id must not be empty".to_string(),
+        ));
+    }
+    let item = get_work_item_by_public_id(pool, public_id)
+        .await
+        .map_err(work_items_query_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no work item '{public_id}'")))?;
+
+    let timeline = work_item_timeline(pool, item.id, WORK_ITEM_DETAIL_TIMELINE_LIMIT)
+        .await
+        .map_err(work_items_query_error)?;
+    let acceptance_criteria = list_acceptance_criteria(pool, item.id)
+        .await
+        .map_err(work_items_query_error)?;
+    // The bug-detail sidecar exists only for bugs; skip the probe for other kinds.
+    let bug_details = if item.kind.as_str() == crate::tracker::kind::WorkItemKind::Bug.as_str() {
+        fetch_bug_details(pool, item.id)
+            .await
+            .map_err(work_items_query_error)?
+    } else {
+        None
+    };
+
+    Ok(Json(WorkItemDetailResponse {
+        item,
+        timeline,
+        acceptance_criteria,
+        bug_details,
+    }))
+}
+
+/// Query for `GET /api/work_items/tree`.
+#[derive(Debug, Deserialize)]
+pub struct WorkItemTreeQuery {
+    /// The subtree root's `public_id`. Required — omitting it is a `400` (list
+    /// the top-level roots via `GET /api/work_items?kind=plan`).
+    #[serde(default)]
+    pub root: Option<String>,
+    /// Optional cap on returned rows (default `WORK_ITEM_TREE_DEFAULT_ROWS`,
+    /// clamped by the query to `[1, 100_000]`).
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+/// One node of the flattened subtree: every [`WorkItemRow`] field (via
+/// `#[serde(flatten)]`) plus its `depth` (0 at the root) and `path` (numeric ids
+/// from the root down to and including this node; `path.len() == depth + 1`).
+#[derive(Debug, Serialize)]
+pub struct WorkItemTreeNode {
+    #[serde(flatten)]
+    pub item: WorkItemRow,
+    pub depth: i32,
+    pub path: Vec<i64>,
+}
+
+/// Response for `GET /api/work_items/tree?root=<public_id>`.
+#[derive(Debug, Serialize)]
+pub struct WorkItemTreeResponse {
+    /// The resolved root `public_id` (echoed from the DB row).
+    pub root: String,
+    pub count: usize,
+    pub nodes: Vec<WorkItemTreeNode>,
+}
+
+/// `GET /api/work_items/tree?root=<public_id>` — the item's subtree, ordered by
+/// depth then priority, flattened with a derived `depth`/`path` per node for
+/// indentation and ancestry. `400` if `root` is omitted; `404` if it is unknown.
+/// `pub(crate)`: only `daemon.rs` routes it.
+pub(crate) async fn work_item_tree(
+    State(state): State<ApiState>,
+    Query(params): Query<WorkItemTreeQuery>,
+) -> Result<Json<WorkItemTreeResponse>, (StatusCode, String)> {
+    let pool = real_pool(&state, "work item tree")?;
+    let root = trimmed_non_empty(params.root.as_deref()).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            "tree requires a 'root' query parameter (a work-item public_id); \
+             list the top-level roots via GET /api/work_items?kind=plan"
+                .to_string(),
+        )
+    })?;
+    let max_rows = params
+        .limit
+        .unwrap_or(WORK_ITEM_TREE_DEFAULT_ROWS)
+        .clamp(1, 100_000);
+
+    let root_item = get_work_item_by_public_id(pool, root)
+        .await
+        .map_err(work_items_query_error)?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("no work item '{root}'")))?;
+
+    let rows = get_work_item_subtree(pool, root_item.id, max_rows)
+        .await
+        .map_err(work_items_query_error)?;
+
+    // Derive depth + root-path from the parent_id chain. `get_work_item_subtree`
+    // returns rows ordered by ascending depth, so a node's parent is always
+    // resolved before the node itself — a single O(n) forward pass. Sizes are
+    // known, so preallocate.
+    let mut depth_by_id: std::collections::HashMap<i64, i32> =
+        std::collections::HashMap::with_capacity(rows.len());
+    let mut path_by_id: std::collections::HashMap<i64, Vec<i64>> =
+        std::collections::HashMap::with_capacity(rows.len());
+    let mut nodes: Vec<WorkItemTreeNode> = Vec::with_capacity(rows.len());
+    for item in rows {
+        let (depth, path) = match item
+            .parent_id
+            .and_then(|pid| depth_by_id.get(&pid).copied().map(|depth| (pid, depth)))
+        {
+            Some((pid, parent_depth)) => {
+                let parent_path = path_by_id.get(&pid);
+                let mut path = Vec::with_capacity(parent_path.map_or(1, |p| p.len() + 1));
+                if let Some(p) = parent_path {
+                    path.extend_from_slice(p);
+                }
+                path.push(item.id);
+                (parent_depth + 1, path)
+            }
+            // The subtree root: its parent (if any) is outside the returned set.
+            None => (0, vec![item.id]),
+        };
+        depth_by_id.insert(item.id, depth);
+        path_by_id.insert(item.id, path.clone());
+        nodes.push(WorkItemTreeNode { item, depth, path });
+    }
+
+    Ok(Json(WorkItemTreeResponse {
+        root: root_item.public_id,
+        count: nodes.len(),
+        nodes,
+    }))
+}
+
+fn filter_mandate_bundle_by_scope(
+    bundle: &mut crate::mandates::MandateBundle,
+    scope: &str,
+) -> Result<(), (StatusCode, String)> {
+    let scope = scope.trim().to_ascii_lowercase();
+    if scope.is_empty() || scope == "all" {
+        return Ok(());
+    }
+    match scope.as_str() {
+        "global" | "workspace" | "project" | "session" => {
+            bundle.sources.retain(|source| source.scope == scope);
+            bundle
+                .skipped_sources
+                .retain(|source| source.scope == scope);
+            if scope != "project" {
+                bundle.project_override = None;
+            }
+            Ok(())
+        }
+        _ => Err((
+            StatusCode::BAD_REQUEST,
+            "scope must be one of all, global, workspace, project, session".to_string(),
+        )),
+    }
 }
 
 // ============================================================================
@@ -2360,6 +3109,9 @@ pub struct StatusResponse {
 #[derive(Debug, Serialize)]
 pub struct DaemonInfo {
     pub version: &'static str,
+    /// Lifecycle phase label (starting / scanning / ready / …) — the same value
+    /// `/health` reports, surfaced on the Overview status pane.
+    pub phase: &'static str,
     pub uptime_secs: u64,
     pub current_rss_bytes: u64,
     pub peak_rss_bytes: u64,
@@ -2478,6 +3230,7 @@ pub async fn status(
 
     let daemon = DaemonInfo {
         version: env!("CARGO_PKG_VERSION"),
+        phase: state.lifecycle.current().label(),
         uptime_secs: state.stats.uptime_start.elapsed().as_secs(),
         current_rss_bytes: state
             .stats
@@ -2567,4 +3320,200 @@ pub async fn status(
         model_state: snapshot,
         counters: state.stats.snapshot(),
     }))
+}
+
+// ============================================================================
+// GET /api/stats?kind=... — Web UI stats slices
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct StatsQuery {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+    #[serde(default)]
+    pub job: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
+    pub since_minutes: Option<i32>,
+    /// Clients view: include already-exited clients (default false → live only).
+    #[serde(default)]
+    pub include_exited: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StatsResponse {
+    pub kind: String,
+    pub server_seq: Option<i64>,
+    pub data: serde_json::Value,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow)]
+struct ToolTelemetryRollup {
+    tool: String,
+    calls: i64,
+    ok_count: i64,
+    error_count: i64,
+    avg_duration_ms: Option<f64>,
+    max_duration_ms: Option<i64>,
+    last_ts: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+pub async fn stats(
+    State(state): State<ApiState>,
+    Query(params): Query<StatsQuery>,
+) -> Result<Json<StatsResponse>, (StatusCode, String)> {
+    let kind = params
+        .kind
+        .unwrap_or_else(|| "status".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    let server_seq = if let Some(pool) = state.db.pool() {
+        current_realtime_seq(pool).await.ok()
+    } else {
+        None
+    };
+    let data = match kind.as_str() {
+        "counters" => state.stats.snapshot(),
+        "status" => {
+            let Json(response) = status(State(state.clone())).await?;
+            serde_json::to_value(response).map_err(json_error)?
+        }
+        "index" => {
+            let pool = real_pool(&state, "index stats")?;
+            let snapshot = status_snapshot(pool).await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("status_snapshot failed: {}", e),
+                )
+            })?;
+            let failures = state.db.failure_kind_counts().await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failure_kind_counts failed: {}", e),
+                )
+            })?;
+            serde_json::json!({
+                "project_count": snapshot.project_count,
+                "indexed_file_count": snapshot.indexed_file_count,
+                "chunk_count": snapshot.chunk_count,
+                "last_indexed_at": snapshot.last_indexed_at,
+                "per_project": snapshot.per_project,
+                "failure_kind_counts": failures,
+            })
+        }
+        "cron" => {
+            let pool = real_pool(&state, "cron stats")?;
+            let limit = params.limit.unwrap_or(50).clamp(1, 500);
+            let rollup = crate::db::queries::cron_job_rollup(pool)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("cron_job_rollup failed: {}", e),
+                    )
+                })?;
+            let recent = crate::db::queries::recent_cron_runs(pool, params.job.as_deref(), limit)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("recent_cron_runs failed: {}", e),
+                    )
+                })?;
+            serde_json::json!({ "rollup": rollup, "recent": recent })
+        }
+        "clients" => {
+            let pool = real_pool(&state, "client stats")?;
+            let since_minutes = params.since_minutes.unwrap_or(240).clamp(1, 10_080);
+            let active = crate::db::queries::active_clients(
+                pool,
+                params.project.as_deref(),
+                params.include_exited.unwrap_or(false),
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("active_clients failed: {}", e),
+                )
+            })?;
+            let matrix = crate::db::queries::client_project_matrix(
+                pool,
+                since_minutes,
+                params.project.as_deref(),
+            )
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("client_project_matrix failed: {}", e),
+                )
+            })?;
+            serde_json::json!({ "active": active, "project_matrix": matrix })
+        }
+        "telemetry" => {
+            let pool = real_pool(&state, "telemetry stats")?;
+            let limit = params.limit.unwrap_or(25).clamp(1, 100);
+            let since_minutes = params.since_minutes.unwrap_or(240).clamp(1, 10_080);
+            let rows = sqlx::query_as::<_, ToolTelemetryRollup>(
+                "SELECT tool,
+                        COUNT(*)::BIGINT AS calls,
+                        COUNT(*) FILTER (WHERE outcome = 'ok')::BIGINT AS ok_count,
+                        COUNT(*) FILTER (WHERE outcome <> 'ok')::BIGINT AS error_count,
+                        AVG(duration_ms)::float8 AS avg_duration_ms,
+                        MAX(duration_ms)::BIGINT AS max_duration_ms,
+                        MAX(ts) AS last_ts
+                   FROM mcp_tool_calls
+                  WHERE ts > now() - make_interval(mins => $1)
+                  GROUP BY tool
+                  ORDER BY calls DESC, tool
+                  LIMIT $2",
+            )
+            .bind(since_minutes)
+            .bind(limit)
+            .fetch_all(pool)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("telemetry rollup failed: {}", e),
+                )
+            })?;
+            serde_json::json!({ "tools": rows })
+        }
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "kind must be one of status, counters, index, cron, clients, telemetry".to_string(),
+            ));
+        }
+    };
+
+    Ok(Json(StatsResponse {
+        kind,
+        server_seq,
+        data,
+    }))
+}
+
+fn real_pool<'a>(
+    state: &'a ApiState,
+    surface: &str,
+) -> Result<&'a sqlx::PgPool, (StatusCode, String)> {
+    state.db.pool().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{surface} requires a real PgPool DbClient (mock unsupported)"),
+        )
+    })
+}
+
+fn json_error(e: serde_json::Error) -> (StatusCode, String) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("json serialization failed: {e}"),
+    )
 }

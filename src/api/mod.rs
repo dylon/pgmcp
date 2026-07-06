@@ -1,4 +1,17 @@
+pub mod audit;
+pub mod auth;
+pub mod db_browser;
+pub mod experiments;
 pub mod handlers;
+pub mod logs;
+pub mod mandates_write;
+pub mod metrics;
+/// Shared plumbing (writes kill-switch, pool accessor, audit IP, DB-error map)
+/// for the token-gated operator write surface. Private to `api`; the two write
+/// modules reach it via `super::operator`.
+mod operator;
+pub mod resources;
+pub mod work_items_write;
 
 use std::sync::Arc;
 

@@ -4,6 +4,7 @@ pub mod client_writer;
 pub mod inference;
 pub mod metrics;
 pub mod recorder;
+pub mod resources;
 #[allow(dead_code)]
 pub mod rss;
 pub mod telemetry_writer;

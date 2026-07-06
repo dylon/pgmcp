@@ -2,7 +2,7 @@
 # continuity; `pgmcp-testing` is a sibling member providing test fixtures
 # (mocks, factories) consumed via [dev-dependencies] below.
 [workspace]
-members = [".", "pgmcp-testing"]
+members = [".", "pgmcp-testing", "webui"]
 
 [package]
 name = "pgmcp"
@@ -179,6 +179,7 @@ bincode = "1"
 # Already a transitive dep via sqlx; promoted to direct so the DbClient trait
 # can use #[async_trait] on its method signatures.
 async-trait = "0.1"
+pgmcp-webui = { path = "webui" }
 
 # ── Sibling-crate path deps (integration plan
 #    `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`) ──
@@ -186,7 +187,7 @@ async-trait = "0.1"
 # These five crates live next to pgmcp under `/home/dylon/Workspace/f1r3fly.io/`.
 # All deps are non-feature-gated per pgmcp's `[features]`-free policy
 # (CLAUDE.md: "no cargo features on pgmcp"). The sibling crates' own
-# features are selected here at the dep site so future swaps stay surgical.
+# features are selected here at the dep site so backend swaps stay surgical.
 #
 # - `libdictenstein`: dictionary backends — DynamicDawg{Char,U64},
 #   DoubleArrayTrie{Char}, SuffixAutomaton{Char}, PathMapDictionary{Char},
@@ -231,11 +232,10 @@ lling-llang = { path = "../lling-llang", features = ["levenshtein", "lm-rerank",
 # pgmcp's `gnn_semantic_issues` MCP tool (Phase 8, 20 of 20)
 # ships ANYWAY: libgrammstein's `GnnSemanticScorer::detect_issues`
 # is a heuristic CPG walk under the plain `code` feature — the
-# `code-neural` flag gates a placeholder inference path that the
-# current upstream detector does not actually consume. Enabling
+# `code-neural` flag gates an experimental inference path that the
+# current upstream detector does not consume. Enabling
 # `code-neural` therefore only adds version-skew exposure without
-# adding capability. Re-evaluate when libgrammstein bumps to
-# ndarray 0.17 or the ort-side detector ships.
+# adding capability.
 libgrammstein = { path = "../libgrammstein", features = ["mimalloc-alloc", "lling-llang-integration", "wfst-export", "serde-extras", "rag", "rag-hnsw", "neural-rescore", "candle-model", "subword", "code", "code-python", "code-rust", "code-javascript", "code-rholang", "code-metta"] }
 llammer-pipeline = { path = "../llammer-pipeline", features = ["phonetic-rescore"] }
 # In-process LaTeX parser. Replaces the `pandoc` subprocess for `.tex`: pgmcp
@@ -276,6 +276,7 @@ whatlang = "0.16"
 # ~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md
 # Phase 11.
 mimalloc = "0.1"
+nvml-wrapper = "0.12.1"
 
 [dev-dependencies]
 proptest = "1"

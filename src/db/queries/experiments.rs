@@ -1367,6 +1367,82 @@ pub async fn get_experiment_core(
     .await
 }
 
+/// The mutable-assignment projection of an experiment used by the operator
+/// `PATCH /api/experiments/{slug}` write path: the join key + the three fields
+/// the console can edit (project / status / title). `project` is the joined
+/// `projects.name` (for display), `project_id` the raw FK (for the picker).
+#[derive(Debug, Clone, sqlx::FromRow, serde::Serialize)]
+pub struct ExperimentAssignmentRow {
+    pub id: i64,
+    pub slug: String,
+    pub title: String,
+    pub status: String,
+    pub project_id: Option<i32>,
+    pub project: Option<String>,
+}
+
+/// Lock + read the current (`valid_to IS NULL`) experiment version by slug for
+/// an operator assignment write, returning its editable projection (or `None`
+/// when the slug is unknown). `FOR UPDATE OF e` locks only the `experiments`
+/// row (the left-joined `projects` side cannot be locked) so a concurrent
+/// operator edit serializes behind this one.
+pub async fn get_experiment_assignment_for_update_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    slug: &str,
+) -> Result<Option<ExperimentAssignmentRow>, sqlx::Error> {
+    sqlx::query_as::<_, ExperimentAssignmentRow>(
+        "SELECT e.id, e.slug, e.title, e.status::text AS status, e.project_id, p.name AS project
+         FROM experiments e
+         LEFT JOIN projects p ON p.id = e.project_id
+         WHERE e.slug = $1 AND e.valid_to IS NULL
+         ORDER BY e.id DESC
+         LIMIT 1
+         FOR UPDATE OF e",
+    )
+    .bind(slug)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
+/// Apply an operator assignment edit to the current experiment version and
+/// return its updated projection. Each field is independently optional:
+///
+/// - `project_touched=false` leaves `project_id` unchanged; `project_touched=
+///   true` SETS it to `project_id` (which may be `None` to CLEAR — a plain
+///   COALESCE cannot express "set to NULL", hence the explicit boolean flag).
+/// - `status` / `title` use COALESCE, so `None` leaves them unchanged (both are
+///   NOT NULL columns, so there is no "clear" case for them).
+///
+/// The `project` name in the returned row is resolved via a correlated
+/// subquery against the post-update `project_id`, so a single statement yields
+/// the canonical joined view.
+pub async fn update_experiment_assignment_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    id: i64,
+    project_touched: bool,
+    project_id: Option<i32>,
+    status: Option<&str>,
+    title: Option<&str>,
+) -> Result<Option<ExperimentAssignmentRow>, sqlx::Error> {
+    sqlx::query_as::<_, ExperimentAssignmentRow>(
+        "UPDATE experiments e SET
+             project_id = CASE WHEN $2 THEN $3 ELSE e.project_id END,
+             status     = COALESCE($4, e.status),
+             title      = COALESCE($5, e.title),
+             updated_at = NOW()
+         WHERE e.id = $1 AND e.valid_to IS NULL
+         RETURNING e.id, e.slug, e.title, e.status::text AS status, e.project_id,
+                   (SELECT p.name FROM projects p WHERE p.id = e.project_id) AS project",
+    )
+    .bind(id)
+    .bind(project_touched)
+    .bind(project_id)
+    .bind(status)
+    .bind(title)
+    .fetch_optional(&mut **tx)
+    .await
+}
+
 /// A decision row for `experiment_get`.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct ExperimentResultRow {
@@ -1549,5 +1625,118 @@ pub async fn insert_experiment_artifact(
     .bind(embedding)
     .bind(git_ref)
     .fetch_one(pool)
+    .await
+}
+
+// ============================================================================
+// Web UI read models (the Experiments pane — `src/api/experiments.rs`)
+//
+// Read-only projections consumed by the daemon's REST surface. `list_experiments`
+// (above) filters by numeric `project_id`; the web UI filters by human-readable
+// project NAME, so `list_experiments_webui` joins `projects` and matches
+// `p.name` — an unknown name yields an EMPTY list rather than the unfiltered set
+// (which is what resolving name→id then passing `None` would wrongly produce).
+// It also rolls up the first hypothesis statement and the latest decision so a
+// list row is self-describing without an N+1 fan-out. `list_experiment_artifacts`
+// is the artifact reader the pane's detail view needs (only `insert_*` existed).
+// ============================================================================
+
+/// A row for the web UI Experiments list — richer than [`ExperimentListRow`]:
+/// it carries the headline hypothesis plus the latest-decision rollup so the
+/// list is self-describing. `verdict`/`p_value`/`decided_at` are `NULL` while an
+/// experiment is still open (no decision recorded).
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct ExperimentWebuiListRow {
+    pub id: i64,
+    pub slug: String,
+    pub title: String,
+    pub kind: String,
+    pub status: String,
+    pub project: Option<String>,
+    /// First (lowest-id) active hypothesis statement, if any.
+    pub hypothesis: Option<String>,
+    /// Latest decision's verdict, else the first hypothesis's standing verdict.
+    pub verdict: Option<String>,
+    /// p-value of the latest decision, if one has been recorded.
+    pub p_value: Option<f64>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    /// Timestamp of the latest decision (`NULL` while the experiment is open).
+    pub decided_at: Option<DateTime<Utc>>,
+}
+
+/// Web UI Experiments list: active experiments filtered by project NAME and/or
+/// status, newest-updated first. `project_name = None` ⇒ all projects; a name
+/// matching no project yields an empty result (not the unfiltered set). `status`
+/// is compared against `experiments.status::text` (the closed vocabulary).
+pub async fn list_experiments_webui(
+    pool: &PgPool,
+    project_name: Option<&str>,
+    status: Option<&str>,
+    limit: i64,
+) -> Result<Vec<ExperimentWebuiListRow>, sqlx::Error> {
+    sqlx::query_as::<_, ExperimentWebuiListRow>(
+        "SELECT e.id, e.slug, e.title, e.kind::text AS kind, e.status::text AS status,
+                p.name AS project,
+                (SELECT h.statement FROM experiment_hypotheses h
+                  WHERE h.experiment_id = e.id AND h.valid_to IS NULL
+                  ORDER BY h.id LIMIT 1) AS hypothesis,
+                COALESCE(
+                  (SELECT r.verdict::text FROM experiment_results r
+                    WHERE r.experiment_id = e.id ORDER BY r.id DESC LIMIT 1),
+                  (SELECT h.verdict::text FROM experiment_hypotheses h
+                    WHERE h.experiment_id = e.id AND h.valid_to IS NULL
+                    ORDER BY h.id LIMIT 1)
+                ) AS verdict,
+                (SELECT r.p_value FROM experiment_results r
+                  WHERE r.experiment_id = e.id ORDER BY r.id DESC LIMIT 1) AS p_value,
+                e.created_at, e.updated_at,
+                (SELECT r.created_at FROM experiment_results r
+                  WHERE r.experiment_id = e.id ORDER BY r.id DESC LIMIT 1) AS decided_at
+         FROM experiments e
+         LEFT JOIN projects p ON p.id = e.project_id
+         WHERE e.valid_to IS NULL
+           AND ($1::text IS NULL OR p.name = $1)
+           AND ($2::text IS NULL OR e.status::text = $2)
+         ORDER BY e.updated_at DESC
+         LIMIT $3",
+    )
+    .bind(project_name)
+    .bind(status)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+}
+
+/// An `experiment_artifacts` row for the web UI. The embedding vector and the
+/// FTS-only columns are omitted; `metrics` is the artifact's JSONB blob.
+#[derive(Debug, Clone, serde::Serialize, sqlx::FromRow)]
+pub struct ExperimentArtifactRow {
+    pub id: i64,
+    pub kind: String,
+    pub tool: Option<String>,
+    pub label: Option<String>,
+    pub content: Option<String>,
+    pub content_sha256: Option<String>,
+    pub metrics: serde_json::Value,
+    pub git_ref: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// All artifacts attached to a specific experiment, newest first. Free-standing
+/// captures (`experiment_id IS NULL`) are intentionally excluded — this backs
+/// the per-experiment detail view.
+pub async fn list_experiment_artifacts(
+    pool: &PgPool,
+    experiment_id: i64,
+) -> Result<Vec<ExperimentArtifactRow>, sqlx::Error> {
+    sqlx::query_as::<_, ExperimentArtifactRow>(
+        "SELECT id, kind, tool, label, content, content_sha256, metrics, git_ref, created_at
+         FROM experiment_artifacts
+         WHERE experiment_id = $1
+         ORDER BY created_at DESC, id DESC",
+    )
+    .bind(experiment_id)
+    .fetch_all(pool)
     .await
 }

@@ -140,6 +140,52 @@ fn is_loopback_host(host: &str) -> bool {
         || host.eq_ignore_ascii_case("ip6-localhost")
 }
 
+fn http_origin(host: &str, port: u16) -> String {
+    let host = host.trim();
+    if host.starts_with('[') || !host.contains(':') {
+        format!("http://{host}:{port}")
+    } else {
+        format!("http://[{host}]:{port}")
+    }
+}
+
+pub(crate) fn default_webui_origins(config: &Config) -> Vec<String> {
+    if !config.webui.allowed_origins.is_empty() {
+        return config.webui.allowed_origins.clone();
+    }
+    let port = config.mcp.port;
+    let host = config.mcp.host.trim();
+    let mut origins = Vec::new();
+    let mut push = |origin: String| {
+        if !origins.contains(&origin) {
+            origins.push(origin);
+        }
+    };
+    if is_loopback_host(host) {
+        push(format!("http://127.0.0.1:{port}"));
+        push(format!("http://localhost:{port}"));
+        push(format!("http://[::1]:{port}"));
+        if host != "127.0.0.1" && host != "localhost" && host != "::1" {
+            push(http_origin(host, port));
+        }
+    } else {
+        push(http_origin(host, port));
+    }
+    origins
+}
+
+fn webui_options_from_config(config: &Config) -> pgmcp_webui::WebuiOptions {
+    pgmcp_webui::WebuiOptions {
+        token: config.webui.token.clone().filter(|s| !s.is_empty()),
+        allowed_origins: default_webui_origins(config),
+        heartbeat_secs: config.webui.heartbeat_secs,
+        replay_page: config.webui.replay_page,
+        max_msgs_per_sec: config.webui.max_msgs_per_sec,
+        max_connections: config.webui.max_connections,
+        handshake_rate_per_min: config.webui.handshake_rate_per_min,
+    }
+}
+
 async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> anyhow::Result<()> {
     let shutdown = ShutdownCoordinator::new();
     let lifecycle = daemon_state::DaemonLifecycle::new();
@@ -325,6 +371,24 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         Arc::clone(&stats_tracker),
         shutdown.terminating_flag(),
         500,
+    );
+
+    // 5c. Start the webui resource sampler (per-core CPU, system memory, GPU via
+    // NVML, and this process's RSS/threads). Feeds the gated /api/resources
+    // read; O(1) snapshot so the request path never touches /proc or NVML.
+    let resource_sampler_handle = stats::resources::spawn_resource_sampler(
+        Arc::clone(&stats_tracker),
+        shutdown.terminating_flag(),
+        config_snapshot
+            .webui
+            .resource_sample_secs
+            .saturating_mul(1000),
+        // topic=status realtime snapshots: the sampler is a sync std::thread, so
+        // it emits fire-and-forget onto this runtime via the emitter handle.
+        Some(crate::realtime::RealtimeEmitter::new(
+            db_pool.clone(),
+            tokio::runtime::Handle::current(),
+        )),
     );
 
     // 4. Initialize embedding pool
@@ -1432,13 +1496,97 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             outbox: outbox.clone(),
         };
 
-        let router = axum::Router::new()
+        // Webui-consumed reads are token + origin gated (ADR-034 admin-console
+        // amendment; see `src/api/auth.rs`). They live on a dedicated sub-router
+        // so the auth layer wraps ONLY these routes — the producer / CI / A2A /
+        // control routes below keep their own credentials and must not require
+        // the webui token, or the UserPromptSubmit / CI hooks would break.
+        let webui_api = axum::Router::new()
+            .route("/api/query", axum::routing::post(api::handlers::query))
+            .route(
+                "/api/resources",
+                axum::routing::get(api::resources::resources),
+            )
+            .route("/api/metrics", axum::routing::get(api::metrics::metrics))
+            .route(
+                "/api/experiments",
+                axum::routing::get(api::experiments::experiments_list),
+            )
+            .route(
+                "/api/experiments/{slug}",
+                axum::routing::get(api::experiments::experiment_get)
+                    .patch(api::experiments::experiment_update),
+            )
+            .route(
+                "/api/experiments/{slug}/ledger",
+                axum::routing::get(api::experiments::experiment_ledger),
+            )
+            .route("/api/logs/tail", axum::routing::get(api::logs::tail))
+            .route("/api/logs/grep", axum::routing::get(api::logs::grep))
+            .route(
+                "/api/db/tables",
+                axum::routing::get(api::db_browser::tables),
+            )
+            .route("/api/db/rows", axum::routing::get(api::db_browser::rows))
+            .route("/api/mandates", axum::routing::get(api::handlers::mandates))
+            .route(
+                "/api/work_items",
+                axum::routing::get(api::handlers::work_items),
+            )
+            .route("/api/status", axum::routing::get(api::handlers::status))
+            .route("/api/stats", axum::routing::get(api::handlers::stats))
+            // Operator WRITE surface (ADR-034 admin-console amendment). Gated by
+            // the same require_webui_auth token+origin layer below; each handler
+            // additionally honors the [webui] writes_enabled kill-switch and
+            // commits a webui_audit_log row in the mutation's own transaction.
+            .route(
+                "/api/mandates/durable",
+                axum::routing::post(api::mandates_write::create_durable_mandate),
+            )
+            .route(
+                "/api/mandates/durable/{id}",
+                axum::routing::patch(api::mandates_write::update_durable_mandate),
+            )
+            .route(
+                "/api/mandates/durable/{id}/retire",
+                axum::routing::post(api::mandates_write::retire_durable_mandate),
+            )
+            .route(
+                "/api/mandates/promote",
+                axum::routing::post(api::mandates_write::promote_mandate),
+            )
+            .route(
+                "/api/work_items/{public_id}/transition",
+                axum::routing::post(api::work_items_write::transition_work_item),
+            )
+            .route(
+                "/api/work_items/{public_id}/triage",
+                axum::routing::post(api::work_items_write::triage_work_item),
+            )
+            .route(
+                "/api/work_items/{public_id}/confirm",
+                axum::routing::post(api::work_items_write::confirm_work_item),
+            )
+            .route(
+                "/api/work_items/tree",
+                axum::routing::get(api::handlers::work_item_tree),
+            )
+            .route(
+                "/api/work_items/{public_id}",
+                axum::routing::get(api::handlers::work_item_detail)
+                    .patch(api::work_items_write::patch_work_item),
+            )
+            .route_layer(axum::middleware::from_fn_with_state(
+                api_state.clone(),
+                api::auth::require_webui_auth,
+            ))
+            .with_state(api_state.clone());
+
+        let mut router = axum::Router::new()
             .nest_service("/mcp", mcp_service)
             .route("/health", axum::routing::get(api::handlers::health))
             .route("/api/search", axum::routing::post(api::handlers::search))
             .route("/api/context", axum::routing::get(api::handlers::context))
-            .route("/api/mandates", axum::routing::get(api::handlers::mandates))
-            .route("/api/status", axum::routing::get(api::handlers::status))
             .route("/api/grep", axum::routing::post(api::handlers::grep))
             .route(
                 "/api/file_envelope",
@@ -1493,7 +1641,48 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
                 axum::routing::post(api::handlers::control_resume),
             )
             .merge(crate::a2a::a2a_router())
-            .with_state(api_state);
+            .with_state(api_state.clone())
+            .merge(webui_api);
+
+        if config_snapshot.webui.enabled {
+            let webui_pool = if let Some(url) = config_snapshot
+                .webui
+                .ro_database_url
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+            {
+                match sqlx::postgres::PgPoolOptions::new()
+                    .max_connections(2)
+                    .connect(url)
+                    .await
+                {
+                    Ok(pool) => Some(pool),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            "webui disabled: failed to connect [webui].ro_database_url"
+                        );
+                        None
+                    }
+                }
+            } else {
+                system_ctx.db().pool().cloned()
+            };
+            if let Some(pool) = webui_pool {
+                let options = webui_options_from_config(&config_snapshot);
+                tracing::info!(
+                    origins = ?options.allowed_origins,
+                    token_required = options.token.is_some(),
+                    "webui enabled at /webui"
+                );
+                router = router.merge(pgmcp_webui::router(pgmcp_webui::WebuiState::new(
+                    pool, options,
+                )));
+            } else {
+                tracing::warn!("webui disabled: DbClient has no PgPool");
+            }
+        }
+
         let tcp_listener = tokio::net::TcpListener::bind(&bind_addr)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to bind MCP server to {}: {}", bind_addr, e))?;
@@ -1671,6 +1860,13 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         Err(_) => tracing::warn!("Peak-RSS sampler did not stop within 5s"),
     }
 
+    // Join resource sampler thread (5s timeout)
+    match shutdown::join_with_timeout(resource_sampler_handle, component_timeout) {
+        Ok(Ok(())) => info!("Resource sampler stopped"),
+        Ok(Err(e)) => tracing::error!("Resource sampler panicked: {:?}", e),
+        Err(_) => tracing::warn!("Resource sampler did not stop within 5s"),
+    }
+
     // Drain embedding pool (5s timeout per worker)
     let embed_handles = embed_pool.shutdown_take_handles();
     let embed_count = embed_handles.len();
@@ -1762,7 +1958,8 @@ fn preflight_document_tools() {
 
 #[cfg(test)]
 mod is_loopback_host_tests {
-    use super::is_loopback_host;
+    use super::{default_webui_origins, http_origin, is_loopback_host, webui_options_from_config};
+    use crate::config::Config;
 
     #[test]
     fn loopback_hosts_are_recognized() {
@@ -1789,5 +1986,68 @@ mod is_loopback_host_tests {
         ] {
             assert!(!is_loopback_host(h), "{h} should NOT be loopback");
         }
+    }
+
+    #[test]
+    fn default_webui_origins_cover_loopback_browser_aliases() {
+        let mut config = Config::default();
+        config.mcp.host = "127.0.0.1".to_string();
+        config.mcp.port = 43100;
+
+        assert_eq!(
+            default_webui_origins(&config),
+            vec![
+                "http://127.0.0.1:43100".to_string(),
+                "http://localhost:43100".to_string(),
+                "http://[::1]:43100".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn default_webui_origins_bracket_ipv6_bind_hosts() {
+        let mut config = Config::default();
+        config.mcp.host = "2001:db8::10".to_string();
+        config.mcp.port = 43100;
+
+        assert_eq!(
+            default_webui_origins(&config),
+            vec!["http://[2001:db8::10]:43100".to_string()]
+        );
+    }
+
+    #[test]
+    fn http_origin_preserves_already_bracketed_ipv6_hosts() {
+        assert_eq!(
+            http_origin("[2001:db8::10]", 43100),
+            "http://[2001:db8::10]:43100"
+        );
+    }
+
+    #[test]
+    fn configured_webui_origins_override_derived_origins() {
+        let mut config = Config::default();
+        config.webui.allowed_origins = vec!["https://console.example".to_string()];
+
+        assert_eq!(
+            default_webui_origins(&config),
+            vec!["https://console.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn webui_options_filter_empty_token_and_use_derived_origins() {
+        let mut config = Config::default();
+        config.mcp.port = 43101;
+        config.webui.token = Some(String::new());
+
+        let options = webui_options_from_config(&config);
+
+        assert_eq!(options.token, None);
+        assert!(
+            options
+                .allowed_origins
+                .contains(&"http://127.0.0.1:43101".to_string())
+        );
     }
 }

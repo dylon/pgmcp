@@ -11,6 +11,9 @@
 # crate root polluting the repo.
 node_modules/
 package-lock.json
+!webui/package-lock.json
+webui/.shadow-cljs/
+webui/resources/cljs/
 
 # Rocq compilation artifacts (P13.5). The proof source
 # (`docs/formal/rocq/*.v`) is committed; `coqc` outputs (`*.vo`,
@@ -31,3 +34,7 @@ docs/formal/**/*.thy
 docs/formal/**/.*.aux
 
 .pgmcp.toml
+
+# Python bytecode cache (scripts/*.py — e.g. the webui render smoke test)
+__pycache__/
+*.pyc

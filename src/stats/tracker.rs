@@ -826,6 +826,11 @@ pub struct StatsTracker {
     /// watched filesystem crosses the alert threshold; surfaced in
     /// `/api/status`. `None` until the first alert. Lock-free (`ArcSwapOption`).
     disk_report: ArcSwapOption<crate::health::disk_report::DiskReport>,
+    /// Latest system + process resource snapshot from the webui resource
+    /// sampler (`crate::stats::resources`). `None` until the first sample.
+    /// Lock-free (`ArcSwapOption`); read by `/api/resources` and
+    /// `stats?kind=resources`.
+    resources: ArcSwapOption<crate::stats::resources::ResourceSnapshot>,
     /// Live used-% of the worst watched filesystem, written every watchdog poll
     /// (encoded via `f64::to_bits`; `NaN` until the first poll). The cheap
     /// headline that always matches `df` — independent of the throttled, more
@@ -1122,6 +1127,7 @@ impl StatsTracker {
             db_health: Arc::new(DbHealth::new()),
             disk_pressure: Arc::new(DiskPressure::new()),
             disk_report: ArcSwapOption::empty(),
+            resources: ArcSwapOption::empty(),
             disk_used_pct_bits: AtomicU64::new(f64::NAN.to_bits()),
         }
     }
@@ -1294,6 +1300,14 @@ impl StatsTracker {
     /// The latest disk-pressure consumer breakdown, if one has been emitted.
     pub fn disk_report(&self) -> Option<Arc<crate::health::disk_report::DiskReport>> {
         self.disk_report.load_full()
+    }
+
+    pub fn set_resources(&self, snapshot: crate::stats::resources::ResourceSnapshot) {
+        self.resources.store(Some(Arc::new(snapshot)));
+    }
+
+    pub fn resources(&self) -> Option<Arc<crate::stats::resources::ResourceSnapshot>> {
+        self.resources.load_full()
     }
 
     /// Store the live used-% of the worst watched filesystem (watchdog → every

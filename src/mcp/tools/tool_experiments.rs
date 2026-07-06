@@ -202,6 +202,57 @@ async fn validate_project_id(
     }
 }
 
+/// Infer the owning project when `experiment_open` is called without an explicit
+/// `project_id`:
+///
+/// 1. an explicit `project` NAME (resolved via [`queries::resolve_project_id`]),
+///    else
+/// 2. the caller's cwd — looked up from `mcp_clients` by the request-scoped MCP
+///    session id ([`crate::mcp::server::current_mcp_session`]) — resolved to the
+///    most-specific enclosing project via [`queries::resolve_project_by_path`].
+///
+/// Best-effort by design: any miss (no name / unknown name, no session, cwd
+/// outside every project root) yields `None` — a workspace-general experiment,
+/// exactly as before this inference existed — so it NEVER fails the open. A real
+/// DB fault is logged at `error!` (ADR-021: a swallowed error behind a degraded
+/// fallback) but still degrades to `None` rather than aborting the open.
+async fn infer_open_project_id(pool: &sqlx::PgPool, project_name: Option<&str>) -> Option<i32> {
+    // (1) Explicit project NAME wins over cwd inference.
+    if let Some(name) = project_name.map(str::trim).filter(|s| !s.is_empty()) {
+        match queries::resolve_project_id(pool, Some(name)).await {
+            Ok(Some(id)) => return Some(id),
+            Ok(None) => {} // unknown name — fall through to cwd inference
+            Err(e) => {
+                tracing::error!(error = %e, name, "experiment_open: resolve project name failed");
+            }
+        }
+    }
+
+    // (2) Caller cwd via the request-scoped session id → longest project path.
+    let session = crate::mcp::server::current_mcp_session()?;
+    let cwd = match sqlx::query_scalar::<_, Option<String>>(
+        "SELECT cwd FROM mcp_clients WHERE mcp_session_id = $1",
+    )
+    .bind(&session)
+    .fetch_optional(pool)
+    .await
+    {
+        Ok(row) => row.flatten(),
+        Err(e) => {
+            tracing::error!(error = %e, "experiment_open: mcp_clients cwd lookup failed");
+            return None;
+        }
+    }?;
+
+    match queries::resolve_project_by_path(pool, &cwd).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::error!(error = %e, "experiment_open: resolve_project_by_path failed");
+            None
+        }
+    }
+}
+
 fn map_experiment_open_err(e: sqlx::Error) -> McpError {
     if let Some(db) = e.as_database_error() {
         let code = db.code().map(|code| code.into_owned());
@@ -257,7 +308,14 @@ pub async fn tool_experiment_open(
             None,
         ));
     }
-    let project_id = validate_project_id(pool, params.project_id).await?;
+    // Explicit `project_id` is validated and wins. When omitted, infer the
+    // owning project from an explicit `project` NAME, else the caller's cwd —
+    // keeping the existing explicit path working and the no-signal path a
+    // workspace-general experiment (project_id = None).
+    let project_id = match validate_project_id(pool, params.project_id).await? {
+        Some(id) => Some(id),
+        None => infer_open_project_id(pool, params.project.as_deref()).await,
+    };
     let context = nonblank_str(params.context.as_deref());
     let unit = nonblank_str(params.unit.as_deref());
     let git_ref = nonblank_str(params.git_ref.as_deref());

@@ -158,5 +158,17 @@ async fn resolve_and_upsert(pool: &PgPool, obs: &ClientObservation) -> Result<()
     .execute(pool)
     .await?;
 
+    // Realtime event (topic=client): a client connected / re-identified. Own-tx,
+    // best-effort — OS-identity capture must not fail on a telemetry write.
+    crate::realtime::emit(
+        pool,
+        &crate::realtime::RealtimeEvent::client_upsert(
+            &obs.mcp_session_id,
+            &obs.client_name,
+            project_id,
+        ),
+    )
+    .await;
+
     Ok(())
 }

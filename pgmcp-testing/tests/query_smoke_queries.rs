@@ -674,6 +674,31 @@ async fn queries_grep_search_chunks_smoke() {
 }
 
 #[tokio::test]
+async fn queries_grep_search_chunks_filters_project() {
+    let db = require_test_db!();
+    let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;
+
+    let results = queries::grep_search_chunks(
+        db.pool(),
+        "auth",
+        Some("proj-auth"),
+        None,
+        None,
+        false,
+        10,
+        true,
+    )
+    .await
+    .expect("grep_search_chunks project filter");
+
+    assert!(!results.is_empty(), "expected auth hits in proj-auth");
+    assert!(
+        results.iter().all(|r| r.project_name == "proj-auth"),
+        "project filter must exclude cross-project grep hits: {results:?}"
+    );
+}
+
+#[tokio::test]
 async fn queries_find_files_by_path_pattern_smoke() {
     let db = require_test_db!();
     let _ = SyntheticCorpus::seed_with_assignments(db.pool()).await;

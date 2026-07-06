@@ -442,7 +442,26 @@ async fn flush_batch(pool: &PgPool, stats: &StatsTracker, rows: &[CronRunRecord]
             stats
                 .cron_history_writes_dropped
                 .fetch_add(n as u64, Ordering::Relaxed);
+            return;
         }
+    }
+
+    // Realtime events (topic=cron): one tick per persisted cron run. Emitting
+    // here — from the async writer task that drains the guard's mpsc channel —
+    // is consistent with how `CronRunGuard::drop` already writes (a non-blocking
+    // `try_send`), so the sync scheduler/work-pool threads never touch the DB.
+    // Own-tx, best-effort: a telemetry write must not disturb the history writer.
+    for r in rows {
+        crate::realtime::emit(
+            pool,
+            &crate::realtime::RealtimeEvent::cron_tick(
+                &r.job_name,
+                r.outcome.as_str(),
+                r.duration_ms,
+                r.trigger_source.as_str(),
+            ),
+        )
+        .await;
     }
 }
 
