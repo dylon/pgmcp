@@ -21,6 +21,78 @@ use super::values::{CommitRef, ConceptValue, DurableMandateRef, PathValue, Symbo
 use crate::context::SystemContext;
 use crate::mcp::tools::sota_helpers::{pool_or_err, project_id_or_err};
 
+/// Which per-project fuzzy source a rebuild reads — selects the row-count
+/// subquery used by [`source_exceeds`] for the skip-oversize guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FuzzySource {
+    /// `file_symbols ⨝ indexed_files` (source of the symbols trie).
+    Symbols,
+    /// `indexed_files` (source of the paths trie).
+    Paths,
+    /// `git_commits` (source of the commits trie).
+    Commits,
+}
+
+/// BOUNDED-count guard for the skip-oversize policy (the reliable, active
+/// 2026-07-08 `fuzzy-sync` OOM fix).
+///
+/// Returns `true` iff the project's source-row count for `source` **exceeds**
+/// `threshold`. Efficient by construction: the inner `SELECT 1 … LIMIT $1`
+/// (with `$1 = threshold + 1`) makes Postgres stop scanning after
+/// `threshold + 1` rows, so this NEVER counts all ~22 M rows of a pathological
+/// project — it answers the yes/no question in `O(threshold)` at most. The
+/// project filter binds `$2`.
+///
+/// `threshold == 0` disables the guard (returns `false` without querying),
+/// mirroring `[fuzzy] oversize_trie_row_threshold = 0` ("never skip").
+pub async fn source_exceeds(
+    pool: &PgPool,
+    project_id: i32,
+    source: FuzzySource,
+    threshold: u64,
+) -> Result<bool, FuzzyError> {
+    if threshold == 0 {
+        return Ok(false);
+    }
+    let limit = oversize_probe_limit(threshold);
+    let query = match source {
+        FuzzySource::Symbols => sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM (SELECT 1 FROM file_symbols fs \
+             JOIN indexed_files f ON fs.file_id = f.id \
+             WHERE f.project_id = $2 LIMIT $1) t",
+        ),
+        FuzzySource::Paths => sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM (SELECT 1 FROM indexed_files \
+             WHERE project_id = $2 LIMIT $1) t",
+        ),
+        FuzzySource::Commits => sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM (SELECT 1 FROM git_commits \
+             WHERE project_id = $2 LIMIT $1) t",
+        ),
+    };
+    let count: i64 = query
+        .bind(limit)
+        .bind(project_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| FuzzyError::Trie(format!("source_exceeds count: {e}")))?;
+    Ok(source_is_over(count, threshold))
+}
+
+/// The `LIMIT` bind for the bounded-count probe: `threshold + 1`, saturating and
+/// clamped to a valid non-negative `i64` even at the `u64` ceiling. Pure so the
+/// skip-oversize arithmetic is unit-tested without a DB.
+fn oversize_probe_limit(threshold: u64) -> i64 {
+    threshold.saturating_add(1).min(i64::MAX as u64) as i64
+}
+
+/// Pure skip decision: the bounded count (capped at `threshold + 1` by the
+/// `LIMIT`) exceeds `threshold`. A negative count (impossible from `count(*)`)
+/// is treated as not-over.
+fn source_is_over(count_capped: i64, threshold: u64) -> bool {
+    count_capped >= 0 && count_capped as u64 > threshold
+}
+
 /// Rebuild the symbol index from `file_symbols` + `indexed_files`.
 /// Returns the number of rows ingested.
 ///
@@ -221,19 +293,39 @@ pub async fn open_symbol_trie(
     let (idx, _recovery) = FuzzyIndex::<SymbolValue>::open_or_create(&path)
         .map_err(|e| McpError::internal_error(format!("fuzzy symbol trie open: {e}"), None))?;
     if fresh {
-        let every = enable_eviction_for_warm(ctx, &idx);
+        let threshold = ctx.config().load().fuzzy.oversize_trie_row_threshold;
         let pool = pool_or_err(ctx)?;
-        rebuild_symbols(pool, project_id, &idx, every)
+        // Skip-oversize guard (mirror of the cron path): never build a
+        // pathologically large trie in RAM on first-touch lazy warm. On skip we
+        // still return the freshly-opened (empty) trie — it serves no fuzzy hits
+        // until the source drops under the cap, but it never OOMs the daemon.
+        if source_exceeds(pool, project_id, FuzzySource::Symbols, threshold)
             .await
             .map_err(|e| {
-                McpError::internal_error(format!("fuzzy symbol trie initial warm: {e}"), None)
-            })?;
-        tracing::info!(
-            path = %path.display(),
-            project = %project_name,
-            entries = idx.len(),
-            "fuzzy symbol trie lazy-warmed from PG"
-        );
+                McpError::internal_error(format!("fuzzy symbol oversize check: {e}"), None)
+            })?
+        {
+            tracing::warn!(
+                path = %path.display(),
+                project = %project_name,
+                threshold,
+                "skipping oversize fuzzy symbol trie lazy-warm (source rows exceed \
+                 [fuzzy] oversize_trie_row_threshold); serving empty trie until bounded"
+            );
+        } else {
+            let every = enable_eviction_for_warm(ctx, &idx);
+            rebuild_symbols(pool, project_id, &idx, every)
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(format!("fuzzy symbol trie initial warm: {e}"), None)
+                })?;
+            tracing::info!(
+                path = %path.display(),
+                project = %project_name,
+                entries = idx.len(),
+                "fuzzy symbol trie lazy-warmed from PG"
+            );
+        }
     }
     Ok(ctx.fuzzy_cache().insert_symbols(&key, &path, idx))
 }
@@ -259,19 +351,36 @@ pub async fn open_path_trie(
     let (idx, _recovery) = FuzzyIndex::<PathValue>::open_or_create(&path)
         .map_err(|e| McpError::internal_error(format!("fuzzy path trie open: {e}"), None))?;
     if fresh {
-        let every = enable_eviction_for_warm(ctx, &idx);
+        let threshold = ctx.config().load().fuzzy.oversize_trie_row_threshold;
         let pool = pool_or_err(ctx)?;
-        rebuild_paths(pool, project_id, &idx, every)
+        // Skip-oversize guard (mirror of the cron path); see `open_symbol_trie`.
+        if source_exceeds(pool, project_id, FuzzySource::Paths, threshold)
             .await
             .map_err(|e| {
-                McpError::internal_error(format!("fuzzy path trie initial warm: {e}"), None)
-            })?;
-        tracing::info!(
-            path = %path.display(),
-            project = %project_name,
-            entries = idx.len(),
-            "fuzzy path trie lazy-warmed from PG"
-        );
+                McpError::internal_error(format!("fuzzy path oversize check: {e}"), None)
+            })?
+        {
+            tracing::warn!(
+                path = %path.display(),
+                project = %project_name,
+                threshold,
+                "skipping oversize fuzzy path trie lazy-warm (source rows exceed \
+                 [fuzzy] oversize_trie_row_threshold); serving empty trie until bounded"
+            );
+        } else {
+            let every = enable_eviction_for_warm(ctx, &idx);
+            rebuild_paths(pool, project_id, &idx, every)
+                .await
+                .map_err(|e| {
+                    McpError::internal_error(format!("fuzzy path trie initial warm: {e}"), None)
+                })?;
+            tracing::info!(
+                path = %path.display(),
+                project = %project_name,
+                entries = idx.len(),
+                "fuzzy path trie lazy-warmed from PG"
+            );
+        }
     }
     Ok(ctx.fuzzy_cache().insert_paths(&key, &path, idx))
 }
@@ -314,7 +423,7 @@ pub async fn rebuild_concepts(
             },
         )?;
         count += 1;
-        if count % every == 0 {
+        if count.is_multiple_of(every) {
             idx.checkpoint()?;
         }
     }
@@ -383,9 +492,38 @@ pub async fn rebuild_durable_mandates(
             },
         )?;
         count += 1;
-        if count % every == 0 {
+        if count.is_multiple_of(every) {
             idx.checkpoint()?;
         }
     }
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversize_probe_limit_is_threshold_plus_one_and_saturates() {
+        assert_eq!(oversize_probe_limit(0), 1, "threshold 0 → LIMIT 1");
+        assert_eq!(oversize_probe_limit(3_000_000), 3_000_001);
+        // At the u64 ceiling the +1 saturates and the value is clamped into i64.
+        assert_eq!(oversize_probe_limit(u64::MAX), i64::MAX);
+        assert_eq!(oversize_probe_limit(i64::MAX as u64), i64::MAX);
+    }
+
+    #[test]
+    fn source_is_over_only_when_bounded_count_exceeds_threshold() {
+        // Bounded count comes back capped at threshold + 1.
+        assert!(
+            source_is_over(3_000_001, 3_000_000),
+            "capped count threshold+1 ⇒ over"
+        );
+        assert!(
+            !source_is_over(3_000_000, 3_000_000),
+            "exactly at threshold ⇒ not over"
+        );
+        assert!(!source_is_over(0, 3_000_000), "empty source ⇒ not over");
+        assert!(!source_is_over(-1, 3_000_000), "negative count ⇒ not over");
+    }
 }

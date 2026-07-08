@@ -1176,6 +1176,22 @@ pub struct FuzzyConfig {
     #[serde(default = "default_fuzzy_checkpoint_every_rows")]
     pub checkpoint_every_rows: usize,
 
+    /// Skip rebuilding a fuzzy trie whose **source row count exceeds this
+    /// threshold** (`0` = never skip). This is the RELIABLE, active
+    /// `fuzzy-sync` OOM bound (2026-07-08): rather than materialize a
+    /// pathologically large trie in RAM, `cron::fuzzy_sync` leaves the prior
+    /// on-disk trie in place and moves on. It bounds per-trie build RAM WITHOUT
+    /// the (currently buggy) resident-budget eviction — see
+    /// `resident_budget_bytes` / `docs/libdictenstein-char-resident-eviction-corruption-bug.md`.
+    ///
+    /// The check is a BOUNDED count (`SELECT 1 … LIMIT threshold+1`), so it never
+    /// scans the whole source of a huge project. Default 3 000 000: the
+    /// pathological catch-all `default` project (22 541 files → ~22 M symbol
+    /// rows, an 11.5 GB in-RAM trie) is skipped so it can't OOM the daemon, while
+    /// every well-sized project rebuilds normally.
+    #[serde(default = "default_fuzzy_oversize_trie_row_threshold")]
+    pub oversize_trie_row_threshold: u64,
+
     /// P13.3 cost-model knobs. Tunable per-deployment but defaults
     /// reflect liblevenshtein's published articulatory-feature
     /// weights and pgmcp's empirical "fold near-name symbols
@@ -1251,6 +1267,7 @@ impl Default for FuzzyConfig {
             max_disk_bytes: default_fuzzy_max_disk_bytes(),
             resident_budget_bytes: default_fuzzy_resident_budget_bytes(),
             checkpoint_every_rows: default_fuzzy_checkpoint_every_rows(),
+            oversize_trie_row_threshold: default_fuzzy_oversize_trie_row_threshold(),
             articulatory_voicing_weight: default_articulatory_voicing_weight(),
             articulatory_place_step: default_articulatory_place_step(),
             articulatory_manner_default: default_articulatory_manner_default(),
@@ -1309,6 +1326,14 @@ fn default_fuzzy_resident_budget_bytes() -> u64 {
 
 fn default_fuzzy_checkpoint_every_rows() -> usize {
     25_000
+}
+
+fn default_fuzzy_oversize_trie_row_threshold() -> u64 {
+    // Skip any per-project fuzzy trie whose source exceeds ~3 M rows. Chosen to
+    // skip ONLY the pathological catch-all (the `default` project's ~22 M symbol
+    // rows / 11.5 GB in-RAM trie that OOM'd the daemon) while letting every
+    // real, well-sized project rebuild. `0` disables the skip entirely.
+    3_000_000
 }
 
 /// `[api]` — REST API / RAG-hook tuning. `/api/search` (consumed by the

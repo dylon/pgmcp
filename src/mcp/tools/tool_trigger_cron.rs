@@ -368,13 +368,14 @@ async fn trigger_cron_dispatch(
                 .db()
                 .pool()
                 .ok_or_else(|| McpError::internal_error("no pool available", None))?;
-            let (data_dir, max_disk_bytes, eviction_cfg, checkpoint_every) = {
+            let (data_dir, max_disk_bytes, eviction_cfg, checkpoint_every, oversize_threshold) = {
                 let cfg = ctx.config().load();
                 (
                     cfg.fuzzy.data_dir.clone(),
                     cfg.fuzzy.max_disk_bytes,
                     cfg.fuzzy.eviction_config(),
                     cfg.fuzzy.checkpoint_every_rows,
+                    cfg.fuzzy.oversize_trie_row_threshold,
                 )
             };
             let report = crate::cron::fuzzy_sync::run_fuzzy_sync(
@@ -383,6 +384,7 @@ async fn trigger_cron_dispatch(
                 max_disk_bytes,
                 eviction_cfg,
                 checkpoint_every,
+                oversize_threshold,
                 std::sync::Arc::clone(stats),
             )
             .await
@@ -395,7 +397,8 @@ async fn trigger_cron_dispatch(
                 "commits_synced": report.commits_synced,
                 "durable_mandates_synced": report.durable_mandates_synced,
                 "concepts_synced": report.concepts_synced,
-                "guidance": "Per-project symbol/path/commit + global durable-mandate & ontology-concept fuzzy tries rebuilt from PG.",
+                "skipped_oversize": report.skipped_oversize,
+                "guidance": "Per-project symbol/path/commit + global durable-mandate & ontology-concept fuzzy tries rebuilt from PG. skipped_oversize counts per-(project,kind) rebuilds skipped by [fuzzy] oversize_trie_row_threshold.",
             }))
         }
         "graph-analysis" => {

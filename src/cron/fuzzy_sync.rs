@@ -81,6 +81,7 @@ pub async fn run_fuzzy_sync(
     max_disk_bytes: u64,
     eviction_cfg: EvictionConfig,
     checkpoint_every_rows: usize,
+    oversize_threshold: u64,
     stats: Arc<StatsTracker>,
 ) -> Result<FuzzySyncReport, FuzzyError> {
     let mut report = FuzzySyncReport::default();
@@ -95,32 +96,78 @@ pub async fn run_fuzzy_sync(
     for (project_id, project_name) in &projects {
         let project_key = project_artifact_key(*project_id, project_name);
 
-        let symbols_path = trie_path(data_dir, "symbols", &project_key);
-        let paths_path = trie_path(data_dir, "paths", &project_key);
-        let commits_path = trie_path(data_dir, "commits", &project_key);
-
+        // Skip-oversize guard (the reliable, active OOM fix): a project whose
+        // source exceeds `oversize_threshold` rows would build a pathologically
+        // large trie ENTIRELY in RAM (the `default` project's 11.5 GB symbols
+        // trie is what OOM'd the daemon). When over the cap we do NOT open or
+        // build the trie — the prior on-disk trie is left untouched and readers
+        // keep serving it. Each kind is guarded independently: paths/commits are
+        // usually well under the cap even when symbols blow past it.
+        //
         // Eviction MUST be enabled BEFORE the rebuild: the per-page checkpoints in
         // `rebuild_*` only bound the overlay (swizzle cold nodes to disk down to
         // `resident_budget_bytes`) when the coordinator is already installed. This
-        // is the crux of the 2026-07-08 OOM fix — before it, eviction was enabled
-        // in `finalize_trie` AFTER the whole trie was built in RAM.
-        let (sym_idx, _sym_recovery) = FuzzyIndex::<SymbolValue>::open_or_create(&symbols_path)?;
-        prime_eviction(&sym_idx, max_disk_bytes, &eviction_cfg);
-        let (path_idx, _path_recovery) = FuzzyIndex::<PathValue>::open_or_create(&paths_path)?;
-        prime_eviction(&path_idx, max_disk_bytes, &eviction_cfg);
-        let (commit_idx, _commit_recovery) =
-            FuzzyIndex::<CommitRef>::open_or_create(&commits_path)?;
-        prime_eviction(&commit_idx, max_disk_bytes, &eviction_cfg);
+        // is the crux of the incremental-checkpoint OOM fix — before it, eviction
+        // was enabled in `finalize_trie` AFTER the whole trie was built in RAM.
+        if !should_skip_oversize(
+            pool,
+            *project_id,
+            project_name,
+            sync::FuzzySource::Symbols,
+            "symbols",
+            oversize_threshold,
+            &mut report,
+        )
+        .await?
+        {
+            let symbols_path = trie_path(data_dir, "symbols", &project_key);
+            let (sym_idx, _sym_recovery) =
+                FuzzyIndex::<SymbolValue>::open_or_create(&symbols_path)?;
+            prime_eviction(&sym_idx, max_disk_bytes, &eviction_cfg);
+            report.symbols_synced +=
+                sync::rebuild_symbols(pool, *project_id, &sym_idx, checkpoint_every_rows).await?;
+            finalize_trie(&sym_idx, &symbols_path, max_disk_bytes, &stats)?;
+        }
 
-        report.symbols_synced +=
-            sync::rebuild_symbols(pool, *project_id, &sym_idx, checkpoint_every_rows).await?;
-        finalize_trie(&sym_idx, &symbols_path, max_disk_bytes, &stats)?;
-        report.paths_synced +=
-            sync::rebuild_paths(pool, *project_id, &path_idx, checkpoint_every_rows).await?;
-        finalize_trie(&path_idx, &paths_path, max_disk_bytes, &stats)?;
-        report.commits_synced +=
-            sync::rebuild_commits(pool, *project_id, &commit_idx, checkpoint_every_rows).await?;
-        finalize_trie(&commit_idx, &commits_path, max_disk_bytes, &stats)?;
+        if !should_skip_oversize(
+            pool,
+            *project_id,
+            project_name,
+            sync::FuzzySource::Paths,
+            "paths",
+            oversize_threshold,
+            &mut report,
+        )
+        .await?
+        {
+            let paths_path = trie_path(data_dir, "paths", &project_key);
+            let (path_idx, _path_recovery) = FuzzyIndex::<PathValue>::open_or_create(&paths_path)?;
+            prime_eviction(&path_idx, max_disk_bytes, &eviction_cfg);
+            report.paths_synced +=
+                sync::rebuild_paths(pool, *project_id, &path_idx, checkpoint_every_rows).await?;
+            finalize_trie(&path_idx, &paths_path, max_disk_bytes, &stats)?;
+        }
+
+        if !should_skip_oversize(
+            pool,
+            *project_id,
+            project_name,
+            sync::FuzzySource::Commits,
+            "commits",
+            oversize_threshold,
+            &mut report,
+        )
+        .await?
+        {
+            let commits_path = trie_path(data_dir, "commits", &project_key);
+            let (commit_idx, _commit_recovery) =
+                FuzzyIndex::<CommitRef>::open_or_create(&commits_path)?;
+            prime_eviction(&commit_idx, max_disk_bytes, &eviction_cfg);
+            report.commits_synced +=
+                sync::rebuild_commits(pool, *project_id, &commit_idx, checkpoint_every_rows)
+                    .await?;
+            finalize_trie(&commit_idx, &commits_path, max_disk_bytes, &stats)?;
+        }
     }
 
     // Durable mandates are workspace-global; one trie shared across
@@ -197,6 +244,39 @@ where
     }
 }
 
+/// Skip-oversize decision for one (project, kind): returns `true` — and logs +
+/// counts the skip — when the project's source for `source` exceeds
+/// `threshold` rows. The caller then does NOT open or build the trie, leaving
+/// the prior on-disk trie intact.
+///
+/// ADR-021: a **designed cap** (not a runtime failure) logs at `warn!`, not
+/// `error!`. `threshold == 0` disables the guard (`source_exceeds` returns
+/// `false` without querying), so this is a cheap no-op when the knob is off.
+async fn should_skip_oversize(
+    pool: &PgPool,
+    project_id: i32,
+    project_name: &str,
+    source: sync::FuzzySource,
+    kind: &str,
+    threshold: u64,
+    report: &mut FuzzySyncReport,
+) -> Result<bool, FuzzyError> {
+    if sync::source_exceeds(pool, project_id, source, threshold).await? {
+        tracing::warn!(
+            job = "fuzzy-sync",
+            project_id,
+            project = %project_name,
+            kind,
+            threshold,
+            "skipping oversize fuzzy trie rebuild (source rows exceed \
+             [fuzzy] oversize_trie_row_threshold); keeping prior on-disk trie"
+        );
+        report.skipped_oversize += 1;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Per-run summary for the fuzzy-sync cron.
 #[derive(Debug, Default, Clone)]
 pub struct FuzzySyncReport {
@@ -205,6 +285,9 @@ pub struct FuzzySyncReport {
     pub commits_synced: usize,
     pub durable_mandates_synced: usize,
     pub concepts_synced: usize,
+    /// Number of per-(project, kind) trie rebuilds skipped by the
+    /// skip-oversize guard ([`crate::config::FuzzyConfig::oversize_trie_row_threshold`]).
+    pub skipped_oversize: usize,
 }
 
 /// Filesystem-safe project slug.

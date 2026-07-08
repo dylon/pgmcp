@@ -83,6 +83,10 @@ impl LogBroadcaster {
     }
 
     /// Number of retained peers (test/introspection).
+    // Kept as a diagnostic accessor for the log-broadcaster peer set; has no
+    // production caller yet, so `#[allow(dead_code)]` keeps the intended API
+    // without tripping the `-D warnings` gate (pre-existing since f5b13de).
+    #[allow(dead_code)]
     pub fn peer_count(&self) -> usize {
         self.peers.load().len()
     }
