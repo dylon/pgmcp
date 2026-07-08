@@ -515,6 +515,14 @@ pub struct ClientsConfig {
     /// `0` disables the cache (every call hits the DB).
     #[serde(default = "default_cwd_project_cache_ttl_secs")]
     pub cwd_project_cache_ttl_secs: u64,
+    /// Retention window (days) for `client_file_events` — the file-touch
+    /// attribution log (ADR-022) — and for exited `mcp_clients` rows. With
+    /// `capture_reads = true` the events table grows ~1-2 M rows/day and had NO
+    /// retention, reaching 31 M rows / 9.7 GB (the 2026-07-08 disk-pressure
+    /// incident). The `stale-cleanup` cron prunes rows older than this in bounded
+    /// batches. Default 7; `0` = keep forever.
+    #[serde(default = "default_file_event_retention_days")]
+    pub file_event_retention_days: i64,
 }
 
 impl Default for ClientsConfig {
@@ -541,6 +549,7 @@ impl Default for ClientsConfig {
             preload_file_dir: String::new(),
             preload_file_rotate_bytes: default_preload_file_rotate_bytes(),
             cwd_project_cache_ttl_secs: default_cwd_project_cache_ttl_secs(),
+            file_event_retention_days: default_file_event_retention_days(),
         }
     }
 }
@@ -548,6 +557,9 @@ impl Default for ClientsConfig {
 fn default_cwd_project_cache_ttl_secs() -> u64 {
     30
 }
+fn default_file_event_retention_days() -> i64 {
+    7
+} // prune client_file_events + exited mcp_clients older than this (0 = keep forever)
 
 impl ClientsConfig {
     /// Resolve the preload shim's datagram socket path. An explicit
@@ -1138,6 +1150,32 @@ pub struct FuzzyConfig {
     #[serde(default = "default_fuzzy_max_disk_bytes")]
     pub max_disk_bytes: u64,
 
+    /// Resident-heap budget (bytes) for a fuzzy trie's in-memory overlay during a
+    /// rebuild. Passed to libdictenstein's eviction coordinator as
+    /// `resident_budget_bytes`: after every checkpoint, the coldest just-serialized
+    /// overlay nodes are swizzled to disk down to this budget, so rebuild RAM would
+    /// be bounded INDEPENDENT of trie size (the intended `fuzzy-sync` OOM fix — the
+    /// `default` project's 11.5 GB symbols trie built in ~1 GB instead of OOM-ing).
+    ///
+    /// **Default 0 (DORMANT).** Activating it (`> 0`) currently triggers a
+    /// libdictenstein corruption on the incremental-checkpoint+eviction path for
+    /// **char** tries ("char v2 sequential child mismatch" — eviction scatters a
+    /// sequential-sibling parent's children across arenas). See
+    /// `docs/libdictenstein-char-resident-eviction-corruption-bug.md`. Set this to
+    /// e.g. `768 * 1024 * 1024` ONLY after that fix lands in libdictenstein; until
+    /// then the daemon relies on the cgroup `MemoryMax` backstop + a raised
+    /// `fuzzy_sync_interval_secs`. Only takes effect when `max_disk_bytes > 0`.
+    #[serde(default = "default_fuzzy_resident_budget_bytes")]
+    pub resident_budget_bytes: u64,
+
+    /// During a `fuzzy-sync` rebuild, page the source query by this many rows
+    /// (keyset pagination) and checkpoint (flush overlay + run the resident-budget
+    /// eviction tail) after each page — so neither the source result set nor the
+    /// overlay is ever materialized whole. Peak rebuild RAM ≈ one page + the
+    /// resident budget. Default 25 000.
+    #[serde(default = "default_fuzzy_checkpoint_every_rows")]
+    pub checkpoint_every_rows: usize,
+
     /// P13.3 cost-model knobs. Tunable per-deployment but defaults
     /// reflect liblevenshtein's published articulatory-feature
     /// weights and pgmcp's empirical "fold near-name symbols
@@ -1176,10 +1214,17 @@ impl FuzzyConfig {
     /// `crate::fuzzy::disk_guard`.
     pub fn eviction_config(&self) -> libdictenstein::persistent_artrie::eviction::EvictionConfig {
         use libdictenstein::persistent_artrie::eviction::EvictionConfig;
-        if self.max_disk_bytes > 0 {
-            EvictionConfig::default()
-        } else {
-            EvictionConfig::disabled()
+        if self.max_disk_bytes == 0 {
+            return EvictionConfig::disabled();
+        }
+        // Populate `resident_budget_bytes` so the post-checkpoint eviction tail
+        // (libdictenstein `force_eviction_char_resident`) actually bounds the
+        // overlay. `EvictionConfig::default()` leaves it `None` (= unbounded), which
+        // is the pre-2026-07-08 OOM behavior. `0` opts back into unbounded.
+        EvictionConfig {
+            resident_budget_bytes: (self.resident_budget_bytes > 0)
+                .then_some(self.resident_budget_bytes as usize),
+            ..EvictionConfig::default()
         }
     }
 
@@ -1204,6 +1249,8 @@ impl Default for FuzzyConfig {
         Self {
             data_dir: default_fuzzy_data_dir(),
             max_disk_bytes: default_fuzzy_max_disk_bytes(),
+            resident_budget_bytes: default_fuzzy_resident_budget_bytes(),
+            checkpoint_every_rows: default_fuzzy_checkpoint_every_rows(),
             articulatory_voicing_weight: default_articulatory_voicing_weight(),
             articulatory_place_step: default_articulatory_place_step(),
             articulatory_manner_default: default_articulatory_manner_default(),
@@ -1249,6 +1296,19 @@ fn default_fuzzy_data_dir() -> std::path::PathBuf {
 
 fn default_fuzzy_max_disk_bytes() -> u64 {
     5 * 1024 * 1024 * 1024
+}
+
+fn default_fuzzy_resident_budget_bytes() -> u64 {
+    // DORMANT (0) until the libdictenstein char-eviction corruption is fixed — see
+    // docs/libdictenstein-char-resident-eviction-corruption-bug.md. Activating it
+    // (e.g. 768 MiB) is what bounds fuzzy-sync rebuild RAM, but today it corrupts
+    // the trie on incremental checkpoint. Until then: cgroup MemoryMax backstop +
+    // raised fuzzy_sync_interval_secs keep the daemon safe.
+    0
+}
+
+fn default_fuzzy_checkpoint_every_rows() -> usize {
+    25_000
 }
 
 /// `[api]` — REST API / RAG-hook tuning. `/api/search` (consumed by the

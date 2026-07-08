@@ -20,28 +20,19 @@ use crate::quality::findings::{Finding, FindingCategory, Severity};
 
 const SEC: FindingCategory = FindingCategory::Security;
 
-/// Fetch (path, content) for every text file in the project, once.
+/// Fetch (path, content) for every text file in the project, once. Delegates to
+/// the shared [`super::load_project_file_contents`] loader (single SQL + PG-timeout
+/// lift), dropping rows whose (nullable) content is absent so callers get a plain
+/// `String`.
 async fn project_contents(
     ctx: &SystemContext,
     project_id: i32,
 ) -> Result<Vec<(String, String)>, McpError> {
     let pool = pool_or_err(ctx)?;
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        relative_path: String,
-        content: Option<String>,
-    }
-    let rows: Vec<Row> = sqlx::query_as::<_, Row>(
-        "SELECT relative_path, content FROM indexed_files
-         WHERE project_id = $1 AND content IS NOT NULL",
-    )
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| McpError::internal_error(format!("content fetch failed: {e}"), None))?;
-    Ok(rows
+    Ok(super::load_project_file_contents(pool, project_id, None)
+        .await?
         .into_iter()
-        .filter_map(|r| r.content.map(|c| (r.relative_path, c)))
+        .filter_map(|(path, content)| content.map(|c| (path, c)))
         .collect())
 }
 

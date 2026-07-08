@@ -55,12 +55,36 @@ impl LogBroadcaster {
         self.level.store(level_to_u8(&level), Ordering::Release);
     }
 
-    /// Add a connected peer.
+    /// Hard cap on retained peers. A backstop against unbounded accumulation:
+    /// `add_peer` had no counterpart removal, so every MCP client init (and every
+    /// reconnect — frequent, especially across daemon restarts) permanently grew
+    /// the fan-out Vec, and `log()` spawned a `param`-cloning notify task per peer
+    /// per message to all of them — the 2026-07-08 tens-of-GB in-use balloon.
+    const MAX_PEERS: usize = 64;
+
+    /// Add a connected peer, opportunistically pruning any whose transport has
+    /// since closed and evicting the oldest if the cap is exceeded. `rcu` makes the
+    /// prune+append atomic against concurrent `add_peer`/`log` prunes (no lost
+    /// update, unlike load→modify→store).
     pub fn add_peer(&self, peer: Peer<RoleServer>) {
-        let guard = self.peers.load();
-        let mut peers = guard.to_vec();
-        peers.push(peer);
-        self.peers.store(Arc::new(peers));
+        self.peers.rcu(|current| {
+            let mut peers: Vec<Peer<RoleServer>> = current
+                .iter()
+                .filter(|p| !p.is_transport_closed())
+                .cloned()
+                .collect();
+            peers.push(peer.clone());
+            let overflow = peers.len().saturating_sub(Self::MAX_PEERS);
+            if overflow > 0 {
+                peers.drain(0..overflow);
+            }
+            Arc::new(peers)
+        });
+    }
+
+    /// Number of retained peers (test/introspection).
+    pub fn peer_count(&self) -> usize {
+        self.peers.load().len()
     }
 
     /// Check if a message at the given level would be logged.
@@ -82,6 +106,21 @@ impl LogBroadcaster {
             return;
         }
 
+        // Prune peers whose transport has closed so the fan-out list cannot grow
+        // without bound (there is no remove-on-disconnect hook). Only pay the rcu
+        // COW when there is actually something to drop.
+        if peers.iter().any(|p| p.is_transport_closed()) {
+            self.peers.rcu(|current| {
+                Arc::new(
+                    current
+                        .iter()
+                        .filter(|p| !p.is_transport_closed())
+                        .cloned()
+                        .collect::<Vec<Peer<RoleServer>>>(),
+                )
+            });
+        }
+
         let param = LoggingMessageNotificationParam::new(level, data).with_logger(logger);
 
         for peer in peers.iter() {
@@ -91,7 +130,14 @@ impl LogBroadcaster {
             let peer = peer.clone();
             let param = param.clone();
             tokio::spawn(async move {
-                let _ = peer.notify_logging_message(param).await;
+                // Bound the notify: a stuck / dead-but-not-yet-closed peer must not
+                // hold its `param` clone (and pin memory) indefinitely — the other
+                // half of the balloon. 5 s is generous for a live client.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    peer.notify_logging_message(param),
+                )
+                .await;
             });
         }
     }

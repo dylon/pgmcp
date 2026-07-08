@@ -489,11 +489,16 @@ pub async fn delete_projects_by_workspace(
 
 /// Delete projects that have zero indexed files (orphaned after stale file removal).
 pub async fn cleanup_orphaned_projects(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    // Corpus-scale: the NOT EXISTS anti-join scans every project against
+    // indexed_files and the DELETE cascades to git_commits/git_commit_chunks,
+    // which can exceed the pool's 30 s default; lift the timeout for the tx.
+    let mut tx = crate::db::pool::begin_heavy(pool, "0", "stale-cleanup").await?;
     let result = sqlx::query(
         "DELETE FROM projects p
          WHERE NOT EXISTS (SELECT 1 FROM indexed_files f WHERE f.project_id = p.id)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(result.rows_affected())
 }

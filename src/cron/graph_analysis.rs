@@ -837,6 +837,10 @@ async fn load_churn_data(
     pool: &PgPool,
     project_id: i32,
 ) -> Result<HashMap<i64, ChurnData>, sqlx::Error> {
+    // Corpus-scale: the per-project churn CTE aggregates over git_commit_files ×
+    // git_commits and can exceed the pool's 30 s default on large histories;
+    // lift the timeout for this read.
+    let mut tx = crate::db::pool::begin_heavy(pool, "10min", "graph-analysis").await?;
     let rows = sqlx::query_as::<_, ChurnRowDb>(
         "WITH file_churn AS (
             SELECT
@@ -869,8 +873,9 @@ async fn load_churn_data(
         FROM file_churn"
     )
     .bind(project_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     let mut map = HashMap::new();
     for row in rows {

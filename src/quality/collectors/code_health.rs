@@ -260,27 +260,15 @@ pub async fn collect_documented_tech_debt(
     project_name: &str,
 ) -> Result<Vec<Finding>, McpError> {
     let pool = pool_or_err(ctx)?;
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        relative_path: String,
-        content: Option<String>,
-    }
-    let rows: Vec<Row> = sqlx::query_as::<_, Row>(
-        "SELECT relative_path, content FROM indexed_files
-         WHERE project_id = $1 AND content IS NOT NULL",
-    )
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| {
-        McpError::internal_error(format!("documented_tech_debt query failed: {e}"), None)
-    })?;
+    // Corpus-scale content scan — routed through the shared PG-timeout-lifted
+    // loader so a large project's read is not cancelled at the pool's 30 s default.
+    let rows = super::load_project_file_contents(pool, project_id, None).await?;
 
     let marker_re =
         regex::Regex::new(r"(?i)\b(TODO|FIXME|HACK|XXX|BUG|WORKAROUND)\b").expect("valid regex");
     let mut out = Vec::new();
-    for r in &rows {
-        let content = r.content.as_deref().unwrap_or("");
+    for (relative_path, content) in &rows {
+        let content = content.as_deref().unwrap_or("");
         for (i, line) in content.lines().enumerate() {
             if let Some(m) = marker_re.find(line) {
                 let marker = m.as_str().to_ascii_uppercase();
@@ -296,10 +284,10 @@ pub async fn collect_documented_tech_debt(
                         severity,
                         format!("{marker}: {}", truncate_preview(line, 100)),
                     )
-                    .at(&r.relative_path, (i + 1) as u32)
+                    .at(relative_path, (i + 1) as u32)
                     .with_kind(format!("marker_{}", marker.to_ascii_lowercase()))
                     .with_raw(json!({
-                        "file": r.relative_path, "line": i + 1, "kind": marker,
+                        "file": relative_path, "line": i + 1, "kind": marker,
                         "snippet": truncate_preview(line, 200),
                     })),
                 );

@@ -80,6 +80,7 @@ pub async fn run_fuzzy_sync(
     data_dir: &Path,
     max_disk_bytes: u64,
     eviction_cfg: EvictionConfig,
+    checkpoint_every_rows: usize,
     stats: Arc<StatsTracker>,
 ) -> Result<FuzzySyncReport, FuzzyError> {
     let mut report = FuzzySyncReport::default();
@@ -98,35 +99,28 @@ pub async fn run_fuzzy_sync(
         let paths_path = trie_path(data_dir, "paths", &project_key);
         let commits_path = trie_path(data_dir, "commits", &project_key);
 
+        // Eviction MUST be enabled BEFORE the rebuild: the per-page checkpoints in
+        // `rebuild_*` only bound the overlay (swizzle cold nodes to disk down to
+        // `resident_budget_bytes`) when the coordinator is already installed. This
+        // is the crux of the 2026-07-08 OOM fix — before it, eviction was enabled
+        // in `finalize_trie` AFTER the whole trie was built in RAM.
         let (sym_idx, _sym_recovery) = FuzzyIndex::<SymbolValue>::open_or_create(&symbols_path)?;
+        prime_eviction(&sym_idx, max_disk_bytes, &eviction_cfg);
         let (path_idx, _path_recovery) = FuzzyIndex::<PathValue>::open_or_create(&paths_path)?;
+        prime_eviction(&path_idx, max_disk_bytes, &eviction_cfg);
         let (commit_idx, _commit_recovery) =
             FuzzyIndex::<CommitRef>::open_or_create(&commits_path)?;
+        prime_eviction(&commit_idx, max_disk_bytes, &eviction_cfg);
 
-        report.symbols_synced += sync::rebuild_symbols(pool, *project_id, &sym_idx).await?;
-        finalize_trie(
-            &sym_idx,
-            &symbols_path,
-            max_disk_bytes,
-            &eviction_cfg,
-            &stats,
-        )?;
-        report.paths_synced += sync::rebuild_paths(pool, *project_id, &path_idx).await?;
-        finalize_trie(
-            &path_idx,
-            &paths_path,
-            max_disk_bytes,
-            &eviction_cfg,
-            &stats,
-        )?;
-        report.commits_synced += sync::rebuild_commits(pool, *project_id, &commit_idx).await?;
-        finalize_trie(
-            &commit_idx,
-            &commits_path,
-            max_disk_bytes,
-            &eviction_cfg,
-            &stats,
-        )?;
+        report.symbols_synced +=
+            sync::rebuild_symbols(pool, *project_id, &sym_idx, checkpoint_every_rows).await?;
+        finalize_trie(&sym_idx, &symbols_path, max_disk_bytes, &stats)?;
+        report.paths_synced +=
+            sync::rebuild_paths(pool, *project_id, &path_idx, checkpoint_every_rows).await?;
+        finalize_trie(&path_idx, &paths_path, max_disk_bytes, &stats)?;
+        report.commits_synced +=
+            sync::rebuild_commits(pool, *project_id, &commit_idx, checkpoint_every_rows).await?;
+        finalize_trie(&commit_idx, &commits_path, max_disk_bytes, &stats)?;
     }
 
     // Durable mandates are workspace-global; one trie shared across
@@ -134,14 +128,10 @@ pub async fn run_fuzzy_sync(
     let mandates_path = data_dir.join("fuzzy").join("mandates_durable.artrie");
     let (mandate_idx, _mandate_recovery) =
         FuzzyIndex::<DurableMandateRef>::open_or_create(&mandates_path)?;
-    report.durable_mandates_synced += sync::rebuild_durable_mandates(pool, &mandate_idx).await?;
-    finalize_trie(
-        &mandate_idx,
-        &mandates_path,
-        max_disk_bytes,
-        &eviction_cfg,
-        &stats,
-    )?;
+    prime_eviction(&mandate_idx, max_disk_bytes, &eviction_cfg);
+    report.durable_mandates_synced +=
+        sync::rebuild_durable_mandates(pool, &mandate_idx, checkpoint_every_rows).await?;
+    finalize_trie(&mandate_idx, &mandates_path, max_disk_bytes, &stats)?;
 
     // Concepts (ontology) are workspace-global like durable mandates: one trie
     // across all projects + workspace rollups, keyed by concept name. Backs the
@@ -149,14 +139,10 @@ pub async fn run_fuzzy_sync(
     let concepts_path = concept_trie_path(data_dir);
     let (concept_idx, _concept_recovery) =
         FuzzyIndex::<ConceptValue>::open_or_create(&concepts_path)?;
-    report.concepts_synced += sync::rebuild_concepts(pool, &concept_idx).await?;
-    finalize_trie(
-        &concept_idx,
-        &concepts_path,
-        max_disk_bytes,
-        &eviction_cfg,
-        &stats,
-    )?;
+    prime_eviction(&concept_idx, max_disk_bytes, &eviction_cfg);
+    report.concepts_synced +=
+        sync::rebuild_concepts(pool, &concept_idx, checkpoint_every_rows).await?;
+    finalize_trie(&concept_idx, &concepts_path, max_disk_bytes, &stats)?;
 
     stats
         .fuzzy_sync_runs
@@ -181,24 +167,34 @@ fn finalize_trie<V>(
     idx: &FuzzyIndex<V>,
     path: &Path,
     max_disk_bytes: u64,
-    eviction_cfg: &EvictionConfig,
     stats: &StatsTracker,
 ) -> Result<(), FuzzyError>
 where
     V: DictionaryValue + Clone + Send + Sync + 'static,
 {
-    if max_disk_bytes > 0 {
-        // A freshly-opened trie is never already-enabled; tolerate the
-        // "already enabled" error rather than abort the whole sync.
-        let _ = idx.enable_eviction(eviction_cfg.clone());
-    }
-    // Checkpoint persists the rebuilt trie and, when eviction is enabled,
-    // populates the coordinator's disk-location registry so eviction can
-    // reclaim in-memory node boxes under memory pressure.
+    // Final checkpoint: persist any residual overlay from the last (partial) page
+    // and run the resident-budget eviction tail one last time. Eviction itself was
+    // enabled by `prime_eviction` BEFORE the rebuild, so the per-page checkpoints
+    // already bounded RAM; this is the closing flush.
     idx.checkpoint()?;
     crate::fuzzy::disk_guard::enforce_disk_cap(path, max_disk_bytes, stats);
     crate::fuzzy::disk_guard::record_eviction_stats(idx, stats);
     Ok(())
+}
+
+/// Enable heap eviction on a freshly-opened trie BEFORE its rebuild, so the
+/// per-page checkpoints in `sync::rebuild_*` bound the in-memory overlay
+/// (swizzling the coldest nodes to disk down to `resident_budget_bytes`). No-op
+/// when `max_disk_bytes == 0` (eviction disabled). A reused handle's "already
+/// enabled" error is tolerated. This ordering — eviction before the first insert —
+/// is what makes the rebuild memory-bounded (the 2026-07-08 OOM fix).
+fn prime_eviction<V>(idx: &FuzzyIndex<V>, max_disk_bytes: u64, eviction_cfg: &EvictionConfig)
+where
+    V: DictionaryValue + Clone + Send + Sync + 'static,
+{
+    if max_disk_bytes > 0 {
+        let _ = idx.enable_eviction(eviction_cfg.clone());
+    }
 }
 
 /// Per-run summary for the fuzzy-sync cron.

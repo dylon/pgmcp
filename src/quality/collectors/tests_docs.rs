@@ -149,28 +149,24 @@ pub async fn collect_flaky_test_candidates(
     project_name: &str,
 ) -> Result<Vec<Finding>, McpError> {
     let pool = pool_or_err(ctx)?;
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        relative_path: String,
-        content: Option<String>,
-    }
-    let rows: Vec<Row> = sqlx::query_as::<_, Row>(
-        "SELECT relative_path, content FROM indexed_files
-         WHERE project_id = $1 AND relative_path ~* '(test|spec|_test\\.|_spec\\.)'
-           AND content IS NOT NULL",
+    // Corpus-scale content scan — routed through the shared PG-timeout-lifted
+    // loader so a large project's read is not cancelled at the pool's 30 s default.
+    // The `(?i)` prefix preserves the original `~*` case-insensitive test-file
+    // filter (the shared loader's operator is the case-sensitive `~`).
+    let rows = super::load_project_file_contents(
+        pool,
+        project_id,
+        Some(r"(?i)(test|spec|_test\.|_spec\.)"),
     )
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| McpError::internal_error(format!("flaky_test query failed: {e}"), None))?;
+    .await?;
 
     let re = Regex::new(
         r"(?i)(thread::sleep|time\.sleep|Instant::now|SystemTime::now|rand::|random\(|Math\.random|reqwest|TcpStream|\.connect\()",
     )
     .expect("re");
     let mut out = Vec::new();
-    for r in &rows {
-        let content = r.content.as_deref().unwrap_or("");
+    for (relative_path, content) in &rows {
+        let content = content.as_deref().unwrap_or("");
         let mut signals: Vec<&str> = Vec::new();
         for cap in re.find_iter(content) {
             let s = cap.as_str();
@@ -187,13 +183,13 @@ pub async fn collect_flaky_test_candidates(
                     Severity::Low,
                     format!(
                         "{} shows flakiness signals: {}",
-                        r.relative_path,
+                        relative_path,
                         signals.join(", ")
                     ),
                 )
-                .at_file(&r.relative_path)
+                .at_file(relative_path)
                 .with_kind("flaky_signals")
-                .with_raw(json!({ "path": r.relative_path, "signals": signals })),
+                .with_raw(json!({ "path": relative_path, "signals": signals })),
             );
         }
     }

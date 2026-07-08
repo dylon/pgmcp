@@ -370,4 +370,73 @@ mod tests {
             "fuzzy query lost after reopen: {fuzzy:?}"
         );
     }
+
+    /// The 2026-07-08 fuzzy-sync OOM fix hinges on the resident-budget eviction
+    /// tail ACTUALLY reclaiming char-trie overlay nodes on checkpoint. The byte
+    /// `force_eviction` path is a no-op for a char trie, so the fix relies on the
+    /// char `force_eviction_char_resident` path, which fires only when
+    /// `resident_budget_bytes` is `Some`. This bulk-loads far more than a tiny
+    /// budget with periodic checkpoints (the `rebuild_*` pattern) and asserts
+    /// (a) eviction actually reclaimed nodes — else the fix is inert — and
+    /// (b) every term survives eviction + reopen (RAM is bounded WITHOUT sacrificing
+    /// completeness). This is the gate the OOM fix is built on.
+    // IGNORED pending the libdictenstein fix: this currently FAILS by design — it
+    // reproduces the "char v2 sequential child mismatch" corruption
+    // (docs/libdictenstein-char-resident-eviction-corruption-bug.md). Remove the
+    // `#[ignore]` once libdictenstein fixes the resident-budget char-eviction path;
+    // it then becomes the green gate for activating `[fuzzy] resident_budget_bytes`.
+    #[test]
+    #[ignore = "reproduces open libdictenstein char-eviction corruption; un-ignore when fixed"]
+    fn resident_budget_eviction_reclaims_and_preserves_terms() {
+        use libdictenstein::persistent_artrie::eviction::EvictionConfig;
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("evict.artrie");
+        let (idx, _) = FuzzyIndex::<i64>::open_or_create(&path).expect("create");
+        // Tiny resident budget forces the post-checkpoint eviction tail to swizzle
+        // cold overlay nodes to disk during the bulk load. Disable the async
+        // memory-pressure monitor so the test drives eviction purely via checkpoints.
+        idx.enable_eviction(EvictionConfig {
+            resident_budget_bytes: Some(64 * 1024),
+            enable_memory_pressure_monitor: false,
+            ..EvictionConfig::default()
+        })
+        .expect("enable eviction");
+
+        const N: i64 = 20_000;
+        for i in 0..N {
+            idx.upsert(&format!("symbol_{i:08}"), i).expect("upsert");
+            if i % 2_000 == 0 {
+                idx.checkpoint().expect("checkpoint");
+            }
+        }
+        idx.checkpoint().expect("final checkpoint");
+
+        // (a) The char resident-budget eviction path actually reclaimed nodes. If
+        // this is 0 the char eviction is a no-op and the OOM fix does nothing.
+        let ev = idx.eviction_stats();
+        assert!(
+            ev.nodes_evicted > 0,
+            "resident-budget eviction must reclaim char overlay nodes during a bulk load \
+             (nodes_evicted={}, bytes_freed={})",
+            ev.nodes_evicted,
+            ev.bytes_freed
+        );
+
+        // (b) Completeness: eviction swizzles to disk, it must NOT lose terms.
+        assert_eq!(idx.len(), N as usize, "all terms present after eviction");
+        drop(idx);
+        let (idx2, _) = FuzzyIndex::<i64>::open_or_create(&path).expect("reopen");
+        assert_eq!(
+            idx2.len(),
+            N as usize,
+            "all terms survive eviction + reopen"
+        );
+        for i in (0..N).step_by(2_500) {
+            let term = format!("symbol_{i:08}");
+            assert!(
+                idx2.contains(&term),
+                "term {term} survives eviction + reopen"
+            );
+        }
+    }
 }

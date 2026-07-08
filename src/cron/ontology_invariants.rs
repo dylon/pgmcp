@@ -40,6 +40,9 @@ pub async fn run_ontology_invariants(
     let mut evidence = 0u64;
 
     // 1. ADRs.
+    // Corpus-scale: scanning indexed_files.content across the corpus can exceed
+    // the pool's 30 s default; lift the timeout for this read.
+    let mut tx = crate::db::pool::begin_heavy(pool, "120s", "ontology-invariants").await?;
     let adrs: Vec<(i64, String, Option<String>)> = sqlx::query_as(
         "SELECT id, relative_path, content FROM indexed_files
          WHERE content IS NOT NULL
@@ -48,8 +51,9 @@ pub async fn run_ontology_invariants(
          LIMIT $1",
     )
     .bind(max)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     for (file_id, path, content) in &adrs {
         let Some(content) = content else { continue };
         if let Some(cand) = mine::extract_adr_invariant(content, path) {
@@ -68,6 +72,9 @@ pub async fn run_ontology_invariants(
     }
 
     // 2. Mandate files (CLAUDE.md / AGENTS.md).
+    // Corpus-scale: scanning indexed_files.content across the corpus can exceed
+    // the pool's 30 s default; lift the timeout for this read.
+    let mut tx = crate::db::pool::begin_heavy(pool, "120s", "ontology-invariants").await?;
     let mandates: Vec<(i64, String, Option<String>)> = sqlx::query_as(
         "SELECT id, relative_path, content FROM indexed_files
          WHERE content IS NOT NULL
@@ -77,8 +84,9 @@ pub async fn run_ontology_invariants(
          LIMIT $1",
     )
     .bind(max)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     for (file_id, path, content) in &mandates {
         let Some(content) = content else { continue };
         for cand in mine::extract_line_invariants(content, "project mandate") {
@@ -97,6 +105,9 @@ pub async fn run_ontology_invariants(
     }
 
     // 3. Commits carrying an invariant cue (pre-filtered in SQL, confirmed in Rust).
+    // Corpus-scale: scanning git_commits subject/body across all history can
+    // exceed the pool's 30 s default; lift the timeout for this read.
+    let mut tx = crate::db::pool::begin_heavy(pool, "120s", "ontology-invariants").await?;
     let commits: Vec<(i64, String, Option<String>)> = sqlx::query_as(
         "SELECT id, subject, body FROM git_commits
          WHERE subject ILIKE '%must%' OR subject ILIKE '%never%' OR subject ILIKE '%always%'
@@ -106,8 +117,9 @@ pub async fn run_ontology_invariants(
          LIMIT $1",
     )
     .bind(max)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     for (commit_id, subject, body) in &commits {
         if let Some(cand) = mine::extract_commit_invariant(subject, body.as_deref()) {
             persist(

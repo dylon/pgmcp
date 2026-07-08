@@ -102,6 +102,9 @@ async fn build_project_tree(
     project_id: i32,
     project_name: &str,
 ) -> Result<u64, sqlx::Error> {
+    // Corpus-scale: loading up to MAX_CHUNKS_PER_PROJECT embedding vectors for a
+    // project can exceed the pool's 30 s default; lift the timeout for this read.
+    let mut tx = crate::db::pool::begin_heavy(pool, "120s", "code-raptor").await?;
     let rows: Vec<(String, Option<Vector>)> = sqlx::query_as(
         "SELECT f.relative_path, c.embedding_v2
          FROM file_chunks c
@@ -111,8 +114,9 @@ async fn build_project_tree(
     )
     .bind(project_id)
     .bind(MAX_CHUNKS_PER_PROJECT)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     let n = rows.len();
     // Need enough chunks to form meaningful clusters.

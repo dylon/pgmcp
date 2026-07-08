@@ -62,23 +62,14 @@ pub async fn collect_deprecated_but_used(
     project_name: &str,
 ) -> Result<Vec<Finding>, McpError> {
     let pool = pool_or_err(ctx)?;
-    #[derive(sqlx::FromRow)]
-    struct Row {
-        relative_path: String,
-        content: Option<String>,
-    }
-    let rows: Vec<Row> = sqlx::query_as::<_, Row>(
-        "SELECT relative_path, content FROM indexed_files WHERE project_id = $1 AND content IS NOT NULL",
-    )
-    .bind(project_id)
-    .fetch_all(pool)
-    .await
-    .map_err(|e| McpError::internal_error(format!("deprecated_but_used query failed: {e}"), None))?;
+    // Corpus-scale content scan — routed through the shared PG-timeout-lifted
+    // loader so a large project's read is not cancelled at the pool's 30 s default.
+    let rows = super::load_project_file_contents(pool, project_id, None).await?;
 
     let re = Regex::new(r"(#\[deprecated|@Deprecated|@deprecated|@Obsolete)").expect("re");
     let mut out = Vec::new();
-    for r in &rows {
-        let content = r.content.as_deref().unwrap_or("");
+    for (relative_path, content) in &rows {
+        let content = content.as_deref().unwrap_or("");
         for (i, line) in content.lines().enumerate() {
             if re.is_match(line) {
                 out.push(
@@ -92,9 +83,9 @@ pub async fn collect_deprecated_but_used(
                             truncate_preview(line, 80)
                         ),
                     )
-                    .at(&r.relative_path, (i + 1) as u32)
+                    .at(relative_path, (i + 1) as u32)
                     .with_kind("deprecated_definition")
-                    .with_raw(json!({ "file": r.relative_path, "line": i + 1 })),
+                    .with_raw(json!({ "file": relative_path, "line": i + 1 })),
                 );
             }
         }

@@ -1914,6 +1914,17 @@ async fn run_mmap_global_topic_scan(
         // don't re-index the same chunks across worktrees / sibling
         // clones. See `bulk_extract_embeddings` in src/db/queries.rs
         // for rationale; the SQL is the same shape.
+        // Corpus-scale: each deep-OFFSET page over the full file_chunks corpus
+        // (with the worktree-dedup NOT EXISTS) can exceed the pool's 30 s
+        // default; lift the timeout per page.
+        let mut tx =
+            match crate::db::pool::begin_heavy(&pool_for_meta, "600s", "topic-clustering").await {
+                Ok(tx) => tx,
+                Err(e) => {
+                    error!(error = %e, offset, "mmap-streaming: begin_heavy failed");
+                    return;
+                }
+            };
         let rows = sqlx::query_as::<_, EmbRow>(sqlx::AssertSqlSafe(format!(
             "SELECT c.id AS id, c.file_id AS file_id, p.name AS project_name,
                     f.path AS path, f.language AS language,
@@ -1940,7 +1951,7 @@ async fn run_mmap_global_topic_scan(
         )))
         .bind(batch_size as i64)
         .bind(offset as i64)
-        .fetch_all(&pool_for_meta)
+        .fetch_all(&mut *tx)
         .await;
 
         let rows = match rows {
@@ -1950,6 +1961,10 @@ async fn run_mmap_global_topic_scan(
                 return;
             }
         };
+        if let Err(e) = tx.commit().await {
+            error!(error = %e, offset, "mmap-streaming: commit failed");
+            return;
+        }
         if rows.is_empty() {
             break;
         }
@@ -2743,7 +2758,17 @@ async fn count_chunks(db: &dyn DbClient) -> Option<usize> {
             return None;
         }
     };
-    match sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
+    // Corpus-scale: the full-corpus COUNT(*) over file_chunks with the
+    // correlated worktree-dedup NOT EXISTS can exceed the pool's 30 s default;
+    // lift the timeout for this pre-flight read.
+    let mut tx = match crate::db::pool::begin_heavy(pool, "600s", "topic-clustering").await {
+        Ok(tx) => tx,
+        Err(e) => {
+            error!(error = %e, "count_chunks: begin_heavy failed");
+            return None;
+        }
+    };
+    let count = sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(format!(
         "SELECT COUNT(*)
          FROM file_chunks c
          JOIN indexed_files f ON c.file_id = f.id
@@ -2763,10 +2788,16 @@ async fn count_chunks(db: &dyn DbClient) -> Option<usize> {
                  )
            )",
     )))
-    .fetch_one(pool)
-    .await
-    {
-        Ok(n) => Some(n as usize),
+    .fetch_one(&mut *tx)
+    .await;
+    match count {
+        Ok(n) => {
+            if let Err(e) = tx.commit().await {
+                error!(error = %e, "count_chunks: commit failed");
+                return None;
+            }
+            Some(n as usize)
+        }
         Err(e) => {
             error!(error = %e, "count_chunks pre-flight query failed");
             None

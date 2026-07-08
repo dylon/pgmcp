@@ -80,6 +80,9 @@ async fn train_project(
     project_name: &str,
     data_dir: &Path,
 ) -> Result<bool, TrainError> {
+    // Corpus-scale: loading every content chunk of a project can exceed the
+    // pool's 30 s default on large projects; lift the timeout for this read.
+    let mut tx = crate::db::pool::begin_heavy(pool, "600s", "ngram-lm-train").await?;
     let contents: Vec<String> = sqlx::query_scalar::<_, String>(
         "SELECT fc.content
          FROM file_chunks fc
@@ -89,8 +92,9 @@ async fn train_project(
            AND length(fc.content) > 0",
     )
     .bind(project_id)
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
 
     if contents.len() < 5 {
         return Ok(false);

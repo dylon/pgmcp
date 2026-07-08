@@ -18,9 +18,14 @@ use crate::quality::aggregate::aggregate_for_project;
 use crate::quality::report::ReportOptions;
 use crate::stats::tracker::StatsTracker;
 
-/// Per-project aggregation timeout (seconds). Matches the default tool timeout
-/// the `quality_report` tool uses.
-const QUALITY_HISTORY_TOOL_TIMEOUT_SECS: u64 = 30;
+/// Per-project aggregation timeout (seconds). Set to 300 s — not the 60 s
+/// `DEFAULT_TOOL_TIMEOUT_SECS` (`src/quality/aggregate.rs`) that the ad-hoc
+/// `quality_report` tool uses — because this cron fans the collectors over
+/// *every* project unattended, and the large-project collector reads (full-corpus
+/// content scans, now PG-timeout-lifted via
+/// [`crate::quality::collectors::load_project_file_contents`]) need the extra
+/// headroom to complete within the tokio budget.
+const QUALITY_HISTORY_TOOL_TIMEOUT_SECS: u64 = 300;
 
 /// Snapshot every indexed project's quality GPAs into `quality_report_history`.
 /// Best-effort per project (one project's failure never aborts the sweep).

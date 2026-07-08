@@ -1375,7 +1375,10 @@ impl BacklogCounts {
 
 /// Read the per-table backlog. One round trip via eighteen COUNT(*) probes.
 pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::Error> {
-    sqlx::query_as::<_, BacklogCounts>(
+    // Corpus-scale: eighteen COUNT(*) probes (file_chunks alone is millions of
+    // rows) can exceed the pool's 30 s default; lift the timeout for this read.
+    let mut tx = crate::db::pool::begin_heavy(pool, "600s", "embedding-migration").await?;
+    let counts = sqlx::query_as::<_, BacklogCounts>(
         "SELECT
             (SELECT COUNT(*) FROM file_chunks            WHERE embedding_v2 IS NULL) AS file_chunks,
             (SELECT COUNT(*) FROM session_prompts        WHERE embedding_v2 IS NULL) AS session_prompts,
@@ -1397,8 +1400,10 @@ pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::E
             (SELECT COUNT(*) FROM tool_cards             WHERE embedding    IS NULL) AS tool_cards,
             (SELECT COUNT(*) FROM mcp_tool_catalog       WHERE embedding    IS NULL) AS mcp_tool_catalog",
     )
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(counts)
 }
 
 /// Count `file_chunks` still needing a contextual re-embed (graph-roadmap
@@ -1414,11 +1419,16 @@ pub async fn full_backlog_counts(pool: &PgPool) -> Result<BacklogCounts, sqlx::E
 /// additive re-embed of already-dense rows, so it is tracked separately and the
 /// guard ORs the two backlogs.
 async fn contextual_backlog_count(pool: &PgPool) -> Result<i64, sqlx::Error> {
-    sqlx::query_scalar(
+    // Corpus-scale: the full-corpus COUNT(*) join can exceed the pool's 30 s
+    // default; lift the timeout for this read.
+    let mut tx = crate::db::pool::begin_heavy(pool, "600s", "embedding-migration").await?;
+    let count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM file_chunks c
          JOIN indexed_files f ON f.id = c.file_id
          WHERE c.contextual_text IS NULL AND c.embedding_v2 IS NOT NULL",
     )
-    .fetch_one(pool)
-    .await
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(count)
 }

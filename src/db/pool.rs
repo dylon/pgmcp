@@ -99,6 +99,39 @@ pub async fn create_pool(config: &DatabaseConfig) -> Result<PgPool, sqlx::Error>
     Ok(pool)
 }
 
+/// Begin a transaction with the per-statement timeout lifted to `timeout`
+/// (e.g. `"600s"`, `"10min"`, `"0"` = unlimited) and the backend tagged for the
+/// graceful-shutdown sweep (`db::admin::terminate_heavy_backends`). Both
+/// `SET LOCAL`s auto-revert on `commit`/`rollback`, so the connection returns to
+/// the pool at the default `statement_timeout` (30 s) with no leak — the caller
+/// MUST `tx.commit()` (or drop on the error path → rollback) and must not hold the
+/// transaction open past its query.
+///
+/// This distills the verbatim `pool.begin()` + `SET LOCAL statement_timeout` +
+/// `SET LOCAL application_name = 'pgmcp:heavy:<job>'` prologue repeated across the
+/// heavy-query sites (`memory_search.rs`, `graph_analysis.rs`, `graph.rs`,
+/// `similarity.rs`, `symbols.rs`). Statements that CANNOT run inside a transaction
+/// (`VACUUM`) instead use a dedicated-connection session `SET`/restore — see the
+/// `db-maintenance` cron in `src/cron/scheduler.rs`.
+pub async fn begin_heavy(
+    pool: &PgPool,
+    timeout: &str,
+    job_tag: &str,
+) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL statement_timeout = '{timeout}'"
+    )))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL application_name = 'pgmcp:heavy:{job_tag}'"
+    )))
+    .execute(&mut *tx)
+    .await?;
+    Ok(tx)
+}
+
 /// Health check — run a simple query to verify connectivity.
 pub async fn health_check(pool: &PgPool) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT 1").execute(pool).await?;

@@ -618,9 +618,14 @@ pub async fn find_files_by_path_pattern(
 /// the rest. `Missing`-only (`!exists()`); an edited file still `exists()` and is
 /// re-indexed, never pruned.
 pub async fn cleanup_stale_files(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    // Corpus-scale: SELECTing every indexed path (~60k+ rows) can exceed the
+    // pool's 30 s default; lift the timeout for this read. (The per-batch
+    // DELETEs below already run in their own timeout-lifted transactions.)
+    let mut tx = crate::db::pool::begin_heavy(pool, "120s", "stale-cleanup").await?;
     let paths = sqlx::query_scalar::<_, String>("SELECT path FROM indexed_files")
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
+    tx.commit().await?;
 
     let missing: Vec<String> = paths
         .into_iter()

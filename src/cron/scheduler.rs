@@ -1021,6 +1021,9 @@ pub fn schedule_maintenance_jobs(
     let rt_clone = rt.clone();
     let lc = lifecycle.clone();
     let hist_stale = system_ctx.cron_history().clone();
+    // `file_event_retention_days` lives on `ClientsConfig` (top-level `Config`),
+    // not `CronConfig`; read it from the live full config.
+    let client_event_retention_days = system_ctx.config().load().clients.file_event_retention_days;
     handle.schedule_recurring(
         5000,
         config.stale_cleanup_interval_secs * 1000,
@@ -1048,6 +1051,36 @@ pub fn schedule_maintenance_jobs(
                         }
                     }
                     Err(e) => tracing::error!("Orphaned project cleanup failed: {}", e),
+                }
+                // Retention: prune the high-churn client_file_events attribution log
+                // + exited mcp_clients rows past their window (2026-07-08: unbounded
+                // growth to 31 M rows / 9.7 GB caused disk pressure). Batched + capped
+                // inside the query fns so this hourly tick stays bounded.
+                if let Some(pool) = db.pool() {
+                    match crate::db::queries::delete_old_client_file_events(
+                        pool,
+                        client_event_retention_days,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(deleted = n, "Pruned aged client_file_events")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::error!("client_file_events retention failed: {}", e),
+                    }
+                    match crate::db::queries::delete_exited_clients(
+                        pool,
+                        client_event_retention_days,
+                    )
+                    .await
+                    {
+                        Ok(n) if n > 0 => {
+                            tracing::info!(deleted = n, "Pruned aged exited mcp_clients")
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::error!("mcp_clients retention failed: {}", e),
+                    }
                 }
             });
             true
@@ -1512,12 +1545,27 @@ pub fn schedule_maintenance_jobs(
             let db = db_clone.clone();
             let hist = hist_integrity.clone();
             crate::cron::history::spawn_recorded(&rt_clone, hist, "integrity-check", async move {
-                match sqlx::query("DELETE FROM indexed_files WHERE content_hash IS NULL")
-                    .execute(db.pool().expect("inline SQL needs PgPool"))
-                    .await
-                {
-                    Ok(result) => {
-                        let count = result.rows_affected();
+                // Lift the 30 s timeout: finding NULL rows is index-backed, but the
+                // ON DELETE CASCADE to `file_chunks` can exceed 30 s after a crashed
+                // mass-index left many NULL-content_hash files each with many chunks.
+                // `0` = unlimited (matches the `cleanup_stale_files` sibling cascade).
+                let integrity = async {
+                    let mut tx = crate::db::pool::begin_heavy(
+                        db.pool().expect("inline SQL needs PgPool"),
+                        "0",
+                        "integrity-check",
+                    )
+                    .await?;
+                    let result =
+                        sqlx::query("DELETE FROM indexed_files WHERE content_hash IS NULL")
+                            .execute(&mut *tx)
+                            .await?;
+                    tx.commit().await?;
+                    Ok::<u64, sqlx::Error>(result.rows_affected())
+                }
+                .await;
+                match integrity {
+                    Ok(count) => {
                         if count > 0 {
                             tracing::info!(count, "Cleaned up incompletely indexed files");
                         }
@@ -1536,6 +1584,10 @@ pub fn schedule_maintenance_jobs(
     let lc = lifecycle.clone();
     let hist_dbm = system_ctx.cron_history().clone();
     let cron_history_retention_days = config.cron_history_retention_days;
+    // `statement_timeout_ms` lives on `DatabaseConfig`, not `CronConfig` — read it
+    // from the live full config so the restore re-applies the pool's real
+    // after_connect value (respecting any user override), not a hardcoded default.
+    let statement_timeout_ms = system_ctx.config().load().database.statement_timeout_ms;
     handle.schedule_recurring(
         config.db_maintenance_interval_secs * 1000,
         config.db_maintenance_interval_secs * 1000,
@@ -1548,17 +1600,50 @@ pub fn schedule_maintenance_jobs(
             let hist = hist_dbm.clone();
             crate::cron::history::spawn_recorded(&rt_clone, hist, "db-maintenance", async move {
                 let pool = db.pool().expect("inline SQL needs PgPool");
-                if let Err(e) = sqlx::query("VACUUM ANALYZE indexed_files")
-                    .execute(pool)
-                    .await
-                {
-                    tracing::error!("DB maintenance failed: {}", e);
-                }
-                if let Err(e) = sqlx::query("VACUUM ANALYZE file_chunks")
-                    .execute(pool)
-                    .await
-                {
-                    tracing::error!("DB maintenance (chunks) failed: {}", e);
+                // VACUUM cannot run inside a transaction, so `begin_heavy`'s
+                // `SET LOCAL` idiom does NOT apply. Lift the 30 s statement_timeout at
+                // the SESSION level on a DEDICATED connection and RESTORE it before the
+                // connection returns to the pool. NOT `RESET`: `RESET` reverts to the
+                // cluster/role default (typically unlimited), which would leak to the
+                // next borrower — `after_connect`'s 30 s is itself a session `SET`, so
+                // we re-apply that literal. `file_chunks` (769k wide rows) routinely
+                // exceeds 30 s; `0` = unlimited (a cancelled maintenance VACUUM just
+                // wastes its work and leaves the bloat it meant to reclaim).
+                match pool.acquire().await {
+                    Ok(mut conn) => {
+                        if let Err(e) = sqlx::query("SET statement_timeout = 0")
+                            .execute(&mut *conn)
+                            .await
+                        {
+                            tracing::error!("DB maintenance: lift statement_timeout failed: {}", e);
+                        }
+                        if let Err(e) = sqlx::query("VACUUM ANALYZE indexed_files")
+                            .execute(&mut *conn)
+                            .await
+                        {
+                            tracing::error!("DB maintenance failed: {}", e);
+                        }
+                        if let Err(e) = sqlx::query("VACUUM ANALYZE file_chunks")
+                            .execute(&mut *conn)
+                            .await
+                        {
+                            tracing::error!("DB maintenance (chunks) failed: {}", e);
+                        }
+                        // Restore the pool default (explicit re-apply, never RESET) so
+                        // this connection cannot leak an unbounded timeout.
+                        if let Err(e) = sqlx::query(sqlx::AssertSqlSafe(format!(
+                            "SET statement_timeout = {statement_timeout_ms}"
+                        )))
+                        .execute(&mut *conn)
+                        .await
+                        {
+                            tracing::error!(
+                                "DB maintenance: restore statement_timeout failed: {}",
+                                e
+                            );
+                        }
+                    }
+                    Err(e) => tracing::error!("DB maintenance: acquire connection failed: {}", e),
                 }
                 // Retention sweep for the cron-run-history ledger (0 = keep forever).
                 match crate::db::queries::delete_cron_runs_older_than(
@@ -2083,6 +2168,7 @@ pub fn schedule_maintenance_jobs(
     let fuzzy_data_dir = fuzzy_config.data_dir.clone();
     let fuzzy_max_disk_bytes = fuzzy_config.max_disk_bytes;
     let fuzzy_eviction_cfg = fuzzy_config.eviction_config();
+    let fuzzy_checkpoint_every = fuzzy_config.checkpoint_every_rows;
     register_heavy_cron(
         handle,
         &lifecycle,
@@ -2101,6 +2187,7 @@ pub fn schedule_maintenance_jobs(
             let data_dir = fuzzy_data_dir.clone();
             let max_disk_bytes = fuzzy_max_disk_bytes;
             let eviction_cfg = fuzzy_eviction_cfg.clone();
+            let checkpoint_every = fuzzy_checkpoint_every;
             let Some(pool) = db.pool().cloned() else {
                 tracing::warn!(job = "fuzzy-sync", "skipping run: DbClient has no pool");
                 run.noop();
@@ -2112,6 +2199,7 @@ pub fn schedule_maintenance_jobs(
                     &data_dir,
                     max_disk_bytes,
                     eviction_cfg,
+                    checkpoint_every,
                     stats,
                 )
                 .await

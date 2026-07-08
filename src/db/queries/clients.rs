@@ -228,3 +228,58 @@ pub async fn active_agents_by_project(
     .fetch_all(pool)
     .await
 }
+
+/// Prune `client_file_events` rows older than `days` in bounded batches. The table
+/// is high-churn (~1-2 M rows/day with `capture_reads`) and had NO retention,
+/// reaching 31 M rows / 9.7 GB (the 2026-07-08 disk-pressure incident). Batched +
+/// per-call-capped so the hourly `stale-cleanup` tick stays bounded; a large
+/// backlog drains over several ticks. Each batch lifts the 30 s pool timeout via
+/// `begin_heavy` (auto-reverting on commit). `days <= 0` disables. Returns the
+/// number of rows deleted this call.
+pub async fn delete_old_client_file_events(pool: &PgPool, days: i64) -> Result<u64, sqlx::Error> {
+    if days <= 0 {
+        return Ok(0);
+    }
+    const BATCH: i64 = 200_000;
+    const MAX_BATCHES_PER_CALL: usize = 30; // ≤6 M rows/call — one tick can't run away
+    let mut total = 0u64;
+    for _ in 0..MAX_BATCHES_PER_CALL {
+        let mut tx = crate::db::pool::begin_heavy(pool, "120s", "client-events-retention").await?;
+        let affected = sqlx::query(
+            "DELETE FROM client_file_events
+              WHERE ctid = ANY(ARRAY(
+                    SELECT ctid FROM client_file_events
+                     WHERE ts < now() - make_interval(days => $1::int)
+                     LIMIT $2))",
+        )
+        .bind(days as i32)
+        .bind(BATCH)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        total += affected;
+        if affected < BATCH as u64 {
+            break; // drained
+        }
+    }
+    Ok(total)
+}
+
+/// Prune exited `mcp_clients` rows older than `days` (small table — single
+/// statement). Never touches `alive` rows. `days <= 0` disables.
+pub async fn delete_exited_clients(pool: &PgPool, days: i64) -> Result<u64, sqlx::Error> {
+    if days <= 0 {
+        return Ok(0);
+    }
+    let affected = sqlx::query(
+        "DELETE FROM mcp_clients
+          WHERE NOT alive
+            AND COALESCE(exited_at, last_seen) < now() - make_interval(days => $1::int)",
+    )
+    .bind(days as i32)
+    .execute(pool)
+    .await?
+    .rows_affected();
+    Ok(affected)
+}

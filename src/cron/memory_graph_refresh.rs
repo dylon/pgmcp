@@ -49,13 +49,17 @@ pub enum RefreshOutcome {
 /// work-items created directly by agents) are covered by the `max_staleness_secs`
 /// backstop, not by this fingerprint.
 async fn corpus_fingerprint(pool: &PgPool) -> Result<(String, i64), sqlx::Error> {
+    // Corpus-scale: count(*)+max(id) over the full file_chunks corpus can exceed
+    // the pool's 30 s default; lift the timeout for this fingerprint read.
+    let mut tx = crate::db::pool::begin_heavy(pool, "120s", "memory-graph-refresh").await?;
     let row: (String, i64) = sqlx::query_as(
         "SELECT count(*)::text || ':' || coalesce(max(id), 0)::text,
                 extract(epoch FROM now())::bigint
            FROM file_chunks",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(row)
 }
 
