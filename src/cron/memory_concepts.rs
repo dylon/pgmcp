@@ -107,7 +107,17 @@ pub async fn run_memory_concepts(
     stats.memory_concept_runs.fetch_add(1, Ordering::Relaxed);
 
     // New concepts/edges must surface in the heterogeneous graph immediately.
+    // The concepts carry embeddings, so refresh the vectors matview too — after
+    // the 2026-07-06 split the lean nodes matview makes them traversable but the
+    // embeddings (searchable via `memory_unified_search`) live in
+    // `memory_unified_node_vectors`. Tolerate 42P01 while that matview is still
+    // being built post-split (the background `ensure_memory_unified_views` owns it).
     queries::refresh_memory_unified_nodes(pool).await?;
+    match queries::refresh_memory_unified_node_vectors(pool).await {
+        Ok(()) => {}
+        Err(e) if queries::is_undefined_table(&e) => {}
+        Err(e) => return Err(e),
+    }
     queries::refresh_memory_unified_edges(pool).await?;
     info!(
         topic_concepts = emitted,

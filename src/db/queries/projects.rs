@@ -4,7 +4,29 @@
 
 use crate::db::queries::*;
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use sqlx::PgPool;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+/// TTL (seconds) for the cwd→project-id cache; `0` disables it. Set once at
+/// daemon startup from `[clients] cwd_project_cache_ttl_secs`.
+static CWD_PROJECT_CACHE_TTL_SECS: AtomicU64 = AtomicU64::new(30);
+
+/// Process-wide cwd → (project-id, inserted-at) cache for [`find_project_id_by_cwd`].
+static CWD_PROJECT_CACHE: LazyLock<DashMap<String, (Option<i32>, Instant)>> =
+    LazyLock::new(DashMap::new);
+
+/// Hard cap on distinct cached cwds; on overflow the cache is cleared (it rebuilds
+/// cheaply). cwds are naturally bounded (project dirs + a handful of agent cwds),
+/// so this only guards the pathological case — it can never grow without bound.
+const CWD_PROJECT_CACHE_MAX: usize = 4096;
+
+/// Set the cwd→project-id cache TTL (seconds); `0` disables the cache.
+pub fn set_cwd_project_cache_ttl_secs(secs: u64) {
+    CWD_PROJECT_CACHE_TTL_SECS.store(secs, Ordering::Relaxed);
+}
 
 // ============================================================================
 // Project queries
@@ -91,8 +113,53 @@ pub struct ProjectInfo {
     pub file_count: Option<i64>,
 }
 
+/// Lean variant of [`find_project_by_cwd`] returning only the project **id**.
+///
+/// The full variant carries a correlated `(SELECT COUNT(*) FROM indexed_files …)`
+/// that costs ~1.2 s under concurrent write load (heap visibility fetches on the
+/// very table being re-indexed) — and every hot caller that only needs the id
+/// throws that count away. The high-frequency loops (the reactive ingest writer
+/// at ~200 ms per distinct path, and the mcp-client-liveness sweep per client per
+/// 30 s) use this id-only query instead, so they stop piling that count onto the
+/// DB during a matview-refresh saturation window. The remaining `LIKE`-prefix
+/// scan over ~99 project rows is sub-millisecond. Same longest-prefix semantics.
+pub async fn find_project_id_by_cwd(pool: &PgPool, cwd: &str) -> Result<Option<i32>, sqlx::Error> {
+    let ttl = CWD_PROJECT_CACHE_TTL_SECS.load(Ordering::Relaxed);
+    if ttl > 0
+        && let Some(hit) = CWD_PROJECT_CACHE.get(cwd)
+    {
+        let (id, at) = *hit;
+        if at.elapsed().as_secs() < ttl {
+            return Ok(id);
+        }
+    }
+    let id = sqlx::query_scalar::<_, i32>(
+        "SELECT p.id
+         FROM projects p
+         WHERE $1 = p.path
+            OR $1 LIKE CASE
+                 WHEN right(p.path, 1) = '/' THEN p.path || '%'
+                 ELSE p.path || '/%'
+               END
+         ORDER BY LENGTH(p.path) DESC
+         LIMIT 1",
+    )
+    .bind(cwd)
+    .fetch_optional(pool)
+    .await?;
+    if ttl > 0 {
+        if CWD_PROJECT_CACHE.len() >= CWD_PROJECT_CACHE_MAX {
+            CWD_PROJECT_CACHE.clear();
+        }
+        CWD_PROJECT_CACHE.insert(cwd.to_string(), (id, Instant::now()));
+    }
+    Ok(id)
+}
+
 /// Find the project whose path is the longest prefix of a given directory.
 /// Used by the `context` CLI subcommand to identify which project the user is in.
+/// Carries `file_count`; hot callers that only need the id should use the lean
+/// [`find_project_id_by_cwd`] instead.
 pub async fn find_project_by_cwd(
     pool: &PgPool,
     cwd: &str,

@@ -11,7 +11,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 
-use crate::health::{DbHealth, DiskPressure};
+use crate::health::{DbHealth, DiskPressure, MemoryPressure};
 use crate::stats::client_writer::ClientObservation;
 use crate::stats::telemetry_writer::TelemetryRow;
 
@@ -822,6 +822,11 @@ pub struct StatsTracker {
     // no subsystem constructor needs a new parameter.
     db_health: Arc<DbHealth>,
     disk_pressure: Arc<DiskPressure>,
+    /// Memory-pressure flag written by the memory watchdog
+    /// (`crate::health::watchdog::spawn_memory_watchdog`) and read lock-free by
+    /// the heavy-cron gate and the embed/ingest intake gates. Mirrors
+    /// `disk_pressure` on the RAM axis.
+    memory_pressure: Arc<MemoryPressure>,
     /// Latest disk-pressure consumer breakdown, set by the watchdog when a
     /// watched filesystem crosses the alert threshold; surfaced in
     /// `/api/status`. `None` until the first alert. Lock-free (`ArcSwapOption`).
@@ -1126,6 +1131,7 @@ impl StatsTracker {
             uptime_start: Instant::now(),
             db_health: Arc::new(DbHealth::new()),
             disk_pressure: Arc::new(DiskPressure::new()),
+            memory_pressure: Arc::new(MemoryPressure::new()),
             disk_report: ArcSwapOption::empty(),
             resources: ArcSwapOption::empty(),
             disk_used_pct_bits: AtomicU64::new(f64::NAN.to_bits()),
@@ -1292,6 +1298,14 @@ impl StatsTracker {
         &self.disk_pressure
     }
 
+    /// Shared memory-pressure flag. Consulted by the heavy-cron gate and the
+    /// embed-pool / ingest intake gates to pause pgmcp's own memory-growing work
+    /// (heavy crons + indexing) under low free RAM / high RSS. See
+    /// `crate::health`.
+    pub fn memory_pressure(&self) -> &Arc<MemoryPressure> {
+        &self.memory_pressure
+    }
+
     /// Store the latest disk-pressure consumer breakdown (watchdog → /api/status).
     pub fn set_disk_report(&self, report: crate::health::disk_report::DiskReport) {
         self.disk_report.store(Some(Arc::new(report)));
@@ -1376,6 +1390,7 @@ impl StatsTracker {
     pub fn snapshot(&self) -> serde_json::Value {
         let db_health = self.db_health.snapshot();
         let disk_pressure = self.disk_pressure.snapshot();
+        let memory_pressure = self.memory_pressure.snapshot();
         serde_json::json!({
             "files_indexed": self.files_indexed.load(Ordering::Acquire),
             "files_failed": self.files_failed.load(Ordering::Acquire),
@@ -1658,6 +1673,10 @@ impl StatsTracker {
             "disk_pressure": disk_pressure.paused,
             "disk_avail_bytes": disk_pressure.last_avail_bytes,
             "disk_pressure_generation": disk_pressure.generation,
+            "memory_pressure": memory_pressure.paused,
+            "memory_avail_bytes": memory_pressure.last_avail_bytes,
+            "memory_rss_bytes": memory_pressure.last_rss_bytes,
+            "memory_pressure_generation": memory_pressure.generation,
             // Live used-% of the fullest watched filesystem (matches `df`), set
             // every watchdog poll — the always-current fullness headline, vs. the
             // throttled `disk_report` consumer breakdown below.

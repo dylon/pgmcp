@@ -22,10 +22,12 @@ pub mod db_health;
 pub mod disk_pressure;
 pub mod disk_report;
 pub mod fs;
+pub mod memory_pressure;
 pub mod outbox;
 pub mod prober;
 pub mod watchdog;
 
 pub use db_health::DbHealth;
 pub use disk_pressure::DiskPressure;
+pub use memory_pressure::MemoryPressure;
 pub use outbox::{OnFull, Outbox, OutboxReplayer};

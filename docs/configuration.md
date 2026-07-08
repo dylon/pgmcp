@@ -134,6 +134,10 @@ graph_analysis_interval_secs = 7200
 quality_history_interval_secs = 21600    # snapshot quality GPAs (trend/forecast); 0 disables
 tool_policy_interval_secs = 21600        # recompute per-client learned tool surface from usage; 0 disables
 findings_promotion_interval_secs = 21600 # auto-promote findings → items (opted-in projects); 0 disables
+memory_graph_refresh_interval_secs = 21600       # STRUCTURAL nodes+edges refresh (cheap; set 300 for a 5-min-fresh traversal graph); 0 disables
+memory_vectors_refresh_interval_secs = 21600     # vectors matview + HNSW (semantic search; the expensive HNSW re-maintenance — slower cadence); 0 disables
+memory_graph_refresh_max_staleness_secs = 86400  # force either refresh at least this often even when the corpus fingerprint is unchanged
+matview_refresh_maintenance_work_mem_mib = 1024  # session-local maintenance_work_mem for the CONCURRENT matview refresh (0 = cluster default)
 
 # Proactive digest — OFF by default (local-first). Rides the SessionStart
 # `pgmcp context` CLI and the UserPromptSubmit observe `additional_context`.
@@ -187,6 +191,25 @@ preload_file_capture = false # Phase-2E: capture Codex's subprocess edits via th
 preload_file_dir = ""        # trace dir the shim appends to / daemon tails; "" ⇒ $XDG_RUNTIME_DIR/pgmcp/fstrace
                              #   (must match a Codex [sandbox_workspace_write] writable_roots entry)
 preload_file_rotate_bytes = 8388608  # in-place truncate a trace file once fully drained past this size
+cwd_project_cache_ttl_secs = 30      # TTL for the process-wide cwd→project-id cache (lean find_project_id_by_cwd); 0 disables
+
+# Memory watchdog (src/health) — the RAM analogue of [disk_guard]. Pauses heavy
+# crons + indexing (and reclaims retained heap via malloc_trim) under low free RAM
+# or high process RSS, so a transient balloon defers-and-retries instead of
+# OOM-killing the daemon (fixes the 2026-07-06 memory-graph-refresh OOM). Setting
+# BOTH pause_avail_mib = 0 and pause_rss_mib = 0 disables it.
+[mem_guard]
+poll_interval_secs = 5           # poll cadence (RAM balloons faster than disk fills)
+warn_avail_mib = 12288           # log a warning below 12 GiB free
+pause_avail_mib = 8192           # ENTER pressure below 8 GiB free (0 disables this axis)
+resume_avail_mib = 16384         # EXIT pressure above 16 GiB free (clamped > pause)
+pause_rss_mib = 40960            # ENTER pressure when this process's RSS ≥ 40 GiB (0 disables this axis)
+resume_rss_mib = 28672           # EXIT pressure when RSS back under 28 GiB (clamped < pause)
+trim_after_heavy_cron = true     # malloc_trim(0) after each heavy cron to return retained glibc-arena heap
+trim_above_rss_mib = 4096        # poll-cadence malloc_trim whenever RSS ≥ this (MiB), from ANY source — the
+                                 #   non-heavy recorded crons (project-deps-index/target-cleanup/…) that the
+                                 #   per-heavy-cron trim misses would otherwise accumulate a tens-of-GB balloon
+                                 #   (2026-07-08). Keeps RSS bounded near this floor. 0 disables.
 ```
 
 ### Configuration Reference

@@ -85,6 +85,7 @@ mod v65_global_mandates;
 mod v66_webui_audit_log;
 mod v67_durable_mandates_operator;
 mod v68_experiment_audit_action;
+mod v69_memory_pressure_skip_reason;
 mod v6_unified_graph;
 mod v7_cge_orphan_cleanup;
 mod v8_csm_protocols;
@@ -144,6 +145,44 @@ async fn build_hnsw_index(
     .execute(&mut *tx)
     .await?;
     sqlx::query(sqlx::AssertSqlSafe(create_index_sql))
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Run a heavy `CREATE MATERIALIZED VIEW` materialization under the same extended
+/// session settings as [`build_hnsw_index`], so it cannot hit the daemon's 30 s
+/// default `statement_timeout` (`src/db/pool.rs`) and abort the rebuild partway.
+/// The `memory_unified_edges` build (EXISTS-heavy over `file_symbols`) and the
+/// `memory_unified_node_vectors` build (materializing ~1M embedding vectors) both
+/// exceed 30 s on a grown corpus; without this, the background
+/// `ensure_memory_unified_views` rebuild is canceled and leaves a matview missing
+/// (2026-07-07 incident: the edges build timed out, aborting before the vectors
+/// matview was created, so `memory_unified_search` lost its HNSW). `SET LOCAL`
+/// scopes both effects to the transaction; a plain non-concurrent
+/// `CREATE MATERIALIZED VIEW` is fully transactional.
+async fn execute_matview_build(
+    pool: &PgPool,
+    config: &VectorConfig,
+    create_sql: String,
+) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL maintenance_work_mem = '{}'",
+        config.hnsw_maintenance_work_mem.replace('\'', "''")
+    )))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL statement_timeout = {}",
+        config
+            .hnsw_build_statement_timeout_secs
+            .saturating_mul(1000)
+    )))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(create_sql))
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -2971,6 +3010,19 @@ pub async fn run_migrations(
     )
     .await?;
 
+    // Step 69 — widen the cron_run_history skip_reason CHECK to admit
+    // `memory_pressure` (the new src/health memory-watchdog gate). Existing
+    // installs that already recorded v40 need this stamped-CHECK refresh; fresh
+    // installs received the widened base constraint from v40's vocabulary build.
+    // ================================================================
+    apply_step(
+        pool,
+        v69_memory_pressure_skip_reason::MEMORY_PRESSURE_SKIP_REASON,
+        v69_memory_pressure_skip_reason::MEMORY_PRESSURE_SKIP_REASON_NAME,
+        || v69_memory_pressure_skip_reason::apply(pool),
+    )
+    .await?;
+
     // Every-boot vocabulary-catalog reconcile (RC1 durable fix). Unconditional
     // and idempotent; closes the post-v2 catalog-drift gap that silently
     // FK-skipped symbol extraction for files carrying a newly-added effect.
@@ -3158,7 +3210,17 @@ async fn seed_catalog(
 /// of truth for the rebuild-gate hash. Edits propagate transparently
 /// — the hash changes, the next restart rebuilds, the new hash is
 /// upserted into `pgmcp_metadata['memory_unified_views_def_hash']`.
-pub(crate) const MEMORY_UNIFIED_NODES_SQL: &str = "CREATE MATERIALIZED VIEW memory_unified_nodes AS
+///
+/// 2026-07-06 (P3): this is now the **shared source UNION** (no `CREATE` prefix)
+/// materialized into TWO matviews by `build_memory_unified_views`:
+/// `memory_unified_nodes` (lean: `node_id, node_type, label, importance` — the
+/// traversal tools, cheap to refresh) and `memory_unified_node_vectors`
+/// (`node_id, node_type, embedding` WHERE embedding IS NOT NULL — vector search +
+/// HNSW, the expensive-to-refresh one). Splitting the ~4.9 GB HNSW out of the
+/// nodes matview stops every `memory-graph-refresh` from rebuilding it and lets
+/// the lean traversal matview refresh cheaply/often. Column names come from the
+/// first arm's aliases (node_id / node_type / label / embedding / importance).
+pub(crate) const MEMORY_UNIFIED_NODES_SQL: &str = "
     SELECT 'memory_entity:' || id::TEXT AS node_id,
            'memory_entity'::TEXT AS node_type,
            name AS label,
@@ -3793,6 +3855,14 @@ pub(crate) const MEMORY_UNIFIED_EDGES_SQL: &str = "CREATE MATERIALIZED VIEW memo
 /// rebuild and HNSW index build on every daemon restart.
 const MEMORY_UNIFIED_VIEWS_HASH_KEY: &str = "memory_unified_views_def_hash";
 
+/// Structure-version marker folded into the views-definition hash so a change to
+/// the *materialization shape* (independent of the arm SQL) forces a rebuild.
+/// Bumped to `split:nodes+vectors:v1` on 2026-07-06 when the embedding + HNSW were
+/// split out of `memory_unified_nodes` into `memory_unified_node_vectors` — the
+/// hash then differs from every pre-split install and triggers the one-time
+/// rebuild into the three-matview shape.
+const MEMORY_UNIFIED_VIEWS_STRUCT_MARKER: &str = "split:nodes+vectors:v1";
+
 /// Phase 6.3: materialized `memory_unified_nodes` view +
 /// `memory_unified_edges` view. F9: drops and recreates only when
 /// the combined definition (`MEMORY_UNIFIED_NODES_SQL` +
@@ -3832,22 +3902,24 @@ async fn ensure_trajectory_similarities(pool: &PgPool) -> Result<(), sqlx::Error
 
 /// Whether each `memory_unified` graph relation currently exists as a
 /// MATERIALIZED VIEW (`relkind = 'm'`), returned as `(nodes_present,
-/// edges_present)`. The asymmetry is load-bearing: the edges matview is cheap (a
-/// join + GROUP BY over indexed base tables), while the nodes matview carries the
-/// multi-minute HNSW index — so a caller can repair a missing edges matview
-/// without re-running the HNSW.
-async fn matviews_present(pool: &PgPool) -> Result<(bool, bool), sqlx::Error> {
-    let nodes: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = 'memory_unified_nodes' AND relkind = 'm')",
-    )
-    .fetch_one(pool)
-    .await?;
-    let edges: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = 'memory_unified_edges' AND relkind = 'm')",
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok((nodes, edges))
+/// vectors_present, edges_present)`. The asymmetry is load-bearing: the lean
+/// `memory_unified_nodes` + `memory_unified_edges` matviews are cheap (projections
+/// / a join + GROUP BY over indexed base tables), while
+/// `memory_unified_node_vectors` carries the multi-minute HNSW index — so a caller
+/// can repair a missing nodes/edges/vectors matview at the appropriate cost
+/// (`ensure_edges_only` / `ensure_vectors_only`) without a full rebuild.
+async fn matviews_present(pool: &PgPool) -> Result<(bool, bool, bool), sqlx::Error> {
+    let present = |relname: &'static str| async move {
+        sqlx::query_scalar::<_, bool>(sqlx::AssertSqlSafe(format!(
+            "SELECT EXISTS(SELECT 1 FROM pg_class WHERE relname = '{relname}' AND relkind = 'm')"
+        )))
+        .fetch_one(pool)
+        .await
+    };
+    let nodes = present("memory_unified_nodes").await?;
+    let vectors = present("memory_unified_node_vectors").await?;
+    let edges = present("memory_unified_edges").await?;
+    Ok((nodes, vectors, edges))
 }
 
 /// Create the `memory_unified_edges` matview + its four indexes (unique edge key
@@ -3855,8 +3927,14 @@ async fn matviews_present(pool: &PgPool) -> Result<(bool, bool), sqlx::Error> {
 /// write — the caller owns both. Shared by `build_memory_unified_views` (which
 /// drops first and now creates edges BEFORE the nodes HNSW build) and
 /// `ensure_edges_only` (the cheap self-heal).
-async fn create_memory_unified_edges(pool: &PgPool) -> Result<(), sqlx::Error> {
-    sqlx::query(MEMORY_UNIFIED_EDGES_SQL).execute(pool).await?;
+async fn create_memory_unified_edges(
+    pool: &PgPool,
+    config: &VectorConfig,
+) -> Result<(), sqlx::Error> {
+    // Extended statement_timeout: the edges materialization (EXISTS gates over
+    // file_symbols) exceeds the daemon's 30 s default on a grown corpus, which
+    // was aborting the whole unified-views rebuild (2026-07-07).
+    execute_matview_build(pool, config, MEMORY_UNIFIED_EDGES_SQL.to_string()).await?;
     // Unique index on the edge key. REQUIRED for REFRESH MATERIALIZED VIEW
     // CONCURRENTLY (see refresh_memory_unified_edges); the outer GROUP BY in
     // MEMORY_UNIFIED_EDGES_SQL guarantees (from_id, to_id, edge_type) is unique.
@@ -3891,7 +3969,7 @@ async fn create_memory_unified_edges(pool: &PgPool) -> Result<(), sqlx::Error> {
 /// recreates. Does NOT touch `memory_unified_nodes` and does NOT write the
 /// views-hash (the hash attests to a full build of BOTH matviews — only
 /// `build_memory_unified_views` records it).
-async fn ensure_edges_only(pool: &PgPool) -> Result<(), sqlx::Error> {
+async fn ensure_edges_only(pool: &PgPool, config: &VectorConfig) -> Result<(), sqlx::Error> {
     sqlx::query(
         "DO $$
          BEGIN
@@ -3904,8 +3982,49 @@ async fn ensure_edges_only(pool: &PgPool) -> Result<(), sqlx::Error> {
     )
     .execute(pool)
     .await?;
-    create_memory_unified_edges(pool).await?;
+    create_memory_unified_edges(pool, config).await?;
     info!("memory_unified_edges was missing (nodes present); rebuilt edges-only, skipped HNSW");
+    Ok(())
+}
+
+/// Self-heal a MISSING `memory_unified_node_vectors` matview while
+/// `memory_unified_nodes` (and edges) are present — rebuilds ONLY the vectors
+/// matview + its HNSW, without touching nodes/edges. Repairs the
+/// crash-during-HNSW window: `build_memory_unified_views` creates vectors LAST, so
+/// a SIGKILL/restart during the multi-minute HNSW build leaves nodes+edges present
+/// and vectors missing. Does NOT write the views-hash (that attests to a full
+/// build of all three — only `build_memory_unified_views` records it).
+async fn ensure_vectors_only(pool: &PgPool, config: &VectorConfig) -> Result<(), sqlx::Error> {
+    sqlx::query("DROP MATERIALIZED VIEW IF EXISTS memory_unified_node_vectors")
+        .execute(pool)
+        .await?;
+    execute_matview_build(
+        pool,
+        config,
+        format!(
+            "CREATE MATERIALIZED VIEW memory_unified_node_vectors AS
+         SELECT node_id, node_type, embedding FROM ({}) src WHERE embedding IS NOT NULL",
+            MEMORY_UNIFIED_NODES_SQL
+        ),
+    )
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_unified_node_vectors_uq
+            ON memory_unified_node_vectors (node_id)",
+    )
+    .execute(pool)
+    .await?;
+    build_hnsw_index(
+        pool,
+        config,
+        "CREATE INDEX IF NOT EXISTS idx_memory_unified_node_vectors_embedding
+            ON memory_unified_node_vectors USING hnsw (embedding vector_cosine_ops)
+            WITH (m = 24, ef_construction = 200)",
+    )
+    .await?;
+    info!(
+        "memory_unified_node_vectors was missing (nodes+edges present); rebuilt vectors-only + HNSW"
+    );
     Ok(())
 }
 
@@ -3923,8 +4042,8 @@ pub(crate) async fn ensure_memory_unified_views(
     config: &VectorConfig,
 ) -> Result<(), sqlx::Error> {
     let combined = format!(
-        "{}\n---\n{}",
-        MEMORY_UNIFIED_NODES_SQL, MEMORY_UNIFIED_EDGES_SQL
+        "{}\n---\n{}\n---\n{}",
+        MEMORY_UNIFIED_NODES_SQL, MEMORY_UNIFIED_EDGES_SQL, MEMORY_UNIFIED_VIEWS_STRUCT_MARKER
     );
     let current_hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(combined.as_bytes()));
 
@@ -3936,29 +4055,40 @@ pub(crate) async fn ensure_memory_unified_views(
 
     // Existence dominates the hash gate: a matching hash must NEVER let a missing
     // matview slip through (the 2026-06-20 outage — an interrupted rebuild dropped
-    // edges after the hash was stored, and the bare hash-skip then masked it).
-    let (nodes_present, edges_present) = matviews_present(pool).await?;
-    if stored.as_deref() == Some(current_hash.as_str()) {
-        if nodes_present && edges_present {
+    // edges after the hash was stored, and the bare hash-skip then masked it). With
+    // the nodes/vectors split the same applies to a crash during the vectors HNSW
+    // build (leaves nodes+edges present, vectors missing).
+    let (nodes_present, vectors_present, edges_present) = matviews_present(pool).await?;
+    if stored.as_deref() == Some(current_hash.as_str()) && nodes_present {
+        // Definition unchanged and the lean nodes matview present: repair only
+        // what's missing (cheap for edges; a vectors-only HNSW rebuild otherwise)
+        // — both in one pass, so no missing matview persists to the next restart.
+        if edges_present && vectors_present {
             info!(
-                "memory_unified_views definition unchanged (hash {}); both matviews present; skipping rebuild",
+                "memory_unified_views definition unchanged (hash {}); all three matviews present; skipping rebuild",
                 current_hash
             );
             return Ok(());
         }
-        if nodes_present && !edges_present {
-            // Cheap, targeted self-heal — no nodes/HNSW rebuild.
+        if !edges_present {
             tracing::error!(
                 "memory_unified_edges missing though nodes present and views-hash unchanged ({}); repairing edges-only",
                 current_hash
             );
-            return ensure_edges_only(pool).await;
+            ensure_edges_only(pool, config).await?;
         }
-        // nodes absent with a stored hash (rare) — fall through to a full build.
+        if !vectors_present {
+            tracing::error!(
+                "memory_unified_node_vectors missing though nodes present and views-hash unchanged ({}); repairing vectors-only",
+                current_hash
+            );
+            ensure_vectors_only(pool, config).await?;
+        }
+        return Ok(());
     }
 
     info!(
-        "memory_unified_views definition changed or matviews missing (was {:?}, now {}); rebuilding",
+        "memory_unified_views definition changed or nodes matview missing (was {:?}, now {}); rebuilding",
         stored, current_hash
     );
     build_memory_unified_views(pool, config, &current_hash).await
@@ -3977,7 +4107,12 @@ pub(crate) async fn ensure_memory_unified_views_present(
     pool: &PgPool,
     config: &VectorConfig,
 ) -> Result<(), sqlx::Error> {
-    let (nodes_present, edges_present) = matviews_present(pool).await?;
+    // The (expensive) `memory_unified_node_vectors` HNSW is intentionally NOT
+    // built on the critical path — a missing vectors matview is repaired by the
+    // post-READY background `ensure_memory_unified_views` (via `ensure_vectors_only`),
+    // and `memory_unified_search` falls back to the legacy inline-embedding query
+    // while it is absent, so search degrades but never blocks startup.
+    let (nodes_present, _vectors_present, edges_present) = matviews_present(pool).await?;
     if nodes_present && edges_present {
         return Ok(());
     }
@@ -3989,7 +4124,7 @@ pub(crate) async fn ensure_memory_unified_views_present(
         // crash-loop the daemon (the exact failure mode the deferral exists to
         // avoid); the post-READY background `ensure_memory_unified_views` (and
         // the next boot) retry. Degraded-fallback ⇒ error! per ADR-021.
-        if let Err(e) = ensure_edges_only(pool).await {
+        if let Err(e) = ensure_edges_only(pool, config).await {
             tracing::error!(
                 error = %e,
                 "startup edges-only repair failed; unified-graph traversal degraded until the background rebuild"
@@ -4000,8 +4135,8 @@ pub(crate) async fn ensure_memory_unified_views_present(
     // nodes (and possibly edges) absent — a fresh/empty corpus, so this build is
     // near-instant and safe on the critical path.
     let combined = format!(
-        "{}\n---\n{}",
-        MEMORY_UNIFIED_NODES_SQL, MEMORY_UNIFIED_EDGES_SQL
+        "{}\n---\n{}\n---\n{}",
+        MEMORY_UNIFIED_NODES_SQL, MEMORY_UNIFIED_EDGES_SQL, MEMORY_UNIFIED_VIEWS_STRUCT_MARKER
     );
     let current_hash = format!("{:016x}", xxhash_rust::xxh3::xxh3_64(combined.as_bytes()));
     info!("memory_unified_views absent; building on the startup path (empty/new corpus)");
@@ -4034,55 +4169,88 @@ async fn build_memory_unified_views(
     )
     .execute(pool)
     .await?;
+    // Drop the vectors matview first (it holds the HNSW; no dependents), then the
+    // lean nodes matview. Plain DROP (no CASCADE) — the matview's own indexes drop
+    // with it and nothing else depends on either (0 catalog dependents).
+    sqlx::query("DROP MATERIALIZED VIEW IF EXISTS memory_unified_node_vectors")
+        .execute(pool)
+        .await?;
     sqlx::query("DROP MATERIALIZED VIEW IF EXISTS memory_unified_nodes")
         .execute(pool)
         .await?;
 
-    sqlx::query(MEMORY_UNIFIED_NODES_SQL).execute(pool).await?;
-    // Unique index on the synthetic node_id ('<type>:<pk>', globally unique
-    // across arms). REQUIRED for REFRESH MATERIALIZED VIEW CONCURRENTLY
-    // (see refresh_memory_unified_nodes), and a useful point-lookup besides.
+    // Lean nodes matview (traversal): node_id / node_type / label / importance —
+    // NO embedding, NO HNSW — so it refreshes cheaply/often for the
+    // memory_neighbors / memory_path_search / graph_neighbors walks. The 18-arm
+    // source UNION is projection-pruned to these 4 columns, so the (expensive)
+    // embedding subqueries are not even evaluated for this matview.
+    execute_matview_build(
+        pool,
+        config,
+        format!(
+            "CREATE MATERIALIZED VIEW memory_unified_nodes AS
+         SELECT node_id, node_type, label, importance FROM ({}) src",
+            MEMORY_UNIFIED_NODES_SQL
+        ),
+    )
+    .await?;
+    // Unique index on the synthetic node_id ('<type>:<pk>', globally unique across
+    // arms). REQUIRED for REFRESH MATERIALIZED VIEW CONCURRENTLY, and a useful
+    // point-lookup besides.
     sqlx::query(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_unified_nodes_uq
             ON memory_unified_nodes (node_id)",
     )
     .execute(pool)
     .await?;
-    // Lookup index by (node_type, node_id-suffix prefix) for the
-    // neighbors / search paths. Cheap b-tree; the HNSW would be on
-    // `embedding` but a matview supports HNSW only if pgvector is
-    // recent enough — we keep the cosine index implicit (matview is
-    // rebuilt on refresh, not incrementally).
+    // Lookup index by node_type for the neighbors / search paths.
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_memory_unified_nodes_type
             ON memory_unified_nodes (node_type)",
     )
     .execute(pool)
     .await?;
-    // Edges matview FIRST — BEFORE the (multi-minute, large-corpus) nodes HNSW
-    // build below — so the window in which `memory_unified_edges` does not exist
-    // collapses from the entire HNSW duration to ~the matview-create time. A
-    // SIGKILL/restart during the HNSW now leaves edges PRESENT (the 2026-06-20
-    // `graph_neighbors` outage left it dropped precisely because edges was created
-    // LAST). Cheap: a join + GROUP BY over indexed base tables, no HNSW. If a
-    // future edit reintroduces a duplicate (from_id,to_id,edge_type) triple, the
-    // UNIQUE index here fails the build loudly at boot — before any concurrent
-    // refresh can hit the duplicate.
-    create_memory_unified_edges(pool).await?;
 
-    // HNSW on embedding for vector retrieval. Built via the F8
-    // helper so `maintenance_work_mem` / `statement_timeout` /
-    // parallel-workers tuning kicks in.
+    // Edges matview next — still BEFORE the expensive vectors HNSW below, so a
+    // SIGKILL/restart during the HNSW leaves BOTH nodes and edges PRESENT (only
+    // the vectors matview would be missing, self-healed by `ensure_vectors_only`).
+    // Cheap: a join + GROUP BY over indexed base tables, no HNSW. If a future edit
+    // reintroduces a duplicate (from_id,to_id,edge_type) triple, the UNIQUE index
+    // fails the build loudly at boot — before any concurrent refresh can hit it.
+    create_memory_unified_edges(pool, config).await?;
+
+    // Vectors matview (vector search): node_id / node_type / embedding for the
+    // embedding-bearing arms only, carrying the HNSW. This is the expensive step
+    // (the ~4.9 GB HNSW build over ~1M vectors) — built LAST for crash-safety.
+    // node_type stays here so `memory_unified_search` filters on the HNSW-scanned
+    // table before joining the lean nodes matview for label/importance.
+    execute_matview_build(
+        pool,
+        config,
+        format!(
+            "CREATE MATERIALIZED VIEW memory_unified_node_vectors AS
+         SELECT node_id, node_type, embedding FROM ({}) src WHERE embedding IS NOT NULL",
+            MEMORY_UNIFIED_NODES_SQL
+        ),
+    )
+    .await?;
+    // Unique index on node_id — REQUIRED for REFRESH MATERIALIZED VIEW CONCURRENTLY.
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_unified_node_vectors_uq
+            ON memory_unified_node_vectors (node_id)",
+    )
+    .execute(pool)
+    .await?;
+    // HNSW on embedding for vector retrieval. Built via the F8 helper so
+    // `maintenance_work_mem` / `statement_timeout` / parallel-workers tuning kicks in.
     build_hnsw_index(
         pool,
         config,
-        "CREATE INDEX IF NOT EXISTS idx_memory_unified_nodes_embedding
-            ON memory_unified_nodes USING hnsw (embedding vector_cosine_ops)
+        "CREATE INDEX IF NOT EXISTS idx_memory_unified_node_vectors_embedding
+            ON memory_unified_node_vectors USING hnsw (embedding vector_cosine_ops)
             WITH (m = 24, ef_construction = 200)",
     )
     .await?;
-
-    // (memory_unified_edges + its 4 indexes were created above, before the HNSW.)
 
     sqlx::query(
         "INSERT INTO pgmcp_metadata (key, value)

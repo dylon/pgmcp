@@ -164,6 +164,22 @@ fn try_heavy_gate<'a>(
         hist.record_skip(job, CronTriggerSource::Scheduled, SkipReason::DiskPressure);
         return None;
     }
+    // Memory-pressure gate (src/health): heavy crons grow the heap — loading
+    // corpus-scale graphs/embeddings, or a matview refresh whose DB saturation
+    // backs up pgmcp's in-flight buffers — so pause them while the memory
+    // watchdog reports low free RAM / high RSS. This is the in-pool safety net;
+    // the scheduler-thread `heavy_submit_decision` already defers-and-retries so
+    // the run *waits for RAM* rather than losing the cycle, but pressure can also
+    // onset between that check and this dequeue.
+    if stats.memory_pressure().is_paused() {
+        stats.record_cron_outcome(job, CronJobOutcome::Skipped(SkipReason::MemoryPressure), 0);
+        hist.record_skip(
+            job,
+            CronTriggerSource::Scheduled,
+            SkipReason::MemoryPressure,
+        );
+        return None;
+    }
     match lock.try_lock() {
         Ok(g) => Some(g),
         Err(_) => {
@@ -211,32 +227,104 @@ fn cooldown_decision(lc: &DaemonLifecycle, cooldown_ms: u64) -> CooldownDecision
     }
 }
 
-/// Schedule a one-shot retry of a cooldown-deferred heavy cron at
-/// `delay_ms`. The one-shot re-evaluates the settle on fire: if the window has
-/// elapsed it runs the body; otherwise it re-arms itself. Bounded —
-/// `ms_in_current_phase` grows monotonically while Ready, and a phase
-/// regression simply re-waits Ready (ADR-018 §6).
+/// Re-check cadence for a heavy cron deferred by memory pressure — short enough
+/// to run promptly once RAM recovers, long enough not to spin. Aligns with the
+/// memory-watchdog poll cadence.
+const MEM_PRESSURE_RETRY_MS: u64 = 30_000;
+
+/// Max memory-pressure re-checks per deferred run (~10 min at
+/// [`MEM_PRESSURE_RETRY_MS`]). If RAM has not recovered by then the chain gives
+/// up and the next recurring interval retries — bounding the chain so a
+/// pathologically long RAM starvation can't accumulate timers without end.
+const MEM_PRESSURE_MAX_RETRIES: u32 = 20;
+
+/// Whether to `malloc_trim(0)` after each heavy-cron body (P0.1); set once at
+/// daemon startup from `[mem_guard] trim_after_heavy_cron`. Process-wide tunable
+/// (mirrors `a2a::client::set_default_timeout_secs`).
+static TRIM_AFTER_HEAVY_CRON: AtomicBool = AtomicBool::new(true);
+
+/// Enable/disable the post-heavy-cron `malloc_trim` reclaim.
+pub fn set_trim_after_heavy_cron(enabled: bool) {
+    TRIM_AFTER_HEAVY_CRON.store(enabled, AtomicOrdering::Relaxed);
+}
+
+/// Combined pre-submit decision for a heavy cron, on the scheduler thread so a
+/// deferral schedules a one-shot retry instead of slipping a full interval.
+/// Order: post-boot settle (cooldown) first, then memory pressure — so a Ready
+/// cron **waits for RAM to recover and then runs** (the user-facing "wait until
+/// it's safe to run the job" semantics) rather than losing the cycle. Returns
+/// `None` to submit now, or `Some((reason, retry_delay_ms))` to defer.
+///
+/// While not-yet-Ready (or stopping) it returns `None` so the in-pool
+/// PhaseGate / Shutdown gates record the precise reason exactly as before —
+/// the memory gate only applies once the daemon is serving.
+fn heavy_submit_decision(
+    lc: &DaemonLifecycle,
+    stats: &StatsTracker,
+    cooldown_ms: u64,
+) -> Option<(crate::stats::tracker::SkipReason, u64)> {
+    use crate::stats::tracker::SkipReason;
+    if !lc.is_at_least(crate::daemon_state::DaemonPhase::Ready) || lc.is_stopping() {
+        return None;
+    }
+    if let CooldownDecision::DeferMs(d) = cooldown_decision(lc, cooldown_ms) {
+        return Some((SkipReason::Cooldown, d));
+    }
+    if stats.memory_pressure().is_paused() {
+        return Some((SkipReason::MemoryPressure, MEM_PRESSURE_RETRY_MS));
+    }
+    None
+}
+
+/// Schedule a one-shot retry of a deferred heavy cron at `delay_ms`. On fire it
+/// re-evaluates [`heavy_submit_decision`]: if clear it runs the body; if still
+/// deferred it re-arms — bounded for memory pressure by `mem_retries_left`
+/// (cooldown deferrals always expire on their own, so they don't consume it).
+/// `ms_in_current_phase` grows monotonically while Ready, so the cooldown branch
+/// stays bounded exactly as before (ADR-018 §6).
+#[allow(clippy::too_many_arguments)]
 fn schedule_heavy_retry(
     handle: CronHandle,
     lc: DaemonLifecycle,
+    stats: Arc<StatsTracker>,
     run_once: Arc<dyn Fn() + Send + Sync>,
     cooldown_ms: u64,
     job: &'static str,
     delay_ms: u64,
+    mem_retries_left: u32,
 ) {
+    use crate::stats::tracker::SkipReason;
     // Clone for the closure capture so `handle` itself stays free to be the
     // `schedule_once` receiver (the closure re-arms via `handle_inner`).
     let handle_inner = handle.clone();
     handle.schedule_once(delay_ms, job, move || {
-        match cooldown_decision(&lc, cooldown_ms) {
-            CooldownDecision::RunNow => run_once(),
-            CooldownDecision::DeferMs(d) => schedule_heavy_retry(
+        match heavy_submit_decision(&lc, &stats, cooldown_ms) {
+            None => run_once(),
+            Some((SkipReason::MemoryPressure, d)) => {
+                // Still RAM-pressured: re-arm until the budget is exhausted, then
+                // give up and let the next recurring interval retry.
+                if mem_retries_left > 0 {
+                    schedule_heavy_retry(
+                        handle_inner.clone(),
+                        lc.clone(),
+                        Arc::clone(&stats),
+                        Arc::clone(&run_once),
+                        cooldown_ms,
+                        job,
+                        d,
+                        mem_retries_left - 1,
+                    );
+                }
+            }
+            Some((_, d)) => schedule_heavy_retry(
                 handle_inner.clone(),
                 lc.clone(),
+                Arc::clone(&stats),
                 Arc::clone(&run_once),
                 cooldown_ms,
                 job,
                 d,
+                mem_retries_left,
             ),
         }
         false // one-shot
@@ -244,36 +332,38 @@ fn schedule_heavy_retry(
 }
 
 /// The recurring-closure body shared by every heavy cron (ADR-018 §6). On each
-/// tick it either submits the body now (`run_once`) or, if still inside the
-/// post-boot settle, records a `Cooldown` skip and schedules a one-shot retry at
-/// expiry — instead of letting the skip slip the run a full interval. Returns
-/// `true` to keep the recurring schedule (the retry is additive).
+/// tick it either submits the body now (`run_once`) or, if deferred by the
+/// post-boot settle or by memory pressure, records the skip and schedules a
+/// one-shot retry at expiry — instead of letting the skip slip the run a full
+/// interval. Returns `true` to keep the recurring schedule (the retry is additive).
 fn heavy_cron_tick(
     lc: &DaemonLifecycle,
     handle: &CronHandle,
     hist: &crate::cron::history::CronHistoryWriter,
-    stats: &StatsTracker,
+    stats: &Arc<StatsTracker>,
     job: &'static str,
     cooldown_ms: u64,
     run_once: &Arc<dyn Fn() + Send + Sync>,
 ) -> bool {
     use crate::cron::history::CronTriggerSource;
-    use crate::stats::tracker::{CronJobOutcome, SkipReason};
+    use crate::stats::tracker::CronJobOutcome;
     if lc.is_stopping() {
         return false;
     }
-    match cooldown_decision(lc, cooldown_ms) {
-        CooldownDecision::RunNow => run_once(),
-        CooldownDecision::DeferMs(d) => {
-            stats.record_cron_outcome(job, CronJobOutcome::Skipped(SkipReason::Cooldown), 0);
-            hist.record_skip(job, CronTriggerSource::Scheduled, SkipReason::Cooldown);
+    match heavy_submit_decision(lc, stats, cooldown_ms) {
+        None => run_once(),
+        Some((reason, d)) => {
+            stats.record_cron_outcome(job, CronJobOutcome::Skipped(reason), 0);
+            hist.record_skip(job, CronTriggerSource::Scheduled, reason);
             schedule_heavy_retry(
                 handle.clone(),
                 lc.clone(),
+                Arc::clone(stats),
                 Arc::clone(run_once),
                 cooldown_ms,
                 job,
                 d,
+                MEM_PRESSURE_MAX_RETRIES,
             );
         }
     }
@@ -332,6 +422,18 @@ fn register_heavy_cron<F>(
                         None,
                     );
                     body(&mut guard);
+                    // Return retained glibc-arena high-water to the kernel after
+                    // every heavy cron (P0.1). A transient in-body balloon — e.g.
+                    // the DB-saturation backpressure during a `memory-graph-refresh`
+                    // matview refresh — otherwise persists as RSS across runs under
+                    // MALLOC_ARENA_MAX=2 and stacks toward the OOM kill. Runs before
+                    // `guard` drops so the recorded `rss_mb_end` reflects the
+                    // reclaimed footprint (the ledger-visible proof the balloon is
+                    // gone). See `crate::stats::rss::trim_malloc`. Gated by
+                    // `[mem_guard] trim_after_heavy_cron` (default on).
+                    if TRIM_AFTER_HEAVY_CRON.load(AtomicOrdering::Relaxed) {
+                        crate::stats::rss::trim_malloc();
+                    }
                     // `guard` drops here → records one row (Ok/NoOp/Failed set by
                     // `body`, or Panicked if `body` unwound).
                 },
@@ -1733,6 +1835,117 @@ pub fn schedule_maintenance_jobs(
             run.ok();
         },
     );
+
+    // Memory-graph-refresh (unified KG matviews: memory_unified_nodes +
+    // memory_unified_edges). Heavy: a CONCURRENT refresh of the multi-GB nodes
+    // matview + its HNSW saturates the DB for ~10 min and backs up pgmcp's
+    // in-flight heap — the balloon behind the 2026-07-06 OOM kills. Routed
+    // through the gated heavy path here (serialized on heavy_cron_lock +
+    // memory-pressure defer-and-retry + post-body malloc_trim) with a
+    // data-change gate, instead of the old ungated light spawn_recorded in
+    // daemon.rs. `interval_secs = 0` disables it (mirrors the old guard).
+    let mgr_interval_ms = config.memory_graph_refresh_interval_secs * 1000;
+    if mgr_interval_ms > 0 {
+        // Reuse the graph settle window (both are heavy graph-materialization
+        // crons); no dedicated ready-delay knob needed.
+        let mgr_cooldown_ms = config.ready_delay_graph_secs * 1000;
+        let mgr_staleness = config.memory_graph_refresh_max_staleness_secs;
+        let db_clone_mgr = Arc::clone(&db);
+        let rt_clone_mgr = rt.clone();
+        let stats_for_mgr = Arc::clone(&stats);
+        register_heavy_cron(
+            handle,
+            &lifecycle,
+            &cron_pool,
+            &heavy_cron_lock,
+            &stats,
+            system_ctx.cron_history(),
+            "memory-graph-refresh",
+            initial_delay("memory-graph-refresh", mgr_interval_ms),
+            mgr_interval_ms,
+            mgr_cooldown_ms,
+            move |run| {
+                let db = db_clone_mgr.clone();
+                let rt = rt_clone_mgr.clone();
+                let stats = Arc::clone(&stats_for_mgr);
+                let outcome = rt.block_on(async {
+                    let Some(pool) = db.pool().cloned() else {
+                        // CLI / no-pool mode — nothing to refresh.
+                        return Ok(None);
+                    };
+                    crate::cron::memory_graph_refresh::run_memory_graph_refresh(
+                        &pool,
+                        &stats,
+                        mgr_staleness,
+                    )
+                    .await
+                    .map(Some)
+                });
+                use crate::cron::memory_graph_refresh::RefreshOutcome;
+                match outcome {
+                    Ok(None) | Ok(Some(RefreshOutcome::SkippedUnchanged)) => run.noop(),
+                    Ok(Some(RefreshOutcome::Refreshed)) => run.ok(),
+                    Err(e) => {
+                        tracing::error!(error = %e, "memory-graph-refresh pass failed");
+                        run.fail(e.to_string());
+                    }
+                }
+            },
+        );
+    }
+
+    // Vectors-matview refresh — the expensive HNSW re-maintenance
+    // (`memory_unified_node_vectors`), SPLIT from the structural nodes+edges
+    // refresh above so it runs on a SLOWER cadence
+    // (`memory_vectors_refresh_interval_secs`). Same gated heavy path + data-change
+    // gate (separate watermark). `interval_secs = 0` disables it.
+    let mvr_interval_ms = config.memory_vectors_refresh_interval_secs * 1000;
+    if mvr_interval_ms > 0 {
+        let mvr_cooldown_ms = config.ready_delay_graph_secs * 1000;
+        let mvr_staleness = config.memory_graph_refresh_max_staleness_secs;
+        let db_clone_mvr = Arc::clone(&db);
+        let rt_clone_mvr = rt.clone();
+        let stats_for_mvr = Arc::clone(&stats);
+        register_heavy_cron(
+            handle,
+            &lifecycle,
+            &cron_pool,
+            &heavy_cron_lock,
+            &stats,
+            system_ctx.cron_history(),
+            "memory-vectors-refresh",
+            initial_delay("memory-vectors-refresh", mvr_interval_ms),
+            mvr_interval_ms,
+            mvr_cooldown_ms,
+            move |run| {
+                let db = db_clone_mvr.clone();
+                let rt = rt_clone_mvr.clone();
+                let stats = Arc::clone(&stats_for_mvr);
+                let outcome = rt.block_on(async {
+                    let Some(pool) = db.pool().cloned() else {
+                        // CLI / no-pool mode — nothing to refresh.
+                        return Ok(None);
+                    };
+                    crate::cron::memory_graph_refresh::run_memory_vectors_refresh(
+                        &pool,
+                        &stats,
+                        mvr_staleness,
+                    )
+                    .await
+                    .map(Some)
+                });
+                use crate::cron::memory_graph_refresh::RefreshOutcome;
+                match outcome {
+                    Ok(None) | Ok(Some(RefreshOutcome::SkippedUnchanged)) => run.noop(),
+                    Ok(Some(RefreshOutcome::Refreshed)) => run.ok(),
+                    Err(e) => {
+                        tracing::error!(error = %e, "memory-vectors-refresh pass failed");
+                        run.fail(e.to_string());
+                    }
+                }
+            },
+        );
+    }
 
     // Symbol extraction (Tier-0e tree-sitter pass — populates file_symbols + symbol_references)
     let symbol_extraction_interval_ms = config.symbol_extraction_interval_secs * 1000;

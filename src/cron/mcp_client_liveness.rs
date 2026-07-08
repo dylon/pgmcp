@@ -127,9 +127,9 @@ async fn sweep(
 
         if alive {
             let project_id = match &cwd {
-                Some(c) => crate::db::queries::find_project_by_cwd(pool, c)
-                    .await?
-                    .map(|p| p.id),
+                // Lean id-only lookup (no correlated COUNT) — swept per alive
+                // client every 30 s and only needs the id.
+                Some(c) => crate::db::queries::find_project_id_by_cwd(pool, c).await?,
                 None => None,
             };
             sqlx::query(

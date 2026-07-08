@@ -232,6 +232,21 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         crate::a2a::client::set_default_timeout_secs(config_snapshot.a2a.timeout_secs);
     }
 
+    // OOM-fix process-wide tunables (2026-07-06): apply from config before the
+    // crons / query paths that read them run. Each mirrors the A2A-timeout
+    // set-once-at-startup idiom above.
+    crate::cron::scheduler::set_trim_after_heavy_cron(
+        config_snapshot.mem_guard.trim_after_heavy_cron,
+    );
+    crate::db::queries::set_matview_refresh_maintenance_work_mem_mib(
+        config_snapshot
+            .cron
+            .matview_refresh_maintenance_work_mem_mib,
+    );
+    crate::db::queries::set_cwd_project_cache_ttl_secs(
+        config_snapshot.clients.cwd_project_cache_ttl_secs,
+    );
+
     // 1. Initialize database
     let db_pool = db::pool::create_pool(&config_snapshot.database).await?;
     // Retry on transient lock contention (e.g. an orphaned backend from a killed
@@ -687,6 +702,7 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
                 c.ebpf_batch_ms,
                 c.ingest_batch_max,
                 c.file_event_stream.then(|| c.pg_notify_channel.clone()),
+                Arc::clone(stats_tracker.memory_pressure()),
             );
             stats_tracker.set_file_event_sender(ingest.sender());
             Some(ingest)
@@ -847,6 +863,23 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
             );
         } else {
             tracing::info!("disk-watchdog disabled ([disk_guard] pause_floor_gb = 0)");
+        }
+        // Memory watchdog (src/health): the RAM analogue of the disk watchdog —
+        // pauses heavy crons + indexing (and reclaims retained glibc-arena heap)
+        // when free RAM runs low or the process RSS climbs past its budget, so a
+        // transient balloon defers-and-retries instead of OOM-killing the daemon.
+        // Needs no PgPool. Disabled only when both floors are 0.
+        let mg = &config_snapshot.mem_guard;
+        if mg.pause_avail_mib > 0 || mg.pause_rss_mib > 0 {
+            let _memory_watchdog_handle = crate::health::watchdog::spawn_memory_watchdog(
+                Arc::clone(&stats_tracker),
+                Arc::clone(&config),
+                shutdown.cancellation_token(),
+            );
+        } else {
+            tracing::info!(
+                "memory-watchdog disabled ([mem_guard] pause_avail_mib = 0 and pause_rss_mib = 0)"
+            );
         }
     } else {
         tracing::warn!("resilience prober/watchdog disabled: DbClient has no PgPool (CLI mode?)");
@@ -1039,37 +1072,15 @@ async fn run_server(config: Config, is_daemon: bool, config_path: PathBuf) -> an
         });
     }
 
-    // 11e. Schedule the memory-graph-refresh cron: keep the unified
-    // knowledge-graph matviews (memory_unified_nodes + memory_unified_edges)
-    // current with the indexed corpus so the traversal tools see fresh nodes/
-    // edges. Cheap UNION-ALL projections; default 6h. Set the interval to 0 to
-    // disable. (Fixes the previously-never-called refresh path.)
-    if config_snapshot.cron.memory_graph_refresh_interval_secs > 0
-        && let Some(pool) = system_ctx.db().pool().cloned()
-    {
-        let stats_for_graph = Arc::clone(&stats_tracker);
-        let interval_ms = config_snapshot
-            .cron
-            .memory_graph_refresh_interval_secs
-            .saturating_mul(1000);
-        let rt_for_graph = tokio::runtime::Handle::current();
-        let hist_graph = system_ctx.cron_history().clone();
-        // 90s initial delay: after the boot-time hash-gated rebuild + warmup.
-        cron_handle.schedule_recurring(90_000, interval_ms, "memory-graph-refresh", move || {
-            let pool = pool.clone();
-            let stats = Arc::clone(&stats_for_graph);
-            let hist = hist_graph.clone();
-            crate::cron::history::spawn_recorded(
-                &rt_for_graph,
-                hist,
-                "memory-graph-refresh",
-                async move {
-                    cron::memory_graph_refresh::run_or_log(Arc::new(pool), stats).await;
-                },
-            );
-            true
-        });
-    }
+    // 11e. Memory-graph-refresh moved to the gated heavy-cron path
+    // (`cron::scheduler::schedule_maintenance_jobs`) on 2026-07-06. As an ungated
+    // *light* cron it fired a `REFRESH MATERIALIZED VIEW CONCURRENTLY` of the
+    // 9.2 GB `memory_unified_nodes` matview (+ its HNSW) every 6 h, saturating the
+    // DB for ~10 min and ballooning pgmcp's own RSS to repeated OOM kills. It now
+    // serializes on `heavy_cron_lock`, obeys the memory-pressure defer-and-retry
+    // gate, reclaims the heap (`malloc_trim`) after each run, and skips entirely
+    // when the corpus is unchanged (data-change gate). See
+    // `docs/scientific-ledger/oom-memory-graph-refresh-2026-07-06.md`.
 
     // 11e-bis. Schedule the tape-store-reaper cron: reclaim per-tree `TapeStore`s
     // left resident by a recursion run that ended without an explicit `drop_tree`

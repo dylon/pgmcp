@@ -43,6 +43,14 @@ pub struct Config {
     /// (`pause_floor_gb = 0` disables).
     #[serde(default)]
     pub disk_guard: DiskGuardConfig,
+    /// `[mem_guard]` — pressure-driven memory watchdog (src/health). Pauses
+    /// pgmcp's own memory-growing work (heavy crons + indexing) and reclaims
+    /// retained heap when system available RAM runs low or the process RSS
+    /// climbs past its ceiling, so a transient balloon defers-and-retries
+    /// instead of escalating into an OOM kill. On by default (both floors 0
+    /// disables).
+    #[serde(default)]
+    pub mem_guard: MemGuardConfig,
     /// `[outbox]` — durable store-and-forward for fire-and-forget hook ingress
     /// while the DB is down (src/health). Replayed on recovery. On by default,
     /// self-limiting (capped + own-filesystem self-floor).
@@ -499,6 +507,14 @@ pub struct ClientsConfig {
     /// once fully drained (bounds tmpfs growth under a build flood). Default 8 MiB.
     #[serde(default = "default_preload_file_rotate_bytes")]
     pub preload_file_rotate_bytes: u64,
+    /// TTL (seconds) for the process-wide cwd→project-id cache consulted by the
+    /// lean `find_project_id_by_cwd` (the reactive ingest writer's per-path lookup
+    /// at ~200 ms, the liveness sweep per client at 30 s). Caching the result
+    /// keeps that storm off the DB — including while a matview refresh has the DB
+    /// saturated, when even the sub-ms query would otherwise queue. Default 30;
+    /// `0` disables the cache (every call hits the DB).
+    #[serde(default = "default_cwd_project_cache_ttl_secs")]
+    pub cwd_project_cache_ttl_secs: u64,
 }
 
 impl Default for ClientsConfig {
@@ -524,8 +540,13 @@ impl Default for ClientsConfig {
             preload_file_capture: false,
             preload_file_dir: String::new(),
             preload_file_rotate_bytes: default_preload_file_rotate_bytes(),
+            cwd_project_cache_ttl_secs: default_cwd_project_cache_ttl_secs(),
         }
     }
+}
+
+fn default_cwd_project_cache_ttl_secs() -> u64 {
+    30
 }
 
 impl ClientsConfig {
@@ -2565,6 +2586,106 @@ impl Default for DiskGuardConfig {
     }
 }
 
+/// `[mem_guard]` — pressure-driven memory watchdog (src/health/watchdog.rs).
+///
+/// The RAM analogue of [`DiskGuardConfig`]. Polls two axes every
+/// `poll_interval_secs`:
+/// - **system available RAM** (`/proc/meminfo:MemAvailable`) — *low* is bad, so
+///   `pause` < `resume` (mirrors the disk floors);
+/// - **process RSS** (`/proc/self/statm`) against an ABSOLUTE MiB ceiling —
+///   *high* is bad, so the polarity is inverted (`resume` < `pause`). Absolute
+///   (not a fraction of a boot-time budget) so a contended boot can't resolve the
+///   ceiling low and spuriously pause a legitimately-busy daemon.
+///
+/// When either axis crosses its pause floor the shared [`MemoryPressure`] flag
+/// is set, so heavy crons + the embed/ingest intake pause; the heavy-cron
+/// cooldown seam then retries the deferred run once RAM recovers (wait-for-RAM,
+/// not a lost cycle). On the pause edge the watchdog also calls `malloc_trim(0)`
+/// to hand retained glibc-arena high-water back to the kernel. Hysteresis on
+/// both axes prevents flapping. Setting **both** `pause_avail_mib = 0` and
+/// `pause_rss_mib = 0` disables the guard.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemGuardConfig {
+    /// Poll cadence. RAM balloons faster than disk fills, so this defaults far
+    /// tighter than the disk guard's 30 s. Clamped ≥ 1 s at runtime.
+    #[serde(default = "default_mem_guard_poll_secs")]
+    pub poll_interval_secs: u64,
+    /// System available MiB below which to log an early warning (0 disables).
+    #[serde(default = "default_mem_guard_warn_avail_mib")]
+    pub warn_avail_mib: u64,
+    /// System available MiB below which to ENTER pressure (0 disables this axis).
+    #[serde(default = "default_mem_guard_pause_avail_mib")]
+    pub pause_avail_mib: u64,
+    /// System available MiB above which to EXIT pressure (clamped > pause).
+    #[serde(default = "default_mem_guard_resume_avail_mib")]
+    pub resume_avail_mib: u64,
+    /// Process RSS in MiB at/above which to ENTER pressure (0 disables this axis).
+    /// An ABSOLUTE ceiling — far above the ~9 GB healthy peak, below the 80–97 GB
+    /// OOM balloon. On smaller boxes the available-RAM axis is the effective guard.
+    #[serde(default = "default_mem_guard_pause_rss_mib")]
+    pub pause_rss_mib: u64,
+    /// Process RSS in MiB below which to EXIT pressure (clamped < pause).
+    #[serde(default = "default_mem_guard_resume_rss_mib")]
+    pub resume_rss_mib: u64,
+    /// Call `malloc_trim(0)` after each heavy-cron body to hand retained
+    /// glibc-arena high-water back to the kernel (the P0.1 balloon-reclaim). On
+    /// by default — the trim is cheap (~tens of ms, off the hot path) and always
+    /// beneficial; set false only to isolate its effect when profiling.
+    #[serde(default = "default_mem_guard_trim_after_heavy_cron")]
+    pub trim_after_heavy_cron: bool,
+    /// Poll-cadence `malloc_trim(0)` threshold (MiB): the memory-watchdog trims
+    /// retained glibc-arena high-water every `poll_interval_secs` whenever RSS is
+    /// at or above this, REGARDLESS of source. This is what keeps NON-heavy
+    /// recorded crons (`project-deps-index`, `target-cleanup`, `mcp-client-liveness`,
+    /// …) — which the per-heavy-cron trim misses — from accumulating an untrimmed
+    /// tens-of-GB balloon (the 2026-07-08 incident: 50 GB over 10 h). Default 4096
+    /// (4 GiB): well above the ~1.5 GB baseline so normal operation never trims, but
+    /// any real growth is reclaimed within one poll. `0` disables.
+    #[serde(default = "default_mem_guard_trim_above_rss_mib")]
+    pub trim_above_rss_mib: u64,
+}
+
+impl Default for MemGuardConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_secs: default_mem_guard_poll_secs(),
+            warn_avail_mib: default_mem_guard_warn_avail_mib(),
+            pause_avail_mib: default_mem_guard_pause_avail_mib(),
+            resume_avail_mib: default_mem_guard_resume_avail_mib(),
+            pause_rss_mib: default_mem_guard_pause_rss_mib(),
+            resume_rss_mib: default_mem_guard_resume_rss_mib(),
+            trim_after_heavy_cron: default_mem_guard_trim_after_heavy_cron(),
+            trim_above_rss_mib: default_mem_guard_trim_above_rss_mib(),
+        }
+    }
+}
+
+fn default_mem_guard_trim_after_heavy_cron() -> bool {
+    true
+}
+fn default_mem_guard_trim_above_rss_mib() -> u64 {
+    4096
+} // 4 GiB — poll-cadence arena reclaim floor (catches non-heavy-cron balloon)
+
+fn default_mem_guard_poll_secs() -> u64 {
+    5
+}
+fn default_mem_guard_warn_avail_mib() -> u64 {
+    12_288 // 12 GiB free
+}
+fn default_mem_guard_pause_avail_mib() -> u64 {
+    8_192 // 8 GiB free — system-wide headroom guard (swappiness=0 never swaps anon)
+}
+fn default_mem_guard_resume_avail_mib() -> u64 {
+    16_384 // 16 GiB free
+}
+fn default_mem_guard_pause_rss_mib() -> u64 {
+    40_960 // 40 GiB — far above the ~9 GB healthy peak, below the OOM balloon
+}
+fn default_mem_guard_resume_rss_mib() -> u64 {
+    28_672 // 28 GiB
+}
+
 fn default_disk_guard_alert_used_pct() -> u8 {
     85
 }
@@ -3167,10 +3288,37 @@ pub struct CronConfig {
     #[serde(default = "default_similarity_scan_interval")]
     pub similarity_scan_interval_secs: u64,
     /// Interval between `memory-graph-refresh` cron passes (default: 21600 = 6
-    /// hours) that refresh the unified knowledge-graph matviews
-    /// (`memory_unified_nodes` + `memory_unified_edges`).
+    /// hours) that refresh the STRUCTURAL unified knowledge-graph matviews
+    /// (`memory_unified_nodes` + `memory_unified_edges`) the traversal tools walk.
+    /// Cheap, so it can run frequently (e.g. 300 = every 5 min) for a fresh graph;
+    /// the expensive vectors/HNSW matview refreshes separately on
+    /// `memory_vectors_refresh_interval_secs`.
     #[serde(default = "default_memory_graph_refresh_interval")]
     pub memory_graph_refresh_interval_secs: u64,
+    /// Interval between `memory-vectors-refresh` cron passes (default: 21600 = 6
+    /// hours) that refresh the `memory_unified_node_vectors` matview + its HNSW —
+    /// the expensive semantic-search index (~minutes of HNSW re-maintenance over
+    /// ~1M vectors). Split from the structural refresh above so it runs on a
+    /// slower cadence than the cheap nodes+edges refresh. `0` disables it.
+    #[serde(default = "default_memory_vectors_refresh_interval")]
+    pub memory_vectors_refresh_interval_secs: u64,
+    /// Max age (seconds) a `memory-graph-refresh` watermark may reach before the
+    /// cron force-refreshes even when its (file-chunk) corpus fingerprint is
+    /// unchanged — the backstop that bounds staleness of low-churn non-file graph
+    /// arms the fingerprint doesn't track. Default 86400 (24 h). Must exceed
+    /// `memory_graph_refresh_interval_secs` for the data-change gate to ever skip.
+    #[serde(default = "default_memory_graph_refresh_max_staleness")]
+    pub memory_graph_refresh_max_staleness_secs: u64,
+    /// `maintenance_work_mem` (MiB) applied via `SET LOCAL` to the CONCURRENT
+    /// matview-refresh session (`refresh_matview_concurrently`). The unified
+    /// nodes/vectors refresh rebuilds a multi-GB HNSW; at the cluster default
+    /// (often 64 MB) it spills heavily and saturates the DB — the trigger behind
+    /// the 2026-07-06 OOM. A session-local raise slashes the spill without
+    /// touching the cluster config or any other session. Default 1024 (1 GiB);
+    /// `0` leaves the cluster default. PostgreSQL bounds it at value ×
+    /// `max_parallel_maintenance_workers`.
+    #[serde(default = "default_matview_refresh_maintenance_work_mem_mib")]
+    pub matview_refresh_maintenance_work_mem_mib: u64,
     /// Stage-5c MSM `evolves_like` trajectory-similarity cron settings.
     #[serde(default)]
     pub trajectory_similarity: TrajectorySimilarityConfig,
@@ -3632,6 +3780,10 @@ impl Default for CronConfig {
             git_history_index_interval_secs: default_git_history_index(),
             similarity_scan_interval_secs: default_similarity_scan_interval(),
             memory_graph_refresh_interval_secs: default_memory_graph_refresh_interval(),
+            memory_vectors_refresh_interval_secs: default_memory_vectors_refresh_interval(),
+            memory_graph_refresh_max_staleness_secs: default_memory_graph_refresh_max_staleness(),
+            matview_refresh_maintenance_work_mem_mib:
+                default_matview_refresh_maintenance_work_mem_mib(),
             trajectory_similarity: TrajectorySimilarityConfig::default(),
             similarity_threshold: default_similarity_threshold(),
             similarity_top_k: default_similarity_top_k(),
@@ -4065,6 +4217,15 @@ fn default_similarity_scan_interval() -> u64 {
 fn default_memory_graph_refresh_interval() -> u64 {
     21600
 } // 6 hours
+fn default_memory_vectors_refresh_interval() -> u64 {
+    21600
+} // 6 hours — the expensive vectors/HNSW refresh, split from the structural refresh
+fn default_memory_graph_refresh_max_staleness() -> u64 {
+    86400
+} // 24 hours — force a refresh at least daily even if the fingerprint is unchanged
+fn default_matview_refresh_maintenance_work_mem_mib() -> u64 {
+    1024
+} // 1 GiB session-local maintenance_work_mem for the CONCURRENT matview refresh
 fn default_similarity_threshold() -> f64 {
     0.85
 }

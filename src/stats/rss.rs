@@ -52,6 +52,33 @@ pub fn mem_available_bytes() -> Option<u64> {
     None
 }
 
+/// Return free-but-retained heap memory to the OS via glibc `malloc_trim(0)`.
+///
+/// glibc keeps each malloc arena's high-water mark for the life of the process
+/// (see `cap_malloc_arenas` in `main.rs`), so a transient allocation burst — e.g.
+/// the in-flight request/result buffers that pile up while a heavy cron saturates
+/// the database for minutes — inflates RSS with memory that is *free* but never
+/// handed back to the kernel. With `vm.swappiness=0` that retained anonymous RSS
+/// is never swapped either, so it stacks across runs until the OOM killer fires.
+/// Calling this after heavy work (and on the memory-watchdog pressure edge)
+/// releases the top of the main arena plus any fully-free `mmap`'d chunks,
+/// converting the retention from cumulative-and-fatal to transient-and-reclaimed.
+///
+/// Cost is an arena-lock walk (tens of ms on a large heap), so call it off hot
+/// paths only. No-op on non-glibc targets (`malloc_trim` is a GNU extension).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+pub fn trim_malloc() {
+    // SAFETY: `malloc_trim` takes a pad byte count and is always safe to call;
+    // the returned c_int (1 = memory released, 0 = none) is advisory only.
+    unsafe {
+        libc::malloc_trim(0);
+    }
+}
+
+/// No-op fallback on non-glibc targets.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+pub fn trim_malloc() {}
+
 #[cfg(target_os = "linux")]
 fn page_size_bytes() -> u64 {
     // SAFETY: sysconf(_SC_PAGESIZE) is always safe; returns -1 on error which we guard.

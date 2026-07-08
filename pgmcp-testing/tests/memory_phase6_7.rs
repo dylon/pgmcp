@@ -9,7 +9,8 @@ mod common;
 use common::text_of;
 use pgmcp::db::queries::{
     memory_neighbors, memory_path_search, memory_ppr_search, memory_raptor_search,
-    memory_unified_search, refresh_memory_unified_edges, refresh_memory_unified_nodes,
+    memory_unified_search, refresh_memory_unified_edges, refresh_memory_unified_node_vectors,
+    refresh_memory_unified_nodes,
 };
 use pgmcp::reranker::{RerankerChoice, parse_reranker_choice};
 use pgmcp_testing::fixtures::test_embedding;
@@ -76,6 +77,11 @@ async fn unified_search_returns_observation_matching_query_axis() {
     refresh_memory_unified_nodes(pool)
         .await
         .expect("refresh matview");
+    // Post-2026-07-06 split: searchable embeddings live in the vectors matview,
+    // so refresh it too or `memory_unified_search` won't see the new observation.
+    refresh_memory_unified_node_vectors(pool)
+        .await
+        .expect("refresh vectors matview");
     refresh_memory_unified_edges(pool)
         .await
         .expect("refresh edges matview");
@@ -139,6 +145,10 @@ async fn unified_search_tool_normalizes_filters_and_bounds() {
     refresh_memory_unified_nodes(pool)
         .await
         .expect("refresh matview");
+    // Post-split: refresh the vectors matview so the search below sees the obs.
+    refresh_memory_unified_node_vectors(pool)
+        .await
+        .expect("refresh vectors matview");
 
     let result = server
         .call_tool_cli(

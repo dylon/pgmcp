@@ -7,6 +7,19 @@ use crate::db::queries::*;
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Session-local `maintenance_work_mem` (MiB) applied to each CONCURRENT matview
+/// refresh; set once at daemon startup from `[cron]
+/// matview_refresh_maintenance_work_mem_mib`. `0` leaves the cluster default. A
+/// process-wide tunable (mirrors `a2a::client::set_default_timeout_secs`) so the
+/// query layer needn't thread config through every refresh caller.
+static MATVIEW_REFRESH_WORK_MEM_MIB: AtomicU64 = AtomicU64::new(1024);
+
+/// Set the session-local `maintenance_work_mem` (MiB) for matview refreshes.
+pub fn set_matview_refresh_maintenance_work_mem_mib(mib: u64) {
+    MATVIEW_REFRESH_WORK_MEM_MIB.store(mib, Ordering::Relaxed);
+}
 
 /// Substring/ILIKE search across entity names, types, and observation
 /// content (Phase 3 baseline; semantic search is `memory_semantic_search`
@@ -823,20 +836,40 @@ pub async fn memory_unified_search(
     )))
     .execute(&mut *tx)
     .await?;
-    let rows = sqlx::query_as::<_, UnifiedNodeHit>(
+    // Since the 2026-07-06 split the embedding + HNSW live in
+    // `memory_unified_node_vectors`; join it to the lean `memory_unified_nodes` for
+    // label/importance. The `node_type` filter stays on the HNSW-scanned vectors
+    // matview so the index plan is unchanged. Fall back to the legacy inline-
+    // embedding query while the vectors matview is still being (re)built post-deploy
+    // (the background `ensure_memory_unified_views` creates it) — search degrades
+    // but never errors during that transition window.
+    let vectors_ready: bool =
+        sqlx::query_scalar("SELECT to_regclass('memory_unified_node_vectors') IS NOT NULL")
+            .fetch_one(&mut *tx)
+            .await?;
+    let sql = if vectors_ready {
+        "SELECT v.node_id, v.node_type, n.label, n.importance,
+                1 - (v.embedding <=> $1) AS similarity
+         FROM memory_unified_node_vectors v
+         JOIN memory_unified_nodes n ON n.node_id = v.node_id
+         WHERE ($2::text[] IS NULL OR v.node_type = ANY($2))
+         ORDER BY v.embedding <=> $1
+         LIMIT $3"
+    } else {
         "SELECT node_id, node_type, label, importance,
                 1 - (embedding <=> $1) AS similarity
          FROM memory_unified_nodes
          WHERE embedding IS NOT NULL
            AND ($2::text[] IS NULL OR node_type = ANY($2))
          ORDER BY embedding <=> $1
-         LIMIT $3",
-    )
-    .bind(&v)
-    .bind(node_types)
-    .bind(limit)
-    .fetch_all(&mut *tx)
-    .await?;
+         LIMIT $3"
+    };
+    let rows = sqlx::query_as::<_, UnifiedNodeHit>(sql)
+        .bind(&v)
+        .bind(node_types)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
     tx.commit().await?;
     Ok(rows)
 }
@@ -871,6 +904,23 @@ async fn refresh_matview_concurrently(
     sqlx::query("SET LOCAL statement_timeout = '600s'")
         .execute(&mut *tx)
         .await?;
+    // Raise maintenance_work_mem for just this refresh session (`SET LOCAL`
+    // scopes it to the tx). The unified nodes/vectors refresh rebuilds a multi-GB
+    // HNSW index over ~1M rows; at the cluster default (commonly 64 MB) that
+    // sort/build spills heavily and saturates the DB for ~10 min — the trigger
+    // behind the memory-graph-refresh RSS balloon (2026-07-06). A session-local
+    // raise slashes the spill without touching the cluster config or any other
+    // session; PostgreSQL bounds it at value × max_parallel_maintenance_workers
+    // on a separate service with headroom. Value from `[cron]
+    // matview_refresh_maintenance_work_mem_mib` (0 = leave the cluster default).
+    let work_mem_mib = MATVIEW_REFRESH_WORK_MEM_MIB.load(Ordering::Relaxed);
+    if work_mem_mib > 0 {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SET LOCAL maintenance_work_mem = '{work_mem_mib}MB'"
+        )))
+        .execute(&mut *tx)
+        .await?;
+    }
     sqlx::query(sqlx::AssertSqlSafe(format!(
         "SET LOCAL application_name = 'pgmcp:heavy:{job_tag}'"
     )))
@@ -898,6 +948,24 @@ pub async fn refresh_memory_unified_nodes(pool: &PgPool) -> Result<(), sqlx::Err
 /// `trajectory-similarity` crons or on-demand.
 pub async fn refresh_memory_unified_edges(pool: &PgPool) -> Result<(), sqlx::Error> {
     refresh_matview_concurrently(pool, "memory_unified_edges", "memory-graph-refresh").await
+}
+
+/// Refresh the materialized **node-vectors** view (embedding + HNSW). Split out of
+/// `memory_unified_nodes` on 2026-07-06 so the lean nodes matview refreshes cheaply
+/// while this (HNSW-bearing) one carries the expensive rebuild. Relies on
+/// `idx_memory_unified_node_vectors_uq (node_id)` for `CONCURRENTLY`. Called from
+/// the `memory-graph-refresh` cron. No-op (`42P01`) is impossible once the split
+/// build has run; the caller treats a missing matview as a soft failure.
+pub async fn refresh_memory_unified_node_vectors(pool: &PgPool) -> Result<(), sqlx::Error> {
+    refresh_matview_concurrently(pool, "memory_unified_node_vectors", "memory-graph-refresh").await
+}
+
+/// True if `e` is PostgreSQL `42P01 undefined_table` — used to tolerate a
+/// not-yet-created matview (e.g. `memory_unified_node_vectors` during the
+/// post-split transition, before the background `ensure_memory_unified_views`
+/// has created it) when a caller refreshes it opportunistically.
+pub fn is_undefined_table(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(d) if d.code().as_deref() == Some("42P01"))
 }
 
 /// Phase 6.3: BFS neighbors of a typed node over `memory_unified_edges`.

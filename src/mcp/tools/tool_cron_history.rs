@@ -54,6 +54,7 @@ fn cron_interval_secs(c: &CronConfig, job: &str) -> Option<u64> {
         "findings-promotion" => c.findings_promotion_interval_secs,
         "concurrency-scan" => c.concurrency_scan_interval_secs,
         "memory-graph-refresh" => c.memory_graph_refresh_interval_secs,
+        "memory-vectors-refresh" => c.memory_vectors_refresh_interval_secs,
         _ => return None,
     };
     (secs > 0).then_some(secs)

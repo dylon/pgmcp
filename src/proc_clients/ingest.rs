@@ -68,6 +68,7 @@ impl FileEventIngest {
     /// - `batch_ms` / `batch_max` — flush a batch after this long, or this many.
     /// - `pg_notify_channel` — `Some(ch)` ⇒ the writer `pg_notify`s each landed
     ///   batch on `ch` for the live fan-out (ADR-022); `None` ⇒ no fan-out.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         pool: PgPool,
         capacity: usize,
@@ -75,6 +76,7 @@ impl FileEventIngest {
         batch_ms: u64,
         batch_max: usize,
         pg_notify_channel: Option<String>,
+        memory_pressure: std::sync::Arc<crate::health::MemoryPressure>,
     ) -> Self {
         let subject: Subject<FileTouchEvent> = Subject::new(capacity.max(1));
         let tx = subject.sender();
@@ -92,6 +94,14 @@ impl FileEventIngest {
         let notify_ch = pg_notify_channel;
         let writer =
             Observable::from_receiver(batched).subscribe(move |batch: Vec<FileTouchEvent>| {
+                // Best-effort memory gate (src/health): under memory pressure, skip
+                // this batch instead of driving its DB writes — the events are
+                // drop-tolerant telemetry, and skipping keeps the ingest writer from
+                // adding to a balloon. (The embed-intake gate + heavy-cron gate carry
+                // the load-bearing pauses; this is the marginal ingest path.)
+                if memory_pressure.is_paused() {
+                    return;
+                }
                 // Plain std thread (subscribe spawns one), so block_on is legal and
                 // drives the batch insert to completion before the next batch.
                 rt.block_on(write_batch(&pool, batch, notify_ch.as_deref()));
@@ -162,11 +172,12 @@ async fn write_batch(pool: &PgPool, batch: Vec<FileTouchEvent>, pg_notify_channe
     let file_ids = resolve_file_ids(pool, &distinct).await;
     let mut projects: HashMap<String, Option<i32>> = HashMap::with_capacity(distinct.len());
     for path in &distinct {
-        let pid = crate::db::queries::find_project_by_cwd(pool, path)
+        // Lean id-only lookup (no correlated COUNT) — this loop runs per distinct
+        // path every ~200 ms and only needs the id.
+        let pid = crate::db::queries::find_project_id_by_cwd(pool, path)
             .await
             .ok()
-            .flatten()
-            .map(|p| p.id);
+            .flatten();
         projects.insert(path.clone(), pid);
     }
 

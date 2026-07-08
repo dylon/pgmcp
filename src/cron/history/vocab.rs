@@ -128,6 +128,7 @@ const SKIP_REASONS: &[SkipReason] = &[
     SkipReason::Shutdown,
     SkipReason::DbDown,
     SkipReason::DiskPressure,
+    SkipReason::MemoryPressure,
 ];
 
 /// Compile-time exhaustiveness lock: adding a `SkipReason` variant breaks this
@@ -141,7 +142,8 @@ fn skip_reason_exhaustiveness(r: SkipReason) {
         | SkipReason::LockBusy
         | SkipReason::Shutdown
         | SkipReason::DbDown
-        | SkipReason::DiskPressure => {}
+        | SkipReason::DiskPressure
+        | SkipReason::MemoryPressure => {}
     }
 }
 
@@ -212,14 +214,15 @@ mod tests {
             "shutdown",
             "db_down",
             "disk_pressure",
+            "memory_pressure",
         ]
         .into_iter()
         .collect();
         assert_eq!(got, expected, "SkipReason list drifted from outcomes.rs");
-        assert_eq!(SKIP_REASONS.len(), 6);
+        assert_eq!(SKIP_REASONS.len(), 7);
         let s = skip_reason_sql_in_list();
-        assert_eq!(s.matches('\'').count(), 6 * 2);
-        assert_eq!(s.matches(',').count(), 5);
+        assert_eq!(s.matches('\'').count(), 7 * 2);
+        assert_eq!(s.matches(',').count(), 6);
     }
 
     #[test]

@@ -607,7 +607,14 @@ fn sleep_with_shutdown(dur: std::time::Duration, shutdown: &AtomicBool) {
         if shutdown.load(Ordering::Acquire) {
             return;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100).min(dur - start.elapsed()));
+        // `saturating_sub`, not `-`: the loop condition passed, but a preempted /
+        // heavily-loaded thread can cross `elapsed >= dur` before this line runs, and
+        // `Duration - Duration` panics on underflow ("overflow when subtracting
+        // durations"). Saturating to ZERO makes the sleep a no-op and the next loop
+        // check exits cleanly.
+        std::thread::sleep(
+            std::time::Duration::from_millis(100).min(dur.saturating_sub(start.elapsed())),
+        );
     }
 }
 
@@ -680,14 +687,18 @@ fn run_worker_event_loop(
             }
         }
 
-        // Intake gate (src/health): when the DB is down or disk is under
-        // pressure, do NOT pull the next index task — leave it buffered on the
-        // bounded channel so the scanner/watcher backpressures and no indexing
-        // work is pulled-and-dropped. Queries (read-only) keep flowing either
-        // way. The file already in hand (if the DB drops mid-task) rides the
-        // existing retry helpers and, on ultimate failure, is re-picked-up by
-        // the mtime `rescan_workspace` reconciliation — see docs ADR-015.
-        let intake_open = stats.db_health().is_up() && !stats.disk_pressure().is_paused();
+        // Intake gate (src/health): when the DB is down, disk is under pressure,
+        // or memory is under pressure, do NOT pull the next index task — leave it
+        // buffered on the bounded channel so the scanner/watcher backpressures and
+        // no indexing work is pulled-and-dropped. Reading a file + chunking +
+        // embedding is the indexer's main memory grower, so pausing intake under
+        // memory pressure keeps it from adding to a balloon. Queries (read-only)
+        // keep flowing either way. The file already in hand (if the DB drops
+        // mid-task) rides the existing retry helpers and, on ultimate failure, is
+        // re-picked-up by the mtime `rescan_workspace` reconciliation (ADR-015).
+        let intake_open = stats.db_health().is_up()
+            && !stats.disk_pressure().is_paused()
+            && !stats.memory_pressure().is_paused();
         if intake_open {
             crossbeam_channel::select! {
                 recv(query_rx) -> msg => {

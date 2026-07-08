@@ -1,6 +1,8 @@
 //! Regression: a MISSING `memory_unified_edges` matview must SELF-HEAL on the
 //! next migration pass — even when the stored views-hash still MATCHES — and
-//! WITHOUT rebuilding `memory_unified_nodes` or its (multi-minute) HNSW index.
+//! WITHOUT rebuilding `memory_unified_nodes`, `memory_unified_node_vectors`, or
+//! the (multi-minute) HNSW index that now lives on the vectors matview (the
+//! 2026-07-06 nodes/vectors split).
 //!
 //! The 2026-06-20 `graph_neighbors` outage: `build_memory_unified_views` drops
 //! `memory_unified_edges` FIRST and (pre-fix) only recreated it AFTER the nodes
@@ -86,9 +88,15 @@ async fn missing_edges_matview_self_heals_without_rebuilding_nodes() {
     let nodes_rfn = relfilenode(&pool, "memory_unified_nodes")
         .await
         .expect("nodes matview present after harness setup");
-    let hnsw_rfn = relfilenode(&pool, "idx_memory_unified_nodes_embedding")
+    // Post-2026-07-06 split: the embedding + HNSW live in the separate
+    // `memory_unified_node_vectors` matview. The edges-only repair must rebuild
+    // NONE of nodes / vectors / the (expensive) vectors HNSW.
+    let vectors_rfn = relfilenode(&pool, "memory_unified_node_vectors")
         .await
-        .expect("nodes HNSW index present after harness setup");
+        .expect("vectors matview present after harness setup");
+    let hnsw_rfn = relfilenode(&pool, "idx_memory_unified_node_vectors_embedding")
+        .await
+        .expect("vectors HNSW index present after harness setup");
 
     // ---- Gate A — the daemon startup critical-path guard (defer = true). ----
     // Reproduce the live failure EXACTLY: edges dropped, stored hash left MATCHING.
@@ -119,9 +127,14 @@ async fn missing_edges_matview_self_heals_without_rebuilding_nodes() {
         "nodes matview must NOT be rebuilt by the edges-only repair (Gate A)"
     );
     assert_eq!(
-        relfilenode(&pool, "idx_memory_unified_nodes_embedding").await,
+        relfilenode(&pool, "memory_unified_node_vectors").await,
+        Some(vectors_rfn),
+        "vectors matview must NOT be rebuilt by the edges-only repair (Gate A)"
+    );
+    assert_eq!(
+        relfilenode(&pool, "idx_memory_unified_node_vectors_embedding").await,
         Some(hnsw_rfn),
-        "nodes HNSW index must NOT be rebuilt by the edges-only repair (Gate A)"
+        "vectors HNSW index must NOT be rebuilt by the edges-only repair (Gate A)"
     );
 
     // ---- Gate B — the hash gate (defer = false): existence dominates. ----
@@ -149,9 +162,14 @@ async fn missing_edges_matview_self_heals_without_rebuilding_nodes() {
         "nodes matview must NOT be rebuilt by the hash-gate edges-only repair (Gate B)"
     );
     assert_eq!(
-        relfilenode(&pool, "idx_memory_unified_nodes_embedding").await,
+        relfilenode(&pool, "memory_unified_node_vectors").await,
+        Some(vectors_rfn),
+        "vectors matview must NOT be rebuilt by the hash-gate edges-only repair (Gate B)"
+    );
+    assert_eq!(
+        relfilenode(&pool, "idx_memory_unified_node_vectors_embedding").await,
         Some(hnsw_rfn),
-        "nodes HNSW index must NOT be rebuilt by the hash-gate edges-only repair (Gate B)"
+        "vectors HNSW index must NOT be rebuilt by the hash-gate edges-only repair (Gate B)"
     );
 
     // End-to-end: a query over the repaired matview (what `graph_neighbors` walks)

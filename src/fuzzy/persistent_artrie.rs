@@ -70,7 +70,29 @@ where
         // Sniff for an existing trie file. PersistentARTrieChar uses the
         // path itself as the primary file; if it doesn't exist, create.
         if path.exists() {
-            let (trie, report) = PersistentARTrieChar::<V>::open_with_recovery(path)?;
+            // The Tier-1 single-owner advisory lock is released when the prior
+            // handle's trie is dropped — but not always *synchronously*: a
+            // background overlay worker can hold the lock for a few ms after the
+            // `Arc` refcount hits zero, and a fast restart after an OOM-kill
+            // (systemd `RestartSec=5`) can beat the dying process's flock release.
+            // Retry a bounded number of times on a transient `FileLocked` to ride
+            // out that window; any other error, or exhausting the retries,
+            // propagates. (Root cause is libdictenstein's async drop-release; this
+            // is the resilient open at pgmcp's layer.)
+            use libdictenstein::persistent_artrie::error::PersistentARTrieError;
+            const MAX_ATTEMPTS: u32 = 10;
+            const BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+            let mut attempt: u32 = 0;
+            let (trie, report) = loop {
+                match PersistentARTrieChar::<V>::open_with_recovery(path) {
+                    Ok(ok) => break ok,
+                    Err(PersistentARTrieError::FileLocked { .. }) if attempt + 1 < MAX_ATTEMPTS => {
+                        attempt += 1;
+                        std::thread::sleep(BACKOFF);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+            };
             let storage = std::sync::Arc::new(trie);
             Ok((
                 Self {

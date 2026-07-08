@@ -34,6 +34,11 @@ use chrono::{DateTime, Utc};
 /// - `DiskPressure`: the `crate::health` disk watchdog has paused pgmcp's
 ///   disk-growing work because a watched filesystem is below its free-bytes
 ///   or free-inode floor. Applies to heavy crons (which write/grow data).
+/// - `MemoryPressure`: the `crate::health` memory watchdog has paused pgmcp's
+///   memory-growing work because system available RAM fell below its floor or
+///   the process RSS climbed past its ceiling. Applies to heavy crons; the
+///   deferred run is retried once memory recovers (honor-settle cooldown seam),
+///   so this is a *wait-for-RAM*, not a lost cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkipReason {
     PhaseGate,
@@ -42,6 +47,7 @@ pub enum SkipReason {
     Shutdown,
     DbDown,
     DiskPressure,
+    MemoryPressure,
 }
 
 impl SkipReason {
@@ -53,6 +59,7 @@ impl SkipReason {
             SkipReason::Shutdown => "shutdown",
             SkipReason::DbDown => "db_down",
             SkipReason::DiskPressure => "disk_pressure",
+            SkipReason::MemoryPressure => "memory_pressure",
         }
     }
 }
@@ -88,6 +95,7 @@ impl CronJobOutcome {
             CronJobOutcome::Skipped(SkipReason::Shutdown) => "skipped:shutdown",
             CronJobOutcome::Skipped(SkipReason::DbDown) => "skipped:db_down",
             CronJobOutcome::Skipped(SkipReason::DiskPressure) => "skipped:disk_pressure",
+            CronJobOutcome::Skipped(SkipReason::MemoryPressure) => "skipped:memory_pressure",
             CronJobOutcome::Panicked => "panicked",
         }
     }
