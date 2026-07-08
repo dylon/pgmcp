@@ -760,10 +760,26 @@ fn codex_relative_path_allowed(relative: &Path) -> bool {
 }
 
 /// Find the project root for a given file path.
+///
+/// Fast path: the nearest ancestor already registered in `project_roots` (the
+/// in-memory `DashMap` populated by the parallel walk). **C1 filesystem
+/// fallback:** on a full `DashMap` miss — which happens when the parallel walk
+/// hasn't yet visited this file's root dir (a benign ordering race), or on a
+/// single-file rescan through the watcher — the ancestors are probed on disk for
+/// the nearest `.git` (a directory for a checkout/clone, OR a *file* for a linked
+/// worktree pointer), bounded by the file's workspace root. Without this fallback
+/// every raced file collapsed into one synthetic catch-all project (the 22 k-file
+/// `default` that ballooned the fuzzy-sync symbols trie to 11.5 GB and OOM'd the
+/// daemon). An FS-found root is inserted into `project_roots` (mirroring the walk)
+/// so subsequent files under it take the fast path. Returns `None` only when no
+/// `.git` exists anywhere from the file up to its workspace root (the caller then
+/// assigns a bounded per-top-level-directory project — see C2 in `embed::pool`).
 pub fn find_project_root<'a>(
     path: &Path,
     project_roots: &'a DashMap<PathBuf, ProjectRoot>,
+    workspace_paths: &[String],
 ) -> Option<(PathBuf, dashmap::mapref::one::Ref<'a, PathBuf, ProjectRoot>)> {
+    // Fast path: nearest already-known ancestor root.
     let mut current = path.parent();
     while let Some(dir) = current {
         if let Some(root) = project_roots.get(&dir.to_path_buf()) {
@@ -771,7 +787,90 @@ pub fn find_project_root<'a>(
         }
         current = dir.parent();
     }
+
+    // C1 filesystem fallback (DashMap missed): resolve the file's REAL git root.
+    let workspace_root = matching_workspace_root(path, workspace_paths)?;
+    let start = path.parent()?;
+    let git_root = nearest_git_root_ancestor(start, Path::new(workspace_root))?;
+    let name = git_root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "unknown".into());
+    {
+        // `or_insert_with` briefly holds a shard WRITE guard; scope it so the
+        // subsequent `get` (a READ guard on the same shard) cannot deadlock.
+        let _ = project_roots
+            .entry(git_root.clone())
+            .or_insert_with(|| ProjectRoot {
+                workspace_path: workspace_root.to_string(),
+                name,
+            });
+    }
+    project_roots.get(&git_root).map(|r| (git_root, r))
+}
+
+/// The configured workspace root that contains `path` (the longest match wins
+/// when workspaces nest). `None` when `path` lies outside every configured
+/// workspace. Pure; unit-tested.
+pub fn matching_workspace_root<'a>(path: &Path, workspace_paths: &'a [String]) -> Option<&'a str> {
+    workspace_paths
+        .iter()
+        .filter(|ws| path.starts_with(ws.as_str()))
+        .max_by_key(|ws| ws.len())
+        .map(String::as_str)
+}
+
+/// Nearest ancestor of `start_dir` (inclusive) that is a git root, without
+/// walking above `workspace_root`. A "git root" is any dir for which
+/// `is_git_root` holds — the FS-backed wrapper treats a `.git` entry (directory
+/// OR file) as the marker, so linked worktrees (whose `.git` is a file) are
+/// discovered as roots too. Pure over the probe so C1's ancestor resolution is
+/// unit-tested without touching the filesystem.
+fn nearest_git_root_ancestor_with<F: Fn(&Path) -> bool>(
+    start_dir: &Path,
+    workspace_root: &Path,
+    is_git_root: F,
+) -> Option<PathBuf> {
+    let mut current = Some(start_dir);
+    while let Some(dir) = current {
+        if !dir.starts_with(workspace_root) {
+            break;
+        }
+        if is_git_root(dir) {
+            return Some(dir.to_path_buf());
+        }
+        current = dir.parent();
+    }
     None
+}
+
+/// Filesystem-backed [`nearest_git_root_ancestor_with`]: a dir is a git root iff
+/// it contains a `.git` entry (directory for a checkout/clone, file for a linked
+/// worktree pointer).
+fn nearest_git_root_ancestor(start_dir: &Path, workspace_root: &Path) -> Option<PathBuf> {
+    nearest_git_root_ancestor_with(start_dir, workspace_root, |dir| dir.join(".git").exists())
+}
+
+/// C2: the `(path, name)` of the per-**top-level-directory** project for a
+/// git-less file — the first path component beneath its workspace root becomes
+/// its own bounded project (`name` = that component, `path` = `workspace/component`).
+/// A genuinely git-less directory thus gets its OWN bounded project instead of
+/// collapsing every such file into one shared `default` catch-all. `None` when
+/// `path` is outside every workspace or has no component beneath the workspace
+/// root (the caller then falls back to the file's own parent directory — still a
+/// bounded per-directory project, never a shared default). Pure; unit-tested.
+pub fn per_top_level_dir_project(
+    path: &Path,
+    workspace_paths: &[String],
+) -> Option<(PathBuf, String)> {
+    let workspace_root = matching_workspace_root(path, workspace_paths)?;
+    let relative = path.strip_prefix(workspace_root).ok()?;
+    let name = match relative.components().next()? {
+        std::path::Component::Normal(component) => component.to_str()?.to_string(),
+        _ => return None,
+    };
+    let project_path = Path::new(workspace_root).join(&name);
+    Some((project_path, name))
 }
 
 /// Info about a discovered project root.
@@ -944,5 +1043,114 @@ mod tests {
                 "expected Codex scanner to exclude {path}"
             );
         }
+    }
+
+    // ── C1: ancestor FS git-root resolution ──────────────────────────────────
+
+    fn ws() -> Vec<String> {
+        vec!["/home/u/ws".to_string()]
+    }
+
+    #[test]
+    fn c1_resolves_nearest_ancestor_git_root() {
+        // `.git` lives at `/home/u/ws/proj`; a deep file resolves to it.
+        let roots = ["/home/u/ws/proj"];
+        let is_root = |dir: &Path| roots.contains(&dir.to_string_lossy().as_ref());
+        let got = nearest_git_root_ancestor_with(
+            Path::new("/home/u/ws/proj/src/deep/mod.rs")
+                .parent()
+                .unwrap(),
+            Path::new("/home/u/ws"),
+            is_root,
+        );
+        assert_eq!(got, Some(PathBuf::from("/home/u/ws/proj")));
+    }
+
+    #[test]
+    fn c1_picks_the_nearest_when_nested_git_roots_exist() {
+        // Both the outer repo and an inner submodule-like dir have `.git`; the
+        // NEAREST ancestor wins.
+        let roots = ["/home/u/ws/proj", "/home/u/ws/proj/vendor/lib"];
+        let is_root = |dir: &Path| roots.contains(&dir.to_string_lossy().as_ref());
+        let got = nearest_git_root_ancestor_with(
+            Path::new("/home/u/ws/proj/vendor/lib/src/x.rs")
+                .parent()
+                .unwrap(),
+            Path::new("/home/u/ws"),
+            is_root,
+        );
+        assert_eq!(got, Some(PathBuf::from("/home/u/ws/proj/vendor/lib")));
+    }
+
+    #[test]
+    fn c1_stops_at_workspace_root_and_does_not_walk_above_it() {
+        // A `.git` ABOVE the workspace root must NOT be returned.
+        let roots = ["/home/u"];
+        let is_root = |dir: &Path| roots.contains(&dir.to_string_lossy().as_ref());
+        let got = nearest_git_root_ancestor_with(
+            Path::new("/home/u/ws/loose/file.txt").parent().unwrap(),
+            Path::new("/home/u/ws"),
+            is_root,
+        );
+        assert_eq!(got, None, "must not escape above the workspace root");
+    }
+
+    #[test]
+    fn c1_workspace_root_itself_is_probed_inclusively() {
+        let roots = ["/home/u/ws"];
+        let is_root = |dir: &Path| roots.contains(&dir.to_string_lossy().as_ref());
+        let got = nearest_git_root_ancestor_with(
+            Path::new("/home/u/ws/a/b.txt").parent().unwrap(),
+            Path::new("/home/u/ws"),
+            is_root,
+        );
+        assert_eq!(got, Some(PathBuf::from("/home/u/ws")));
+    }
+
+    #[test]
+    fn matching_workspace_root_picks_longest_prefix() {
+        let paths = vec!["/home/u/ws".to_string(), "/home/u/ws/nested".to_string()];
+        assert_eq!(
+            matching_workspace_root(Path::new("/home/u/ws/nested/proj/f.rs"), &paths),
+            Some("/home/u/ws/nested"),
+            "most specific (longest) workspace wins"
+        );
+        assert_eq!(
+            matching_workspace_root(Path::new("/elsewhere/f.rs"), &paths),
+            None
+        );
+    }
+
+    // ── C2: per-top-level-directory fallback (never a shared default) ─────────
+
+    #[test]
+    fn c2_git_less_file_gets_per_top_level_dir_project() {
+        let got = per_top_level_dir_project(Path::new("/home/u/ws/loose/sub/note.md"), &ws());
+        assert_eq!(
+            got,
+            Some((PathBuf::from("/home/u/ws/loose"), "loose".to_string())),
+            "the first component beneath the workspace root is the project"
+        );
+    }
+
+    #[test]
+    fn c2_two_git_less_dirs_get_distinct_projects_never_merged() {
+        let a = per_top_level_dir_project(Path::new("/home/u/ws/alpha/x.txt"), &ws());
+        let b = per_top_level_dir_project(Path::new("/home/u/ws/beta/y.txt"), &ws());
+        assert_eq!(a, Some((PathBuf::from("/home/u/ws/alpha"), "alpha".into())));
+        assert_eq!(b, Some((PathBuf::from("/home/u/ws/beta"), "beta".into())));
+        assert_ne!(
+            a, b,
+            "distinct top-level dirs never collapse into one default"
+        );
+    }
+
+    #[test]
+    fn c2_returns_none_outside_any_workspace() {
+        assert_eq!(
+            per_top_level_dir_project(Path::new("/elsewhere/x.txt"), &ws()),
+            None,
+            "outside every workspace → caller uses a bounded parent-dir fallback"
+        );
     }
 }

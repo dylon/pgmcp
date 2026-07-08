@@ -961,13 +961,24 @@ fn process_index_file_task(
 
     // Resolve project (project_root + project_id) — async DB call.
     let resolved = rt.block_on(async {
-        match scanner::find_project_root(&path, &task.project_roots) {
+        match scanner::find_project_root(&path, &task.project_roots, &cfg.workspace.paths) {
             Some((root_path, root_info)) => {
                 let info = root_info.clone();
                 drop(root_info); // release dashmap ref
                 let git_common_dir = crate::indexer::git_indexer::detect_git_common_dir(&root_path);
                 let git_root_commits =
                     crate::indexer::git_indexer::detect_git_root_commits(&root_path);
+                // Per-worktree projects: each resolved git root — a normal
+                // checkout, an independent fork, OR a linked worktree — upserts as
+                // its own project under its own path. Worktrees are deliberately
+                // NOT collapsed onto their main here: that map-to-main inflated a
+                // heavily-worktree'd main's source-row count past the fuzzy
+                // `skip-oversize` threshold, which would drop the main's fuzzy trie
+                // (the row count double-counts worktree dupes that the trie itself
+                // dedups by name). Cross-project tools still default to the main
+                // checkout via `pick_main_worktree_ids`, grouping worktrees at
+                // query time from the `git_common_dir` / `git_root_commits` signals
+                // persisted here.
                 let id = upsert_project_with_retry(
                     db.as_ref(),
                     &info.workspace_path,
@@ -984,19 +995,44 @@ fn process_index_file_task(
                 ))
             }
             None => {
-                let workspace = cfg.workspace.paths.first().cloned().unwrap_or_default();
-                // The synthetic "default" project has no project_root, so
-                // can't run `git rev-parse` — pass NULL for both signals.
+                // C2: no git root anywhere from the file up to its workspace root
+                // (C1's FS fallback also missed). Give the file a per-top-level-
+                // directory project so a genuinely git-less directory becomes its
+                // OWN bounded project — NEVER a single shared `default` catch-all
+                // (the 22 k-file merge that ballooned the fuzzy-sync symbols trie
+                // to 11.5 GB and OOM'd the daemon).
+                let (proj_path, proj_name) =
+                    scanner::per_top_level_dir_project(&path, &cfg.workspace.paths).unwrap_or_else(
+                        || {
+                            // Degenerate: file outside every workspace (or a file
+                            // sitting directly in a workspace root). Keep its own
+                            // parent directory as a bounded per-directory project.
+                            let parent = path.parent().unwrap_or(&path).to_path_buf();
+                            let name = parent
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| "unknown".into());
+                            (parent, name)
+                        },
+                    );
+                let workspace = scanner::matching_workspace_root(&path, &cfg.workspace.paths)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| cfg.workspace.paths.first().cloned().unwrap_or_default());
+                // A git-less directory has no worktree-grouping signals.
                 let id = upsert_project_with_retry(
                     db.as_ref(),
                     &workspace,
-                    &workspace,
-                    "default",
+                    &proj_path.to_string_lossy(),
+                    &proj_name,
                     None,
                     None,
                 )
                 .await?;
-                Ok((id, workspace, None))
+                Ok((
+                    id,
+                    proj_path.to_string_lossy().into_owned(),
+                    Some(proj_path),
+                ))
             }
         }
     });

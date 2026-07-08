@@ -6,6 +6,7 @@ use crate::db::queries::*;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use sqlx::PgPool;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -255,11 +256,10 @@ pub(crate) fn pick_main_worktree_ids(
 
     let mut main_ids = singletons;
     for (_, mut members) in groups {
-        // Shortest basename wins; tie-break lexicographically; final tie-break by id.
+        // Shortest basename wins; lexicographic tie-break; final tie-break by id.
         members.sort_by(|a, b| {
-            a.1.len()
-                .cmp(&b.1.len())
-                .then_with(|| a.1.cmp(&b.1))
+            worktree_basename_rank(&a.1)
+                .cmp(&worktree_basename_rank(&b.1))
                 .then_with(|| a.0.cmp(&b.0))
         });
         if let Some((id, _)) = members.into_iter().next() {
@@ -269,6 +269,72 @@ pub(crate) fn pick_main_worktree_ids(
 
     main_ids.sort();
     main_ids
+}
+
+/// Ranking key for the "main" of a worktree group: **shortest basename wins,
+/// lexicographic as the tiebreak**. Extracted so the convention lives in exactly
+/// one pure, tested place: [`pick_main_worktree_ids`] applies it per group at
+/// query time, and [`project_main_path_name`] resolves the same canonical
+/// checkout at assignment time (see its docs for how the two agree).
+fn worktree_basename_rank(basename: &str) -> (usize, &str) {
+    (basename.len(), basename)
+}
+
+/// Assignment-time project identity for a resolved git root: the `(path, name)`
+/// under which the root should be upserted so that all linked worktrees of one
+/// upstream collapse onto a **single main-checkout project row** — no
+/// per-worktree row explosion, and correct cross-project analysis.
+///
+/// The main checkout is the directory that **owns the shared `.git`**: the
+/// parent of `git_common_dir`, which `detect_git_common_dir` canonicalizes to
+/// `<main>/.git` for the main checkout AND every linked worktree of it. So:
+///
+/// - a **linked worktree** (its `.git` is a FILE pointing at the shared dir)
+///   projects onto its main checkout;
+/// - a **normal checkout** or an **independent fork** (its `.git` is its OWN
+///   directory) has `parent(git_common_dir) == own_path`, so it projects onto
+///   ITSELF and stays its own project — a distinct fork is never merged;
+/// - a **non-git directory** (`git_common_dir == None`) keeps its own path.
+///
+/// `git_common_dir` is used directly (rather than re-deriving via the
+/// shortest-basename heuristic) because the owner is the *group-invariant*
+/// target: every worktree of one upstream maps to the same checkout, which is
+/// exactly what guarantees the collapse. Under the user's `<canonical>-<feature>`
+/// worktree-naming convention that owner is precisely the shortest-basename
+/// member [`pick_main_worktree_ids`] selects at query time (via
+/// [`worktree_basename_rank`]), so assignment-time identity and query-time
+/// grouping agree. Only a `.git`-named common dir is unwrapped; anything else
+/// (e.g. a bare-repo common dir) falls back to `own_path` so a checkout is never
+/// mis-attributed.
+// NOTE: not wired into assignment right now. Assignment uses PER-WORKTREE project
+// identity (see src/embed/pool.rs): each resolved git root — including a linked
+// worktree — is its own project, and cross-project tools default to the main via
+// `pick_main_worktree_ids` at query time. Map-to-main (this helper) was reverted
+// from the assignment path because collapsing worktrees onto their main inflates
+// the main's RAW source-row count past the fuzzy `skip-oversize` threshold (the
+// trie dedups by name but the row count double-counts worktree files), which would
+// drop a heavily-worktree'd main's fuzzy trie. This validated helper is retained
+// for a future map-to-main path that also dedups worktree files at index time.
+#[allow(dead_code)]
+pub(crate) fn project_main_path_name(
+    own_path: &Path,
+    git_common_dir: Option<&str>,
+) -> (PathBuf, String) {
+    let main_path = git_common_dir
+        .map(Path::new)
+        .filter(|gcd| gcd.file_name() == Some(std::ffi::OsStr::new(".git")))
+        .and_then(Path::parent)
+        // A main checkout / independent fork owns its OWN `.git`, so the owner
+        // equals `own_path` — keep it as its own project. Only a DIFFERENT owner
+        // (a linked worktree's upstream) remaps.
+        .filter(|owner| *owner != own_path)
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| own_path.to_path_buf());
+    let name = main_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| main_path.to_string_lossy().into_owned());
+    (main_path, name)
 }
 
 #[cfg(test)]
@@ -391,6 +457,69 @@ mod worktree_tests {
     fn empty_input_returns_empty() {
         let rows: Vec<(i32, String, Option<String>, Option<String>)> = Vec::new();
         assert!(pick_main_worktree_ids(&rows).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod project_identity_tests {
+    use super::project_main_path_name;
+    use std::path::{Path, PathBuf};
+
+    /// C3: a linked worktree (its `.git` is a FILE whose canonical common dir is
+    /// the MAIN checkout's `.git`) projects onto the main checkout's path/name,
+    /// so every worktree of one upstream collapses to a single project row.
+    #[test]
+    fn git_file_worktree_projects_onto_its_main_checkout() {
+        // `f1r3node-reified-rspaces` is a worktree of `f1r3node`; both resolve
+        // `git_common_dir` to `/ws/f1r3node/.git`.
+        let (path, name) = project_main_path_name(
+            Path::new("/ws/f1r3node-reified-rspaces"),
+            Some("/ws/f1r3node/.git"),
+        );
+        assert_eq!(path, PathBuf::from("/ws/f1r3node"));
+        assert_eq!(name, "f1r3node");
+    }
+
+    /// C3: an independent fork / normal checkout (its `.git` is its OWN
+    /// directory, so `git_common_dir` points under itself) stays its own
+    /// project — a distinct fork is never merged into another.
+    #[test]
+    fn git_dir_fork_projects_onto_itself() {
+        let (path, name) = project_main_path_name(
+            Path::new("/ws/MeTTa-Compiler-fork"),
+            Some("/ws/MeTTa-Compiler-fork/.git"),
+        );
+        assert_eq!(path, PathBuf::from("/ws/MeTTa-Compiler-fork"));
+        assert_eq!(name, "MeTTa-Compiler-fork");
+    }
+
+    /// A plain main checkout resolves to itself (identity is unchanged from the
+    /// pre-C3 behavior for normal git-rooted projects).
+    #[test]
+    fn main_checkout_projects_onto_itself() {
+        let (path, name) =
+            project_main_path_name(Path::new("/ws/f1r3node"), Some("/ws/f1r3node/.git"));
+        assert_eq!(path, PathBuf::from("/ws/f1r3node"));
+        assert_eq!(name, "f1r3node");
+    }
+
+    /// C3: a non-git directory (no `git_common_dir`) keeps its own path/name —
+    /// C2 gives it a bounded per-directory project; it is never a shared default.
+    #[test]
+    fn non_git_dir_keeps_its_own_identity() {
+        let (path, name) = project_main_path_name(Path::new("/ws/loose-notes"), None);
+        assert_eq!(path, PathBuf::from("/ws/loose-notes"));
+        assert_eq!(name, "loose-notes");
+    }
+
+    /// A common dir that is NOT `.git`-named (e.g. a bare repo) does not unwrap;
+    /// the project keeps its own path so a checkout is never mis-attributed.
+    #[test]
+    fn non_dotgit_common_dir_falls_back_to_own_path() {
+        let (path, name) =
+            project_main_path_name(Path::new("/ws/checkout"), Some("/ws/bare-repo.git"));
+        assert_eq!(path, PathBuf::from("/ws/checkout"));
+        assert_eq!(name, "checkout");
     }
 }
 

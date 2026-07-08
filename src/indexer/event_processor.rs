@@ -180,11 +180,12 @@ pub fn start_indexing(
                     // Fall through — still index the .pgmcp.toml as a regular file
 
                     // Look up project override for this file
-                    let project_override =
-                        scanner::find_project_root(&event.path, &project_roots_for_filter)
-                            .and_then(|(root, _)| {
-                                project_overrides_for_filter.get(&root).map(|r| r.clone())
-                            });
+                    let project_override = scanner::find_project_root(
+                        &event.path,
+                        &project_roots_for_filter,
+                        &cfg.workspace.paths,
+                    )
+                    .and_then(|(root, _)| project_overrides_for_filter.get(&root).map(|r| r.clone()));
 
                     // Extension check: global OR project-level file_types
                     if event.kind != watcher::FileEventKind::Remove {
