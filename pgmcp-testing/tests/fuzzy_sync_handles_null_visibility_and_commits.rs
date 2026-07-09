@@ -111,7 +111,7 @@ async fn rebuild_symbols_tolerates_null_visibility() {
 
     // Pre-fix this returned: "persistent trie error: symbol fetch: error occurred
     // while decoding column 3: unexpected null; try decoding as an `Option`".
-    let count = rebuild_symbols(testdb.pool(), project_id, &idx)
+    let count = rebuild_symbols(testdb.pool(), project_id, &idx, 25_000)
         .await
         .expect("rebuild_symbols must tolerate NULL visibility");
     assert!(count >= 1, "expected >=1 symbol synced, got {count}");
@@ -143,7 +143,7 @@ async fn rebuild_commits_uses_commit_hash_column() {
     let (idx, _recovery) = FuzzyIndex::<CommitRef>::open_or_create(&path).expect("open_or_create");
 
     // Pre-fix this returned: "commit fetch: ... column \"sha\" does not exist".
-    let count = rebuild_commits(testdb.pool(), project_id, &idx)
+    let count = rebuild_commits(testdb.pool(), project_id, &idx, 25_000)
         .await
         .expect("rebuild_commits must select commit_hash, not sha");
     assert!(count >= 1, "expected >=1 commit synced, got {count}");

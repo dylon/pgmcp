@@ -38,7 +38,7 @@ async fn concept_trie_fuzzy_and_prefix_lookup() {
     let dir = tempdir().expect("tempdir");
     let path = dir.path().join("concepts.artrie");
     let (idx, _) = FuzzyIndex::<ConceptValue>::open_or_create(&path).expect("open trie");
-    let n = rebuild_concepts(pool, &idx)
+    let n = rebuild_concepts(pool, &idx, 25_000)
         .await
         .expect("rebuild concepts");
     assert!(n >= 2, "rebuilt at least the two seeded concepts (got {n})");
