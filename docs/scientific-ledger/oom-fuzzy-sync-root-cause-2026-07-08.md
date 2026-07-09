@@ -94,3 +94,38 @@ CLAUDE.md mandates: each hypothesis, its test, and the result.
 
 Interim safety: cgroup `MemoryMax=24G` + `fuzzy_sync_interval_secs=86400` (raised
 from 30 min) prevent a system OOM while A1 is dormant.
+
+## H5 (CORRECTED, decisive): stale TRIE bloat + reopen-eager-load — CONFIRMED
+
+After deploying A1 + skip-oversize + C-layer, a live triggered fuzzy-sync STILL
+ballooned to ~13 GB (though it plateaued < the 24 GB backstop, no system OOM). The
+diagnosis of H3/H4 was **incomplete**: the balloon is neither the build overlay (A1
+bounds it) nor the current source size (skip-oversize checks it).
+
+- **Test:** `/proc/PID/smaps_rollup` → 13.6 GB **anonymous heap**; `/proc/PID/maps` →
+  one `.artrie` mmap of **11.28 GB** (the `default` symbols trie) open mid-sync.
+  `SELECT count(*)` over `default`'s current `file_symbols` = **208,625**.
+- **Result (CONFIRMED):** the `default` trie is **11.5 GB on disk with only 208 K
+  current symbols** — it is **stale-bloated**. `rebuild_symbols`/`paths`/`commits`
+  *upsert* current terms but NEVER remove deleted ones, so as a project's source
+  shrinks (file cleanup: millions → 208 K) the trie retains every old term. Each
+  fuzzy-sync `open_or_create`s that bloated trie, and libdictenstein's reopen
+  **eager-loads the full ~11 GB image into heap** — the balloon. This is why A1
+  (build-eviction) and skip-oversize (source-count) both failed to stop it.
+
+**Fix applied (decisive):** wiped `$data_dir/fuzzy` (103 GB, mostly stale bloat) →
+reclaimed ~100 GB → tries rebuild fresh from the current (small) sources. **Live
+re-verified: fuzzy-sync RSS now plateaus at ~1.5–2.0 GB with a clean sawtooth**
+(tries free between iterations when not stale-huge) — down from 48 GB / 13 GB. The
+committed fixes (skip-oversize, A1, C-layer, backstop) are complementary safety
+nets; the reset was decisive.
+
+## Still open (durable)
+
+- **Prevent re-bloat (rebuild-fresh):** the wipe is a one-time reset; without a code
+  change the tries slowly re-accumulate deleted terms (months of runway — 11.5 GB
+  took months). Durable fix: `run_fuzzy_sync` should DISCARD each trie before
+  rebuilding (fresh from the current source), ideally gated on a per-trie
+  data-change check (mirror `memory_graph_refresh`) to avoid rewriting unchanged
+  tries, and reader-safe (build to a temp path + atomic swap, or accept the brief
+  rebuild window). Not urgent; deserves careful implementation, not a rushed change.
