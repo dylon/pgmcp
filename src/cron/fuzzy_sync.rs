@@ -871,7 +871,10 @@ mod tests {
 
         reset_trie_on_disk(&artrie, false).expect("reset per-project");
 
-        assert!(!dir.exists(), "the dedicated per-project dir is removed whole");
+        assert!(
+            !dir.exists(),
+            "the dedicated per-project dir is removed whole"
+        );
         assert!(sibling.exists(), "a sibling project's trie is untouched");
 
         // Idempotent: a second reset on the now-absent dir is a clean no-op.
@@ -898,7 +901,10 @@ mod tests {
 
         // This trie's own files (stem `mandates_durable.`) are gone …
         assert!(!mandates.exists(), "global .artrie removed");
-        assert!(!fuzzy.join("mandates_durable.wal").exists(), "global .wal removed");
+        assert!(
+            !fuzzy.join("mandates_durable.wal").exists(),
+            "global .wal removed"
+        );
         assert!(
             !fuzzy.join("mandates_durable.wal.compacting-stale").exists(),
             "crash-left compaction sibling removed"
@@ -906,7 +912,10 @@ mod tests {
         // … but the sibling global trie, the sentinel, and the shared wal_pending
         // dir (+ its segments) all survive.
         assert!(concepts.exists(), "sibling concepts .artrie untouched");
-        assert!(fuzzy.join("concepts_global.wal").exists(), "sibling .wal untouched");
+        assert!(
+            fuzzy.join("concepts_global.wal").exists(),
+            "sibling .wal untouched"
+        );
         assert!(
             fuzzy.join(".format_version").exists(),
             "format sentinel preserved (would break the whole tree if removed)"
