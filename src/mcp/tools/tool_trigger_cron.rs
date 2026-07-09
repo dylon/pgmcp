@@ -368,7 +368,14 @@ async fn trigger_cron_dispatch(
                 .db()
                 .pool()
                 .ok_or_else(|| McpError::internal_error("no pool available", None))?;
-            let (data_dir, max_disk_bytes, eviction_cfg, checkpoint_every, oversize_threshold) = {
+            let (
+                data_dir,
+                max_disk_bytes,
+                eviction_cfg,
+                checkpoint_every,
+                oversize_threshold,
+                max_staleness,
+            ) = {
                 let cfg = ctx.config().load();
                 (
                     cfg.fuzzy.data_dir.clone(),
@@ -376,6 +383,7 @@ async fn trigger_cron_dispatch(
                     cfg.fuzzy.eviction_config(),
                     cfg.fuzzy.checkpoint_every_rows,
                     cfg.fuzzy.oversize_trie_row_threshold,
+                    cfg.cron.fuzzy_sync_max_staleness_secs,
                 )
             };
             let report = crate::cron::fuzzy_sync::run_fuzzy_sync(
@@ -385,6 +393,7 @@ async fn trigger_cron_dispatch(
                 eviction_cfg,
                 checkpoint_every,
                 oversize_threshold,
+                max_staleness,
                 std::sync::Arc::clone(stats),
             )
             .await
@@ -398,7 +407,8 @@ async fn trigger_cron_dispatch(
                 "durable_mandates_synced": report.durable_mandates_synced,
                 "concepts_synced": report.concepts_synced,
                 "skipped_oversize": report.skipped_oversize,
-                "guidance": "Per-project symbol/path/commit + global durable-mandate & ontology-concept fuzzy tries rebuilt from PG. skipped_oversize counts per-(project,kind) rebuilds skipped by [fuzzy] oversize_trie_row_threshold.",
+                "skipped_unchanged": report.skipped_unchanged,
+                "guidance": "Per-project symbol/path/commit + global durable-mandate & ontology-concept fuzzy tries rebuilt from a CLEAN slate (only when the PG source fingerprint changed since the last rebuild, within [cron] fuzzy_sync_max_staleness_secs). skipped_oversize counts rebuilds skipped by [fuzzy] oversize_trie_row_threshold; skipped_unchanged counts (project,kind) tries skipped by the data-change gate.",
             }))
         }
         "graph-analysis" => {

@@ -3548,6 +3548,19 @@ pub struct CronConfig {
     #[serde(default = "default_fuzzy_sync_interval")]
     pub fuzzy_sync_interval_secs: u64,
 
+    /// Max-staleness backstop for the `cron::fuzzy_sync` per-trie data-change
+    /// gate, in seconds (default: 604800 = 7 days). Each (project, kind) trie is
+    /// rebuilt-fresh only when its PG source fingerprint (`count:max_id`) changed
+    /// since the last successful rebuild — an unchanged trie is skipped so the
+    /// job does not rewrite every trie every run. This backstop bounds that skip:
+    /// a low-churn trie whose fingerprint has not moved is still rebuilt once its
+    /// last rebuild is older than this window, so a silently-drifted on-disk trie
+    /// (e.g. from a partial write) self-heals. `0` collapses the window to zero —
+    /// the fingerprint is never considered fresh, so every run rebuilds every
+    /// changed-or-not trie (the gate is effectively disabled).
+    #[serde(default = "default_fuzzy_sync_max_staleness")]
+    pub fuzzy_sync_max_staleness_secs: u64,
+
     /// Interval between per-project HybridLanguageModel re-training
     /// runs in seconds (default: 43200 = 12 h). Backs Phase 9's third
     /// RRF leg in `tool_hybrid_search`.
@@ -3903,6 +3916,7 @@ impl Default for CronConfig {
             graph_analysis_interval_secs: default_graph_analysis_interval(),
             symbol_extraction_interval_secs: default_symbol_extraction_interval(),
             fuzzy_sync_interval_secs: default_fuzzy_sync_interval(),
+            fuzzy_sync_max_staleness_secs: default_fuzzy_sync_max_staleness(),
             ngram_lm_train_interval_secs: default_ngram_lm_train_interval(),
             topic_dendrogram_interval_secs: default_topic_dendrogram_interval(),
             embedding_migration_interval_secs: default_embedding_migration_interval(),
@@ -4408,6 +4422,9 @@ fn default_symbol_extraction_interval() -> u64 {
 fn default_fuzzy_sync_interval() -> u64 {
     1800
 } // 30 min
+fn default_fuzzy_sync_max_staleness() -> u64 {
+    604_800
+} // 7 days — backstop so a low-churn fuzzy trie still rebuilds occasionally
 fn default_ngram_lm_train_interval() -> u64 {
     43200
 } // 12 h

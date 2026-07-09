@@ -2170,6 +2170,7 @@ pub fn schedule_maintenance_jobs(
     let fuzzy_eviction_cfg = fuzzy_config.eviction_config();
     let fuzzy_checkpoint_every = fuzzy_config.checkpoint_every_rows;
     let fuzzy_oversize_threshold = fuzzy_config.oversize_trie_row_threshold;
+    let fuzzy_max_staleness = config.fuzzy_sync_max_staleness_secs;
     register_heavy_cron(
         handle,
         &lifecycle,
@@ -2190,6 +2191,7 @@ pub fn schedule_maintenance_jobs(
             let eviction_cfg = fuzzy_eviction_cfg.clone();
             let checkpoint_every = fuzzy_checkpoint_every;
             let oversize_threshold = fuzzy_oversize_threshold;
+            let max_staleness = fuzzy_max_staleness;
             let Some(pool) = db.pool().cloned() else {
                 tracing::warn!(job = "fuzzy-sync", "skipping run: DbClient has no pool");
                 run.noop();
@@ -2203,6 +2205,7 @@ pub fn schedule_maintenance_jobs(
                     eviction_cfg,
                     checkpoint_every,
                     oversize_threshold,
+                    max_staleness,
                     stats,
                 )
                 .await
@@ -2217,6 +2220,7 @@ pub fn schedule_maintenance_jobs(
                         durable_mandates = report.durable_mandates_synced,
                         concepts = report.concepts_synced,
                         skipped_oversize = report.skipped_oversize,
+                        skipped_unchanged = report.skipped_unchanged,
                         "fuzzy-sync run complete"
                     );
                     run.ok_with(serde_json::json!({
@@ -2226,6 +2230,7 @@ pub fn schedule_maintenance_jobs(
                         "durable_mandates": report.durable_mandates_synced,
                         "concepts": report.concepts_synced,
                         "skipped_oversize": report.skipped_oversize,
+                        "skipped_unchanged": report.skipped_unchanged,
                     }));
                 }
                 Err(e) => {

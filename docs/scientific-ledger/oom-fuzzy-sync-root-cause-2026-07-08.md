@@ -120,12 +120,35 @@ re-verified: fuzzy-sync RSS now plateaus at ~1.5–2.0 GB with a clean sawtooth*
 committed fixes (skip-oversize, A1, C-layer, backstop) are complementary safety
 nets; the reset was decisive.
 
-## Still open (durable)
+## Durable fix — IMPLEMENTED (2026-07-09, uncommitted on `main`)
 
-- **Prevent re-bloat (rebuild-fresh):** the wipe is a one-time reset; without a code
-  change the tries slowly re-accumulate deleted terms (months of runway — 11.5 GB
-  took months). Durable fix: `run_fuzzy_sync` should DISCARD each trie before
-  rebuilding (fresh from the current source), ideally gated on a per-trie
-  data-change check (mirror `memory_graph_refresh`) to avoid rewriting unchanged
-  tries, and reader-safe (build to a temp path + atomic swap, or accept the brief
-  rebuild window). Not urgent; deserves careful implementation, not a rushed change.
+The one-time wipe is now backed by a code change so the tries cannot re-accumulate
+deleted terms. `run_fuzzy_sync` (`src/cron/fuzzy_sync.rs`) rebuilds each trie from a
+CLEAN on-disk slate, gated on a per-trie data-change check that mirrors
+`memory_graph_refresh`:
+
+- **Rebuild-fresh.** Before a trie is reopened it is reset to empty via
+  `reset_trie_on_disk`: per-project tries live in a dedicated dir
+  (`.../{kind}/{key}/`) → `remove_dir_all` the parent; the two workspace-global
+  tries (durable-mandates, concepts) share `$data_dir/fuzzy/`, so only their own
+  stem-matched files (`{stem}.artrie`/`.wal`/compaction siblings) are removed —
+  never the sibling trie, the `.format_version` sentinel, or the shared
+  `wal_pending`/`wal_archive` dirs. `open_or_create` then takes the `create` path
+  (no WAL replay), so the trie holds ONLY the live source.
+- **Per-trie data-change gate.** A cheap `count(*):max(id)` fingerprint over each
+  trie's PG source (via `begin_heavy`) is compared to a `pgmcp_metadata` watermark
+  (`fuzzy_sync:{kind}[:{project_id}]`). Unchanged-within-window tries are skipped
+  (`FuzzySyncReport.skipped_unchanged`), so the job does not rewrite every trie
+  every run. `count(*)` moving on DELETE is what catches a *shrinking* source (the
+  stale-accumulation trigger). Backstop knob `[cron] fuzzy_sync_max_staleness_secs`
+  (default 7 days) forces an occasional rebuild of a low-churn trie. The watermark
+  is stamped ONLY after a successful rebuild, so a failure re-attempts next run.
+- **Reader-safety.** We accept the brief rebuild window (no temp+swap): an existing
+  `FuzzyCache` reader keeps its mmap of the old inode; only a reader that OPENS
+  during the sub-second gated rebuild sees an empty trie briefly — acceptable for
+  the best-effort fuzzy leg. The cache's mtime check re-opens the new inode after.
+
+Pure gate/reset logic is unit-tested (`is_unchanged`, `watermark_key`,
+`reset_trie_on_disk` per-project + shared-dir) in `src/cron/fuzzy_sync.rs`. Verified
+via `cargo clippy --bin pgmcp --all-targets -D warnings` (clean) + the fuzzy_sync
+unit tests (14 pass). Full `scripts/verify.sh` + deploy pending (operator-run).
