@@ -149,6 +149,34 @@ CLEAN on-disk slate, gated on a per-trie data-change check that mirrors
   the best-effort fuzzy leg. The cache's mtime check re-opens the new inode after.
 
 Pure gate/reset logic is unit-tested (`is_unchanged`, `watermark_key`,
-`reset_trie_on_disk` per-project + shared-dir) in `src/cron/fuzzy_sync.rs`. Verified
-via `cargo clippy --bin pgmcp --all-targets -D warnings` (clean) + the fuzzy_sync
-unit tests (14 pass). Full `scripts/verify.sh` + deploy pending (operator-run).
+`reset_trie_on_disk` per-project + shared-dir) in `src/cron/fuzzy_sync.rs`.
+
+## Verification — VERIFIED + DEPLOYED + LIVE (2026-07-09)
+
+Commits `64bcbc2` (fix) + `9db705b` (fmt) on `main`.
+
+- **Full `scripts/verify.sh` PASSED** — all 9 gates + every TLC formal-model gate,
+  `VERIFY_EXIT=0` ("verify.sh: all gates passed"). Gate 1 initially caught the new
+  test asserts' formatting (fixed in `9db705b`); the re-run is fully green.
+- **Deployed** — release binary installed to `~/.local/bin/pgmcp` (atomic-rename
+  over the busy inode; A1 binary kept as `pgmcp.bak-predurable` for rollback),
+  `systemctl --user restart pgmcp`. Running process confirmed as the durable binary.
+- **Live-verified across two triggered `fuzzy-sync` runs** (the mandate: watch RSS
+  *during* the cron, not just after restart):
+  - **Run 1** (watermarks empty → full rebuild-fresh of every trie): wall **301 s**,
+    **RSS baseline 1.43 GB → peak 2.03 GB** — bounded, no balloon (would be 12+ GB
+    if broken). Stamped **216 `fuzzy_sync:*` watermarks** in `pgmcp_metadata`
+    (`{count}:{max_id}|{epoch}`, e.g. `fuzzy_sync:commits:376428 = 500:3505|…`).
+  - **Run 2** (fresh MCP session; watermarks primed): report
+    `skipped_unchanged: 216, skipped_oversize: 0`, with **216 matching
+    `"fuzzy source unchanged; skipping trie rebuild"` INFO lines** in
+    `~/.local/share/pgmcp/pgmcp.log` — and it correctly REBUILT the tries whose
+    sources drifted during the ~8 min of post-restart indexing (`symbols_synced:
+    71699`, `paths_synced: 15513`, …). The gate discriminates exactly as designed.
+- **Re-bloat prevented at the source** — the fuzzy tree is now **347 MB** (was
+  103 GB) and the pathological `default` symbols trie is **40 MB** (was 11.5 GB),
+  holding only its 208 K current symbols. Daemon steady-state RSS **1.57 GB**,
+  health 200; root disk **324 GB free**.
+
+The OOM is fixed, the reset is permanent, and the whole path is validated by the
+full contract + live evidence. No open follow-ups.
