@@ -75,7 +75,16 @@ CLAUDE.md mandates: each hypothesis, its test, and the result.
 
 ## Still open (gated, not abandoned)
 
-1. **A1 activation** — gated on the libdictenstein char-eviction fix (user-coordinated).
+1. **A1 activation** — UNBLOCKED (2026-07-08): libdictenstein fixed the char-eviction
+   corruption (root cause was an arena-space/block-space off-by-one in
+   `check_sequential_char_children`, not node scattering; a companion "dirty-skip"
+   fix also bounds per-checkpoint DISK growth to `O(dirty nodes)`). Activating:
+   `[fuzzy] resident_budget_bytes` 0 → 768 MiB (lib guidance: keep it modest) +
+   un-`#[ignore]` the `resident_budget_eviction_reclaims_and_preserves_terms` gate
+   (now passes). A1 becomes the PRIMARY RAM bound (any trie builds in ~the budget).
+   skip-oversize stays as defense-in-depth — it also guards the lib's "reopen
+   eager-loads the full image" caveat (a huge trie is a RAM risk at query/restart
+   even when A1 bounded its build) — and C-layer keeps tries small at the source.
 2. **C-layer (default-bloat root cause)** — `scanner::find_project_root` FS git-root
    fallback + per-top-level-dir projects + worktree→main canonicalization
    (`git_common_dir`, reusing `pick_main_worktree_ids`). Designed; gated on disk

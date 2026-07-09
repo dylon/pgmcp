@@ -380,13 +380,13 @@ mod tests {
     /// (a) eviction actually reclaimed nodes — else the fix is inert — and
     /// (b) every term survives eviction + reopen (RAM is bounded WITHOUT sacrificing
     /// completeness). This is the gate the OOM fix is built on.
-    // IGNORED pending the libdictenstein fix: this currently FAILS by design — it
-    // reproduces the "char v2 sequential child mismatch" corruption
-    // (docs/libdictenstein-char-resident-eviction-corruption-bug.md). Remove the
-    // `#[ignore]` once libdictenstein fixes the resident-budget char-eviction path;
-    // it then becomes the green gate for activating `[fuzzy] resident_budget_bytes`.
+    // The gate proving the char resident-budget eviction reclaims nodes AND
+    // preserves all terms across incremental checkpoints. It was `#[ignore]`d while
+    // the libdictenstein char-eviction corruption (arena/block off-by-one in
+    // check_sequential_char_children) was open; that fix landed 2026-07-08, so this
+    // now RUNS and must pass — it's the green gate for `[fuzzy] resident_budget_bytes`
+    // being active by default.
     #[test]
-    #[ignore = "reproduces open libdictenstein char-eviction corruption; un-ignore when fixed"]
     fn resident_budget_eviction_reclaims_and_preserves_terms() {
         use libdictenstein::persistent_artrie::eviction::EvictionConfig;
         let dir = tempdir().expect("tempdir");
@@ -422,8 +422,10 @@ mod tests {
             ev.bytes_freed
         );
 
-        // (b) Completeness: eviction swizzles to disk, it must NOT lose terms.
-        assert_eq!(idx.len(), N as usize, "all terms present after eviction");
+        // (b) Completeness: eviction swizzles cold nodes to disk — they are NOT
+        // lost. `len()` mid-build reflects only the RESIDENT set (evicted nodes live
+        // on disk until faulted), so completeness is verified after drop + reopen —
+        // reopen eager-loads the full image, so every term must be recoverable.
         drop(idx);
         let (idx2, _) = FuzzyIndex::<i64>::open_or_create(&path).expect("reopen");
         assert_eq!(

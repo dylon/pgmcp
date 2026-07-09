@@ -1157,14 +1157,15 @@ pub struct FuzzyConfig {
     /// be bounded INDEPENDENT of trie size (the intended `fuzzy-sync` OOM fix — the
     /// `default` project's 11.5 GB symbols trie built in ~1 GB instead of OOM-ing).
     ///
-    /// **Default 0 (DORMANT).** Activating it (`> 0`) currently triggers a
-    /// libdictenstein corruption on the incremental-checkpoint+eviction path for
-    /// **char** tries ("char v2 sequential child mismatch" — eviction scatters a
-    /// sequential-sibling parent's children across arenas). See
-    /// `docs/libdictenstein-char-resident-eviction-corruption-bug.md`. Set this to
-    /// e.g. `768 * 1024 * 1024` ONLY after that fix lands in libdictenstein; until
-    /// then the daemon relies on the cgroup `MemoryMax` backstop + a raised
-    /// `fuzzy_sync_interval_secs`. Only takes effect when `max_disk_bytes > 0`.
+    /// **Default 768 MiB (ACTIVE).** The libdictenstein char-eviction corruption
+    /// that once blocked this (an arena/block off-by-one in
+    /// `check_sequential_char_children`) was fixed 2026-07-08, along with a
+    /// "dirty-skip" checkpoint fix that also bounds on-disk growth — so the
+    /// incremental-checkpoint rebuild is now safe on both RAM and disk. `0` =
+    /// unbounded (pre-fix behavior). Only takes effect when `max_disk_bytes > 0`.
+    /// Keep it modest: reopen eager-loads the full live set, so pair it with
+    /// `oversize_trie_row_threshold` to cap query/restart RAM. See
+    /// `docs/libdictenstein-char-resident-eviction-corruption-bug.md`.
     #[serde(default = "default_fuzzy_resident_budget_bytes")]
     pub resident_budget_bytes: u64,
 
@@ -1316,12 +1317,15 @@ fn default_fuzzy_max_disk_bytes() -> u64 {
 }
 
 fn default_fuzzy_resident_budget_bytes() -> u64 {
-    // DORMANT (0) until the libdictenstein char-eviction corruption is fixed — see
-    // docs/libdictenstein-char-resident-eviction-corruption-bug.md. Activating it
-    // (e.g. 768 MiB) is what bounds fuzzy-sync rebuild RAM, but today it corrupts
-    // the trie on incremental checkpoint. Until then: cgroup MemoryMax backstop +
-    // raised fuzzy_sync_interval_secs keep the daemon safe.
-    0
+    // 768 MiB. Bounds fuzzy-sync rebuild RAM — and, via libdictenstein's companion
+    // "dirty-skip" checkpoint fix, on-disk growth too — by evicting the coldest
+    // overlay nodes to disk on each incremental checkpoint down to this budget. The
+    // char-eviction corruption that blocked this (an arena-space/block-space
+    // off-by-one in `check_sequential_char_children`) was fixed in libdictenstein on
+    // 2026-07-08. `0` = unbounded (pre-fix behavior). Keep it MODEST (lib guidance):
+    // reopen eager-loads the full live set, so also cap trie size via
+    // `[fuzzy] oversize_trie_row_threshold` for query/restart RAM.
+    768 * 1024 * 1024
 }
 
 fn default_fuzzy_checkpoint_every_rows() -> usize {
