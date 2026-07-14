@@ -151,7 +151,7 @@ High-level project understanding and engineering quality assessment.
 - **Per-project overrides** -- `.pgmcp.toml` in project roots for custom exclusions and file types
 - **CUDA acceleration** -- mandatory GPU-accelerated embedding and FCM paths via Candle/cudarc
 - **Cross-agent memory search** -- synthetic `claude` and `codex` projects make both clients' config, prompt history, and sessions queryable through the same MCP tools
-- **Cross-agent documentation guidelines** -- 23 authoring guidelines (canonical seed in `src/docguidelines/`) injected into the MCP `instructions` for *every* client (Claude, Codex, any MCP client), reinforced in the `orient` envelope, enumerable via the `documentation_guidelines` tool, and published at the `pgmcp://guidelines` resource
+- **Cross-agent documentation guidelines** -- 26 authoring guidelines (canonical seed in `src/docguidelines/`) injected into the MCP `instructions` for *every* client (Claude, Codex, any MCP client), reinforced in the `orient` envelope, enumerable via the `documentation_guidelines` tool, and published at the `pgmcp://guidelines` resource
 - **Software pattern knowledge index** -- separate pgvector tables for local full-text design pattern/anti-pattern sources; file search tools never return pattern docs
 - **Auto-RAG context injection** -- Claude Code hooks inject project context and relevant code on every prompt
 - **PreToolUse tool-call proxy** -- five hook scripts at `~/.claude/hooks/pgmcp-*.sh` augment (Layer A) or selectively deny (Layer B, opt-in via `PGMCP_HOOK_MODE=enforce`) `Read`/`Grep`/`Glob` to bias Claude toward pgmcp's richer tools

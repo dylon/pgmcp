@@ -38,7 +38,7 @@
 //!
 //! # Design
 //!
-//! At 23 entries this is deliberately **DB-free** — a static Rust seed list with
+//! At 26 entries this is deliberately **DB-free** — a static Rust seed list with
 //! cheap referential-integrity unit tests, mirroring the spirit of
 //! `src/patterns/` and `src/tools_catalog/` without their migration / embedding /
 //! cron machinery. To add or edit a guideline, change [`guideline_seeds`] (and,
@@ -119,7 +119,7 @@ const fn g(slug: &'static str, category: GuidelineCategory, text: &'static str) 
     }
 }
 
-/// The canonical 23 documentation guidelines, in the user's original order.
+/// The canonical 26 documentation guidelines, in the user's original order.
 ///
 /// Every other rendering ([`render_instructions_banner`], [`guidelines_json`],
 /// [`compact_for_orient`]) is derived from this list — there is exactly one
@@ -185,6 +185,20 @@ pub fn guideline_seeds() -> Vec<GuidelineSeed> {
              catalog in pgmcp for available tooling.",
         ),
         g(
+            "diagrams-prefer-plantuml",
+            Diagrams,
+            "Prefer PlantUML over Mermaid for any diagram type both support; reach for Mermaid \
+             only where PlantUML has no equivalent. PlantUML output is byte-reproducible and \
+             renders LaTeX; Mermaid's is neither.",
+        ),
+        g(
+            "diagrams-plantuml-latex",
+            Diagrams,
+            "PlantUML supports LaTeX expressions — <latex>…</latex> inline and <math>…</math>, \
+             typeset by the bundled JLaTeXMath into embedded vector SVG — so render mathematical \
+             formulae in diagram labels with PlantUML LaTeX rather than unicode literals.",
+        ),
+        g(
             "diagrams-fully-colored",
             Diagrams,
             "Ensure all the diagrams are fully colored with intuitive colorization per concept.",
@@ -202,14 +216,26 @@ pub fn guideline_seeds() -> Vec<GuidelineSeed> {
              complete.",
         ),
         g(
-            "math-unicode",
+            "math-mathjax",
             MathNotation,
-            "Use unicode characters for mathematical formulae and everywhere else applicable.",
+            "Use MathJax syntax for LaTeX expressions in mathematical prose; do not spell formulae \
+             out with unicode literals. Unicode remains correct for non-mathematical text — \
+             box-drawing, arrows, enumerations, and separators.",
+        ),
+        g(
+            "math-delimiters",
+            MathNotation,
+            // Raw string: the escape sequences below are LaTeX, not Rust. The
+            // `$…$` / `$$…$$` prohibition is not stylistic — GitHub's CommonMark
+            // pass rewrites backslash escapes inside those spans before MathJax
+            // sees them, corrupting the expression loudly or silently.
+            r"Delimit math for GitHub-flavored Markdown: inline math is a backtick span wrapped in dollar signs, and display math is a fenced block whose info-string is `math`. Never use $…$ or $$…$$ — GitHub's CommonMark pass strips backslash escapes (\_ \{ \} \; \, \#) before MathJax parses them, corrupting the expression loudly or silently. Write a literal dollar sign as inline code, and never let an ASCII letter abut the opening delimiter.",
         ),
         g(
             "math-backticks",
             MathNotation,
-            "Ensure all mathematical expressions are properly quoted in backticks.",
+            "Ensure all mathematical expressions are properly delimited as math spans rather than \
+             left as bare prose or as an inert code span.",
         ),
         g(
             "citations-exist",
@@ -266,8 +292,8 @@ pub fn guideline_seeds() -> Vec<GuidelineSeed> {
 /// resource and as the source for the `~/.claude/CLAUDE.md` mirror.
 pub fn render_instructions_banner() -> String {
     let seeds = guideline_seeds();
-    // Preamble + 7 headings + 23 bullets; comfortably under one realloc.
-    let mut out = String::with_capacity(3072);
+    // Preamble + 7 headings + 26 bullets; comfortably under one realloc.
+    let mut out = String::with_capacity(4096);
     out.push_str(
         "### Documentation guidelines (pgmcp — apply across ALL agents)\n\n\
          When you produce or edit ANY documentation in ANY project — design / architecture / \
@@ -338,8 +364,8 @@ mod tests {
     use std::collections::HashSet;
 
     #[test]
-    fn there_are_twenty_three_guidelines() {
-        assert_eq!(guideline_seeds().len(), 23);
+    fn there_are_twenty_six_guidelines() {
+        assert_eq!(guideline_seeds().len(), 26);
     }
 
     #[test]
@@ -371,8 +397,8 @@ mod tests {
         assert_eq!(count(GuidelineCategory::Placement), 2);
         assert_eq!(count(GuidelineCategory::Coverage), 3);
         assert_eq!(count(GuidelineCategory::Pedagogy), 4);
-        assert_eq!(count(GuidelineCategory::Diagrams), 7);
-        assert_eq!(count(GuidelineCategory::MathNotation), 2);
+        assert_eq!(count(GuidelineCategory::Diagrams), 9);
+        assert_eq!(count(GuidelineCategory::MathNotation), 3);
         assert_eq!(count(GuidelineCategory::Citations), 3);
         assert_eq!(count(GuidelineCategory::AlgorithmsCode), 2);
         // The partition is total: the per-category counts sum to the whole.
@@ -386,6 +412,10 @@ mod tests {
         assert!(banner.contains("MUST follow"));
         assert!(banner.contains("documentation_guidelines"));
         assert!(banner.contains("Knuth's literate programming"));
+        // The two mandates most easily lost to a reword: the diagram-engine
+        // ranking and the math-notation switch. Pin them by name.
+        assert!(banner.contains("Prefer PlantUML over Mermaid"));
+        assert!(banner.contains("MathJax"));
         for s in guideline_seeds() {
             assert!(
                 banner.contains(s.text),
@@ -405,10 +435,10 @@ mod tests {
     #[test]
     fn json_payload_shape_is_complete() {
         let v = guidelines_json();
-        assert_eq!(v["count"].as_u64(), Some(23));
+        assert_eq!(v["count"].as_u64(), Some(26));
         assert_eq!(
             v["documentation_guidelines"].as_array().map(Vec::len),
-            Some(23)
+            Some(26)
         );
         assert_eq!(v["categories"].as_array().map(Vec::len), Some(7));
         assert!(v["note"].is_string());
@@ -423,7 +453,7 @@ mod tests {
     #[test]
     fn orient_payload_is_a_concise_pointer() {
         let v = compact_for_orient();
-        assert_eq!(v["count"].as_u64(), Some(23));
+        assert_eq!(v["count"].as_u64(), Some(26));
         assert_eq!(v["categories"].as_array().map(Vec::len), Some(7));
         assert!(
             v["note"]

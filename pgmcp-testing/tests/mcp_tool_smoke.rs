@@ -1230,7 +1230,7 @@ async fn index_stats_zeroed_mock_returns_zero_counters() {
 
 #[tokio::test]
 async fn documentation_guidelines_returns_the_full_static_list() {
-    // Nullary, DB-free tool: must return the canonical 23-guideline seed set
+    // Nullary, DB-free tool: must return the canonical 26-guideline seed set
     // regardless of database state (this also satisfies the dispatch-coverage
     // gate, which scans for a string-literal `call_tool_cli("documentation_guidelines", …)`).
     let server = server_with_mock(MockDbClient::new());
@@ -1241,10 +1241,10 @@ async fn documentation_guidelines_returns_the_full_static_list() {
     let payload = text_of(&result);
     let v: serde_json::Value =
         serde_json::from_str(&payload).expect("documentation_guidelines JSON");
-    assert_eq!(v["count"].as_u64(), Some(23));
+    assert_eq!(v["count"].as_u64(), Some(26));
     assert_eq!(
         v["documentation_guidelines"].as_array().map(Vec::len),
-        Some(23)
+        Some(26)
     );
     assert_eq!(v["categories"].as_array().map(Vec::len), Some(7));
     // The list is the canonical seed set (verbatim slugs), not DB-derived.
