@@ -22,7 +22,7 @@ motivated this process. See `CLAUDE.md` for history.
 
 ## Verification gates
 
-`./scripts/verify.sh` runs all six gates unconditionally. Gates fail-fast;
+`./scripts/verify.sh` runs all nine gates unconditionally. Gates fail-fast;
 script exits non-zero on the first failure.
 
 | # | Command | Purpose |
@@ -30,13 +30,50 @@ script exits non-zero on the first failure.
 | 1 | `cargo fmt --check` | Formatting |
 | 2 | `cargo build --all-targets` | Full build (nvcc runs in build.rs) |
 | 3 | `cargo clippy --all-targets -- -D warnings` | Lints clean |
-| 4 | `cargo test --release --bin pgmcp` | Unit / proptest suite |
-| 5 | `cargo test --release --test gpu_fallback_smoke -- --ignored` | GPU-init-failure fail-closed behavior |
-| 6 | `cargo smoke` | GPU smoke scenarios (`examples/gpu_smoke.rs`) |
+| 4 | `cargo build + test --release --bin pgmcp` | Unit / proptest suite |
+| 5 | `cargo test --release -p pgmcp-testing` | Integration suite (one `all` binary) |
+| 6 | `cargo test --release --test gpu_fallback_smoke -- --ignored` | GPU-init-failure fail-closed behavior |
+| 7 | `cargo smoke` | GPU smoke scenarios (`examples/gpu_smoke.rs`) |
+| 8 | `cargo test --release --tests` | Root-package integration tests |
+| 9 | `pgmcp bug-gate` | Boy Scout: no open bugs anchored to changed files |
 
-All six gates require a working CUDA toolkit and GPU. Gate 5 intentionally
+All gates require a working CUDA toolkit and GPU. Gate 6 intentionally
 forces GPU-unavailable via `CUDA_VISIBLE_DEVICES=""` to verify that production
 FCM returns a degenerate result instead of silently switching to CPU.
+
+## Integration-test layout (`pgmcp-testing/tests/`)
+
+**`pgmcp-testing` sets `autotests = false`.** Adding a `tests/foo.rs` is not
+enough — you must also add `mod foo;` to `tests/main.rs`, or the file is never
+compiled and its tests silently never run.
+
+Why: Cargo autodiscovers every `tests/*.rs` as its own `[[test]]` target. With
+234 such files that meant 234 independent crates, each running full `opt-level=3`
+codegen and then *statically linking* the ~282 MB `libpgmcp` rlib plus candle,
+cudarc, ort, and tree-sitter into a ~105 MB executable — **≈23.5 GB of linker
+output to run the suite**, and well over an hour of wall time. Routing every file
+through the single `tests/main.rs` target collapses that to one compile and one
+link (a single ~220 MB binary, ~8 min cold including all dependencies).
+
+Consequences to know:
+
+- Test names gain their file as a module prefix, e.g.
+  `mcp_tool_smoke::documentation_guidelines_returns_the_full_static_list`.
+  Substring filters (`cargo test documentation_guidelines`, `nextest run …`) are
+  unaffected.
+- Shared helpers live in `tests/common/mod.rs`, declared **once** in
+  `tests/main.rs`. Within a test file, reference them as `crate::common::…`
+  (not `common::…`, which would resolve relative to that file's module).
+- All files now share one process under `cargo test` (they get one process each
+  under `cargo nextest`). Do not introduce process-global mutation —
+  `env::set_var`, `set_current_dir`, a global `tracing_subscriber` init — into a
+  test file without serializing it.
+- The root package (`pgmcp/tests/`, 7 files) still uses autodiscovery, because
+  Gate 6 invokes `--test gpu_fallback_smoke` by target name.
+
+The linker is also pinned to **mold** via `.cargo/config.toml` (`-C
+link-arg=-fuse-ld=mold`); see the comment there for why it must share the
+`[build] rustflags` array rather than live in a `[target.*]` block.
 
 ## Adding a compile-time choice
 

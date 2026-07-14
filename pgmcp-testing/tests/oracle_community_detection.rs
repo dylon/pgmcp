@@ -10,9 +10,7 @@
 //!    visible block structure)
 //! 3. Place every node into exactly one community
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::fixtures::synthetic_corpus::seed_graph_corpus;
 use pgmcp_testing::pool_tool_helpers::{seed_file, seed_project};
 use pgmcp_testing::require_test_db;

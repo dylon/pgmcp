@@ -4,9 +4,7 @@
 //! near basis-0 (3 of 5 files), so util and api are the
 //! basis-distant outliers and one of them must top the ranking.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::fixtures::synthetic_corpus::seed_graph_corpus;
 use pgmcp_testing::require_test_db;
 

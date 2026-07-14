@@ -11,8 +11,6 @@
 //! 21 functions total: 3 pure (`content_hash`, `content_sha256`,
 //! `chunk_text`) and 18 DB-backed.
 
-mod common;
-
 use chrono::Utc;
 use pgmcp::db::patterns::{self, PatternListOptions, PatternSearchOptions, SourceUpsert};
 use pgmcp::patterns::{ParadigmSeed, PatternSeed};

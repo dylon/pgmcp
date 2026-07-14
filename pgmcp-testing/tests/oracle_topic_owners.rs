@@ -4,9 +4,7 @@
 //! (alice ≈ 2/3, bob ≈ 1/3) onto `proj-auth`'s chunks and asserts the per-topic
 //! ownership / bus-factor math is exercised.
 
-mod common;
-
-use common::server_with_pool;
+use crate::common::server_with_pool;
 use pgmcp_testing::fixtures::synthetic_corpus::SyntheticCorpus;
 use pgmcp_testing::require_test_db;
 

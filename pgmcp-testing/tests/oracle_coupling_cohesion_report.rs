@@ -2,9 +2,7 @@
 //! At module_depth=1 the synthetic graph corpus has 3 modules:
 //! `core/`, `util/`, `api/`.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::fixtures::synthetic_corpus::seed_graph_corpus;
 use pgmcp_testing::require_test_db;
 use serde_json::Value;

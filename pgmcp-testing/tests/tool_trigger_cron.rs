@@ -9,11 +9,9 @@
 //! path (which short-circuits before touching the DB) so the test runs
 //! quickly and deterministically.
 
-mod common;
-
 use std::sync::Arc;
 
-use common::text_of;
+use crate::common::text_of;
 use pgmcp::mcp::server::McpServer;
 use pgmcp_testing::pool_tool_helpers::{context_with_pool, server_with_pool};
 use pgmcp_testing::require_test_db;

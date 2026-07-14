@@ -23,11 +23,9 @@
 //! working_set_config / orchestration_sessions / csm_run_traces) plus the mock
 //! data plane — no shell, no user files.
 
-mod common;
-
 use std::future::Future;
 
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp::tape::data_plane::{MockTapeDataPlane, PageQuery, TreePath};
 use pgmcp::tape::engine::PagingEngine;
 use pgmcp::tape::store;

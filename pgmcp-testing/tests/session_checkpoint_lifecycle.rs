@@ -15,11 +15,9 @@
 //! read/write to pgmcp's OWN tables (orchestration_sessions / csm_run_traces /
 //! work_items) — no shell, no user files.
 
-mod common;
-
 use std::future::Future;
 
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp::mcp::server::McpServer;
 use pgmcp_testing::require_test_db;
 use serde_json::{Value, json};

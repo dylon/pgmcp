@@ -1,8 +1,6 @@
 //! Real-Postgres correctness oracle for `hot_path_audit`.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::require_test_db;
 use serde_json::Value;
 use sqlx::PgPool;

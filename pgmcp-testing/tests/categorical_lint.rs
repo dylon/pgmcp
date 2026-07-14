@@ -3,9 +3,7 @@
 //! the rollup is consistent and is flagged when it is not. Drives the dispatched
 //! tool via `call_tool_cli` (Layer-D coverage gate).
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::require_test_db;
 use serde_json::json;
 

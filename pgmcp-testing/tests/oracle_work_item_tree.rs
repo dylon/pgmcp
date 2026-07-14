@@ -1,10 +1,8 @@
 //! Focused oracle coverage for `work_item_tree`.
 
-mod common;
-
 use std::collections::HashSet;
 
-use common::text_of;
+use crate::common::text_of;
 use pgmcp_testing::pool_tool_helpers::server_with_pool;
 use pgmcp_testing::require_test_db;
 use serde_json::{Value, json};

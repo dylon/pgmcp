@@ -1,8 +1,6 @@
 //! Focused oracle coverage for `deadlock_candidates`.
 
-mod common;
-
-use common::text_of;
+use crate::common::text_of;
 use pgmcp::parsing::type_tags::vocabulary::EFFECT_UNSAFE;
 use pgmcp_testing::pool_tool_helpers::{
     seed_file, seed_file_symbol, seed_project, server_with_pool,

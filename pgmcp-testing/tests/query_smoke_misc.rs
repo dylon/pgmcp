@@ -20,8 +20,6 @@
 //!     `InMemoryOcrCache` lookup/store paths.
 //!   * `src/stats/telemetry_writer.rs` — `try_enqueue`.
 
-mod common;
-
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 

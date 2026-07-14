@@ -14,12 +14,10 @@
 //! (`work_items.embedding` is `vector(1024)`); the dimension is not load-bearing
 //! for the tag/progress side tables, but keeps the harness identical.
 
-mod common;
-
 use std::sync::Arc;
 
+use crate::common::text_of;
 use arc_swap::ArcSwap;
-use common::text_of;
 use pgmcp::config::Config;
 use pgmcp::context::SystemContext;
 use pgmcp::db::DbClient;

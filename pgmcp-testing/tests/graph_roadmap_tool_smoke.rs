@@ -8,9 +8,7 @@
 //! `query_inventory_vs_coverage` safety net guards. These also satisfy that
 //! net's requirement that every `call_tool_cli` arm has a corresponding test.
 
-mod common;
-
-use common::server_with_pool;
+use crate::common::server_with_pool;
 use pgmcp_testing::fixtures::synthetic_corpus::SyntheticCorpus;
 use pgmcp_testing::require_test_db;
 use serde_json::json;

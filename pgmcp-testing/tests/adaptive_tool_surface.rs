@@ -3,11 +3,9 @@
 //!
 //! Requires a real Postgres (migrated) test DB — gated by `require_test_db!`.
 
-mod common;
-
 use std::collections::HashSet;
 
-use common::{context_with_pool, server_with_pool, text_of};
+use crate::common::{context_with_pool, server_with_pool, text_of};
 use pgmcp::mcp::client_profile::{ClientProfile, ToolSurface};
 use pgmcp::mcp::server::McpServer;
 use pgmcp::mcp::tool_policy::{ToolPolicyConfig, recompute_and_persist};

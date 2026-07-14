@@ -5,8 +5,7 @@ use pgmcp_testing::pool_tool_helpers::{
 };
 use pgmcp_testing::require_test_db;
 
-mod common;
-use common::text_of;
+use crate::common::text_of;
 
 #[tokio::test]
 async fn public_api_surface_summary_is_not_limited_and_full_is_limited() {

@@ -31,9 +31,7 @@
 //! thread with a generous stack ([`with_big_stack`]). Single-call corpus tests
 //! stay plain `#[tokio::test]`s (one call never overflows).
 
-mod common;
-
-use common::{server_with_mock, server_with_pool, text_of};
+use crate::common::{server_with_mock, server_with_pool, text_of};
 use pgmcp::mcp::server::McpServer;
 use pgmcp_testing::fixtures::test_embedding;
 use pgmcp_testing::mocks::MockDbClient;

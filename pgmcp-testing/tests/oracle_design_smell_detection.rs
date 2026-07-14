@@ -4,9 +4,7 @@
 //! it at 1, with churn 8.0/month) so the `unstable_dependency`
 //! heuristic (in_degree > 5 AND churn_rate > 2.0) fires.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::fixtures::synthetic_corpus::seed_graph_corpus;
 use pgmcp_testing::require_test_db;
 

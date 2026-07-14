@@ -4,9 +4,7 @@
 //! two-snapshot size history (a growing theme), mode=longitudinal surfaces it as
 //! emerging. (The trend math itself is unit-tested in `topic_analysis::trends`.)
 
-mod common;
-
-use common::server_with_pool;
+use crate::common::server_with_pool;
 use pgmcp_testing::require_test_db;
 
 fn text_of(result: &rmcp::model::CallToolResult) -> String {

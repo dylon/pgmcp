@@ -13,9 +13,7 @@
 //! "not found" (proving its SQL ran), which we tolerate distinctly from a schema
 //! error.
 
-mod common;
-
-use common::server_with_pool;
+use crate::common::server_with_pool;
 use pgmcp_testing::require_test_db;
 use serde_json::json;
 

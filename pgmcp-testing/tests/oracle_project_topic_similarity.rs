@@ -6,9 +6,7 @@
 //! similarity below the clustering threshold. (Fork-detection itself is covered
 //! deterministically by the `similarity` unit tests.)
 
-mod common;
-
-use common::server_with_pool;
+use crate::common::server_with_pool;
 use pgmcp_testing::fixtures::synthetic_corpus::SyntheticCorpus;
 use pgmcp_testing::require_test_db;
 

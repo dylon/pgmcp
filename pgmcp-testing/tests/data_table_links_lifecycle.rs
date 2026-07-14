@@ -3,9 +3,7 @@
 //! surfacing in `data_table_describe`. Drives the dispatched tools through
 //! `call_tool_cli` (the Layer-D coverage gate requirement) against a real DB.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::require_test_db;
 use serde_json::json;
 

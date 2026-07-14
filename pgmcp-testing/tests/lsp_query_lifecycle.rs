@@ -2,9 +2,7 @@
 //! `file_symbols` + `symbol_occurrences`. Drives the dispatched tool through
 //! `call_tool_cli` (Layer-D coverage gate) and asserts the core LSP ops.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::require_test_db;
 use serde_json::json;
 

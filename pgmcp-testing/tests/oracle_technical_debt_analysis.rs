@@ -3,9 +3,7 @@
 //! with its already-high churn rate this produces the highest
 //! debt_score.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::fixtures::synthetic_corpus::seed_graph_corpus;
 use pgmcp_testing::require_test_db;
 use uuid::Uuid;

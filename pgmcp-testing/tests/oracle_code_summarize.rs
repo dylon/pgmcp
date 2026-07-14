@@ -17,12 +17,10 @@
 //!
 //! Skips with `SKIPPED:` if no test DB is configured.
 
-mod common;
-
 use std::sync::Arc;
 
+use crate::common::text_of;
 use arc_swap::ArcSwap;
-use common::text_of;
 use pgmcp::config::Config;
 use pgmcp::context::SystemContext;
 use pgmcp::db::DbClient;

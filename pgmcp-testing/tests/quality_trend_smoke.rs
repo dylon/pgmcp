@@ -14,12 +14,10 @@
 //! (a falling overall GPA yields a negative slope and a forward
 //! `weeks_to_threshold`).
 
-mod common;
-
 use std::sync::Arc;
 
+use crate::common::text_of;
 use arc_swap::ArcSwap;
-use common::text_of;
 use pgmcp::config::Config;
 use pgmcp::context::SystemContext;
 use pgmcp::db::DbClient;

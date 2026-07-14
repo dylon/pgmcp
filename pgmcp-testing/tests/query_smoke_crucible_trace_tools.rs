@@ -11,9 +11,7 @@
 //! requires every dispatched tool to have a `call_tool_cli("<name>", …)`
 //! invocation.
 
-mod common;
-
-use common::server_with_pool;
+use crate::common::server_with_pool;
 use pgmcp_testing::require_test_db;
 use serde_json::json;
 

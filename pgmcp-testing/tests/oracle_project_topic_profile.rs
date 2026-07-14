@@ -4,9 +4,7 @@
 //! topic (10 auth chunks vs. a handful of split-candidate chunks), so its
 //! specialization index is high and its top topic is "auth".
 
-mod common;
-
-use common::server_with_pool;
+use crate::common::server_with_pool;
 use pgmcp_testing::fixtures::synthetic_corpus::SyntheticCorpus;
 use pgmcp_testing::require_test_db;
 

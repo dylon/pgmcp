@@ -8,9 +8,7 @@
 //! 1024-d embedding backend, so embed-on-write (`create`/`alter`) and the
 //! semantic `search` path run for real.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::require_test_db;
 use serde_json::json;
 

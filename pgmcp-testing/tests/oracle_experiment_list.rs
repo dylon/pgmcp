@@ -5,9 +5,7 @@
 //! positive project scoping, bounded pagination, deterministic newest-first
 //! ordering, and read-only execution.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::pool_tool_helpers::seed_project;
 use pgmcp_testing::require_test_db;
 use serde_json::{Value, json};

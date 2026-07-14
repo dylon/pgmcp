@@ -20,12 +20,10 @@
 //! `work_item_view`, `work_item_next_actionable`, `work_item_assign`,
 //! `work_item_history`, and `work_item_bulk`).
 
-mod common;
-
 use std::sync::Arc;
 
+use crate::common::text_of;
 use arc_swap::ArcSwap;
-use common::text_of;
 use pgmcp::config::Config;
 use pgmcp::context::SystemContext;
 use pgmcp::db::DbClient;

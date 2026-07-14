@@ -38,8 +38,22 @@ CUDARC_CUDA_VERSION = { value = "13000", force = true }
 # strictly required and avoids baking host-CPU-specific tuning into the
 # build (which could surprise on a CI runner with different
 # microarchitecture).
+#
+# `-fuse-ld=mold` routes rustc's `cc` link step through mold instead of the
+# default GNU ld.bfd. pgmcp's link units are enormous (the `pgmcp` rlib alone is
+# ~282 MB, and every binary statically pulls in candle + cudarc + ort +
+# tree-sitter), which is bfd's worst case; mold is GNU-ld compatible and links
+# these multi-hundred-MB images several times faster. It must live in THIS
+# array, not a `[target.x86_64-unknown-linux-gnu]` block: Cargo does not merge
+# `[build] rustflags` with `[target.*] rustflags` — the target-specific array
+# fully replaces the build one, which would silently drop `+aes,+sse2` and break
+# the gxhash build. Requires `mold` on PATH (pacman: mold) and a gcc that
+# understands `-fuse-ld=` (>= 12).
 [build]
-rustflags = ["-C", "target-feature=+aes,+sse2"]
+rustflags = [
+    "-C", "target-feature=+aes,+sse2",
+    "-C", "link-arg=-fuse-ld=mold",
+]
 
 [alias]
 # Convenience wrappers for individual verification gates. The full verify

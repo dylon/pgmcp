@@ -5,9 +5,7 @@
 //! server construction touches the DB. This file also satisfies
 //! `query_inventory_vs_coverage::every_dispatched_tool_has_an_integration_test`.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::require_test_db;
 use serde_json::json;
 

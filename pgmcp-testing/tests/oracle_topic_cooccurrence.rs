@@ -6,9 +6,7 @@
 //! Louvain pipeline picks it up. (The graph/bridge logic itself is unit-tested
 //! in `topic_analysis::cooccurrence`.)
 
-mod common;
-
-use common::server_with_pool;
+use crate::common::server_with_pool;
 use pgmcp_testing::fixtures::synthetic_corpus::SyntheticCorpus;
 use pgmcp_testing::require_test_db;
 

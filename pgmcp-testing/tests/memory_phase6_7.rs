@@ -4,9 +4,7 @@
 //!
 //! Phase 7 model-download tests are `#[ignore]`-gated.
 
-mod common;
-
-use common::text_of;
+use crate::common::text_of;
 use pgmcp::db::queries::{
     memory_neighbors, memory_path_search, memory_ppr_search, memory_raptor_search,
     memory_unified_search, refresh_memory_unified_edges, refresh_memory_unified_node_vectors,

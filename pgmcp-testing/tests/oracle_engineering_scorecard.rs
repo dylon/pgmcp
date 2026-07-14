@@ -16,9 +16,7 @@
 //!    each ORR checklist item, seed only the input that gates that
 //!    item and assert exactly that one item flips false.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::fixtures::synthetic_corpus::{ScorecardScenario, seed_scorecard_corpus};
 use pgmcp_testing::require_test_db;
 

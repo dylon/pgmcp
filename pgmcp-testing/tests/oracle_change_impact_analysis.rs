@@ -3,9 +3,7 @@
 //! util/util.rs (util → a); BFS at depth 3 also picks up b
 //! (b → c → a).
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::fixtures::synthetic_corpus::seed_graph_corpus;
 use pgmcp_testing::pool_tool_helpers::{seed_file, seed_file_symbol, seed_project};
 use pgmcp_testing::require_test_db;

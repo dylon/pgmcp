@@ -3,9 +3,7 @@
 //! which arrived without integration tests. Drives each through call_tool_cli
 //! (Layer-D coverage gate) and asserts the dispatch path executes.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::require_test_db;
 use serde_json::json;
 

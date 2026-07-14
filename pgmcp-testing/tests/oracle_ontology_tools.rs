@@ -3,8 +3,6 @@
 //! filtered search, and hierarchy-edge/ resolve helpers. The MCP handler/body
 //! layer is a thin compile-checked wrapper over these. Self-skips with no DB.
 
-mod common;
-
 use pgmcp::db::queries;
 use pgmcp::ontology::edge::OntologyRelation;
 use pgmcp::ontology::facet::{ConceptStatus, Facet};
@@ -12,7 +10,7 @@ use pgmcp::tracker::transition::Actor;
 use serde_json::json;
 use uuid::Uuid;
 
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 
 async fn seed_project_and_file(
     pool: &sqlx::PgPool,

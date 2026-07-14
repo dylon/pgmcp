@@ -28,8 +28,6 @@ use pgmcp_testing::fixtures::test_config;
 use pgmcp_testing::mocks::{DeterministicEmbeddingBackend, MockDbClient};
 use pgmcp_testing::require_test_db;
 
-mod common;
-
 fn server_with_mock(mock: MockDbClient) -> McpServer {
     let db: Arc<dyn DbClient> = Arc::new(mock);
     let stats = Arc::new(StatsTracker::new());
@@ -213,7 +211,7 @@ async fn find_orphans_real_db_scopes_project_language_and_limit() {
     let db = require_test_db!();
     let pool = db.pool().clone();
     SyntheticCorpus::seed_with_assignments(&pool).await;
-    let server = common::server_with_pool(pool);
+    let server = crate::common::server_with_pool(pool);
 
     let result = server
         .call_tool_cli(
@@ -264,7 +262,7 @@ async fn find_orphans_rejects_duplicate_project_display_names() {
         .execute(&pool)
         .await
         .expect("insert second duplicate project");
-    let server = common::server_with_pool(pool);
+    let server = crate::common::server_with_pool(pool);
 
     let err = server
         .call_tool_cli("find_orphans", serde_json::json!({"project": "orphan-dup"}))

@@ -5,9 +5,7 @@
 //! collectors + both scorecards) → render. Asserts the three-pillar structure,
 //! JSON validity, every rendition target, and clean error handling.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::fixtures::synthetic_corpus::seed_graph_corpus;
 use pgmcp_testing::require_test_db;
 

@@ -25,11 +25,9 @@
 //! `indexed_files` / `memory_*`) plus reads/writes to pgmcp's OWN working-set
 //! tables and (gated) `memory_observations` — no shell, no user files.
 
-mod common;
-
 use std::path::{Path, PathBuf};
 
-use common::context_with_pool;
+use crate::common::context_with_pool;
 use pgmcp::config::Config;
 use pgmcp::context::SystemContext;
 // `context_tape` is re-exported through pgmcp's tape bridge module, so the test

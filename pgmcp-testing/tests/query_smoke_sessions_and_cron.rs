@@ -8,8 +8,6 @@
 //! `session_mandates`, `durable_mandates`, `session_prompts`, or
 //! `mcp_tool_calls` would slip through `scripts/verify.sh`.
 
-mod common;
-
 use std::sync::Arc;
 
 use pgmcp::cron::telemetry_retention;

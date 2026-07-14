@@ -2,9 +2,7 @@
 //! dependency in project C propagates exposure to its transitive dependents
 //! A → B → C. Drives the dispatched tool via call_tool_cli (coverage gate).
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::require_test_db;
 use serde_json::json;
 

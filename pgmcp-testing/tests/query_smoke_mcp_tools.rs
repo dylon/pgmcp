@@ -12,9 +12,7 @@
 //! See `/home/dylon/.claude/plans/identify-the-root-cause-functional-wren.md`
 //! for the full plan (Layers A–D).
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::fixtures::synthetic_corpus::SyntheticCorpus;
 use pgmcp_testing::require_test_db;
 use serde_json::json;

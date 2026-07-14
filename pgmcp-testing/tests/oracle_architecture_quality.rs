@@ -2,9 +2,7 @@
 //! 11 dimensions, every scorable grade in {A,B,C,D,F}, N/A dimensions excluded
 //! from the overall score, and project-id scoped metric rows.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::fixtures::synthetic_corpus::seed_graph_corpus;
 use pgmcp_testing::require_test_db;
 use serde_json::Value;

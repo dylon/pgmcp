@@ -2,9 +2,7 @@
 //! synthetic graph corpus pre-loads `file_metrics` rows with known
 //! pagerank scores so the rank order is deterministic.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::fixtures::synthetic_corpus::seed_graph_corpus;
 use pgmcp_testing::require_test_db;
 use uuid::Uuid;

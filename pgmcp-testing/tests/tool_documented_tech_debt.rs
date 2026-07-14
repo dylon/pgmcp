@@ -5,9 +5,7 @@
 //! literal `call_tool_cli("documented_tech_debt", …)` satisfies the
 //! `every_dispatched_tool_has_an_integration_test` coverage gate.
 
-mod common;
-
-use common::text_of;
+use crate::common::text_of;
 use pgmcp_testing::pool_tool_helpers::{seed_file, seed_project, server_with_pool};
 use pgmcp_testing::require_test_db;
 use serde_json::Value;

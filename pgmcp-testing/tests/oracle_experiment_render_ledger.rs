@@ -5,12 +5,10 @@
 //! dry-run no-write behavior, contained ledger paths, safe filenames, atomic
 //! write semantics, and no database mutation.
 
-mod common;
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp::config::Config;
 use pgmcp::mcp::server::McpServer;
 use pgmcp_testing::pool_tool_helpers::context_with_pool;

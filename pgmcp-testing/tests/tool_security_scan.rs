@@ -7,11 +7,9 @@
 //! avoid `refresh=true` with a free lock so the test never spawns real scanner
 //! subprocesses (slow / environment-dependent); the busy path is checked instead.
 
-mod common;
-
 use std::sync::Arc;
 
-use common::text_of;
+use crate::common::text_of;
 use pgmcp::mcp::server::McpServer;
 use pgmcp_testing::pool_tool_helpers::{context_with_pool, server_with_pool};
 use pgmcp_testing::require_test_db;

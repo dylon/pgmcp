@@ -19,8 +19,6 @@
 //! that the SQL parses, the bindings match, and the result type
 //! decodes.
 
-mod common;
-
 use chrono::Utc;
 use pgmcp::db::queries;
 use pgmcp_testing::fixtures::synthetic_corpus::SyntheticCorpus;

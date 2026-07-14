@@ -1,9 +1,7 @@
 //! Integration tests for topic apps #3 (topic_drift_warning) and #8
 //! (topic_ownership_forecast). Coverage gate via call_tool_cli.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::require_test_db;
 use serde_json::json;
 

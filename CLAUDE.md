@@ -35,6 +35,22 @@ These are individual gates, NOT a replacement for `scripts/verify.sh`:
     cargo verify-test      # test --release --bin pgmcp
     cargo smoke            # run --release --example gpu_smoke
 
+## Integration tests: `autotests = false` (`pgmcp-testing/tests/`)
+
+Dropping a new file into `pgmcp-testing/tests/` is **not** enough. The package
+sets `autotests = false` and routes all 234 test files through one `[[test]]`
+target, so you must add `mod <file>;` to `pgmcp-testing/tests/main.rs` or your
+tests are never compiled and never run — silently.
+
+Cargo's default (one `[[test]]` per `tests/*.rs`) meant 234 crates each
+statically linking the ~282 MB `libpgmcp` rlib plus candle/cudarc/ort — ≈23.5 GB
+of linker output and >1 h of wall time. One target: ~8 min cold, ~12 s to run
+1,252 tests. Shared helpers are `crate::common::…` (declared once in `main.rs`).
+Don't add process-global mutation (`env::set_var`, `set_current_dir`, global
+subscriber init) to a test file — under `cargo test` they all share one process
+now. The root `pgmcp/tests/` keeps autodiscovery (Gate 6 names
+`--test gpu_fallback_smoke`). Full rationale: `docs/DEVELOPING.md`.
+
 ## CUDA is mandatory
 
 pgmcp does not support a CPU-only build. Every build links cudarc, `ort/cuda`,

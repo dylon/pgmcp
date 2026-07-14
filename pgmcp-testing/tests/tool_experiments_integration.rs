@@ -14,12 +14,10 @@
 //! signature), so this local helper is kept for explicitness rather than
 //! out of dimensional necessity.
 
-mod common;
-
 use std::sync::Arc;
 
+use crate::common::text_of;
 use arc_swap::ArcSwap;
-use common::text_of;
 use pgmcp::config::Config;
 use pgmcp::context::SystemContext;
 use pgmcp::db::DbClient;

@@ -4,9 +4,7 @@
 //! database/logging topics carry a single chunk each (below the default thin
 //! threshold), so the report must surface 1 orphan and ≥2 thin topics.
 
-mod common;
-
-use common::server_with_pool;
+use crate::common::server_with_pool;
 use pgmcp_testing::fixtures::synthetic_corpus::SyntheticCorpus;
 use pgmcp_testing::require_test_db;
 

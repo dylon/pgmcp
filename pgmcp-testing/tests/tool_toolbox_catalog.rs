@@ -9,9 +9,7 @@
 //! cards on first call; embeddings stay NULL in tests (the cron does not run), so
 //! semantic results are empty but the envelopes are well-formed.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::require_test_db;
 use serde_json::json;
 

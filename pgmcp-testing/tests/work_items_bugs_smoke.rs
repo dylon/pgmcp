@@ -10,12 +10,10 @@
 //! `call_tool_cli("<tool>", …)` per dispatched tool — here `work_item_triage`
 //! and `work_item_resolve`).
 
-mod common;
-
 use std::sync::Arc;
 
+use crate::common::text_of;
 use arc_swap::ArcSwap;
-use common::text_of;
 use pgmcp::config::Config;
 use pgmcp::context::SystemContext;
 use pgmcp::db::DbClient;

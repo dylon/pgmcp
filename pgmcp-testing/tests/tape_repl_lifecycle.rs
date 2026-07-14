@@ -37,12 +37,10 @@
 //! each request runs one verb on its own task stack). The chained tests run on a
 //! dedicated 16 MiB-stack thread, mirroring `tape_verbs.rs`.
 
-mod common;
-
 use std::sync::Arc;
 
+use crate::common::text_of;
 use arc_swap::ArcSwap;
-use common::text_of;
 use pgmcp::config::Config;
 use pgmcp::context::SystemContext;
 use pgmcp::db::DbClient;

@@ -9,9 +9,7 @@
 //! votes below share it, which is exactly what exercises the one-vote-per-agent
 //! upsert.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::require_test_db;
 use serde_json::json;
 

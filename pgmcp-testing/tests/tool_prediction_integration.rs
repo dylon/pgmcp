@@ -1,9 +1,7 @@
 //! Phase 6: real-DB integration tests for the Prediction tool category.
 //! `bug_prediction`, `technical_debt_analysis`, `anomaly_detection`.
 
-mod common;
-
-use common::text_of;
+use crate::common::text_of;
 use pgmcp_testing::pool_tool_helpers::{
     seed_file, seed_file_symbol, seed_project, server_with_pool,
 };

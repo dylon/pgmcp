@@ -25,8 +25,6 @@
 //!    derived from `test_embedding(seed)`; query with one of the
 //!    seeds and assert the matching commit ranks first.
 
-mod common;
-
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -43,7 +41,7 @@ use pgmcp_testing::mocks::DeterministicEmbeddingBackend;
 use pgmcp_testing::require_test_db;
 use sqlx::PgPool;
 
-use common::text_of;
+use crate::common::text_of;
 
 const D: usize = 1024;
 

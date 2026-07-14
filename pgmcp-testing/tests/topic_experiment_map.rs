@@ -1,9 +1,7 @@
 //! Integration test for topic ⊗ experiment map (#7, ADR-029): experiments
 //! anchored to a topic surface under that topic. Coverage gate via call_tool_cli.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::require_test_db;
 use serde_json::json;
 

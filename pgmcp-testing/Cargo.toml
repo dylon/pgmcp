@@ -6,6 +6,14 @@ description = "Test fixtures, mocks, and factories for pgmcp."
 license = "Apache-2.0"
 publish = false
 
+# Cargo autodiscovers every `tests/*.rs` as its own `[[test]]` target. With 234
+# such files that meant 234 independent crates, each running full O3 codegen and
+# then statically linking the 282 MB `libpgmcp` rlib plus candle/ort/cudarc into
+# a ~105 MB executable — ~23.5 GB of linker output to run 817 tests. Disable the
+# autodiscovery and route every file through the single `tests/main.rs` target,
+# which declares each file as a `mod`. One compile, one link.
+autotests = false
+
 # Consumed only via the parent crate's [dev-dependencies]. The parent
 # (`pgmcp`) itself is a transitive dep here so we can `impl pgmcp::db::DbClient`
 # for our mocks. The parent → testing → parent loop is fine because
@@ -61,6 +69,13 @@ arc-swap = "1"
 rmcp = { version = "1.7", features = ["server"] }
 assert_cmd = "2"
 predicates = "3"
+
+# The single consolidated integration-test target (see `autotests = false`).
+# `tests/main.rs` declares every `tests/*.rs` file as a `mod`, so test names keep
+# their file as a module prefix and existing filters keep working.
+[[test]]
+name = "all"
+path = "tests/main.rs"
 
 # Use a hyphenated name for the CLI command while keeping the source
 # file `regen_goldens.rs` underscored (rustc idiomatic).

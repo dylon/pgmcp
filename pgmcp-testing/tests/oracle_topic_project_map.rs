@@ -4,9 +4,7 @@
 //! global roll-up sets those), so the test stamps a breadth-2 incidence on the
 //! "auth" theme and asserts the map surfaces it.
 
-mod common;
-
-use common::server_with_pool;
+use crate::common::server_with_pool;
 use pgmcp_testing::fixtures::synthetic_corpus::SyntheticCorpus;
 use pgmcp_testing::require_test_db;
 

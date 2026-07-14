@@ -11,9 +11,7 @@
 //! return all 6 cross-pairs (every two-file subset of {A, B, C, D}).
 //! E never appears regardless of threshold.
 
-mod common;
-
-use common::{server_with_pool, text_of};
+use crate::common::{server_with_pool, text_of};
 use pgmcp_testing::fixtures::synthetic_git_history::seed_git_history;
 use pgmcp_testing::require_test_db;
 
