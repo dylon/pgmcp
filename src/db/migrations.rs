@@ -87,6 +87,8 @@ mod v67_durable_mandates_operator;
 mod v68_experiment_audit_action;
 mod v69_memory_pressure_skip_reason;
 mod v6_unified_graph;
+mod v70_toolbox_discopy;
+mod v71_toolbox_wolfram_fv;
 mod v7_cge_orphan_cleanup;
 mod v8_csm_protocols;
 mod v9_quality_report_history;
@@ -3020,6 +3022,40 @@ pub async fn run_migrations(
         v69_memory_pressure_skip_reason::MEMORY_PRESSURE_SKIP_REASON,
         v69_memory_pressure_skip_reason::MEMORY_PRESSURE_SKIP_REASON_NAME,
         || v69_memory_pressure_skip_reason::apply(pool),
+    )
+    .await?;
+
+    // Step 70 — re-seed the toolbox catalog after adding the two DisCoPy cards
+    // (`discopy` for string-diagram drawing in the diagramming domain,
+    // `discopy-categorical` for categorical semantics / ZX rewriting in the
+    // formal_verification domain). Same idempotent, content-hash-driven upsert
+    // path as `toolbox_refresh`; run on migration because lazy seeding only
+    // fires on an EMPTY table. See `src/db/migrations/v70_toolbox_discopy.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v70_toolbox_discopy::TOOLBOX_DISCOPY,
+        v70_toolbox_discopy::TOOLBOX_DISCOPY_NAME,
+        || v70_toolbox_discopy::apply(pool),
+    )
+    .await?;
+
+    // Step 71 — re-seed the toolbox catalog after broadening Wolfram from one
+    // CAS card into its full surface: `wolfram-prover` (FindEquationalProof →
+    // ProofObject), `wolfram-solver` (Resolve/Reduce CAD + SAT), and
+    // `wolfram-modeling` (Modelica SystemModelSimulate + control models), plus
+    // the new `system_modeling` FV category. Also re-hashes the `wolfram` and
+    // `wolfram-graphics` cards, whose prose was corrected (the former wrongly
+    // denied machine-checked proof; both now document the 2-seat license cap
+    // that surfaces as a misleading `No valid password found.`). Same idempotent
+    // upsert path as `toolbox_refresh`; run on migration because lazy seeding
+    // only fires on an EMPTY table. See `src/db/migrations/v71_toolbox_wolfram_fv.rs`.
+    // ================================================================
+    apply_step(
+        pool,
+        v71_toolbox_wolfram_fv::TOOLBOX_WOLFRAM_FV,
+        v71_toolbox_wolfram_fv::TOOLBOX_WOLFRAM_FV_NAME,
+        || v71_toolbox_wolfram_fv::apply(pool),
     )
     .await?;
 

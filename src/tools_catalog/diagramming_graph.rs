@@ -288,5 +288,27 @@ pub(super) fn seeds() -> Vec<ToolSeed> {
             "/usr/bin/pikchr (v1.0)",
             "https://pikchr.org/",
         ),
+        tool(
+            "discopy",
+            "DisCoPy",
+            DIA,
+            "diagram_language",
+            "Python toolkit for string diagrams — typed, composable monoidal-category terms drawn to SVG/PNG/PDF or native TikZ.",
+            "DisCoPy makes a string diagram a first-class Python value: objects are types (`Ty`), morphisms are boxes (`Box`), and diagrams are built by sequential (`>>`) and parallel (`@`) composition, which the library type-checks as you build. It draws via a matplotlib backend (SVG/PNG/PDF) or emits native TikZ for LaTeX inclusion; `Equation` typesets diagram equalities side by side and `to_gif` animates a rewrite sequence.",
+            "Reach for DisCoPy when the figure *is* a term in a monoidal category — a string/wiring diagram, tensor network, quantum circuit, ZX diagram, or pregroup grammar derivation — rather than a boxes-and-arrows sketch. For software architecture, flowcharts, and sequence diagrams use `plantuml`; for relationship graphs use `graphviz`.",
+            "Input: Python (`discopy.monoidal` / `rigid` / `quantum.zx` / `grammar.pregroup`). Output: SVG/PNG/PDF via matplotlib (`path=`), a `.tikz` fragment via `to_tikz=True`, or an animated GIF via `to_gif`.",
+            "`python -c \"from discopy.monoidal import Ty,Box; x=Ty('x'); f=Box('f',x,x); (f>>f).draw(path='d.svg', show=False)\"`; TikZ: `d.draw(to_tikz=True, path='d.tikz', show=False)` (the flag is `to_tikz=True` — passing `backend=TikZ()` silently falls through to matplotlib); equalities: `Equation(lhs, rhs).draw(path='eq.svg', show=False)`.",
+            "Diagrams are typed and composable, so an ill-formed wiring fails at construction rather than rendering wrong; the TikZ backend keeps figure math in LaTeX alongside the prose; layout is computed, not hand-placed; the same object both draws and computes (see the `discopy-categorical` card).",
+            "Not a general-purpose diagramming tool — no UML, architecture, flowchart, or ER support. TikZ output is a bare `tikzpicture` fragment needing a LaTeX pass (`tikz` card) to become SVG/PDF. `draw()` defaults to `show=True`, so always pass `show=False` alongside `path=` in batch use (matplotlib itself auto-selects the Agg backend when no display is present).",
+            &[
+                "tikz",
+                "matplotlib",
+                "graphviz",
+                "plantuml",
+                "discopy-categorical",
+            ],
+            "pacman: python-discopy (/usr/lib/python3.14/site-packages/discopy, v1.2.2)",
+            "https://discopy.org/",
+        ),
     ]
 }

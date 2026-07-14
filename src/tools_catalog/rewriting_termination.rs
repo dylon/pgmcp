@@ -133,5 +133,21 @@ pub(super) fn seeds() -> Vec<ToolSeed> {
             "opam: ~/.opam/default/bin/ott (0.34)",
             "https://www.cl.cam.ac.uk/~pes20/ott/",
         ),
+        tool(
+            "discopy-categorical",
+            "DisCoPy (categorical semantics / ZX)",
+            FV,
+            "rewriting_semantics",
+            "Compute with string diagrams in Python: free monoidal categories, functorial semantics, ZX-calculus rewriting, and pregroup grammars.",
+            "DisCoPy builds the free monoidal category over a signature — with `monoidal`, `braided`, `symmetric`, `rigid`, `compact`, `frobenius`, `traced`, `markov`, and `hypergraph` layers — and interprets it through a `Functor` into concrete semantics (numpy/tensorflow tensors, python functions, quantum channels). On top of that sit the ZX-calculus (`quantum.zx`), quantum circuits and ansätze, pregroup/DisCoCat derivations (`grammar.pregroup`), Thue rewrite systems (`grammar.thue`), diagram `normal_form()`, and structural equality.",
+            "Reach for DisCoPy to model a system as a monoidal category and check equalities by diagram rewriting: verify a quantum-circuit identity through ZX, give functorial semantics to a protocol or process algebra, or explore compositional (DisCoCat) grammar. It answers \"do these two processes denote the same thing?\" compositionally, where `maude`/`k-framework` answer it by term rewriting over a syntax.",
+            "Input: Python term construction (`>>`, `@`, `.dagger()`) plus a `Functor` assigning objects to dimensions and boxes to arrays. Output: normalized diagrams, functor images (tensors / python functions), booleans from equality checks, and drawings.",
+            "ZX: `python -c \"from discopy.quantum.zx import Z,X,Id; print(Z(1,2) >> Id(1) @ X(1,1))\"`; semantics: `from discopy.frobenius import Ty,Box; from discopy.tensor import Dim,Functor; x=Ty('x'); f=Box('f',x,x); F=Functor(ob={x:Dim(2)}, ar={f:[[0,1],[1,0]]}); F(f>>f).array` → the 2×2 identity; normalization: `d.normal_form()`; pregroup: `from discopy.grammar.pregroup import Ty,Word,Cup,Id`.",
+            "Compositional by construction — a `Functor` *is* the semantics, so syntax and meaning cannot silently drift apart; ZX rewriting for circuit identities; sympy-backed symbolic scalars for parameterised diagrams; the same object also draws (see the `discopy` card).",
+            "NOT machine-checked: there is no proof object or trusted kernel, and equality is structural or numeric (floating-point) — reach for `rocq`, `z3`, or `tla-plus` when a proof is required. The optional `pytket`, `pennylane`, `torch`, and `nltk` backends are NOT installed here, so `quantum.tk`, `quantum.pennylane`, the torch tensor backend, and `grammar.cfg` NLTK parsing are unavailable (`sympy` and `tensorflow` are present).",
+            &["maude", "k-framework", "ott", "discopy"],
+            "pacman: python-discopy (/usr/lib/python3.14/site-packages/discopy, v1.2.2)",
+            "https://discopy.org/",
+        ),
     ]
 }

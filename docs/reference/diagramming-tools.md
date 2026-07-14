@@ -13,7 +13,7 @@ probe-grounded (real binary, path, and version captured by `--version` /
 `command -v` / `kpsewhich`). GUI-only tools with no scriptable surface are
 documented here but not carded.
 
-> Domain summary: **43 cards across 8 categories** — `graph_layout`,
+> Domain summary: **45 cards across 8 categories** — `graph_layout`,
 > `uml_architecture`, `scientific_plotting`, `diagram_language`, `ascii_diagram`,
 > `diagram_conversion`, `circuit_diagram`, `protocol_data_diagram`.
 
@@ -24,7 +24,7 @@ Query them with the MCP tools, e.g.
 
 ──────────────────────────────────────────────────────────────────────────────
 
-## Installed & carded (43)
+## Installed & carded (45)
 
 ### graph_layout
 | slug | tool | version | invocation gist |
@@ -72,6 +72,18 @@ Query them with the MCP tools, e.g.
 | `seaborn` | seaborn | 0.13.2 | `python -c "...sns.heatmap...; plt.savefig('h.svg')"` |
 | `plotly` | Plotly | 6.8.0 | `fig.write_html('c.html')` / `fig.write_image('c.svg')` |
 | `altair` | Vega-Altair | 6.2.1 | `chart.save('c.svg')` (needs `python-vl-convert`) |
+| `wolfram-graphics` | Wolfram Language graphics | 15.0.0.0 | `wolfram -script plot.wl` → `Export["fig.svg", Plot[…]]` |
+
+> **Wolfram's 2-seat license.** `$MaxLicenseProcesses == 2`. Every long-lived
+> `Wolfram/AgentTools` MCP server holds one seat for the lifetime of its agent
+> session, so once two sessions are up, any *new* kernel — `wolfram -script`,
+> `wolframscript`, another MCP server — aborts with `No valid password found.`
+> (rc 85). **That message names the wrong cause**: the license is valid
+> (`$LicenseType == "Professional"`, no expiry). Diagnose with
+> `ps -eo pid,etimes,args | grep WolframKernel` and free a seat rather than
+> re-activating. The same cap applies to the `wolfram`, `wolfram-prover`,
+> `wolfram-solver`, and `wolfram-modeling` cards in the `formal_verification`
+> domain.
 
 ### diagram_language
 | slug | tool | version | invocation gist |
@@ -81,6 +93,15 @@ Query them with the MCP tools, e.g.
 | `pic` | GNU pic | 1.24.1 | `pic d.pic | groff -p -Tps`; `pic2plot -Tsvg` |
 | `asymptote` | Asymptote | 3.12 | `asy -f svg -o fig fig.asy` (2D/3D) |
 | `pikchr` | Pikchr | 1.0 | `pikchr d.pikchr > d.svg` (PIC → self-contained SVG) |
+| `discopy` | DisCoPy | 1.2.2 | `python -c "…(f>>f).draw(path='d.svg', show=False)"`; TikZ via `to_tikz=True` |
+
+> **DisCoPy's two cards.** One pacman package surfaces under two globally-unique
+> slugs: `discopy` here (the *drawing* surface — string diagrams to SVG/PNG/PDF
+> or native TikZ) and `discopy-categorical` in the **`formal_verification`**
+> domain (the *computing* surface — functorial semantics, ZX-calculus rewriting,
+> pregroup grammars). Reach for it only when the figure genuinely **is** a term
+> in a monoidal category; `plantuml` and `graphviz` remain right for
+> architecture, flow, and relationship diagrams.
 
 ### ascii_diagram
 | slug | tool | version | invocation gist |
@@ -119,9 +140,18 @@ Query them with the MCP tools, e.g.
 (`/home/dylon/Workspace/f1r3fly.io/node_modules/.bin/`), not inside the pgmcp
 crate; invoke by absolute path or `npx` from the workspace. `svgbob` is the
 `svgbob_cli` binary in `~/.cargo/bin`. The Python plotting libs
-(`matplotlib`/`seaborn`/`plotly`/`altair`) are pacman packages under
+(`matplotlib`/`seaborn`/`plotly`/`altair`) and `discopy` are pacman packages under
 `/usr/lib/python3.14/site-packages`. `tikz`/`pgfplots`/`circuitikz` are TeX Live
 packages resolved via `kpsewhich` and compiled through `lualatex`/`pdflatex`.
+`wolfram-graphics` is a manual install (`/usr/local/bin/wolfram`; `wolframscript`
+is **not** on PATH).
+
+**DisCoPy optional backends.** `python-discopy` pulls in `numpy`/`networkx`/
+`matplotlib`/`pillow`; of its optdeps only `python-sympy` and `ipython` are
+installed here. `pytket`, `pennylane`, `python-pytorch`, and `python-nltk` are
+**absent**, so `discopy.quantum.tk`, `discopy.quantum.pennylane`, the torch
+`matrix` backend, and `discopy.grammar.cfg`'s NLTK parsing will `ImportError`.
+The `tensorflow` matrix backend *is* available.
 
 **Altair static export:** install the renderer with `sudo pacman -S
 python-vl-convert` (in the `extra` repo) — without it, `chart.save('out.svg')`
@@ -192,7 +222,16 @@ deliberately excluded. Install commands assume Arch (`pacman`/AUR), `npm`,
   (`src/db/migrations/v35_toolbox_domain_diagramming.rs`), built from
   `ToolDomain::sql_in_list()` (ADR-003 single-source-of-truth idiom).
 - Pure card additions need **no** embedding-signature bump
-  (`DEV_TOOL_EMBEDDING_SIGNATURE` in `src/db/tool_cards.rs`); new cards insert with
-  a NULL embedding that the embedding-migration cron backfills. On an
-  already-seeded daemon, reach new cards via `toolbox_refresh {mode:"reembed"}`
-  after the v35 migration applies on restart.
+  (`DEV_TOOL_EMBEDDING_SIGNATURE` in `src/db/tool_cards.rs`, currently
+  `pgmcp-tool-embedding-v2`); new cards insert with a NULL embedding that the
+  embedding-migration cron backfills. Bump the signature only when
+  `card_content()`'s prose composition changes globally.
+- **A new card also needs a re-seed migration.** Lazy seeding
+  (`ensure_toolbox_seeded_if_empty`) fires only on an **empty** `tool_cards`
+  table, so on an already-provisioned install a restart alone will never insert
+  the card. Ship a version-gated step that re-runs the idempotent
+  `upsert_tool_category` + `upsert_tool_card` over the full seed set — see
+  `v49_toolbox_debug_tools.rs`, `v63_toolbox_wolfram.rs`, and
+  `v70_toolbox_discopy.rs`. An operator can force the same convergence
+  out-of-band with `toolbox_refresh {mode:"reembed"}` (which additionally embeds
+  inline rather than waiting for the cron).

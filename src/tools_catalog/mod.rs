@@ -280,6 +280,14 @@ pub fn tool_category_seeds() -> Vec<ToolCategorySeed> {
             description: "Mathematical-optimization solver (LP / SDP / MIP).",
             domain: fv,
         },
+        ToolCategorySeed {
+            slug: "system_modeling",
+            name: "System modeling & simulation",
+            description: "Dynamical-system modeling and simulation: equation-based (Modelica) \
+                           component models, state-space / transfer-function control models, \
+                           ODE/DAE integration, and stochastic (Markov) processes.",
+            domain: fv,
+        },
         // ---- developer_tooling ----
         ToolCategorySeed {
             slug: "cpu_profiler",
