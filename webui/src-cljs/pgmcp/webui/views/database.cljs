@@ -54,7 +54,7 @@
        "database-view"
        [:div.toolbar [table-selector tables table]]
        (cond
-         (nil? tables-payload) [ui/empty-box "Loading tables…"]
+         (nil? tables-payload) [ui/skeleton-rows]
          (:error tables-payload) [ui/error-box (:error tables-payload)]
          (empty? tables) [ui/empty-box "No tables available."]
          :else

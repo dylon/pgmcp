@@ -21,39 +21,45 @@
                    (.preventDefault event)
                    (when can-run?
                      (rf/dispatch [:machine/dispatch {:type :query/run}])))}
-     [rc/single-dropdown
-      :class "query-mode"
-      :choices schema/query-mode-choices
-      :model mode
-      :on-change #(set-field! :mode %)
-      :width "132px"]
-     [rc/input-text
-      :class "query-text"
-      :model text
-      :placeholder "query"
-      :change-on-blur? false
-      :on-change #(set-field! :text %)]
-     [rc/input-text
-      :class "query-project"
-      :model project
-      :placeholder "project"
-      :change-on-blur? false
-      :on-change #(set-field! :project %)]
-     [rc/input-text
-      :class "query-limit"
-      :model (str limit)
-      :placeholder "limit"
-      :width "82px"
-      :change-on-blur? false
-      :validation-regex #"^\d{0,3}$"
-      :attr {:aria-label "limit"
-             :inputMode "numeric"
-             :pattern "[0-9]*"}
-      :on-change #(set-field! :limit %)]
-     [rc/button
-      :label (if pending? "Running" "Run")
-      :disabled? (not can-run?)
-      :attr {:type "submit"}]]))
+     [ui/labeled-field "Mode"
+      [rc/single-dropdown
+       :class "query-mode"
+       :choices schema/query-mode-choices
+       :model mode
+       :on-change #(set-field! :mode %)
+       :width "132px"]]
+     [ui/labeled-field "Query"
+      [rc/input-text
+       :class "query-text"
+       :model text
+       :placeholder "search terms / pattern"
+       :change-on-blur? false
+       :on-change #(set-field! :text %)]]
+     [ui/labeled-field "Project"
+      [rc/input-text
+       :class "query-project"
+       :model project
+       :placeholder "all projects"
+       :change-on-blur? false
+       :on-change #(set-field! :project %)]]
+     [ui/labeled-field "Limit"
+      [rc/input-text
+       :class "query-limit"
+       :model (str limit)
+       :placeholder "20"
+       :width "82px"
+       :change-on-blur? false
+       :validation-regex #"^\d{0,3}$"
+       :attr {:aria-label "limit"
+              :inputMode "numeric"
+              :pattern "[0-9]*"}
+       :on-change #(set-field! :limit %)]]
+     [ui/labeled-field " "
+      [rc/button
+       :label (if pending? "Running" "Run")
+       :class "btn-primary"
+       :disabled? (not can-run?)
+       :attr {:type "submit"}]]]))
 
 (defn result-row [id {:keys [path lines language project score snippet]}]
   [:div.result-row
@@ -72,9 +78,9 @@
                       (when pending? "loading")]]
      (cond
        (nil? payload)
-       [ui/empty-box (if pending?
-                       "Loading query results."
-                       "No query results loaded.")]
+       (if pending?
+         [ui/skeleton-rows]
+         [ui/empty-box "No query results loaded — enter a query and Run."])
 
        (:error payload)
        [ui/error-box (:error payload)]

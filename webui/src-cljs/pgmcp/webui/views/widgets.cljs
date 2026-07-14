@@ -8,7 +8,8 @@
   Normalizers return a vector of section maps and a pane renders them with
   `sections`."
   (:require [clojure.string :as str]
-            [pgmcp.webui.viz :as viz]))
+            [pgmcp.webui.viz :as viz]
+            [re-frame.core :as rf]))
 
 (defn chip [{:keys [label status]}]
   [:span {:class (str "chip " (name (or status :neutral)))} (str label)])
@@ -90,35 +91,77 @@
     (chip {:label (:chip v) :status (:status v)})
     (str v)))
 
+(defn- sort-value
+  "The comparable value for a cell under column `c`: chip maps sort by their
+  label, numeric columns coerce to a number (non-numeric → -Inf so blanks sink),
+  everything else lower-cases for case-insensitive ordering."
+  [c row]
+  (let [v (get row (:key c))
+        v (if (and (map? v) (contains? v :chip)) (:chip v) v)]
+    (if (= :num (:align c))
+      (let [n (js/parseFloat (str v))]
+        (if (js/isNaN n) js/Number.NEGATIVE_INFINITY n))
+      (str/lower-case (str v)))))
+
+(defn- next-sort
+  "The sort map after clicking column `c` given the current sort `st`: first
+  click on a column → ascending; re-click → flip direction."
+  [st c]
+  (if (= (:key st) (:key c))
+    {:key (:key c) :dir (if (= :asc (:dir st)) :desc :asc)}
+    {:key (:key c) :dir :asc}))
+
+(defn- sort-rows [columns rows st]
+  (let [c (first (filter #(= (:key %) (:key st)) columns))
+        ordered (sort-by #(sort-value c %) rows)]
+    (if (= :desc (:dir st)) (reverse ordered) ordered)))
+
 (defn data-table
   "columns: [{:key <k> :label <str> :align :num|nil :render (fn [row] hiccup)}]
   rows: seq of maps. A column's :render, when present, produces a typed cell;
-  otherwise the value is rendered by `cell` (chip data or stringified)."
-  [{:keys [columns rows empty-text]}]
-  (if (empty? rows)
-    [:div.empty (or empty-text "No rows.")]
-    [:div.table-scroll
-     [:table.data-table
-      [:thead
-       (into [:tr]
-             (for [[idx c] (map-indexed vector columns)]
-               ^{:key idx}
-               [:th {:class (when (= :num (:align c)) "num")} (str (:label c))]))]
-      (into [:tbody]
-            (for [[ridx row] (map-indexed vector rows)]
-              ^{:key ridx}
-              (into [:tr]
-                    (for [[cidx c] (map-indexed vector columns)]
-                      ^{:key cidx}
-                      [:td {:class (when (= :num (:align c)) "num")}
-                       (if-let [render (:render c)]
-                         (render row)
-                         (cell (get row (:key c))))]))))]]))
+  otherwise the value is rendered by `cell` (chip data or stringified).
+
+  Sortable by default: clicking a header sorts by that column (numeric columns
+  numerically), toggling asc/desc, with a ▲/▼ indicator. Pass :sortable? false
+  to disable (e.g. an inherently-ordered feed). Sort state lives in re-frame
+  under :panel/ui-param keyed by :sort-id (the section title) — no ad-hoc mutable
+  cell, so it honors the CESK/app-db single-source-of-truth rule."
+  [{:keys [columns rows empty-text sortable? sort-id]}]
+  (let [sortable? (not (false? sortable?))
+        sort-id (or sort-id :table)
+        st @(rf/subscribe [:panel/ui-param sort-id :sort nil])
+        sorted (if (and sortable? st) (sort-rows columns rows st) rows)]
+    (if (empty? rows)
+      [:div.empty (or empty-text "No rows.")]
+      [:div.table-scroll
+       [:table.data-table
+        [:thead
+         (into [:tr]
+               (for [[idx c] (map-indexed vector columns)]
+                 ^{:key idx}
+                 [:th {:class (str (when (= :num (:align c)) "num ")
+                                   (when sortable? "sortable"))
+                       :on-click (when sortable?
+                                   #(rf/dispatch [:ui/set-panel-param sort-id :sort (next-sort st c)]))}
+                  (str (:label c))
+                  (when (and sortable? (= (:key c) (:key st)))
+                    (if (= :asc (:dir st)) " ▲" " ▼"))]))]
+        (into [:tbody]
+              (for [[ridx row] (map-indexed vector sorted)]
+                ^{:key ridx}
+                (into [:tr]
+                      (for [[cidx c] (map-indexed vector columns)]
+                        ^{:key cidx}
+                        [:td {:class (when (= :num (:align c)) "num")}
+                         (if-let [render (:render c)]
+                           (render row)
+                           (cell (get row (:key c))))]))))]])))
 
 (defn section-body [s]
   (cond
     (contains? s :tiles) (tiles (:tiles s))
-    (contains? s :table) (data-table (:table s))
+    (contains? s :table) [data-table (assoc (:table s)
+                                             :sort-id (or (:sort-id (:table s)) (:title s) :table))]
     (contains? s :kv) (kv-grid (:kv s))
     (contains? s :meters) (meters (:meters s))
     (contains? s :chips) (chips (:chips s))

@@ -351,15 +351,35 @@
 
 (defn normalized-work-tree
   "Flatten a tree payload {nodes:[{...item, depth, path}]} into display rows with
-  their indentation depth preserved."
+  their indentation depth preserved. :id/:parent-id are surfaced so the view can
+  compute parent→child visibility for expand/collapse."
   [payload]
   (mapv (fn [n]
-          {:public-id (or (:public_id n) "")
+          {:id (:id n)
+           :parent-id (:parent_id n)
+           :public-id (or (:public_id n) "")
            :kind (or (:kind n) "")
            :status (or (:status n) "")
            :title (or (:title n) "")
            :depth (or (:depth n) 0)})
         (or (:nodes payload) [])))
+
+(defn tree-visible-rows
+  "Given flat depth-ordered tree rows and a set of collapsed node ids, drop any
+  row with a collapsed ancestor and tag each surviving row with :has-children."
+  [rows collapsed]
+  (let [by-id (into {} (map (juxt :id identity)) rows)
+        parents (into #{} (keep :parent-id) rows)
+        ancestor-collapsed? (fn [row]
+                              (loop [pid (:parent-id row)]
+                                (cond
+                                  (nil? pid) false
+                                  (contains? collapsed pid) true
+                                  :else (recur (:parent-id (get by-id pid))))))]
+    (into []
+          (comp (remove ancestor-collapsed?)
+                (map #(assoc % :has-children (contains? parents (:id %)))))
+          rows)))
 
 (defn known-event-topic? [event]
   (schema/known-topic? (:topic event)))

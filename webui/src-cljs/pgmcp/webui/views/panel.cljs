@@ -38,10 +38,10 @@
         controls]
        (cond
          (and (nil? payload) pending?)
-         [ui/empty-box "Loading…"]
+         [ui/skeleton-rows]
 
          (nil? payload)
-         [ui/empty-box "No data. Click Refresh."]
+         [ui/empty-box "No data yet — click Refresh to load."]
 
          (:error payload)
          [ui/error-box (:error payload)]

@@ -20,21 +20,25 @@
                    (.preventDefault event)
                    (when-not pending?
                      (rf/dispatch [:machine/dispatch {:type :mandates/load}])))}
-     [rc/single-dropdown
-      :choices schema/mandate-scope-choices
-      :model scope
-      :on-change #(set-field! :scope %)
-      :width "132px"]
-     [rc/input-text
-      :class "mandate-project"
-      :model project
-      :placeholder "project"
-      :change-on-blur? false
-      :on-change #(set-field! :project %)]
-     [rc/button
-      :label (if pending? "Loading" "Load")
-      :disabled? pending?
-      :attr {:type "submit"}]]))
+     [ui/labeled-field "Scope"
+      [rc/single-dropdown
+       :choices schema/mandate-scope-choices
+       :model scope
+       :on-change #(set-field! :scope %)
+       :width "132px"]]
+     [ui/labeled-field "Project"
+      [rc/input-text
+       :class "mandate-project"
+       :model project
+       :placeholder "all projects"
+       :change-on-blur? false
+       :on-change #(set-field! :project %)]]
+     [ui/labeled-field " "
+      [rc/button
+       :label (if pending? "Loading" "Load")
+       :class "btn-primary"
+       :disabled? pending?
+       :attr {:type "submit"}]]]))
 
 (def durable-scope-choices
   (mapv (fn [s] {:id s :label s}) ["global" "project" "workspace"]))
@@ -73,6 +77,7 @@
      [:div.chips-row
       [ui/toolbar-button
        {:label "Create"
+        :variant :primary
         :disabled? (or (= :pending status) (str/blank? imperative))
         :on-click #(rf/dispatch [:action/submit :new-mandate
                                  {:method "POST"
@@ -150,9 +155,9 @@
                       (when pending? "loading")]]
      (cond
        (nil? payload)
-       [ui/empty-box (if pending?
-                       "Loading mandates."
-                       "No mandates loaded.")]
+       (if pending?
+         [ui/skeleton-rows]
+         [ui/empty-box "No mandates loaded — choose a scope and Load."])
 
        (:error payload)
        [ui/error-box (:error payload)]

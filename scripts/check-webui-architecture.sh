@@ -33,6 +33,7 @@ for required_file in \
   webui/src-cljs/pgmcp/webui/views/work.cljs \
   webui/src-cljs/pgmcp/webui/views/resources.cljs \
   webui/src-cljs/pgmcp/webui/views/panel.cljs \
+  webui/src-cljs/pgmcp/webui/views/layout.cljs \
   webui/src-cljs/pgmcp/webui/views/metrics.cljs \
   webui/src-cljs/pgmcp/webui/views/clients.cljs \
   webui/src-cljs/pgmcp/webui/views/database.cljs \

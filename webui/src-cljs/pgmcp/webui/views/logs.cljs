@@ -35,37 +35,43 @@
   (rf/dispatch [:ui/set-panel-param :logs key value]))
 
 (defn logs-controls [q level since until]
-  [:span.chips-row
-   [rc/single-dropdown
-    :choices level-choices
-    :model (or level "")
-    :width "120px"
-    :on-change #(set-param! :level %)]
-   [rc/input-text
-    :class "query-text"
-    :model (or since "")
-    :placeholder "since (RFC3339)"
-    :width "180px"
-    :change-on-blur? false
-    :on-change #(set-param! :since %)]
-   [rc/input-text
-    :class "query-text"
-    :model (or until "")
-    :placeholder "until (RFC3339)"
-    :width "180px"
-    :change-on-blur? false
-    :on-change #(set-param! :until %)]
-   [rc/input-text
-    :class "query-text"
-    :model (or q "")
-    :placeholder "fuzzy grep (empty = tail)"
-    :change-on-blur? false
-    :on-change #(set-param! :q %)]
-   [ui/toolbar-button
-    {:label "Search"
-     :on-click #(panel/load! :logs (if (str/blank? (or q ""))
-                                     (tail-url level since until)
-                                     (grep-url q)))}]])
+  [:<>
+   [ui/labeled-field "Level"
+    [rc/single-dropdown
+     :choices level-choices
+     :model (or level "")
+     :width "120px"
+     :on-change #(set-param! :level %)]]
+   [ui/labeled-field "Since"
+    [rc/input-text
+     :class "query-text"
+     :model (or since "")
+     :placeholder "RFC3339"
+     :width "170px"
+     :change-on-blur? false
+     :on-change #(set-param! :since %)]]
+   [ui/labeled-field "Until"
+    [rc/input-text
+     :class "query-text"
+     :model (or until "")
+     :placeholder "RFC3339"
+     :width "170px"
+     :change-on-blur? false
+     :on-change #(set-param! :until %)]]
+   [ui/labeled-field "Grep"
+    [rc/input-text
+     :class "query-text"
+     :model (or q "")
+     :placeholder "fuzzy (empty = tail)"
+     :change-on-blur? false
+     :on-change #(set-param! :q %)]]
+   [ui/labeled-field " "
+    [ui/toolbar-button
+     {:label "Search"
+      :variant :primary
+      :on-click #(panel/load! :logs (if (str/blank? (or q ""))
+                                      (tail-url level since until)
+                                      (grep-url q)))}]]])
 
 (defn logs-page []
   (let [q @(rf/subscribe [:panel/ui-param :logs :q ""])

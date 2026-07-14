@@ -159,3 +159,28 @@
         daemon (first sections)]
     (is (some (fn [t] (and (= "Phase" (:label t)) (= "ready" (:value t))))
               (:tiles daemon)))))
+
+;; ── work-item tree (split-pane hierarchy) ───────────────────────────────
+
+(deftest normalized-work-tree-surfaces-id-and-parent
+  (let [rows (domain/normalized-work-tree
+              {:nodes [{:id 1 :parent_id nil :public_id "PLAN-1" :kind "plan"
+                        :status "in_progress" :title "Root" :depth 0}
+                       {:id 2 :parent_id 1 :public_id "TASK-1" :kind "task"
+                        :status "ready" :title "Child" :depth 1}]})]
+    (is (= [1 2] (mapv :id rows)))
+    (is (= [nil 1] (mapv :parent-id rows)))
+    (is (= "PLAN-1" (:public-id (first rows))))))
+
+(deftest tree-visible-rows-flags-children-and-hides-collapsed
+  (let [rows [{:id 1 :parent-id nil :depth 0}
+              {:id 2 :parent-id 1 :depth 1}
+              {:id 3 :parent-id 2 :depth 2}]]
+    (testing "nothing collapsed → all visible; ancestors flagged has-children"
+      (let [v (domain/tree-visible-rows rows #{})]
+        (is (= [1 2 3] (mapv :id v)))
+        (is (= [true true false] (mapv :has-children v)))))
+    (testing "collapsing the root hides its whole subtree"
+      (is (= [1] (mapv :id (domain/tree-visible-rows rows #{1})))))
+    (testing "collapsing a mid node hides only its descendants"
+      (is (= [1 2] (mapv :id (domain/tree-visible-rows rows #{2})))))))

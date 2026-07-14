@@ -28,10 +28,10 @@
        [resources-toolbar]
        (cond
          (and (nil? payload) pending?)
-         [ui/empty-box "Loading resources…"]
+         [ui/skeleton-rows]
 
          (nil? payload)
-         [ui/empty-box "No resource data. Click Refresh."]
+         [ui/empty-box "No resource data — click Refresh."]
 
          (:error payload)
          [ui/error-box (:error payload)]

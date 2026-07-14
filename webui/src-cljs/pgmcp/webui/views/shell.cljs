@@ -28,9 +28,11 @@
    :mandates "Mandates"
    :work "Work"})
 
-(def nav-order
-  [:overview :resources :metrics :clients :database :logs :experiments
-   :query :events :mandates :work])
+;; The 11 panes clustered by intent: Workspace (what you work on) vs System
+;; (how the daemon/host is doing). Rendered as two labeled segments in the tab bar.
+(def nav-groups
+  [{:label "Workspace" :views [:overview :query :events :work :experiments :mandates]}
+   {:label "System" :views [:clients :logs :metrics :database :resources]}])
 
 (defn brand []
   [:div.brand
@@ -42,15 +44,19 @@
 (defn nav-button [view active-view]
   [rc/button
    :label (get view-labels view (name view))
-   :class (when (= view active-view) "active")
+   :class (str "nav-btn" (when (= view active-view) " active"))
    :on-click #(rf/dispatch [:machine/dispatch {:type :ui/view :view view}])])
 
 (defn navigation []
   (let [active-view @(rf/subscribe [:control/view])]
-    [rc/h-box
-     :class "tabs"
-     :gap "8px"
-     :children (mapv #(nav-button % active-view) nav-order)]))
+    (into [:nav.tabs]
+          (for [{:keys [label views]} nav-groups]
+            ^{:key label}
+            [:div.nav-group
+             [:span.nav-group-label label]
+             (into [:div.nav-group-btns]
+                   (for [v views]
+                     ^{:key v} [nav-button v active-view]))]))))
 
 (defn connection-pill []
   (let [connection @(rf/subscribe [:control/connection])]
