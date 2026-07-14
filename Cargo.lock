@@ -3099,6 +3099,7 @@ dependencies = [
  "parking_lot",
  "pathmap 0.2.2",
  "rustc-hash 1.1.0",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "smallvec",

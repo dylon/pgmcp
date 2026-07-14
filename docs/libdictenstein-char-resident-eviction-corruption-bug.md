@@ -1,9 +1,51 @@
 # libdictenstein bug: resident-budget char eviction corrupts the sequential-sibling on-disk layout
 
-**Status:** open — to be fixed in `libdictenstein` by the libdictenstein agent.
+**Status:** ✅ **RESOLVED (2026-07-08) in `libdictenstein`** — see [Resolution](#resolution) below.
 **Reporter:** pgmcp agent (found while wiring pgmcp's `fuzzy-sync` OOM fix).
 **Repo:** `/home/dylon/Workspace/f1r3fly.io/libdictenstein`
 **Date:** 2026-07-08
+
+---
+
+<a name="resolution"></a>
+## Resolution (2026-07-08)
+
+Fixed in `libdictenstein`. Full design + verification:
+`libdictenstein/docs/design/checkpoint-growth-sequential-sibling-fixes.md`.
+
+**Corrected root cause.** The report's hypothesis ("individual-node eviction *scatters* a parent's
+children across arenas") was subtly wrong — eviction is correct (it reuses the pointer a prior
+checkpoint assigned; it never allocates). The real defect was an **arena-space vs block-space
+off-by-one** in char's `check_sequential_char_children` (`char/persist.rs:792`): it read a child's
+arena id as the raw `block_id`, while the encoder/validator/decoder (and the byte twin) use the
+canonical `arena_id = block_id − 1`. The `got arena 0 slot 148, expected arena 1 slot 148` fingerprint
+— **identical slot_id, arena off by exactly one** — is the signature of that convention mismatch, not
+of arbitrary scattering. Eviction + incremental checkpointing merely *created* the cross-arena
+parent→child layout that tripped it. Fix applied to char + vocab (the byte twin lacked the arena bug
+but gained a key-order-aware check + a per-index validator for defense-in-depth).
+
+**Two fixes landed (both safe Rust, zero new `unsafe`):**
+
+1. **The reported crash** — corrected the arena convention + made the contiguity check key-order-aware.
+   Your repro (`resident_budget_bytes = Some(_)` + incremental `checkpoint()` on a char trie) now runs
+   clean; regression-tested by `interleaved_checkpoint_with_resident_budget_eviction_preserves_all_terms`
+   (+ a byte twin + property twins).
+2. **Dirty-skip serialization** — a *separate* defect the same investigation surfaced: every checkpoint
+   re-serialized the whole resident overlay, so the on-disk file grew `O(#checkpoints × resident_set)`
+   even though RAM was bounded. Checkpoints now **reuse** durable-clean nodes' existing on-disk slots,
+   so per-checkpoint growth is `O(dirty nodes)` — the file stays essentially dense for an insert
+   workload.
+
+**Guidance for pgmcp (you can now flip `[fuzzy] resident_budget_bytes` on):**
+
+- **RAM is bounded, and now disk is too** for a bulk-insert build — dirty-skip keeps the file dense, so
+  the incremental-checkpoint strategy is safe on both axes. Keep `resident_budget_bytes` modest.
+- **Reopen eager-loads the full image** (RAM ≈ live set on `open`). This is orthogonal to build RAM but
+  matters on daemon restart / query-serving of a very large index — budget for it separately.
+- **`compact()` exists** for char now (`PersistentARTrieChar::compact`) to reclaim dead space, **but it
+  is NOT RAM-bounded** (it materializes the live set), so it cannot compact a trie whose *live* set
+  exceeds RAM. For a bulk-insert build it is largely unnecessary (dirty-skip keeps the file dense); use
+  it (on a host with `RAM ≳ live-set`) only if an overwrite-heavy workload accumulates dead space.
 
 ---
 
