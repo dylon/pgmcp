@@ -129,9 +129,10 @@ async fn train_project(
     let (counts_backend, vocab) = try_build_lm_training_inputs(&vocab_path, &counts_path)
         .map_err(|e| TrainError::Train(format!("lm training inputs: {e}")))?;
 
-    // Train the n-gram side with DENSE term-ids (see `train_ngram_dense_vocab`).
+    // Train the n-gram side (parallel; libgrammstein dense-remaps term-ids on
+    // serialize, so a nearly-dense vocab still round-trips — see `train_ngram`).
     let reader_ngram = ChunkCorpus::new(contents.clone());
-    let ngram_model = train_ngram_dense_vocab(counts_backend, vocab, order, reader_ngram)?;
+    let ngram_model = train_ngram(counts_backend, vocab, order, reader_ngram)?;
 
     // Train the subword embedding side. Tiny dims + few epochs keep
     // per-project cron time bounded (typically <30s for a 10k-chunk
@@ -166,33 +167,23 @@ async fn train_project(
     Ok(true)
 }
 
-/// Train the per-project n-gram model with **dense** term-ids.
+/// Train the per-project n-gram model.
 ///
-/// libdictenstein's `PersistentVocabARTrie` assigns term-ids via a write-once
-/// `next_index.fetch_add` that is only "nearly-dense": when two threads intern
-/// the same *new* token concurrently, the loser's id is burned (a benign gap),
-/// so the term-id space becomes sparse and a winning token can even receive an
-/// id greater than the live term count. libgrammstein's portable format assumes
-/// **dense** ids (`portable_vocabulary_from` / `compute_vocab_fingerprint`
-/// enumerate `1..=entry_count`): a sparse vocabulary silently drops out-of-range
-/// terms and fails the vocab-fingerprint check on reload, so
-/// [`HybridLanguageModel::save_portable`] → [`PgmcpHybridLm::open`] would refuse
-/// the model and the LM leg would be skipped on every query.
+/// Training interns the vocabulary while counting in parallel
+/// (`batch.par_iter()`), and libdictenstein's write-once term-id allocation is
+/// only "nearly-dense" — a concurrent same-token race burns an id, leaving the
+/// term-id space sparse. That is fine: libgrammstein's `to_portable`
+/// dense-remaps the term-ids at serialization time (and normalizes the
+/// vocab-fingerprint over that dense form), so `save_portable` →
+/// [`PgmcpHybridLm::open`] round-trips regardless of the sparse in-memory ids.
 ///
-/// The n-gram trainer interns the vocabulary while counting in parallel
-/// (`batch.par_iter()`); `TrainerBuilder::batch_size(1)` makes each prefetch
-/// batch a single sentence, so counting — and therefore interning — is never
-/// concurrent. That guarantees a dense term-id space and a correct portable
-/// round-trip. Serializing the counting pass is the price of correctness here: it
-/// runs in a background per-project cron (off the query path), and the upstream
-/// dense-remap fix (below) would let it re-parallelize.
-///
-/// The principled upstream fix (dense-remapping the term-ids at serialization
-/// time, so training can re-parallelize) is handed off in
-/// `~/.claude/plans/libgrammstein-portable-sparse-termid.md`.
+/// (An earlier interim forced dense ids with `TrainerBuilder::batch_size(1)`,
+/// serializing the counting pass; the upstream dense-remap fix — handoff
+/// `~/.claude/plans/libgrammstein-portable-sparse-termid.md` — removed that need
+/// and restored full training parallelism.)
 ///
 /// [`PgmcpHybridLm::open`]: crate::wfst::hybrid_lm::PgmcpHybridLm::open
-fn train_ngram_dense_vocab(
+fn train_ngram(
     counts_backend: PgmcpLmBackend,
     vocab: SharedVocabARTrie,
     order: usize,
@@ -201,7 +192,6 @@ fn train_ngram_dense_vocab(
     TrainerBuilder::new(counts_backend)
         .order(order)
         .with_vocabulary(vocab)
-        .batch_size(1)
         .train(reader)
         .map_err(|e| TrainError::Train(format!("ngram: {e}")))
 }
@@ -311,7 +301,7 @@ mod tests {
         let (counts_backend, vocab) =
             try_build_lm_training_inputs(&vocab_path, &counts_path).expect("build training inputs");
 
-        let ngram_model = train_ngram_dense_vocab(
+        let ngram_model = train_ngram(
             counts_backend,
             vocab,
             cfg.order,
@@ -388,7 +378,7 @@ mod tests {
         let (counts_backend, vocab) =
             try_build_lm_training_inputs(&vocab_path, &counts_path).expect("build training inputs");
 
-        let ngram_model = train_ngram_dense_vocab(
+        let ngram_model = train_ngram(
             counts_backend,
             vocab,
             cfg.order,

@@ -17,8 +17,9 @@
 //! counts keyed by raw LEB128 term-id byte sequences — self-delimiting, so
 //! there is no `'|'` round-trip, no char lift (each varint byte stays a `u8`,
 //! not a `u32` `char`), and no delimiter-collision hazard. On load the counts
-//! trie is rebuilt as a fresh on-disk working file under `<model_dir>/live/`;
-//! the vocabulary travels inside `model.bin` and is rebuilt by libgrammstein.
+//! trie and the vocabulary are rebuilt as fresh on-disk working files under
+//! `<model_dir>/live/` — `load_portable_at` keeps the vocabulary in that managed
+//! dir instead of a `/tmp` temp dir, so an OOM-killed load leaves nothing to leak.
 //!
 //! Plan: `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`
 //! Phase 9 + Phase 13.2.
@@ -47,8 +48,9 @@ pub type PgmcpLmStore = TermIdStore<PgmcpLmBackend>;
 
 /// Filenames of the two on-disk tries that back the LM, under a given working
 /// dir (`<model_dir>/live` for readers, `<model_dir>/train` for the training
-/// cron). Training uses both; loading uses only the counts trie (the vocabulary
-/// travels inside `model.bin` and is rebuilt by libgrammstein).
+/// cron). Both training and loading use both tries — the counts trie plus the
+/// vocabulary (which `load_portable_at` materializes from `model.bin` into the
+/// managed `live/` dir rather than a `/tmp` temp dir).
 pub(crate) fn lm_trie_paths(dir: &Path) -> (PathBuf, PathBuf) {
     (dir.join("vocab.artrie"), dir.join("counts.artrie"))
 }
@@ -160,11 +162,13 @@ impl PgmcpHybridLm {
     /// Load a previously-trained model from the portable bincode
     /// format produced by `cron::ngram_lm_train`.
     ///
-    /// The counts trie is rebuilt from `model.bin` into a fresh on-disk working
-    /// file under `<model_dir>/live/` (the vocabulary is embedded in `model.bin`
-    /// and rebuilt by libgrammstein). The `live/` dir is wiped first —
-    /// `DiskManager::create` reuses, not truncates, an existing file, and stale
-    /// WAL/archive segments could corrupt a "fresh" trie.
+    /// The counts trie and the vocabulary are both rebuilt from `model.bin` into
+    /// fresh on-disk working files under `<model_dir>/live/` (via
+    /// `load_portable_at`, which materializes the vocabulary in the managed
+    /// `live/` dir rather than a `/tmp` temp dir). The `live/` dir is wiped first
+    /// — `DiskManager::create` reuses, not truncates, an existing file, and stale
+    /// WAL/archive segments could corrupt a "fresh" trie; the wipe also makes each
+    /// open self-healing if a prior run was OOM-killed mid-load.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LmError> {
         let path = path.as_ref().to_path_buf();
         let model_dir = path
@@ -174,15 +178,19 @@ impl PgmcpHybridLm {
         let live_dir = model_dir.join("live");
         let _ = std::fs::remove_dir_all(&live_dir);
         std::fs::create_dir_all(&live_dir)?;
-        let (_, counts_path) = lm_trie_paths(&live_dir);
+        let (vocab_path, counts_path) = lm_trie_paths(&live_dir);
 
-        // `load_portable`'s factory is `FnOnce() -> B` (no error channel), so
+        // `load_portable_at`'s factory is `FnOnce() -> B` (no error channel), so
         // the infallible builder is used here; trie I/O failure surfaces as a
-        // panic with a clear message (a corrupt model dir is unrecoverable).
-        // Only the counts backend is supplied — the vocabulary is embedded in
-        // `model.bin` and rebuilt by libgrammstein on load.
+        // panic with a clear message (a corrupt model dir is unrecoverable). The
+        // vocabulary is materialized under the wiped `live/` dir (not a `/tmp`
+        // temp dir): pgmcp's daemon can be OOM-killed, and SIGKILL skips the RAII
+        // temp-dir guard's `Drop`, so keeping the vocab in `live/` (wiped by the
+        // `remove_dir_all` above on every open) is self-healing — no unbounded
+        // `/tmp` accumulation across crashes.
         let factory = move || build_counts_backend(&counts_path);
-        let inner = HybridLanguageModel::<PgmcpLmStore>::load_portable(&path, factory)?;
+        let inner =
+            HybridLanguageModel::<PgmcpLmStore>::load_portable_at(&path, factory, &vocab_path)?;
         Ok(Self {
             inner: Arc::new(inner),
             path,
