@@ -21,14 +21,14 @@ use std::sync::atomic::Ordering;
 use libgrammstein::corpus::{CorpusReader, Document};
 use libgrammstein::embedding::EmbeddingTrainerBuilder;
 use libgrammstein::hybrid::HybridLanguageModel;
-use libgrammstein::ngram::TrainerBuilder;
+use libgrammstein::ngram::{NgramModel, SharedVocabARTrie, TrainerBuilder};
 use sqlx::PgPool;
 use tracing::{debug, error, info};
 
 use crate::cron::fuzzy_sync::{project_artifact_key, slugify};
 use crate::stats::tracker::StatsTracker;
 use crate::wfst::hybrid_lm::{
-    HybridLmConfig, PgmcpLmDictionary, lm_trie_paths, try_build_lm_dictionary,
+    HybridLmConfig, PgmcpLmBackend, PgmcpLmStore, lm_trie_paths, try_build_lm_training_inputs,
 };
 
 /// Cron entry point. Runs across all projects; logs and continues
@@ -111,11 +111,12 @@ async fn train_project(
     let cfg = HybridLmConfig::default();
     let order = cfg.order;
 
-    // Build the vocab-indexed persistent dictionary backed by fresh on-disk
-    // tries under the project's model dir (a `train/` subdir, kept separate
-    // from readers' `live/` dir so the cron and a reader never share a trie
-    // path). Wipe it first so the tries start empty (`create` reuses, not
-    // truncates, existing files).
+    // Build the byte counts backend + persistent vocabulary backed by fresh
+    // on-disk tries under the project's model dir (a `train/` subdir, kept
+    // separate from readers' `live/` dir so the cron and a reader never share a
+    // trie path). Wipe it first so the tries start empty (`create` reuses, not
+    // truncates, existing files). The trainer wires the backend + vocab into a
+    // byte-native `TermIdStore` internally.
     let model_path = model_path_for_project(data_dir, project_id, project_name);
     let train_dir = model_path
         .parent()
@@ -125,15 +126,12 @@ async fn train_project(
     let _ = std::fs::remove_dir_all(&train_dir);
     std::fs::create_dir_all(&train_dir)?;
     let (vocab_path, counts_path) = lm_trie_paths(&train_dir);
-    let dictionary = try_build_lm_dictionary(&vocab_path, &counts_path)
-        .map_err(|e| TrainError::Train(format!("lm dictionary: {e}")))?;
+    let (counts_backend, vocab) = try_build_lm_training_inputs(&vocab_path, &counts_path)
+        .map_err(|e| TrainError::Train(format!("lm training inputs: {e}")))?;
 
-    // Train the n-gram side.
+    // Train the n-gram side with DENSE term-ids (see `train_ngram_dense_vocab`).
     let reader_ngram = ChunkCorpus::new(contents.clone());
-    let ngram_model = TrainerBuilder::new(dictionary)
-        .order(order)
-        .train(reader_ngram)
-        .map_err(|e| TrainError::Train(format!("ngram: {e}")))?;
+    let ngram_model = train_ngram_dense_vocab(counts_backend, vocab, order, reader_ngram)?;
 
     // Train the subword embedding side. Tiny dims + few epochs keep
     // per-project cron time bounded (typically <30s for a 10k-chunk
@@ -147,7 +145,7 @@ async fn train_project(
         .train(reader_emb)
         .map_err(|e| TrainError::Train(format!("embedding: {e}")))?;
 
-    let model: HybridLanguageModel<PgmcpLmDictionary> =
+    let model: HybridLanguageModel<PgmcpLmStore> =
         HybridLanguageModel::new(ngram_model, embedding, cfg.to_grammstein());
 
     if let Some(parent) = model_path.parent() {
@@ -166,6 +164,46 @@ async fn train_project(
         "ngram-lm-train persisted hybrid LM"
     );
     Ok(true)
+}
+
+/// Train the per-project n-gram model with **dense** term-ids.
+///
+/// libdictenstein's `PersistentVocabARTrie` assigns term-ids via a write-once
+/// `next_index.fetch_add` that is only "nearly-dense": when two threads intern
+/// the same *new* token concurrently, the loser's id is burned (a benign gap),
+/// so the term-id space becomes sparse and a winning token can even receive an
+/// id greater than the live term count. libgrammstein's portable format assumes
+/// **dense** ids (`portable_vocabulary_from` / `compute_vocab_fingerprint`
+/// enumerate `1..=entry_count`): a sparse vocabulary silently drops out-of-range
+/// terms and fails the vocab-fingerprint check on reload, so
+/// [`HybridLanguageModel::save_portable`] → [`PgmcpHybridLm::open`] would refuse
+/// the model and the LM leg would be skipped on every query.
+///
+/// The n-gram trainer interns the vocabulary while counting in parallel
+/// (`batch.par_iter()`); `TrainerBuilder::batch_size(1)` makes each prefetch
+/// batch a single sentence, so counting — and therefore interning — is never
+/// concurrent. That guarantees a dense term-id space and a correct portable
+/// round-trip. Serializing the counting pass is the price of correctness here: it
+/// runs in a background per-project cron (off the query path), and the upstream
+/// dense-remap fix (below) would let it re-parallelize.
+///
+/// The principled upstream fix (dense-remapping the term-ids at serialization
+/// time, so training can re-parallelize) is handed off in
+/// `~/.claude/plans/libgrammstein-portable-sparse-termid.md`.
+///
+/// [`PgmcpHybridLm::open`]: crate::wfst::hybrid_lm::PgmcpHybridLm::open
+fn train_ngram_dense_vocab(
+    counts_backend: PgmcpLmBackend,
+    vocab: SharedVocabARTrie,
+    order: usize,
+    reader: ChunkCorpus,
+) -> Result<NgramModel<PgmcpLmStore>, TrainError> {
+    TrainerBuilder::new(counts_backend)
+        .order(order)
+        .with_vocabulary(vocab)
+        .batch_size(1)
+        .train(reader)
+        .map_err(|e| TrainError::Train(format!("ngram: {e}")))
 }
 
 /// Low-level on-disk location for an ad-hoc HybridLM model keyed only by a
@@ -240,14 +278,13 @@ mod tests {
     use crate::wfst::hybrid_lm::PgmcpHybridLm;
     use libgrammstein::embedding::EmbeddingTrainerBuilder;
 
-    /// End-to-end proof of the vocab-indexed persistent LM backend: train →
-    /// `save_portable` → `open` (which rebuilds the on-disk vocab+counts tries
-    /// from `model.bin`) → score, plus stability across a reload. Exercises
-    /// both `IterableDictionary` impls (save iterates the wrapper → decodes to
-    /// `'|'`-joined keys; load replays them) and the `'|'` delimiter invariant
-    /// (a mismatch would corrupt the round-trip silently).
+    /// End-to-end proof of the byte-native `TermIdStore` LM backend: train →
+    /// `save_portable` → `open` (which rebuilds the on-disk counts trie from
+    /// `model.bin` plus the embedded vocabulary) → score, plus stability across a
+    /// reload. The n-gram keys are raw LEB128 term-id bytes — no `'|'` join, no
+    /// char lift.
     #[test]
-    fn vocab_indexed_lm_roundtrip_train_save_open() {
+    fn termid_lm_roundtrip_train_save_open() {
         let dir = tempfile::tempdir().expect("tempdir");
         let data_dir = dir.path();
         let project = "roundtrip_proj";
@@ -271,13 +308,16 @@ mod tests {
             .join("train");
         std::fs::create_dir_all(&train_dir).expect("mkdir train");
         let (vocab_path, counts_path) = lm_trie_paths(&train_dir);
-        let dictionary =
-            try_build_lm_dictionary(&vocab_path, &counts_path).expect("build dictionary");
+        let (counts_backend, vocab) =
+            try_build_lm_training_inputs(&vocab_path, &counts_path).expect("build training inputs");
 
-        let ngram_model = TrainerBuilder::new(dictionary)
-            .order(cfg.order)
-            .train(ChunkCorpus::new(contents.clone()))
-            .expect("train ngram");
+        let ngram_model = train_ngram_dense_vocab(
+            counts_backend,
+            vocab,
+            cfg.order,
+            ChunkCorpus::new(contents.clone()),
+        )
+        .expect("train ngram");
         let embedding = EmbeddingTrainerBuilder::new()
             .dim(16)
             .window_size(3)
@@ -285,16 +325,17 @@ mod tests {
             .epochs(1)
             .train(ChunkCorpus::new(contents))
             .expect("train embedding");
-        let model: HybridLanguageModel<PgmcpLmDictionary> =
+        let model: HybridLanguageModel<PgmcpLmStore> =
             HybridLanguageModel::new(ngram_model, embedding, cfg.to_grammstein());
         std::fs::create_dir_all(model_path.parent().expect("parent")).expect("mkdir model dir");
         model.save_portable(&model_path).expect("save_portable");
 
-        // The vocab-indexed backend really did write both persistent tries.
+        // The byte-native backend really did write both persistent tries during
+        // training (the vocabulary + the counts ART).
         assert!(vocab_path.exists(), "vocab.artrie was created on disk");
         assert!(counts_path.exists(), "counts.artrie was created on disk");
 
-        // The production loader rebuilds the tries under `live/` and scores.
+        // The production loader rebuilds the counts trie under `live/` and scores.
         let lm = PgmcpHybridLm::open(&model_path).expect("open");
         let s1 = lm.score_continuation(&["quick", "brown"], "fox");
         assert!(s1.is_finite(), "score is finite: {s1}");
@@ -306,6 +347,87 @@ mod tests {
         assert!(
             (s1 - s2).abs() < 1e-9,
             "score stable across reload: {s1} vs {s2}"
+        );
+    }
+
+    /// Delimiter-collision safety: a corpus whose vocabulary contains tokens with
+    /// a literal `'|'` must train, save, load, and score correctly. The
+    /// tokenizer's word boundary is `[\s\p{P}]+`, and `'|'` (U+007C) is Unicode
+    /// category `Sm` (math symbol), not `P` — so `foo|bar` survives tokenization
+    /// as a single token and reaches the store. Under the old char-lift the
+    /// n-gram key `"foo|bar|baz"` would split back into three tokens (silent
+    /// corruption); the byte-native `TermIdStore` keys on LEB128 term-id bytes,
+    /// so the collision class cannot occur. (The raw-token collision case is also
+    /// covered upstream by libgrammstein's
+    /// `google_books_sharding_delimiter_collision` test.)
+    #[test]
+    fn termid_lm_delimiter_token_roundtrips() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data_dir = dir.path();
+        let project = "delim_proj";
+
+        // Tokens containing a literal '|', repeated across enough chunks/tokens
+        // to satisfy the n-gram + embedding trainers' minimums.
+        let contents: Vec<String> = (0..12)
+            .map(|i| {
+                format!(
+                    "foo|bar baz qux foo|bar alpha|beta gamma delta number {i} \
+                     foo|bar baz alpha|beta gamma epsilon zeta eta theta iota"
+                )
+            })
+            .collect();
+
+        let cfg = HybridLmConfig::default();
+        let model_path = model_path_for(data_dir, project);
+        let train_dir = model_path
+            .parent()
+            .expect("model path has parent")
+            .join("train");
+        std::fs::create_dir_all(&train_dir).expect("mkdir train");
+        let (vocab_path, counts_path) = lm_trie_paths(&train_dir);
+        let (counts_backend, vocab) =
+            try_build_lm_training_inputs(&vocab_path, &counts_path).expect("build training inputs");
+
+        let ngram_model = train_ngram_dense_vocab(
+            counts_backend,
+            vocab,
+            cfg.order,
+            ChunkCorpus::new(contents.clone()),
+        )
+        .expect("train ngram");
+        let embedding = EmbeddingTrainerBuilder::new()
+            .dim(16)
+            .window_size(3)
+            .min_count(1)
+            .epochs(1)
+            .train(ChunkCorpus::new(contents))
+            .expect("train embedding");
+        let model: HybridLanguageModel<PgmcpLmStore> =
+            HybridLanguageModel::new(ngram_model, embedding, cfg.to_grammstein());
+        std::fs::create_dir_all(model_path.parent().expect("parent")).expect("mkdir model dir");
+        model.save_portable(&model_path).expect("save_portable");
+
+        // Load and score n-grams whose tokens contain '|': finite scores prove
+        // the term-id keys round-tripped without delimiter corruption.
+        let lm = PgmcpHybridLm::open(&model_path).expect("open");
+        let s_delim = lm.score_continuation(&["foo|bar"], "baz");
+        assert!(
+            s_delim.is_finite(),
+            "delimiter-token continuation scores finitely: {s_delim}"
+        );
+        let s_two = lm.score_continuation(&["foo|bar", "baz"], "qux");
+        assert!(
+            s_two.is_finite(),
+            "two-token '|' context scores finitely: {s_two}"
+        );
+
+        // Reload determinism holds for the '|'-token model too.
+        let s_reload = PgmcpHybridLm::open(&model_path)
+            .expect("reopen")
+            .score_continuation(&["foo|bar"], "baz");
+        assert!(
+            (s_delim - s_reload).abs() < 1e-9,
+            "delimiter-token score stable across reload: {s_delim} vs {s_reload}"
         );
     }
 

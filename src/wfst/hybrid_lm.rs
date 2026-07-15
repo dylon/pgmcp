@@ -9,13 +9,16 @@
 //!
 //! Persistence uses libgrammstein's "portable" format
 //! (`save_portable` / `load_portable`), which is backend-INDEPENDENT — the
-//! on-disk `model.bin` stores `(key, NgramEntrySnapshot)` pairs + embedding +
-//! config, never the dictionary's in-memory representation. pgmcp pins the
-//! backend to a vocabulary-indexed disk-backed ART trie
-//! (`VocabularyIndexedDictionary<SharedCharARTrie<NgramEntry>>`): a
-//! `PersistentVocabARTrie` maps words ↔ u64 ids and a `PersistentARTrieChar`
-//! holds the integer-keyed n-gram counts. The vocab + counts tries are real
-//! on-disk working files rebuilt from `model.bin` on load.
+//! on-disk `model.bin` stores `(term-id-byte key, NgramEntrySnapshot)` pairs +
+//! the embedded vocabulary + embedding + config, never the store's in-memory
+//! representation. pgmcp pins the backend to libgrammstein's byte-native
+//! `TermIdStore<Arc<PersistentARTrie<NgramEntry>>>`: a `PersistentVocabARTrie`
+//! maps words ↔ u64 term-ids and a byte `PersistentARTrie` holds the n-gram
+//! counts keyed by raw LEB128 term-id byte sequences — self-delimiting, so
+//! there is no `'|'` round-trip, no char lift (each varint byte stays a `u8`,
+//! not a `u32` `char`), and no delimiter-collision hazard. On load the counts
+//! trie is rebuilt as a fresh on-disk working file under `<model_dir>/live/`;
+//! the vocabulary travels inside `model.bin` and is rebuilt by libgrammstein.
 //!
 //! Plan: `~/.claude/plans/pgmcp-is-already-partially-glittery-graham.md`
 //! Phase 9 + Phase 13.2.
@@ -23,67 +26,64 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use libdictenstein::persistent_artrie::char::{PersistentARTrieChar, SharedCharARTrie};
+use libdictenstein::persistent_artrie::PersistentARTrie;
 use libgrammstein::hybrid::{HybridConfig, HybridLanguageModel, InterpolationStrategy};
-use libgrammstein::ngram::NgramEntry;
-use libgrammstein::ngram::open_or_create_vocabulary;
-use libgrammstein::ngram::vocabulary_indexed::VocabularyIndexedDictionary;
+use libgrammstein::ngram::{NgramEntry, SharedVocabARTrie, TermIdStore, open_or_create_vocabulary};
 use lling_llang::layers::rescoring::lm_rerank::LanguageModel as LlingLanguageModel;
 use thiserror::Error;
 
-/// Concrete dictionary backend pgmcp uses for the per-project LM: a
-/// vocabulary-indexed dictionary over a disk-backed char ARTrie. The
-/// vocabulary (`SharedVocabARTrie`, a `PersistentVocabARTrie`) maps words ↔
-/// u64 ids; the n-gram counts live in a `PersistentARTrieChar`-backed
-/// `SharedCharARTrie`. The delimiter is pinned to `'|'` to match
-/// libgrammstein's `LEGACY_NGRAM_SEPARATOR`, so portable keys round-trip
-/// through `NgramTrie`'s legacy split/join. The runtime dictionary is rebuilt
-/// from the backend-independent portable `model.bin` on load (see module doc).
-pub type PgmcpLmDictionary = VocabularyIndexedDictionary<SharedCharARTrie<NgramEntry>>;
+/// Byte counts backend for the per-project LM: a disk-backed byte
+/// `PersistentARTrie` of `NgramEntry`, keyed on raw LEB128 term-id byte
+/// sequences (self-delimiting — no `'|'`, no char lift).
+pub(crate) type PgmcpLmBackend = Arc<PersistentARTrie<NgramEntry>>;
 
-/// Delimiter pinned to libgrammstein's `LEGACY_NGRAM_SEPARATOR` (`'|'`) — the
-/// `VocabularyIndexedDictionary` MUST split/join on the same char `NgramTrie`
-/// uses for its legacy keys, or the portable round-trip silently breaks.
-const LM_NGRAM_DELIMITER: char = '|';
+/// The per-project LM's n-gram store — libgrammstein's byte-native
+/// [`TermIdStore`] over the disk counts backend. Replaces the char-lifted
+/// `VocabularyIndexedDictionary<SharedCharARTrie<NgramEntry>>`: a
+/// `PersistentVocabARTrie` maps words ↔ u64 term-ids and the byte counts trie
+/// holds the term-id-keyed n-gram counts. The store is rebuilt from the
+/// backend-independent portable `model.bin` on load (see module doc).
+pub type PgmcpLmStore = TermIdStore<PgmcpLmBackend>;
 
-/// Filenames of the two on-disk tries that back the LM dictionary, under a
-/// given working dir (`<model_dir>/live` for readers, `<model_dir>/train` for
-/// the training cron).
+/// Filenames of the two on-disk tries that back the LM, under a given working
+/// dir (`<model_dir>/live` for readers, `<model_dir>/train` for the training
+/// cron). Training uses both; loading uses only the counts trie (the vocabulary
+/// travels inside `model.bin` and is rebuilt by libgrammstein).
 pub(crate) fn lm_trie_paths(dir: &Path) -> (PathBuf, PathBuf) {
     (dir.join("vocab.artrie"), dir.join("counts.artrie"))
 }
 
-/// Build an empty vocabulary-indexed LM dictionary backed by FRESH on-disk
-/// tries (vocab ↔ id + integer-keyed n-gram counts) with the pinned `'|'`
-/// delimiter. Shared by the loader ([`PgmcpHybridLm::open`]) and the training
-/// cron. The caller must ensure the paths are empty (their dir wiped) first —
-/// `PersistentARTrieChar::create` reuses, not truncates, an existing file.
-pub(crate) fn try_build_lm_dictionary(
-    vocab_path: &Path,
-    counts_path: &Path,
-) -> Result<PgmcpLmDictionary, LmError> {
-    let vocab = open_or_create_vocabulary(vocab_path)
-        .map_err(|e| LmError::Grammstein(format!("vocab trie: {e}")))?;
-    // `SharedCharARTrie<V> = Arc<PersistentARTrieChar<V>>` since libdictenstein's
-    // overlay refactor moved concurrency inside the trie (no external `RwLock`).
-    let counts: SharedCharARTrie<NgramEntry> = Arc::new(
-        PersistentARTrieChar::<NgramEntry>::create(counts_path)
+/// Build a FRESH byte counts backend (disk ART) for the LM's n-gram counts.
+/// The caller must ensure the path's dir is wiped first — `create` reuses, not
+/// truncates, an existing file.
+pub(crate) fn try_build_counts_backend(counts_path: &Path) -> Result<PgmcpLmBackend, LmError> {
+    Ok(Arc::new(
+        PersistentARTrie::<NgramEntry>::create(counts_path)
             .map_err(|e| LmError::Grammstein(format!("counts trie: {e}")))?,
-    );
-    Ok(VocabularyIndexedDictionary::with_delimiter(
-        counts,
-        vocab,
-        LM_NGRAM_DELIMITER,
     ))
 }
 
-/// Infallible wrapper for the `FnOnce() -> D` factory that
+/// Infallible wrapper for the `FnOnce() -> B` backend factory that
 /// [`HybridLanguageModel::load_portable`] requires (it has no error channel).
 /// A persistent-trie I/O failure here means the model working dir is
 /// unrecoverable, so panicking with a clear message is the right behavior.
-pub(crate) fn build_lm_dictionary(vocab_path: &Path, counts_path: &Path) -> PgmcpLmDictionary {
-    try_build_lm_dictionary(vocab_path, counts_path)
-        .expect("hybrid-lm: build persistent LM dictionary")
+pub(crate) fn build_counts_backend(counts_path: &Path) -> PgmcpLmBackend {
+    try_build_counts_backend(counts_path).expect("hybrid-lm: build persistent counts backend")
+}
+
+/// Build FRESH training inputs for the per-project LM: the byte counts backend
+/// (disk ART for the n-gram counts) plus a persistent word ↔ term-id vocabulary.
+/// The trainer (`TrainerBuilder::new(backend).with_vocabulary(vocab)`) wires the
+/// two into a [`TermIdStore`] internally. Shared by the training cron and its
+/// round-trip test. The caller must ensure the dir is wiped first — `create` and
+/// `open_or_create_vocabulary` reuse, not truncate, existing files.
+pub(crate) fn try_build_lm_training_inputs(
+    vocab_path: &Path,
+    counts_path: &Path,
+) -> Result<(PgmcpLmBackend, SharedVocabARTrie), LmError> {
+    let vocab = open_or_create_vocabulary(vocab_path)
+        .map_err(|e| LmError::Grammstein(format!("vocab trie: {e}")))?;
+    Ok((try_build_counts_backend(counts_path)?, vocab))
 }
 
 /// pgmcp-side config knob for the n-gram-LM third leg of hybrid_search.
@@ -152,7 +152,7 @@ impl From<libgrammstein::Error> for LmError {
 /// per-call clones.
 #[derive(Clone)]
 pub struct PgmcpHybridLm {
-    inner: Arc<HybridLanguageModel<PgmcpLmDictionary>>,
+    inner: Arc<HybridLanguageModel<PgmcpLmStore>>,
     path: PathBuf,
 }
 
@@ -160,11 +160,11 @@ impl PgmcpHybridLm {
     /// Load a previously-trained model from the portable bincode
     /// format produced by `cron::ngram_lm_train`.
     ///
-    /// The runtime dictionary is rebuilt from `model.bin` into fresh on-disk
-    /// vocab + counts tries under `<model_dir>/live/`. These are working
-    /// storage derived from the (crash-safe) portable file, so the dir is
-    /// wiped first — `DiskManager::create` reuses, not truncates, an existing
-    /// file, and stale WAL/archive segments could corrupt a "fresh" trie.
+    /// The counts trie is rebuilt from `model.bin` into a fresh on-disk working
+    /// file under `<model_dir>/live/` (the vocabulary is embedded in `model.bin`
+    /// and rebuilt by libgrammstein). The `live/` dir is wiped first —
+    /// `DiskManager::create` reuses, not truncates, an existing file, and stale
+    /// WAL/archive segments could corrupt a "fresh" trie.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LmError> {
         let path = path.as_ref().to_path_buf();
         let model_dir = path
@@ -174,14 +174,15 @@ impl PgmcpHybridLm {
         let live_dir = model_dir.join("live");
         let _ = std::fs::remove_dir_all(&live_dir);
         std::fs::create_dir_all(&live_dir)?;
-        let vocab_path = live_dir.join("vocab.artrie");
-        let counts_path = live_dir.join("counts.artrie");
+        let (_, counts_path) = lm_trie_paths(&live_dir);
 
-        // `load_portable`'s factory is `FnOnce() -> D` (no error channel), so
+        // `load_portable`'s factory is `FnOnce() -> B` (no error channel), so
         // the infallible builder is used here; trie I/O failure surfaces as a
         // panic with a clear message (a corrupt model dir is unrecoverable).
-        let factory = move || build_lm_dictionary(&vocab_path, &counts_path);
-        let inner = HybridLanguageModel::<PgmcpLmDictionary>::load_portable(&path, factory)?;
+        // Only the counts backend is supplied — the vocabulary is embedded in
+        // `model.bin` and rebuilt by libgrammstein on load.
+        let factory = move || build_counts_backend(&counts_path);
+        let inner = HybridLanguageModel::<PgmcpLmStore>::load_portable(&path, factory)?;
         Ok(Self {
             inner: Arc::new(inner),
             path,
@@ -190,7 +191,7 @@ impl PgmcpHybridLm {
 
     /// Wrap an already-constructed model (used by tests and the
     /// training cron's in-process round-trip after save).
-    pub fn from_loaded(inner: HybridLanguageModel<PgmcpLmDictionary>, path: PathBuf) -> Self {
+    pub fn from_loaded(inner: HybridLanguageModel<PgmcpLmStore>, path: PathBuf) -> Self {
         Self {
             inner: Arc::new(inner),
             path,
@@ -210,7 +211,7 @@ impl PgmcpHybridLm {
     /// Reference to the underlying libgrammstein model (escape hatch
     /// for tests + the integration::lazy_ngram WFST state-source
     /// callers if they need direct access).
-    pub fn inner(&self) -> &HybridLanguageModel<PgmcpLmDictionary> {
+    pub fn inner(&self) -> &HybridLanguageModel<PgmcpLmStore> {
         &self.inner
     }
 }
